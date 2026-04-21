@@ -1,11 +1,21 @@
 /**
- * Passthrough backend — when a request doesn't match any CLI backend,
- * forward it to the vendor's real HTTP API using a configured key.
+ * Passthrough backend — direct vendor-API call, no CLI harness.
  *
- * Kept minimal on purpose. If you want full routing across many
- * providers (cost optimization, fallback chains, compliance filters),
- * point cli-bridge at an OpenAI-compatible router (tangle-router,
- * openrouter, litellm) instead of wiring that logic here.
+ * Model id scheme: `<provider>/<model>` where `<provider>` is one of
+ * openai, anthropic, moonshot, zai. This is NOT subscription-backed —
+ * it uses API keys you've configured in env and bills per token.
+ *
+ * Examples:
+ *   openai/gpt-4o
+ *   anthropic/claude-3-5-sonnet
+ *   moonshot/kimi-k2-0905-preview
+ *   zai/glm-4.6
+ *
+ * Kept here so cli-bridge is a single endpoint for BOTH subscription-
+ * backed CLI harnesses AND metered API calls — pick by model id shape.
+ * Use sparingly; if you want per-provider config + fallback chains +
+ * cost tracking, send traffic through a router (tangle-router,
+ * openrouter, litellm) instead.
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -14,9 +24,9 @@ import type { SessionRecord } from '../sessions/store.js'
 
 interface ProviderBinding {
   name: string
+  prefix: string
   baseUrl: string
   apiKey: string | null
-  matchPrefixes: string[]
 }
 
 export class PassthroughBackend implements Backend {
@@ -30,38 +40,16 @@ export class PassthroughBackend implements Backend {
     zaiApiKey: string | null
   }) {
     this.providers = [
-      {
-        name: 'openai',
-        baseUrl: 'https://api.openai.com/v1',
-        apiKey: opts.openaiApiKey,
-        matchPrefixes: ['gpt-', 'o1-', 'o3-', 'openai/'],
-      },
-      {
-        name: 'anthropic',
-        baseUrl: 'https://api.anthropic.com/v1',
-        apiKey: opts.anthropicApiKey,
-        matchPrefixes: ['claude-3', 'anthropic/'],
-      },
-      {
-        name: 'moonshot',
-        baseUrl: 'https://api.moonshot.ai/v1',
-        apiKey: opts.moonshotApiKey,
-        matchPrefixes: ['moonshot-', 'kimi-', 'moonshot/'],
-      },
-      {
-        name: 'zai',
-        baseUrl: 'https://api.z.ai/api/paas/v4',
-        apiKey: opts.zaiApiKey,
-        matchPrefixes: ['glm-', 'zai/', 'glm/'],
-      },
+      { name: 'openai', prefix: 'openai/', baseUrl: 'https://api.openai.com/v1', apiKey: opts.openaiApiKey },
+      { name: 'anthropic', prefix: 'anthropic/', baseUrl: 'https://api.anthropic.com/v1', apiKey: opts.anthropicApiKey },
+      { name: 'moonshot', prefix: 'moonshot/', baseUrl: 'https://api.moonshot.ai/v1', apiKey: opts.moonshotApiKey },
+      { name: 'zai', prefix: 'zai/', baseUrl: 'https://api.z.ai/api/paas/v4', apiKey: opts.zaiApiKey },
     ]
   }
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
-    return this.providers.some(p =>
-      p.apiKey !== null && p.matchPrefixes.some(pfx => m.startsWith(pfx)),
-    )
+    return this.providers.some(p => p.apiKey !== null && m.startsWith(p.prefix))
   }
 
   async health(): Promise<BackendHealth> {
@@ -82,9 +70,10 @@ export class PassthroughBackend implements Backend {
       throw new BackendError(`no passthrough provider matches model "${req.model}"`, 'not_configured')
     }
 
-    // For now, only support OpenAI-shaped Chat Completions. Anthropic's
-    // /v1/messages needs a separate request shape — wired in the route
-    // layer, not here, to keep this backend small.
+    // Strip the "<provider>/" prefix before forwarding — upstreams expect
+    // their own bare model ids ("gpt-4o", not "openai/gpt-4o").
+    const bareModel = req.model.slice(provider.prefix.length)
+
     const res = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -92,7 +81,7 @@ export class PassthroughBackend implements Backend {
         'Authorization': `Bearer ${provider.apiKey}`,
       },
       body: JSON.stringify({
-        model: req.model,
+        model: bareModel,
         messages: req.messages,
         stream: true,
         temperature: req.temperature,
@@ -138,9 +127,7 @@ export class PassthroughBackend implements Backend {
             usage?: { prompt_tokens?: number; completion_tokens?: number }
           }
           const choice = parsed.choices?.[0]
-          if (choice?.delta?.content) {
-            yield { content: choice.delta.content }
-          }
+          if (choice?.delta?.content) yield { content: choice.delta.content }
           if (choice?.finish_reason) {
             yield {
               finish_reason: choice.finish_reason as ChatDelta['finish_reason'],
@@ -149,9 +136,7 @@ export class PassthroughBackend implements Backend {
                 : undefined,
             }
           }
-        } catch {
-          // skip malformed delta line
-        }
+        } catch { /* skip malformed delta line */ }
       }
     }
 
@@ -161,7 +146,7 @@ export class PassthroughBackend implements Backend {
   private pick(model: string): ProviderBinding | null {
     const m = model.toLowerCase()
     for (const p of this.providers) {
-      if (p.apiKey !== null && p.matchPrefixes.some(pfx => m.startsWith(pfx))) return p
+      if (p.apiKey !== null && m.startsWith(p.prefix)) return p
     }
     return null
   }

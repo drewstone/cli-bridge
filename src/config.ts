@@ -18,13 +18,11 @@ export interface Config {
   claudeBin: string
   claudeTimeoutMs: number
   /**
-   * Optional ANTHROPIC_BASE_URL override for the Claude Code subprocess.
-   * When set, Claude Code's outbound calls go there instead of
-   * api.anthropic.com — the classic pairing is a local `claudish` proxy
-   * so Claude Code's workflow drives a Z.AI / OpenRouter / Gemini brain.
-   * See README "Claude Code with a different brain".
+   * When set, the `claudish` harness is registered and Claude Code is
+   * spawned with ANTHROPIC_BASE_URL=<this> for `claudish/*` model ids.
+   * Points at a local claudish proxy (https://github.com/MadAppGang/claudish).
    */
-  claudeAnthropicBaseUrl: string | null
+  claudishUrl: string | null
   openaiApiKey: string | null
   anthropicApiKey: string | null
   moonshotApiKey: string | null
@@ -49,8 +47,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`invalid BRIDGE_PORT: ${env.BRIDGE_PORT}`)
   }
 
-  // The safety gate. Non-loopback bind without a bearer is a misconfiguration
-  // you cannot set by accident.
   if (!LOOPBACK.has(host) && !bearer) {
     throw new Error(
       `BRIDGE_HOST is ${host} (not loopback) but BRIDGE_BEARER is not set. ` +
@@ -68,7 +64,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     backends,
     claudeBin: env.CLAUDE_BIN ?? 'claude',
     claudeTimeoutMs: Number.parseInt(env.CLAUDE_TIMEOUT_MS ?? '300000', 10),
-    claudeAnthropicBaseUrl: env.CLAUDE_ANTHROPIC_BASE_URL?.trim() || null,
+    claudishUrl: env.CLAUDISH_URL?.trim() || null,
     openaiApiKey: env.OPENAI_API_KEY?.trim() || null,
     anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || null,
     moonshotApiKey: env.MOONSHOT_API_KEY?.trim() || null,

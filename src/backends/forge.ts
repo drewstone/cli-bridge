@@ -1,13 +1,9 @@
 /**
  * Forge Code backend — stub.
  *
- * Forge (https://github.com/antinomyhq/forge) is an OSS coding CLI.
- * It talks to providers directly (BYOK) but has nice session + tool
- * plumbing worth wrapping if you want to unify its workflow with the
- * proprietary CLIs on the same cli-bridge endpoint.
- *
- * To implement: `forge` binary on $PATH, invoke non-interactively,
- * capture output stream, translate to ChatDelta.
+ * Model id scheme: `forge/<provider>/<model>` — Forge is OSS,
+ * multi-provider, BYOK. Typical ids: `forge/anthropic/claude-sonnet-4-5`,
+ * `forge/openai/gpt-4o`.
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -18,7 +14,8 @@ export class ForgeBackend implements Backend {
   readonly name = 'forge'
 
   matches(model: string): boolean {
-    return model.toLowerCase().startsWith('forge/')
+    const m = model.toLowerCase()
+    return m === 'forge' || m.startsWith('forge/')
   }
 
   async health(): Promise<BackendHealth> {

@@ -1,6 +1,6 @@
 {
   "name": "cli-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Expose your local coding-CLI subscriptions (Claude Code, Codex, Kimi via opencode, …) as an OpenAI-compatible HTTP API with persistent session resume. Personal tool — single-user by default.",
   "type": "module",
   "license": "MIT",

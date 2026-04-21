@@ -1,13 +1,8 @@
 /**
  * Factory Droid backend — stub.
  *
- * Factory (https://docs.factory.ai/) ships a `droid` CLI — coding
- * agent with parallel droids and session context. Ships as `droid` on
- * the $PATH after install; subscription-backed.
- *
- * To implement: check the droid CLI's headless flags (`droid exec`?),
- * pick a stream format, mirror the Claude backend shape for session
- * resume + streaming.
+ * Model id scheme: `factory/<model>` — Factory's own model selector.
+ * The CLI is `droid`; subscription-backed.
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -19,7 +14,7 @@ export class FactoryBackend implements Backend {
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
-    return m.startsWith('factory/') || m.startsWith('droid/')
+    return m === 'factory' || m.startsWith('factory/')
   }
 
   async health(): Promise<BackendHealth> {

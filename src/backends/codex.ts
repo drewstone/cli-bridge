@@ -1,13 +1,12 @@
 /**
  * Codex CLI backend — stub.
  *
- * OpenAI's Codex CLI has a `codex exec` subcommand with a documented
- * JSON protocol, but session resume + streaming are less stable than
- * Claude Code's. Wire this up when needed.
+ * Model id scheme: `codex/<model>` where `<model>` is Codex's native
+ * model name (default `gpt-5-codex`, or whatever the subscription
+ * surfaces). `codex` alone defaults to the subscription's default.
  *
- * To implement: mirror the shape of claude.ts. `codex exec --session-id
- * <id> --output json` prints NDJSON; translate its `message` and `usage`
- * events to ChatDelta.
+ * To implement: `codex exec --model <model> --session <id>` with the
+ * prompt on stdin, parse its NDJSON event stream to ChatDelta.
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -19,15 +18,11 @@ export class CodexBackend implements Backend {
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
-    return m.startsWith('codex') || m.startsWith('gpt-5-codex')
+    return m === 'codex' || m.startsWith('codex/')
   }
 
   async health(): Promise<BackendHealth> {
-    return {
-      name: this.name,
-      state: 'unavailable',
-      detail: 'codex backend stubbed — see src/backends/codex.ts',
-    }
+    return { name: this.name, state: 'unavailable', detail: 'codex backend stubbed' }
   }
 
   // eslint-disable-next-line require-yield

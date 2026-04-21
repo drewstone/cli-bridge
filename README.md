@@ -2,40 +2,63 @@
 
 **Use your local coding-CLI subscriptions as one OpenAI-compatible HTTP API — with persistent session resume.**
 
-Backends this is built for (implemented or planned):
+Model ids are `<harness>/<model>`. The harness is the agent runtime (Claude Code, Codex, opencode, claudish, …); the model is whatever that runtime can address. One string, both choices explicit.
 
-- [Claude Code](https://github.com/anthropics/claude-code) — ✓ implemented
-- [OpenAI Codex CLI](https://github.com/openai/codex) — stubbed
-- [opencode](https://github.com/sst/opencode) — stubbed
-- [Kimi Code](https://platform.moonshot.ai/) (Kimi For Coding) — stubbed (via `opencode-kimi-full` plugin)
-- [Factory Droid](https://docs.factory.ai/) — planned
-- [Amp](https://ampcode.com/) — planned
-- [Forge Code](https://github.com/antinomyhq/forge) — planned
+Backends this is built for (✓ implemented, ◦ stubbed):
 
-Plus a thin passthrough backend for vendor HTTP APIs (OpenAI, Anthropic, Moonshot, Z.AI) when you want to mix metered traffic alongside subscription-backed traffic on the same endpoint.
+| Harness | Status | What it is |
+|---|---|---|
+| `claude/` | ✓ | [Claude Code](https://github.com/anthropics/claude-code) CLI — your Claude Max / Pro subscription |
+| `claudish/` | ✓ | Claude Code + [claudish](https://github.com/MadAppGang/claudish) — Claude's workflow, a different brain |
+| `codex/` | ◦ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
+| `opencode/` | ◦ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
+| `factory/` | ◦ | [Factory Droid](https://docs.factory.ai/) |
+| `amp/` | ◦ | [Sourcegraph Amp](https://ampcode.com/) |
+| `forge/` | ◦ | [Forge Code](https://github.com/antinomyhq/forge) |
+| `<provider>/` | ✓ | Passthrough: `openai/`, `anthropic/`, `moonshot/`, `zai/` — direct vendor API, not a CLI |
 
 Personal productivity tool. Single-user by default. Loopback-only by default. No ambition to be a shared proxy.
 
 ---
 
-## The idea
+## The idea in two sentences
 
-Every AI lab now ships a CLI: `claude` (Claude Code), `codex`, `opencode`, `kimi-cli`. Each comes with better session economics than their metered API — Claude Code's context compression, opencode's workspace model, Codex's session cache — because you're paying a flat subscription, not per token.
+Every AI lab now ships a CLI, each with its own subscription + better session economics than the metered API. cli-bridge exposes all of them as one OpenAI-compatible endpoint so your tools (editor, aider, tangle-router, a bash script) can switch harnesses with a single string.
 
-`cli-bridge` exposes those CLIs as one OpenAI-compatible endpoint (`POST /v1/chat/completions`). Point any OpenAI client — cursor, aider, a bash script, Tangle's internal dev tools — at `http://127.0.0.1:8787` and it drives the CLI of your choice under the hood. Session resume is tracked in a local SQLite so `X-Session-Id: foo` across calls resumes the same Claude Code conversation.
+## Model id scheme
 
-## Why this exists, plainly
+```
+<harness>/<model>
 
-- **Your own productivity**, anywhere. Submit a task to your dev box from your phone, resume it from your laptop, pipe it into verticalbench, use it for PR reviews. Your subscription, your compute, stays yours.
-- **Stable external session ids**. CLIs rotate internal ids, cli-bridge keeps a mapping so your caller doesn't have to.
-- **One API surface**. Your clients speak OpenAI; under the hood you pick `claude` or `codex` or whatever by model prefix.
+claude/sonnet                        # Claude Code + Anthropic Sonnet
+claude/opus                          # Claude Code + Anthropic Opus
+claude/claude-sonnet-4-5-20250929    # Claude Code + specific version
 
-## Why NOT to use this
+claudish/openrouter@deepseek/deepseek-r1   # Claude Code workflow, DeepSeek brain
+claudish/google@gemini-2.0-flash           # Claude Code workflow, Gemini brain
+claudish/zai@glm-4.6                       # Claude Code workflow, Z.AI brain
 
-- You want to share one subscription across your team / customers / marketplace. **Don't.** Most vendor terms scope these to one seat. Moonshot's Kimi For Coding rejects non-coding-agent callers at the backend by policy, not by bug — build a real pay-per-token API integration instead.
-- You want a full-featured router with cost tracking / fallback chains / budgets. Use LiteLLM, OpenRouter, or similar. `cli-bridge` is deliberately small.
+codex/gpt-5-codex                    # Codex CLI, Codex model
+opencode/kimi-for-coding             # opencode + kimi-full plugin (Kimi Code sub)
+opencode/anthropic/claude-sonnet-4-5 # opencode's configured anthropic provider
 
----
+openai/gpt-4o                        # passthrough — OpenAI API, metered
+zai/glm-4.6                          # passthrough — Z.AI API, metered
+```
+
+The registry matches on the `<harness>/` prefix; first-registered-first-match wins. `bridge/claude` (no model) defaults to whatever the harness default is.
+
+## Through tangle-router
+
+When reaching cli-bridge via tangle-router's `/api/chat`, prefix the whole thing with `bridge/`:
+
+```
+bridge/claude/sonnet
+bridge/claudish/openrouter@deepseek/deepseek-r1
+bridge/opencode/kimi-for-coding
+```
+
+The router's short-circuit strips the leading `bridge/` and forwards the `<harness>/<model>` as-is.
 
 ## Install
 
@@ -54,12 +77,11 @@ pnpm start
 
 | Backend | Install | Auth |
 |---|---|---|
-| Claude Code | `npm i -g @anthropic-ai/claude-code` | `claude /login` (OAuth, opens browser) |
-| Codex CLI | `brew install openai/homebrew-tap/codex` | `codex login` |
-| opencode | `brew install sst/tap/opencode` | `opencode login` |
-| Kimi Code | `brew install sst/tap/opencode` + [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin | OAuth device flow via plugin (Kimi For Coding subscription) |
-| Factory / Amp / Forge | tbd — see backend stubs | tbd |
-| Passthrough | (none) | provider API keys in `.env` |
+| `claude` | `npm i -g @anthropic-ai/claude-code` | `claude /login` (OAuth, opens browser) |
+| `claudish` | claude above + run `claudish` locally, point `CLAUDISH_URL` at it | claudish's own provider config |
+| `codex` | `brew install openai/homebrew-tap/codex` | `codex login` |
+| `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
+| `passthrough` | (none) | provider API keys in `.env` |
 
 ## Quick test
 
@@ -68,66 +90,63 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-Session-Id: my-first-session' \
   -d '{
-    "model": "claude-sonnet",
+    "model": "claude/sonnet",
     "messages": [{"role": "user", "content": "say hi in 3 words"}],
     "stream": true
   }'
 ```
 
-Subsequent calls with the same `X-Session-Id` resume the conversation — Claude Code sees the prior context, doesn't re-charge you for replaying it (one of the real wins vs. metered APIs).
+Subsequent calls with the same `X-Session-Id` resume the conversation. Claude Code sees prior context, doesn't re-charge you for replaying it.
 
 ## API
 
 ### `POST /v1/chat/completions`
 
-OpenAI Chat Completions, streaming by default. Supports:
-- `model` — picks backend by prefix (`claude*` → Claude Code, `gpt*`/`o1*` → OpenAI passthrough, `kimi*` → Moonshot passthrough, `glm*` → Z.AI passthrough)
-- `messages` — standard chat array
-- `stream` — default true; `false` returns a single JSON response
-- `session_id` (body) or `X-Session-Id` (header) — stable id you control
+OpenAI Chat Completions. Model id routes via harness prefix. Supports streaming (default) or `stream: false`. Session resume via `session_id` body field or `X-Session-Id` header.
 
 ### `GET /v1/models`
 
-Lists model ids each backend claims.
+Lists model ids each ready backend claims, with which harness serves them.
 
 ### `GET /health`
 
-JSON report of each backend's probe state — useful as liveness + "which CLIs are ready on this host?"
+JSON report per backend — ready / unavailable / error with detail.
 
 ### `GET /v1/sessions` · `DELETE /v1/sessions/:id`
 
-Inspect / clear session mappings. Useful when a CLI rewrites its session format and old internal ids no longer resolve.
+Inspect / clear external-to-internal session mappings.
 
-## Claude Code with a different brain
+## Claudish setup
 
-Claude Code is the best agent workflow shell. If you want that workflow but with a Z.AI / OpenRouter / Gemini model driving the responses, chain it with [`claudish`](https://github.com/MadAppGang/claudish) — a local Anthropic-format proxy that translates to other providers.
-
-Run claudish on a port, then point cli-bridge's Claude subprocess at it:
+Claudish is a separate tool (Hono-based Anthropic proxy). Run it locally:
 
 ```bash
-# .env
-CLAUDE_ANTHROPIC_BASE_URL=http://127.0.0.1:3456  # claudish instance
+brew install claudish   # or install-from-source per its repo
+claudish --port 3456
+# then in cli-bridge .env:
+CLAUDISH_URL=http://127.0.0.1:3456
+BRIDGE_BACKENDS=claude,claudish,passthrough
 ```
 
-cli-bridge's Claude backend will spawn `claude` with `ANTHROPIC_BASE_URL=…` and the agent talks to your preferred backend model.
+Now every `claudish/<model>` call spawns Claude Code with `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` — Claude Code's workflow, whatever-you-configured's brain.
 
 ## Use with Tangle products
 
-**VerticalBench** — replace `claude -p` subprocess calls in `blueprint-agent/scripts/experiments/lib/meta-reviewer.ts` with an HTTP call to cli-bridge, using a stable `session_id` per leaf. The driver agent's enrichment loop now has durable session state across runs.
+**VerticalBench** — swap `claude -p` subprocess calls for HTTP to cli-bridge with `X-Session-Id: leaf-<id>`. Durable session state across runs, no re-billing replays.
 
-**Agent Builder (Forge, dev mode)** — set `BYOK_CLI_ENDPOINT=http://host.docker.internal:8787` in agent-builder's dev `.dev.vars`. Forge talks to your subscribed Claude Code locally instead of charging against platform credits during development. (Never ship this to production — the router is the right path for paying customer traffic.)
+**Agent Builder dev** — `BYOK_CLI_ENDPOINT=http://host.docker.internal:8787` in `.dev.vars`. Forge drives your Claude Code subscription locally during development. Never ship that to production.
 
-**PR reviews & automations** — any bash cron / GitHub Action / Coolify job can hit `POST /v1/chat/completions` against the remote cli-bridge and drive your subscription. Pair with `X-Session-Id: pr-review-#{pr_id}` so follow-up comments land on the same Claude Code context.
+**PR reviews & automations** — any bash cron / GitHub Action can hit `POST /v1/chat/completions` with a stable `X-Session-Id`.
 
 ## Deploy
 
-See `deploy/README.md` for the Hetzner box setup (Docker or systemd). Remote deploy requires `BRIDGE_BEARER` — cli-bridge refuses to bind non-loopback without one.
+See `deploy/README.md` for Hetzner box (Docker or systemd). Remote deploy requires `BRIDGE_BEARER` — cli-bridge refuses to bind non-loopback without one.
 
 ## Design notes
 
-- **Backends are independent.** Each is a class implementing `Backend`. Add a new one in `src/backends/*.ts`, register it in `src/server.ts`. See `codex.ts` / `opencode.ts` for stubs.
-- **SSE framing is standard.** OpenAI's `chat.completion.chunk` shape. Tested against cursor, aider, Tangle's router — no client-side adapters needed.
-- **Single-user assumption is deliberate.** No per-call user auth beyond the optional bearer. Not a multi-tenant server.
+- **Explicit in the model id, not the env.** The `<harness>/<model>` scheme means "what you type is what runs." No mode toggles that change behavior under the same id.
+- **Harnesses are independent.** Each is a class implementing `Backend`; add a new one in `src/backends/*.ts`, register it in `src/server.ts`.
+- **Single-user assumption is deliberate.** No per-call user auth beyond the optional bearer.
 
 ## License
 

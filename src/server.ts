@@ -12,6 +12,7 @@ import { loadConfig, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { BackendRegistry } from './backends/registry.js'
 import { ClaudeBackend } from './backends/claude.js'
+import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
 import { OpencodeBackend } from './backends/opencode.js'
 import { FactoryBackend } from './backends/factory.js'
@@ -27,24 +28,31 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
   const sessions = new SessionStore(config.dataDir)
   const registry = new BackendRegistry()
 
+  // Register order matters — first match wins. Harness-specific backends
+  // come first so a `claude/sonnet` doesn't get claimed by a passthrough
+  // that happens to know a provider-prefixed `claude/*`.
   if (config.backends.has('claude')) {
-    registry.register(new ClaudeBackend(config.claudeBin, config.claudeTimeoutMs, config.claudeAnthropicBaseUrl))
+    registry.register(new ClaudeBackend({
+      bin: config.claudeBin,
+      timeoutMs: config.claudeTimeoutMs,
+      harness: 'claude',
+    }))
   }
-  if (config.backends.has('codex')) {
-    registry.register(new CodexBackend())
+  if (config.backends.has('claudish')) {
+    if (!config.claudishUrl) {
+      throw new Error('claudish backend enabled but CLAUDISH_URL is not set')
+    }
+    registry.register(new ClaudishBackend({
+      bin: config.claudeBin,
+      timeoutMs: config.claudeTimeoutMs,
+      claudishUrl: config.claudishUrl,
+    }))
   }
-  if (config.backends.has('opencode')) {
-    registry.register(new OpencodeBackend())
-  }
-  if (config.backends.has('factory')) {
-    registry.register(new FactoryBackend())
-  }
-  if (config.backends.has('amp')) {
-    registry.register(new AmpBackend())
-  }
-  if (config.backends.has('forge')) {
-    registry.register(new ForgeBackend())
-  }
+  if (config.backends.has('codex')) registry.register(new CodexBackend())
+  if (config.backends.has('opencode')) registry.register(new OpencodeBackend())
+  if (config.backends.has('factory')) registry.register(new FactoryBackend())
+  if (config.backends.has('amp')) registry.register(new AmpBackend())
+  if (config.backends.has('forge')) registry.register(new ForgeBackend())
   if (config.backends.has('passthrough')) {
     registry.register(new PassthroughBackend({
       openaiApiKey: config.openaiApiKey,
@@ -56,12 +64,9 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
 
   const app = new Hono()
 
-  // Bearer guard — only active when BRIDGE_BEARER is set. Loopback users
-  // can skip this; remote deploys cannot (config.ts refuses to load
-  // without a bearer when host is non-loopback).
+  // Bearer guard — only active when BRIDGE_BEARER is set.
   if (config.bearer) {
     app.use('*', async (c, next) => {
-      // Health is intentionally open — liveness probes don't need auth
       if (c.req.path === '/health') return next()
       const header = c.req.header('authorization') ?? ''
       const tok = header.startsWith('Bearer ') ? header.slice(7) : ''
@@ -79,7 +84,8 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
 
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
-    version: '0.1.0',
+    version: '0.2.0',
+    scheme: 'bridge/<harness>/<model>',
     backends: registry.all().map(b => b.name),
     endpoints: ['/health', '/v1/models', '/v1/chat/completions', '/v1/sessions'],
   }))
@@ -94,7 +100,6 @@ function constantTimeEqual(a: string, b: string): boolean {
   return acc === 0
 }
 
-// Entry point
 if (import.meta.url === `file://${process.argv[1]}`) {
   const config = loadConfig()
   const { app, sessions } = buildApp(config)

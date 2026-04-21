@@ -1,12 +1,8 @@
 /**
  * Sourcegraph Amp backend — stub.
  *
- * Amp is Sourcegraph's coding CLI (https://ampcode.com/). Ships as
- * `amp` on the $PATH after install. Has its own session + context
- * tracking; subscription-backed like Claude Code and Kimi Code.
- *
- * To implement: check `amp exec` or `amp run` for headless mode,
- * pick a stream format, mirror the Claude backend shape.
+ * Model id scheme: `amp/<model>` — Amp's own model selector. Amp is
+ * subscription-backed; one seat per account.
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -18,7 +14,7 @@ export class AmpBackend implements Backend {
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
-    return m.startsWith('amp/') || m.startsWith('sourcegraph/')
+    return m === 'amp' || m.startsWith('amp/')
   }
 
   async health(): Promise<BackendHealth> {

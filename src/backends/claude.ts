@@ -2,35 +2,24 @@
  * Claude Code backend — spawns `claude -p` with stream-json I/O and
  * translates the stream to OpenAI-shaped chat deltas.
  *
+ * Model id scheme: `claude/<model>` where `<model>` is passed to
+ * `claude --model <model>`. Claude Code accepts the short aliases
+ * (`sonnet`, `opus`, `haiku`) and the fully-qualified Anthropic
+ * version ids. A bare `claude` with no model defaults to sonnet.
+ *
  * Session resume:
- *   - The external `session_id` maps via SessionStore to Claude's
- *     internal conversation uuid (stored at session creation).
+ *   - External `session_id` maps (via SessionStore) to Claude's
+ *     internal conversation uuid captured from the `system:init` event.
  *   - When we have an internal id, we pass `--resume <id>` so Claude
- *     loads the prior transcript and context.
- *   - First call (no prior internal id): let Claude assign one. We
- *     capture it from the `system:init` event in the stream and persist.
+ *     loads prior transcript + context.
  *
- * Message shaping:
- *   - We concatenate non-last user/system messages into the prompt
- *     (claude -p takes a single prompt string). For multi-turn, callers
- *     should reuse the session id so Claude's own context tracking
- *     handles history — not flatten-to-prompt every time.
- *   - If the caller floods messages[] instead of resuming, we fall back
- *     to flattening; it still works, just less efficient.
- *
- * Auth:
- *   - `claude` CLI is auth'd on the host via its own `claude login`
- *     (OAuth flow). We never touch that flow.
- *
- * Failure modes we handle:
- *   - CLI not installed → BackendError('cli_missing') at health() time
- *   - Subprocess exits non-zero → BackendError('upstream') with stderr snippet
- *   - Timeout → kill the subprocess, yield finish_reason='timeout'
- *   - Abort signal → kill subprocess, stop yielding
- *   - Malformed JSON line → log + skip (don't kill the whole turn on one bad line)
+ * Why a claude SEPARATE harness and not unified with claudish: Claude
+ * Code with its native Anthropic endpoint has different guarantees than
+ * Claude Code bent toward a third-party brain. Keeping them on separate
+ * model-id prefixes makes the choice explicit at call time.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
@@ -66,18 +55,38 @@ interface ClaudeStreamResult {
 }
 type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamResult | { type: string }
 
+export interface ClaudeBackendOptions {
+  bin: string
+  timeoutMs: number
+  /** Harness name that claims the <harness>/* prefix. Default 'claude'. */
+  harness?: string
+  /**
+   * If set, the Claude Code subprocess is spawned with
+   * ANTHROPIC_BASE_URL=<this value>. Used by the `claudish` harness to
+   * aim Claude Code at a local claudish proxy so the workflow runs over
+   * a different model backend.
+   */
+  anthropicBaseUrl?: string | null
+}
+
 export class ClaudeBackend implements Backend {
-  readonly name = 'claude'
-  constructor(
-    private readonly bin: string,
-    private readonly timeoutMs: number,
-    /** Optional ANTHROPIC_BASE_URL for the subprocess (claudish etc.) */
-    private readonly anthropicBaseUrl: string | null = null,
-  ) {}
+  readonly name: string
+  private readonly bin: string
+  private readonly timeoutMs: number
+  private readonly anthropicBaseUrl: string | null
+  private readonly prefix: string
+
+  constructor(opts: ClaudeBackendOptions) {
+    this.name = opts.harness ?? 'claude'
+    this.bin = opts.bin
+    this.timeoutMs = opts.timeoutMs
+    this.anthropicBaseUrl = opts.anthropicBaseUrl ?? null
+    this.prefix = `${this.name}/`
+  }
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
-    return m.startsWith('claude') || m === 'sonnet' || m === 'opus' || m === 'haiku'
+    return m === this.name || m.startsWith(this.prefix)
   }
 
   async health(): Promise<BackendHealth> {
@@ -92,7 +101,12 @@ export class ClaudeBackend implements Backend {
       })
       child.on('close', (code) => {
         if (code === 0) {
-          resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
+          resolve({
+            name: this.name,
+            state: 'ready',
+            version: stdout.trim() || undefined,
+            detail: this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined,
+          })
         } else {
           resolve({
             name: this.name,
@@ -115,8 +129,10 @@ export class ClaudeBackend implements Backend {
     if (session?.internalId) {
       args.push('--resume', session.internalId)
     }
-    if (req.model && req.model !== 'claude') {
-      args.push('--model', this.normalizeModel(req.model))
+
+    const modelArg = this.extractModel(req.model)
+    if (modelArg) {
+      args.push('--model', modelArg)
     }
 
     const childEnv: NodeJS.ProcessEnv = { ...process.env }
@@ -149,7 +165,6 @@ export class ClaudeBackend implements Backend {
         try {
           msg = JSON.parse(line) as ClaudeStreamLine
         } catch {
-          // Tolerate malformed lines — don't kill the turn on one bad line.
           continue
         }
 
@@ -181,10 +196,7 @@ export class ClaudeBackend implements Backend {
         if (msg.type === 'result') {
           const r = msg as ClaudeStreamResult
           if (r.is_error) {
-            yield {
-              finish_reason: 'error',
-              internal_session_id: internalSessionId,
-            }
+            yield { finish_reason: 'error', internal_session_id: internalSessionId }
           } else {
             yield {
               finish_reason: 'stop',
@@ -196,7 +208,6 @@ export class ClaudeBackend implements Backend {
         }
       }
 
-      // Stream ended without a `result` event — treat as abnormal close.
       const exitCode: number | null = await new Promise((resolve) => {
         if (child.exitCode !== null) resolve(child.exitCode)
         else child.once('close', (code) => resolve(code))
@@ -223,24 +234,21 @@ export class ClaudeBackend implements Backend {
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
-    // Claude Code's -p flag takes a single prompt. For a conversation,
-    // the CORRECT path is session resume (so Claude tracks history
-    // itself). If the caller sends a flat messages[] array without a
-    // session id, we concat with role headers as a best-effort fallback.
     if (messages.length === 1) return messages[0]?.content ?? ''
     return messages.map((m) => `[${m.role}] ${m.content}`).join('\n\n')
   }
 
-  private normalizeModel(model: string): string {
-    // Map common aliases to the model names Claude Code accepts.
-    const m = model.toLowerCase()
-    if (m === 'claude' || m === 'claude-sonnet' || m === 'sonnet') return 'sonnet'
-    if (m === 'claude-opus' || m === 'opus') return 'opus'
-    if (m === 'claude-haiku' || m === 'haiku') return 'haiku'
-    // Pass through anything Anthropic-flavored; Claude Code accepts its own full ids.
-    return model
+  /**
+   * Parse `claude/sonnet` → `sonnet`, `claude` (bare) → null (default
+   * model). Claude Code accepts short aliases and full version ids; we
+   * pass whatever the caller wrote through unchanged.
+   */
+  private extractModel(fullModel: string): string | null {
+    if (fullModel.toLowerCase() === this.name) return null
+    if (fullModel.startsWith(this.prefix)) {
+      const rest = fullModel.slice(this.prefix.length)
+      return rest.length > 0 ? rest : null
+    }
+    return null
   }
 }
-
-// Keeping the unused type imports alive for readers.
-type _Keep = ChildProcessWithoutNullStreams
