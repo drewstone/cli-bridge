@@ -14,6 +14,9 @@ import { BackendRegistry } from './backends/registry.js'
 import { ClaudeBackend } from './backends/claude.js'
 import { CodexBackend } from './backends/codex.js'
 import { OpencodeBackend } from './backends/opencode.js'
+import { FactoryBackend } from './backends/factory.js'
+import { AmpBackend } from './backends/amp.js'
+import { ForgeBackend } from './backends/forge.js'
 import { PassthroughBackend } from './backends/passthrough.js'
 import { mountChatCompletions } from './routes/chat-completions.js'
 import { mountHealth } from './routes/health.js'
@@ -32,6 +35,15 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
   }
   if (config.backends.has('opencode')) {
     registry.register(new OpencodeBackend())
+  }
+  if (config.backends.has('factory')) {
+    registry.register(new FactoryBackend())
+  }
+  if (config.backends.has('amp')) {
+    registry.register(new AmpBackend())
+  }
+  if (config.backends.has('forge')) {
+    registry.register(new ForgeBackend())
   }
   if (config.backends.has('passthrough')) {
     registry.register(new PassthroughBackend({

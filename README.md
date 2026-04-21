@@ -1,6 +1,18 @@
 # cli-bridge
 
-**Use your local coding-CLI subscriptions (Claude Code, Codex, Kimi via opencode, Z.AI, …) as an OpenAI-compatible HTTP API — with persistent session resume.**
+**Use your local coding-CLI subscriptions as one OpenAI-compatible HTTP API — with persistent session resume.**
+
+Backends this is built for (implemented or planned):
+
+- [Claude Code](https://github.com/anthropics/claude-code) — ✓ implemented
+- [OpenAI Codex CLI](https://github.com/openai/codex) — stubbed
+- [opencode](https://github.com/sst/opencode) — stubbed
+- [Kimi Code](https://platform.moonshot.ai/) (Kimi For Coding) — stubbed (via `opencode-kimi-full` plugin)
+- [Factory Droid](https://docs.factory.ai/) — planned
+- [Amp](https://ampcode.com/) — planned
+- [Forge Code](https://github.com/antinomyhq/forge) — planned
+
+Plus a thin passthrough backend for vendor HTTP APIs (OpenAI, Anthropic, Moonshot, Z.AI) when you want to mix metered traffic alongside subscription-backed traffic on the same endpoint.
 
 Personal productivity tool. Single-user by default. Loopback-only by default. No ambition to be a shared proxy.
 
@@ -43,8 +55,10 @@ pnpm start
 | Backend | Install | Auth |
 |---|---|---|
 | Claude Code | `npm i -g @anthropic-ai/claude-code` | `claude /login` (OAuth, opens browser) |
-| Codex | `brew install openai/homebrew-tap/codex` | `codex login` |
-| opencode | `brew install sst/tap/opencode` | `opencode login` (for Kimi: install `opencode-kimi-full` plugin) |
+| Codex CLI | `brew install openai/homebrew-tap/codex` | `codex login` |
+| opencode | `brew install sst/tap/opencode` | `opencode login` |
+| Kimi Code | `brew install sst/tap/opencode` + [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin | OAuth device flow via plugin (Kimi For Coding subscription) |
+| Factory / Amp / Forge | tbd — see backend stubs | tbd |
 | Passthrough | (none) | provider API keys in `.env` |
 
 ## Quick test
