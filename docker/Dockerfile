@@ -11,7 +11,8 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 # App deps + build
 COPY package.json pnpm-lock.yaml* ./
 RUN corepack enable && corepack prepare pnpm@10 --activate \
-  && pnpm install --frozen-lockfile --prod=false
+  && pnpm install --frozen-lockfile --prod=false \
+  && pnpm rebuild better-sqlite3
 COPY . .
 RUN pnpm typecheck
 
