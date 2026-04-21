@@ -1,0 +1,39 @@
+# Run cli-bridge as a local service. Mounts your host's ~/.claude into
+# the container so the Claude backend inherits your OAuth without a
+# second login ceremony.
+#
+# Before first run:
+#   1. `claude /login` on the host (NOT in the container)
+#   2. cp .env.example .env and set BRIDGE_BEARER if binding non-loopback
+#   3. docker compose -f docker/compose.yml up --build
+#
+# Remote deploy (Hetzner, etc.):
+#   Same setup, but bind on 127.0.0.1 and front with Caddy/nginx that
+#   terminates TLS and adds an Authorization: Bearer header. Never
+#   expose cli-bridge to the public internet on port 8787 directly.
+
+services:
+  cli-bridge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: cli-bridge
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ./data:/data
+      - ~/.claude:/root/.claude
+      - ~/.codex:/root/.codex
+      - ~/.config/opencode:/root/.config/opencode
+    ports:
+      # Loopback-only by default. Change to "0.0.0.0:8787:8787" (with a
+      # bearer!) if you need remote access, or better, front with a
+      # reverse proxy on the host.
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
