@@ -27,14 +27,17 @@ RUN curl -fsSL https://opencode.ai/install | bash \
   && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
   && chmod +x /usr/local/bin/opencode
 
-# Moonshot's official Kimi CLI — the legit path to Kimi For Coding.
-# Installer default lands the binary under the user's home; we copy it
-# out to /usr/local/bin for the same volume-shadow reason as opencode.
-RUN curl -LsSf https://code.kimi.com/install.sh | bash \
-  && if [ -x /root/.kimi/bin/kimi ]; then cp /root/.kimi/bin/kimi /usr/local/bin/kimi; \
-     elif [ -x /root/.local/bin/kimi ]; then cp /root/.local/bin/kimi /usr/local/bin/kimi; \
-     fi \
-  && chmod +x /usr/local/bin/kimi || true
+# Moonshot's official Kimi CLI — distributed as a uv-installed Python
+# tool (`uv tool install kimi-cli`). The installer drops uv at
+# ~/.local/bin/uv but PATH doesn't pick that up during the RUN shell,
+# so we do it in two steps: install uv explicitly, then run uv tool
+# install with an absolute path. Symlink both into /usr/local/bin so
+# they're on PATH at runtime AND survive the /root/.kimi volume mount
+# (which only covers auth state).
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+  && /root/.local/bin/uv tool install --python 3.13 kimi-cli \
+  && ln -sf /root/.local/bin/kimi /usr/local/bin/kimi \
+  && ln -sf /root/.local/bin/uv /usr/local/bin/uv
 
 # Factory droid, Sourcegraph amp, Forge left out by default — install
 # manually on hosts that need them. They change rapidly.
