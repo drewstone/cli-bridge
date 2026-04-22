@@ -48,11 +48,21 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
       claudishUrl: config.claudishUrl,
     }))
   }
-  if (config.backends.has('codex')) registry.register(new CodexBackend())
-  if (config.backends.has('opencode')) registry.register(new OpencodeBackend())
-  if (config.backends.has('factory')) registry.register(new FactoryBackend())
-  if (config.backends.has('amp')) registry.register(new AmpBackend())
-  if (config.backends.has('forge')) registry.register(new ForgeBackend())
+  if (config.backends.has('codex')) {
+    registry.register(new CodexBackend({ bin: config.codexBin, timeoutMs: config.codexTimeoutMs }))
+  }
+  if (config.backends.has('opencode')) {
+    registry.register(new OpencodeBackend({ bin: config.opencodeBin, timeoutMs: config.opencodeTimeoutMs }))
+  }
+  if (config.backends.has('factory')) {
+    registry.register(new FactoryBackend({ bin: config.factoryBin, timeoutMs: config.cliTimeoutMsDefault }))
+  }
+  if (config.backends.has('amp')) {
+    registry.register(new AmpBackend({ bin: config.ampBin, timeoutMs: config.cliTimeoutMsDefault }))
+  }
+  if (config.backends.has('forge')) {
+    registry.register(new ForgeBackend({ bin: config.forgeBin, timeoutMs: config.cliTimeoutMsDefault }))
+  }
   if (config.backends.has('passthrough')) {
     registry.register(new PassthroughBackend({
       openaiApiKey: config.openaiApiKey,

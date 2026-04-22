@@ -17,10 +17,17 @@ export interface Config {
   backends: Set<string>
   claudeBin: string
   claudeTimeoutMs: number
+  codexBin: string
+  codexTimeoutMs: number
+  opencodeBin: string
+  opencodeTimeoutMs: number
+  factoryBin: string
+  ampBin: string
+  forgeBin: string
+  cliTimeoutMsDefault: number
   /**
    * When set, the `claudish` harness is registered and Claude Code is
    * spawned with ANTHROPIC_BASE_URL=<this> for `claudish/*` model ids.
-   * Points at a local claudish proxy (https://github.com/MadAppGang/claudish).
    */
   claudishUrl: string | null
   openaiApiKey: string | null
@@ -56,6 +63,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     )
   }
 
+  const defaultTimeout = Number.parseInt(env.CLI_TIMEOUT_MS ?? '300000', 10)
+
   return {
     host,
     port,
@@ -63,7 +72,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir,
     backends,
     claudeBin: env.CLAUDE_BIN ?? 'claude',
-    claudeTimeoutMs: Number.parseInt(env.CLAUDE_TIMEOUT_MS ?? '300000', 10),
+    claudeTimeoutMs: Number.parseInt(env.CLAUDE_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    codexBin: env.CODEX_BIN ?? 'codex',
+    codexTimeoutMs: Number.parseInt(env.CODEX_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    opencodeBin: env.OPENCODE_BIN ?? 'opencode',
+    opencodeTimeoutMs: Number.parseInt(env.OPENCODE_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
+    ampBin: env.AMP_BIN ?? 'amp',
+    forgeBin: env.FORGE_BIN ?? 'forge',
+    cliTimeoutMsDefault: defaultTimeout,
     claudishUrl: env.CLAUDISH_URL?.trim() || null,
     openaiApiKey: env.OPENAI_API_KEY?.trim() || null,
     anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || null,

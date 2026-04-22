@@ -27,6 +27,7 @@ const chatRequestSchema = z.object({
   temperature: z.number().optional(),
   max_tokens: z.number().optional(),
   session_id: z.string().optional(),
+  resume_id: z.string().optional(), // alias for session_id
   metadata: z.record(z.unknown()).optional(),
 })
 
@@ -53,9 +54,24 @@ export function mountChatCompletions(
       }, 400)
     }
 
+    // Session id resolution — accept several aliases so clients with
+    // different conventions all work:
+    //   body.session_id                (canonical)
+    //   body.resume_id                 (alias)
+    //   header X-Session-Id            (canonical)
+    //   header X-Resume                (alias — ergonomic single-word form)
+    //   header X-Conversation-Id       (alias — matches OpenAI Assistants vocab)
+    const headerSession =
+      c.req.header('x-session-id')
+      ?? c.req.header('x-resume')
+      ?? c.req.header('x-conversation-id')
+      ?? undefined
+    const bodySession = parsed.data.session_id
+      ?? (parsed.data as Record<string, unknown>).resume_id as string | undefined
+
     const req: ChatRequest = {
       ...parsed.data,
-      session_id: parsed.data.session_id ?? c.req.header('x-session-id') ?? undefined,
+      session_id: bodySession ?? headerSession,
     }
 
     const backend = deps.registry.resolve(req.model)
