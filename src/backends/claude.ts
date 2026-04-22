@@ -23,6 +23,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
+import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 
 interface ClaudeStreamInit {
@@ -123,8 +124,33 @@ export class ClaudeBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    const mode: BridgeMode = req.mode ?? 'byob'
+
+    // hosted-sandboxed requires the sandbox launcher which is a separate
+    // code path (src/sandbox.ts, not yet landed). Fail loud until that's
+    // wired up so we never quietly run untrusted prompts on the bare VM.
+    if (mode === 'hosted-sandboxed') {
+      throw new ModeNotSupportedError(
+        this.name,
+        mode,
+        'sandbox launcher not yet wired — use byob or hosted-safe',
+      )
+    }
+
     const prompt = this.flattenPrompt(req.messages)
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
+
+    // hosted-safe: force Claude Code into plan mode and hard-disable
+    // every tool that can touch the FS or shell. `plan` mode alone
+    // already bans Write/Edit/Bash/NotebookEdit, but we also pass the
+    // full disallowed list so a future upstream flag rename doesn't
+    // silently re-enable them.
+    if (mode === 'hosted-safe') {
+      args.push(
+        '--permission-mode', 'plan',
+        '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
+      )
+    }
 
     if (session?.internalId) {
       args.push('--resume', session.internalId)

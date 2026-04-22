@@ -13,6 +13,7 @@ import type { BackendRegistry } from '../backends/registry.js'
 import type { SessionStore } from '../sessions/store.js'
 import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
+import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, makeChunkMeta } from '../streaming/sse.js'
 
 const chatRequestSchema = z.object({
@@ -28,6 +29,7 @@ const chatRequestSchema = z.object({
   max_tokens: z.number().optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
+  mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
   metadata: z.record(z.unknown()).optional(),
 })
 
@@ -69,9 +71,26 @@ export function mountChatCompletions(
     const bodySession = parsed.data.session_id
       ?? (parsed.data as Record<string, unknown>).resume_id as string | undefined
 
+    let mode
+    try {
+      mode = parseMode({
+        body: parsed.data.mode,
+        bridgeModeHeader: c.req.header('x-bridge-mode'),
+        sandboxHeader: c.req.header('x-sandbox'),
+      })
+    } catch (err) {
+      return c.json({
+        error: {
+          message: err instanceof Error ? err.message : String(err),
+          type: 'invalid_request_error',
+        },
+      }, 400)
+    }
+
     const req: ChatRequest = {
       ...parsed.data,
       session_id: bodySession ?? headerSession,
+      mode,
     }
 
     const backend = deps.registry.resolve(req.model)
@@ -95,6 +114,9 @@ export function mountChatCompletions(
 
     // Persist internal session id as it flows in. Returns a new
     // AsyncIterable<ChatDelta> so the typed boundary stays clean.
+    // Mode errors and BackendError('not_configured') re-throw so the
+    // outer handler can return a real HTTP status — everything else
+    // terminates the stream with finish_reason='error'.
     const wrapped: AsyncIterable<ChatDelta> = {
       [Symbol.asyncIterator]: async function* () {
         try {
@@ -110,14 +132,20 @@ export function mountChatCompletions(
             yield delta
           }
         } catch (err) {
-          // Surface backend errors as a terminal finish_reason='error'
-          // rather than throwing — keeps the SSE stream well-formed.
+          if (
+            err instanceof ModeNotSupportedError
+            || (err instanceof BackendError && err.code === 'not_configured')
+          ) {
+            throw err
+          }
           yield { finish_reason: 'error' } satisfies ChatDelta
-          // Preserve the cause for observability: annotate once then end.
           console.error(`[cli-bridge] backend ${backend.name} failed:`, err)
         }
       },
     }
+
+    // Surface mode in response headers so clients can confirm what actually ran.
+    c.header('X-Bridge-Mode', req.mode ?? 'byob')
 
     if (req.stream === false) {
       try {
@@ -139,9 +167,14 @@ export function mountChatCompletions(
           await stream.writeSSE({ data: payload })
         }
       } catch (err) {
+        const type = err instanceof ModeNotSupportedError
+          ? 'mode_not_supported'
+          : err instanceof BackendError
+            ? err.code
+            : 'server_error'
         const message = err instanceof Error ? err.message : String(err)
         await stream.writeSSE({
-          data: JSON.stringify({ error: { message, type: 'server_error' } }),
+          data: JSON.stringify({ error: { message, type } }),
         })
       }
       await stream.writeSSE({ data: '[DONE]' })
@@ -150,6 +183,9 @@ export function mountChatCompletions(
 }
 
 function errorResponse(c: Context, err: unknown): Response {
+  if (err instanceof ModeNotSupportedError) {
+    return c.json({ error: { message: err.message, type: 'mode_not_supported' } }, 501)
+  }
   if (err instanceof BackendError) {
     // Hono's typed status gate treats 499 as an unofficial code; collapse
     // that one to 504 and keep the rest as documented codes.

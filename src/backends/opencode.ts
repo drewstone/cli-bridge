@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
+import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 
 export interface OpencodeBackendOptions {
@@ -61,6 +62,9 @@ export class OpencodeBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
+      'opencode hosted-safe requires a verified per-provider tool-disable flag path')
+
     const prompt = this.flattenPrompt(req.messages)
     const model = this.extractModel(req.model)
 

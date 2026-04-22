@@ -15,6 +15,7 @@
  */
 
 import type { SessionRecord } from '../sessions/store.js'
+import type { BridgeMode } from '../modes.js'
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -31,6 +32,14 @@ export interface ChatRequest {
   max_tokens?: number
   /** External stable session id. If unset, the backend starts fresh. */
   session_id?: string
+  /**
+   * Execution mode. If unset, the backend picks its default (byob). In
+   * `hosted-safe` mode the backend MUST disable every tool that can
+   * touch the FS or shell. A backend that cannot enforce hosted-safe
+   * for its underlying CLI MUST throw BackendError('not_configured')
+   * rather than quietly run with tools enabled.
+   */
+  mode?: BridgeMode
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
 }

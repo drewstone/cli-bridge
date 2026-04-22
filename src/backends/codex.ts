@@ -29,6 +29,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
+import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 
 export interface CodexBackendOptions {
@@ -69,6 +70,12 @@ export class CodexBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    // Codex has `--sandbox` flags but we haven't verified end-to-end that
+    // every FS/shell tool is gated under read-only. Reject hosted-safe
+    // until that audit lands — never fake safety.
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
+      'codex hosted-safe requires verified --sandbox read-only audit')
+
     const prompt = this.flattenPrompt(req.messages)
     const modelArg = this.extractModel(req.model)
 
