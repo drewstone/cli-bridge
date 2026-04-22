@@ -21,6 +21,8 @@ export interface Config {
   codexTimeoutMs: number
   opencodeBin: string
   opencodeTimeoutMs: number
+  kimiBin: string
+  kimiTimeoutMs: number
   factoryBin: string
   ampBin: string
   forgeBin: string
@@ -77,6 +79,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     codexTimeoutMs: Number.parseInt(env.CODEX_TIMEOUT_MS ?? String(defaultTimeout), 10),
     opencodeBin: env.OPENCODE_BIN ?? 'opencode',
     opencodeTimeoutMs: Number.parseInt(env.OPENCODE_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    kimiBin: env.KIMI_BIN ?? 'kimi',
+    kimiTimeoutMs: Number.parseInt(env.KIMI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
     forgeBin: env.FORGE_BIN ?? 'forge',

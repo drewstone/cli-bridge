@@ -15,6 +15,7 @@ import { ClaudeBackend } from './backends/claude.js'
 import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
 import { OpencodeBackend } from './backends/opencode.js'
+import { KimiBackend } from './backends/kimi.js'
 import { FactoryBackend } from './backends/factory.js'
 import { AmpBackend } from './backends/amp.js'
 import { ForgeBackend } from './backends/forge.js'
@@ -53,6 +54,9 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
   }
   if (config.backends.has('opencode')) {
     registry.register(new OpencodeBackend({ bin: config.opencodeBin, timeoutMs: config.opencodeTimeoutMs }))
+  }
+  if (config.backends.has('kimi')) {
+    registry.register(new KimiBackend({ bin: config.kimiBin, timeoutMs: config.kimiTimeoutMs }))
   }
   if (config.backends.has('factory')) {
     registry.register(new FactoryBackend({ bin: config.factoryBin, timeoutMs: config.cliTimeoutMsDefault }))
