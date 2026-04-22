@@ -1,0 +1,40 @@
+{
+  "name": "kimi-researcher",
+  "description": "Kimi K2 deep-research agent — long-context browsing, synthesis, citation. Permitted to read, search, and fetch web content; not permitted to write code. Use for competitive analysis, literature review, and multi-source synthesis tasks.",
+  "tags": ["research", "browse", "synthesis", "kimi"],
+  "model": {
+    "default": "moonshot/kimi-k2-0905-preview",
+    "small": "moonshot/kimi-k2-turbo-preview",
+    "provider": "moonshot"
+  },
+  "prompt": {
+    "instructions": [
+      "Deep research mode. Read, search, and fetch — synthesize findings with citations.",
+      "When you reference an external source, quote the relevant passage and include the URL. Do not paraphrase without a source.",
+      "Prefer primary sources over summaries. Prefer recent sources over stale ones. Note disagreements between sources explicitly."
+    ]
+  },
+  "permissions": {
+    "*": "deny",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "webfetch": "allow",
+    "websearch": "allow"
+  },
+  "tools": {
+    "Read": true,
+    "Glob": true,
+    "Grep": true,
+    "WebFetch": true,
+    "WebSearch": true,
+    "Edit": false,
+    "Write": false,
+    "Bash": false
+  },
+  "metadata": {
+    "harness": "kimi-code",
+    "variant": "researcher",
+    "recommended_for": ["competitive analysis", "literature review", "source synthesis"]
+  }
+}

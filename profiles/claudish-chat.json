@@ -1,0 +1,34 @@
+{
+  "name": "claudish-chat",
+  "description": "Claude-flavored conversation routed through an alternative brain (OpenRouter, Gemini, Z.AI, etc). Text-only — no tools, no code. Use for chat completion where you want Claude's conversational shape on top of a non-Anthropic model.",
+  "tags": ["chat", "text-only", "claudish", "multi-brain"],
+  "model": {
+    "default": "openrouter/google/gemini-2.5-flash",
+    "small": "openrouter/google/gemini-2.5-flash-lite",
+    "provider": "openrouter"
+  },
+  "prompt": {
+    "instructions": [
+      "Conversational mode. Reply in plain prose. No tools, no code execution, no file access.",
+      "Match Claude's tendencies for structure and clarity: lead with the answer, then nuance. Avoid filler and preamble."
+    ]
+  },
+  "permissions": {
+    "*": "deny"
+  },
+  "tools": {
+    "Read": false,
+    "Glob": false,
+    "Grep": false,
+    "Edit": false,
+    "Write": false,
+    "Bash": false,
+    "WebFetch": false,
+    "WebSearch": false
+  },
+  "metadata": {
+    "harness": "claudish",
+    "variant": "chat",
+    "recommended_for": ["conversational Q&A", "non-Anthropic model via Claude's UX shape"]
+  }
+}
