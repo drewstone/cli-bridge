@@ -11,6 +11,9 @@ importers:
       '@hono/node-server':
         specifier: ^1.13.0
         version: 1.19.14(hono@4.12.14)
+      '@tangle-network/sandbox':
+        specifier: ^0.0.3
+        version: 0.0.3
       better-sqlite3:
         specifier: ^12.0.0
         version: 12.9.0
@@ -466,6 +469,14 @@ packages:
     resolution: {integrity: sha512-Nd/SgG27WoA9e+/TdK74KnHz852TLa94ovOYySo/yMPuTmpckK/jIF2jSwS3g7ELSKXK13/cVdmg1Z/DaCWKxA==}
     cpu: [x64]
     os: [win32]
+
+  '@tangle-network/sandbox@0.0.3':
+    resolution: {integrity: sha512-GWZVIGrZtg2YpTUP8x0AC9HU6xVu862cv3X0zheijcyCujMnlyFBNerohWPh9U4rS5Linm+/f4RZrYOeQXuaYw==}
+    peerDependencies:
+      viem: ^2.0.0
+    peerDependenciesMeta:
+      viem:
+        optional: true
 
   '@types/better-sqlite3@7.6.13':
     resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
@@ -1074,6 +1085,8 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.60.2':
     optional: true
+
+  '@tangle-network/sandbox@0.0.3': {}
 
   '@types/better-sqlite3@7.6.13':
     dependencies:

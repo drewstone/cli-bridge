@@ -36,6 +36,14 @@ export interface Config {
   anthropicApiKey: string | null
   moonshotApiKey: string | null
   zaiApiKey: string | null
+  /** Tangle sandbox-api base URL (e.g. https://sandbox.tangle.tools). When set + key present, the `sandbox` backend registers. */
+  sandboxApiUrl: string | null
+  /** Bearer for sandbox-api. Required for the sandbox backend. */
+  sandboxApiKey: string | null
+  /** Filesystem dir holding cataloged AgentProfile JSON files (one per profile, filename is the id). */
+  sandboxProfilesDir: string
+  /** Per-task timeout sent to sandbox-api `/batch/run`. Default 5min. */
+  sandboxTimeoutMs: number
 }
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
@@ -93,5 +101,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || null,
     moonshotApiKey: env.MOONSHOT_API_KEY?.trim() || null,
     zaiApiKey: env.ZAI_API_KEY?.trim() || null,
+    sandboxApiUrl: env.SANDBOX_API_URL?.trim() || null,
+    sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
+    sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
+    sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
   }
 }

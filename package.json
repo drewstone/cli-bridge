@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
+    "@tangle-network/sandbox": "^0.0.3",
     "better-sqlite3": "^12.0.0",
     "hono": "^4.9.0",
     "zod": "^3.24.0"
