@@ -70,7 +70,7 @@ cp .env.example .env
 # edit .env to taste
 pnpm verify   # probes each configured backend, reports ready/unavailable
 pnpm start
-# → http://127.0.0.1:8787
+# → http://127.0.0.1:3344  (was 8787; changed to dodge port collisions)
 ```
 
 **Prereqs:** Node 22+. For each backend you want enabled, install + log in on the host:
@@ -86,7 +86,7 @@ pnpm start
 ## Quick test
 
 ```bash
-curl -N http://127.0.0.1:8787/v1/chat/completions \
+curl -N http://127.0.0.1:3344/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-Session-Id: my-first-session' \
   -d '{
@@ -134,7 +134,7 @@ Now every `claudish/<model>` call spawns Claude Code with `ANTHROPIC_BASE_URL=ht
 
 **VerticalBench** — swap `claude -p` subprocess calls for HTTP to cli-bridge with `X-Session-Id: leaf-<id>`. Durable session state across runs, no re-billing replays.
 
-**Agent Builder dev** — `BYOK_CLI_ENDPOINT=http://host.docker.internal:8787` in `.dev.vars`. Forge drives your Claude Code subscription locally during development. Never ship that to production.
+**Agent Builder dev** — `BYOK_CLI_ENDPOINT=http://host.docker.internal:3344` in `.dev.vars`. Forge drives your Claude Code subscription locally during development. Never ship that to production.
 
 **PR reviews & automations** — any bash cron / GitHub Action can hit `POST /v1/chat/completions` with a stable `X-Session-Id`.
 

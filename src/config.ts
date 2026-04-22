@@ -42,7 +42,10 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const host = env.BRIDGE_HOST ?? '127.0.0.1'
-  const port = Number.parseInt(env.BRIDGE_PORT ?? '8787', 10)
+  // 3344 chosen to dodge common dev/services collisions: 8787 was hit
+  // by other Hono dev servers, 4098 collided with the ADC sandbox-api
+  // gateway in the wild. 3344 is unassigned on IANA + low-conflict.
+  const port = Number.parseInt(env.BRIDGE_PORT ?? '3344', 10)
   const bearer = env.BRIDGE_BEARER?.trim() || null
   const dataDir = resolve(env.BRIDGE_DATA_DIR ?? './data')
   const backends = new Set(
