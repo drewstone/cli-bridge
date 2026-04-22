@@ -313,4 +313,93 @@ describe('POST /v1/chat/completions', () => {
     const body = await res2.json() as { choices: Array<{ message: { content: string } }> }
     expect(body.choices[0]?.message.content).toContain('turn=')
   })
+
+  it('accepts OpenAI-shaped response_format: { type: json_object } on the wire', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+        response_format: { type: 'json_object' },
+      }),
+    })
+    expect(res.status).toBe(200)
+  })
+
+  it('rejects response_format with an invalid type', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        response_format: { type: 'bogus' },
+      }),
+    })
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('ClaudeBackend JSON mode (buildArgs)', () => {
+  const b = new ClaudeBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'claude-code' })
+  const baseReq = {
+    model: 'claude-code/sonnet',
+    messages: [{ role: 'user' as const, content: 'summarize' }],
+  }
+
+  it('injects --append-system-prompt with the JSON directive when responseFormat is json_object', () => {
+    const args = b.buildArgs(
+      { ...baseReq, responseFormat: { type: 'json_object' } },
+      null,
+      'byob',
+      'summarize',
+    )
+    const i = args.indexOf('--append-system-prompt')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toContain('single JSON object')
+    expect(args[i + 1]).toContain('No markdown fences')
+  })
+
+  it('does NOT add --append-system-prompt when responseFormat is absent (regression guard)', () => {
+    const args = b.buildArgs(baseReq, null, 'byob', 'summarize')
+    expect(args).not.toContain('--append-system-prompt')
+  })
+
+  it('does NOT add --append-system-prompt when responseFormat is text', () => {
+    const args = b.buildArgs(
+      { ...baseReq, responseFormat: { type: 'text' } },
+      null,
+      'byob',
+      'summarize',
+    )
+    expect(args).not.toContain('--append-system-prompt')
+  })
+})
+
+describe('KimiBackend JSON mode (buildPrompt)', () => {
+  const b = new KimiBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'kimi-code' })
+  const baseReq = {
+    model: 'kimi-code/kimi-for-coding',
+    messages: [{ role: 'user' as const, content: 'summarize this repo' }],
+  }
+
+  it('prepends the JSON directive when responseFormat is json_object', () => {
+    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'json_object' } })
+    expect(prompt).toMatch(/^Respond with ONLY a single JSON object/)
+    expect(prompt).toContain('No markdown fences')
+    expect(prompt).toContain('summarize this repo')
+  })
+
+  it('does NOT prepend the directive when responseFormat is absent (regression guard)', () => {
+    const prompt = b.buildPrompt(baseReq)
+    expect(prompt).not.toContain('single JSON object')
+    expect(prompt).toBe('summarize this repo')
+  })
+
+  it('does NOT prepend the directive when responseFormat is text', () => {
+    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'text' } })
+    expect(prompt).not.toContain('single JSON object')
+  })
 })

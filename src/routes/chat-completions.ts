@@ -4,6 +4,14 @@
  * Accepts the standard OpenAI chat request, plus an optional
  * `X-Session-Id` header (or `session_id` field in the body) for
  * session-resume across turns. If absent, starts a fresh session.
+ *
+ * Non-native JSON mode: callers may pass
+ * `response_format: { type: 'json_object' }` on the wire. CLI harnesses
+ * (claude-code, kimi-code) have no native json-mode flag, so backends
+ * honor the hint prompt-side — they inject a "reply with a single JSON
+ * object, no prose, no fences" directive. Content may still need
+ * markdown-fence stripping by the client; treat fence-stripping as a
+ * belt-and-suspenders fallback.
  */
 
 import type { Context, Hono } from 'hono'
@@ -30,6 +38,11 @@ const chatRequestSchema = z.object({
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
   mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
+  // OpenAI-compatible shape — wire is snake_case, TS is camelCase. We
+  // translate to responseFormat when we build the ChatRequest below.
+  response_format: z.object({
+    type: z.enum(['text', 'json_object']),
+  }).optional(),
   metadata: z.record(z.unknown()).optional(),
 })
 
@@ -94,10 +107,15 @@ export function mountChatCompletions(
     // identity. Header is `X-Tangle-Forwarded-Authorization` and is set
     // by tangle-router on bridge dispatch (sandbox path).
     const forwardedAuthz = c.req.header('x-tangle-forwarded-authorization')
+    // Pull response_format off so it doesn't bleed through the spread
+    // as an unknown extra field — we translate snake_case → camelCase
+    // here to match the ChatRequest type.
+    const { response_format, ...rest } = parsed.data
     const req: ChatRequest = {
-      ...parsed.data,
+      ...rest,
       session_id: bodySession ?? headerSession,
       mode,
+      ...(response_format ? { responseFormat: response_format } : {}),
       metadata: {
         ...(parsed.data.metadata ?? {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
