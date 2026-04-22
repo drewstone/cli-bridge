@@ -102,7 +102,8 @@ describe('ClaudeBackend model parsing', () => {
     expect(b.matches('claude-code/claude-sonnet-4-5-20250929')).toBe(true)
     expect(b.matches('CLAUDE-CODE/OPUS')).toBe(true) // case-insensitive
     expect(b.matches('claudish/sonnet')).toBe(false)
-    expect(b.matches('claude/sonnet')).toBe(false) // old name no longer claimed
+    expect(b.matches('claude/sonnet')).toBe(false) // old prefix no longer claimed
+    expect(b.matches('claude')).toBe(false) // bare old name no longer claimed
     expect(b.matches('gpt-4')).toBe(false)
   })
 })
@@ -114,7 +115,8 @@ describe('KimiBackend model parsing', () => {
     expect(b.matches('kimi-code/kimi-for-coding')).toBe(true)
     expect(b.matches('kimi-code/kimi-k2-0905-preview')).toBe(true)
     expect(b.matches('KIMI-CODE/kimi-for-coding')).toBe(true) // case-insensitive
-    expect(b.matches('kimi/kimi-for-coding')).toBe(false) // old name no longer claimed
+    expect(b.matches('kimi/kimi-for-coding')).toBe(false) // old prefix no longer claimed
+    expect(b.matches('kimi')).toBe(false) // bare old name no longer claimed
     expect(b.matches('claude-code/sonnet')).toBe(false)
   })
 })
