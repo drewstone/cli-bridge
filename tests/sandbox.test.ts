@@ -10,7 +10,10 @@
 import { describe, expect, it } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 import { Hono } from 'hono'
 import type { AgentProfile } from '@tangle-network/sandbox'
 import { SandboxBackend } from '../src/backends/sandbox.js'
@@ -279,6 +282,28 @@ describe('createProfileCatalog', () => {
     const dir = join(tmpdir(), 'cli-bridge-profiles-nonexistent-' + Math.random())
     const catalog = createProfileCatalog(dir)
     expect(catalog.list()).toEqual([])
+  })
+
+  // Ships-by-default: the repo-level `profiles/` directory is the
+  // config default for SANDBOX_PROFILES_DIR, so anything shipped in
+  // that directory becomes addressable as `sandbox/<id>` out of the
+  // box. If `vb-reviewer` stops loading the VerticalBench shot loop
+  // silently falls back to a hard-coded prompt — catch it here.
+  it('ships vb-reviewer in the default profiles/ dir', () => {
+    const dir = join(__dirname, '..', 'profiles')
+    const catalog = createProfileCatalog(dir)
+    const ids = catalog.list().map((e) => e.id)
+    expect(ids).toContain('vb-reviewer')
+
+    const profile = catalog.get('vb-reviewer')
+    expect(profile).not.toBeNull()
+    expect(profile!.name).toBe('vb-reviewer')
+    // Reviewer must be read-only — it analyzes, it does not mutate.
+    expect(profile!.permissions?.Write).toBe('deny')
+    expect(profile!.permissions?.Edit).toBe('deny')
+    expect(profile!.permissions?.Bash).toBe('deny')
+    // Version field is part of the DSPy-RLM optimization contract.
+    expect(typeof profile!.version).toBe('string')
   })
 })
 

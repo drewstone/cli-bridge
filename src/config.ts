@@ -57,7 +57,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const bearer = env.BRIDGE_BEARER?.trim() || null
   const dataDir = resolve(env.BRIDGE_DATA_DIR ?? './data')
   const backends = new Set(
-    (env.BRIDGE_BACKENDS ?? 'claude,passthrough')
+    (env.BRIDGE_BACKENDS ?? 'claude,kimi,sandbox,passthrough')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean),
