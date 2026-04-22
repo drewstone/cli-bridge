@@ -19,9 +19,13 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 # OpenAI Codex
 RUN npm install -g @openai/codex@latest
 
-# opencode (official installer writes to ~/.opencode/bin)
+# opencode (official installer writes to ~/.opencode/bin). Copy the
+# binary to /usr/local/bin so it survives the /root/.opencode volume
+# mount the runtime layers in (the installer's bin dir otherwise
+# gets shadowed by the empty host mount on first boot).
 RUN curl -fsSL https://opencode.ai/install | bash \
-  && ln -s /root/.opencode/bin/opencode /usr/local/bin/opencode
+  && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
+  && chmod +x /usr/local/bin/opencode
 
 # Factory droid, Sourcegraph amp, Forge left out by default — install
 # manually on hosts that need them. They change rapidly.
