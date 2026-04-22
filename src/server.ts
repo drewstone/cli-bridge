@@ -30,8 +30,8 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
   const registry = new BackendRegistry()
 
   // Register order matters — first match wins. Harness-specific backends
-  // come first so a `claude/sonnet` doesn't get claimed by a passthrough
-  // that happens to know a provider-prefixed `claude/*`.
+  // come first so a `claude-code/sonnet` doesn't get claimed by a
+  // passthrough that happens to know a provider-prefixed model id.
   if (config.backends.has('claude')) {
     registry.register(new ClaudeBackend({
       bin: config.claudeBin,
