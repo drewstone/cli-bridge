@@ -17,6 +17,7 @@ import { SessionStore } from '../src/sessions/store.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
+import { KimiBackend } from '../src/backends/kimi.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 
 class FakeBackend implements Backend {
@@ -94,14 +95,27 @@ describe('ClaudeBackend model parsing', () => {
   // Uses the real backend but never actually spawns — we only exercise
   // matches() and its public contract. chat() is tested via the fake
   // backend above.
-  const b = new ClaudeBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'claude' })
+  const b = new ClaudeBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'claude-code' })
   it('matches bare name and prefix', () => {
-    expect(b.matches('claude')).toBe(true)
-    expect(b.matches('claude/sonnet')).toBe(true)
-    expect(b.matches('claude/claude-sonnet-4-5-20250929')).toBe(true)
-    expect(b.matches('CLAUDE/OPUS')).toBe(true) // case-insensitive
+    expect(b.matches('claude-code')).toBe(true)
+    expect(b.matches('claude-code/sonnet')).toBe(true)
+    expect(b.matches('claude-code/claude-sonnet-4-5-20250929')).toBe(true)
+    expect(b.matches('CLAUDE-CODE/OPUS')).toBe(true) // case-insensitive
     expect(b.matches('claudish/sonnet')).toBe(false)
+    expect(b.matches('claude/sonnet')).toBe(false) // old name no longer claimed
     expect(b.matches('gpt-4')).toBe(false)
+  })
+})
+
+describe('KimiBackend model parsing', () => {
+  const b = new KimiBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'kimi-code' })
+  it('matches bare name and prefix', () => {
+    expect(b.matches('kimi-code')).toBe(true)
+    expect(b.matches('kimi-code/kimi-for-coding')).toBe(true)
+    expect(b.matches('kimi-code/kimi-k2-0905-preview')).toBe(true)
+    expect(b.matches('KIMI-CODE/kimi-for-coding')).toBe(true) // case-insensitive
+    expect(b.matches('kimi/kimi-for-coding')).toBe(false) // old name no longer claimed
+    expect(b.matches('claude-code/sonnet')).toBe(false)
   })
 })
 

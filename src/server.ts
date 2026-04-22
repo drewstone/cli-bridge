@@ -36,7 +36,7 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
     registry.register(new ClaudeBackend({
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
-      harness: 'claude',
+      harness: 'claude-code',
     }))
   }
   if (config.backends.has('claudish')) {
@@ -56,7 +56,11 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
     registry.register(new OpencodeBackend({ bin: config.opencodeBin, timeoutMs: config.opencodeTimeoutMs }))
   }
   if (config.backends.has('kimi')) {
-    registry.register(new KimiBackend({ bin: config.kimiBin, timeoutMs: config.kimiTimeoutMs }))
+    registry.register(new KimiBackend({
+      bin: config.kimiBin,
+      timeoutMs: config.kimiTimeoutMs,
+      harness: 'kimi-code',
+    }))
   }
   if (config.backends.has('factory')) {
     registry.register(new FactoryBackend({ bin: config.factoryBin, timeoutMs: config.cliTimeoutMsDefault }))

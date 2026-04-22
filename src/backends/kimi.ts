@@ -6,9 +6,11 @@
  * for model selection, `--output-format stream-json` for JSONL. We
  * parse the stream-json events to OpenAI chat deltas.
  *
- * Model id scheme: `kimi/<model>` where `<model>` is what Kimi CLI
- * accepts (e.g., `kimi-for-coding`, `kimi-k2-0905-preview`, or the
- * CLI's configured default for `kimi` alone).
+ * Model id scheme: `<harness>/<model>` where `<harness>` defaults to
+ * `kimi-code` (the product name Moonshot ships the CLI under) and
+ * `<model>` is what Kimi CLI accepts (e.g., `kimi-for-coding`,
+ * `kimi-k2-0905-preview`, or the CLI's configured default if the
+ * model is omitted).
  *
  * Why Kimi CLI over opencode + opencode-kimi-full:
  *   - Official Moonshot client — Moonshot's server-side gate lists
@@ -36,15 +38,22 @@ import type { SessionRecord } from '../sessions/store.js'
 export interface KimiBackendOptions {
   bin: string
   timeoutMs: number
+  /** Harness name that claims the `<harness>/*` prefix. Default 'kimi-code'. */
+  harness?: string
 }
 
 export class KimiBackend implements Backend {
-  readonly name = 'kimi'
-  constructor(private readonly opts: KimiBackendOptions) {}
+  readonly name: string
+  private readonly prefix: string
+
+  constructor(private readonly opts: KimiBackendOptions) {
+    this.name = opts.harness ?? 'kimi-code'
+    this.prefix = `${this.name}/`
+  }
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
-    return m === 'kimi' || m.startsWith('kimi/')
+    return m === this.name || m.startsWith(this.prefix)
   }
 
   async health(): Promise<BackendHealth> {
@@ -171,10 +180,9 @@ export class KimiBackend implements Backend {
   }
 
   private extractModel(fullModel: string): string | null {
-    const lower = fullModel.toLowerCase()
-    if (lower === 'kimi') return null
-    if (lower.startsWith('kimi/')) {
-      const rest = fullModel.slice('kimi/'.length)
+    if (fullModel.toLowerCase() === this.name) return null
+    if (fullModel.startsWith(this.prefix)) {
+      const rest = fullModel.slice(this.prefix.length)
       return rest.length > 0 ? rest : null
     }
     return null
