@@ -2,7 +2,7 @@
 
 Everything deployed at `router.tangle.tools`. The bridge short-circuits
 on model prefix `bridge/<harness>/<model>` and forwards to cli-bridge
-at `http://cli-bridge:8787` on the internal docker network.
+at `http://cli-bridge:3344` on the internal docker network.
 
 ## Current state (last verified 2026-04-22)
 
@@ -114,7 +114,7 @@ cd /srv/router && docker compose up -d claude-code-proxy cli-bridge
 ```bash
 # Probe cli-bridge health from the router network
 ssh root@178.104.236.58 \
-  'docker exec tangle-backend node -e "fetch(\"http://cli-bridge:8787/health\").then(r=>r.json()).then(j=>console.log(JSON.stringify(j,null,2)))"'
+  'docker exec tangle-backend node -e "fetch(\"http://cli-bridge:3344/health\").then(r=>r.json()).then(j=>console.log(JSON.stringify(j,null,2)))"'
 
 # Watch a specific backend's logs
 ssh root@178.104.236.58 'docker logs -f tangle-cli-bridge'

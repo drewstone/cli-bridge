@@ -21,7 +21,7 @@ cp .env.example .env
 claude /login
 
 docker compose -f docker/compose.yml up -d --build
-curl -fsS http://127.0.0.1:8787/health
+curl -fsS http://127.0.0.1:3344/health
 ```
 
 ## Remote: Hetzner box behind Caddy
@@ -30,7 +30,7 @@ If you want to hit cli-bridge from a phone / laptop / CI:
 
 1. Bind loopback in `docker/compose.yml` (the default).
 2. Set `BRIDGE_BEARER` to a random 32-byte hex string.
-3. Add a Caddy site that terminates TLS, forwards to `127.0.0.1:8787`,
+3. Add a Caddy site that terminates TLS, forwards to `127.0.0.1:3344`,
    and requires an `Authorization: Bearer …` header.
 4. Mount the Caddy config + cli-bridge compose as siblings under `/srv`,
    e.g. the same layout as `tangle-router`.
@@ -42,7 +42,7 @@ bridge.drewstone.dev {
     # strip + forward only if bearer matches — never pass unverified
     @authed header Authorization "Bearer {env.EXPECTED_BEARER}"
     handle @authed {
-        reverse_proxy 127.0.0.1:8787 {
+        reverse_proxy 127.0.0.1:3344 {
             header_up -Authorization
         }
     }
@@ -77,13 +77,13 @@ sudo journalctl -u cli-bridge@$USER -f
 
 ```bash
 # Health
-curl -fsS http://127.0.0.1:8787/health
+curl -fsS http://127.0.0.1:3344/health
 
 # Model catalog
-curl -fsS http://127.0.0.1:8787/v1/models | jq
+curl -fsS http://127.0.0.1:3344/v1/models | jq
 
 # First real call (replace bearer if configured)
-curl -sS http://127.0.0.1:8787/v1/chat/completions \
+curl -sS http://127.0.0.1:3344/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-Session-Id: smoke' \
   -d '{"model":"claude","messages":[{"role":"user","content":"ping"}],"stream":false}' | jq
