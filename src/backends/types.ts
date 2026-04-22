@@ -40,6 +40,14 @@ export interface ChatRequest {
    * rather than quietly run with tools enabled.
    */
   mode?: BridgeMode
+  /**
+   * OpenAI-compatible response-format hint. `json_object` asks the
+   * backend to return a single JSON object with no prose and no
+   * markdown fences. CLI harnesses don't expose a native json-mode
+   * flag, so backends honor this prompt-side — callers should still
+   * treat fence-stripping as a belt-and-suspenders fallback.
+   */
+  responseFormat?: { type: 'text' | 'json_object' }
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
 }
@@ -83,6 +91,21 @@ export interface Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta>
+}
+
+/**
+ * Prompt-side directive emitted when the caller requests
+ * `response_format: { type: 'json_object' }`. Claude Code and Kimi CLI
+ * have no native json-mode flag, so we inject this instruction and let
+ * the model comply. Clients SHOULD still strip ```json fences as a
+ * belt-and-suspenders fallback — non-native json mode is best-effort.
+ */
+export const JSON_MODE_DIRECTIVE =
+  'Respond with ONLY a single JSON object. No prose. No markdown fences.'
+
+/** True when the request asked for `json_object` response format. */
+export function wantsJsonObject(req: ChatRequest): boolean {
+  return req.responseFormat?.type === 'json_object'
 }
 
 export class BackendError extends Error {

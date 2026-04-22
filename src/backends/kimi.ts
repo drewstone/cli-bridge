@@ -32,7 +32,7 @@
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
-import { BackendError } from './types.js'
+import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 
@@ -84,7 +84,7 @@ export class KimiBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
-    const prompt = this.flattenPrompt(req.messages)
+    const prompt = this.buildPrompt(req)
     const model = this.extractModel(req.model)
 
     const args = ['--print', '--output-format', 'stream-json', '--prompt', prompt]
@@ -224,6 +224,24 @@ export class KimiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
     }
+  }
+
+  /**
+   * Build the final prompt text passed to `kimi --print --prompt`. Kimi
+   * CLI has no `--append-system-prompt` equivalent and no native
+   * json-mode flag, so when the caller asks for `json_object` we
+   * prepend the directive to the user prompt. Best-effort — clients
+   * should still strip markdown fences as a fallback.
+   *
+   * Exposed (not private) so tests can verify the prefix without
+   * spawning a real subprocess.
+   */
+  buildPrompt(req: ChatRequest): string {
+    const flat = this.flattenPrompt(req.messages)
+    if (wantsJsonObject(req)) {
+      return `${JSON_MODE_DIRECTIVE}\n\n${flat}`
+    }
+    return flat
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {

@@ -22,7 +22,7 @@
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
-import { BackendError } from './types.js'
+import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 
@@ -138,28 +138,7 @@ export class ClaudeBackend implements Backend {
     }
 
     const prompt = this.flattenPrompt(req.messages)
-    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
-
-    // hosted-safe: force Claude Code into plan mode and hard-disable
-    // every tool that can touch the FS or shell. `plan` mode alone
-    // already bans Write/Edit/Bash/NotebookEdit, but we also pass the
-    // full disallowed list so a future upstream flag rename doesn't
-    // silently re-enable them.
-    if (mode === 'hosted-safe') {
-      args.push(
-        '--permission-mode', 'plan',
-        '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
-      )
-    }
-
-    if (session?.internalId) {
-      args.push('--resume', session.internalId)
-    }
-
-    const modelArg = this.extractModel(req.model)
-    if (modelArg) {
-      args.push('--model', modelArg)
-    }
+    const args = this.buildArgs(req, session, mode, prompt)
 
     const childEnv: NodeJS.ProcessEnv = { ...process.env }
     if (this.anthropicBaseUrl) {
@@ -257,6 +236,52 @@ export class ClaudeBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
     }
+  }
+
+  /**
+   * Build the argv for `claude -p …`. Extracted so tests can verify
+   * flag composition (json-mode, hosted-safe, resume, model) without
+   * spawning a real subprocess.
+   *
+   * Non-native JSON mode is honored via `--append-system-prompt` — a
+   * real Claude Code flag that cleanly layers the directive on top of
+   * the user prompt without mutating it. Content may still arrive
+   * fenced; callers should keep fence-stripping as a fallback.
+   */
+  buildArgs(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    mode: BridgeMode,
+    prompt: string,
+  ): string[] {
+    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
+
+    if (wantsJsonObject(req)) {
+      args.push('--append-system-prompt', JSON_MODE_DIRECTIVE)
+    }
+
+    // hosted-safe: force Claude Code into plan mode and hard-disable
+    // every tool that can touch the FS or shell. `plan` mode alone
+    // already bans Write/Edit/Bash/NotebookEdit, but we also pass the
+    // full disallowed list so a future upstream flag rename doesn't
+    // silently re-enable them.
+    if (mode === 'hosted-safe') {
+      args.push(
+        '--permission-mode', 'plan',
+        '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
+      )
+    }
+
+    if (session?.internalId) {
+      args.push('--resume', session.internalId)
+    }
+
+    const modelArg = this.extractModel(req.model)
+    if (modelArg) {
+      args.push('--model', modelArg)
+    }
+
+    return args
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
