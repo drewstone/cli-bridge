@@ -33,6 +33,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
+import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 
 export interface KimiBackendOptions {
@@ -80,6 +81,9 @@ export class KimiBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
+      'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
+
     const prompt = this.flattenPrompt(req.messages)
     const model = this.extractModel(req.model)
 
@@ -104,7 +108,18 @@ export class KimiBackend implements Backend {
     try {
       let internalSessionId: string | undefined
       let stderr = ''
-      child.stderr.on('data', (b) => { stderr += b.toString() })
+      let emittedContent = false
+      child.stderr.on('data', (b) => {
+        const chunk = b.toString()
+        stderr += chunk
+        // Kimi prints "To resume this session: kimi -r <uuid>" to
+        // stderr after --print. That's our session id when no init
+        // event carries one.
+        if (!internalSessionId) {
+          const m = chunk.match(/kimi\s+-r\s+([0-9a-f-]{8,})/i)
+          if (m) internalSessionId = m[1]
+        }
+      })
 
       const rl = createInterface({ input: child.stdout })
       let sawError: string | null = null
@@ -131,11 +146,44 @@ export class KimiBackend implements Backend {
           continue
         }
 
-        const text = extractText(ev)
-        if (text) yield { content: text }
-
-        const toolCall = extractToolUse(ev)
-        if (toolCall) yield { tool_calls: [toolCall] }
+        // Kimi's actual event shape for assistant output:
+        //   {"role":"assistant","content":[{"type":"think","think":"..."},
+        //                                   {"type":"text","text":"..."},
+        //                                   {"type":"tool_use",…}]}
+        // Walk the content array block-by-block — matches how we handle
+        // Claude Code's stream-json. Generic extractText is a fallback
+        // for events whose content is just a string.
+        const role = String(ev.role ?? '')
+        const contentField = ev.content
+        if (role === 'assistant' && Array.isArray(contentField)) {
+          for (const block of contentField as Array<Record<string, unknown>>) {
+            if (!block || typeof block !== 'object') continue
+            const blockType = String(block.type ?? '')
+            if (blockType === 'text' && typeof block.text === 'string' && block.text) {
+              yield { content: block.text }
+              emittedContent = true
+            } else if (blockType === 'tool_use') {
+              const id = String(block.id ?? block.tool_use_id ?? '')
+              const name = String(block.name ?? block.tool ?? '')
+              const input = block.input ?? {}
+              if (id && name) {
+                yield {
+                  tool_calls: [{
+                    id,
+                    name,
+                    arguments: typeof input === 'string' ? input : JSON.stringify(input),
+                  }],
+                }
+              }
+            }
+            // 'think' blocks are reasoning chain-of-thought; don't surface.
+          }
+        } else {
+          const text = extractText(ev)
+          if (text) { yield { content: text }; emittedContent = true }
+          const toolCall = extractToolUse(ev)
+          if (toolCall) yield { tool_calls: [toolCall] }
+        }
 
         if (
           type === 'result'
@@ -163,7 +211,11 @@ export class KimiBackend implements Backend {
         return
       }
       if (sawError) throw new BackendError(`kimi: ${sawError}`, 'upstream')
-      if (exitCode !== 0 && exitCode !== null) {
+      // Kimi CLI --print exits non-zero on some successful runs (known
+      // quirk — the "To resume this session: kimi -r <uuid>" stderr
+      // message is printed as a successful trailer, not an error). If
+      // we observed real assistant content, treat exit non-zero as OK.
+      if (exitCode !== 0 && exitCode !== null && !emittedContent) {
         throw new BackendError(`kimi exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
       }
       yield { finish_reason: 'stop', internal_session_id: internalSessionId }
@@ -180,11 +232,14 @@ export class KimiBackend implements Backend {
   }
 
   private extractModel(fullModel: string): string | null {
-    if (fullModel.toLowerCase() === this.name) return null
-    if (fullModel.startsWith(this.prefix)) {
-      const rest = fullModel.slice(this.prefix.length)
-      return rest.length > 0 ? rest : null
-    }
+    // Kimi's config.toml uses `<provider>/<model>` as the literal key
+    // (e.g. `kimi-code/kimi-for-coding`) — the harness prefix IS the
+    // provider side of that key. Pass the full string through; stripping
+    // the prefix makes `--model kimi-for-coding` fail with "LLM not set".
+    // Bare harness name alone → let kimi pick its default model.
+    const lower = fullModel.toLowerCase()
+    if (lower === this.name) return null
+    if (lower.startsWith(this.prefix)) return fullModel
     return null
   }
 }

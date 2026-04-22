@@ -30,6 +30,7 @@ class FakeBackend implements Backend {
     yield { internal_session_id: `${this.name}-int-xyz` }
     yield { content: `[${this.name}] ` }
     yield { content: req.messages[0]?.content ?? '' }
+    yield { content: ` mode=${req.mode ?? 'byob'}` }
     yield { content: session ? ` turn=${session.turns + 1}` : '' }
     yield { finish_reason: 'stop', usage: { input_tokens: 3, output_tokens: 5 } }
   }
@@ -191,6 +192,100 @@ describe('POST /v1/chat/completions', () => {
       body: '{bad',
     })
     expect(res.status).toBe(400)
+  })
+
+  it('defaults mode to byob when no header or body field is set', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+      }),
+    })
+    expect(res.headers.get('x-bridge-mode')).toBe('byob')
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0]?.message.content).toContain('mode=byob')
+  })
+
+  it('reads mode from X-Bridge-Mode header', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bridge-mode': 'hosted-safe' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+      }),
+    })
+    expect(res.headers.get('x-bridge-mode')).toBe('hosted-safe')
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0]?.message.content).toContain('mode=hosted-safe')
+  })
+
+  it('X-Sandbox: 1 maps to hosted-sandboxed mode', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-sandbox': '1' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+      }),
+    })
+    expect(res.headers.get('x-bridge-mode')).toBe('hosted-sandboxed')
+  })
+
+  it('body `mode` field takes precedence over headers', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bridge-mode': 'hosted-safe' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+        mode: 'byob',
+      }),
+    })
+    expect(res.headers.get('x-bridge-mode')).toBe('byob')
+  })
+
+  it('returns 400 on invalid mode value', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        mode: 'yolo-mode',
+      }),
+    })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 501 when backend rejects requested mode (ModeNotSupportedError)', async () => {
+    // Real KimiBackend currently rejects hosted-safe. Spawn will never
+    // happen — the mode guard fires inside chat() before subprocess start.
+    const kimi = new KimiBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'kimi-code' })
+    const registry = new BackendRegistry().register(kimi)
+    const appLocal = new Hono()
+    mountChatCompletions(appLocal, { registry, sessions })
+
+    const res = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'kimi-code/kimi-for-coding',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+        mode: 'hosted-safe',
+      }),
+    })
+    expect(res.status).toBe(501)
+    const body = await res.json() as { error: { type: string; message: string } }
+    expect(body.error.type).toBe('mode_not_supported')
+    expect(body.error.message).toContain('kimi-code')
   })
 
   it('resuming a session exposes prior turn count to the backend', async () => {
