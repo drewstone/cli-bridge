@@ -87,10 +87,21 @@ export function mountChatCompletions(
       }, 400)
     }
 
+    // Forward the user's identity (when the upstream router supplied
+    // it) into request metadata so backends like sandbox can re-use the
+    // user's own auth when calling downstream services. This keeps
+    // billing accountable to the actual user, not cli-bridge's service
+    // identity. Header is `X-Tangle-Forwarded-Authorization` and is set
+    // by tangle-router on bridge dispatch (sandbox path).
+    const forwardedAuthz = c.req.header('x-tangle-forwarded-authorization')
     const req: ChatRequest = {
       ...parsed.data,
       session_id: bodySession ?? headerSession,
       mode,
+      metadata: {
+        ...(parsed.data.metadata ?? {}),
+        ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
+      },
     }
 
     const backend = deps.registry.resolve(req.model)

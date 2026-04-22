@@ -9,6 +9,7 @@
 
 import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
+import type { ProfileCatalog } from '../profiles/loader.js'
 
 interface ModelEntry {
   id: string
@@ -17,7 +18,10 @@ interface ModelEntry {
   note?: string
 }
 
-export function mountModels(app: Hono, deps: { registry: BackendRegistry }): void {
+export function mountModels(
+  app: Hono,
+  deps: { registry: BackendRegistry; catalog?: ProfileCatalog },
+): void {
   app.get('/v1/models', async (c) => {
     const data: ModelEntry[] = []
 
@@ -63,6 +67,25 @@ export function mountModels(app: Hono, deps: { registry: BackendRegistry }): voi
           for (const id of ['openai/gpt-4o', 'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'moonshot/kimi-k2-0905-preview', 'zai/glm-4.6']) {
             data.push({ id, object: 'model', backend: b.name, note: 'forwards to vendor API — requires key' })
           }
+          break
+        case 'sandbox':
+          // Cataloged AgentProfiles — each becomes an addressable model id.
+          // Inline profiles are also accepted via `model: "sandbox"` + body
+          // field `agent_profile`, but those don't appear in the listing.
+          for (const e of deps.catalog?.list() ?? []) {
+            data.push({
+              id: `sandbox/${e.id}`,
+              object: 'model',
+              backend: b.name,
+              note: e.profile.description ?? 'sandbox AgentProfile',
+            })
+          }
+          data.push({
+            id: 'sandbox',
+            object: 'model',
+            backend: b.name,
+            note: 'inline profile mode — pass full AgentProfile in body field `agent_profile`',
+          })
           break
       }
     }

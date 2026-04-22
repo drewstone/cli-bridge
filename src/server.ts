@@ -20,14 +20,23 @@ import { FactoryBackend } from './backends/factory.js'
 import { AmpBackend } from './backends/amp.js'
 import { ForgeBackend } from './backends/forge.js'
 import { PassthroughBackend } from './backends/passthrough.js'
+import { SandboxBackend } from './backends/sandbox.js'
+import { createProfileCatalog, type ProfileCatalog } from './profiles/loader.js'
 import { mountChatCompletions } from './routes/chat-completions.js'
 import { mountHealth } from './routes/health.js'
 import { mountModels } from './routes/models.js'
+import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
 
-export function buildApp(config: Config): { app: Hono; sessions: SessionStore; registry: BackendRegistry } {
+export function buildApp(config: Config): {
+  app: Hono
+  sessions: SessionStore
+  registry: BackendRegistry
+  catalog: ProfileCatalog
+} {
   const sessions = new SessionStore(config.dataDir)
   const registry = new BackendRegistry()
+  const catalog = createProfileCatalog(config.sandboxProfilesDir)
 
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
@@ -79,6 +88,17 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
       zaiApiKey: config.zaiApiKey,
     }))
   }
+  if (config.backends.has('sandbox')) {
+    if (!config.sandboxApiUrl || !config.sandboxApiKey) {
+      throw new Error('sandbox backend enabled but SANDBOX_API_URL + SANDBOX_API_KEY not set')
+    }
+    registry.register(new SandboxBackend({
+      apiUrl: config.sandboxApiUrl,
+      apiKey: config.sandboxApiKey,
+      timeoutMs: config.sandboxTimeoutMs,
+      resolveProfile: (id) => catalog.get(id),
+    }))
+  }
 
   const app = new Hono()
 
@@ -96,8 +116,9 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
   }
 
   mountHealth(app, { registry })
-  mountModels(app, { registry })
+  mountModels(app, { registry, catalog })
   mountSessions(app, { sessions })
+  mountProfiles(app, { catalog })
   mountChatCompletions(app, { registry, sessions })
 
   app.get('/', (c) => c.json({
@@ -108,7 +129,7 @@ export function buildApp(config: Config): { app: Hono; sessions: SessionStore; r
     endpoints: ['/health', '/v1/models', '/v1/chat/completions', '/v1/sessions'],
   }))
 
-  return { app, sessions, registry }
+  return { app, sessions, registry, catalog }
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
