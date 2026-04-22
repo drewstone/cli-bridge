@@ -18,6 +18,9 @@ import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { KimiBackend } from '../src/backends/kimi.js'
+import { CodexBackend } from '../src/backends/codex.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
+import { ModeNotSupportedError } from '../src/modes.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 
 class FakeBackend implements Backend {
@@ -117,6 +120,100 @@ describe('KimiBackend model parsing', () => {
     expect(b.matches('KIMI-CODE/kimi-for-coding')).toBe(true) // case-insensitive
     expect(b.matches('kimi/kimi-for-coding')).toBe(false) // old name no longer claimed
     expect(b.matches('claude-code/sonnet')).toBe(false)
+  })
+})
+
+describe('mode gating per backend (spawn-gated by /nonexistent bin)', () => {
+  // These tests only verify the synchronous mode-gate inside chat() —
+  // whether ModeNotSupportedError is thrown. The bin points at a
+  // nonexistent path so spawn inevitably fails, but the mode gate fires
+  // BEFORE spawn, so we can distinguish "rejected at the gate" (error
+  // name === 'ModeNotSupportedError') from "rejected later at spawn"
+  // (anything else).
+
+  async function firstDeltaError(
+    gen: AsyncIterable<unknown>,
+  ): Promise<{ name: string; message: string } | null> {
+    try {
+      for await (const _ of gen) return null
+      return null
+    } catch (err) {
+      if (err instanceof Error) return { name: err.name, message: err.message }
+      throw err
+    }
+  }
+
+  it('kimi-code: hosted-safe passes the mode gate (uses --plan)', async () => {
+    const b = new KimiBackend({ bin: '/nonexistent', timeoutMs: 500, harness: 'kimi-code' })
+    const err = await firstDeltaError(
+      b.chat(
+        { model: 'kimi-code', messages: [{ role: 'user', content: 'x' }], mode: 'hosted-safe' },
+        null,
+        new AbortController().signal,
+      ),
+    )
+    // mode gate passed → spawn fails later with BackendError (ENOENT)
+    expect(err?.name).toBe('BackendError')
+    expect(err?.message).toContain('spawn failed')
+  })
+
+  it('kimi-code: hosted-sandboxed is rejected at the gate with sandbox-launcher message', async () => {
+    const b = new KimiBackend({ bin: '/nonexistent', timeoutMs: 500, harness: 'kimi-code' })
+    await expect(async () => {
+      for await (const _ of b.chat(
+        { model: 'kimi-code', messages: [{ role: 'user', content: 'x' }], mode: 'hosted-sandboxed' },
+        null,
+        new AbortController().signal,
+      )) { /* drain */ }
+    }).rejects.toThrowError(ModeNotSupportedError)
+  })
+
+  it('codex: hosted-safe passes the mode gate (uses --disable shell_tool + sandbox=read-only)', async () => {
+    const b = new CodexBackend({ bin: '/nonexistent', timeoutMs: 500 })
+    const err = await firstDeltaError(
+      b.chat(
+        { model: 'codex', messages: [{ role: 'user', content: 'x' }], mode: 'hosted-safe' },
+        null,
+        new AbortController().signal,
+      ),
+    )
+    expect(err?.name).toBe('BackendError')
+    expect(err?.message).toContain('spawn failed')
+  })
+
+  it('codex: hosted-sandboxed is rejected at the gate with sandbox-launcher message', async () => {
+    const b = new CodexBackend({ bin: '/nonexistent', timeoutMs: 500 })
+    await expect(async () => {
+      for await (const _ of b.chat(
+        { model: 'codex', messages: [{ role: 'user', content: 'x' }], mode: 'hosted-sandboxed' },
+        null,
+        new AbortController().signal,
+      )) { /* drain */ }
+    }).rejects.toThrowError(ModeNotSupportedError)
+  })
+
+  it('opencode: hosted-safe passes the mode gate (writes OPENCODE_CONFIG with deny-all)', async () => {
+    const b = new OpencodeBackend({ bin: '/nonexistent', timeoutMs: 500 })
+    const err = await firstDeltaError(
+      b.chat(
+        { model: 'opencode', messages: [{ role: 'user', content: 'x' }], mode: 'hosted-safe' },
+        null,
+        new AbortController().signal,
+      ),
+    )
+    expect(err?.name).toBe('BackendError')
+    expect(err?.message).toContain('spawn failed')
+  })
+
+  it('opencode: hosted-sandboxed is rejected at the gate with sandbox-launcher message', async () => {
+    const b = new OpencodeBackend({ bin: '/nonexistent', timeoutMs: 500 })
+    await expect(async () => {
+      for await (const _ of b.chat(
+        { model: 'opencode', messages: [{ role: 'user', content: 'x' }], mode: 'hosted-sandboxed' },
+        null,
+        new AbortController().signal,
+      )) { /* drain */ }
+    }).rejects.toThrowError(ModeNotSupportedError)
   })
 })
 
@@ -265,8 +362,9 @@ describe('POST /v1/chat/completions', () => {
   })
 
   it('returns 501 when backend rejects requested mode (ModeNotSupportedError)', async () => {
-    // Real KimiBackend currently rejects hosted-safe. Spawn will never
-    // happen — the mode guard fires inside chat() before subprocess start.
+    // Kimi supports hosted-safe now but still rejects hosted-sandboxed
+    // (sandbox launcher not yet wired). Spawn will never happen — the
+    // mode guard fires inside chat() before subprocess start.
     const kimi = new KimiBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'kimi-code' })
     const registry = new BackendRegistry().register(kimi)
     const appLocal = new Hono()
@@ -279,13 +377,14 @@ describe('POST /v1/chat/completions', () => {
         model: 'kimi-code/kimi-for-coding',
         messages: [{ role: 'user', content: 'x' }],
         stream: false,
-        mode: 'hosted-safe',
+        mode: 'hosted-sandboxed',
       }),
     })
     expect(res.status).toBe(501)
     const body = await res.json() as { error: { type: string; message: string } }
     expect(body.error.type).toBe('mode_not_supported')
     expect(body.error.message).toContain('kimi-code')
+    expect(body.error.message).toContain('sandbox launcher')
   })
 
   it('resuming a session exposes prior turn count to the backend', async () => {

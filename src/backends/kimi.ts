@@ -81,13 +81,25 @@ export class KimiBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
-      'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
+    // hosted-sandboxed isn't wired yet; kimi supports byob and hosted-safe.
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob', 'hosted-safe'],
+      'kimi hosted-sandboxed requires the sandbox launcher — not yet wired')
 
     const prompt = this.flattenPrompt(req.messages)
     const model = this.extractModel(req.model)
 
     const args = ['--print', '--output-format', 'stream-json', '--prompt', prompt]
+
+    // hosted-safe: kimi 1.30.0+ `--plan` restricts the model to read-only
+    // tools (Glob, Grep, ReadFile) — no file writes, no shell, no
+    // WebFetch. Plan mode is the official upstream knob for "explore
+    // without touching"; verified against docs/en/reference/kimi-command.md
+    // and docs/en/guides/interaction.md. When resuming, --plan forces plan
+    // mode on regardless of the resumed session's prior state.
+    if (req.mode === 'hosted-safe') {
+      args.push('--plan')
+    }
+
     if (session?.internalId) {
       args.push('--resume', session.internalId)
     }
@@ -100,6 +112,12 @@ export class KimiBackend implements Backend {
       cwd: session?.cwd ?? process.cwd(),
       env: process.env,
     })
+
+    // Capture spawn failures (ENOENT, EACCES) into a local so the read
+    // loop surfaces them as BackendError instead of leaking as an
+    // unhandled 'error' event on the emitter.
+    const spawnErr: { err: Error | null } = { err: null }
+    child.on('error', (err) => { spawnErr.err = err })
 
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
@@ -203,9 +221,16 @@ export class KimiBackend implements Backend {
 
       const exitCode: number | null = await new Promise((resolve) => {
         if (child.exitCode !== null) resolve(child.exitCode)
-        else child.once('close', (code) => resolve(code))
+        else if (spawnErr.err) resolve(null)
+        else {
+          child.once('close', (code) => resolve(code))
+          child.once('error', () => resolve(null))
+        }
       })
 
+      if (spawnErr.err) {
+        throw new BackendError(`kimi spawn failed: ${spawnErr.err.message}`, 'cli_missing')
+      }
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return

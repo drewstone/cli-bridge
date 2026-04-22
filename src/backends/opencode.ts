@@ -19,6 +19,9 @@
 
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -62,8 +65,10 @@ export class OpencodeBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
-      'opencode hosted-safe requires a verified per-provider tool-disable flag path')
+    // opencode supports byob and hosted-safe; hosted-sandboxed defers to
+    // the sandbox launcher (not yet wired).
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob', 'hosted-safe'],
+      'opencode hosted-sandboxed requires the sandbox launcher — not yet wired')
 
     const prompt = this.flattenPrompt(req.messages)
     const model = this.extractModel(req.model)
@@ -71,13 +76,55 @@ export class OpencodeBackend implements Backend {
     const args: string[] = ['run', '--format', 'json']
     if (model) args.push('-m', model)
     if (session?.internalId) args.push('-s', session.internalId)
+
+    // hosted-safe: opencode has no CLI flag for permissions — the only
+    // runtime knob is `OPENCODE_CONFIG=<path>` pointing to a JSON config
+    // whose `permission` block is merged with higher precedence than
+    // global config (verified against opencode.ai/docs/config/ and
+    // docs/permissions/). We write a fresh temp config per invocation
+    // denying every tool by default and allowing only Read/Glob/Grep —
+    // this matches the documented recipe for a deny-all-by-default
+    // policy. `--agent plan` is also set as defense in depth; plan agent
+    // restricts edits + bash to `ask`, which in a non-interactive
+    // `run` context blocks them (no approval UI → refused).
+    //
+    // Caveat: user-installed MCP servers declared in the user's global
+    // config may still surface tools. The `"*": "deny"` at the top of
+    // the permission map applies across all tools, but opencode's
+    // permission enforcement for MCP tools is not explicitly documented
+    // as matching `"*"`. hosted-safe therefore assumes the operator has
+    // vetted their MCP config; if they haven't, use hosted-sandboxed.
+    let tempConfigDir: string | null = null
+    const childEnv: NodeJS.ProcessEnv = { ...process.env }
+    if (req.mode === 'hosted-safe') {
+      args.push('--agent', 'plan')
+      tempConfigDir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-safe-'))
+      const configPath = join(tempConfigDir, 'opencode.json')
+      writeFileSync(configPath, JSON.stringify({
+        $schema: 'https://opencode.ai/config.json',
+        permission: {
+          '*': 'deny',
+          read: 'allow',
+          glob: 'allow',
+          grep: 'allow',
+        },
+      }), 'utf8')
+      childEnv.OPENCODE_CONFIG = configPath
+    }
+
     args.push(prompt)
 
     const child = spawn(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: session?.cwd ?? process.cwd(),
-      env: process.env,
+      env: childEnv,
     })
+
+    // Capture spawn failures (ENOENT, EACCES) into a local so the read
+    // loop surfaces them as BackendError instead of leaking as an
+    // unhandled 'error' event on the emitter.
+    const spawnErr: { err: Error | null } = { err: null }
+    child.on('error', (err) => { spawnErr.err = err })
 
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
@@ -132,9 +179,16 @@ export class OpencodeBackend implements Backend {
 
       const exitCode: number | null = await new Promise((resolve) => {
         if (child.exitCode !== null) resolve(child.exitCode)
-        else child.once('close', (code) => resolve(code))
+        else if (spawnErr.err) resolve(null)
+        else {
+          child.once('close', (code) => resolve(code))
+          child.once('error', () => resolve(null))
+        }
       })
 
+      if (spawnErr.err) {
+        throw new BackendError(`opencode spawn failed: ${spawnErr.err.message}`, 'cli_missing')
+      }
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
@@ -148,6 +202,10 @@ export class OpencodeBackend implements Backend {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
+      if (tempConfigDir) {
+        try { rmSync(tempConfigDir, { recursive: true, force: true }) }
+        catch { /* best effort — temp dir cleanup */ }
+      }
     }
   }
 

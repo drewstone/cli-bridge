@@ -70,11 +70,10 @@ export class CodexBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    // Codex has `--sandbox` flags but we haven't verified end-to-end that
-    // every FS/shell tool is gated under read-only. Reject hosted-safe
-    // until that audit lands — never fake safety.
-    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
-      'codex hosted-safe requires verified --sandbox read-only audit')
+    // codex supports byob and hosted-safe; hosted-sandboxed defers to
+    // the sandbox launcher (not yet wired).
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob', 'hosted-safe'],
+      'codex hosted-sandboxed requires the sandbox launcher — not yet wired')
 
     const prompt = this.flattenPrompt(req.messages)
     const modelArg = this.extractModel(req.model)
@@ -83,6 +82,35 @@ export class CodexBackend implements Backend {
     // else `codex exec <prompt>`. --json emits JSONL events.
     const args: string[] = ['exec', '--json']
     if (modelArg) args.push('-c', `model="${modelArg}"`)
+
+    // hosted-safe: kill the exec/shell tool surface outright and pin the
+    // sandbox to read-only. `--disable shell_tool` removes the tool from
+    // the schema offered to the model (verified via `codex features list
+    // --disable shell_tool` flipping the flag to false). `--disable
+    // unified_exec` removes the PTY-backed alternate exec path.
+    // `--disable apps` and `--disable plugins` strip user-installed tool
+    // extensions that could reach the shell via a side channel.
+    // `sandbox_mode=read-only` is defense in depth: even if an MCP
+    // server attempts a write, the sandbox rejects it. We use the
+    // `-c sandbox_mode=…` override (not `-s`) because `codex exec
+    // resume` doesn't accept `-s`, while `-c` works on both paths.
+    //
+    // We do NOT set approval_policy=never because `never` auto-approves
+    // rather than auto-denies (verified against codex config-reference) —
+    // safety comes from the tool+sandbox layer, not the approval layer.
+    //
+    // Caveat: user-configured MCP servers in ~/.codex/config.toml can
+    // still surface their own tools. hosted-safe assumes the operator
+    // has audited their MCP config; if they haven't, use hosted-sandboxed.
+    if (req.mode === 'hosted-safe') {
+      args.push(
+        '-c', 'sandbox_mode="read-only"',
+        '--disable', 'shell_tool',
+        '--disable', 'unified_exec',
+        '--disable', 'apps',
+        '--disable', 'plugins',
+      )
+    }
 
     if (session?.internalId) {
       args.splice(1, 0, 'resume', session.internalId)
@@ -95,6 +123,12 @@ export class CodexBackend implements Backend {
       cwd: session?.cwd ?? process.cwd(),
       env: process.env,
     })
+
+    // Capture spawn failures (ENOENT, EACCES) into a local so the read
+    // loop surfaces them as BackendError instead of leaking as an
+    // unhandled 'error' event on the emitter.
+    const spawnErr: { err: Error | null } = { err: null }
+    child.on('error', (err) => { spawnErr.err = err })
 
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
@@ -142,9 +176,16 @@ export class CodexBackend implements Backend {
 
       const exitCode: number | null = await new Promise((resolve) => {
         if (child.exitCode !== null) resolve(child.exitCode)
-        else child.once('close', (code) => resolve(code))
+        else if (spawnErr.err) resolve(null)
+        else {
+          child.once('close', (code) => resolve(code))
+          child.once('error', () => resolve(null))
+        }
       })
 
+      if (spawnErr.err) {
+        throw new BackendError(`codex spawn failed: ${spawnErr.err.message}`, 'cli_missing')
+      }
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
