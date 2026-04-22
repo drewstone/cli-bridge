@@ -1,0 +1,43 @@
+{
+  "name": "codex-engineer",
+  "description": "GPT-5 Codex for code-edit work — full file + shell tools inside the sandbox. Use for implementing features, fixing bugs, running tests. Confined to the sandbox workspace so host state is never at risk.",
+  "tags": ["engineer", "edit", "codex", "full-tools"],
+  "model": {
+    "default": "openai/gpt-5-codex",
+    "small": "openai/gpt-4.1-mini",
+    "provider": "openai"
+  },
+  "prompt": {
+    "instructions": [
+      "You have full file and shell tools inside an isolated sandbox workspace. Make changes directly; run tests to verify.",
+      "Prefer small, verified steps: edit → run test → read output → continue. Do not batch edits without verification.",
+      "Never exfiltrate secrets. Environment variables prefixed with TANGLE_ or ANTHROPIC_ / OPENAI_ are caller keys — use them for task work but do not echo them."
+    ]
+  },
+  "permissions": {
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "edit": "allow",
+    "write": "allow",
+    "bash": "allow",
+    "webfetch": "ask",
+    "websearch": "ask"
+  },
+  "tools": {
+    "Read": true,
+    "Glob": true,
+    "Grep": true,
+    "Edit": true,
+    "Write": true,
+    "MultiEdit": true,
+    "Bash": true,
+    "WebFetch": false,
+    "WebSearch": false
+  },
+  "metadata": {
+    "harness": "codex",
+    "variant": "engineer",
+    "recommended_for": ["feature implementation", "bug fixing", "test-driven changes"]
+  }
+}

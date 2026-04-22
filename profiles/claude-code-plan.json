@@ -1,0 +1,39 @@
+{
+  "name": "claude-code-plan",
+  "description": "Claude Sonnet in plan mode — read-only analysis and reasoning, no file writes, no shell. Use for architecture review, codebase Q&A, and planning work where the agent should think before (or without) touching anything.",
+  "tags": ["plan", "read-only", "reasoning", "claude-code"],
+  "model": {
+    "default": "anthropic/claude-sonnet-4-5",
+    "small": "anthropic/claude-haiku-4-5",
+    "provider": "anthropic"
+  },
+  "prompt": {
+    "instructions": [
+      "Plan mode: read, analyze, and explain. Do not attempt to write files, run shell commands, or make network changes.",
+      "When the answer requires an action, describe the action precisely enough for the caller to execute it — do not execute it yourself."
+    ]
+  },
+  "permissions": {
+    "*": "deny",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow"
+  },
+  "tools": {
+    "Read": true,
+    "Glob": true,
+    "Grep": true,
+    "Edit": false,
+    "Write": false,
+    "MultiEdit": false,
+    "NotebookEdit": false,
+    "Bash": false,
+    "WebFetch": false,
+    "WebSearch": false
+  },
+  "metadata": {
+    "harness": "claude-code",
+    "variant": "plan",
+    "recommended_for": ["code review", "architecture analysis", "codebase Q&A"]
+  }
+}

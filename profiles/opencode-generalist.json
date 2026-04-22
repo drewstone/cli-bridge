@@ -1,0 +1,42 @@
+{
+  "name": "opencode-generalist",
+  "description": "Multi-provider balanced coding agent — full tools in the sandbox, model-agnostic so the caller can swap providers without re-writing the profile. Use when you want agent-ish behavior without committing to a specific vendor.",
+  "tags": ["generalist", "multi-provider", "opencode", "balanced"],
+  "model": {
+    "default": "anthropic/claude-sonnet-4-5",
+    "small": "openai/gpt-4.1-mini",
+    "provider": "opencode"
+  },
+  "prompt": {
+    "instructions": [
+      "General-purpose coding agent. Read code to understand, edit code to change, run tests to verify.",
+      "When the task is ambiguous, state your interpretation before acting. When the task is blocked, explain the blocker precisely — do not guess."
+    ]
+  },
+  "permissions": {
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "edit": "allow",
+    "write": "allow",
+    "bash": "allow",
+    "webfetch": "ask",
+    "websearch": "ask"
+  },
+  "tools": {
+    "Read": true,
+    "Glob": true,
+    "Grep": true,
+    "Edit": true,
+    "Write": true,
+    "MultiEdit": true,
+    "Bash": true,
+    "WebFetch": false,
+    "WebSearch": false
+  },
+  "metadata": {
+    "harness": "opencode",
+    "variant": "generalist",
+    "recommended_for": ["general coding work", "provider-portable agent tasks"]
+  }
+}
