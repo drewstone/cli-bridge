@@ -26,9 +26,14 @@ export function mountModels(app: Hono, deps: { registry: BackendRegistry }): voi
       if (health.state !== 'ready') continue
 
       switch (b.name) {
-        case 'claude':
+        case 'claude-code':
           for (const model of ['sonnet', 'opus', 'haiku']) {
-            data.push({ id: `claude/${model}`, object: 'model', backend: b.name })
+            data.push({ id: `claude-code/${model}`, object: 'model', backend: b.name })
+          }
+          break
+        case 'kimi-code':
+          for (const model of ['kimi-for-coding', 'kimi-k2-0905-preview']) {
+            data.push({ id: `kimi-code/${model}`, object: 'model', backend: b.name })
           }
           break
         case 'claudish':

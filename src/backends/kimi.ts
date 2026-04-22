@@ -180,8 +180,9 @@ export class KimiBackend implements Backend {
   }
 
   private extractModel(fullModel: string): string | null {
-    if (fullModel.toLowerCase() === this.name) return null
-    if (fullModel.startsWith(this.prefix)) {
+    const lower = fullModel.toLowerCase()
+    if (lower === this.name) return null
+    if (lower.startsWith(this.prefix)) {
       const rest = fullModel.slice(this.prefix.length)
       return rest.length > 0 ? rest : null
     }
