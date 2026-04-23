@@ -74,19 +74,24 @@ export class PassthroughBackend implements Backend {
     // their own bare model ids ("gpt-4o", not "openai/gpt-4o").
     const bareModel = req.model.slice(provider.prefix.length)
 
+    const body: Record<string, unknown> = {
+      model: bareModel,
+      messages: req.messages,
+      stream: true,
+      temperature: req.temperature,
+      max_tokens: req.max_tokens,
+    }
+    if (req.responseFormat) {
+      body.response_format = req.responseFormat
+    }
+
     const res = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${provider.apiKey}`,
       },
-      body: JSON.stringify({
-        model: bareModel,
-        messages: req.messages,
-        stream: true,
-        temperature: req.temperature,
-        max_tokens: req.max_tokens,
-      }),
+      body: JSON.stringify(body),
       signal,
     })
 

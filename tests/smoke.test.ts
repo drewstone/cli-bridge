@@ -22,6 +22,8 @@ import { CodexBackend } from '../src/backends/codex.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountSessions } from '../src/routes/sessions.js'
+import { mountHealth } from '../src/routes/health.js'
+import { mountModels } from '../src/routes/models.js'
 
 class FakeBackend implements Backend {
   constructor(readonly name: string) {}
@@ -493,6 +495,52 @@ describe('KimiBackend JSON mode (buildPrompt)', () => {
     )
     expect(prompt).toContain('Be precise.')
     expect(prompt).toContain('summarize this repo')
+  })
+})
+
+describe('GET /health', () => {
+  it('reports ok when at least one backend is ready', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('claude'))
+    mountHealth(app, { registry })
+    const res = await app.request('/health')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { status: string; backends: Array<{ state: string }> }
+    expect(body.status).toBe('ok')
+    expect(body.backends[0]!.state).toBe('ready')
+  })
+
+  it('reports degraded (503) when no backends are ready', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry()
+    mountHealth(app, { registry })
+    const res = await app.request('/health')
+    expect(res.status).toBe(503)
+    const body = await res.json() as { status: string }
+    expect(body.status).toBe('degraded')
+  })
+})
+
+describe('GET /v1/models', () => {
+  it('lists models for ready backends only', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('claude-code'))
+    mountModels(app, { registry })
+    const res = await app.request('/v1/models')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<{ id: string; backend: string }> }
+    expect(body.data.length).toBeGreaterThan(0)
+    expect(body.data.some((m) => m.backend === 'claude-code')).toBe(true)
+  })
+
+  it('excludes models from unavailable backends', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry()
+    mountModels(app, { registry })
+    const res = await app.request('/v1/models')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<unknown> }
+    expect(body.data).toHaveLength(0)
   })
 })
 
