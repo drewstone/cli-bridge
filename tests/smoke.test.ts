@@ -18,6 +18,8 @@ import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { KimiBackend } from '../src/backends/kimi.js'
+import { CodexBackend } from '../src/backends/codex.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 
 class FakeBackend implements Backend {
@@ -128,6 +130,28 @@ describe('KimiBackend model parsing', () => {
     expect(b.resolveCliModel('kimi-code/kimi-k2.6')).toBeNull()
     expect(b.resolveCliModel('kimi-code')).toBeNull()
     expect(b.resolveCliModel('kimi-code/kimi-for-coding')).toBe('kimi-code/kimi-for-coding')
+  })
+})
+
+describe('CodexBackend model parsing', () => {
+  const b = new CodexBackend({ bin: '/nonexistent', timeoutMs: 1000 })
+  it('matches bare name and prefix', () => {
+    expect(b.matches('codex')).toBe(true)
+    expect(b.matches('codex/gpt-5-codex')).toBe(true)
+    expect(b.matches('CODEX/GPT-5')).toBe(true) // case-insensitive
+    expect(b.matches('codex-fake')).toBe(false)
+    expect(b.matches('claude-code/sonnet')).toBe(false)
+  })
+})
+
+describe('OpencodeBackend model parsing', () => {
+  const b = new OpencodeBackend({ bin: '/nonexistent', timeoutMs: 1000 })
+  it('matches bare name and prefix', () => {
+    expect(b.matches('opencode')).toBe(true)
+    expect(b.matches('opencode/kimi-for-coding')).toBe(true)
+    expect(b.matches('OPENCODE/anthropic/claude-sonnet')).toBe(true) // case-insensitive
+    expect(b.matches('opencode-fake')).toBe(false)
+    expect(b.matches('claude-code/sonnet')).toBe(false)
   })
 })
 

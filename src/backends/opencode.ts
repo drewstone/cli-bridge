@@ -23,6 +23,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { resolvePromptMessages } from './profile-support.js'
 
 export interface OpencodeBackendOptions {
   bin: string
@@ -65,7 +66,7 @@ export class OpencodeBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
-    const prompt = this.flattenPrompt(req.messages)
+    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const model = this.extractModel(req.model)
 
     const args: string[] = ['run', '--format', 'json']
@@ -75,7 +76,7 @@ export class OpencodeBackend implements Backend {
 
     const child = spawn(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: session?.cwd ?? process.cwd(),
+      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: process.env,
     })
 

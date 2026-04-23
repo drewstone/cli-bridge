@@ -10,8 +10,8 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 |---|---|---|
 | `claude/` | ✓ | [Claude Code](https://github.com/anthropics/claude-code) CLI — your Claude Max / Pro subscription |
 | `claudish/` | ✓ | Claude Code + [claudish](https://github.com/MadAppGang/claudish) — Claude's workflow, a different brain |
-| `codex/` | ◦ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
-| `opencode/` | ◦ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
+| `codex/` | ✓ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
+| `opencode/` | ✓ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
 | `factory/` | ◦ | [Factory Droid](https://docs.factory.ai/) |
 | `amp/` | ◦ | [Sourcegraph Amp](https://ampcode.com/) |
 | `forge/` | ◦ | [Forge Code](https://github.com/antinomyhq/forge) |
