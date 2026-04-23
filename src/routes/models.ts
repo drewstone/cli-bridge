@@ -48,11 +48,11 @@ export function mountModels(
           }
           break
         case 'codex':
-          data.push({ id: 'codex/gpt-5-codex', object: 'model', backend: b.name, note: 'stubbed' })
+          data.push({ id: 'codex/gpt-5-codex', object: 'model', backend: b.name })
           break
         case 'opencode':
-          data.push({ id: 'opencode/kimi-for-coding', object: 'model', backend: b.name, note: 'stubbed — Kimi Code via opencode-kimi-full' })
-          data.push({ id: 'opencode/anthropic/claude-sonnet-4-5', object: 'model', backend: b.name, note: 'stubbed' })
+          data.push({ id: 'opencode/kimi-for-coding', object: 'model', backend: b.name, note: 'Kimi Code via opencode-kimi-full' })
+          data.push({ id: 'opencode/anthropic/claude-sonnet-4-5', object: 'model', backend: b.name })
           break
         case 'factory':
           data.push({ id: 'factory/droid', object: 'model', backend: b.name, note: 'stubbed' })
