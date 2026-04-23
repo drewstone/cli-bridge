@@ -21,6 +21,7 @@ import { KimiBackend } from '../src/backends/kimi.js'
 import { CodexBackend } from '../src/backends/codex.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
+import { mountSessions } from '../src/routes/sessions.js'
 
 class FakeBackend implements Backend {
   constructor(readonly name: string) {}
@@ -492,5 +493,64 @@ describe('KimiBackend JSON mode (buildPrompt)', () => {
     )
     expect(prompt).toContain('Be precise.')
     expect(prompt).toContain('summarize this repo')
+  })
+})
+
+describe('GET /v1/sessions', () => {
+  let dir: string
+  let sessions: SessionStore
+  let app: Hono
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cli-bridge-test-'))
+    sessions = new SessionStore(dir)
+    app = new Hono()
+    mountSessions(app, { sessions })
+  })
+  afterEach(() => {
+    sessions.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('lists sessions with default limit', async () => {
+    sessions.upsert({ externalId: 'a', backend: 'claude', internalId: 'i-a' })
+    sessions.upsert({ externalId: 'b', backend: 'kimi', internalId: 'i-b' })
+    const res = await app.request('/v1/sessions')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: unknown[] }
+    expect(body.data).toHaveLength(2)
+  })
+
+  it('caps limit at 500', async () => {
+    const res = await app.request('/v1/sessions?limit=9999')
+    expect(res.status).toBe(200)
+  })
+
+  it('falls back to default 50 when limit is non-numeric (regression guard)', async () => {
+    // Before the fix, ?limit=abc produced NaN which SQLite rejected.
+    const res = await app.request('/v1/sessions?limit=abc')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: unknown[] }
+    expect(Array.isArray(body.data)).toBe(true)
+  })
+
+  it('deletes a session by externalId', async () => {
+    sessions.upsert({ externalId: 'del', backend: 'claude', internalId: 'i-del' })
+    const res = await app.request('/v1/sessions/del', { method: 'DELETE' })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { deleted: number }
+    expect(body.deleted).toBe(1)
+    expect(sessions.get('del', 'claude')).toBeNull()
+  })
+
+  it('deletes only the specified backend when backend query is given', async () => {
+    sessions.upsert({ externalId: 'shared', backend: 'claude', internalId: 'i-c' })
+    sessions.upsert({ externalId: 'shared', backend: 'kimi', internalId: 'i-k' })
+    const res = await app.request('/v1/sessions/shared?backend=claude', { method: 'DELETE' })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { deleted: number }
+    expect(body.deleted).toBe(1)
+    expect(sessions.get('shared', 'claude')).toBeNull()
+    expect(sessions.get('shared', 'kimi')).not.toBeNull()
   })
 })
