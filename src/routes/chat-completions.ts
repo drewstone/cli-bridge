@@ -83,8 +83,7 @@ export function mountChatCompletions(
       ?? c.req.header('x-resume')
       ?? c.req.header('x-conversation-id')
       ?? undefined
-    const bodySession = parsed.data.session_id
-      ?? (parsed.data as Record<string, unknown>).resume_id as string | undefined
+    const bodySession = parsed.data.session_id ?? parsed.data.resume_id
 
     let mode
     try {
