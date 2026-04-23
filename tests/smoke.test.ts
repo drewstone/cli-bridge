@@ -32,6 +32,9 @@ class FakeBackend implements Backend {
     yield { content: req.messages[0]?.content ?? '' }
     yield { content: ` mode=${req.mode ?? 'byob'}` }
     yield { content: session ? ` turn=${session.turns + 1}` : '' }
+    if (req.cwd) yield { content: ` cwd=${req.cwd}` }
+    const prompt = (req.agent_profile as Record<string, unknown> | undefined)?.prompt as Record<string, unknown> | undefined
+    if (typeof prompt?.systemPrompt === 'string') yield { content: ` profile=${prompt.systemPrompt}` }
     yield { finish_reason: 'stop', usage: { input_tokens: 3, output_tokens: 5 } }
   }
 }
@@ -114,11 +117,17 @@ describe('KimiBackend model parsing', () => {
   it('matches bare name and prefix', () => {
     expect(b.matches('kimi-code')).toBe(true)
     expect(b.matches('kimi-code/kimi-for-coding')).toBe(true)
-    expect(b.matches('kimi-code/kimi-k2-0905-preview')).toBe(true)
+    expect(b.matches('kimi-code/kimi-k2.6')).toBe(true)
     expect(b.matches('KIMI-CODE/kimi-for-coding')).toBe(true) // case-insensitive
     expect(b.matches('kimi/kimi-for-coding')).toBe(false) // old prefix no longer claimed
     expect(b.matches('kimi')).toBe(false) // bare old name no longer claimed
     expect(b.matches('claude-code/sonnet')).toBe(false)
+  })
+
+  it('omits --model for the K2.6 alias so the local default stays authoritative', () => {
+    expect(b.resolveCliModel('kimi-code/kimi-k2.6')).toBeNull()
+    expect(b.resolveCliModel('kimi-code')).toBeNull()
+    expect(b.resolveCliModel('kimi-code/kimi-for-coding')).toBe('kimi-code/kimi-for-coding')
   })
 })
 
@@ -328,6 +337,43 @@ describe('POST /v1/chat/completions', () => {
     expect(res.status).toBe(200)
   })
 
+  it('persists cwd and agent_profile into resumed sessions', async () => {
+    const profile = {
+      name: 'local-coder',
+      prompt: { systemPrompt: 'Be surgical.' },
+      skills: ['critical-audit'],
+    }
+    await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'one' }],
+        session_id: 'profile-1',
+        cwd: '/tmp/demo',
+        agent_profile: profile,
+        stream: false,
+      }),
+    })
+    const stored = sessions.get('profile-1', 'claude')
+    expect(stored?.cwd).toBe('/tmp/demo')
+    expect(stored?.metadata.agent_profile).toEqual(profile)
+
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'two' }],
+        session_id: 'profile-1',
+        stream: false,
+      }),
+    })
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0]?.message.content).toContain('cwd=/tmp/demo')
+    expect(body.choices[0]?.message.content).toContain('profile=Be surgical.')
+  })
+
   it('rejects response_format with an invalid type', async () => {
     const res = await app.request('/v1/chat/completions', {
       method: 'POST',
@@ -376,6 +422,18 @@ describe('ClaudeBackend JSON mode (buildArgs)', () => {
     )
     expect(args).not.toContain('--append-system-prompt')
   })
+
+  it('includes profile-derived system prompt in --append-system-prompt', () => {
+    const args = b.buildArgs(
+      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      null,
+      'byob',
+      'summarize',
+    )
+    const i = args.indexOf('--append-system-prompt')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toContain('Be precise.')
+  })
 })
 
 describe('KimiBackend JSON mode (buildPrompt)', () => {
@@ -386,20 +444,29 @@ describe('KimiBackend JSON mode (buildPrompt)', () => {
   }
 
   it('prepends the JSON directive when responseFormat is json_object', () => {
-    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'json_object' } })
+    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'json_object' } }, null)
     expect(prompt).toMatch(/^Respond with ONLY a single JSON object/)
     expect(prompt).toContain('No markdown fences')
     expect(prompt).toContain('summarize this repo')
   })
 
   it('does NOT prepend the directive when responseFormat is absent (regression guard)', () => {
-    const prompt = b.buildPrompt(baseReq)
+    const prompt = b.buildPrompt(baseReq, null)
     expect(prompt).not.toContain('single JSON object')
     expect(prompt).toBe('summarize this repo')
   })
 
   it('does NOT prepend the directive when responseFormat is text', () => {
-    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'text' } })
+    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'text' } }, null)
     expect(prompt).not.toContain('single JSON object')
+  })
+
+  it('prepends profile-derived context for local harnesses', () => {
+    const prompt = b.buildPrompt(
+      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      null,
+    )
+    expect(prompt).toContain('Be precise.')
+    expect(prompt).toContain('summarize this repo')
   })
 })

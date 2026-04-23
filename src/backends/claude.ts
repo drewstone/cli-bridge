@@ -25,6 +25,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { renderLocalHarnessProfilePreamble, resolveAgentProfile } from './profile-support.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -147,7 +148,7 @@ export class ClaudeBackend implements Backend {
 
     const child = spawn(this.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: session?.cwd ?? process.cwd(),
+      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: childEnv,
     })
 
@@ -256,8 +257,12 @@ export class ClaudeBackend implements Backend {
   ): string[] {
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
 
-    if (wantsJsonObject(req)) {
-      args.push('--append-system-prompt', JSON_MODE_DIRECTIVE)
+    const appendPrompts = [
+      renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
+      wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
+    ].filter((value): value is string => Boolean(value))
+    if (appendPrompts.length) {
+      args.push('--append-system-prompt', appendPrompts.join('\n\n'))
     }
 
     // hosted-safe: force Claude Code into plan mode and hard-disable

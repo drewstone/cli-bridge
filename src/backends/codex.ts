@@ -31,6 +31,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { resolvePromptMessages } from './profile-support.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -76,7 +77,7 @@ export class CodexBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'codex hosted-safe requires verified --sandbox read-only audit')
 
-    const prompt = this.flattenPrompt(req.messages)
+    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const modelArg = this.extractModel(req.model)
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
@@ -92,7 +93,7 @@ export class CodexBackend implements Backend {
 
     const child = spawn(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: session?.cwd ?? process.cwd(),
+      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: process.env,
     })
 

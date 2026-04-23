@@ -104,6 +104,36 @@ Subsequent calls with the same `X-Session-Id` resume the conversation. Claude Co
 
 OpenAI Chat Completions. Model id routes via harness prefix. Supports streaming (default) or `stream: false`. Session resume via `session_id` body field or `X-Session-Id` header.
 
+Extra fields this bridge accepts beyond vanilla OpenAI:
+
+- `cwd`: persist a working directory for the session and run future resumed turns there
+- `agent_profile`: full `AgentProfile` object
+
+Behavior:
+
+- `sandbox` backends honor the full `agent_profile` natively
+- local harness backends (`claude-code`, `codex`, `kimi-code`) persist the full profile, honor the executable subset directly where possible, and compile the remaining context into a deterministic system-prompt preamble
+
+Example:
+
+```bash
+curl http://127.0.0.1:3344/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer '"$BRIDGE_BEARER" \
+  -d '{
+    "model": "codex/gpt-5.4-mini",
+    "session_id": "agent-builder-local",
+    "cwd": "/Users/drew/webb/agent-builder",
+    "agent_profile": {
+      "name": "local-coder",
+      "prompt": { "systemPrompt": "Be surgical. No placeholder logic." },
+      "skills": ["critical-audit"]
+    },
+    "messages": [{ "role": "user", "content": "inspect the repo and propose the smallest viable fix" }],
+    "stream": false
+  }'
+```
+
 ### `GET /v1/models`
 
 Lists model ids each ready backend claims, with which harness serves them.

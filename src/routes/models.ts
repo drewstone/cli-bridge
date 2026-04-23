@@ -36,7 +36,7 @@ export function mountModels(
           }
           break
         case 'kimi-code':
-          for (const model of ['kimi-for-coding', 'kimi-k2-0905-preview']) {
+          for (const model of ['kimi-for-coding', 'kimi-k2.6']) {
             data.push({ id: `kimi-code/${model}`, object: 'model', backend: b.name })
           }
           break

@@ -9,8 +9,8 @@
  * Model id scheme: `<harness>/<model>` where `<harness>` defaults to
  * `kimi-code` (the product name Moonshot ships the CLI under) and
  * `<model>` is what Kimi CLI accepts (e.g., `kimi-for-coding`,
- * `kimi-k2-0905-preview`, or the CLI's configured default if the
- * model is omitted).
+ * `kimi-k2.6`, or the CLI's configured default if the model is
+ * omitted).
  *
  * Why Kimi CLI over opencode + opencode-kimi-full:
  *   - Official Moonshot client — Moonshot's server-side gate lists
@@ -30,11 +30,15 @@
  */
 
 import { spawn } from 'node:child_process'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { resolvePromptMessages } from './profile-support.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -84,10 +88,14 @@ export class KimiBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
-    const prompt = this.buildPrompt(req)
-    const model = this.extractModel(req.model)
+    const prompt = this.buildPrompt(req, session)
+    const model = this.resolveCliModel(req.model)
+    const configFile = await this.prepareConfigFile(req.model)
 
     const args = ['--print', '--output-format', 'stream-json', '--prompt', prompt]
+    if (configFile) {
+      args.push('--config-file', configFile)
+    }
     if (session?.internalId) {
       args.push('--resume', session.internalId)
     }
@@ -97,7 +105,7 @@ export class KimiBackend implements Backend {
 
     const child = spawn(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: session?.cwd ?? process.cwd(),
+      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: process.env,
     })
 
@@ -223,6 +231,7 @@ export class KimiBackend implements Backend {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
+      if (configFile) await cleanupConfigFile(configFile)
     }
   }
 
@@ -236,31 +245,84 @@ export class KimiBackend implements Backend {
    * Exposed (not private) so tests can verify the prefix without
    * spawning a real subprocess.
    */
-  buildPrompt(req: ChatRequest): string {
-    const flat = this.flattenPrompt(req.messages)
+  buildPrompt(req: ChatRequest, session: SessionRecord | null): string {
+    const flat = this.flattenPrompt(resolvePromptMessages(req, session))
     if (wantsJsonObject(req)) {
       return `${JSON_MODE_DIRECTIVE}\n\n${flat}`
     }
     return flat
   }
 
-  private flattenPrompt(messages: ChatRequest['messages']): string {
-    if (messages.length === 1) return messages[0]?.content ?? ''
-    return messages.map((m) => `[${m.role}] ${m.content}`).join('\n\n')
-  }
+  /** Exposed so tests can verify when the backend omits `--model`. */
+  resolveCliModel(fullModel: string): string | null {
+    // K2.6 is the required path on this machine, but the current Kimi
+    // CLI is unstable when passed `--model kimi-code/kimi-k2.6`
+    // explicitly. When the external caller requests that exact model,
+    // route to the CLI's default model instead and require the local
+    // config to pin that default to K2.6.
+    const lower = fullModel.toLowerCase()
+    if (lower === this.name || lower === `${this.prefix}kimi-k2.6`) return null
 
-  private extractModel(fullModel: string): string | null {
     // Kimi's config.toml uses `<provider>/<model>` as the literal key
     // (e.g. `kimi-code/kimi-for-coding`) — the harness prefix IS the
     // provider side of that key. Pass the full string through; stripping
     // the prefix makes `--model kimi-for-coding` fail with "LLM not set".
-    // Bare harness name alone → let kimi pick its default model.
-    // Case-insensitive comparison preserved from the rename PR.
-    const lower = fullModel.toLowerCase()
-    if (lower === this.name) return null
     if (lower.startsWith(this.prefix)) return fullModel
     return null
   }
+
+  private async prepareConfigFile(fullModel: string): Promise<string | null> {
+    if (fullModel.toLowerCase() !== `${this.prefix}kimi-k2.6`) return null
+
+    const home = process.env.HOME
+    if (!home) throw new BackendError('HOME is not set for kimi backend', 'not_configured')
+
+    const source = join(home, '.kimi', 'config.toml')
+    let config: string
+    try {
+      config = await readFile(source, 'utf8')
+    } catch (error) {
+      throw new BackendError(`failed to read Kimi config: ${source}`, 'not_configured', error)
+    }
+
+    const next = ensureK2DefaultConfig(config)
+    const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-kimi-'))
+    const file = join(dir, 'config.toml')
+    await writeFile(file, next, 'utf8')
+    return file
+  }
+
+  private flattenPrompt(messages: ChatRequest['messages']): string {
+    if (messages.length === 1) return messages[0]?.content ?? ''
+    return messages.map((m) => `[${m.role}] ${m.content}`).join('\n\n')
+  }
+}
+
+function ensureK2DefaultConfig(config: string): string {
+  const nextDefault = 'default_model = "kimi-code/kimi-k2.6"'
+  let next = config
+
+  if (/^default_model\s*=.*$/m.test(next)) {
+    next = next.replace(/^default_model\s*=.*$/m, nextDefault)
+  } else {
+    next = `${nextDefault}\n${next}`
+  }
+
+  if (!/\[models\."kimi-code\/kimi-k2\.6"\]/.test(next)) {
+    next += '\n\n[models."kimi-code/kimi-k2.6"]\n'
+    next += 'provider = "managed:kimi-code"\n'
+    next += 'model = "kimi-k2.6"\n'
+    next += 'max_context_size = 262144\n'
+    next += 'capabilities = ["thinking", "video_in", "image_in"]\n'
+    next += 'display_name = "Kimi-k2.6"\n'
+  }
+
+  return next
+}
+
+async function cleanupConfigFile(file: string): Promise<void> {
+  await rm(file, { force: true }).catch(() => undefined)
+  await rm(dirname(file), { recursive: true, force: true }).catch(() => undefined)
 }
 
 function pickSessionId(ev: Record<string, unknown>): string | null {

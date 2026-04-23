@@ -43,6 +43,8 @@ const chatRequestSchema = z.object({
   response_format: z.object({
     type: z.enum(['text', 'json_object']),
   }).optional(),
+  agent_profile: z.unknown().optional(),
+  cwd: z.string().optional(),
   metadata: z.record(z.unknown()).optional(),
 })
 
@@ -110,12 +112,14 @@ export function mountChatCompletions(
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
-    const { response_format, ...rest } = parsed.data
+    const { response_format, agent_profile, cwd, ...rest } = parsed.data
     const req: ChatRequest = {
       ...rest,
       session_id: bodySession ?? headerSession,
       mode,
       ...(response_format ? { responseFormat: response_format } : {}),
+      ...(agent_profile ? { agent_profile: agent_profile as ChatRequest['agent_profile'] } : {}),
+      ...(cwd ? { cwd } : {}),
       metadata: {
         ...(parsed.data.metadata ?? {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
@@ -135,6 +139,12 @@ export function mountChatCompletions(
     const session = req.session_id
       ? deps.sessions.get(req.session_id, backend.name)
       : null
+    if (!req.agent_profile && session?.metadata?.agent_profile && typeof session.metadata.agent_profile === 'object') {
+      req.agent_profile = session.metadata.agent_profile as ChatRequest['agent_profile']
+    }
+    if (!req.cwd && session?.cwd) {
+      req.cwd = session.cwd
+    }
 
     const ac = new AbortController()
     c.req.raw.signal.addEventListener('abort', () => ac.abort(), { once: true })
@@ -155,7 +165,12 @@ export function mountChatCompletions(
                 externalId: req.session_id,
                 backend: backend.name,
                 internalId: delta.internal_session_id,
-                metadata: { model: req.model },
+                cwd: req.cwd ?? session?.cwd ?? null,
+                metadata: {
+                  model: req.model,
+                  ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
+                  ...(req.metadata ?? {}),
+                },
               })
             }
             yield delta
