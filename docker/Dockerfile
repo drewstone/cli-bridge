@@ -51,7 +51,7 @@ COPY . .
 RUN pnpm typecheck
 
 ENV BRIDGE_HOST=0.0.0.0
-ENV BRIDGE_PORT=8787
+ENV BRIDGE_PORT=3344
 ENV BRIDGE_DATA_DIR=/data
 VOLUME /data
 
@@ -65,5 +65,5 @@ VOLUME /root/.opencode
 VOLUME /root/.kimi
 VOLUME /root/.config/kimi
 
-EXPOSE 8787
+EXPOSE 3344
 CMD ["pnpm", "start"]

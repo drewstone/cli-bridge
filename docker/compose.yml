@@ -10,7 +10,7 @@
 # Remote deploy (Hetzner, etc.):
 #   Same setup, but bind on 127.0.0.1 and front with Caddy/nginx that
 #   terminates TLS and adds an Authorization: Bearer header. Never
-#   expose cli-bridge to the public internet on port 8787 directly.
+#   expose cli-bridge to the public internet on port 3344 directly.
 
 services:
   cli-bridge:
@@ -27,12 +27,12 @@ services:
       - ~/.codex:/root/.codex
       - ~/.config/opencode:/root/.config/opencode
     ports:
-      # Loopback-only by default. Change to "0.0.0.0:8787:8787" (with a
+      # Loopback-only by default. Change to "0.0.0.0:3344:3344" (with a
       # bearer!) if you need remote access, or better, front with a
       # reverse proxy on the host.
-      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:3344:3344"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3344/health"]
       interval: 30s
       timeout: 5s
       retries: 3
