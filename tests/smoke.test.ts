@@ -461,6 +461,34 @@ describe('ClaudeBackend JSON mode (buildArgs)', () => {
     expect(i).toBeGreaterThan(-1)
     expect(args[i + 1]).toContain('Be precise.')
   })
+
+  it('byob mode sets --permission-mode bypassPermissions (regression: without this every Write/Edit blocks)', () => {
+    // 2026-04-24: gen44 claude smoke showed `The file write requests
+    // need user approval` on every leaf. Root cause: claude CLI defaults
+    // to interactive approval, which has no approver in the non-TTY
+    // bridge pipeline. byob explicitly means "caller trusts the tools"
+    // (see src/modes.ts), so bypass is correct.
+    const args = b.buildArgs(baseReq, null, 'byob', 'summarize')
+    const i = args.indexOf('--permission-mode')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toBe('bypassPermissions')
+    // And must NOT carry hosted-safe's plan/disallowed-tools baggage
+    expect(args).not.toContain('plan')
+    expect(args).not.toContain('--disallowed-tools')
+  })
+
+  it('hosted-safe mode still uses plan + disallowed-tools, not bypass', () => {
+    const args = b.buildArgs(baseReq, null, 'hosted-safe', 'summarize')
+    const i = args.indexOf('--permission-mode')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toBe('plan')
+    const d = args.indexOf('--disallowed-tools')
+    expect(d).toBeGreaterThan(-1)
+    expect(args[d + 1]).toContain('Bash')
+    expect(args[d + 1]).toContain('Edit')
+    expect(args[d + 1]).toContain('Write')
+    expect(args).not.toContain('bypassPermissions')
+  })
 })
 
 describe('KimiBackend JSON mode (buildPrompt)', () => {

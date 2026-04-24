@@ -275,6 +275,16 @@ export class ClaudeBackend implements Backend {
         '--permission-mode', 'plan',
         '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
       )
+    } else if (mode === 'byob') {
+      // byob = caller runs their own bridge and trusts the tool calls;
+      // the whole point of the mode is "full harness tools available"
+      // (see src/modes.ts). Claude Code's default permission mode is
+      // interactive approval, which in a non-TTY bridge pipeline hangs
+      // every Write/Edit call (worker emits `The file write requests
+      // need user approval` and no approver exists). Use bypass mode
+      // explicitly — matches what kimi.ts does implicitly by not
+      // exposing a permission flag at all.
+      args.push('--permission-mode', 'bypassPermissions')
     }
 
     if (session?.internalId) {
