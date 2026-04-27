@@ -46,6 +46,32 @@ const chatRequestSchema = z.object({
   agent_profile: z.unknown().optional(),
   cwd: z.string().optional(),
   metadata: z.record(z.unknown()).optional(),
+  /**
+   * Where the harness runs.
+   *
+   *   `host` (default)  — spawn the chosen harness CLI (claude/kimi/...)
+   *                       on the host. Uses cli-bridge's local executor
+   *                       and the operator's CLI subscription auth.
+   *
+   *   `sandbox`         — provision a Tangle sandbox with the equivalent
+   *                       in-container backend (kimi-code, claude-code,
+   *                       codex, opencode, ...) and dispatch the prompt
+   *                       there via SubagentRunner-style sidecar.
+   *
+   * Same agent_profile + prompt + cwd contract regardless. Switching
+   * targets is a one-field change for the caller.
+   */
+  execution: z.object({
+    kind: z.enum(['host', 'sandbox']),
+    /** When kind=sandbox, the repoUrl to clone into /workspace before dispatch. */
+    repoUrl: z.string().optional(),
+    /** When kind=sandbox, the git ref to check out post-clone. */
+    gitRef: z.string().optional(),
+    /** When kind=sandbox, the sandbox capability tier (defaults to 'base'). */
+    capability: z.string().optional(),
+    /** When kind=sandbox, the sandbox TTL in seconds (default 30 min). */
+    ttlSeconds: z.number().int().positive().optional(),
+  }).optional(),
 })
 
 export function mountChatCompletions(
@@ -111,7 +137,7 @@ export function mountChatCompletions(
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
-    const { response_format, agent_profile, cwd, ...rest } = parsed.data
+    const { response_format, agent_profile, cwd, execution, ...rest } = parsed.data
     const req: ChatRequest = {
       ...rest,
       session_id: bodySession ?? headerSession,
@@ -119,6 +145,7 @@ export function mountChatCompletions(
       ...(response_format ? { responseFormat: response_format } : {}),
       ...(agent_profile ? { agent_profile: agent_profile as ChatRequest['agent_profile'] } : {}),
       ...(cwd ? { cwd } : {}),
+      ...(execution ? { execution: execution as ChatRequest['execution'] } : {}),
       metadata: {
         ...(parsed.data.metadata ?? {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
@@ -148,7 +175,39 @@ export function mountChatCompletions(
     const ac = new AbortController()
     c.req.raw.signal.addEventListener('abort', () => ac.abort(), { once: true })
 
-    const source = backend.chat(req, session, ac.signal)
+    // Execution router: when the caller asks for `execution: 'sandbox'`
+    // on a host harness (claude/kimi/codex/...), delegate to the
+    // SandboxBackend instead of spawning the local CLI. The agent_profile
+    // + prompt + cwd contract is identical — only the execution location
+    // changes. Map the host harness → in-container backend type via
+    // `harnessToSandboxBackendType`.
+    let source
+    if (req.execution?.kind === 'sandbox' && backend.name !== 'sandbox') {
+      const sandboxBackend = deps.registry.byName('sandbox')
+      if (!sandboxBackend) {
+        return c.json({
+          error: {
+            message: 'execution=sandbox requested but the sandbox backend is not registered. Set TANGLE_API_KEY/SANDBOX_API_KEY + SANDBOX_BASE_URL.',
+            type: 'not_found_error',
+          },
+        }, 503)
+      }
+      const sandboxBackendType = harnessToSandboxBackendType(backend.name)
+      // Stash the desired in-container backend type on metadata so
+      // SandboxBackend.chat() picks it up. Same path as
+      // forwardedAuthorization — opaque metadata field that backends
+      // honour by convention.
+      const delegatedReq: ChatRequest = {
+        ...req,
+        metadata: {
+          ...(req.metadata ?? {}),
+          sandboxBackendType,
+        },
+      }
+      source = sandboxBackend.chat(delegatedReq, session, ac.signal)
+    } else {
+      source = backend.chat(req, session, ac.signal)
+    }
 
     // Persist internal session id as it flows in. Returns a new
     // AsyncIterable<ChatDelta> so the typed boundary stays clean.
@@ -242,4 +301,24 @@ function errorResponse(c: Context, err: unknown): Response {
   }
   const message = err instanceof Error ? err.message : String(err)
   return c.json({ error: { message, type: 'server_error' } }, 500)
+}
+
+/**
+ * Map a host harness name (the `Backend.name` field — `claude`,
+ * `kimi-code`, `codex`, `opencode`, `amp`, `factory`, `forge`) to the
+ * matching in-container backend type the sandbox SDK accepts. The two
+ * sets are mostly 1:1; the only divergence today is `factory` (host)
+ * vs `factory-droids` (sandbox), which mirrors the upstream package
+ * naming conventions.
+ *
+ * Unknown harnesses fall through as-is — sandbox-api will 400 if it
+ * doesn't recognise the type, which is the right loud failure.
+ */
+function harnessToSandboxBackendType(harnessName: string): string {
+  switch (harnessName) {
+    case 'claude': return 'claude-code'
+    case 'claudish': return 'claude-code'
+    case 'factory': return 'factory-droids'
+    default: return harnessName
+  }
 }
