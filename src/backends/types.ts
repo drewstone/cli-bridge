@@ -16,6 +16,7 @@
 
 import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
+import type { AgentProfile } from '@tangle-network/sandbox'
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -48,6 +49,10 @@ export interface ChatRequest {
    * treat fence-stripping as a belt-and-suspenders fallback.
    */
   responseFormat?: { type: 'text' | 'json_object' }
+  /** Optional caller-declared AgentProfile. Sandbox uses it natively; local harnesses honor a prompt/context subset. */
+  agent_profile?: AgentProfile
+  /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */
+  cwd?: string
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
 }

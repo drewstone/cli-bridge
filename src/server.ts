@@ -27,25 +27,69 @@ import { mountHealth } from './routes/health.js'
 import { mountModels } from './routes/models.js'
 import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
+import { ContainerPool } from './executors/container-pool.js'
+import { createDockerSpawner } from './executors/docker.js'
+import type { Spawner } from './executors/types.js'
+import type { BackendExecutorConfig } from './config.js'
 
-export function buildApp(config: Config): {
+export interface BuildAppExtras {
+  /** Disposers to await on graceful shutdown — pool teardown lives here. */
+  shutdownHooks: Array<() => Promise<void>>
+}
+
+/**
+ * Build a Spawner for a backend, plus the shutdown hook that tears down
+ * the underlying container pool when the bridge exits. Returns null when
+ * the backend's executor is `host` — backends fall back to their default
+ * hostSpawner in that case.
+ */
+async function buildExecutorForBackend(
+  cfg: BackendExecutorConfig | undefined,
+  extras: BuildAppExtras,
+): Promise<Spawner | null> {
+  if (!cfg || cfg.kind !== 'docker') return null
+  if (!cfg.image || !cfg.poolSize || !cfg.containerConfigDir) {
+    throw new Error(`backend ${cfg.name} executor=docker but missing image/poolSize/containerConfigDir`)
+  }
+  const pool = await ContainerPool.create({
+    size: cfg.poolSize,
+    image: cfg.image,
+    namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
+    oauthMode: cfg.oauthMode ?? 'share',
+    ...(cfg.oauthMode === 'share' || !cfg.oauthMode
+      ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }
+      : {
+          perSlotVolumePrefix: `${cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`}-oauth`,
+          perSlotMountTarget: cfg.containerConfigDir,
+        }),
+    onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
+  })
+  extras.shutdownHooks.push(() => pool.destroy())
+  return createDockerSpawner({ pool })
+}
+
+export async function buildApp(config: Config): Promise<{
   app: Hono
   sessions: SessionStore
   registry: BackendRegistry
   catalog: ProfileCatalog
-} {
+  extras: BuildAppExtras
+}> {
   const sessions = new SessionStore(config.dataDir)
   const registry = new BackendRegistry()
+  const extras: BuildAppExtras = { shutdownHooks: [] }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
 
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
   if (config.backends.has('claude')) {
+    const spawner = await buildExecutorForBackend(config.executors.claude, extras)
     registry.register(new ClaudeBackend({
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
       harness: 'claude-code',
+      ...(spawner ? { spawner } : {}),
     }))
   }
   if (config.backends.has('claudish')) {
@@ -59,16 +103,28 @@ export function buildApp(config: Config): {
     }))
   }
   if (config.backends.has('codex')) {
-    registry.register(new CodexBackend({ bin: config.codexBin, timeoutMs: config.codexTimeoutMs }))
+    const spawner = await buildExecutorForBackend(config.executors.codex, extras)
+    registry.register(new CodexBackend({
+      bin: config.codexBin,
+      timeoutMs: config.codexTimeoutMs,
+      ...(spawner ? { spawner } : {}),
+    }))
   }
   if (config.backends.has('opencode')) {
-    registry.register(new OpencodeBackend({ bin: config.opencodeBin, timeoutMs: config.opencodeTimeoutMs }))
+    const spawner = await buildExecutorForBackend(config.executors.opencode, extras)
+    registry.register(new OpencodeBackend({
+      bin: config.opencodeBin,
+      timeoutMs: config.opencodeTimeoutMs,
+      ...(spawner ? { spawner } : {}),
+    }))
   }
   if (config.backends.has('kimi')) {
+    const spawner = await buildExecutorForBackend(config.executors.kimi, extras)
     registry.register(new KimiBackend({
       bin: config.kimiBin,
       timeoutMs: config.kimiTimeoutMs,
       harness: 'kimi-code',
+      ...(spawner ? { spawner } : {}),
     }))
   }
   if (config.backends.has('factory')) {
@@ -129,7 +185,7 @@ export function buildApp(config: Config): {
     endpoints: ['/health', '/v1/models', '/v1/chat/completions', '/v1/sessions'],
   }))
 
-  return { app, sessions, registry, catalog }
+  return { app, sessions, registry, catalog, extras }
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -141,15 +197,23 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const config = loadConfig()
-  const { app, sessions } = buildApp(config)
+  const { app, sessions, extras } = await buildApp(config)
   const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, (info) => {
     console.log(`[cli-bridge] listening on http://${info.address}:${info.port}  (host=${config.host})`)
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
+    for (const cfg of Object.values(config.executors)) {
+      if (cfg.kind === 'docker') {
+        console.log(`[cli-bridge] ${cfg.name} executor: docker pool size=${cfg.poolSize} image=${cfg.image}`)
+      }
+    }
   })
 
-  const shutdown = (sig: string) => {
+  const shutdown = async (sig: string) => {
     console.log(`[cli-bridge] ${sig} — shutting down`)
+    for (const hook of extras.shutdownHooks) {
+      try { await hook() } catch {}
+    }
     server.close(() => {
       sessions.close()
       process.exit(0)

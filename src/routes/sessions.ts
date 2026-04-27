@@ -9,8 +9,9 @@ import type { SessionStore } from '../sessions/store.js'
 
 export function mountSessions(app: Hono, deps: { sessions: SessionStore }): void {
   app.get('/v1/sessions', (c) => {
-    const limit = Number.parseInt(c.req.query('limit') ?? '50', 10)
-    return c.json({ data: deps.sessions.list(Math.min(Math.max(1, limit), 500)) })
+    const parsed = Number.parseInt(c.req.query('limit') ?? '50', 10)
+    const limit = Number.isNaN(parsed) ? 50 : Math.min(Math.max(1, parsed), 500)
+    return c.json({ data: deps.sessions.list(limit) })
   })
 
   app.delete('/v1/sessions/:externalId', (c) => {

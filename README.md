@@ -10,8 +10,8 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 |---|---|---|
 | `claude/` | ✓ | [Claude Code](https://github.com/anthropics/claude-code) CLI — your Claude Max / Pro subscription |
 | `claudish/` | ✓ | Claude Code + [claudish](https://github.com/MadAppGang/claudish) — Claude's workflow, a different brain |
-| `codex/` | ◦ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
-| `opencode/` | ◦ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
+| `codex/` | ✓ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
+| `opencode/` | ✓ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
 | `factory/` | ◦ | [Factory Droid](https://docs.factory.ai/) |
 | `amp/` | ◦ | [Sourcegraph Amp](https://ampcode.com/) |
 | `forge/` | ◦ | [Forge Code](https://github.com/antinomyhq/forge) |
@@ -104,6 +104,36 @@ Subsequent calls with the same `X-Session-Id` resume the conversation. Claude Co
 
 OpenAI Chat Completions. Model id routes via harness prefix. Supports streaming (default) or `stream: false`. Session resume via `session_id` body field or `X-Session-Id` header.
 
+Extra fields this bridge accepts beyond vanilla OpenAI:
+
+- `cwd`: persist a working directory for the session and run future resumed turns there
+- `agent_profile`: full `AgentProfile` object
+
+Behavior:
+
+- `sandbox` backends honor the full `agent_profile` natively
+- local harness backends (`claude-code`, `codex`, `kimi-code`) persist the full profile, honor the executable subset directly where possible, and compile the remaining context into a deterministic system-prompt preamble
+
+Example:
+
+```bash
+curl http://127.0.0.1:3344/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer '"$BRIDGE_BEARER" \
+  -d '{
+    "model": "codex/gpt-5.4-mini",
+    "session_id": "agent-builder-local",
+    "cwd": "/Users/drew/webb/agent-builder",
+    "agent_profile": {
+      "name": "local-coder",
+      "prompt": { "systemPrompt": "Be surgical. No placeholder logic." },
+      "skills": ["critical-audit"]
+    },
+    "messages": [{ "role": "user", "content": "inspect the repo and propose the smallest viable fix" }],
+    "stream": false
+  }'
+```
+
 ### `GET /v1/models`
 
 Lists model ids each ready backend claims, with which harness serves them.
@@ -137,6 +167,72 @@ Now every `claudish/<model>` call spawns Claude Code with `ANTHROPIC_BASE_URL=ht
 **Agent Builder dev** — `BYOK_CLI_ENDPOINT=http://host.docker.internal:3344` in `.dev.vars`. Forge drives your Claude Code subscription locally during development. Never ship that to production.
 
 **PR reviews & automations** — any bash cron / GitHub Action can hit `POST /v1/chat/completions` with a stable `X-Session-Id`.
+
+## Parallel mode (Docker pool)
+
+Default behavior spawns the CLI on the host. That's fine for one
+caller; under N concurrent chat() calls you hit:
+
+- shared `~/.claude` (or `~/.kimi`, `~/.codex`, `~/.config/opencode`) OAuth state
+- shared scratch dirs (multiple CLI processes touching the same tmp)
+- single CLI subprocess instance contending with itself
+
+The Docker executor solves all three: each chat() runs inside a
+pre-warmed container slot, and session_id sticks the same caller to
+the same slot so `--resume` reads the same on-disk transcript
+turn-to-turn. Works for **every subprocess backend** — claude, kimi,
+codex, opencode — through the same `Spawner` abstraction.
+
+```bash
+# 1. build the unified runtime image once (has all four CLIs installed)
+docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest .
+
+# 2. enable per backend (any subset)
+cat >> .env <<'EOF'
+CLAUDE_EXECUTOR=docker
+CLAUDE_DOCKER_POOL_SIZE=4
+KIMI_EXECUTOR=docker
+KIMI_DOCKER_POOL_SIZE=2
+CODEX_EXECUTOR=host
+OPENCODE_EXECUTOR=host
+EOF
+
+# Or flip everything at once:
+# echo 'BRIDGE_DEFAULT_EXECUTOR=docker' >> .env
+
+# 3. start as usual
+pnpm start
+# [cli-bridge] claude executor: docker pool size=4 image=cli-bridge-cli-runtime:latest
+# [cli-bridge] kimi   executor: docker pool size=2 image=cli-bridge-cli-runtime:latest
+```
+
+OAuth mount modes:
+
+- `share` (default) — bind-mounts host `~/.claude` (etc) into every slot.
+  Simplest; concurrent token-refresh can race on the same session DB.
+- `per-slot` — each slot gets its own named docker volume. Full OAuth
+  isolation; one `<cli> /login` per slot on first run.
+
+### Topology guide
+
+cli-bridge spawns pool containers by talking to the **host docker
+daemon** — pool slots are siblings of cli-bridge, not nested. Two
+shapes work:
+
+- **cli-bridge on host** (recommended for autoresearch / dev). The
+  bridge runs as `pnpm start`; pool containers spawn directly via the
+  host docker daemon. Callers (orchestrators, evals) hit
+  `127.0.0.1:3344`.
+
+- **cli-bridge in a container** (deployment). The compose stack
+  bind-mounts `/var/run/docker.sock` so the bridge can drive the host
+  daemon to spawn pool slots as siblings on the host. Set
+  `<NAME>_DOCKER_HOST_CONFIG_DIR` to a HOST path (not a path inside the
+  bridge container) — the daemon resolves binds against the host fs.
+
+Either way, an orchestrator running in its own container hits the bridge
+at `host.docker.internal:3344` (Docker Desktop) or the bridge gateway
+IP (Linux). No DinD anywhere.
 
 ## Deploy
 

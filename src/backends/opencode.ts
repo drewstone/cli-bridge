@@ -17,21 +17,28 @@
  * right headers so Moonshot's backend accepts the call.
  */
 
-import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { resolvePromptMessages } from './profile-support.js'
+import { hostSpawner } from '../executors/host.js'
+import type { Spawner } from '../executors/types.js'
 
 export interface OpencodeBackendOptions {
   bin: string
   timeoutMs: number
+  /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
+  spawner?: Spawner
 }
 
 export class OpencodeBackend implements Backend {
   readonly name = 'opencode'
-  constructor(private readonly opts: OpencodeBackendOptions) {}
+  private readonly spawner: Spawner
+  constructor(private readonly opts: OpencodeBackendOptions) {
+    this.spawner = opts.spawner ?? hostSpawner
+  }
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
@@ -39,22 +46,33 @@ export class OpencodeBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    return new Promise((resolve) => {
-      const child = spawn(this.opts.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let stdout = ''; let stderr = ''
-      child.stdout.on('data', (b) => { stdout += b.toString() })
-      child.stderr.on('data', (b) => { stderr += b.toString() })
-      child.on('error', (err) => {
-        resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
+    let release = (): void => {}
+    try {
+      const spawned = await this.spawner(this.opts.bin, ['--version'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
       })
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-        } else {
-          resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
-        }
+      release = spawned.release
+      const child = spawned.child
+      return await new Promise<BackendHealth>((resolve) => {
+        let stdout = ''; let stderr = ''
+        child.stdout?.on('data', (b) => { stdout += b.toString() })
+        child.stderr?.on('data', (b) => { stderr += b.toString() })
+        child.on('error', (err) => {
+          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
+        })
+        child.on('close', (code) => {
+          if (code === 0) {
+            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
+          } else {
+            resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
+          }
+        })
       })
-    })
+    } catch (err) {
+      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
+    } finally {
+      release()
+    }
   }
 
   async *chat(
@@ -65,7 +83,7 @@ export class OpencodeBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
-    const prompt = this.flattenPrompt(req.messages)
+    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const model = this.extractModel(req.model)
 
     const args: string[] = ['run', '--format', 'json']
@@ -73,11 +91,14 @@ export class OpencodeBackend implements Backend {
     if (session?.internalId) args.push('-s', session.internalId)
     args.push(prompt)
 
-    const child = spawn(this.opts.bin, args, {
+    const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: session?.cwd ?? process.cwd(),
+      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: process.env,
+      ...(req.session_id ? { sessionId: req.session_id } : {}),
     })
+    const child = spawned.child
+    const releaseSpawner = spawned.release
 
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
@@ -86,8 +107,10 @@ export class OpencodeBackend implements Backend {
     try {
       let internalSessionId: string | undefined
       let stderr = ''
-      child.stderr.on('data', (b) => { stderr += b.toString() })
-
+      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      if (!child.stdout) {
+        throw new BackendError('opencode subprocess has no stdout pipe', 'upstream')
+      }
       const rl = createInterface({ input: child.stdout })
       let sawError: string | null = null
 
@@ -148,6 +171,7 @@ export class OpencodeBackend implements Backend {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
+      releaseSpawner()
     }
   }
 

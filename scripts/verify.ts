@@ -10,7 +10,7 @@ import { buildApp } from '../src/server.js'
 
 async function main(): Promise<void> {
   const config = loadConfig()
-  const { registry, sessions } = buildApp(config)
+  const { registry, sessions, extras } = await buildApp(config)
 
   console.log('cli-bridge verify')
   console.log('─'.repeat(60))
@@ -22,6 +22,9 @@ async function main(): Promise<void> {
     if (h.state === 'error') allOk = false
   }
   sessions.close()
+  for (const hook of extras.shutdownHooks) {
+    try { await hook() } catch {}
+  }
   process.exit(allOk ? 0 : 1)
 }
 

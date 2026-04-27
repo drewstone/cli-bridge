@@ -18,7 +18,12 @@ import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { KimiBackend } from '../src/backends/kimi.js'
+import { CodexBackend } from '../src/backends/codex.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
+import { mountSessions } from '../src/routes/sessions.js'
+import { mountHealth } from '../src/routes/health.js'
+import { mountModels } from '../src/routes/models.js'
 
 class FakeBackend implements Backend {
   constructor(readonly name: string) {}
@@ -32,6 +37,9 @@ class FakeBackend implements Backend {
     yield { content: req.messages[0]?.content ?? '' }
     yield { content: ` mode=${req.mode ?? 'byob'}` }
     yield { content: session ? ` turn=${session.turns + 1}` : '' }
+    if (req.cwd) yield { content: ` cwd=${req.cwd}` }
+    const prompt = (req.agent_profile as Record<string, unknown> | undefined)?.prompt as Record<string, unknown> | undefined
+    if (typeof prompt?.systemPrompt === 'string') yield { content: ` profile=${prompt.systemPrompt}` }
     yield { finish_reason: 'stop', usage: { input_tokens: 3, output_tokens: 5 } }
   }
 }
@@ -114,10 +122,38 @@ describe('KimiBackend model parsing', () => {
   it('matches bare name and prefix', () => {
     expect(b.matches('kimi-code')).toBe(true)
     expect(b.matches('kimi-code/kimi-for-coding')).toBe(true)
-    expect(b.matches('kimi-code/kimi-k2-0905-preview')).toBe(true)
+    expect(b.matches('kimi-code/kimi-k2.6')).toBe(true)
     expect(b.matches('KIMI-CODE/kimi-for-coding')).toBe(true) // case-insensitive
     expect(b.matches('kimi/kimi-for-coding')).toBe(false) // old prefix no longer claimed
     expect(b.matches('kimi')).toBe(false) // bare old name no longer claimed
+    expect(b.matches('claude-code/sonnet')).toBe(false)
+  })
+
+  it('omits --model for the K2.6 alias so the local default stays authoritative', () => {
+    expect(b.resolveCliModel('kimi-code/kimi-k2.6')).toBeNull()
+    expect(b.resolveCliModel('kimi-code')).toBeNull()
+    expect(b.resolveCliModel('kimi-code/kimi-for-coding')).toBe('kimi-code/kimi-for-coding')
+  })
+})
+
+describe('CodexBackend model parsing', () => {
+  const b = new CodexBackend({ bin: '/nonexistent', timeoutMs: 1000 })
+  it('matches bare name and prefix', () => {
+    expect(b.matches('codex')).toBe(true)
+    expect(b.matches('codex/gpt-5-codex')).toBe(true)
+    expect(b.matches('CODEX/GPT-5')).toBe(true) // case-insensitive
+    expect(b.matches('codex-fake')).toBe(false)
+    expect(b.matches('claude-code/sonnet')).toBe(false)
+  })
+})
+
+describe('OpencodeBackend model parsing', () => {
+  const b = new OpencodeBackend({ bin: '/nonexistent', timeoutMs: 1000 })
+  it('matches bare name and prefix', () => {
+    expect(b.matches('opencode')).toBe(true)
+    expect(b.matches('opencode/kimi-for-coding')).toBe(true)
+    expect(b.matches('OPENCODE/anthropic/claude-sonnet')).toBe(true) // case-insensitive
+    expect(b.matches('opencode-fake')).toBe(false)
     expect(b.matches('claude-code/sonnet')).toBe(false)
   })
 })
@@ -328,6 +364,43 @@ describe('POST /v1/chat/completions', () => {
     expect(res.status).toBe(200)
   })
 
+  it('persists cwd and agent_profile into resumed sessions', async () => {
+    const profile = {
+      name: 'local-coder',
+      prompt: { systemPrompt: 'Be surgical.' },
+      skills: ['critical-audit'],
+    }
+    await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'one' }],
+        session_id: 'profile-1',
+        cwd: '/tmp/demo',
+        agent_profile: profile,
+        stream: false,
+      }),
+    })
+    const stored = sessions.get('profile-1', 'claude')
+    expect(stored?.cwd).toBe('/tmp/demo')
+    expect(stored?.metadata.agent_profile).toEqual(profile)
+
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'two' }],
+        session_id: 'profile-1',
+        stream: false,
+      }),
+    })
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0]?.message.content).toContain('cwd=/tmp/demo')
+    expect(body.choices[0]?.message.content).toContain('profile=Be surgical.')
+  })
+
   it('rejects response_format with an invalid type', async () => {
     const res = await app.request('/v1/chat/completions', {
       method: 'POST',
@@ -376,6 +449,46 @@ describe('ClaudeBackend JSON mode (buildArgs)', () => {
     )
     expect(args).not.toContain('--append-system-prompt')
   })
+
+  it('includes profile-derived system prompt in --append-system-prompt', () => {
+    const args = b.buildArgs(
+      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      null,
+      'byob',
+      'summarize',
+    )
+    const i = args.indexOf('--append-system-prompt')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toContain('Be precise.')
+  })
+
+  it('byob mode sets --permission-mode bypassPermissions (regression: without this every Write/Edit blocks)', () => {
+    // 2026-04-24: gen44 claude smoke showed `The file write requests
+    // need user approval` on every leaf. Root cause: claude CLI defaults
+    // to interactive approval, which has no approver in the non-TTY
+    // bridge pipeline. byob explicitly means "caller trusts the tools"
+    // (see src/modes.ts), so bypass is correct.
+    const args = b.buildArgs(baseReq, null, 'byob', 'summarize')
+    const i = args.indexOf('--permission-mode')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toBe('bypassPermissions')
+    // And must NOT carry hosted-safe's plan/disallowed-tools baggage
+    expect(args).not.toContain('plan')
+    expect(args).not.toContain('--disallowed-tools')
+  })
+
+  it('hosted-safe mode still uses plan + disallowed-tools, not bypass', () => {
+    const args = b.buildArgs(baseReq, null, 'hosted-safe', 'summarize')
+    const i = args.indexOf('--permission-mode')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toBe('plan')
+    const d = args.indexOf('--disallowed-tools')
+    expect(d).toBeGreaterThan(-1)
+    expect(args[d + 1]).toContain('Bash')
+    expect(args[d + 1]).toContain('Edit')
+    expect(args[d + 1]).toContain('Write')
+    expect(args).not.toContain('bypassPermissions')
+  })
 })
 
 describe('KimiBackend JSON mode (buildPrompt)', () => {
@@ -386,20 +499,134 @@ describe('KimiBackend JSON mode (buildPrompt)', () => {
   }
 
   it('prepends the JSON directive when responseFormat is json_object', () => {
-    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'json_object' } })
+    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'json_object' } }, null)
     expect(prompt).toMatch(/^Respond with ONLY a single JSON object/)
     expect(prompt).toContain('No markdown fences')
     expect(prompt).toContain('summarize this repo')
   })
 
   it('does NOT prepend the directive when responseFormat is absent (regression guard)', () => {
-    const prompt = b.buildPrompt(baseReq)
+    const prompt = b.buildPrompt(baseReq, null)
     expect(prompt).not.toContain('single JSON object')
     expect(prompt).toBe('summarize this repo')
   })
 
   it('does NOT prepend the directive when responseFormat is text', () => {
-    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'text' } })
+    const prompt = b.buildPrompt({ ...baseReq, responseFormat: { type: 'text' } }, null)
     expect(prompt).not.toContain('single JSON object')
+  })
+
+  it('prepends profile-derived context for local harnesses', () => {
+    const prompt = b.buildPrompt(
+      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      null,
+    )
+    expect(prompt).toContain('Be precise.')
+    expect(prompt).toContain('summarize this repo')
+  })
+})
+
+describe('GET /health', () => {
+  it('reports ok when at least one backend is ready', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('claude'))
+    mountHealth(app, { registry })
+    const res = await app.request('/health')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { status: string; backends: Array<{ state: string }> }
+    expect(body.status).toBe('ok')
+    expect(body.backends[0]!.state).toBe('ready')
+  })
+
+  it('reports degraded (503) when no backends are ready', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry()
+    mountHealth(app, { registry })
+    const res = await app.request('/health')
+    expect(res.status).toBe(503)
+    const body = await res.json() as { status: string }
+    expect(body.status).toBe('degraded')
+  })
+})
+
+describe('GET /v1/models', () => {
+  it('lists models for ready backends only', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('claude-code'))
+    mountModels(app, { registry })
+    const res = await app.request('/v1/models')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<{ id: string; backend: string }> }
+    expect(body.data.length).toBeGreaterThan(0)
+    expect(body.data.some((m) => m.backend === 'claude-code')).toBe(true)
+  })
+
+  it('excludes models from unavailable backends', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry()
+    mountModels(app, { registry })
+    const res = await app.request('/v1/models')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<unknown> }
+    expect(body.data).toHaveLength(0)
+  })
+})
+
+describe('GET /v1/sessions', () => {
+  let dir: string
+  let sessions: SessionStore
+  let app: Hono
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cli-bridge-test-'))
+    sessions = new SessionStore(dir)
+    app = new Hono()
+    mountSessions(app, { sessions })
+  })
+  afterEach(() => {
+    sessions.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('lists sessions with default limit', async () => {
+    sessions.upsert({ externalId: 'a', backend: 'claude', internalId: 'i-a' })
+    sessions.upsert({ externalId: 'b', backend: 'kimi', internalId: 'i-b' })
+    const res = await app.request('/v1/sessions')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: unknown[] }
+    expect(body.data).toHaveLength(2)
+  })
+
+  it('caps limit at 500', async () => {
+    const res = await app.request('/v1/sessions?limit=9999')
+    expect(res.status).toBe(200)
+  })
+
+  it('falls back to default 50 when limit is non-numeric (regression guard)', async () => {
+    // Before the fix, ?limit=abc produced NaN which SQLite rejected.
+    const res = await app.request('/v1/sessions?limit=abc')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: unknown[] }
+    expect(Array.isArray(body.data)).toBe(true)
+  })
+
+  it('deletes a session by externalId', async () => {
+    sessions.upsert({ externalId: 'del', backend: 'claude', internalId: 'i-del' })
+    const res = await app.request('/v1/sessions/del', { method: 'DELETE' })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { deleted: number }
+    expect(body.deleted).toBe(1)
+    expect(sessions.get('del', 'claude')).toBeNull()
+  })
+
+  it('deletes only the specified backend when backend query is given', async () => {
+    sessions.upsert({ externalId: 'shared', backend: 'claude', internalId: 'i-c' })
+    sessions.upsert({ externalId: 'shared', backend: 'kimi', internalId: 'i-k' })
+    const res = await app.request('/v1/sessions/shared?backend=claude', { method: 'DELETE' })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { deleted: number }
+    expect(body.deleted).toBe(1)
+    expect(sessions.get('shared', 'claude')).toBeNull()
+    expect(sessions.get('shared', 'kimi')).not.toBeNull()
   })
 })
