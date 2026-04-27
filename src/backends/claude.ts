@@ -24,7 +24,13 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { renderLocalHarnessProfilePreamble, resolveAgentProfile } from './profile-support.js'
+import {
+  buildMcpAllowList,
+  materialiseMcpConfig,
+  renderLocalHarnessProfilePreamble,
+  resolveAgentProfile,
+  type MaterialisedMcpConfig,
+} from './profile-support.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 
@@ -160,7 +166,11 @@ export class ClaudeBackend implements Backend {
     }
 
     const prompt = this.flattenPrompt(req.messages)
-    const args = this.buildArgs(req, session, mode, prompt)
+    // Materialise MCP servers (if any) into a temp config file BEFORE
+    // building args — buildArgs needs the path. Tracked so we can clean
+    // up the temp dir after the subprocess exits.
+    const mcpMaterialised = materialiseMcpConfig(resolveAgentProfile(req, session))
+    const args = this.buildArgs(req, session, mode, prompt, mcpMaterialised)
 
     const childEnv: NodeJS.ProcessEnv = { ...process.env }
     if (this.anthropicBaseUrl) {
@@ -264,6 +274,7 @@ export class ClaudeBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
       releaseSpawner()
+      mcpMaterialised?.cleanup()
     }
   }
 
@@ -282,6 +293,7 @@ export class ClaudeBackend implements Backend {
     session: SessionRecord | null,
     mode: BridgeMode,
     prompt: string,
+    mcp?: MaterialisedMcpConfig | null,
   ): string[] {
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
 
@@ -291,6 +303,18 @@ export class ClaudeBackend implements Backend {
     ].filter((value): value is string => Boolean(value))
     if (appendPrompts.length) {
       args.push('--append-system-prompt', appendPrompts.join('\n\n'))
+    }
+
+    // MCP wiring — when the caller passed agent_profile.mcp, register
+    // the servers via --mcp-config and auto-allow their tools so byob
+    // mode doesn't hang on the per-call permission prompt. Hosted-safe
+    // mode keeps the gate (callers using hosted-safe explicitly want
+    // tool grants confirmed elsewhere).
+    if (mcp) {
+      args.push('--mcp-config', mcp.configPath)
+      if (mode !== 'hosted-safe') {
+        args.push('--allowedTools', buildMcpAllowList(mcp.serverNames))
+      }
     }
 
     // hosted-safe: force Claude Code into plan mode and hard-disable

@@ -1,4 +1,7 @@
-import type { AgentProfile } from '@tangle-network/sandbox'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/sandbox'
 import type { ChatMessage, ChatRequest } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 
@@ -6,6 +9,88 @@ export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | n
   if (req.agent_profile && typeof req.agent_profile === 'object') return req.agent_profile
   const stored = session?.metadata?.agent_profile
   return stored && typeof stored === 'object' ? stored as AgentProfile : null
+}
+
+/**
+ * Materialise an `AgentProfile.mcp` map into a temp JSON file in the
+ * canonical claude/kimi mcp-config shape:
+ *
+ *   { "mcpServers": { name: {command, args, env}, ... } }
+ *
+ * Returns `null` when the profile has no enabled MCP servers — backends
+ * should skip the `--mcp-config` flag in that case rather than passing
+ * an empty config.
+ *
+ * Caller MUST invoke `cleanup()` after the subprocess exits (typically
+ * in a `finally` block) so the temp dir doesn't leak.
+ *
+ * Honours `AgentProfileMcpServer.enabled` — entries explicitly disabled
+ * are dropped. Entries without a `command` (e.g., remote http/sse
+ * transports) are also dropped here because the local CLIs only support
+ * stdio MCP servers via `--mcp-config`. Remote MCP servers would need a
+ * separate registration path (claude has `claude mcp add --transport
+ * http`) which we don't model in this materialiser.
+ */
+export interface MaterialisedMcpConfig {
+  configPath: string
+  serverNames: string[]
+  cleanup(): void
+}
+
+export function materialiseMcpConfig(profile: AgentProfile | null): MaterialisedMcpConfig | null {
+  if (!profile || typeof profile !== 'object') return null
+  const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
+  if (!mcp || typeof mcp !== 'object') return null
+
+  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {}
+  for (const [name, raw] of Object.entries(mcp)) {
+    if (!name || !raw || typeof raw !== 'object') continue
+    if (raw.enabled === false) continue
+    if (!raw.command || typeof raw.command !== 'string') continue
+    mcpServers[name] = {
+      command: raw.command,
+      ...(Array.isArray(raw.args) ? { args: raw.args.filter((a) => typeof a === 'string') } : {}),
+      ...(raw.env && typeof raw.env === 'object'
+        ? {
+            env: Object.fromEntries(
+              Object.entries(raw.env).filter(([, v]) => typeof v === 'string'),
+            ) as Record<string, string>,
+          }
+        : {}),
+    }
+  }
+  const serverNames = Object.keys(mcpServers)
+  if (serverNames.length === 0) return null
+
+  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
+  const configPath = join(dir, 'mcp-config.json')
+  writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2))
+  return {
+    configPath,
+    serverNames,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best-effort cleanup
+      }
+    },
+  }
+}
+
+/**
+ * Build the `--allowedTools` CSV that auto-allows every tool exposed by
+ * the named MCP servers. Without this, claude's permission system will
+ * prompt on first use of each MCP tool, which hangs in non-interactive
+ * mode (`-p` print mode). Caller decides whether to actually pass the
+ * resulting flag — hosted-safe mode usually wants to keep MCP tools
+ * gated rather than auto-allow them.
+ *
+ * Format follows claude's tool spec: `mcp__<server>` allows ALL tools
+ * exposed by that server. Per-tool grants would be `mcp__<server>__<tool>`.
+ */
+export function buildMcpAllowList(serverNames: string[]): string {
+  return serverNames.map((n) => `mcp__${n}`).join(',')
 }
 
 export function resolvePromptMessages(req: ChatRequest, session: SessionRecord | null): ChatMessage[] {
