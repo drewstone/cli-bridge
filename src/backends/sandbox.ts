@@ -85,12 +85,29 @@ export class SandboxBackend implements Backend {
     const taskId = session?.internalId ?? `chat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
     const message = flattenPrompt(req.messages)
 
+    // Backend type: caller can override via metadata (set by the
+    // execution-router when delegating from another harness). Defaults
+    // to 'opencode' for backwards compat with the original sandbox/...
+    // model-id path.
+    const overrideBackendType = (req.metadata as Record<string, unknown> | undefined)?.sandboxBackendType
+    const backendType = (typeof overrideBackendType === 'string' && overrideBackendType.length > 0)
+      ? overrideBackendType
+      : 'opencode'
+
+    const sandboxOpts = req.execution?.kind === 'sandbox' ? req.execution : null
+
     const requestBody = {
       tasks: [{ id: taskId, message, timeoutMs: this.opts.timeoutMs }],
-      backend: { type: 'opencode' as const, profile },
+      backend: { type: backendType, profile },
       timeoutMs: this.opts.timeoutMs,
       scalingMode: 'balanced' as const,
       persistent: Boolean(session),
+      // Sandbox provisioning hints from execution.* — sandbox-api
+      // honours these when minting a fresh container for the task.
+      ...(sandboxOpts?.repoUrl ? { repoUrl: sandboxOpts.repoUrl } : {}),
+      ...(sandboxOpts?.gitRef ? { gitRef: sandboxOpts.gitRef } : {}),
+      ...(sandboxOpts?.capability ? { capability: sandboxOpts.capability } : {}),
+      ...(sandboxOpts?.ttlSeconds ? { ttlSeconds: sandboxOpts.ttlSeconds } : {}),
     }
 
     // Auth choice for sandbox-api:
@@ -178,6 +195,14 @@ export class SandboxBackend implements Backend {
   private resolveProfileForRequest(req: ChatRequestWithProfile): AgentProfile | string {
     if (req.agent_profile && typeof req.agent_profile === 'object') {
       return req.agent_profile
+    }
+    // Execution-router delegation path: the caller asked for a host
+    // harness (e.g. model='claude-code/sonnet') with execution.kind='sandbox'.
+    // No catalog profile, no inline profile — that's fine, the sandbox
+    // sidecar runs the bare harness with default permissions. Return an
+    // empty profile so the sandbox-api knows "no overrides".
+    if (req.execution?.kind === 'sandbox' && !req.model.toLowerCase().startsWith(PREFIX)) {
+      return {} as AgentProfile
     }
     if (req.model.toLowerCase() === HARNESS) {
       throw new BackendError(

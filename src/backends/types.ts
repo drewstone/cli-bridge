@@ -53,6 +53,22 @@ export interface ChatRequest {
   agent_profile?: AgentProfile
   /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */
   cwd?: string
+  /**
+   * Where the harness runs. Default `{ kind: 'host' }`. When
+   * `{ kind: 'sandbox', repoUrl, ... }` cli-bridge provisions a Tangle
+   * sandbox with the matching in-container backend and dispatches the
+   * prompt there. Same agent_profile + prompt contract — only the
+   * execution location changes.
+   */
+  execution?:
+    | { kind: 'host' }
+    | {
+        kind: 'sandbox'
+        repoUrl?: string
+        gitRef?: string
+        capability?: string
+        ttlSeconds?: number
+      }
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
 }
