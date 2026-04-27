@@ -19,13 +19,14 @@
  * model-id prefixes makes the choice explicit at call time.
  */
 
-import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { renderLocalHarnessProfilePreamble, resolveAgentProfile } from './profile-support.js'
+import { hostSpawner } from '../executors/host.js'
+import type { Spawner } from '../executors/types.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -69,6 +70,13 @@ export interface ClaudeBackendOptions {
    * a different model backend.
    */
   anthropicBaseUrl?: string | null
+  /**
+   * Subprocess spawner. Defaults to host node spawn. Pass a
+   * docker-pooled spawner to run claude inside isolated containers
+   * (per-call FS isolation; safe parallelism). See
+   * `src/executors/docker.ts` + `container-pool.ts`.
+   */
+  spawner?: Spawner
 }
 
 export class ClaudeBackend implements Backend {
@@ -77,6 +85,7 @@ export class ClaudeBackend implements Backend {
   private readonly timeoutMs: number
   private readonly anthropicBaseUrl: string | null
   private readonly prefix: string
+  private readonly spawner: Spawner
 
   constructor(opts: ClaudeBackendOptions) {
     this.name = opts.harness ?? 'claude'
@@ -84,6 +93,7 @@ export class ClaudeBackend implements Backend {
     this.timeoutMs = opts.timeoutMs
     this.anthropicBaseUrl = opts.anthropicBaseUrl ?? null
     this.prefix = `${this.name}/`
+    this.spawner = opts.spawner ?? hostSpawner
   }
 
   matches(model: string): boolean {
@@ -92,32 +102,43 @@ export class ClaudeBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    return new Promise((resolve) => {
-      const child = spawn(this.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let stdout = ''
-      let stderr = ''
-      child.stdout.on('data', (b) => { stdout += b.toString() })
-      child.stderr.on('data', (b) => { stderr += b.toString() })
-      child.on('error', (err) => {
-        resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
+    let release = (): void => {}
+    try {
+      const spawned = await this.spawner(this.bin, ['--version'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
       })
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve({
-            name: this.name,
-            state: 'ready',
-            version: stdout.trim() || undefined,
-            detail: this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined,
-          })
-        } else {
-          resolve({
-            name: this.name,
-            state: 'error',
-            detail: `exit ${code}: ${stderr.slice(0, 200) || stdout.slice(0, 200)}`,
-          })
-        }
+      release = spawned.release
+      const child = spawned.child
+      return await new Promise<BackendHealth>((resolve) => {
+        let stdout = ''
+        let stderr = ''
+        child.stdout?.on('data', (b) => { stdout += b.toString() })
+        child.stderr?.on('data', (b) => { stderr += b.toString() })
+        child.on('error', (err) => {
+          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
+        })
+        child.on('close', (code) => {
+          if (code === 0) {
+            resolve({
+              name: this.name,
+              state: 'ready',
+              version: stdout.trim() || undefined,
+              detail: this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined,
+            })
+          } else {
+            resolve({
+              name: this.name,
+              state: 'error',
+              detail: `exit ${code}: ${stderr.slice(0, 200) || stdout.slice(0, 200)}`,
+            })
+          }
+        })
       })
-    })
+    } catch (err) {
+      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
+    } finally {
+      release()
+    }
   }
 
   async *chat(
@@ -146,11 +167,14 @@ export class ClaudeBackend implements Backend {
       childEnv.ANTHROPIC_BASE_URL = this.anthropicBaseUrl
     }
 
-    const child = spawn(this.bin, args, {
+    const spawned = await this.spawner(this.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: childEnv,
+      ...(req.session_id ? { sessionId: req.session_id } : {}),
     })
+    const child = spawned.child
+    const releaseSpawner = spawned.release
 
     const timeoutHandle = setTimeout(() => {
       child.kill('SIGTERM')
@@ -162,8 +186,11 @@ export class ClaudeBackend implements Backend {
     try {
       let internalSessionId: string | undefined
       let stderr = ''
-      child.stderr.on('data', (b) => { stderr += b.toString() })
+      child.stderr?.on('data', (b) => { stderr += b.toString() })
 
+      if (!child.stdout) {
+        throw new BackendError('claude subprocess has no stdout pipe', 'upstream')
+      }
       const rl = createInterface({ input: child.stdout })
       for await (const line of rl) {
         if (!line.trim()) continue
@@ -236,6 +263,7 @@ export class ClaudeBackend implements Backend {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
+      releaseSpawner()
     }
   }
 

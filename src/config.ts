@@ -44,6 +44,41 @@ export interface Config {
   sandboxProfilesDir: string
   /** Per-task timeout sent to sandbox-api `/batch/run`. Default 5min. */
   sandboxTimeoutMs: number
+  /**
+   * Per-backend executor configuration. Every subprocess backend
+   * (claude, kimi, codex, opencode, …) reads its own slot from this
+   * map at startup. `host` (default) spawns the CLI on the host;
+   * `docker` provisions a pool of pre-warmed containers and dispatches
+   * each chat() via `docker exec`.
+   *
+   * Env keys per backend `<NAME>` (uppercased, e.g. CLAUDE, KIMI):
+   *   `<NAME>_EXECUTOR=host|docker`
+   *   `<NAME>_DOCKER_IMAGE=<image-tag>`
+   *   `<NAME>_DOCKER_POOL_SIZE=<n>`
+   *   `<NAME>_DOCKER_OAUTH_MOUNT=share|per-slot`
+   *   `<NAME>_DOCKER_NAME_PREFIX=<prefix>`
+   *   `<NAME>_DOCKER_HOST_CONFIG_DIR=<host path>`  (share mode only)
+   *   `<NAME>_DOCKER_CONTAINER_CONFIG_DIR=<container path>`  (mount target)
+   *
+   * `BRIDGE_DEFAULT_EXECUTOR` sets the fallback for backends that don't
+   * override individually. Default: host.
+   */
+  executors: Record<string, BackendExecutorConfig>
+}
+
+export interface BackendExecutorConfig {
+  /** Backend name, lowercase: 'claude', 'kimi', 'codex', 'opencode', … */
+  name: string
+  kind: 'host' | 'docker'
+  /** Docker-only fields. Empty/undefined when kind === 'host'. */
+  image?: string
+  poolSize?: number
+  oauthMode?: 'share' | 'per-slot'
+  namePrefix?: string
+  /** Host path that gets bind-mounted (share mode). */
+  hostConfigDir?: string
+  /** Mount target inside the container, e.g. /root/.claude or /root/.config/opencode. */
+  containerConfigDir?: string
 }
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
@@ -105,5 +140,80 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
+    executors: parseAllExecutors(env),
   }
+}
+
+/**
+ * Per-backend executor defaults. All four subprocess backends share the
+ * same default runtime image (`cli-bridge-cli-runtime`) — that image
+ * has every CLI installed. Per-backend `<NAME>_DOCKER_IMAGE` env
+ * overrides if you want a leaner per-backend image. The OAuth/config
+ * mount target differs per backend because each CLI stores auth state
+ * in a different path.
+ */
+const SHARED_RUNTIME_IMAGE = 'cli-bridge-cli-runtime:latest'
+
+const BACKEND_EXECUTOR_DEFAULTS: Record<string, { image: string; containerConfigDir: string; hostConfigEnvKey: string; defaultHostConfigDir: string }> = {
+  claude: {
+    image: SHARED_RUNTIME_IMAGE,
+    containerConfigDir: '/root/.claude',
+    hostConfigEnvKey: 'HOME',
+    defaultHostConfigDir: '.claude',
+  },
+  kimi: {
+    image: SHARED_RUNTIME_IMAGE,
+    containerConfigDir: '/root/.kimi',
+    hostConfigEnvKey: 'HOME',
+    defaultHostConfigDir: '.kimi',
+  },
+  codex: {
+    image: SHARED_RUNTIME_IMAGE,
+    containerConfigDir: '/root/.codex',
+    hostConfigEnvKey: 'HOME',
+    defaultHostConfigDir: '.codex',
+  },
+  opencode: {
+    image: SHARED_RUNTIME_IMAGE,
+    containerConfigDir: '/root/.config/opencode',
+    hostConfigEnvKey: 'HOME',
+    defaultHostConfigDir: '.config/opencode',
+  },
+}
+
+const SUPPORTED_EXECUTOR_BACKENDS = Object.keys(BACKEND_EXECUTOR_DEFAULTS)
+
+function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecutorConfig> {
+  const defaultKind = parseExecutor('BRIDGE_DEFAULT_EXECUTOR', env.BRIDGE_DEFAULT_EXECUTOR, 'host')
+  const out: Record<string, BackendExecutorConfig> = {}
+  for (const name of SUPPORTED_EXECUTOR_BACKENDS) {
+    const defaults = BACKEND_EXECUTOR_DEFAULTS[name]
+    if (!defaults) continue
+    const upper = name.toUpperCase()
+    const kind = parseExecutor(`${upper}_EXECUTOR`, env[`${upper}_EXECUTOR`], defaultKind)
+    const cfg: BackendExecutorConfig = { name, kind }
+    if (kind === 'docker') {
+      cfg.image = env[`${upper}_DOCKER_IMAGE`] ?? defaults.image
+      cfg.poolSize = Number.parseInt(env[`${upper}_DOCKER_POOL_SIZE`] ?? '4', 10)
+      cfg.oauthMode = parseOauthMode(`${upper}_DOCKER_OAUTH_MOUNT`, env[`${upper}_DOCKER_OAUTH_MOUNT`], 'share')
+      cfg.namePrefix = env[`${upper}_DOCKER_NAME_PREFIX`] ?? `cli-bridge-${name}-pool`
+      const hostBase = env[defaults.hostConfigEnvKey] ?? '/root'
+      cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.defaultHostConfigDir}`)
+      cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? defaults.containerConfigDir
+    }
+    out[name] = cfg
+  }
+  return out
+}
+
+function parseExecutor(key: string, value: string | undefined, fallback: 'host' | 'docker'): 'host' | 'docker' {
+  if (value === 'host' || value === 'docker') return value
+  if (value === undefined || value === '') return fallback
+  throw new Error(`invalid ${key}: ${value} — expected host|docker`)
+}
+
+function parseOauthMode(key: string, value: string | undefined, fallback: 'share' | 'per-slot'): 'share' | 'per-slot' {
+  if (value === 'share' || value === 'per-slot') return value
+  if (value === undefined || value === '') return fallback
+  throw new Error(`invalid ${key}: ${value} — expected share|per-slot`)
 }

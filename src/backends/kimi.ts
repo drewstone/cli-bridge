@@ -29,7 +29,6 @@
  * common ones (`content`, `text`, `message.content`, `delta.text`).
  */
 
-import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -39,21 +38,27 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { resolvePromptMessages } from './profile-support.js'
+import { hostSpawner } from '../executors/host.js'
+import type { Spawner } from '../executors/types.js'
 
 export interface KimiBackendOptions {
   bin: string
   timeoutMs: number
   /** Harness name that claims the `<harness>/*` prefix. Default 'kimi-code'. */
   harness?: string
+  /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
+  spawner?: Spawner
 }
 
 export class KimiBackend implements Backend {
   readonly name: string
   private readonly prefix: string
+  private readonly spawner: Spawner
 
   constructor(private readonly opts: KimiBackendOptions) {
     this.name = opts.harness ?? 'kimi-code'
     this.prefix = `${this.name}/`
+    this.spawner = opts.spawner ?? hostSpawner
   }
 
   matches(model: string): boolean {
@@ -62,22 +67,33 @@ export class KimiBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    return new Promise((resolve) => {
-      const child = spawn(this.opts.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let stdout = ''; let stderr = ''
-      child.stdout.on('data', (b) => { stdout += b.toString() })
-      child.stderr.on('data', (b) => { stderr += b.toString() })
-      child.on('error', (err) => {
-        resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
+    let release = (): void => {}
+    try {
+      const spawned = await this.spawner(this.opts.bin, ['--version'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
       })
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-        } else {
-          resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
-        }
+      release = spawned.release
+      const child = spawned.child
+      return await new Promise<BackendHealth>((resolve) => {
+        let stdout = ''; let stderr = ''
+        child.stdout?.on('data', (b) => { stdout += b.toString() })
+        child.stderr?.on('data', (b) => { stderr += b.toString() })
+        child.on('error', (err) => {
+          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
+        })
+        child.on('close', (code) => {
+          if (code === 0) {
+            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
+          } else {
+            resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
+          }
+        })
       })
-    })
+    } catch (err) {
+      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
+    } finally {
+      release()
+    }
   }
 
   async *chat(
@@ -103,11 +119,14 @@ export class KimiBackend implements Backend {
       args.push('--model', model)
     }
 
-    const child = spawn(this.opts.bin, args, {
+    const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: process.env,
+      ...(req.session_id ? { sessionId: req.session_id } : {}),
     })
+    const child = spawned.child
+    const releaseSpawner = spawned.release
 
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
@@ -117,7 +136,10 @@ export class KimiBackend implements Backend {
       let internalSessionId: string | undefined
       let stderr = ''
       let emittedContent = false
-      child.stderr.on('data', (b) => {
+      if (!child.stdout) {
+        throw new BackendError('kimi subprocess has no stdout pipe', 'upstream')
+      }
+      child.stderr?.on('data', (b) => {
         const chunk = b.toString()
         stderr += chunk
         // Kimi prints "To resume this session: kimi -r <uuid>" to
@@ -232,6 +254,7 @@ export class KimiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
       if (configFile) await cleanupConfigFile(configFile)
+      releaseSpawner()
     }
   }
 
