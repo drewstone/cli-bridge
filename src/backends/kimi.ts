@@ -37,7 +37,11 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { resolvePromptMessages } from './profile-support.js'
+import {
+  materialiseMcpConfig,
+  resolveAgentProfile,
+  resolvePromptMessages,
+} from './profile-support.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 
@@ -107,10 +111,19 @@ export class KimiBackend implements Backend {
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
     const configFile = await this.prepareConfigFile(req.model)
+    // Materialise agent_profile.mcp into a temp mcp-config.json. Same
+    // shape claude expects ({mcpServers: {name: {command,args,env}}});
+    // kimi takes the path via --mcp-config-file. Cleanup runs in the
+    // outer finally so the temp dir doesn't leak when the subprocess
+    // crashes.
+    const mcpMaterialised = materialiseMcpConfig(resolveAgentProfile(req, session))
 
     const args = ['--print', '--output-format', 'stream-json', '--prompt', prompt]
     if (configFile) {
       args.push('--config-file', configFile)
+    }
+    if (mcpMaterialised) {
+      args.push('--mcp-config-file', mcpMaterialised.configPath)
     }
     if (session?.internalId) {
       args.push('--resume', session.internalId)
@@ -254,6 +267,7 @@ export class KimiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
       if (configFile) await cleanupConfigFile(configFile)
+      mcpMaterialised?.cleanup()
       releaseSpawner()
     }
   }
