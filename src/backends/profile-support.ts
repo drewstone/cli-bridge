@@ -42,11 +42,19 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
   const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
   if (!mcp || typeof mcp !== 'object') return null
 
-  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {}
+  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string>; timeout?: number }> = {}
   for (const [name, raw] of Object.entries(mcp)) {
     if (!name || !raw || typeof raw !== 'object') continue
     if (raw.enabled === false) continue
     if (!raw.command || typeof raw.command !== 'string') continue
+    // `timeout` (ms) is the per-MCP-server tool-call timeout. Claude Code
+    // honors this in mcp-config.json — its default is 300_000ms which
+    // kills long-running tool calls (e.g. coordinators that block while
+    // a subagent audit runs). Forward when supplied so callers don't
+    // need to set MCP_TIMEOUT globally (which has known-silently-ignored
+    // bugs upstream).
+    const timeoutRaw = (raw as { timeout?: unknown }).timeout
+    const timeout = typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : undefined
     mcpServers[name] = {
       command: raw.command,
       ...(Array.isArray(raw.args) ? { args: raw.args.filter((a) => typeof a === 'string') } : {}),
@@ -57,6 +65,7 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
             ) as Record<string, string>,
           }
         : {}),
+      ...(timeout ? { timeout } : {}),
     }
   }
   const serverNames = Object.keys(mcpServers)
