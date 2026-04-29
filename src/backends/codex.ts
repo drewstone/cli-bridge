@@ -101,6 +101,8 @@ export class CodexBackend implements Backend {
     // else `codex exec <prompt>`. --json emits JSONL events.
     const args: string[] = ['exec', '--json']
     if (modelArg) args.push('-c', `model="${modelArg}"`)
+    const reasoningEffort = codexReasoningEffort(req.effort)
+    if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`)
 
     if (session?.internalId) {
       args.splice(1, 0, 'resume', session.internalId)
@@ -201,6 +203,12 @@ export class CodexBackend implements Backend {
     }
     return null
   }
+}
+
+export function codexReasoningEffort(effort: ChatRequest['effort']): 'minimal' | 'low' | 'medium' | 'high' | null {
+  if (!effort) return null
+  if (effort === 'xhigh' || effort === 'max') return 'high'
+  return effort
 }
 
 /**

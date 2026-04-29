@@ -17,9 +17,9 @@ import { SessionStore } from '../src/sessions/store.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
-import { KimiBackend } from '../src/backends/kimi.js'
-import { CodexBackend } from '../src/backends/codex.js'
-import { OpencodeBackend } from '../src/backends/opencode.js'
+import { KimiBackend, thinkingFlagForEffort } from '../src/backends/kimi.js'
+import { CodexBackend, codexReasoningEffort } from '../src/backends/codex.js'
+import { OpencodeBackend, opencodeVariantForEffort } from '../src/backends/opencode.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountSessions } from '../src/routes/sessions.js'
 import { mountHealth } from '../src/routes/health.js'
@@ -36,6 +36,7 @@ class FakeBackend implements Backend {
     yield { content: `[${this.name}] ` }
     yield { content: req.messages[0]?.content ?? '' }
     yield { content: ` mode=${req.mode ?? 'byob'}` }
+    if (req.effort) yield { content: ` effort=${req.effort}` }
     yield { content: session ? ` turn=${session.turns + 1}` : '' }
     if (req.cwd) yield { content: ` cwd=${req.cwd}` }
     const prompt = (req.agent_profile as Record<string, unknown> | undefined)?.prompt as Record<string, unknown> | undefined
@@ -158,6 +159,30 @@ describe('OpencodeBackend model parsing', () => {
   })
 })
 
+describe('reasoning effort mapping', () => {
+  it('maps opencode effort to provider variant', () => {
+    expect(opencodeVariantForEffort('high')).toBe('high')
+    expect(opencodeVariantForEffort('max')).toBe('max')
+    expect(opencodeVariantForEffort(undefined)).toBeNull()
+  })
+
+  it('maps kimi effort to thinking flags', () => {
+    expect(thinkingFlagForEffort('high')).toBe('--thinking')
+    expect(thinkingFlagForEffort('max')).toBe('--thinking')
+    expect(thinkingFlagForEffort('low')).toBe('--no-thinking')
+    expect(thinkingFlagForEffort('minimal')).toBe('--no-thinking')
+    expect(thinkingFlagForEffort('medium')).toBeNull()
+    expect(thinkingFlagForEffort(undefined)).toBeNull()
+  })
+
+  it('maps Codex unsupported max-style effort to the strongest supported config', () => {
+    expect(codexReasoningEffort('high')).toBe('high')
+    expect(codexReasoningEffort('xhigh')).toBe('high')
+    expect(codexReasoningEffort('max')).toBe('high')
+    expect(codexReasoningEffort(undefined)).toBeNull()
+  })
+})
+
 describe('POST /v1/chat/completions', () => {
   let dir: string
   let sessions: SessionStore
@@ -245,6 +270,35 @@ describe('POST /v1/chat/completions', () => {
     expect(res.headers.get('x-bridge-mode')).toBe('byob')
     const body = await res.json() as { choices: Array<{ message: { content: string } }> }
     expect(body.choices[0]?.message.content).toContain('mode=byob')
+  })
+
+  it('validates and forwards effort to the selected backend', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+        effort: 'high',
+      }),
+    })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0]?.message.content).toContain('effort=high')
+  })
+
+  it('rejects invalid effort values before routing', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        effort: 'turbo',
+      }),
+    })
+    expect(res.status).toBe(400)
   })
 
   it('reads mode from X-Bridge-Mode header', async () => {

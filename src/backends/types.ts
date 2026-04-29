@@ -25,12 +25,16 @@ export interface ChatMessage {
   name?: string
 }
 
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
 export interface ChatRequest {
   model: string
   messages: ChatMessage[]
   stream?: boolean
   temperature?: number
   max_tokens?: number
+  /** Reasoning/thinking intensity requested by the caller. Backends map this to their native CLI flag. */
+  effort?: ReasoningEffort
   /** External stable session id. If unset, the backend starts fresh. */
   session_id?: string
   /**
