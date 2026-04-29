@@ -261,6 +261,7 @@ describe('ClaudeBackend with injected spawner', () => {
 
 interface StubSpawnerHandle {
   spawner: Spawner
+  observedArgs: string[] | null
   observedOpts: Parameters<Spawner>[2] | null
   releaseCalls: number
 }
@@ -268,10 +269,12 @@ interface StubSpawnerHandle {
 function createStubSpawner(lines: string[]): StubSpawnerHandle {
   const handle: StubSpawnerHandle = {
     spawner: null as never,
+    observedArgs: null,
     observedOpts: null,
     releaseCalls: 0,
   }
-  handle.spawner = async (_bin, _args, opts) => {
+  handle.spawner = async (_bin, args, opts) => {
+    handle.observedArgs = args
     handle.observedOpts = opts
     const stdout = Readable.from(lines.map((l) => `${l}\n`))
     const stderr = new PassThrough()
@@ -378,6 +381,7 @@ describe('Spawner injection works across all subprocess backends', () => {
       ctrl.signal,
     )) deltas.push(d)
     expect(deltas.find((d) => d.content === 'kimi here')).toBeDefined()
+    expect(stub.observedArgs).toContain('--mcp-config-file')
     expect(stub.observedOpts?.sessionId).toBe('kimi-sess')
     expect(stub.releaseCalls).toBe(1)
   })
@@ -415,6 +419,23 @@ describe('Spawner injection works across all subprocess backends', () => {
       ctrl.signal,
     )) deltas.push(d)
     expect(deltas.find((d) => d.internal_session_id === 'oc-1')).toBeDefined()
+    expect(stub.observedArgs).toContain('--dangerously-skip-permissions')
+    expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('OpencodeBackend rejects empty successful streams', async () => {
+    const stub = createStubSpawner([])
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    await expect(async () => {
+      for await (const _d of backend.chat(
+        { model: 'opencode/deepseek/deepseek-v4-pro', messages: [{ role: 'user', content: 'hi' }] },
+        null,
+        ctrl.signal,
+      )) {
+        // drain
+      }
+    }).rejects.toThrow(/produced no stream output/)
     expect(stub.releaseCalls).toBe(1)
   })
 })

@@ -87,6 +87,23 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
   }
 }
 
+export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
+  const configPath = join(dir, 'mcp-config.json')
+  writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2))
+  return {
+    configPath,
+    serverNames: [],
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best-effort cleanup
+      }
+    },
+  }
+}
+
 /**
  * Build the `--allowedTools` CSV that auto-allows every tool exposed by
  * the named MCP servers. Without this, claude's permission system will

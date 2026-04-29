@@ -38,6 +38,7 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
+  materialiseEmptyMcpConfig,
   materialiseMcpConfig,
   resolveAgentProfile,
   resolvePromptMessages,
@@ -116,7 +117,8 @@ export class KimiBackend implements Backend {
     // kimi takes the path via --mcp-config-file. Cleanup runs in the
     // outer finally so the temp dir doesn't leak when the subprocess
     // crashes.
-    const mcpMaterialised = materialiseMcpConfig(resolveAgentProfile(req, session))
+    const mcpMaterialised =
+      materialiseMcpConfig(resolveAgentProfile(req, session)) ?? materialiseEmptyMcpConfig()
 
     const args = ['--print', '--output-format', 'stream-json', '--prompt', prompt]
     if (configFile) {
@@ -151,6 +153,7 @@ export class KimiBackend implements Backend {
       let internalSessionId: string | undefined
       let stderr = ''
       let emittedContent = false
+      let emittedToolCall = false
       if (!child.stdout) {
         throw new BackendError('kimi subprocess has no stdout pipe', 'upstream')
       }
@@ -219,6 +222,7 @@ export class KimiBackend implements Backend {
                     arguments: typeof input === 'string' ? input : JSON.stringify(input),
                   }],
                 }
+                emittedToolCall = true
               }
             }
             // 'think' blocks are reasoning chain-of-thought; don't surface.
@@ -227,7 +231,7 @@ export class KimiBackend implements Backend {
           const text = extractText(ev)
           if (text) { yield { content: text }; emittedContent = true }
           const toolCall = extractToolUse(ev)
-          if (toolCall) yield { tool_calls: [toolCall] }
+          if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
         }
 
         if (
@@ -262,6 +266,9 @@ export class KimiBackend implements Backend {
       // we observed real assistant content, treat exit non-zero as OK.
       if (exitCode !== 0 && exitCode !== null && !emittedContent) {
         throw new BackendError(`kimi exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+      }
+      if (!emittedContent && !emittedToolCall) {
+        throw new BackendError(`kimi produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
       }
       yield { finish_reason: 'stop', internal_session_id: internalSessionId }
     } finally {

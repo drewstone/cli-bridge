@@ -86,7 +86,7 @@ export class OpencodeBackend implements Backend {
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const model = this.extractModel(req.model)
 
-    const args: string[] = ['run', '--format', 'json']
+    const args: string[] = ['run', '--format', 'json', '--dangerously-skip-permissions']
     if (model) args.push('-m', model)
     const variant = opencodeVariantForEffort(req.effort)
     if (variant) args.push('--variant', variant)
@@ -115,6 +115,8 @@ export class OpencodeBackend implements Backend {
       }
       const rl = createInterface({ input: child.stdout })
       let sawError: string | null = null
+      let emittedContent = false
+      let emittedToolCall = false
 
       for await (const line of rl) {
         if (!line.trim()) continue
@@ -137,7 +139,9 @@ export class OpencodeBackend implements Backend {
         }
 
         const text = extractText(ev)
-        if (text) yield { content: text }
+        if (text) { yield { content: text }; emittedContent = true }
+        const toolCall = extractToolUse(ev)
+        if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
 
         if (
           type === 'message.completed'
@@ -167,6 +171,9 @@ export class OpencodeBackend implements Backend {
       if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(`opencode exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+      }
+      if (!emittedContent && !emittedToolCall) {
+        throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
       }
       yield { finish_reason: 'stop', internal_session_id: internalSessionId }
     } finally {
@@ -198,7 +205,7 @@ export function opencodeVariantForEffort(effort: ChatRequest['effort']): string 
 }
 
 function pickSessionId(ev: Record<string, unknown>): string | null {
-  for (const k of ['session_id', 'sessionId', 'session']) {
+  for (const k of ['session_id', 'sessionId', 'sessionID', 'session']) {
     const v = ev[k]
     if (typeof v === 'string' && v.length > 0) return v
     if (typeof v === 'object' && v !== null) {
@@ -207,6 +214,24 @@ function pickSessionId(ev: Record<string, unknown>): string | null {
     }
   }
   return null
+}
+
+function extractToolUse(ev: Record<string, unknown>): { id: string; name: string; arguments: string } | null {
+  const part = ev.part as Record<string, unknown> | undefined
+  const tool =
+    (ev.tool_call as Record<string, unknown> | undefined)
+    ?? (ev.toolCall as Record<string, unknown> | undefined)
+    ?? (part?.type === 'tool' || part?.type === 'tool_call' ? part : undefined)
+  if (!tool) return null
+  const id = String(tool.id ?? tool.toolCallID ?? tool.tool_call_id ?? '')
+  const name = String(tool.name ?? tool.tool ?? '')
+  if (!id || !name) return null
+  const input = tool.input ?? tool.arguments ?? {}
+  return {
+    id,
+    name,
+    arguments: typeof input === 'string' ? input : JSON.stringify(input),
+  }
 }
 
 function extractText(ev: Record<string, unknown>): string | null {
