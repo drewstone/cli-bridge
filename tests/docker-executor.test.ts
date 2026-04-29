@@ -288,6 +288,29 @@ function createStubSpawner(lines: string[]): StubSpawnerHandle {
   return handle
 }
 
+function createDelayedStubSpawner(closeAfterMs: number): StubSpawnerHandle {
+  const handle: StubSpawnerHandle = {
+    spawner: null as never,
+    observedArgs: null,
+    observedOpts: null,
+    releaseCalls: 0,
+  }
+  handle.spawner = async (_bin, args, opts) => {
+    handle.observedArgs = args
+    handle.observedOpts = opts
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const child = makeFakeChild(stdout, stderr, () => {})
+    setTimeout(() => stdout.end(), closeAfterMs).unref()
+    const result: SpawnResult = {
+      child,
+      release: () => { handle.releaseCalls++ },
+    }
+    return result
+  }
+  return handle
+}
+
 function makeFakeChild(
   stdout: Readable,
   stderr: PassThrough,
@@ -420,6 +443,81 @@ describe('Spawner injection works across all subprocess backends', () => {
     )) deltas.push(d)
     expect(deltas.find((d) => d.internal_session_id === 'oc-1')).toBeDefined()
     expect(stub.observedArgs).toContain('--dangerously-skip-permissions')
+    expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('OpencodeBackend translates opencode tool parts with callID and step token usage', async () => {
+    const stub = createStubSpawner([
+      JSON.stringify({ type: 'step_start', sessionID: 'oc-2', part: { type: 'step-start' } }),
+      JSON.stringify({
+        type: 'tool_use',
+        sessionID: 'oc-2',
+        part: {
+          type: 'tool',
+          tool: 'write',
+          callID: 'call_abc123',
+          state: {
+            status: 'completed',
+            input: { filePath: '/tmp/hello.txt', content: 'hello' },
+            output: 'Wrote file successfully.',
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'step_finish',
+        sessionID: 'oc-2',
+        part: {
+          type: 'step-finish',
+          tokens: { total: 27045, input: 25153, output: 77, reasoning: 23 },
+          cost: 0.04437406,
+        },
+      }),
+      JSON.stringify({ type: 'text', sessionID: 'oc-2', part: { type: 'text', text: 'finished' } }),
+    ])
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const deltas: Array<{
+      content?: string
+      internal_session_id?: string
+      finish_reason?: string
+      tool_calls?: Array<{ id: string; name: string; arguments: string }>
+      usage?: { input_tokens?: number; output_tokens?: number }
+    }> = []
+    for await (const d of backend.chat(
+      { model: 'opencode/deepseek/deepseek-v4-pro', messages: [{ role: 'user', content: 'hi' }] },
+      null,
+      ctrl.signal,
+    )) deltas.push(d)
+
+    expect(deltas.find((d) => d.internal_session_id === 'oc-2')).toBeDefined()
+    expect(deltas.find((d) => d.content === 'finished')).toBeDefined()
+    const tool = deltas.flatMap((d) => d.tool_calls ?? []).find((tc) => tc.id === 'call_abc123')
+    expect(tool?.name).toBe('write')
+    expect(JSON.parse(tool?.arguments ?? '{}')).toEqual({ filePath: '/tmp/hello.txt', content: 'hello' })
+    expect(deltas.at(-1)?.usage).toEqual({ input_tokens: 25153, output_tokens: 77 })
+  })
+
+  it('OpencodeBackend emits liveness progress while opencode buffers json stdout', async () => {
+    const originalProgressMs = process.env.OPENCODE_PROGRESS_MS
+    process.env.OPENCODE_PROGRESS_MS = '10'
+    const stub = createDelayedStubSpawner(35)
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const deltas: Array<{ tool_calls?: Array<{ name: string }> }> = []
+    try {
+      await expect(async () => {
+        for await (const d of backend.chat(
+          { model: 'opencode/deepseek/deepseek-v4-pro', messages: [{ role: 'user', content: 'hi' }] },
+          null,
+          ctrl.signal,
+        )) deltas.push(d)
+      }).rejects.toThrow(/produced no stream output/)
+    } finally {
+      if (originalProgressMs === undefined) delete process.env.OPENCODE_PROGRESS_MS
+      else process.env.OPENCODE_PROGRESS_MS = originalProgressMs
+    }
+
+    expect(deltas.flatMap((d) => d.tool_calls ?? []).some((tc) => tc.name === 'opencode_progress')).toBe(true)
     expect(stub.releaseCalls).toBe(1)
   })
 

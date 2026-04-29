@@ -117,8 +117,35 @@ export class OpencodeBackend implements Backend {
       let sawError: string | null = null
       let emittedContent = false
       let emittedToolCall = false
+      let usage: ChatDelta['usage']
+      let progressSeq = 0
+      const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
+      const lineIter = rl[Symbol.asyncIterator]()
+      let pendingLine = lineIter.next()
 
-      for await (const line of rl) {
+      while (true) {
+        const next = await Promise.race([
+          pendingLine.then((result) => ({ kind: 'line' as const, result })),
+          delay(progressIntervalMs).then(() => ({ kind: 'progress' as const })),
+        ])
+        if (next.kind === 'progress') {
+          progressSeq += 1
+          yield {
+            tool_calls: [{
+              id: `opencode-progress-${progressSeq}`,
+              name: 'opencode_progress',
+              arguments: JSON.stringify({
+                elapsedMs: progressSeq * progressIntervalMs,
+                stderrTail: stderr.slice(-240),
+              }),
+            }],
+          }
+          continue
+        }
+
+        pendingLine = lineIter.next()
+        const { value: line, done } = next.result
+        if (done) break
         if (!line.trim()) continue
         let ev: Record<string, unknown>
         try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
@@ -142,6 +169,8 @@ export class OpencodeBackend implements Backend {
         if (text) { yield { content: text }; emittedContent = true }
         const toolCall = extractToolUse(ev)
         if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
+        const eventUsage = extractUsage(ev)
+        if (eventUsage) usage = eventUsage
 
         if (
           type === 'message.completed'
@@ -149,7 +178,6 @@ export class OpencodeBackend implements Backend {
           || type === 'session.completed'
           || type === 'run.completed'
         ) {
-          const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
           yield {
             finish_reason: sawError ? 'error' : 'stop',
             usage,
@@ -175,7 +203,7 @@ export class OpencodeBackend implements Backend {
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
       }
-      yield { finish_reason: 'stop', internal_session_id: internalSessionId }
+      yield { finish_reason: 'stop', usage, internal_session_id: internalSessionId }
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
@@ -223,14 +251,31 @@ function extractToolUse(ev: Record<string, unknown>): { id: string; name: string
     ?? (ev.toolCall as Record<string, unknown> | undefined)
     ?? (part?.type === 'tool' || part?.type === 'tool_call' ? part : undefined)
   if (!tool) return null
-  const id = String(tool.id ?? tool.toolCallID ?? tool.tool_call_id ?? '')
+  const id = String(tool.id ?? tool.callID ?? tool.toolCallID ?? tool.tool_call_id ?? '')
   const name = String(tool.name ?? tool.tool ?? '')
   if (!id || !name) return null
-  const input = tool.input ?? tool.arguments ?? {}
+  const state = tool.state as Record<string, unknown> | undefined
+  const input = tool.input ?? state?.input ?? tool.arguments ?? {}
   return {
     id,
     name,
     arguments: typeof input === 'string' ? input : JSON.stringify(input),
+  }
+}
+
+function extractUsage(ev: Record<string, unknown>): ChatDelta['usage'] | null {
+  const direct = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
+  if (direct) return direct
+
+  const part = ev.part as Record<string, unknown> | undefined
+  const tokens = part?.tokens as
+    | { input?: number; output?: number; input_tokens?: number; output_tokens?: number }
+    | undefined
+  if (!tokens) return null
+
+  return {
+    input_tokens: tokens.input_tokens ?? tokens.input,
+    output_tokens: tokens.output_tokens ?? tokens.output,
   }
 }
 
@@ -248,4 +293,11 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    timer.unref?.()
+  })
 }
