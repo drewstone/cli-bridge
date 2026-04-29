@@ -91,7 +91,7 @@ describe('execution-router', () => {
       expect(claude.received).toHaveLength(0)
       // SandboxBackend called with the right metadata + execution payload.
       expect(sandbox.received).toHaveLength(1)
-      const r = sandbox.received[0].req
+      const r = sandbox.received[0]!.req
       expect(r.metadata?.sandboxBackendType).toBe('claude-code')
       expect(r.execution).toEqual({
         kind: 'sandbox',
@@ -112,7 +112,7 @@ describe('execution-router', () => {
         execution: { kind: 'sandbox' },
       })
       expect(res.status).toBe(200)
-      expect(sandbox.received[0].req.metadata?.sandboxBackendType).toBe('factory-droids')
+      expect(sandbox.received[0]!.req.metadata?.sandboxBackendType).toBe('factory-droids')
     } finally { cleanup() }
   })
 
@@ -143,7 +143,7 @@ describe('execution-router', () => {
       expect(sandbox.received).toHaveLength(1)
       // No metadata.sandboxBackendType set — direct sandbox/* path
       // doesn't go through the harness mapping.
-      expect(sandbox.received[0].req.metadata?.sandboxBackendType).toBeUndefined()
+      expect(sandbox.received[0]!.req.metadata?.sandboxBackendType).toBeUndefined()
     } finally { cleanup() }
   })
 })

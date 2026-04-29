@@ -35,6 +35,7 @@ const chatRequestSchema = z.object({
   stream: z.boolean().optional(),
   temperature: z.number().optional(),
   max_tokens: z.number().optional(),
+  effort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
   mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),

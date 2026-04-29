@@ -131,6 +131,8 @@ export class KimiBackend implements Backend {
     if (model) {
       args.push('--model', model)
     }
+    const thinkingFlag = thinkingFlagForEffort(req.effort)
+    if (thinkingFlag) args.push(thinkingFlag)
 
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -355,6 +357,12 @@ function ensureK2DefaultConfig(config: string): string {
   }
 
   return next
+}
+
+export function thinkingFlagForEffort(effort: ChatRequest['effort']): '--thinking' | '--no-thinking' | null {
+  if (!effort || effort === 'medium') return null
+  if (effort === 'minimal' || effort === 'low') return '--no-thinking'
+  return '--thinking'
 }
 
 async function cleanupConfigFile(file: string): Promise<void> {

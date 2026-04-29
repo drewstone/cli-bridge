@@ -88,6 +88,8 @@ export class OpencodeBackend implements Backend {
 
     const args: string[] = ['run', '--format', 'json']
     if (model) args.push('-m', model)
+    const variant = opencodeVariantForEffort(req.effort)
+    if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
     args.push(prompt)
 
@@ -189,6 +191,10 @@ export class OpencodeBackend implements Backend {
     }
     return null
   }
+}
+
+export function opencodeVariantForEffort(effort: ChatRequest['effort']): string | null {
+  return effort ?? null
 }
 
 function pickSessionId(ev: Record<string, unknown>): string | null {
