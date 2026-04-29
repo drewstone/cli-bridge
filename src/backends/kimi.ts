@@ -172,7 +172,34 @@ export class KimiBackend implements Backend {
       const rl = createInterface({ input: child.stdout })
       let sawError: string | null = null
 
-      for await (const line of rl) {
+      let progressSeq = 0
+      const progressIntervalMs = Math.max(10, Number(process.env.KIMI_PROGRESS_MS ?? 30_000))
+      const lineIter = rl[Symbol.asyncIterator]()
+      let pendingLine = lineIter.next()
+
+      while (true) {
+        const next = await Promise.race([
+          pendingLine.then((result) => ({ kind: 'line' as const, result })),
+          delay(progressIntervalMs).then(() => ({ kind: 'progress' as const })),
+        ])
+        if (next.kind === 'progress') {
+          progressSeq += 1
+          yield {
+            tool_calls: [{
+              id: `kimi-progress-${progressSeq}`,
+              name: 'kimi_progress',
+              arguments: JSON.stringify({
+                elapsedMs: progressSeq * progressIntervalMs,
+                stderrTail: stderr.slice(-240),
+              }),
+            }],
+          }
+          continue
+        }
+
+        pendingLine = lineIter.next()
+        const { value: line, done } = next.result
+        if (done) break
         if (!line.trim()) continue
         let ev: Record<string, unknown>
         try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
@@ -402,6 +429,13 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    timer.unref?.()
+  })
 }
 
 function extractToolUse(ev: Record<string, unknown>): { id: string; name: string; arguments: string } | null {

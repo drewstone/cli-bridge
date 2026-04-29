@@ -409,6 +409,30 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(stub.releaseCalls).toBe(1)
   })
 
+  it('KimiBackend emits liveness progress while kimi buffers stream-json stdout', async () => {
+    const originalProgressMs = process.env.KIMI_PROGRESS_MS
+    process.env.KIMI_PROGRESS_MS = '10'
+    const stub = createDelayedStubSpawner(35)
+    const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const deltas: Array<{ tool_calls?: Array<{ name: string }> }> = []
+    try {
+      await expect(async () => {
+        for await (const d of backend.chat(
+          { model: 'kimi-code/kimi-for-coding', messages: [{ role: 'user', content: 'hi' }] },
+          null,
+          ctrl.signal,
+        )) deltas.push(d)
+      }).rejects.toThrow(/produced no stream output/)
+    } finally {
+      if (originalProgressMs === undefined) delete process.env.KIMI_PROGRESS_MS
+      else process.env.KIMI_PROGRESS_MS = originalProgressMs
+    }
+
+    expect(deltas.flatMap((d) => d.tool_calls ?? []).some((tc) => tc.name === 'kimi_progress')).toBe(true)
+    expect(stub.releaseCalls).toBe(1)
+  })
+
   it('CodexBackend uses injected spawner', async () => {
     const stub = createStubSpawner([
       JSON.stringify({ type: 'thread.started', thread_id: 'codex-th' }),
