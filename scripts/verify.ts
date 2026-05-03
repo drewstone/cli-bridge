@@ -9,7 +9,10 @@ import { loadConfig } from '../src/config.js'
 import { buildApp } from '../src/server.js'
 
 async function main(): Promise<void> {
-  const config = loadConfig()
+  const config = loadConfig({
+    ...process.env,
+    BRIDGE_BACKENDS: process.env.BRIDGE_BACKENDS ?? 'claude,codex,opencode,kimi,passthrough',
+  })
   const { registry, sessions, extras } = await buildApp(config)
 
   console.log('cli-bridge verify')

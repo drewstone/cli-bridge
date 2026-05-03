@@ -18,9 +18,16 @@ import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
 import type { AgentProfile } from '@tangle-network/sandbox'
 
+export type ChatContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url' | 'input_image'; image_url: string | { url: string } }
+  | { type: 'image'; image: string; mediaType?: string; mimeType?: string }
+
+export type ChatMessageContent = string | ChatContentPart[]
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
-  content: string
+  content: ChatMessageContent
   tool_call_id?: string
   name?: string
 }

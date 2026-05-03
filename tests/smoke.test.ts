@@ -24,6 +24,7 @@ import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountSessions } from '../src/routes/sessions.js'
 import { mountHealth } from '../src/routes/health.js'
 import { mountModels } from '../src/routes/models.js'
+import { contentToText } from '../src/backends/content.js'
 
 class FakeBackend implements Backend {
   constructor(readonly name: string) {}
@@ -34,7 +35,7 @@ class FakeBackend implements Backend {
   async *chat(req: ChatRequest, session: SessionRecord | null): AsyncIterable<ChatDelta> {
     yield { internal_session_id: `${this.name}-int-xyz` }
     yield { content: `[${this.name}] ` }
-    yield { content: req.messages[0]?.content ?? '' }
+    yield { content: contentToText(req.messages[0]?.content ?? '') }
     yield { content: ` mode=${req.mode ?? 'byob'}` }
     if (req.effort) yield { content: ` effort=${req.effort}` }
     yield { content: session ? ` turn=${session.turns + 1}` : '' }
@@ -209,6 +210,7 @@ describe('POST /v1/chat/completions', () => {
       body: JSON.stringify({
         model: 'claude/sonnet',
         messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
         session_id: 's1',
       }),
     })
@@ -219,6 +221,22 @@ describe('POST /v1/chat/completions', () => {
     expect(text).toContain('"finish_reason":"stop"')
     expect(text).toContain('data: [DONE]')
     expect(sessions.get('s1', 'claude')?.internalId).toBe('claude-int-xyz')
+  })
+
+  it('defaults to non-streaming JSON like OpenAI chat completions', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude/sonnet',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('application/json')
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0]?.message.content).toContain('[claude]')
+    expect(body.choices[0]?.message.content).toContain('hi')
   })
 
   it('routes `claudish/google@gemini-2.0-flash` to claudish — not claude', async () => {

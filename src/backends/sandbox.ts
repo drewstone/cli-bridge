@@ -27,6 +27,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { AgentProfile } from '@tangle-network/sandbox'
+import { contentToText } from './content.js'
 
 export interface SandboxBackendOptions {
   /** Tangle sandbox-api base URL, e.g. `https://sandbox.tangle.tools`. */
@@ -220,8 +221,8 @@ export class SandboxBackend implements Backend {
 }
 
 function flattenPrompt(messages: ChatRequest['messages']): string {
-  if (messages.length === 1) return messages[0]?.content ?? ''
-  return messages.map((m) => `[${m.role}] ${m.content}`).join('\n\n')
+  if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
+  return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
 }
 
 interface SSEEvent {

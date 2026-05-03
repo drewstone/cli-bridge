@@ -31,6 +31,7 @@ import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { resolvePromptMessages } from './profile-support.js'
+import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 
@@ -99,7 +100,12 @@ export class CodexBackend implements Backend {
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
     // else `codex exec <prompt>`. --json emits JSONL events.
-    const args: string[] = ['exec', '--json']
+    const args: string[] = [
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '--dangerously-bypass-approvals-and-sandbox',
+    ]
     if (modelArg) args.push('-c', `model="${modelArg}"`)
     const reasoningEffort = codexReasoningEffort(req.effort)
     if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`)
@@ -190,13 +196,18 @@ export class CodexBackend implements Backend {
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
-    if (messages.length === 1) return messages[0]?.content ?? ''
-    return messages.map((m) => `[${m.role}] ${m.content}`).join('\n\n')
+    if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
+    return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
   }
 
   private extractModel(fullModel: string): string | null {
     const lower = fullModel.toLowerCase()
     if (lower === 'codex') return null
+    // `codex/default` is the alias for "no model override; let codex
+    // CLI use whatever ~/.codex/config.toml resolves to". Returning
+    // null here suppresses the `-c model="..."` flag in chat() so the
+    // call works on accounts without entitlement for the gated alias.
+    if (lower === 'codex/default') return null
     if (lower.startsWith('codex/')) {
       const rest = fullModel.slice('codex/'.length)
       return rest.length > 0 ? rest : null

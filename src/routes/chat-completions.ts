@@ -28,7 +28,22 @@ const chatRequestSchema = z.object({
   model: z.string().min(1),
   messages: z.array(z.object({
     role: z.enum(['system', 'user', 'assistant', 'tool']),
-    content: z.string(),
+    content: z.union([
+      z.string(),
+      z.array(z.union([
+        z.object({ type: z.literal('text'), text: z.string() }),
+        z.object({
+          type: z.union([z.literal('image_url'), z.literal('input_image')]),
+          image_url: z.union([z.string(), z.object({ url: z.string() })]),
+        }),
+        z.object({
+          type: z.literal('image'),
+          image: z.string(),
+          mediaType: z.string().optional(),
+          mimeType: z.string().optional(),
+        }),
+      ])),
+    ]),
     tool_call_id: z.string().optional(),
     name: z.string().optional(),
   })).min(1),
@@ -212,9 +227,9 @@ export function mountChatCompletions(
 
     // Persist internal session id as it flows in. Returns a new
     // AsyncIterable<ChatDelta> so the typed boundary stays clean.
-    // Mode errors and BackendError('not_configured') re-throw so the
-    // outer handler can return a real HTTP status — everything else
-    // terminates the stream with finish_reason='error'.
+    // Typed backend/mode errors re-throw so the outer handler can return
+    // a real HTTP status or SSE error frame. Unknown errors terminate
+    // with finish_reason='error' so we do not leak internals.
     const wrapped: AsyncIterable<ChatDelta> = {
       [Symbol.asyncIterator]: async function* () {
         try {
@@ -235,10 +250,7 @@ export function mountChatCompletions(
             yield delta
           }
         } catch (err) {
-          if (
-            err instanceof ModeNotSupportedError
-            || (err instanceof BackendError && err.code === 'not_configured')
-          ) {
+          if (err instanceof ModeNotSupportedError || err instanceof BackendError) {
             throw err
           }
           yield { finish_reason: 'error' } satisfies ChatDelta
@@ -250,7 +262,13 @@ export function mountChatCompletions(
     // Surface mode in response headers so clients can confirm what actually ran.
     c.header('X-Bridge-Mode', req.mode ?? 'byob')
 
-    if (req.stream === false) {
+    // OpenAI's /v1/chat/completions defaults `stream: false` when the
+    // field is omitted. cli-bridge previously inverted that (defaulted
+    // to SSE), which silently broke every off-the-shelf OpenAI SDK
+    // (ai-sdk, agent-eval's callLlm, openai-node) that POSTs without
+    // explicit stream. Match OpenAI's contract: only stream when the
+    // caller asked for it (`stream: true`).
+    if (req.stream !== true) {
       try {
         const body = await collectNonStreaming(wrapped, req.model)
         return c.json(body)

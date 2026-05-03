@@ -33,6 +33,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
+import type { AgentProfile } from '@tangle-network/sandbox'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -43,6 +44,7 @@ import {
   resolveAgentProfile,
   resolvePromptMessages,
 } from './profile-support.js'
+import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 
@@ -366,8 +368,8 @@ export class KimiBackend implements Backend {
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
-    if (messages.length === 1) return messages[0]?.content ?? ''
-    return messages.map((m) => `[${m.role}] ${m.content}`).join('\n\n')
+    if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
+    return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
   }
 }
 

@@ -198,7 +198,19 @@ function constantTimeEqual(a: string, b: string): boolean {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const config = loadConfig()
   const { app, sessions, extras } = await buildApp(config)
-  const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, (info) => {
+  const server = serve({
+    fetch: app.fetch,
+    hostname: config.host,
+    port: config.port,
+    // Pass timeouts at create-time so they apply to the http.Server
+    // before it starts accepting. Setting them post-listen has the
+    // same effect for new sockets, but doing it here is bulletproof.
+    serverOptions: {
+      requestTimeout: 0,
+      headersTimeout: 0,
+      keepAliveTimeout: 0,
+    },
+  }, (info) => {
     console.log(`[cli-bridge] listening on http://${info.address}:${info.port}  (host=${config.host})`)
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
@@ -208,6 +220,14 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       }
     }
   })
+  // Node's http server defaults requestTimeout=300_000 (5 min). Long
+  // audit runs that stream tool_use deltas for 10–30 min get severed
+  // mid-flight by that ceiling; without this bump every long run dies
+  // at 300_700ms and the caller sees a truncated SSE stream with no
+  // final stop event. 0 = no per-request ceiling — the per-backend
+  // CLI_TIMEOUT_MS still bounds the underlying subprocess.
+  ;(server as { requestTimeout?: number }).requestTimeout = 0
+  ;(server as { headersTimeout?: number }).headersTimeout = 0
 
   const shutdown = async (sig: string) => {
     console.log(`[cli-bridge] ${sig} — shutting down`)

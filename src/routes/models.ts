@@ -48,6 +48,15 @@ export function mountModels(
           }
           break
         case 'codex':
+          // `codex/default` ⇒ no `-c model=...` override; codex CLI uses
+          // whatever the user's local config specifies. Works on any
+          // codex subscription tier — including ChatGPT accounts that
+          // don't have entitlement for the gated `gpt-5-codex` alias.
+          data.push({ id: 'codex/default', object: 'model', backend: b.name })
+          // Explicit `gpt-5-codex` alias retained for accounts that DO
+          // have entitlement. Calling this without entitlement returns
+          // a 400 from codex; cli-bridge surfaces the error verbatim
+          // and the server stays up.
           data.push({ id: 'codex/gpt-5-codex', object: 'model', backend: b.name })
           break
         case 'opencode':
