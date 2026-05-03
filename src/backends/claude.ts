@@ -31,6 +31,7 @@ import {
   resolveAgentProfile,
   type MaterialisedMcpConfig,
 } from './profile-support.js'
+import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 
@@ -352,8 +353,8 @@ export class ClaudeBackend implements Backend {
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
-    if (messages.length === 1) return messages[0]?.content ?? ''
-    return messages.map((m) => `[${m.role}] ${m.content}`).join('\n\n')
+    if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
+    return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
   }
 
   /**
