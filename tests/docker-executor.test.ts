@@ -466,7 +466,7 @@ describe('Spawner injection works across all subprocess backends', () => {
       ctrl.signal,
     )) deltas.push(d)
     expect(deltas.find((d) => d.internal_session_id === 'oc-1')).toBeDefined()
-    expect(stub.observedArgs).toContain('--dangerously-skip-permissions')
+    expect(stub.observedArgs).not.toContain('--dangerously-skip-permissions')
     expect(stub.releaseCalls).toBe(1)
   })
 

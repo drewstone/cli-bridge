@@ -18,6 +18,25 @@ interface ModelEntry {
   note?: string
 }
 
+const CODEX_MODELS = [
+  'default',
+  'gpt-5-codex',
+  'gpt-5.4',
+  'gpt-5.5',
+] as const
+
+const OPENCODE_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
+  { id: 'kimi-for-coding', note: 'Kimi Code via opencode-kimi-full legacy alias' },
+  { id: 'kimi-for-coding/k2p6', note: 'Kimi K2.6 via opencode provider' },
+  { id: 'zai/glm-5.1' },
+  { id: 'zai/glm-5-turbo' },
+  { id: 'zai-coding-plan/glm-5.1' },
+  { id: 'zai-coding-plan/glm-5-turbo' },
+  { id: 'deepseek/deepseek-v4-pro' },
+  { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek v4 light/flash tier' },
+  { id: 'anthropic/claude-sonnet-4-5' },
+]
+
 export function mountModels(
   app: Hono,
   deps: { registry: BackendRegistry; catalog?: ProfileCatalog },
@@ -52,16 +71,19 @@ export function mountModels(
           // whatever the user's local config specifies. Works on any
           // codex subscription tier — including ChatGPT accounts that
           // don't have entitlement for the gated `gpt-5-codex` alias.
-          data.push({ id: 'codex/default', object: 'model', backend: b.name })
-          // Explicit `gpt-5-codex` alias retained for accounts that DO
-          // have entitlement. Calling this without entitlement returns
-          // a 400 from codex; cli-bridge surfaces the error verbatim
-          // and the server stays up.
-          data.push({ id: 'codex/gpt-5-codex', object: 'model', backend: b.name })
+          for (const model of CODEX_MODELS) {
+            data.push({ id: `codex/${model}`, object: 'model', backend: b.name })
+          }
           break
         case 'opencode':
-          data.push({ id: 'opencode/kimi-for-coding', object: 'model', backend: b.name, note: 'Kimi Code via opencode-kimi-full' })
-          data.push({ id: 'opencode/anthropic/claude-sonnet-4-5', object: 'model', backend: b.name })
+          for (const model of OPENCODE_MODELS) {
+            data.push({
+              id: `opencode/${model.id}`,
+              object: 'model',
+              backend: b.name,
+              ...(model.note ? { note: model.note } : {}),
+            })
+          }
           break
         case 'factory':
           data.push({ id: 'factory/droid', object: 'model', backend: b.name, note: 'stubbed' })

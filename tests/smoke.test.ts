@@ -633,6 +633,26 @@ describe('GET /v1/models', () => {
     expect(body.data.some((m) => m.backend === 'claude-code')).toBe(true)
   })
 
+  it('advertises the benchmark matrix models for ready codex and opencode backends', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry()
+      .register(new FakeBackend('codex'))
+      .register(new FakeBackend('opencode'))
+    mountModels(app, { registry })
+    const res = await app.request('/v1/models')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<{ id: string; backend: string }> }
+    const ids = new Set(body.data.map((m) => m.id))
+    expect(ids.has('codex/gpt-5.4')).toBe(true)
+    expect(ids.has('codex/gpt-5.5')).toBe(true)
+    expect(ids.has('opencode/zai/glm-5.1')).toBe(true)
+    expect(ids.has('opencode/zai/glm-5-turbo')).toBe(true)
+    expect(ids.has('opencode/zai-coding-plan/glm-5.1')).toBe(true)
+    expect(ids.has('opencode/deepseek/deepseek-v4-pro')).toBe(true)
+    expect(ids.has('opencode/deepseek/deepseek-v4-flash')).toBe(true)
+    expect(ids.has('opencode/kimi-for-coding/k2p6')).toBe(true)
+  })
+
   it('excludes models from unavailable backends', async () => {
     const app = new Hono()
     const registry = new BackendRegistry()

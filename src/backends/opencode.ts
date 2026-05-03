@@ -87,7 +87,7 @@ export class OpencodeBackend implements Backend {
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const model = this.extractModel(req.model)
 
-    const args: string[] = ['run', '--format', 'json', '--dangerously-skip-permissions']
+    const args: string[] = ['run', '--format', 'json']
     if (model) args.push('-m', model)
     const variant = opencodeVariantForEffort(req.effort)
     if (variant) args.push('--variant', variant)
