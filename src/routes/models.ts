@@ -26,15 +26,11 @@ const CODEX_MODELS = [
 ] as const
 
 const OPENCODE_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
-  { id: 'kimi-for-coding', note: 'Kimi Code via opencode-kimi-full legacy alias' },
   { id: 'kimi-for-coding/k2p6', note: 'Kimi K2.6 via opencode provider' },
-  { id: 'zai/glm-5.1' },
-  { id: 'zai/glm-5-turbo' },
-  { id: 'zai-coding-plan/glm-5.1' },
-  { id: 'zai-coding-plan/glm-5-turbo' },
+  { id: 'zai-coding-plan/glm-5.1', note: 'GLM 5.1 via configured coding provider' },
+  { id: 'zai-coding-plan/glm-5-turbo', note: 'GLM 5 Turbo via configured coding provider' },
   { id: 'deepseek/deepseek-v4-pro' },
   { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek v4 light/flash tier' },
-  { id: 'anthropic/claude-sonnet-4-5' },
 ]
 
 export function mountModels(

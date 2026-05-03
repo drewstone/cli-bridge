@@ -645,12 +645,13 @@ describe('GET /v1/models', () => {
     const ids = new Set(body.data.map((m) => m.id))
     expect(ids.has('codex/gpt-5.4')).toBe(true)
     expect(ids.has('codex/gpt-5.5')).toBe(true)
-    expect(ids.has('opencode/zai/glm-5.1')).toBe(true)
-    expect(ids.has('opencode/zai/glm-5-turbo')).toBe(true)
     expect(ids.has('opencode/zai-coding-plan/glm-5.1')).toBe(true)
+    expect(ids.has('opencode/zai-coding-plan/glm-5-turbo')).toBe(true)
     expect(ids.has('opencode/deepseek/deepseek-v4-pro')).toBe(true)
     expect(ids.has('opencode/deepseek/deepseek-v4-flash')).toBe(true)
     expect(ids.has('opencode/kimi-for-coding/k2p6')).toBe(true)
+    expect(ids.has('opencode/zai/glm-5.1')).toBe(false)
+    expect(ids.has('opencode/anthropic/claude-sonnet-4-5')).toBe(false)
   })
 
   it('excludes models from unavailable backends', async () => {
