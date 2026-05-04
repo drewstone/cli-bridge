@@ -87,6 +87,71 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
   }
 }
 
+/**
+ * Same as `materialiseMcpConfig` but writes opencode's schema —
+ * `{mcp: {<name>: {type:'local', command:[...], environment:{...}, enabled, timeout}}}`
+ * instead of claude/kimi's `{mcpServers: {<name>: {command, args, env}}}`.
+ *
+ * opencode-cli loads the file via the `OPENCODE_CONFIG` env var (which
+ * cli-bridge's opencode backend sets when it spawns the CLI). The file
+ * is layered on top of the user's global ~/.config/opencode/opencode.json,
+ * so we only need to declare the MCP servers we want to add.
+ *
+ * Schema source: https://opencode.ai/config.json (`properties.mcp.additionalProperties`).
+ */
+export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): MaterialisedMcpConfig | null {
+  if (!profile || typeof profile !== 'object') return null
+  const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
+  if (!mcp || typeof mcp !== 'object') return null
+
+  const opencodeMcp: Record<string, {
+    type: 'local'
+    command: string[]
+    environment?: Record<string, string>
+    enabled?: boolean
+    timeout?: number
+  }> = {}
+  for (const [name, raw] of Object.entries(mcp)) {
+    if (!name || !raw || typeof raw !== 'object') continue
+    if (raw.enabled === false) continue
+    if (!raw.command || typeof raw.command !== 'string') continue
+    const args = Array.isArray(raw.args) ? raw.args.filter((a) => typeof a === 'string') : []
+    const command: string[] = [raw.command, ...args]
+    const env: Record<string, string> | undefined = raw.env && typeof raw.env === 'object'
+      ? Object.fromEntries(Object.entries(raw.env).filter(([, v]) => typeof v === 'string')) as Record<string, string>
+      : undefined
+    const timeoutRaw = (raw as { timeout?: unknown }).timeout
+    const timeout = typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : undefined
+    opencodeMcp[name] = {
+      type: 'local',
+      command,
+      ...(env ? { environment: env } : {}),
+      enabled: true,
+      ...(timeout ? { timeout } : {}),
+    }
+  }
+  const serverNames = Object.keys(opencodeMcp)
+  if (serverNames.length === 0) return null
+
+  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-'))
+  const configPath = join(dir, 'opencode.json')
+  writeFileSync(configPath, JSON.stringify({
+    $schema: 'https://opencode.ai/config.json',
+    mcp: opencodeMcp,
+  }, null, 2))
+  return {
+    configPath,
+    serverNames,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best-effort cleanup
+      }
+    },
+  }
+}
+
 export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
   const configPath = join(dir, 'mcp-config.json')
