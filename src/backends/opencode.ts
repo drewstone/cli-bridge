@@ -138,13 +138,42 @@ export class OpencodeBackend implements Backend {
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
       const lineIter = rl[Symbol.asyncIterator]()
       let pendingLine = lineIter.next()
+      // Child-close sentinel — race this against the line iterator so a
+      // dead opencode-cli child can't strand the for-await loop. The
+      // readline asyncIterator does NOT always yield done:true when
+      // child.stdout closes (observed: process exits, stdout pipe held
+      // open by buffered framework writers, iterator stays pending
+      // forever). Without this race the bridge holds the response
+      // stream open indefinitely while the model client waits for
+      // a finish_reason that never arrives.
+      let childClosed = false
+      let childExitCode: number | null = child.exitCode
+      const closePromise: Promise<{ kind: 'close'; code: number | null }> = new Promise((resolve) => {
+        if (childExitCode !== null) {
+          childClosed = true
+          resolve({ kind: 'close', code: childExitCode })
+          return
+        }
+        child.once('close', (code) => {
+          childClosed = true
+          childExitCode = typeof code === 'number' ? code : null
+          // Give readline ~50ms to drain any final lines buffered between
+          // the last write and process exit, then resolve.
+          setTimeout(() => resolve({ kind: 'close', code: childExitCode }), 50)
+        })
+      })
 
       while (true) {
         const next = await Promise.race([
           pendingLine.then((result) => ({ kind: 'line' as const, result })),
           delay(progressIntervalMs).then(() => ({ kind: 'progress' as const })),
+          closePromise,
         ])
+        if (next.kind === 'close') break
         if (next.kind === 'progress') {
+          // If the child already closed during the delay, exit cleanly
+          // rather than yield another progress event into a dead stream.
+          if (childClosed) break
           progressSeq += 1
           yield {
             tool_calls: [{
