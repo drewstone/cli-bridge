@@ -46,6 +46,17 @@ class FakeBackend implements Backend {
   }
 }
 
+class DelayedBackend extends FakeBackend {
+  constructor(name: string, private readonly delayMs: number) {
+    super(name)
+  }
+
+  override async *chat(req: ChatRequest, session: SessionRecord | null): AsyncIterable<ChatDelta> {
+    await new Promise((resolve) => setTimeout(resolve, this.delayMs))
+    yield* super.chat(req, session)
+  }
+}
+
 describe('SessionStore', () => {
   let dir: string
   let store: SessionStore
@@ -221,6 +232,41 @@ describe('POST /v1/chat/completions', () => {
     expect(text).toContain('"finish_reason":"stop"')
     expect(text).toContain('data: [DONE]')
     expect(sessions.get('s1', 'claude')?.internalId).toBe('claude-int-xyz')
+  })
+
+  it('keeps SSE alive while a backend is silent', async () => {
+    const oldHeartbeat = process.env.BRIDGE_SSE_HEARTBEAT_MS
+    process.env.BRIDGE_SSE_HEARTBEAT_MS = '10'
+    sessions.close()
+    rmSync(dir, { recursive: true, force: true })
+    dir = mkdtempSync(join(tmpdir(), 'cli-bridge-test-'))
+    sessions = new SessionStore(dir)
+    app = new Hono()
+    mountChatCompletions(
+      app,
+      { registry: new BackendRegistry().register(new DelayedBackend('slow', 40)), sessions },
+    )
+    try {
+      const res = await app.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'slow/test',
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: true,
+          session_id: 'slow-1',
+        }),
+      })
+      expect(res.status).toBe(200)
+      const text = await res.text()
+      expect(text).toContain(': connected')
+      expect(text).toContain(': keepalive')
+      expect(text).toContain('[slow]')
+      expect(text).toContain('data: [DONE]')
+    } finally {
+      if (oldHeartbeat === undefined) delete process.env.BRIDGE_SSE_HEARTBEAT_MS
+      else process.env.BRIDGE_SSE_HEARTBEAT_MS = oldHeartbeat
+    }
   })
 
   it('defaults to non-streaming JSON like OpenAI chat completions', async () => {

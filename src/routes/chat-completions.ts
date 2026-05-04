@@ -24,6 +24,8 @@ import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, makeChunkMeta } from '../streaming/sse.js'
 
+const DEFAULT_SSE_HEARTBEAT_MS = 15_000
+
 const chatRequestSchema = z.object({
   model: z.string().min(1),
   messages: z.array(z.object({
@@ -279,7 +281,12 @@ export function mountChatCompletions(
 
     return streamSSE(c, async (stream) => {
       const meta = makeChunkMeta(req.model)
+      const heartbeatMs = resolveSseHeartbeatMs()
+      const heartbeat = setInterval(() => {
+        void stream.write(': keepalive\n\n').catch(() => {})
+      }, heartbeatMs)
       try {
+        await stream.write(': connected\n\n')
         for await (const delta of wrapped) {
           const chunk = deltaToOpenAIChunk(delta, meta)
           // deltaToOpenAIChunk returns a complete "data: …\n\n" line.
@@ -297,10 +304,17 @@ export function mountChatCompletions(
         await stream.writeSSE({
           data: JSON.stringify({ error: { message, type } }),
         })
+      } finally {
+        clearInterval(heartbeat)
       }
       await stream.writeSSE({ data: '[DONE]' })
     })
   })
+}
+
+function resolveSseHeartbeatMs(): number {
+  const raw = Number(process.env.BRIDGE_SSE_HEARTBEAT_MS)
+  return Number.isFinite(raw) && raw >= 10 ? raw : DEFAULT_SSE_HEARTBEAT_MS
 }
 
 function errorResponse(c: Context, err: unknown): Response {
