@@ -482,6 +482,26 @@ describe('POST /v1/chat/completions', () => {
     expect(res.status).toBe(200)
   })
 
+  it('accepts OpenAI-shaped response_format: { type: json_schema } on the wire', async () => {
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude',
+        messages: [{ role: 'user', content: 'x' }],
+        stream: false,
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'answer',
+            schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+          },
+        },
+      }),
+    })
+    expect(res.status).toBe(200)
+  })
+
   it('persists cwd and agent_profile into resumed sessions', async () => {
     const profile = {
       name: 'local-coder',

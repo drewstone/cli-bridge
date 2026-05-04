@@ -59,7 +59,8 @@ const chatRequestSchema = z.object({
   // OpenAI-compatible shape — wire is snake_case, TS is camelCase. We
   // translate to responseFormat when we build the ChatRequest below.
   response_format: z.object({
-    type: z.enum(['text', 'json_object']),
+    type: z.enum(['text', 'json_object', 'json_schema']),
+    json_schema: z.unknown().optional(),
   }).optional(),
   agent_profile: z.unknown().optional(),
   cwd: z.string().optional(),
@@ -160,7 +161,7 @@ export function mountChatCompletions(
       ...rest,
       session_id: bodySession ?? headerSession,
       mode,
-      ...(response_format ? { responseFormat: response_format } : {}),
+      ...(response_format ? { responseFormat: normalizeResponseFormat(response_format) } : {}),
       ...(agent_profile ? { agent_profile: agent_profile as ChatRequest['agent_profile'] } : {}),
       ...(cwd ? { cwd } : {}),
       ...(execution ? { execution: execution as ChatRequest['execution'] } : {}),
@@ -315,6 +316,12 @@ export function mountChatCompletions(
 function resolveSseHeartbeatMs(): number {
   const raw = Number(process.env.BRIDGE_SSE_HEARTBEAT_MS)
   return Number.isFinite(raw) && raw >= 10 ? raw : DEFAULT_SSE_HEARTBEAT_MS
+}
+
+function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_schema' }): ChatRequest['responseFormat'] {
+  return format.type === 'json_schema'
+    ? { type: 'json_object' }
+    : { type: format.type }
 }
 
 function errorResponse(c: Context, err: unknown): Response {
