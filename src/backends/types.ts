@@ -53,11 +53,9 @@ export interface ChatRequest {
    */
   mode?: BridgeMode
   /**
-   * OpenAI-compatible response-format hint. `json_object` asks the
-   * backend to return a single JSON object with no prose and no
-   * markdown fences. CLI harnesses don't expose a native json-mode
-   * flag, so backends honor this prompt-side — callers should still
-   * treat fence-stripping as a belt-and-suspenders fallback.
+   * OpenAI-compatible response-format hint. CLI harnesses have no
+   * native JSON-schema mode, so `json_schema` is normalized at the
+   * route boundary to this prompt-side `json_object` directive.
    */
   responseFormat?: { type: 'text' | 'json_object' }
   /** Optional caller-declared AgentProfile. Sandbox uses it natively; local harnesses honor a prompt/context subset. */
