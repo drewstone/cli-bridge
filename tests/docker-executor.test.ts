@@ -18,7 +18,7 @@ import { KimiBackend } from '../src/backends/kimi.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import { ContainerPool } from '../src/executors/container-pool.js'
 import { buildDockerExecArgs } from '../src/executors/docker.js'
-import { hostSpawner } from '../src/executors/host.js'
+import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
 
@@ -35,6 +35,26 @@ describe('hostSpawner', () => {
     expect(() => result.release()).not.toThrow()
     // Drain so the test exits cleanly.
     await new Promise<void>((resolve) => result.child.once('close', () => resolve()))
+  })
+
+  it('keeps spawned host env below OS arg/env limits', () => {
+    const env = sanitizeHostEnv({
+      HOME: '/home/drew',
+      PATH: '/usr/bin',
+      ANTHROPIC_API_KEY: 'sk-test',
+      OPENCODE_CONFIG: '/tmp/opencode.json',
+      GH_TOKEN: 'ghp_test',
+      HUGE_SESSION_BLOB: 'x'.repeat(1024 * 1024),
+      npm_config_user_agent: 'pnpm/test',
+    })
+
+    expect(env).toEqual({
+      HOME: '/home/drew',
+      PATH: '/usr/bin',
+      ANTHROPIC_API_KEY: 'sk-test',
+      OPENCODE_CONFIG: '/tmp/opencode.json',
+      GH_TOKEN: 'ghp_test',
+    })
   })
 })
 
