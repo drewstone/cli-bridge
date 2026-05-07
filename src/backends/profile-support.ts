@@ -100,10 +100,6 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
  * Schema source: https://opencode.ai/config.json (`properties.mcp.additionalProperties`).
  */
 export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): MaterialisedMcpConfig | null {
-  if (!profile || typeof profile !== 'object') return null
-  const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
-  if (!mcp || typeof mcp !== 'object') return null
-
   const opencodeMcp: Record<string, {
     type: 'local'
     command: string[]
@@ -111,32 +107,52 @@ export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): Mate
     enabled?: boolean
     timeout?: number
   }> = {}
-  for (const [name, raw] of Object.entries(mcp)) {
-    if (!name || !raw || typeof raw !== 'object') continue
-    if (raw.enabled === false) continue
-    if (!raw.command || typeof raw.command !== 'string') continue
-    const args = Array.isArray(raw.args) ? raw.args.filter((a) => typeof a === 'string') : []
-    const command: string[] = [raw.command, ...args]
-    const env: Record<string, string> | undefined = raw.env && typeof raw.env === 'object'
-      ? Object.fromEntries(Object.entries(raw.env).filter(([, v]) => typeof v === 'string')) as Record<string, string>
-      : undefined
-    const timeoutRaw = (raw as { timeout?: unknown }).timeout
-    const timeout = typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : undefined
-    opencodeMcp[name] = {
-      type: 'local',
-      command,
-      ...(env ? { environment: env } : {}),
-      enabled: true,
-      ...(timeout ? { timeout } : {}),
+
+  if (profile && typeof profile === 'object') {
+    const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
+    if (mcp && typeof mcp === 'object') {
+      for (const [name, raw] of Object.entries(mcp)) {
+        if (!name || !raw || typeof raw !== 'object') continue
+        if (raw.enabled === false) continue
+        if (!raw.command || typeof raw.command !== 'string') continue
+        const args = Array.isArray(raw.args) ? raw.args.filter((a) => typeof a === 'string') : []
+        const command: string[] = [raw.command, ...args]
+        const env: Record<string, string> | undefined = raw.env && typeof raw.env === 'object'
+          ? Object.fromEntries(Object.entries(raw.env).filter(([, v]) => typeof v === 'string')) as Record<string, string>
+          : undefined
+        const timeoutRaw = (raw as { timeout?: unknown }).timeout
+        const timeout = typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : undefined
+        opencodeMcp[name] = {
+          type: 'local',
+          command,
+          ...(env ? { environment: env } : {}),
+          enabled: true,
+          ...(timeout ? { timeout } : {}),
+        }
+      }
     }
   }
   const serverNames = Object.keys(opencodeMcp)
-  if (serverNames.length === 0) return null
 
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-'))
   const configPath = join(dir, 'opencode.json')
+  // Headless benchmark and automation runs must never block on an
+  // interactive permission prompt.
+  const headlessPermission: Record<string, 'allow' | 'ask' | 'deny'> = {
+    external_directory: 'allow',
+    bash: 'allow',
+    edit: 'allow',
+    read: 'allow',
+    write: 'allow',
+    webfetch: 'allow',
+    task: 'allow',
+    plan_enter: 'allow',
+    plan_exit: 'allow',
+    question: 'allow',
+  }
   writeFileSync(configPath, JSON.stringify({
     $schema: 'https://opencode.ai/config.json',
+    permission: headlessPermission,
     mcp: opencodeMcp,
   }, null, 2))
   return {
