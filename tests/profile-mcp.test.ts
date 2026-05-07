@@ -18,6 +18,7 @@ import type { AgentProfile } from '@tangle-network/sandbox'
 import {
   buildMcpAllowList,
   materialiseMcpConfig,
+  materialiseOpencodeMcpConfig,
 } from '../src/backends/profile-support.js'
 
 describe('materialiseMcpConfig', () => {
@@ -92,6 +93,28 @@ describe('materialiseMcpConfig', () => {
     if (!m) return
     expect(m.serverNames).toEqual(['good'])
     m.cleanup()
+  })
+})
+
+describe('materialiseOpencodeMcpConfig', () => {
+  it('writes headless permissions even when no MCP servers are declared', () => {
+    const m = materialiseOpencodeMcpConfig(null)
+    expect(m).not.toBeNull()
+    if (!m) return
+    expect(m.serverNames).toEqual([])
+
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.permission).toMatchObject({
+      external_directory: 'allow',
+      bash: 'allow',
+      edit: 'allow',
+      read: 'allow',
+      write: 'allow',
+      webfetch: 'allow',
+    })
+    expect(written.mcp).toEqual({})
+    m.cleanup()
+    expect(existsSync(m.configPath)).toBe(false)
   })
 })
 
