@@ -80,6 +80,20 @@ export interface ChatRequest {
       }
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
+  /**
+   * OpenAI-style tool definitions. CLI harnesses don't natively expose
+   * caller-supplied tools to the model; when `BRIDGE_EMULATE_TOOL_CALLS=1`
+   * is set, supported backends translate these via prompt-marker emulation
+   * (see backends/tool-emulation.ts). Default off.
+   */
+  tools?: Array<{
+    type: 'function'
+    function: { name: string; description?: string; parameters?: unknown }
+  }>
+  /** OpenAI-style tool_choice — passed to the emulation layer. */
+  tool_choice?:
+    | 'auto' | 'none' | 'required'
+    | { type: 'function'; function: { name: string } }
 }
 
 export interface ChatDelta {

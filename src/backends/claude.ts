@@ -34,6 +34,7 @@ import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -203,6 +204,9 @@ export class ClaudeBackend implements Backend {
     const onAbort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', onAbort, { once: true })
 
+    const emulateTools = isEmulationEnabled(req)
+    const toolMarkerParser = emulateTools ? new ToolMarkerParser() : null
+    let emittedAnyToolCall = false
     try {
       let internalSessionId: string | undefined
       let stderr = ''
@@ -236,7 +240,19 @@ export class ClaudeBackend implements Backend {
           const content = a.message?.content ?? []
           for (const block of content) {
             if (block.type === 'text') {
-              yield { content: block.text }
+              if (toolMarkerParser) {
+                // Emulation: text blocks may contain TOOL_CALL markers.
+                // Surface only the prose between/around markers, and emit
+                // any complete tool calls as synthetic tool_calls deltas.
+                const { toolCalls, prose } = toolMarkerParser.feed(block.text)
+                if (prose) yield { content: prose }
+                if (toolCalls.length > 0) {
+                  emittedAnyToolCall = true
+                  yield { tool_calls: toolCalls }
+                }
+              } else {
+                yield { content: block.text }
+              }
             } else if (block.type === 'tool_use') {
               yield {
                 tool_calls: [{
@@ -255,8 +271,19 @@ export class ClaudeBackend implements Backend {
           if (r.is_error) {
             yield { finish_reason: 'error', internal_session_id: internalSessionId }
           } else {
+            // In emulation mode, drain any trailing prose still in the
+            // parser buffer and pick the right finish_reason. tool_calls
+            // wins over stop when the model declared at least one.
+            if (toolMarkerParser) {
+              const tail = toolMarkerParser.flush()
+              if (tail.prose) yield { content: tail.prose }
+              if (tail.toolCalls.length > 0) {
+                emittedAnyToolCall = true
+                yield { tool_calls: tail.toolCalls }
+              }
+            }
             yield {
-              finish_reason: 'stop',
+              finish_reason: emittedAnyToolCall ? 'tool_calls' : 'stop',
               usage: r.usage,
               internal_session_id: r.session_id ?? internalSessionId,
             }
@@ -308,12 +335,22 @@ export class ClaudeBackend implements Backend {
   ): string[] {
     const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
 
+    const emulateTools = isEmulationEnabled(req)
     const appendPrompts = [
       renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
       wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
+      emulateTools ? renderToolEmulationDirective(req.tools!, req.tool_choice) : null,
     ].filter((value): value is string => Boolean(value))
     if (appendPrompts.length) {
       args.push('--append-system-prompt', appendPrompts.join('\n\n'))
+    }
+    // When emulating caller-supplied tools, disable claude-code's built-in
+    // Read/Bash/Edit/Write — the model must declare a tool call via marker
+    // and stop, not actually run claude-code's own tools. Note: this comes
+    // BEFORE the --allowedTools that --mcp-config would set, so MCP-server
+    // tools (passed via agent_profile.mcp) still work; only built-ins go off.
+    if (emulateTools) {
+      args.push('--allowedTools', '')
     }
 
     // MCP wiring — when the caller passed agent_profile.mcp, register
