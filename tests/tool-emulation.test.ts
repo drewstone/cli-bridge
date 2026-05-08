@@ -118,9 +118,9 @@ describe('ToolMarkerParser', () => {
     ].join('\n')
     const out = parser.feed(chunk)
     expect(out.toolCalls).toHaveLength(2)
-    expect(out.toolCalls[0].name).toBe('a')
-    expect(out.toolCalls[1].name).toBe('b')
-    expect(out.toolCalls[1].arguments).toBe('{"x":1}')
+    expect(out.toolCalls[0]!.name).toBe('a')
+    expect(out.toolCalls[1]!.name).toBe('b')
+    expect(out.toolCalls[1]!.arguments).toBe('{"x":1}')
   })
 
   it('handles a marker split across two chunks', () => {
@@ -128,7 +128,7 @@ describe('ToolMarkerParser', () => {
     expect(a.toolCalls).toHaveLength(0)
     const b = parser.feed('LL>>>{"name":"foo","arguments":{}}<<<END_TOOL_CALL>>> done')
     expect(b.toolCalls).toHaveLength(1)
-    expect(b.toolCalls[0].name).toBe('foo')
+    expect(b.toolCalls[0]!.name).toBe('foo')
     // Prose around the markers shows up across the two feeds. Whitespace
     // immediately after a parsed marker is normalized away by design so
     // back-to-back marker blocks read clean.
@@ -148,12 +148,12 @@ describe('ToolMarkerParser', () => {
     const chunk = '<<<TOOL_CALL>>>```json\n{"name":"x","arguments":{}}\n```<<<END_TOOL_CALL>>>'
     const out = parser.feed(chunk)
     expect(out.toolCalls).toHaveLength(1)
-    expect(out.toolCalls[0].name).toBe('x')
+    expect(out.toolCalls[0]!.name).toBe('x')
   })
 
   it('synthesizes an id when the model omits one', () => {
     const out = parser.feed('<<<TOOL_CALL>>>{"name":"x","arguments":{}}<<<END_TOOL_CALL>>>')
-    expect(out.toolCalls[0].id).toMatch(/^emul_/)
+    expect(out.toolCalls[0]!.id).toMatch(/^emul_/)
   })
 
   it('flush() returns dangling prose without dropping it', () => {

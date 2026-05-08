@@ -26,6 +26,7 @@ import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
 
 export interface OpencodeBackendOptions {
   bin: string
@@ -84,7 +85,11 @@ export class OpencodeBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
-    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
+    const flatPrompt = this.flattenPrompt(resolvePromptMessages(req, session))
+    const emulateTools = isEmulationEnabled(req)
+    const prompt = emulateTools
+      ? `${renderToolEmulationDirective(req.tools!, req.tool_choice)}\n\n${flatPrompt}`
+      : flatPrompt
     const model = this.extractModel(req.model)
 
     // Materialise agent_profile.mcp into a temp opencode-shape config
@@ -146,6 +151,7 @@ export class OpencodeBackend implements Backend {
       let emittedContent = false
       let emittedToolCall = false
       let usage: ChatDelta['usage']
+      const toolMarkerParser = emulateTools ? new ToolMarkerParser() : null
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
 
       for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
@@ -184,7 +190,16 @@ export class OpencodeBackend implements Backend {
         }
 
         const text = extractText(ev)
-        if (text) { yield { content: text }; emittedContent = true }
+        if (text) {
+          if (toolMarkerParser) {
+            const { toolCalls, prose } = toolMarkerParser.feed(text)
+            if (prose) { yield { content: prose }; emittedContent = true }
+            if (toolCalls.length > 0) { yield { tool_calls: toolCalls }; emittedToolCall = true }
+          } else {
+            yield { content: text }
+            emittedContent = true
+          }
+        }
         const toolCall = extractToolUse(ev)
         if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
         const eventUsage = extractUsage(ev)
@@ -196,8 +211,13 @@ export class OpencodeBackend implements Backend {
           || type === 'session.completed'
           || type === 'run.completed'
         ) {
+          if (toolMarkerParser) {
+            const tail = toolMarkerParser.flush()
+            if (tail.prose) { yield { content: tail.prose }; emittedContent = true }
+            if (tail.toolCalls.length > 0) { yield { tool_calls: tail.toolCalls }; emittedToolCall = true }
+          }
           yield {
-            finish_reason: sawError ? 'error' : 'stop',
+            finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
             usage,
             internal_session_id: internalSessionId,
           }
@@ -215,10 +235,16 @@ export class OpencodeBackend implements Backend {
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(`opencode exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
       }
+      // Drain marker parser at process exit (when no completion event was seen).
+      if (toolMarkerParser) {
+        const tail = toolMarkerParser.flush()
+        if (tail.prose) { yield { content: tail.prose }; emittedContent = true }
+        if (tail.toolCalls.length > 0) { yield { tool_calls: tail.toolCalls }; emittedToolCall = true }
+      }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
       }
-      yield { finish_reason: 'stop', usage, internal_session_id: internalSessionId }
+      yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', usage, internal_session_id: internalSessionId }
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
