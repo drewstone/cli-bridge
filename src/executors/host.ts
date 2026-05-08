@@ -15,9 +15,18 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     cwd: opts.cwd,
     env: sanitizeHostEnv(opts.env),
   })
+  // Attach a synchronous error capture INSIDE the spawner — Node fires
+  // the 'error' event for spawn failures (ENOENT, EACCES) on
+  // process.nextTick, which runs BEFORE the awaiter's microtask. If a
+  // backend tries to attach its own listener after `await spawner(...)`,
+  // the event has already crashed the process. By recording it here we
+  // guarantee the listener is registered before the tick fires.
+  let spawnError: Error | null = null
+  child.on('error', (err) => { spawnError = err })
   const result: SpawnResult = {
     child,
     release: () => {},
+    spawnError: () => spawnError,
   }
   return result
 }

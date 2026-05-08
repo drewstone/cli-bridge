@@ -17,7 +17,6 @@
  * right headers so Moonshot's backend accepts the call.
  */
 
-import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -26,6 +25,7 @@ import { materialiseOpencodeMcpConfig, resolveAgentProfile, resolvePromptMessage
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
+import { readProcessLines, waitForProcessClose } from './process-lines.js'
 
 export interface OpencodeBackendOptions {
   bin: string
@@ -118,6 +118,16 @@ export class OpencodeBackend implements Backend {
     const child = spawned.child
     const releaseSpawner = spawned.release
 
+    // The spawner registers a synchronous 'error' listener to prevent
+    // uncaught exceptions on spawn ENOENT/EACCES; we both attach our
+    // own listener (for races where the spawner doesn't expose
+    // spawnError) and consult spawned.spawnError() after first I/O for
+    // the captured event.
+    let spawnErrorMessage = ''
+    child.on('error', (err) => { spawnErrorMessage = err.message })
+    const earlySpawnError = spawned.spawnError?.()
+    if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
+
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', onAbort, { once: true })
@@ -126,61 +136,26 @@ export class OpencodeBackend implements Backend {
       let internalSessionId: string | undefined
       let stderr = ''
       child.stderr?.on('data', (b) => { stderr += b.toString() })
+      if (spawnErrorMessage) {
+        throw new BackendError(`opencode spawn failed: ${spawnErrorMessage}`, 'upstream')
+      }
       if (!child.stdout) {
         throw new BackendError('opencode subprocess has no stdout pipe', 'upstream')
       }
-      const rl = createInterface({ input: child.stdout })
       let sawError: string | null = null
       let emittedContent = false
       let emittedToolCall = false
       let usage: ChatDelta['usage']
-      let progressSeq = 0
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
-      const lineIter = rl[Symbol.asyncIterator]()
-      let pendingLine = lineIter.next()
-      // Child-close sentinel — race this against the line iterator so a
-      // dead opencode-cli child can't strand the for-await loop. The
-      // readline asyncIterator does NOT always yield done:true when
-      // child.stdout closes (observed: process exits, stdout pipe held
-      // open by buffered framework writers, iterator stays pending
-      // forever). Without this race the bridge holds the response
-      // stream open indefinitely while the model client waits for
-      // a finish_reason that never arrives.
-      let childClosed = false
-      let childExitCode: number | null = child.exitCode
-      const closePromise: Promise<{ kind: 'close'; code: number | null }> = new Promise((resolve) => {
-        if (childExitCode !== null) {
-          childClosed = true
-          resolve({ kind: 'close', code: childExitCode })
-          return
-        }
-        child.once('close', (code) => {
-          childClosed = true
-          childExitCode = typeof code === 'number' ? code : null
-          // Give readline ~50ms to drain any final lines buffered between
-          // the last write and process exit, then resolve.
-          setTimeout(() => resolve({ kind: 'close', code: childExitCode }), 50)
-        })
-      })
 
-      while (true) {
-        const next = await Promise.race([
-          pendingLine.then((result) => ({ kind: 'line' as const, result })),
-          delay(progressIntervalMs).then(() => ({ kind: 'progress' as const })),
-          closePromise,
-        ])
-        if (next.kind === 'close') break
+      for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (next.kind === 'progress') {
-          // If the child already closed during the delay, exit cleanly
-          // rather than yield another progress event into a dead stream.
-          if (childClosed) break
-          progressSeq += 1
           yield {
             tool_calls: [{
-              id: `opencode-progress-${progressSeq}`,
+              id: `opencode-progress-${next.seq}`,
               name: 'opencode_progress',
               arguments: JSON.stringify({
-                elapsedMs: progressSeq * progressIntervalMs,
+                elapsedMs: next.elapsedMs,
                 stderrTail: stderr.slice(-240),
               }),
             }],
@@ -188,9 +163,7 @@ export class OpencodeBackend implements Backend {
           continue
         }
 
-        pendingLine = lineIter.next()
-        const { value: line, done } = next.result
-        if (done) break
+        const line = next.line
         if (!line.trim()) continue
         let ev: Record<string, unknown>
         try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
@@ -232,10 +205,7 @@ export class OpencodeBackend implements Backend {
         }
       }
 
-      const exitCode: number | null = await new Promise((resolve) => {
-        if (child.exitCode !== null) resolve(child.exitCode)
-        else child.once('close', (code) => resolve(code))
-      })
+      const exitCode = await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
@@ -339,11 +309,4 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    timer.unref?.()
-  })
 }

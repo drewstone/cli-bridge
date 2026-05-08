@@ -45,6 +45,16 @@ export interface SpawnResult {
    * is safe but unnecessary.
    */
   release(): void
+  /**
+   * Returns the spawn-time 'error' event captured by the spawner's
+   * synchronous listener, or null if none. Backends MUST check this
+   * after the await — Node fires spawn 'error' (ENOENT, EACCES) on
+   * process.nextTick, which races the awaiter's microtask. The
+   * spawner registers the listener synchronously to prevent uncaught
+   * errors from crashing cli-bridge; the backend reads the captured
+   * error here to surface it as a BackendError.
+   */
+  spawnError?(): Error | null
 }
 
 export type Spawner = (bin: string, args: string[], opts: SpawnOpts) => Promise<SpawnResult>

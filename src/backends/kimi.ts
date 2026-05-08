@@ -32,7 +32,6 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { createInterface } from 'node:readline'
 import type { AgentProfile } from '@tangle-network/sandbox'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
@@ -47,6 +46,7 @@ import {
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
+import { readProcessLines, waitForProcessClose } from './process-lines.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -147,6 +147,15 @@ export class KimiBackend implements Backend {
     const child = spawned.child
     const releaseSpawner = spawned.release
 
+    // The spawner registers a synchronous 'error' listener so the spawn
+    // failure event doesn't crash the process before our own listener
+    // can attach. We consult the captured value here (and double-attach
+    // for safety against future spawner refactors).
+    let spawnErrorMessage = ''
+    child.on('error', (err) => { spawnErrorMessage = err.message })
+    const earlySpawnError = spawned.spawnError?.()
+    if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
+
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', onAbort, { once: true })
@@ -156,6 +165,9 @@ export class KimiBackend implements Backend {
       let stderr = ''
       let emittedContent = false
       let emittedToolCall = false
+      if (spawnErrorMessage) {
+        throw new BackendError(`kimi spawn failed: ${spawnErrorMessage}`, 'upstream')
+      }
       if (!child.stdout) {
         throw new BackendError('kimi subprocess has no stdout pipe', 'upstream')
       }
@@ -171,27 +183,18 @@ export class KimiBackend implements Backend {
         }
       })
 
-      const rl = createInterface({ input: child.stdout })
       let sawError: string | null = null
 
-      let progressSeq = 0
       const progressIntervalMs = Math.max(10, Number(process.env.KIMI_PROGRESS_MS ?? 30_000))
-      const lineIter = rl[Symbol.asyncIterator]()
-      let pendingLine = lineIter.next()
 
-      while (true) {
-        const next = await Promise.race([
-          pendingLine.then((result) => ({ kind: 'line' as const, result })),
-          delay(progressIntervalMs).then(() => ({ kind: 'progress' as const })),
-        ])
+      for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (next.kind === 'progress') {
-          progressSeq += 1
           yield {
             tool_calls: [{
-              id: `kimi-progress-${progressSeq}`,
+              id: `kimi-progress-${next.seq}`,
               name: 'kimi_progress',
               arguments: JSON.stringify({
-                elapsedMs: progressSeq * progressIntervalMs,
+                elapsedMs: next.elapsedMs,
                 stderrTail: stderr.slice(-240),
               }),
             }],
@@ -199,9 +202,7 @@ export class KimiBackend implements Backend {
           continue
         }
 
-        pendingLine = lineIter.next()
-        const { value: line, done } = next.result
-        if (done) break
+        const line = next.line
         if (!line.trim()) continue
         let ev: Record<string, unknown>
         try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
@@ -279,10 +280,7 @@ export class KimiBackend implements Backend {
         }
       }
 
-      const exitCode: number | null = await new Promise((resolve) => {
-        if (child.exitCode !== null) resolve(child.exitCode)
-        else child.once('close', (code) => resolve(code))
-      })
+      const exitCode = await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
@@ -431,13 +429,6 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    timer.unref?.()
-  })
 }
 
 function extractToolUse(ev: Record<string, unknown>): { id: string; name: string; arguments: string } | null {
