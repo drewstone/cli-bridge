@@ -19,7 +19,6 @@
  * model-id prefixes makes the choice explicit at call time.
  */
 
-import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
@@ -34,6 +33,7 @@ import {
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
+import { readProcessLines, waitForProcessClose } from './process-lines.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -187,6 +187,15 @@ export class ClaudeBackend implements Backend {
     const child = spawned.child
     const releaseSpawner = spawned.release
 
+    // The spawner registers a synchronous 'error' listener so the spawn
+    // failure event doesn't crash the process before our own listener
+    // can attach. We consult the captured value here (and double-attach
+    // for safety against future spawner refactors).
+    let spawnErrorMessage = ''
+    child.on('error', (err) => { spawnErrorMessage = err.message })
+    const earlySpawnError = spawned.spawnError?.()
+    if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
+
     const timeoutHandle = setTimeout(() => {
       child.kill('SIGTERM')
     }, this.timeoutMs)
@@ -199,11 +208,15 @@ export class ClaudeBackend implements Backend {
       let stderr = ''
       child.stderr?.on('data', (b) => { stderr += b.toString() })
 
+      if (spawnErrorMessage) {
+        throw new BackendError(`claude spawn failed: ${spawnErrorMessage}`, 'upstream')
+      }
       if (!child.stdout) {
         throw new BackendError('claude subprocess has no stdout pipe', 'upstream')
       }
-      const rl = createInterface({ input: child.stdout })
-      for await (const line of rl) {
+      for await (const event of readProcessLines({ child, stdout: child.stdout })) {
+        if (event.kind !== 'line') continue
+        const line = event.line
         if (!line.trim()) continue
         let msg: ClaudeStreamLine
         try {
@@ -252,10 +265,7 @@ export class ClaudeBackend implements Backend {
         }
       }
 
-      const exitCode: number | null = await new Promise((resolve) => {
-        if (child.exitCode !== null) resolve(child.exitCode)
-        else child.once('close', (code) => resolve(code))
-      })
+      const exitCode = await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }

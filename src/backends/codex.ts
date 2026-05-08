@@ -25,7 +25,6 @@
  * again, adjust `extractText` below rather than the whole pipeline.
  */
 
-import { createInterface } from 'node:readline'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -34,6 +33,7 @@ import { resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
+import { readProcessLines, waitForProcessClose } from './process-lines.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -125,6 +125,15 @@ export class CodexBackend implements Backend {
     const child = spawned.child
     const releaseSpawner = spawned.release
 
+    // The spawner registers a synchronous 'error' listener so the spawn
+    // failure event doesn't crash the process before our own listener
+    // can attach. We consult the captured value here (and double-attach
+    // for safety against future spawner refactors).
+    let spawnErrorMessage = ''
+    child.on('error', (err) => { spawnErrorMessage = err.message })
+    const earlySpawnError = spawned.spawnError?.()
+    if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
+
     const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
     const onAbort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', onAbort, { once: true })
@@ -133,13 +142,17 @@ export class CodexBackend implements Backend {
       let internalSessionId: string | undefined
       let stderr = ''
       child.stderr?.on('data', (b) => { stderr += b.toString() })
+      if (spawnErrorMessage) {
+        throw new BackendError(`codex spawn failed: ${spawnErrorMessage}`, 'upstream')
+      }
       if (!child.stdout) {
         throw new BackendError('codex subprocess has no stdout pipe', 'upstream')
       }
-      const rl = createInterface({ input: child.stdout })
       let sawError: string | null = null
 
-      for await (const line of rl) {
+      for await (const event of readProcessLines({ child, stdout: child.stdout })) {
+        if (event.kind !== 'line') continue
+        const line = event.line
         if (!line.trim()) continue
         let ev: Record<string, unknown>
         try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
@@ -171,10 +184,7 @@ export class CodexBackend implements Backend {
         }
       }
 
-      const exitCode: number | null = await new Promise((resolve) => {
-        if (child.exitCode !== null) resolve(child.exitCode)
-        else child.once('close', (code) => resolve(code))
-      })
+      const exitCode = await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
