@@ -156,15 +156,13 @@ export class OpencodeBackend implements Backend {
 
       for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (next.kind === 'progress') {
+          // Subprocess liveness signal — opencode has emitted no stdout
+          // for `progressIntervalMs`. Yield as keepalive so the SSE
+          // writer renders an SSE comment that keeps the socket alive
+          // without injecting a fake OpenAI tool_call into the response.
+          // See ChatDelta.keepalive (backends/types.ts) for the contract.
           yield {
-            tool_calls: [{
-              id: `opencode-progress-${next.seq}`,
-              name: 'opencode_progress',
-              arguments: JSON.stringify({
-                elapsedMs: next.elapsedMs,
-                stderrTail: stderr.slice(-240),
-              }),
-            }],
+            keepalive: { source: 'opencode', elapsedMs: next.elapsedMs },
           }
           continue
         }
