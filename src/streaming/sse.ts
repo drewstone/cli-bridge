@@ -15,11 +15,39 @@ export interface ChunkMeta {
   created: number
 }
 
-export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string {
+/**
+ * Convert a `ChatDelta` into an OpenAI-shaped chat.completion.chunk
+ * `data: …` line. Returns `null` for deltas that carry only a
+ * `keepalive` signal — those must be rendered as SSE comments by the
+ * caller (see `deltaToSseComment`) so they don't appear in the
+ * OpenAI-visible delta stream.
+ */
+export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | null {
+  const hasContent = delta.content !== undefined
+  const hasToolCalls = !!delta.tool_calls && delta.tool_calls.length > 0
+  const hasFinish = delta.finish_reason !== undefined
+  const hasUsage = !!delta.usage
+  const hasSessionId = !!delta.internal_session_id
+
+  // Pure keepalive deltas don't go on the OpenAI wire — surface as SSE
+  // comments via `deltaToSseComment` instead. `internal_session_id`-only
+  // deltas are also non-OpenAI metadata (consumed by the session store)
+  // and are intentionally skipped here.
+  if (!hasContent && !hasToolCalls && !hasFinish && !hasUsage) {
+    return null
+  }
+  // internal_session_id-only deltas: the session id is bookkeeping for
+  // the bridge's own store, not OpenAI surface area. Skip to avoid
+  // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
+  // some agent harnesses) reject as malformed.
+  if (hasSessionId && !hasContent && !hasToolCalls && !hasFinish && !hasUsage) {
+    return null
+  }
+
   const choiceDelta: Record<string, unknown> = {}
-  if (delta.content !== undefined) choiceDelta.content = delta.content
-  if (delta.tool_calls && delta.tool_calls.length > 0) {
-    choiceDelta.tool_calls = delta.tool_calls.map((tc, i) => ({
+  if (hasContent) choiceDelta.content = delta.content
+  if (hasToolCalls) {
+    choiceDelta.tool_calls = delta.tool_calls!.map((tc, i) => ({
       index: i,
       id: tc.id,
       type: 'function',
@@ -42,6 +70,22 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string {
     ...(delta.usage ? { usage: { prompt_tokens: delta.usage.input_tokens, completion_tokens: delta.usage.output_tokens } } : {}),
   }
   return `data: ${JSON.stringify(payload)}\n\n`
+}
+
+/**
+ * Render a `keepalive` delta as a raw SSE comment (RFC: lines starting
+ * with `:` are comments and silently dropped by every conforming SSE
+ * client — OpenAI/AI SDK/LiteLLM included). Returns `null` for deltas
+ * without a keepalive. The string includes the trailing `\n\n` framing.
+ *
+ * Comment lines also serve as transport heartbeats: they keep the TCP
+ * connection alive across NAT/proxies and prevent client-side fetch
+ * idle timeouts during long subprocess silences.
+ */
+export function deltaToSseComment(delta: ChatDelta): string | null {
+  if (!delta.keepalive) return null
+  const { source, elapsedMs } = delta.keepalive
+  return `: keepalive source=${source} elapsed=${elapsedMs}\n\n`
 }
 
 export function sseDone(): string {
@@ -70,6 +114,9 @@ export async function collectNonStreaming(
   let usage: ChatDelta['usage']
 
   for await (const d of iter) {
+    // Backend-liveness signals are transport-layer and have no place in
+    // the non-streaming response body. Drop them silently.
+    if (d.keepalive) continue
     if (d.content) content += d.content
     if (d.tool_calls) toolCalls.push(...d.tool_calls)
     if (d.finish_reason) finishReason = d.finish_reason

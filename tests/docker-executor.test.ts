@@ -429,13 +429,24 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(stub.releaseCalls).toBe(1)
   })
 
-  it('KimiBackend emits liveness progress while kimi buffers stream-json stdout', async () => {
+  it('KimiBackend surfaces buffered-stdout silence as keepalive deltas (not synthetic tool_calls)', async () => {
+    // Why this matters: pre-fix, kimi.ts emitted progress as fake
+    // tool_calls named `kimi_progress`. Strict OpenAI consumers (Vercel
+    // AI SDK in particular) require every tool_calls[].name to exist in
+    // the caller's tools registry, so the synthetic name broke every
+    // multi-turn agent loop driving kimi via cli-bridge. The fix keeps
+    // the liveness signal but routes it through ChatDelta.keepalive,
+    // which the SSE writer renders as an SSE comment (silently dropped
+    // by every conforming consumer) — see backends/types.ts ChatDelta.
     const originalProgressMs = process.env.KIMI_PROGRESS_MS
     process.env.KIMI_PROGRESS_MS = '10'
     const stub = createDelayedStubSpawner(35)
     const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
     const ctrl = new AbortController()
-    const deltas: Array<{ tool_calls?: Array<{ name: string }> }> = []
+    const deltas: Array<{
+      tool_calls?: Array<{ name: string }>
+      keepalive?: { source: string; elapsedMs: number }
+    }> = []
     try {
       await expect(async () => {
         for await (const d of backend.chat(
@@ -449,7 +460,14 @@ describe('Spawner injection works across all subprocess backends', () => {
       else process.env.KIMI_PROGRESS_MS = originalProgressMs
     }
 
-    expect(deltas.flatMap((d) => d.tool_calls ?? []).some((tc) => tc.name === 'kimi_progress')).toBe(true)
+    // Keepalive deltas MUST be emitted with source='kimi' — that's the
+    // only operator-visible signal that kimi is alive but silent.
+    const keepalives = deltas.filter((d) => d.keepalive)
+    expect(keepalives.length).toBeGreaterThan(0)
+    expect(keepalives.every((d) => d.keepalive?.source === 'kimi')).toBe(true)
+    expect(keepalives.every((d) => typeof d.keepalive?.elapsedMs === 'number')).toBe(true)
+    // No synthetic tool_calls — strict consumers would reject these.
+    expect(deltas.flatMap((d) => d.tool_calls ?? [])).toEqual([])
     expect(stub.releaseCalls).toBe(1)
   })
 
@@ -541,13 +559,19 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(deltas.at(-1)?.usage).toEqual({ input_tokens: 25153, output_tokens: 77 })
   })
 
-  it('OpencodeBackend emits liveness progress while opencode buffers json stdout', async () => {
+  it('OpencodeBackend surfaces buffered-stdout silence as keepalive deltas (not synthetic tool_calls)', async () => {
+    // Mirror of the KimiBackend keepalive test — see the comment there
+    // for the rationale on why we deliberately do NOT synthesize a
+    // tool_call to signal liveness.
     const originalProgressMs = process.env.OPENCODE_PROGRESS_MS
     process.env.OPENCODE_PROGRESS_MS = '10'
     const stub = createDelayedStubSpawner(35)
     const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
     const ctrl = new AbortController()
-    const deltas: Array<{ tool_calls?: Array<{ name: string }> }> = []
+    const deltas: Array<{
+      tool_calls?: Array<{ name: string }>
+      keepalive?: { source: string; elapsedMs: number }
+    }> = []
     try {
       await expect(async () => {
         for await (const d of backend.chat(
@@ -561,7 +585,11 @@ describe('Spawner injection works across all subprocess backends', () => {
       else process.env.OPENCODE_PROGRESS_MS = originalProgressMs
     }
 
-    expect(deltas.flatMap((d) => d.tool_calls ?? []).some((tc) => tc.name === 'opencode_progress')).toBe(true)
+    const keepalives = deltas.filter((d) => d.keepalive)
+    expect(keepalives.length).toBeGreaterThan(0)
+    expect(keepalives.every((d) => d.keepalive?.source === 'opencode')).toBe(true)
+    expect(keepalives.every((d) => typeof d.keepalive?.elapsedMs === 'number')).toBe(true)
+    expect(deltas.flatMap((d) => d.tool_calls ?? [])).toEqual([])
     expect(stub.releaseCalls).toBe(1)
   })
 

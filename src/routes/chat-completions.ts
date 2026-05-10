@@ -22,7 +22,7 @@ import type { SessionStore } from '../sessions/store.js'
 import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
-import { collectNonStreaming, deltaToOpenAIChunk, makeChunkMeta } from '../streaming/sse.js'
+import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -304,7 +304,20 @@ export function mountChatCompletions(
       try {
         await stream.write(': connected\n\n')
         for await (const delta of wrapped) {
+          // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
+          // render as SSE comment so the consumer (AI SDK, openai-node)
+          // ignores it per spec instead of trying to route a fake tool
+          // call. SSE comments also count as transport heartbeats.
+          const comment = deltaToSseComment(delta)
+          if (comment) {
+            await stream.write(comment).catch(() => {})
+            continue
+          }
           const chunk = deltaToOpenAIChunk(delta, meta)
+          // Metadata-only deltas (e.g. internal_session_id) yield null —
+          // the route already consumed the metadata above; nothing to
+          // write to the OpenAI-visible stream.
+          if (!chunk) continue
           // deltaToOpenAIChunk returns a complete "data: …\n\n" line.
           // Strip the framing so streamSSE can re-add it.
           const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')

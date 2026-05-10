@@ -192,15 +192,14 @@ export class KimiBackend implements Backend {
 
       for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (next.kind === 'progress') {
+          // Subprocess liveness signal — kimi has emitted no stdout for
+          // `progressIntervalMs` and may be doing internal think work
+          // (stream-json is buffered). Yield as keepalive so the SSE
+          // writer renders an SSE comment that keeps the socket alive
+          // without injecting a fake OpenAI tool_call into the response.
+          // See ChatDelta.keepalive (backends/types.ts) for the contract.
           yield {
-            tool_calls: [{
-              id: `kimi-progress-${next.seq}`,
-              name: 'kimi_progress',
-              arguments: JSON.stringify({
-                elapsedMs: next.elapsedMs,
-                stderrTail: stderr.slice(-240),
-              }),
-            }],
+            keepalive: { source: 'kimi', elapsedMs: next.elapsedMs },
           }
           continue
         }
