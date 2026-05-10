@@ -1,10 +1,11 @@
 /**
  * Unit tests for the prompt-marker tool-emulation path.
  *
- * - Off by default (no env flag, no tools[]) — emulation reports disabled.
- * - On when env flag is set AND caller passed tools[] — directive renders
- *   the tools and the tool_choice constraint, parser extracts JSON tool
- *   calls between the literal markers, and prose around the markers
+ * - ON BY DEFAULT whenever caller passes a non-empty tools[]. Opt-out via
+ *   BRIDGE_DISABLE_TOOL_EMULATION=1 (or BRIDGE_EMULATE_TOOL_CALLS=0).
+ * - Disabled when tools[] is missing/empty even if no env var set.
+ * - Directive renders tools and the tool_choice constraint; parser extracts
+ *   JSON tool calls between the literal markers; prose around the markers
  *   passes through untouched.
  * - Streaming chunks split mid-marker still parse correctly on the next feed.
  * - Malformed JSON inside a marker is dropped (no synthetic call) but the
@@ -41,28 +42,47 @@ const sampleTools = [
 ]
 
 describe('isEmulationEnabled', () => {
-  const original = process.env.BRIDGE_EMULATE_TOOL_CALLS
+  const originalEmulate = process.env.BRIDGE_EMULATE_TOOL_CALLS
+  const originalDisable = process.env.BRIDGE_DISABLE_TOOL_EMULATION
   afterEach(() => {
-    if (original === undefined) delete process.env.BRIDGE_EMULATE_TOOL_CALLS
-    else process.env.BRIDGE_EMULATE_TOOL_CALLS = original
+    if (originalEmulate === undefined) delete process.env.BRIDGE_EMULATE_TOOL_CALLS
+    else process.env.BRIDGE_EMULATE_TOOL_CALLS = originalEmulate
+    if (originalDisable === undefined) delete process.env.BRIDGE_DISABLE_TOOL_EMULATION
+    else process.env.BRIDGE_DISABLE_TOOL_EMULATION = originalDisable
   })
 
-  it('is false when env flag is unset, even with tools[]', () => {
+  it('is TRUE by default when tools[] is non-empty (no env vars needed)', () => {
     delete process.env.BRIDGE_EMULATE_TOOL_CALLS
-    expect(isEmulationEnabled({ tools: sampleTools })).toBe(false)
+    delete process.env.BRIDGE_DISABLE_TOOL_EMULATION
+    expect(isEmulationEnabled({ tools: sampleTools })).toBe(true)
   })
 
-  it('is false when env flag is set but tools[] is missing/empty', () => {
-    process.env.BRIDGE_EMULATE_TOOL_CALLS = '1'
+  it('is false when tools[] is missing or empty, regardless of env', () => {
+    delete process.env.BRIDGE_EMULATE_TOOL_CALLS
+    delete process.env.BRIDGE_DISABLE_TOOL_EMULATION
     expect(isEmulationEnabled({})).toBe(false)
     expect(isEmulationEnabled({ tools: [] })).toBe(false)
   })
 
-  it('is true only when both env flag is "1" AND tools[] has entries', () => {
+  it('opts out via BRIDGE_DISABLE_TOOL_EMULATION=1 even when tools[] supplied', () => {
+    process.env.BRIDGE_DISABLE_TOOL_EMULATION = '1'
+    expect(isEmulationEnabled({ tools: sampleTools })).toBe(false)
+  })
+
+  it('opts out via BRIDGE_EMULATE_TOOL_CALLS=0 even when tools[] supplied', () => {
+    process.env.BRIDGE_EMULATE_TOOL_CALLS = '0'
+    expect(isEmulationEnabled({ tools: sampleTools })).toBe(false)
+  })
+
+  it('the legacy =1 form is also honored as an explicit opt-in', () => {
     process.env.BRIDGE_EMULATE_TOOL_CALLS = '1'
     expect(isEmulationEnabled({ tools: sampleTools })).toBe(true)
-    process.env.BRIDGE_EMULATE_TOOL_CALLS = 'true'  // not "1" — must be exact
-    expect(isEmulationEnabled({ tools: sampleTools })).toBe(false)
+  })
+
+  it('non-"1" non-"0" values of BRIDGE_EMULATE_TOOL_CALLS are treated as no-op (default applies)', () => {
+    process.env.BRIDGE_EMULATE_TOOL_CALLS = 'true'
+    expect(isEmulationEnabled({ tools: sampleTools })).toBe(true)
+    expect(isEmulationEnabled({ tools: [] })).toBe(false)
   })
 })
 
