@@ -15,8 +15,17 @@
  * `tool_calls` deltas. The caller's main-agent loop then drives the
  * multi-turn flow normally.
  *
- * Feature-flagged (`BRIDGE_EMULATE_TOOL_CALLS=1`) — default off so
- * existing benchmark workloads stay byte-for-byte unchanged.
+ * Default: **enabled** whenever the caller passes a non-empty `tools[]`
+ * array. The opt-out is `BRIDGE_DISABLE_TOOL_EMULATION=1` for byte-stable
+ * benchmark workloads that want the legacy pre-0.x.x behavior. cli-bridge
+ * is a localhost-only, bearer-protected, single-user surface — the
+ * agentic default is the right one. Silently dropping caller-supplied
+ * tools (the prior default) was the worst failure mode: wrong output,
+ * no error, no log.
+ *
+ * Migration: any benchmark that relied on the previous default must
+ * either set `BRIDGE_DISABLE_TOOL_EMULATION=1` in its env or stop
+ * passing `tools[]`.
  */
 
 export interface CallerTool {
@@ -43,7 +52,14 @@ const FENCE_CLOSE = '<<<END_TOOL_CALL>>>'
 const MARKER_RE = /<<<TOOL_CALL>>>([\s\S]*?)<<<END_TOOL_CALL>>>/g
 
 export function isEmulationEnabled(req: { tools?: CallerTool[] | null }): boolean {
-  if (process.env.BRIDGE_EMULATE_TOOL_CALLS !== '1') return false
+  // Default ON: emulate whenever the caller supplied tools[]. The bridge
+  // is local + bearer-protected; agentic behavior is the right default
+  // and silently dropping tools[] is the worst failure mode.
+  // Opt-out: BRIDGE_DISABLE_TOOL_EMULATION=1 for byte-stable benchmark
+  // workloads. (BRIDGE_EMULATE_TOOL_CALLS=0 is also honored as an
+  // explicit kill switch — see migration note in the file header.)
+  if (process.env.BRIDGE_DISABLE_TOOL_EMULATION === '1') return false
+  if (process.env.BRIDGE_EMULATE_TOOL_CALLS === '0') return false
   return Array.isArray(req.tools) && req.tools.length > 0
 }
 
