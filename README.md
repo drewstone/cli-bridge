@@ -186,45 +186,70 @@ failing. Configure the wall-clock budget via
 `CAD_RENDER_TIMEOUT_MS` (default 60_000). Each artifact is capped at
 10 MB.
 
-### `POST /images/generate`
+### `POST /v1/images/generations`
 
-Proxy to OpenAI's images API (default model: `gpt-image-1`). Returns
-base64 PNG bytes. Supports image editing when `referenceImage` is
-supplied — the photo + structured prompt workflow for "imagine this
-in your space" mockups.
+OpenAI-compatible image generation, mounted on the standard `/v1` path
+so `@tangle-network/tcloud`'s `imageGenerate(...)` (and any OpenAI Node
+SDK with `baseURL` pointed at this bridge) Just Works without a custom
+transport.
+
+Default model: **`gpt-image-2`**. Override per-call via the OpenAI
+standard `model` field.
 
 ```bash
-curl -s http://127.0.0.1:3344/images/generate \
+curl -s http://127.0.0.1:3344/v1/images/generations \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer '"$BRIDGE_BEARER" \
   -d '{
     "prompt": "a small red square on a white background",
     "size": "1024x1024",
-    "quality": "high",
+    "quality": "low",
     "n": 1
-  }' | jq '.ok, .model, (.images | length)'
+  }' | jq '.data[0].b64_json | length'
 ```
 
-Body shape:
+Request body (schema is permissive — unknown fields pass through):
 
 ```ts
 {
-  model?: string,                  // default "gpt-image-1"
+  model?: string,                  // default "gpt-image-2"
   prompt: string,
-  size?: "1024x1024"|"1024x1536"|"1536x1024"|"auto",  // default "1024x1024"
-  quality?: "low"|"medium"|"high"|"auto",             // default "high"
-  n?: number,                      // default 1, max 4
-  referenceImage?: { mediaType: string, base64: string },  // → /images/edits
+  size?: string,                   // OpenAI-supported sizes
+  quality?: string,                // low | medium | high | auto
+  n?: number,                      // default 1, capped at 10
+  response_format?: "b64_json"|"url",
+  // Any future OpenAI params (style, background, output_format, …) pass
+  // through unchanged — no schema bump required.
 }
 ```
 
-Response: `{ ok: true, images: [{base64, mediaType: "image/png"}, …], model, durationMs }`
-on success; `{ ok: false, error, durationMs }` on upstream failure or
-when `OPENAI_API_KEY` is unset.
+Response is the upstream's body verbatim (OpenAI-shaped):
+`{ created, data: [{ b64_json, revised_prompt? }, …] }`. On upstream
+failure the bridge surfaces the upstream's status code and error body
+unchanged so `OpenAI`-style error handling on the caller side keeps
+working.
 
-**Env:** `OPENAI_API_KEY` is required. The bridge never logs prompts
-(potential PII); only metadata (model, size, n, durationMs) is logged
-on failure.
+**Dispatch order:**
+
+1. `TANGLE_API_KEY` set → forward to `${TANGLE_ROUTER_URL or
+   router.tangle.tools/v1}/images/generations`. Router accounts for
+   credits + applies the operator's routing policy. Canonical
+   production path.
+2. `OPENAI_API_KEY` set → forward directly to OpenAI. Local-dev
+   fallback.
+3. Neither → **HTTP 503** with an OpenAI-shaped
+   `{error:{type:"service_unavailable", code:"no_image_backend"}}`.
+
+The bridge never logs prompts (potential PII); only model, size, n,
+dispatch route, upstream status, and duration are emitted on stderr.
+
+> **Note on image *editing*.** OpenAI's separate `/v1/images/edits`
+> endpoint (multipart, with a reference photo for the "place this in
+> your space" workflow) is intentionally NOT proxied yet — `tcloud`
+> client doesn't surface it as of v0.4.6, and adding a custom shape
+> would re-introduce the very transport asymmetry this route just
+> removed. When the editing API lands in `tcloud`, mount a sibling
+> `/v1/images/edits` route that mirrors the same router-vs-OpenAI fork.
 
 ## Claudish setup
 
