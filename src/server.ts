@@ -27,6 +27,8 @@ import { mountHealth } from './routes/health.js'
 import { mountModels } from './routes/models.js'
 import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
+import { mountCadRender } from './routes/cad-render.js'
+import { mountImagesGenerate } from './routes/images-generate.js'
 import { ContainerPool } from './executors/container-pool.js'
 import { createDockerSpawner } from './executors/docker.js'
 import type { Spawner } from './executors/types.js'
@@ -176,13 +178,22 @@ export async function buildApp(config: Config): Promise<{
   mountSessions(app, { sessions })
   mountProfiles(app, { catalog })
   mountChatCompletions(app, { registry, sessions })
+  mountCadRender(app)
+  mountImagesGenerate(app)
 
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
     version: '0.2.0',
     scheme: 'bridge/<harness>/<model>',
     backends: registry.all().map(b => b.name),
-    endpoints: ['/health', '/v1/models', '/v1/chat/completions', '/v1/sessions'],
+    endpoints: [
+      '/health',
+      '/v1/models',
+      '/v1/chat/completions',
+      '/v1/sessions',
+      '/cad/render',
+      '/images/generate',
+    ],
   }))
 
   return { app, sessions, registry, catalog, extras }

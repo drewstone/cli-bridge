@@ -146,6 +146,86 @@ JSON report per backend — ready / unavailable / error with detail.
 
 Inspect / clear external-to-internal session mappings.
 
+### `POST /cad/render`
+
+Render OpenSCAD source to STL + PNG (+ optional GLB). Generic — any
+project that wants a parametric-CAD rasterizer behind one bearer can
+call it.
+
+```bash
+curl -s http://127.0.0.1:3344/cad/render \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer '"$BRIDGE_BEARER" \
+  -d '{
+    "code": "cube(10);",
+    "outputs": ["stl", "png"],
+    "imageSize": [800, 600]
+  }' | jq '.ok, .durationMs, (.artifacts | keys)'
+```
+
+Body shape:
+
+```ts
+{
+  code: string,            // OpenSCAD source
+  outputs?: Array<"stl"|"png"|"glb">,  // default ["stl","png"]
+  imageSize?: [number, number],        // png only, default [800,600]
+  defines?: Record<string, string | number | boolean>,  // openscad -D vars
+}
+```
+
+Response: `{ ok: true, artifacts: { stl?, png?, glb? }, durationMs, warnings: [] }`
+on success; `{ ok: false, error: string, durationMs }` on openscad
+compile failure or artifact-size overflow.
+
+**Dependencies:** `openscad` on `$PATH` (provided by the `hardware`
+nix profile in `tangle-network/agent-dev-container`). GLB output
+additionally requires `python3` + `trimesh`; if either is missing the
+endpoint omits `glb` from `artifacts` and adds a warning rather than
+failing. Configure the wall-clock budget via
+`CAD_RENDER_TIMEOUT_MS` (default 60_000). Each artifact is capped at
+10 MB.
+
+### `POST /images/generate`
+
+Proxy to OpenAI's images API (default model: `gpt-image-1`). Returns
+base64 PNG bytes. Supports image editing when `referenceImage` is
+supplied — the photo + structured prompt workflow for "imagine this
+in your space" mockups.
+
+```bash
+curl -s http://127.0.0.1:3344/images/generate \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer '"$BRIDGE_BEARER" \
+  -d '{
+    "prompt": "a small red square on a white background",
+    "size": "1024x1024",
+    "quality": "high",
+    "n": 1
+  }' | jq '.ok, .model, (.images | length)'
+```
+
+Body shape:
+
+```ts
+{
+  model?: string,                  // default "gpt-image-1"
+  prompt: string,
+  size?: "1024x1024"|"1024x1536"|"1536x1024"|"auto",  // default "1024x1024"
+  quality?: "low"|"medium"|"high"|"auto",             // default "high"
+  n?: number,                      // default 1, max 4
+  referenceImage?: { mediaType: string, base64: string },  // → /images/edits
+}
+```
+
+Response: `{ ok: true, images: [{base64, mediaType: "image/png"}, …], model, durationMs }`
+on success; `{ ok: false, error, durationMs }` on upstream failure or
+when `OPENAI_API_KEY` is unset.
+
+**Env:** `OPENAI_API_KEY` is required. The bridge never logs prompts
+(potential PII); only metadata (model, size, n, durationMs) is logged
+on failure.
+
 ## Claudish setup
 
 Claudish is a separate tool (Hono-based Anthropic proxy). Run it locally:
