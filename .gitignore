@@ -16,3 +16,4 @@ data/
 .env.local
 .env.*.local
 .claude/
+entities/

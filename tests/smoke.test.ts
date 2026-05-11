@@ -553,51 +553,62 @@ describe('POST /v1/chat/completions', () => {
   })
 })
 
-describe('ClaudeBackend JSON mode (buildArgs)', () => {
+describe('ClaudeBackend stdin payload + buildArgs', () => {
   const b = new ClaudeBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'claude-code' })
   const baseReq = {
     model: 'claude-code/sonnet',
     messages: [{ role: 'user' as const, content: 'summarize' }],
   }
 
-  it('injects --append-system-prompt with the JSON directive when responseFormat is json_object', () => {
+  // ─────── argv + stdin split contract ───────
+  //
+  // The bridge passes USER content via stdin (--input-format
+  // stream-json) and SYSTEM content via argv (--append-system-prompt).
+  // History — argv-stuffing the full prompt via `-p <huge>` hit the
+  // kernel MAX_ARG_STRLEN ceiling (128 KiB per arg) for any
+  // non-trivial agentic call (long tools[], conversation history).
+  // Wrapping system content into a synthetic user-side
+  // `[SYSTEM INSTRUCTIONS]` block tripped the model's
+  // prompt-injection heuristic and the model refused to call tools.
+  // The split below is the working invariant.
+
+  it('uses -p argv (single-shot text mode) when caller passes user text under the cap', () => {
+    // Preferred path: claude-code emits tool-emulation markers
+    // reliably in argv single-shot mode. Stream-json stdin mode is
+    // a fallback only (markers are unreliable there).
+    const args = b.buildArgs(baseReq, null, 'byob', null, { userTextForArgv: 'summarize' })
+    expect(args).toContain('-p')
+    expect(args[args.indexOf('-p') + 1]).toBe('summarize')
+    expect(args).toContain('--output-format')
+    expect(args[args.indexOf('--output-format') + 1]).toBe('stream-json')
+    // Argv mode must NOT include --input-format stream-json — that would
+    // flip claude-code into interactive agent-loop mode.
+    expect(args).not.toContain('--input-format')
+  })
+
+  it('falls back to --input-format stream-json when user text is too large for argv', () => {
+    const args = b.buildArgs(baseReq, null, 'byob')
+    expect(args).toContain('--print')
+    expect(args).toContain('--input-format')
+    expect(args[args.indexOf('--input-format') + 1]).toBe('stream-json')
+    expect(args).not.toContain('-p')
+  })
+
+  it('routes system content to argv via --append-system-prompt when it fits', () => {
+    // JSON-mode directive is bounded (<1 KB) so it always fits.
     const args = b.buildArgs(
       { ...baseReq, responseFormat: { type: 'json_object' } },
       null,
       'byob',
-      'summarize',
     )
     const i = args.indexOf('--append-system-prompt')
     expect(i).toBeGreaterThan(-1)
     expect(args[i + 1]).toContain('single JSON object')
-    expect(args[i + 1]).toContain('No markdown fences')
   })
 
-  it('does NOT add --append-system-prompt when responseFormat is absent (regression guard)', () => {
-    const args = b.buildArgs(baseReq, null, 'byob', 'summarize')
+  it('omits --append-system-prompt when there is no system content', () => {
+    const args = b.buildArgs(baseReq, null, 'byob')
     expect(args).not.toContain('--append-system-prompt')
-  })
-
-  it('does NOT add --append-system-prompt when responseFormat is text', () => {
-    const args = b.buildArgs(
-      { ...baseReq, responseFormat: { type: 'text' } },
-      null,
-      'byob',
-      'summarize',
-    )
-    expect(args).not.toContain('--append-system-prompt')
-  })
-
-  it('includes profile-derived system prompt in --append-system-prompt', () => {
-    const args = b.buildArgs(
-      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
-      null,
-      'byob',
-      'summarize',
-    )
-    const i = args.indexOf('--append-system-prompt')
-    expect(i).toBeGreaterThan(-1)
-    expect(args[i + 1]).toContain('Be precise.')
   })
 
   it('byob mode sets --permission-mode bypassPermissions (regression: without this every Write/Edit blocks)', () => {
@@ -606,7 +617,7 @@ describe('ClaudeBackend JSON mode (buildArgs)', () => {
     // to interactive approval, which has no approver in the non-TTY
     // bridge pipeline. byob explicitly means "caller trusts the tools"
     // (see src/modes.ts), so bypass is correct.
-    const args = b.buildArgs(baseReq, null, 'byob', 'summarize')
+    const args = b.buildArgs(baseReq, null, 'byob')
     const i = args.indexOf('--permission-mode')
     expect(i).toBeGreaterThan(-1)
     expect(args[i + 1]).toBe('bypassPermissions')
@@ -616,7 +627,7 @@ describe('ClaudeBackend JSON mode (buildArgs)', () => {
   })
 
   it('hosted-safe mode still uses plan + disallowed-tools, not bypass', () => {
-    const args = b.buildArgs(baseReq, null, 'hosted-safe', 'summarize')
+    const args = b.buildArgs(baseReq, null, 'hosted-safe')
     const i = args.indexOf('--permission-mode')
     expect(i).toBeGreaterThan(-1)
     expect(args[i + 1]).toBe('plan')
@@ -626,6 +637,95 @@ describe('ClaudeBackend JSON mode (buildArgs)', () => {
     expect(args[d + 1]).toContain('Edit')
     expect(args[d + 1]).toContain('Write')
     expect(args).not.toContain('bypassPermissions')
+  })
+
+  // ─────── stdin payload contract ───────
+
+  it('stdin carries ONLY user content when system fits in argv (default path)', () => {
+    // JSON mode directive fits in argv, so stdin should contain only
+    // the user message — no [SYSTEM INSTRUCTIONS] wrapper.
+    const { messages } = b.composeStdinInput(
+      { ...baseReq, responseFormat: { type: 'json_object' } },
+      null,
+    )
+    expect(messages).toHaveLength(1)
+    expect(messages[0]?.role).toBe('user')
+    expect(messages[0]?.content).toBe('summarize')
+    expect(messages[0]?.content).not.toContain('[SYSTEM INSTRUCTIONS]')
+    expect(messages[0]?.content).not.toContain('single JSON object')
+  })
+
+  it('stdin user content is unwrapped when no system content present', () => {
+    const { messages } = b.composeStdinInput(baseReq, null)
+    expect(messages[0]?.content).toBe('summarize')
+    expect(messages[0]?.content).not.toContain('[SYSTEM INSTRUCTIONS]')
+  })
+
+  it('agent_profile preamble routes to argv, NOT stdin', () => {
+    // Default path: system content fits in argv. Confirm
+    // composeStdinInput keeps user content clean.
+    const { messages } = b.composeStdinInput(
+      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      null,
+    )
+    expect(messages[0]?.content).toBe('summarize')
+    expect(messages[0]?.content).not.toContain('Be precise.')
+    // The profile preamble goes to --append-system-prompt — verified by buildArgs:
+    const args = b.buildArgs(
+      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      null,
+      'byob',
+    )
+    const i = args.indexOf('--append-system-prompt')
+    expect(i).toBeGreaterThan(-1)
+    expect(args[i + 1]).toContain('Be precise.')
+  })
+
+  it('falls back to [SYSTEM INSTRUCTIONS] wrapper when system content exceeds argv cap', () => {
+    // Synthesize a system payload over the 120 KiB threshold. Models
+    // typically reject this as injection-shaped, but the spawn still
+    // succeeds — better than spawn E2BIG. This is the degraded
+    // failsafe path.
+    const enormousProfilePrompt = 'A'.repeat(125 * 1024)
+    const req = {
+      ...baseReq,
+      agent_profile: { name: 'x', prompt: { systemPrompt: enormousProfilePrompt } } as any,
+    }
+    // argv should NOT carry --append-system-prompt because it overflows.
+    const args = b.buildArgs(req, null, 'byob')
+    expect(args).not.toContain('--append-system-prompt')
+    // stdin then folds the system content into the user message (fallback).
+    const { messages } = b.composeStdinInput(req, null)
+    expect(messages[0]?.content).toContain('[SYSTEM INSTRUCTIONS]')
+    expect(messages[0]?.content).toContain('[USER]')
+    expect(messages[0]?.content).toContain('summarize')
+  })
+
+  it('handles 16 verbose tools by routing emulation directive to argv (not E2BIG)', () => {
+    // Regression guard for the original E2BIG class: 16 tools with
+    // ~2 KB descriptions each → ~32 KB combined directive. Pre-fix,
+    // the whole prompt+directive went into `-p <argv>` and died with
+    // spawn E2BIG. Post-fix, the directive goes to
+    // --append-system-prompt (fits comfortably under 120 KiB) and
+    // stdin carries only the small user message.
+    const bigTools = Array.from({ length: 16 }, (_, i) => ({
+      type: 'function' as const,
+      function: {
+        name: `tool_${i}`,
+        description: 'x'.repeat(2_000),
+        parameters: { type: 'object' as const, properties: {}, required: [] },
+      },
+    }))
+    const args = b.buildArgs({ ...baseReq, tools: bigTools }, null, 'byob')
+    // Each individual argv string must stay under MAX_ARG_STRLEN
+    // (128 KiB). The directive lives in --append-system-prompt's
+    // value, which is one argv string — verify it fits.
+    const i = args.indexOf('--append-system-prompt')
+    expect(i).toBeGreaterThan(-1)
+    expect(Buffer.byteLength(args[i + 1] ?? '', 'utf8')).toBeLessThan(120 * 1024)
+    // Stdin stays minimal — user content only.
+    const { messages } = b.composeStdinInput({ ...baseReq, tools: bigTools }, null)
+    expect(messages[0]?.content).toBe('summarize')
   })
 })
 
