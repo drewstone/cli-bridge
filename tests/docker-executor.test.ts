@@ -341,6 +341,12 @@ function makeFakeChild(
   const ee = new EventEmitter()
   ;(ee as unknown as { stdout: Readable }).stdout = stdout
   ;(ee as unknown as { stderr: Readable }).stderr = stderr
+  // claude.ts now writes the NDJSON prompt to stdin via writeStdinPayload;
+  // the stub exposes a sink stdin so the chat() path can call .write/.end
+  // without blowing up. Tests that observe what claude.ts wrote to stdin
+  // can attach a 'data' listener before the chat() call returns.
+  const stdin = new PassThrough()
+  ;(ee as unknown as { stdin: PassThrough }).stdin = stdin
   ;(ee as unknown as { exitCode: number | null }).exitCode = null
   ;(ee as unknown as { kill: () => void }).kill = () => { onKill() }
   // Emit close once stdout drains so chat()'s exit-code wait resolves.

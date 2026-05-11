@@ -35,6 +35,7 @@ import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
+import { writeStdinPayload } from './stdin-payload.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -167,20 +168,47 @@ export class ClaudeBackend implements Backend {
       )
     }
 
-    const prompt = this.flattenPrompt(req.messages)
+    // Two transport modes for sending the user message to claude-code-cli:
+    //
+    //   1. `-p <text>` ARGV — claude-code's "single-shot text" mode.
+    //      Single non-interactive turn. Forced to produce an output
+    //      and exit. This is the mode that correctly emits
+    //      tool-emulation markers (<<<TOOL_CALL>>>...) when caller
+    //      tools[] are registered. PREFERRED.
+    //
+    //   2. `--input-format stream-json` STDIN — claude-code's
+    //      "interactive agent loop" mode. The CLI uses its OWN
+    //      internal tool registry (ToolSearch, Bash, etc.) and the
+    //      emulation markers are NOT emitted reliably. FALLBACK only.
+    //
+    // We use argv when the user-message string fits the kernel's
+    // per-arg limit (MAX_ARG_STRLEN = 128 KiB). Fall back to stdin
+    // when it overflows. System content (agent profile preamble,
+    // tool-emulation directive, etc.) goes through
+    // --append-system-prompt regardless of which user-message
+    // transport is chosen — see buildArgs/composeStdinInput.
+    const stdinInput = this.composeStdinInput(req, session)
+    const userText = stdinInput.messages[0]?.content ?? ''
+    const PROMPT_ARGV_LIMIT = 120 * 1024
+    const userFitsInArgv = Buffer.byteLength(userText, 'utf8') <= PROMPT_ARGV_LIMIT
     // Materialise MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
     // up the temp dir after the subprocess exits.
     const mcpMaterialised = materialiseMcpConfig(resolveAgentProfile(req, session))
-    const args = this.buildArgs(req, session, mode, prompt, mcpMaterialised)
+    const args = this.buildArgs(req, session, mode, mcpMaterialised, {
+      userTextForArgv: userFitsInArgv ? userText : undefined,
+    })
 
     const childEnv: NodeJS.ProcessEnv = { ...process.env }
     if (this.anthropicBaseUrl) {
       childEnv.ANTHROPIC_BASE_URL = this.anthropicBaseUrl
     }
 
+    // Argv mode: stdin is ignored. Stdin mode: stdin is piped (we
+    // write the NDJSON payload below). The split here matches the
+    // contract claude-code-cli expects for each --input-format.
     const spawned = await this.spawner(this.bin, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: childEnv,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
@@ -218,6 +246,20 @@ export class ClaudeBackend implements Backend {
       if (!child.stdout) {
         throw new BackendError('claude subprocess has no stdout pipe', 'upstream')
       }
+
+      // Stdin-mode fallback path: write the NDJSON-framed user
+      // message and close stdin so claude sees EOF. Argv-mode (the
+      // default fast path) carries the user text via `-p <text>` and
+      // child.stdin is 'ignore'.
+      if (!userFitsInArgv) {
+        if (!child.stdin) {
+          throw new BackendError('claude subprocess has no stdin pipe', 'upstream')
+        }
+        const writeResult = await writeStdinPayload(child.stdin, stdinInput.messages)
+        if (!writeResult.ok) {
+          throw new BackendError(`claude stdin write failed: ${writeResult.error}`, 'upstream')
+        }
+      }
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
         const line = event.line
@@ -254,12 +296,35 @@ export class ClaudeBackend implements Backend {
                 yield { content: block.text }
               }
             } else if (block.type === 'tool_use') {
-              yield {
-                tool_calls: [{
-                  id: block.id,
-                  name: block.name,
-                  arguments: JSON.stringify(block.input ?? {}),
-                }],
+              // claude-code-cli emits `tool_use` for its OWN built-in
+              // tools (Read, Bash, Edit, ToolSearch, etc.) as it runs
+              // its internal agent loop. When tool-call emulation is
+              // active (caller passed tools[]), those internal calls
+              // are NOT meant for the caller — claude-code executes
+              // them itself within the same subprocess run and reads
+              // the results internally. Forwarding them as OpenAI
+              // tool_calls to the caller corrupts the conversation:
+              // the caller's harness sees phantom Read/Bash calls,
+              // can't execute them (the names aren't in its tools[]),
+              // returns empty/error results, and the model — which
+              // already saw the real internal results — gets a
+              // contradictory history on the next turn. Observed:
+              // multi-turn agent runs derail at turn 3 producing
+              // text-only output and finish_reason=stop.
+              //
+              // When emulation is OFF (no caller tools[] supplied,
+              // OR explicitly disabled via BRIDGE_DISABLE_TOOL_EMULATION),
+              // surfacing tool_use to the caller IS the contract —
+              // they want claude-code's native tool surface exposed
+              // as OpenAI tool_calls.
+              if (!toolMarkerParser) {
+                yield {
+                  tool_calls: [{
+                    id: block.id,
+                    name: block.name,
+                    arguments: JSON.stringify(block.input ?? {}),
+                  }],
+                }
               }
             }
           }
@@ -330,25 +395,81 @@ export class ClaudeBackend implements Backend {
     req: ChatRequest,
     session: SessionRecord | null,
     mode: BridgeMode,
-    prompt: string,
     mcp?: MaterialisedMcpConfig | null,
+    opts?: { userTextForArgv?: string },
   ): string[] {
-    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
+    // Two transport modes — see chat() for the rationale:
+    //   - argv (`-p <text>`):       single-shot text mode. Tool-emulation
+    //                               markers work reliably. Used when user
+    //                               text fits MAX_ARG_STRLEN.
+    //   - stdin (--input-format=stream-json): interactive agent-loop mode.
+    //                               Fallback only — emulation markers are
+    //                               unreliable in this mode.
+    const argvMode = opts?.userTextForArgv !== undefined
+    const args = argvMode
+      ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
+      : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
 
+    // Fold every system source into --append-system-prompt so
+    // claude-code-cli applies them as a real system slot. Sources:
+    //   1. Caller's role:'system' messages (AI SDK sends them this way)
+    //   2. agent_profile.prompt.systemPrompt preamble
+    //   3. JSON-mode directive (when responseFormat: json_object)
+    //   4. Tool-emulation directive (when caller passed tools[])
+    //
+    // Why not stdin: an earlier version of this code flattened the
+    // whole messages[] array (including role:'system') with `[role]`
+    // tags and piped it through stdin. claude-code-cli reads
+    // `[system] You are a security auditor...` as user-supplied
+    // content that's trying to impersonate a system instruction —
+    // its prompt-injection heuristic refuses to execute the request
+    // and replies with a refusal explanation instead of invoking
+    // any tools. Observed across multiple audit-bench coord runs:
+    // 36-minute trials, zero tool calls, finish_reason=stop.
+    //
+    // The argv limit is MAX_ARG_STRLEN = 128 KiB per argument; we
+    // cap at 120 KiB for headroom. When system content overflows
+    // the cap, composeStdinInput's fallback wraps it into the user
+    // message — degraded (may trip injection heuristics) but the
+    // spawn still succeeds, which beats spawn E2BIG.
     const emulateTools = isEmulationEnabled(req)
-    const appendPrompts = [
+    const systemMessages = (req.messages ?? [])
+      .filter((m) => m.role === 'system')
+      .map((m) => contentToText(m.content))
+      .filter((s) => s.length > 0)
+    const systemBlocks = [
+      ...systemMessages,
       renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
       wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
       emulateTools ? renderToolEmulationDirective(req.tools!, req.tool_choice) : null,
     ].filter((value): value is string => Boolean(value))
-    if (appendPrompts.length) {
-      args.push('--append-system-prompt', appendPrompts.join('\n\n'))
+    if (systemBlocks.length > 0) {
+      const merged = systemBlocks.join('\n\n')
+      const APPEND_LIMIT = 120 * 1024
+      if (Buffer.byteLength(merged, 'utf8') <= APPEND_LIMIT) {
+        args.push('--append-system-prompt', merged)
+      }
     }
-    // When emulating caller-supplied tools, disable claude-code's built-in
-    // Read/Bash/Edit/Write — the model must declare a tool call via marker
-    // and stop, not actually run claude-code's own tools. Note: this comes
-    // BEFORE the --allowedTools that --mcp-config would set, so MCP-server
-    // tools (passed via agent_profile.mcp) still work; only built-ins go off.
+
+    // When emulating caller-supplied tools, signal the soft intent
+    // with `--allowedTools ''`. The CLI parser doesn't actually disable
+    // built-ins from an empty string — the model retains its default
+    // tool registry — but the emulation system-prompt directive
+    // ("use ONLY the caller tools above, emit markers, do not attempt
+    // Read/Bash/Edit/Write") is enough to make the model emit markers
+    // for the registered caller tools.
+    //
+    // We tried `--disallowedTools <full-builtin-list>` to enforce the
+    // intent at the CLI layer. It broke multi-turn agent loops: probes
+    // still returned tool_calls on the first request, but subsequent
+    // requests with assistant+tool history in the conversation
+    // returned text-only deltas with finish_reason=stop and the
+    // harness exited after 5-8 turns producing zero spawn events.
+    // Hypothesis: claude-code uses some of its built-in tools (Task?
+    // ToolSearch?) internally during multi-turn agent loops, and
+    // disabling them all stalls the loop. Soft intent works fine in
+    // practice — the working state pre-disallowedTools produced 15
+    // findings on the same audit task.
     if (emulateTools) {
       args.push('--allowedTools', '')
     }
@@ -402,6 +523,65 @@ export class ClaudeBackend implements Backend {
   private flattenPrompt(messages: ChatRequest['messages']): string {
     if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
     return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
+  }
+
+  /**
+   * Compose the stdin payload for `--input-format stream-json`.
+   *
+   * Default path: stdin carries ONLY user-side content (current turn
+   * + multi-turn history). All system content — agent profile
+   * preamble, tool-emulation directive, JSON-mode directive — goes
+   * through `--append-system-prompt` in argv because claude-code-cli
+   * applies it as a real system slot. Folding system content into a
+   * synthetic `[SYSTEM INSTRUCTIONS]` user-side wrapper trips the
+   * model's prompt-injection heuristic and it refuses to call tools.
+   *
+   * Fallback path (very rare): when system content exceeds the argv
+   * `--append-system-prompt` size cap (~120 KiB), `buildArgs` skips
+   * the flag and we wrap the system blocks into the user message
+   * here. The model may treat it as injection (degraded behavior)
+   * but the spawn still succeeds — better than `spawn E2BIG`.
+   *
+   * Multi-turn `messages[]` arrays serialise as one user message per
+   * element with `[role]` tags so tool-result content (role: 'tool')
+   * remains identifiable to the response-side emulation parser.
+   */
+  composeStdinInput(
+    req: ChatRequest,
+    session: SessionRecord | null,
+  ): { messages: Array<{ role: 'user'; content: string }> } {
+    const emulateTools = isEmulationEnabled(req)
+    const systemMessages = (req.messages ?? [])
+      .filter((m) => m.role === 'system')
+      .map((m) => contentToText(m.content))
+      .filter((s) => s.length > 0)
+    const systemBlocks = [
+      ...systemMessages,
+      renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
+      wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
+      emulateTools ? renderToolEmulationDirective(req.tools!, req.tool_choice) : null,
+    ].filter((value): value is string => Boolean(value))
+
+    // Flatten only the non-system messages. `[role]` tags on user /
+    // assistant / tool messages are fine (claude-code-cli expects
+    // some conversation structure); only `[system]` tags trip the
+    // injection heuristic, and we route those to argv above.
+    const nonSystemMessages = (req.messages ?? []).filter((m) => m.role !== 'system')
+    const userText = this.flattenPrompt(nonSystemMessages)
+
+    // Mirror of `buildArgs`'s decision: if system content fits the
+    // argv cap, it lives in --append-system-prompt and stdin gets
+    // ONLY userText. Otherwise wrap (fallback). Keep the threshold
+    // in lock-step with `APPEND_LIMIT` in buildArgs.
+    const APPEND_LIMIT = 120 * 1024
+    const systemMerged = systemBlocks.join('\n\n')
+    const systemFitsInArgv = systemBlocks.length === 0
+      || Buffer.byteLength(systemMerged, 'utf8') <= APPEND_LIMIT
+    const content = systemFitsInArgv
+      ? userText
+      : `[SYSTEM INSTRUCTIONS]\n${systemMerged}\n\n[USER]\n${userText}`
+
+    return { messages: [{ role: 'user', content }] }
   }
 
   /**
