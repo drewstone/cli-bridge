@@ -242,4 +242,39 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
   process.on('SIGTERM', () => shutdown('SIGTERM'))
   process.on('SIGINT', () => shutdown('SIGINT'))
+
+  // ─── Anti-fragile error handlers ──────────────────────────────────
+  // The bridge spawns long-running CLI subprocesses (claude-code,
+  // kimi-code, opencode) and pipes their stdout/stderr through async
+  // generators. A single unhandled promise rejection ANYWHERE in that
+  // tree — a stream error mid-spawn, a backend throwing during a
+  // request, a tool-emulation marker parser glitch — would crash the
+  // whole bridge under Node's default `--unhandled-rejections=throw`.
+  // That killed in-flight requests + every other concurrent caller.
+  //
+  // The bridge is the local agentic sandbox for every harness on this
+  // host (physim, codebench-matrix, blueprint-agent, manual curl). One
+  // misbehaving caller should not take it down. Convert these into
+  // structured log entries so we know they happened, but keep serving.
+  //
+  // Honest tradeoff: a true OOM or DB-corruption-on-startup will get
+  // logged-and-survived here instead of crashing loud. Watchdogs that
+  // pre-existed will not get the SIGCHLD they expect. Net: caller-level
+  // failures stay isolated; consumers see error responses on their own
+  // requests rather than every concurrent caller losing its connection.
+  process.on('unhandledRejection', (reason, promise) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason))
+    console.error(`[cli-bridge] unhandledRejection — keeping process alive`, {
+      message: err.message,
+      stack: err.stack?.split('\n').slice(0, 6).join('\n'),
+      promise: String(promise).slice(0, 120),
+    })
+  })
+  process.on('uncaughtException', (err) => {
+    console.error(`[cli-bridge] uncaughtException — keeping process alive`, {
+      message: err.message,
+      name: err.name,
+      stack: err.stack?.split('\n').slice(0, 8).join('\n'),
+    })
+  })
 }
