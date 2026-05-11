@@ -23,11 +23,18 @@ export type ChatContentPart =
   | { type: 'image_url' | 'input_image'; image_url: string | { url: string } }
   | { type: 'image'; image: string; mediaType?: string; mimeType?: string }
 
-export type ChatMessageContent = string | ChatContentPart[]
+export type ChatMessageContent = string | ChatContentPart[] | null
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
+  /** OpenAI allows null content on assistant messages with tool_calls. */
   content: ChatMessageContent
+  /** Assistant tool-call decisions, kept verbatim across rounds. */
+  tool_calls?: Array<{
+    id: string
+    type: 'function'
+    function: { name: string; arguments: string }
+  }>
   tool_call_id?: string
   name?: string
 }
