@@ -29,6 +29,7 @@ export function collectSystemText(messages: ChatMessage[]): string {
 }
 
 export function contentToText(content: ChatMessageContent): string {
+  if (content === null) return ''
   if (typeof content === 'string') return content
   return content.map((part) => {
     if (part.type === 'text') return part.text
