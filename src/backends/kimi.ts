@@ -48,6 +48,7 @@ import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
+import { writeStdinPayload } from './stdin-payload.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -112,6 +113,11 @@ export class KimiBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
+    // Compose the full prompt and pipe via stdin instead of stuffing
+    // it into argv. See backends/stdin-payload.ts for the rationale
+    // (Linux MAX_ARG_STRLEN = 128 KiB per arg; any non-trivial
+    // agentic call with tools[] or a long system prompt would E2BIG
+    // on the previous `--prompt <text>` path).
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
     const configFile = await this.prepareConfigFile(req.model)
@@ -123,7 +129,11 @@ export class KimiBackend implements Backend {
     const mcpMaterialised =
       materialiseMcpConfig(resolveAgentProfile(req, session)) ?? materialiseEmptyMcpConfig()
 
-    const args = ['--print', '--output-format', 'stream-json', '--prompt', prompt]
+    const args = [
+      '--print',
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+    ]
     if (configFile) {
       args.push('--config-file', configFile)
     }
@@ -140,7 +150,7 @@ export class KimiBackend implements Backend {
     if (thinkingFlag) args.push(thinkingFlag)
 
     const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: process.env,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
@@ -173,6 +183,19 @@ export class KimiBackend implements Backend {
       }
       if (!child.stdout) {
         throw new BackendError('kimi subprocess has no stdout pipe', 'upstream')
+      }
+      if (!child.stdin) {
+        throw new BackendError('kimi subprocess has no stdin pipe', 'upstream')
+      }
+
+      // Pipe the prompt via stdin instead of argv. kimi's NDJSON input
+      // schema matches claude-code's: {"type":"user","message":
+      // {"role":"user","content":"..."}}, one per line.
+      const stdinResult = await writeStdinPayload(child.stdin, [
+        { role: 'user', content: prompt },
+      ])
+      if (!stdinResult.ok) {
+        throw new BackendError(`kimi stdin write failed: ${stdinResult.error}`, 'upstream')
       }
       child.stderr?.on('data', (b) => {
         const chunk = b.toString()

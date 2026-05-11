@@ -35,6 +35,7 @@ import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
+import { writeStdinPayload } from './stdin-payload.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -167,12 +168,23 @@ export class ClaudeBackend implements Backend {
       )
     }
 
-    const prompt = this.flattenPrompt(req.messages)
+    // Compose the full input as a single user message and pipe via
+    // stdin instead of stuffing it into argv. Argv-based prompt passing
+    // (the previous `-p <text>` path) hits Linux's per-argv-string
+    // limit (MAX_ARG_STRLEN = 128 KiB) once the caller adds tool
+    // definitions, agent profile preambles, or long conversation
+    // histories — the spawn fails with E2BIG before claude-code-cli
+    // even starts. stdin has no such limit. The trade-off is we lose
+    // claude-code-cli's argv-side system-prompt slot (--append-system-
+    // prompt also lives in argv); we fold those directives into the
+    // user message with a clear `[SYSTEM]` / `[USER]` delimiter so the
+    // semantic intent is preserved for the model.
+    const composed = this.composeStdinInput(req, session)
     // Materialise MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
     // up the temp dir after the subprocess exits.
     const mcpMaterialised = materialiseMcpConfig(resolveAgentProfile(req, session))
-    const args = this.buildArgs(req, session, mode, prompt, mcpMaterialised)
+    const args = this.buildArgs(req, session, mode, mcpMaterialised)
 
     const childEnv: NodeJS.ProcessEnv = { ...process.env }
     if (this.anthropicBaseUrl) {
@@ -180,7 +192,7 @@ export class ClaudeBackend implements Backend {
     }
 
     const spawned = await this.spawner(this.bin, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: childEnv,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
@@ -217,6 +229,20 @@ export class ClaudeBackend implements Backend {
       }
       if (!child.stdout) {
         throw new BackendError('claude subprocess has no stdout pipe', 'upstream')
+      }
+      if (!child.stdin) {
+        throw new BackendError('claude subprocess has no stdin pipe', 'upstream')
+      }
+
+      // Write the NDJSON-framed user message and close stdin so claude
+      // sees EOF and starts processing. Each line is one message in
+      // claude-code-cli's `--input-format stream-json` schema. We send
+      // a single user message containing the folded prompt; if a
+      // future caller needs multi-turn history they can pass it as
+      // separate messages and we'll serialise each.
+      const writeResult = await writeStdinPayload(child.stdin, composed.messages)
+      if (!writeResult.ok) {
+        throw new BackendError(`claude stdin write failed: ${writeResult.error}`, 'upstream')
       }
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
@@ -330,20 +356,24 @@ export class ClaudeBackend implements Backend {
     req: ChatRequest,
     session: SessionRecord | null,
     mode: BridgeMode,
-    prompt: string,
     mcp?: MaterialisedMcpConfig | null,
   ): string[] {
-    const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose']
+    // `--input-format stream-json` reads NDJSON from stdin instead of
+    // taking the prompt via `-p <argv>`. This is the cornerstone of the
+    // argv-overflow fix: the prompt + tool emulation directive + agent
+    // profile preamble can collectively exceed Linux's per-argv-string
+    // limit (MAX_ARG_STRLEN = 128 KiB) for any non-trivial agentic call;
+    // stdin has no such bound. claude-code-cli enforces that
+    // `--input-format=stream-json` requires `--output-format=stream-json`,
+    // which we already use.
+    const args = [
+      '--print',
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      '--verbose',
+    ]
 
     const emulateTools = isEmulationEnabled(req)
-    const appendPrompts = [
-      renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
-      wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
-      emulateTools ? renderToolEmulationDirective(req.tools!, req.tool_choice) : null,
-    ].filter((value): value is string => Boolean(value))
-    if (appendPrompts.length) {
-      args.push('--append-system-prompt', appendPrompts.join('\n\n'))
-    }
     // When emulating caller-supplied tools, disable claude-code's built-in
     // Read/Bash/Edit/Write — the model must declare a tool call via marker
     // and stop, not actually run claude-code's own tools. Note: this comes
@@ -402,6 +432,41 @@ export class ClaudeBackend implements Backend {
   private flattenPrompt(messages: ChatRequest['messages']): string {
     if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
     return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
+  }
+
+  /**
+   * Compose the stdin payload for `--input-format stream-json`.
+   *
+   * Claude Code's stream-json input schema requires every message's
+   * `role` to be `"user"` (verified empirically: it errors with
+   * `Expected message role 'user', got 'system'` on system-role input).
+   * We therefore fold the system additions — agent profile preamble,
+   * tool emulation directive, JSON mode directive — into a single
+   * user message wrapped with `[SYSTEM INSTRUCTIONS]` / `[USER]`
+   * delimiters that preserve semantic intent for the model.
+   *
+   * Multi-turn `messages[]` arrays are serialised as one user
+   * message per element, with `[role]` tags. Tool-result messages
+   * keep their `tool_call_id` so the emulation parser on the
+   * response side can match them up.
+   */
+  composeStdinInput(
+    req: ChatRequest,
+    session: SessionRecord | null,
+  ): { messages: Array<{ role: 'user'; content: string }> } {
+    const emulateTools = isEmulationEnabled(req)
+    const systemBlocks = [
+      renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
+      wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
+      emulateTools ? renderToolEmulationDirective(req.tools!, req.tool_choice) : null,
+    ].filter((value): value is string => Boolean(value))
+
+    const userText = this.flattenPrompt(req.messages)
+    const content = systemBlocks.length === 0
+      ? userText
+      : `[SYSTEM INSTRUCTIONS]\n${systemBlocks.join('\n\n')}\n\n[USER]\n${userText}`
+
+    return { messages: [{ role: 'user', content }] }
   }
 
   /**
