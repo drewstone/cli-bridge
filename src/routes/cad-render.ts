@@ -159,21 +159,25 @@ export function mountCadRender(app: Hono): void {
           } else {
             const loaded = await loadArtifact(glbPath)
             if (loaded.kind === 'too_large') {
-              return c.json<FailureBody>(
-                {
-                  ok: false,
-                  error: `glb artifact too large: ${loaded.bytes} bytes exceeds ${MAX_ARTIFACT_BYTES}`,
-                  durationMs: Date.now() - startedAt,
-                },
-                200,
+              // Soft-fail — STL already in hand, GLB is just a derivative
+              // optimized for web 3D viewers. The UI falls back to STL.
+              warnings.push(
+                `glb skipped — artifact too large (${loaded.bytes} bytes exceeds ${MAX_ARTIFACT_BYTES} cap)`,
               )
+            } else {
+              artifacts.glb = loaded.artifact
             }
-            artifacts.glb = loaded.artifact
           }
         }
       }
 
       if (outputs.includes('png')) {
+        // PNG is a DERIVATIVE of the STL — not the source of truth. If the
+        // host can't render it (headless server with no GLX/EGL, common in
+        // CI + sandboxes) we surface the failure as a warning rather than
+        // killing the whole response. The STL the agent really cares about
+        // is already in hand; the UI's `<model-viewer>` re-renders STL
+        // client-side anyway. Same reasoning applies to GLB above.
         const pngPath = join(tmpRoot, 'out.png')
         const pngResult = await runOpenscad(
           [
@@ -186,24 +190,20 @@ export function mountCadRender(app: Hono): void {
           deadline,
         )
         if (pngResult.kind === 'error') {
-          return c.json<FailureBody>(
-            { ok: false, error: pngResult.message, durationMs: Date.now() - startedAt },
-            200,
+          warnings.push(
+            `png render skipped — openscad needs GL/EGL/GLX on host (${truncateOneLine(pngResult.message, 200)}). STL still returned. Run inside xvfb-run or expose offscreen GL to enable PNG.`,
           )
+        } else {
+          if (pngResult.stderr) warnings.push(`openscad png: ${pngResult.stderr}`)
+          const loaded = await loadArtifact(pngPath)
+          if (loaded.kind === 'too_large') {
+            warnings.push(
+              `png skipped — artifact too large (${loaded.bytes} bytes exceeds ${MAX_ARTIFACT_BYTES} cap)`,
+            )
+          } else {
+            artifacts.png = loaded.artifact
+          }
         }
-        if (pngResult.stderr) warnings.push(`openscad png: ${pngResult.stderr}`)
-        const loaded = await loadArtifact(pngPath)
-        if (loaded.kind === 'too_large') {
-          return c.json<FailureBody>(
-            {
-              ok: false,
-              error: `png artifact too large: ${loaded.bytes} bytes exceeds ${MAX_ARTIFACT_BYTES}`,
-              durationMs: Date.now() - startedAt,
-            },
-            200,
-          )
-        }
-        artifacts.png = loaded.artifact
       }
 
       const body: SuccessBody = {
@@ -352,4 +352,12 @@ async function loadArtifact(path: string): Promise<LoadedArtifact> {
 function errorResponse(c: Context, message: string, durationMs: number): Response {
   const body: FailureBody = { ok: false, error: message, durationMs }
   return c.json(body, 500)
+}
+
+/** Collapse multiline stderr into a one-liner suitable for the `warnings`
+ *  channel. Caps length so a flood of openscad spam doesn't dominate the
+ *  response body. */
+function truncateOneLine(s: string, n: number): string {
+  const collapsed = s.replace(/\s+/g, ' ').trim()
+  return collapsed.length <= n ? collapsed : `${collapsed.slice(0, n)}…`
 }
