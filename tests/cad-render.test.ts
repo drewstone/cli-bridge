@@ -121,9 +121,50 @@ describe.skipIf(!OPENSCAD_PRESENT)('POST /cad/render — real openscad happy pat
       const body = (await res.json()) as {
         ok: boolean
         artifacts?: { png?: { bytes: number; base64: string } }
+        warnings?: string[]
+      }
+      // Headless hosts without GLX/EGL can't render PNG. The route now
+      // soft-fails: STL is always returned (this request asked for png-
+      // only so artifacts may be empty), and a warning naming the GL
+      // issue is surfaced. Either way the response is ok=true.
+      expect(body.ok).toBe(true)
+      if (body.artifacts?.png) {
+        expect(body.artifacts.png.bytes).toBeGreaterThan(0)
+      } else {
+        expect((body.warnings ?? []).some((w) => /png|GL|EGL|GLX/i.test(w))).toBe(true)
+      }
+    },
+    TIMEOUT,
+  )
+
+  it(
+    'soft-fails png while preserving the stl when host has no GL',
+    async () => {
+      // Combined request — STL must always succeed even when PNG can't
+      // render on this host. This is the regression test for the
+      // earlier behaviour that threw away a valid STL whenever PNG
+      // failed.
+      const res = await makeApp().request('/cad/render', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          code: 'cube(10);',
+          outputs: ['stl', 'png'],
+          imageSize: [320, 240],
+        }),
+      })
+      expect(res.status).toBe(200)
+      const body = (await res.json()) as {
+        ok: boolean
+        artifacts?: { stl?: { bytes: number }; png?: { bytes: number } }
+        warnings?: string[]
       }
       expect(body.ok).toBe(true)
-      expect(body.artifacts?.png?.bytes).toBeGreaterThan(0)
+      expect(body.artifacts?.stl?.bytes).toBeGreaterThan(0)
+      // If PNG didn't render, the warning must explain why.
+      if (!body.artifacts?.png) {
+        expect((body.warnings ?? []).some((w) => /png/i.test(w))).toBe(true)
+      }
     },
     TIMEOUT,
   )
