@@ -39,8 +39,8 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   materialiseEmptyMcpConfig,
-  materialiseMcpConfig,
-  resolveAgentProfile,
+  materialiseMcpServersForClaudeKimi,
+  resolveMcpServers,
   resolvePromptMessages,
 } from './profile-support.js'
 import { contentToText } from './content.js'
@@ -127,7 +127,7 @@ export class KimiBackend implements Backend {
     // outer finally so the temp dir doesn't leak when the subprocess
     // crashes.
     const mcpMaterialised =
-      materialiseMcpConfig(resolveAgentProfile(req, session)) ?? materialiseEmptyMcpConfig()
+      materialiseMcpServersForClaudeKimi(resolveMcpServers(req, session)) ?? materialiseEmptyMcpConfig()
 
     const args = [
       '--print',

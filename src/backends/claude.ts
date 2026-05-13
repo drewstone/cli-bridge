@@ -25,9 +25,10 @@ import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   buildMcpAllowList,
-  materialiseMcpConfig,
+  materialiseMcpServersForClaudeKimi,
   renderLocalHarnessProfilePreamble,
   resolveAgentProfile,
+  resolveMcpServers,
   type MaterialisedMcpConfig,
 } from './profile-support.js'
 import { contentToText } from './content.js'
@@ -194,7 +195,13 @@ export class ClaudeBackend implements Backend {
     // Materialise MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
     // up the temp dir after the subprocess exits.
-    const mcpMaterialised = materialiseMcpConfig(resolveAgentProfile(req, session))
+    //
+    // Merges request-body `mcp.mcpServers` and `agent_profile.mcp` into
+    // one map; request-body wins on name collisions. See
+    // `resolveMcpServers` for the contract.
+    const mcpMaterialised = materialiseMcpServersForClaudeKimi(
+      resolveMcpServers(req, session),
+    )
     const args = this.buildArgs(req, session, mode, mcpMaterialised, {
       userTextForArgv: userFitsInArgv ? userText : undefined,
     })

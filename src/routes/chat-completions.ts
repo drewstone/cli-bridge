@@ -80,6 +80,24 @@ const chatRequestSchema = z.object({
     json_schema: z.unknown().optional(),
   }).optional(),
   agent_profile: z.unknown().optional(),
+  /**
+   * Standardised MCP passthrough. Shape mirrors Claude Code's
+   * `mcp-config.json` so the same JSON can be forwarded to every
+   * backend that supports MCP natively (claude `--mcp-config`, codex
+   * `CODEX_HOME/config.toml`, kimi `--mcp-config-file`, opencode
+   * `OPENCODE_CONFIG`). Validation is permissive (`z.unknown()` for
+   * each spec) so callers can pass backend-specific fields without
+   * cli-bridge silently stripping them — the per-backend
+   * materialisers normalise. Use the canonical `command/args/env`
+   * (stdio) or `url/headers` (http) layout for cross-backend
+   * portability.
+   *
+   * Also accepted via the `X-Mcp-Config` request header (JSON-encoded
+   * same shape). Body wins on conflict.
+   */
+  mcp: z.object({
+    mcpServers: z.record(z.unknown()).optional(),
+  }).passthrough().optional(),
   cwd: z.string().optional(),
   metadata: z.record(z.unknown()).optional(),
   /**
@@ -188,13 +206,20 @@ export function mountChatCompletions(
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
-    const { response_format, agent_profile, cwd, execution, ...rest } = parsed.data
+    const { response_format, agent_profile, cwd, execution, mcp: bodyMcp, ...rest } = parsed.data
+    // MCP can arrive in the body OR the `X-Mcp-Config` header. Body
+    // wins on conflict — header is for callers that can't extend the
+    // request body (e.g. forwarding through a third-party gateway that
+    // strips unknown JSON fields).
+    const mcpHeader = parseMcpHeader(c.req.header('x-mcp-config'))
+    const mergedMcp = mergeMcpInputs(mcpHeader, bodyMcp as ChatRequest['mcp'] | undefined)
     const req: ChatRequest = {
       ...rest,
       session_id: bodySession ?? headerSession,
       mode,
       ...(response_format ? { responseFormat: normalizeResponseFormat(response_format) } : {}),
       ...(agent_profile ? { agent_profile: agent_profile as ChatRequest['agent_profile'] } : {}),
+      ...(mergedMcp ? { mcp: mergedMcp } : {}),
       ...(cwd ? { cwd } : {}),
       ...(execution ? { execution: execution as ChatRequest['execution'] } : {}),
       metadata: {
@@ -361,6 +386,39 @@ export function mountChatCompletions(
 function resolveSseHeartbeatMs(): number {
   const raw = Number(process.env.BRIDGE_SSE_HEARTBEAT_MS)
   return Number.isFinite(raw) && raw >= 10 ? raw : DEFAULT_SSE_HEARTBEAT_MS
+}
+
+/**
+ * Parse the `X-Mcp-Config` request header. Accepts the canonical
+ * `{ mcpServers: { … } }` shape; invalid JSON is silently dropped
+ * rather than 400-ing the whole request so callers can opportunistically
+ * set the header without it becoming a brittle hard dep.
+ */
+function parseMcpHeader(value: string | undefined): ChatRequest['mcp'] | undefined {
+  if (!value) return undefined
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (parsed && typeof parsed === 'object') return parsed as ChatRequest['mcp']
+  } catch {
+    // ignore — malformed header is best-effort
+  }
+  return undefined
+}
+
+/**
+ * Merge MCP inputs from the header and the body, with body winning on
+ * per-server name collisions. Either side can be undefined.
+ */
+function mergeMcpInputs(
+  fromHeader: ChatRequest['mcp'] | undefined,
+  fromBody: ChatRequest['mcp'] | undefined,
+): ChatRequest['mcp'] | undefined {
+  if (!fromHeader && !fromBody) return undefined
+  const headerServers = (fromHeader?.mcpServers ?? {}) as Record<string, unknown>
+  const bodyServers = (fromBody?.mcpServers ?? {}) as Record<string, unknown>
+  const merged = { ...headerServers, ...bodyServers }
+  if (Object.keys(merged).length === 0) return undefined
+  return { mcpServers: merged } as ChatRequest['mcp']
 }
 
 function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_schema' }): ChatRequest['responseFormat'] {

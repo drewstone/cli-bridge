@@ -108,6 +108,7 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 
 - `cwd`: persist a working directory for the session and run future resumed turns there
 - `agent_profile`: full `AgentProfile` object
+- `mcp`: standardised MCP server passthrough (see [MCP passthrough](#mcp-passthrough))
 
 Behavior:
 
@@ -250,6 +251,91 @@ dispatch route, upstream status, and duration are emitted on stderr.
 > would re-introduce the very transport asymmetry this route just
 > removed. When the editing API lands in `tcloud`, mount a sibling
 > `/v1/images/edits` route that mirrors the same router-vs-OpenAI fork.
+
+## MCP passthrough
+
+Every backend cli-bridge wraps loads Model Context Protocol servers
+natively. Pass a single canonical shape in the request body and the
+bridge translates it to each CLI's native loader — no per-backend
+boilerplate, no marker-emulation theatre when the underlying CLI
+already speaks MCP.
+
+### Wire shape
+
+The shape mirrors Claude Code's `mcp-config.json` so the same JSON can
+be forwarded to every backend that natively supports MCP. Pass it as
+a top-level `mcp` field on the chat-completions body, or as the
+`X-Mcp-Config` HTTP header (JSON-encoded; body wins on per-name
+collision).
+
+```jsonc
+{
+  "model": "claude/sonnet",
+  "messages": [{ "role": "user", "content": "list my repos" }],
+  "mcp": {
+    "mcpServers": {
+      "github": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-github"],
+        "env": { "GITHUB_TOKEN": "ghp_xxx" }
+      },
+      "linear": {
+        "type": "http",
+        "url": "https://mcp.linear.app/mcp",
+        "headers": { "Authorization": "Bearer lin_xxx" }
+      }
+    }
+  }
+}
+```
+
+Per-server fields:
+
+| field      | type                     | notes                                                  |
+| ---------- | ------------------------ | ------------------------------------------------------ |
+| `type`     | `stdio`, `http`, `sse`   | optional; inferred from `command`/`url` when missing   |
+| `command`  | string                   | stdio: executable to spawn                              |
+| `args`     | string[]                 | stdio: argv after `command`                            |
+| `env`      | `Record<string,string>`  | stdio: env vars for the spawned MCP server             |
+| `url`      | string                   | http/sse: endpoint                                     |
+| `headers`  | `Record<string,string>`  | http/sse: request headers (auth, etc.)                 |
+| `enabled`  | boolean                  | set `false` to drop without removing the entry         |
+| `timeout`  | number (ms)              | per-tool-call timeout                                  |
+
+`agent_profile.mcp` (sandbox-native shape) is also honored — request
+body `mcp.mcpServers` wins on per-name collision so caller's per-turn
+intent always overrides profile defaults.
+
+### Per-backend support matrix
+
+| backend    | stdio MCP | http/sse MCP | loader mechanism                                              |
+| ---------- | --------- | ------------ | ------------------------------------------------------------- |
+| claude     | yes       | no (caveat)  | `--mcp-config <tempfile>` (canonical `mcp-config.json` shape) |
+| codex      | yes       | yes          | `CODEX_HOME=<tempdir>` with synthesised `config.toml`         |
+| kimi       | yes       | no           | `--mcp-config-file <tempfile>` (same shape as claude)         |
+| opencode   | yes       | no           | `OPENCODE_CONFIG=<tempfile>` (opencode's per-config schema)   |
+
+**stdio**: every backend loads stdio MCP servers — `command`, `args`,
+and `env` round-trip through the materialised config file unchanged
+(verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
+
+**http/sse caveat**: claude/kimi/opencode load HTTP MCP via the
+respective CLI's separate `mcp add --transport http` registry, which
+is per-user persistent state and not safe for cli-bridge to touch on
+every request. HTTP entries you pass to those backends are dropped at
+materialisation. Use codex for stateless remote-MCP passthrough until
+the upstream CLIs expose a per-invocation HTTP MCP loader.
+
+### Migration from marker-emulation (`BRIDGE_EMULATE_TOOL_CALLS=1`)
+
+The legacy `tools` + `<<<TOOL_CALL>>>` prompt-marker path remains as
+a deprecated fallback for callers whose runtime cannot supply an MCP
+server. New integrations should ship an MCP server (often <50 lines
+of TypeScript using `@modelcontextprotocol/sdk`) and pass it via
+`mcp.mcpServers`. The CLI's native tool-use surface is then exposed
+as OpenAI `tool_calls` in the response, no race conditions, no
+disallowed-tools dance.
 
 ## Claudish setup
 

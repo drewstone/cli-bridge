@@ -2,13 +2,118 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/sandbox'
-import type { ChatMessage, ChatRequest } from './types.js'
+import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 
 export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | null): AgentProfile | null {
   if (req.agent_profile && typeof req.agent_profile === 'object') return req.agent_profile
   const stored = session?.metadata?.agent_profile
   return stored && typeof stored === 'object' ? stored as AgentProfile : null
+}
+
+/**
+ * Merge request-body `mcp.mcpServers` and `agent_profile.mcp` into a
+ * single normalized map keyed by server name. Request-body wins on
+ * name collisions — caller's per-turn intent overrides profile
+ * defaults.
+ *
+ * Returns `null` when neither source supplies any entries. Callers
+ * that need a non-null result (e.g. opencode, which always writes a
+ * config file) should default to `{}` after this returns null.
+ *
+ * The returned spec is the canonical `McpServerSpec` shape; backends
+ * pick the fields they support and ignore the rest.
+ */
+export function resolveMcpServers(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): Record<string, McpServerSpec> | null {
+  const merged: Record<string, McpServerSpec> = {}
+
+  const profile = resolveAgentProfile(req, session)
+  if (profile && typeof profile === 'object') {
+    const profileMcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
+    if (profileMcp && typeof profileMcp === 'object') {
+      for (const [name, raw] of Object.entries(profileMcp)) {
+        if (!name || !raw || typeof raw !== 'object') continue
+        merged[name] = profileMcpToSpec(raw)
+      }
+    }
+  }
+
+  const requestMcp = req.mcp?.mcpServers
+  if (requestMcp && typeof requestMcp === 'object') {
+    for (const [name, raw] of Object.entries(requestMcp)) {
+      if (!name || !raw || typeof raw !== 'object') continue
+      merged[name] = normaliseMcpServerSpec(raw)
+    }
+  }
+
+  return Object.keys(merged).length > 0 ? merged : null
+}
+
+function profileMcpToSpec(raw: AgentProfileMcpServer): McpServerSpec {
+  // AgentProfileMcpServer uses `transport`; McpServerSpec uses `type`.
+  // Rename and forward only the fields we model.
+  const out: McpServerSpec = {}
+  if (raw.transport) out.type = raw.transport
+  if (typeof raw.command === 'string') out.command = raw.command
+  if (Array.isArray(raw.args)) out.args = raw.args.filter((a): a is string => typeof a === 'string')
+  if (raw.env && typeof raw.env === 'object') {
+    out.env = Object.fromEntries(
+      Object.entries(raw.env).filter(([, v]) => typeof v === 'string'),
+    ) as Record<string, string>
+  }
+  if (typeof raw.url === 'string') out.url = raw.url
+  if (raw.headers && typeof raw.headers === 'object') {
+    out.headers = Object.fromEntries(
+      Object.entries(raw.headers).filter(([, v]) => typeof v === 'string'),
+    ) as Record<string, string>
+  }
+  if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled
+  const timeoutRaw = (raw as { timeout?: unknown }).timeout
+  if (typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0) {
+    out.timeout = timeoutRaw
+  }
+  return out
+}
+
+function normaliseMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): McpServerSpec {
+  // Defensive copy — drop any unknown fields, coerce types loosely.
+  const r = raw as Record<string, unknown>
+  const out: McpServerSpec = {}
+  if (r.type === 'stdio' || r.type === 'http' || r.type === 'sse') out.type = r.type
+  if (typeof r.command === 'string') out.command = r.command
+  if (Array.isArray(r.args)) out.args = (r.args as unknown[]).filter((a): a is string => typeof a === 'string')
+  if (r.env && typeof r.env === 'object') {
+    out.env = Object.fromEntries(
+      Object.entries(r.env as Record<string, unknown>).filter(([, v]) => typeof v === 'string'),
+    ) as Record<string, string>
+  }
+  if (typeof r.url === 'string') out.url = r.url
+  if (r.headers && typeof r.headers === 'object') {
+    out.headers = Object.fromEntries(
+      Object.entries(r.headers as Record<string, unknown>).filter(([, v]) => typeof v === 'string'),
+    ) as Record<string, string>
+  }
+  if (typeof r.enabled === 'boolean') out.enabled = r.enabled
+  if (typeof r.timeout === 'number' && Number.isFinite(r.timeout) && r.timeout > 0) {
+    out.timeout = r.timeout
+  }
+  return out
+}
+
+/**
+ * True when this spec describes a local stdio MCP server. cli-bridge's
+ * three primary backends (claude, kimi, opencode) load stdio MCP via
+ * their config-file loaders; remote http/sse MCP needs a per-backend
+ * registration path that we don't model in the unified materialisers.
+ */
+export function isStdioMcpSpec(spec: McpServerSpec): boolean {
+  if (spec.enabled === false) return false
+  if (spec.type === 'stdio') return Boolean(spec.command)
+  if (spec.type === 'http' || spec.type === 'sse') return false
+  return Boolean(spec.command)
 }
 
 /**
@@ -41,31 +146,46 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
   if (!profile || typeof profile !== 'object') return null
   const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
   if (!mcp || typeof mcp !== 'object') return null
-
-  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string>; timeout?: number }> = {}
+  const specs: Record<string, McpServerSpec> = {}
   for (const [name, raw] of Object.entries(mcp)) {
     if (!name || !raw || typeof raw !== 'object') continue
-    if (raw.enabled === false) continue
-    if (!raw.command || typeof raw.command !== 'string') continue
-    // `timeout` (ms) is the per-MCP-server tool-call timeout. Claude Code
-    // honors this in mcp-config.json — its default is 300_000ms which
-    // kills long-running tool calls (e.g. coordinators that block while
-    // a subagent audit runs). Forward when supplied so callers don't
-    // need to set MCP_TIMEOUT globally (which has known-silently-ignored
-    // bugs upstream).
-    const timeoutRaw = (raw as { timeout?: unknown }).timeout
-    const timeout = typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : undefined
+    specs[name] = profileMcpToSpec(raw)
+  }
+  return materialiseMcpServersForClaudeKimi(specs)
+}
+
+/**
+ * Write the canonical claude/kimi `mcp-config.json` shape from a
+ * normalized `McpServerSpec` map. Filters out disabled and non-stdio
+ * entries — claude `--mcp-config` and kimi `--mcp-config-file` both
+ * speak the same `{mcpServers: {name: {command, args, env, timeout}}}`
+ * schema and neither natively loads remote http/sse via this file
+ * path.
+ *
+ * `timeout` (ms) is the per-MCP-server tool-call timeout. Claude Code
+ * honors this in mcp-config.json — its default is 300_000ms which
+ * kills long-running tool calls (e.g. coordinators that block while a
+ * subagent audit runs). Forward when supplied so callers don't need
+ * to set MCP_TIMEOUT globally (which has known-silently-ignored bugs
+ * upstream).
+ *
+ * Returns null when no usable entries remain — backends should skip
+ * the `--mcp-config` flag in that case rather than passing an empty
+ * config.
+ */
+export function materialiseMcpServersForClaudeKimi(
+  specs: Record<string, McpServerSpec> | null,
+): MaterialisedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string>; timeout?: number }> = {}
+  for (const [name, spec] of Object.entries(specs)) {
+    if (!isStdioMcpSpec(spec)) continue
+    if (!spec.command) continue
     mcpServers[name] = {
-      command: raw.command,
-      ...(Array.isArray(raw.args) ? { args: raw.args.filter((a) => typeof a === 'string') } : {}),
-      ...(raw.env && typeof raw.env === 'object'
-        ? {
-            env: Object.fromEntries(
-              Object.entries(raw.env).filter(([, v]) => typeof v === 'string'),
-            ) as Record<string, string>,
-          }
-        : {}),
-      ...(timeout ? { timeout } : {}),
+      command: spec.command,
+      ...(spec.args && spec.args.length ? { args: spec.args } : {}),
+      ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
+      ...(spec.timeout ? { timeout: spec.timeout } : {}),
     }
   }
   const serverNames = Object.keys(mcpServers)
@@ -99,7 +219,36 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
  *
  * Schema source: https://opencode.ai/config.json (`properties.mcp.additionalProperties`).
  */
-export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): MaterialisedMcpConfig | null {
+export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): MaterialisedMcpConfig {
+  const specs: Record<string, McpServerSpec> = {}
+  if (profile && typeof profile === 'object') {
+    const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
+    if (mcp && typeof mcp === 'object') {
+      for (const [name, raw] of Object.entries(mcp)) {
+        if (!name || !raw || typeof raw !== 'object') continue
+        specs[name] = profileMcpToSpec(raw)
+      }
+    }
+  }
+  return materialiseMcpServersForOpencode(specs)
+}
+
+/**
+ * Write opencode's schema —
+ * `{mcp: {<name>: {type:'local', command:[...], environment:{...}, enabled, timeout}}}`
+ * from a normalized `McpServerSpec` map. Layered on top of the user's
+ * global `~/.config/opencode/opencode.json` via `OPENCODE_CONFIG`.
+ *
+ * Always returns a non-null result — opencode needs a config file
+ * even when no MCP servers are declared (so the headless permission
+ * map below can disable interactive prompts).
+ *
+ * Schema source: https://opencode.ai/config.json
+ *   (`properties.mcp.additionalProperties`).
+ */
+export function materialiseMcpServersForOpencode(
+  specs: Record<string, McpServerSpec> | null,
+): MaterialisedMcpConfig {
   const opencodeMcp: Record<string, {
     type: 'local'
     command: string[]
@@ -107,28 +256,17 @@ export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): Mate
     enabled?: boolean
     timeout?: number
   }> = {}
-
-  if (profile && typeof profile === 'object') {
-    const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
-    if (mcp && typeof mcp === 'object') {
-      for (const [name, raw] of Object.entries(mcp)) {
-        if (!name || !raw || typeof raw !== 'object') continue
-        if (raw.enabled === false) continue
-        if (!raw.command || typeof raw.command !== 'string') continue
-        const args = Array.isArray(raw.args) ? raw.args.filter((a) => typeof a === 'string') : []
-        const command: string[] = [raw.command, ...args]
-        const env: Record<string, string> | undefined = raw.env && typeof raw.env === 'object'
-          ? Object.fromEntries(Object.entries(raw.env).filter(([, v]) => typeof v === 'string')) as Record<string, string>
-          : undefined
-        const timeoutRaw = (raw as { timeout?: unknown }).timeout
-        const timeout = typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : undefined
-        opencodeMcp[name] = {
-          type: 'local',
-          command,
-          ...(env ? { environment: env } : {}),
-          enabled: true,
-          ...(timeout ? { timeout } : {}),
-        }
+  if (specs) {
+    for (const [name, spec] of Object.entries(specs)) {
+      if (!isStdioMcpSpec(spec)) continue
+      if (!spec.command) continue
+      const command: string[] = [spec.command, ...(spec.args ?? [])]
+      opencodeMcp[name] = {
+        type: 'local',
+        command,
+        ...(spec.env && Object.keys(spec.env).length ? { environment: spec.env } : {}),
+        enabled: true,
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
       }
     }
   }
@@ -183,6 +321,168 @@ export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
       }
     },
   }
+}
+
+/**
+ * Materialise a `McpServerSpec` map into a temp `CODEX_HOME` directory
+ * containing a synthetic `config.toml`. Codex CLI accepts MCP servers
+ * via the `[mcp_servers.<name>]` TOML stanza in `$CODEX_HOME/config.toml`
+ * — there is no `--mcp-config` flag. We point codex at a temp HOME so
+ * the passthrough is per-invocation and never mutates the user's real
+ * `~/.codex/config.toml`.
+ *
+ * `authSourcePath` is the path to the user's persistent `auth.json`
+ * (default `~/.codex/auth.json`). Codex looks up the session's bearer
+ * token here. We copy it into the temp dir so the spawned codex still
+ * authenticates as the operator. The copy is deleted at cleanup.
+ *
+ * stdio servers — written as `command = "..."` + optional `args`/`env`.
+ * http servers (spec.type === 'http' with `url`) — written as
+ * `url = "..."` + optional `headers`/`bearer_token_env_var`.
+ *
+ * Returns null when no usable servers remain.
+ */
+export interface MaterialisedCodexHome {
+  /** Directory to pass via `CODEX_HOME` env. */
+  homePath: string
+  /** Names actually written. */
+  serverNames: string[]
+  cleanup(): void
+}
+
+export function materialiseMcpServersForCodex(
+  specs: Record<string, McpServerSpec> | null,
+  authSourcePath?: string,
+): MaterialisedCodexHome | null {
+  if (!specs) return null
+
+  const lines: string[] = []
+  const serverNames: string[] = []
+  for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      // Codex's TOML table key parser is strict; skip names that would
+      // require quoting and could collide with other config keys.
+      continue
+    }
+    const block: string[] = [`[mcp_servers.${name}]`]
+    if (spec.type === 'http' || (spec.url && spec.type !== 'sse' && !spec.command)) {
+      if (!spec.url) continue
+      block.push(`url = ${tomlString(spec.url)}`)
+      if (spec.headers && Object.keys(spec.headers).length) {
+        block.push(`http_headers = ${tomlInlineTable(spec.headers)}`)
+      }
+      // codex tool-call timeout key — verified against `codex mcp get`
+      // round-trip. Other names (`tool_timeout_ms`, `request_timeout_ms`)
+      // are silently dropped by the parser.
+      if (spec.timeout) block.push(`tool_timeout_sec = ${Math.max(1, Math.round(spec.timeout / 1000))}`)
+    } else {
+      if (!spec.command) continue
+      block.push(`command = ${tomlString(spec.command)}`)
+      if (spec.args && spec.args.length) {
+        block.push(`args = ${tomlStringArray(spec.args)}`)
+      }
+      if (spec.env && Object.keys(spec.env).length) {
+        block.push(`env = ${tomlInlineTable(spec.env)}`)
+      }
+      // codex stdio servers use `tool_timeout_sec` for per-call and
+      // `startup_timeout_sec` for the launch handshake. We map a
+      // single caller-provided `timeout` to BOTH so generous values
+      // unblock long-running tools without separately requiring the
+      // caller to fiddle with handshake timing.
+      if (spec.timeout) {
+        const secs = Math.max(1, Math.round(spec.timeout / 1000))
+        block.push(`tool_timeout_sec = ${secs}`)
+        block.push(`startup_timeout_sec = ${secs}`)
+      }
+    }
+    lines.push(block.join('\n'))
+    serverNames.push(name)
+  }
+  if (serverNames.length === 0) return null
+
+  // Codex aborts if CODEX_HOME is under the system tmpdir on some
+  // platforms — use the user's HOME/.cache as a stable parent.
+  const baseDir = mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
+  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n')
+
+  if (authSourcePath) {
+    try {
+      const auth = readFileMaybe(authSourcePath)
+      if (auth !== null) writeFileSync(join(baseDir, 'auth.json'), auth)
+    } catch {
+      // Best-effort: codex without auth.json will fail to call the
+      // model. Surface that as an upstream error from the backend
+      // rather than silently swallowing it here.
+    }
+  }
+
+  return {
+    homePath: baseDir,
+    serverNames,
+    cleanup: () => {
+      try {
+        rmSync(baseDir, { recursive: true, force: true })
+      } catch {
+        // best-effort
+      }
+    },
+  }
+}
+
+function stableTmpRoot(): string {
+  // Prefer ~/.cache so codex's "not in /tmp" guard doesn't trip.
+  // `tmpdir()` (typically /tmp) is the documented fallback. The
+  // function is sync because the call sites are sync; HOME is always
+  // set on supported platforms.
+  const home = process.env.HOME
+  if (home) {
+    try {
+      const cache = join(home, '.cache')
+      // Don't mkdir — cli-bridge runs on hosts that always have
+      // ~/.cache (we don't ship a polyfill for first-boot Linux).
+      return cache
+    } catch {
+      // fallthrough
+    }
+  }
+  return tmpdir()
+}
+
+function readFileMaybe(path: string): string | null {
+  try {
+    // Avoid bringing in another import; lazy-require via dynamic globals.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('node:fs') as typeof import('node:fs')
+    return fs.readFileSync(path, 'utf-8')
+  } catch {
+    return null
+  }
+}
+
+function tomlString(s: string): string {
+  // Use TOML's basic string with conservative escaping. Codex's TOML
+  // parser handles `\"`, `\\`, `\n`, `\t` — escape the dangerous set
+  // and trust UTF-8 for the rest.
+  const escaped = s
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+  return `"${escaped}"`
+}
+
+function tomlStringArray(items: string[]): string {
+  return `[${items.map(tomlString).join(', ')}]`
+}
+
+function tomlInlineTable(map: Record<string, string>): string {
+  const entries = Object.entries(map).map(([k, v]) => {
+    const key = /^[A-Za-z0-9_-]+$/.test(k) ? k : tomlString(k)
+    return `${key} = ${tomlString(v)}`
+  })
+  return `{ ${entries.join(', ')} }`
 }
 
 /**
