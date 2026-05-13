@@ -41,6 +41,39 @@ export interface ChatMessage {
 
 export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
+/**
+ * One MCP server entry. Matches Claude Code's `mcp-config.json` so the
+ * same JSON loaded by Claude can be passed straight through cli-bridge.
+ * `type` is optional — when missing, stdio is implied if `command` is
+ * set and http is implied if `url` is set.
+ */
+export interface McpServerSpec {
+  type?: 'stdio' | 'http' | 'sse'
+  /** stdio: executable to spawn. */
+  command?: string
+  /** stdio: argv (after `command`). */
+  args?: string[]
+  /** stdio: environment overrides for the spawned MCP server. */
+  env?: Record<string, string>
+  /** http/sse: endpoint URL. */
+  url?: string
+  /** http/sse: extra request headers (auth, etc.). */
+  headers?: Record<string, string>
+  /** Disable without removing the entry — drop at materialisation. */
+  enabled?: boolean
+  /** Per-tool-call timeout in milliseconds. */
+  timeout?: number
+}
+
+/**
+ * Top-level `mcp` field on the chat request. Mirrors Claude Code's
+ * config file shape so callers can carry the same JSON to every
+ * backend. See ChatRequest.mcp for the full contract.
+ */
+export interface McpRequestConfig {
+  mcpServers?: Record<string, McpServerSpec>
+}
+
 export interface ChatRequest {
   model: string
   messages: ChatMessage[]
@@ -67,6 +100,27 @@ export interface ChatRequest {
   responseFormat?: { type: 'text' | 'json_object' }
   /** Optional caller-declared AgentProfile. Sandbox uses it natively; local harnesses honor a prompt/context subset. */
   agent_profile?: AgentProfile
+  /**
+   * Standard MCP server passthrough. Canonical shape mirrors the
+   * Claude Code `mcp-config.json` schema so the same JSON can be fed to
+   * every backend that supports MCP natively. Each backend translates
+   * this into its native loader (claude `--mcp-config`, codex
+   * `CODEX_HOME/config.toml`, opencode `OPENCODE_CONFIG`, kimi
+   * `--mcp-config-file`).
+   *
+   * When the same server name appears in both `agent_profile.mcp` and
+   * this field, request-body `mcp` wins — caller's explicit intent for
+   * THIS turn overrides any profile default.
+   *
+   * Also accepted via the `X-Mcp-Config` request header (JSON-encoded
+   * same shape) for callers that cannot extend the body.
+   *
+   * Servers a given backend cannot load locally (e.g. `http`/`sse`
+   * transport on a CLI that only supports stdio) are dropped at
+   * materialisation time, NOT silently routed through marker
+   * emulation — fail loud, not theatre.
+   */
+  mcp?: McpRequestConfig
   /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */
   cwd?: string
   /**

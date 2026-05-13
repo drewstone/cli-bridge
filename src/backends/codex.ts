@@ -25,11 +25,16 @@
  * again, adjust `extractText` below rather than the whole pipeline.
  */
 
+import { join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { resolvePromptMessages } from './profile-support.js'
+import {
+  materialiseMcpServersForCodex,
+  resolveMcpServers,
+  resolvePromptMessages,
+} from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
@@ -121,10 +126,25 @@ export class CodexBackend implements Backend {
     }
     args.push(prompt)
 
+    // MCP server passthrough — codex has no `--mcp-config` flag.
+    // Servers are loaded from `$CODEX_HOME/config.toml`'s
+    // `[mcp_servers.<name>]` stanzas. We synthesise a temp HOME
+    // containing the merged servers and copy the user's persistent
+    // `auth.json` so the spawned codex still authenticates as the
+    // operator. Cleanup runs in the outer finally so the temp dir
+    // doesn't leak on subprocess crash.
+    const codexHome = materialiseMcpServersForCodex(
+      resolveMcpServers(req, session),
+      resolveCodexAuthPath(),
+    )
+
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
-      env: process.env,
+      env: {
+        ...process.env,
+        ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
+      },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
     })
     const child = spawned.child
@@ -228,6 +248,7 @@ export class CodexBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       if (child.exitCode === null) child.kill('SIGTERM')
       releaseSpawner()
+      codexHome?.cleanup()
     }
   }
 
@@ -256,6 +277,19 @@ export function codexReasoningEffort(effort: ChatRequest['effort']): 'minimal' |
   if (!effort) return null
   if (effort === 'xhigh' || effort === 'max') return 'high'
   return effort
+}
+
+/**
+ * Path to the user's persistent codex auth.json. cli-bridge points
+ * codex at a synthetic CODEX_HOME for MCP passthrough, but the spawned
+ * codex still needs to authenticate as the operator. Honors a
+ * `CODEX_HOME` already set on cli-bridge's env so admins can pin a
+ * custom location. Falls back to `$HOME/.codex/auth.json` which is
+ * where `codex login` writes by default.
+ */
+function resolveCodexAuthPath(): string | undefined {
+  const home = process.env.CODEX_HOME ?? (process.env.HOME ? join(process.env.HOME, '.codex') : undefined)
+  return home ? join(home, 'auth.json') : undefined
 }
 
 /**

@@ -21,7 +21,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materialiseOpencodeMcpConfig, resolveAgentProfile, resolvePromptMessages } from './profile-support.js'
+import { materialiseMcpServersForOpencode, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
@@ -92,17 +92,18 @@ export class OpencodeBackend implements Backend {
       : flatPrompt
     const model = this.extractModel(req.model)
 
-    // Materialise agent_profile.mcp into a temp opencode-shape config
-    // file. opencode-cli has no per-invocation `--mcp-config-file`
-    // flag — config layering is the only inline injection point. We
-    // set OPENCODE_CONFIG to the temp file path; opencode loads it
-    // on top of the user's global config (verified: a non-existent
+    // Materialise MCP servers (request-body `mcp.mcpServers` ∪
+    // `agent_profile.mcp`) into a temp opencode-shape config file.
+    // opencode-cli has no per-invocation `--mcp-config-file` flag —
+    // config layering is the only inline injection point. We set
+    // OPENCODE_CONFIG to the temp file path; opencode loads it on top
+    // of the user's global config (verified: a non-existent
     // OPENCODE_CONFIG path is logged + skipped, and a valid one
     // contributes mcp servers to the tool registry).
     //
     // Cleanup runs in the outer finally so the temp dir doesn't leak
     // when the subprocess crashes.
-    const mcpMaterialised = materialiseOpencodeMcpConfig(resolveAgentProfile(req, session))
+    const mcpMaterialised = materialiseMcpServersForOpencode(resolveMcpServers(req, session))
 
     const args: string[] = ['run', '--format', 'json']
     if (model) args.push('-m', model)
