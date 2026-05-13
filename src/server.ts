@@ -259,8 +259,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   // kimi-code, opencode) and pipes their stdout/stderr through async
   // generators. A single unhandled promise rejection ANYWHERE in that
   // tree — a stream error mid-spawn, a backend throwing during a
-  // request, a tool-emulation marker parser glitch — would crash the
-  // whole bridge under Node's default `--unhandled-rejections=throw`.
+  // request, an MCP stdio pipe glitch — would crash the whole bridge
+  // under Node's default `--unhandled-rejections=throw`.
   // That killed in-flight requests + every other concurrent caller.
   //
   // The bridge is the local agentic sandbox for every harness on this

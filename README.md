@@ -257,8 +257,8 @@ dispatch route, upstream status, and duration are emitted on stderr.
 Every backend cli-bridge wraps loads Model Context Protocol servers
 natively. Pass a single canonical shape in the request body and the
 bridge translates it to each CLI's native loader — no per-backend
-boilerplate, no marker-emulation theatre when the underlying CLI
-already speaks MCP.
+boilerplate, no prompt-injected tool surrogates: every CLI speaks
+MCP.
 
 ### Wire shape
 
@@ -326,16 +326,6 @@ is per-user persistent state and not safe for cli-bridge to touch on
 every request. HTTP entries you pass to those backends are dropped at
 materialisation. Use codex for stateless remote-MCP passthrough until
 the upstream CLIs expose a per-invocation HTTP MCP loader.
-
-### Migration from marker-emulation (`BRIDGE_EMULATE_TOOL_CALLS=1`)
-
-The legacy `tools` + `<<<TOOL_CALL>>>` prompt-marker path remains as
-a deprecated fallback for callers whose runtime cannot supply an MCP
-server. New integrations should ship an MCP server (often <50 lines
-of TypeScript using `@modelcontextprotocol/sdk`) and pass it via
-`mcp.mcpServers`. The CLI's native tool-use surface is then exposed
-as OpenAI `tool_calls` in the response, no race conditions, no
-disallowed-tools dance.
 
 ## Claudish setup
 

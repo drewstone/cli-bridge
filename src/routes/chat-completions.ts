@@ -126,21 +126,6 @@ const chatRequestSchema = z.object({
     /** When kind=sandbox, the sandbox TTL in seconds (default 30 min). */
     ttlSeconds: z.number().int().positive().optional(),
   }).optional(),
-  // OpenAI-style function tool definitions. Honored only when
-  // BRIDGE_EMULATE_TOOL_CALLS=1 is set on the bridge process. Otherwise
-  // silently ignored (preserves existing behavior).
-  tools: z.array(z.object({
-    type: z.literal('function'),
-    function: z.object({
-      name: z.string(),
-      description: z.string().optional(),
-      parameters: z.unknown().optional(),
-    }),
-  })).optional(),
-  tool_choice: z.union([
-    z.literal('auto'), z.literal('none'), z.literal('required'),
-    z.object({ type: z.literal('function'), function: z.object({ name: z.string() }) }),
-  ]).optional(),
 })
 
 export function mountChatCompletions(
