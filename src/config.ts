@@ -26,6 +26,8 @@ export interface Config {
   factoryBin: string
   ampBin: string
   forgeBin: string
+  piBin: string
+  piTimeoutMs: number
   cliTimeoutMsDefault: number
   /**
    * When set, the `claudish` harness is registered and Claude Code is
@@ -130,6 +132,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
     forgeBin: env.FORGE_BIN ?? 'forge',
+    piBin: env.PI_BIN ?? 'pi',
+    piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     cliTimeoutMsDefault: defaultTimeout,
     claudishUrl: env.CLAUDISH_URL?.trim() || null,
     openaiApiKey: env.OPENAI_API_KEY?.trim() || null,
@@ -178,6 +182,12 @@ const BACKEND_EXECUTOR_DEFAULTS: Record<string, { image: string; containerConfig
     containerConfigDir: '/root/.config/opencode',
     hostConfigEnvKey: 'HOME',
     defaultHostConfigDir: '.config/opencode',
+  },
+  pi: {
+    image: SHARED_RUNTIME_IMAGE,
+    containerConfigDir: '/root/.pi/agent',
+    hostConfigEnvKey: 'HOME',
+    defaultHostConfigDir: '.pi/agent',
   },
 }
 

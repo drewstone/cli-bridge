@@ -19,6 +19,7 @@ import { KimiBackend } from './backends/kimi.js'
 import { FactoryBackend } from './backends/factory.js'
 import { AmpBackend } from './backends/amp.js'
 import { ForgeBackend } from './backends/forge.js'
+import { PiBackend } from './backends/pi.js'
 import { PassthroughBackend } from './backends/passthrough.js'
 import { SandboxBackend } from './backends/sandbox.js'
 import { createProfileCatalog, type ProfileCatalog } from './profiles/loader.js'
@@ -137,6 +138,14 @@ export async function buildApp(config: Config): Promise<{
   }
   if (config.backends.has('forge')) {
     registry.register(new ForgeBackend({ bin: config.forgeBin, timeoutMs: config.cliTimeoutMsDefault }))
+  }
+  if (config.backends.has('pi')) {
+    const spawner = await buildExecutorForBackend(config.executors.pi, extras)
+    registry.register(new PiBackend({
+      bin: config.piBin,
+      timeoutMs: config.piTimeoutMs,
+      ...(spawner ? { spawner } : {}),
+    }))
   }
   if (config.backends.has('passthrough')) {
     registry.register(new PassthroughBackend({

@@ -33,6 +33,17 @@ const OPENCODE_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
   { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek v4 light/flash tier' },
 ]
 
+const PI_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
+  { id: 'deepseek/deepseek-v4-pro', note: 'DeepSeek V4 Pro via pi' },
+  { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek V4 Flash via pi' },
+  { id: 'moonshot/kimi-k2.5', note: 'Moonshot Kimi K2.5 via pi' },
+  { id: 'moonshot/kimi-k2-thinking', note: 'Moonshot Kimi K2 Thinking via pi' },
+  { id: 'zai-coding-paas/glm-5.1', note: 'GLM 5.1 via pi zai-coding-paas extension' },
+  { id: 'zai-coding-paas/glm-5-turbo', note: 'GLM 5 Turbo via pi zai-coding-paas extension' },
+  { id: 'zai-coding-paas/glm-5', note: 'GLM 5 via pi zai-coding-paas extension' },
+  { id: 'zai-glm/glm-4.7', note: 'GLM 4.7 via pi zai-glm (Anthropic-compat)' },
+]
+
 export function mountModels(
   app: Hono,
   deps: { registry: BackendRegistry; catalog?: ProfileCatalog },
@@ -75,6 +86,16 @@ export function mountModels(
           for (const model of OPENCODE_MODELS) {
             data.push({
               id: `opencode/${model.id}`,
+              object: 'model',
+              backend: b.name,
+              ...(model.note ? { note: model.note } : {}),
+            })
+          }
+          break
+        case 'pi':
+          for (const model of PI_MODELS) {
+            data.push({
+              id: `pi/${model.id}`,
               object: 'model',
               backend: b.name,
               ...(model.note ? { note: model.note } : {}),
