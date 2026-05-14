@@ -26,6 +26,7 @@ import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { writeStdinPayload } from './stdin-payload.js'
 
 export interface OpencodeBackendOptions {
   bin: string
@@ -100,15 +101,25 @@ export class OpencodeBackend implements Backend {
     // when the subprocess crashes.
     const mcpMaterialised = materialiseMcpServersForOpencode(resolveMcpServers(req, session))
 
+    // Pipe the prompt via stdin instead of stuffing it into argv. Linux
+    // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
+    // on x86_64, so any caller passing a long system prompt or
+    // multi-turn history would spawn-fail with E2BIG (errno -7) and
+    // surface as an opaque "opencode upstream failure" — the bug is
+    // invisible until a >100 KiB prompt arrives. `opencode run` with
+    // no positional message reads stdin as the literal message text,
+    // which lifts the limit entirely (fd payloads aren't accounted to
+    // the argv+envp stack page budget). Mirrors the kimi/claude
+    // stream-json stdin path, but opencode's stdin schema is raw bytes,
+    // not NDJSON — see writeStdinPayload's 'raw' format.
     const args: string[] = ['run', '--format', 'json']
     if (model) args.push('-m', model)
     const variant = opencodeVariantForEffort(req.effort)
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
-    args.push(prompt)
 
     const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: {
         ...process.env,
@@ -142,6 +153,22 @@ export class OpencodeBackend implements Backend {
       }
       if (!child.stdout) {
         throw new BackendError('opencode subprocess has no stdout pipe', 'upstream')
+      }
+      if (!child.stdin) {
+        throw new BackendError('opencode subprocess has no stdin pipe', 'upstream')
+      }
+
+      // Pipe the composed prompt as raw stdin bytes. opencode reads
+      // stdin to EOF as the literal message when no positional argv
+      // is supplied to `run`. See writeStdinPayload comments for the
+      // EPIPE / backpressure contract.
+      const stdinResult = await writeStdinPayload(
+        child.stdin,
+        [{ role: 'user', content: prompt }],
+        { format: 'raw' },
+      )
+      if (!stdinResult.ok) {
+        throw new BackendError(`opencode stdin write failed: ${stdinResult.error}`, 'upstream')
       }
       let sawError: string | null = null
       let emittedContent = false

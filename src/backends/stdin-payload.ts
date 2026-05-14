@@ -44,27 +44,33 @@ export type WriteStdinResult =
   | { ok: false; error: string }
 
 /**
- * NDJSON envelope shape for `--input-format stream-json`.
+ * Wire shape for prompts piped via stdin.
  *
- *  - 'claude'  → `{"type":"user","message":{"role":"user","content":"…"}}`
- *               (Claude Code CLI; the original, wrapped, envelope).
- *  - 'flat'    → `{"role":"user","content":"…"}`
- *               (Kimi CLI 1.44.0; parses ONLY the flat shape, silently
- *                emits zero output if handed claude's wrapped envelope.)
+ *  - 'claude'  → NDJSON, `{"type":"user","message":{"role":"user","content":"…"}}`
+ *                (Claude Code CLI; the original, wrapped, envelope).
+ *  - 'flat'    → NDJSON, `{"role":"user","content":"…"}`
+ *                (Kimi CLI 1.44.0; parses ONLY the flat shape, silently
+ *                 emits zero output if handed claude's wrapped envelope.)
+ *  - 'raw'     → Concatenated message contents, no JSON envelope, no
+ *                per-message framing — just `m.content` joined with
+ *                blank lines. Used by `opencode run`, which reads stdin
+ *                as the literal message text when no positional argv is
+ *                supplied. There is no opencode flag or schema for a
+ *                structured stdin envelope at the `run` subcommand
+ *                today; raw bytes is the only inline channel.
  *
  * Defaults to 'claude' to preserve existing callers (claude.ts).
  */
-export type StdinPayloadFormat = 'claude' | 'flat'
+export type StdinPayloadFormat = 'claude' | 'flat' | 'raw'
 
 export interface WriteStdinOptions {
   format?: StdinPayloadFormat
 }
 
 /**
- * Serialise `messages` as NDJSON in the requested `--input-format
- * stream-json` schema (see {@link StdinPayloadFormat}) and pipe them
- * into `stdin`. Closes the stream when done. Tolerates EPIPE and
- * backpressure.
+ * Serialise `messages` in the requested wire shape (see
+ * {@link StdinPayloadFormat}) and pipe them into `stdin`. Closes the
+ * stream when done. Tolerates EPIPE and backpressure.
  */
 export async function writeStdinPayload(
   stdin: Writable,
@@ -72,12 +78,20 @@ export async function writeStdinPayload(
   options?: WriteStdinOptions,
 ): Promise<WriteStdinResult> {
   const format = options?.format ?? 'claude'
-  const lines = messages.map((m) => {
-    const payload = format === 'flat'
-      ? { role: m.role, content: m.content }
-      : { type: 'user', message: { role: m.role, content: m.content } }
-    return `${JSON.stringify(payload)}\n`
-  })
+  const lines = format === 'raw'
+    // Raw mode: no envelope, no per-message framing. Concat the
+    // content fields with a blank line between turns; this matches
+    // how a human would pipe a multi-message prompt into a CLI's
+    // stdin (`printf "%s\n\n%s" "$a" "$b" | opencode run`). No
+    // trailing newline — opencode reads to EOF either way, and a
+    // trailing newline would be visible to the model as whitespace.
+    ? [messages.map((m) => m.content).join('\n\n')]
+    : messages.map((m) => {
+      const payload = format === 'flat'
+        ? { role: m.role, content: m.content }
+        : { type: 'user', message: { role: m.role, content: m.content } }
+      return `${JSON.stringify(payload)}\n`
+    })
   let bytesWritten = 0
   let pipeError: string | undefined
 
