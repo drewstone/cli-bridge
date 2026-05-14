@@ -120,6 +120,64 @@ describe('writeStdinPayload', () => {
       expect(obj.message).toBeUndefined()
     }
   })
+
+  it("format:'raw' produces literal content bytes — no JSON envelope, no per-message newline framing", async () => {
+    // opencode's `run` subcommand reads stdin as the literal message
+    // text when no positional argv is supplied. A JSON envelope would
+    // appear to the model as user-supplied text, not as a structured
+    // message. Lock that no framing leaks through.
+    const stdin = new PassThrough()
+    const chunks: string[] = []
+    stdin.on('data', (b: Buffer | string) => {
+      chunks.push(typeof b === 'string' ? b : b.toString('utf8'))
+    })
+    const result = await writeStdinPayload(
+      stdin,
+      [{ role: 'user', content: 'hello opencode' }],
+      { format: 'raw' },
+    )
+    expect(result.ok).toBe(true)
+    const text = chunks.join('')
+    expect(text).toBe('hello opencode')
+    // No JSON envelope characters appear at all.
+    expect(text).not.toContain('"role"')
+    expect(text).not.toContain('"content"')
+    expect(text).not.toContain('"type"')
+  })
+
+  it("format:'raw' joins multi-message content with a blank line — preserves turn boundaries without inventing a wire schema", async () => {
+    const stdin = new PassThrough()
+    const chunks: string[] = []
+    stdin.on('data', (b: Buffer | string) => {
+      chunks.push(typeof b === 'string' ? b : b.toString('utf8'))
+    })
+    const result = await writeStdinPayload(
+      stdin,
+      [
+        { role: 'user', content: 'first turn' },
+        { role: 'user', content: 'second turn' },
+      ],
+      { format: 'raw' },
+    )
+    expect(result.ok).toBe(true)
+    expect(chunks.join('')).toBe('first turn\n\nsecond turn')
+  })
+
+  it("format:'raw' survives prompts > 128 KiB without truncation (the E2BIG threshold)", async () => {
+    // Direct E2BIG regression: previously the same bytes would have
+    // overflowed Linux MAX_ARG_STRLEN at exec time. Through stdin, no
+    // such limit applies — assert the helper writes every byte.
+    const big = 'A'.repeat(200_000)
+    const stdin = new PassThrough()
+    const chunks: string[] = []
+    stdin.on('data', (b: Buffer | string) => {
+      chunks.push(typeof b === 'string' ? b : b.toString('utf8'))
+    })
+    const result = await writeStdinPayload(stdin, [{ role: 'user', content: big }], { format: 'raw' })
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.bytesWritten).toBe(200_000)
+    expect(chunks.join('').length).toBe(200_000)
+  })
 })
 
 // ─── DockerSpawner argv composition ──────────────────────────────────────
@@ -617,6 +675,55 @@ describe('Spawner injection works across all subprocess backends', () => {
     )) deltas.push(d)
     expect(deltas.find((d) => d.internal_session_id === 'oc-1')).toBeDefined()
     expect(stub.observedArgs).not.toContain('--dangerously-skip-permissions')
+    expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('OpencodeBackend pipes the prompt via stdin, never argv (E2BIG regression)', async () => {
+    // Regression: previously the prompt was appended as the last argv
+    // entry to `opencode run …`. Linux MAX_ARG_STRLEN = 128 KiB per
+    // argv string on x86_64, so any caller passing a long system
+    // prompt hit `spawn E2BIG` (errno -7) on the bridge. Lock the
+    // invariant that the prompt text NEVER reaches argv and IS what
+    // arrives on stdin.
+    const longPrompt = 'X'.repeat(200_000) // > MAX_ARG_STRLEN
+    const stub = createStubSpawner([
+      JSON.stringify({ type: 'session.created', session_id: 'oc-stdin' }),
+      JSON.stringify({ type: 'text', part: { type: 'text', text: 'ok' } }),
+      JSON.stringify({ type: 'run.completed' }),
+    ])
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const deltas: Array<{ content?: string; finish_reason?: string }> = []
+    for await (const d of backend.chat(
+      { model: 'opencode/zai-coding-plan/glm-5.1', messages: [{ role: 'user', content: longPrompt }] },
+      null,
+      ctrl.signal,
+    )) deltas.push(d)
+
+    // Every argv entry must be < the prompt — the prompt itself or
+    // any substring of it must not appear in argv at any size.
+    const args = stub.observedArgs ?? []
+    for (const a of args) {
+      expect(a.length).toBeLessThan(longPrompt.length)
+      expect(a).not.toContain('XXXXX') // a 5-char witness suffices — argv-safe
+    }
+    // Args we DO expect.
+    expect(args).toContain('run')
+    expect(args).toContain('--format')
+    expect(args).toContain('json')
+    expect(args).toContain('-m')
+    // Backend strips the `opencode/` harness prefix before passing to the CLI.
+    expect(args).toContain('zai-coding-plan/glm-5.1')
+
+    // Prompt must arrive on stdin (raw bytes, no JSON envelope).
+    const stdinText = stub.stdinChunks.join('')
+    expect(stdinText.length).toBe(longPrompt.length)
+    expect(stdinText).toBe(longPrompt)
+    expect(stdinText).not.toContain('"role"')
+    expect(stdinText).not.toContain('"type"')
+
+    // Sanity: chat still produced a response delta.
+    expect(deltas.find((d) => d.content === 'ok')).toBeDefined()
     expect(stub.releaseCalls).toBe(1)
   })
 
