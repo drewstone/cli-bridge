@@ -177,16 +177,30 @@ export function materialiseMcpServersForClaudeKimi(
   specs: Record<string, McpServerSpec> | null,
 ): MaterialisedMcpConfig | null {
   if (!specs) return null
-  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string>; timeout?: number }> = {}
+  // claude-code accepts three transports in --mcp-config:
+  //   stdio: { command, args, env, timeout }
+  //   http:  { type: "http", url, headers }
+  //   sse:   { type: "sse",  url, headers }
+  // Materialise whichever applies per server. kimi-code reads the same
+  // file shape (claude-code-derived) so this helper is shared.
+  const mcpServers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs)) {
-    if (!isStdioMcpSpec(spec)) continue
-    if (!spec.command) continue
-    mcpServers[name] = {
-      command: spec.command,
-      ...(spec.args && spec.args.length ? { args: spec.args } : {}),
-      ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
-      ...(spec.timeout ? { timeout: spec.timeout } : {}),
+    if (isStdioMcpSpec(spec) && spec.command) {
+      mcpServers[name] = {
+        command: spec.command,
+        ...(spec.args && spec.args.length ? { args: spec.args } : {}),
+        ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+      }
+    } else if ((spec.type === 'http' || spec.type === 'sse') && typeof spec.url === 'string' && spec.url.length > 0) {
+      mcpServers[name] = {
+        type: spec.type,
+        url: spec.url,
+        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+      }
     }
+    // unknown transport / missing required fields → drop silently
   }
   const serverNames = Object.keys(mcpServers)
   if (serverNames.length === 0) return null

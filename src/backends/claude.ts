@@ -416,33 +416,53 @@ export class ClaudeBackend implements Backend {
     // per-call permission prompt. Hosted-safe mode keeps the gate
     // (callers using hosted-safe explicitly want tool grants confirmed
     // elsewhere).
+    // MCP wiring — the canonical custom-tool surface. The caller
+    // passes `mcp.mcpServers` in the request body (or via X-Mcp-Config
+    // header, or via agent_profile.mcp); `resolveMcpServers` merges
+    // those sources into the `mcp` value materialised here. Every
+    // backend translates the merged map into its native loader; for
+    // claude that's `--mcp-config <path>`.
+    //
+    // We always pair with `--strict-mcp-config` so the operator's
+    // `~/.claude/` inherited servers (Google Drive, Linear, etc.) do
+    // NOT leak into the caller's request — the caller's MCP set is
+    // the entire MCP surface for this turn.
+    //
+    // Custom tools come in via MCP — NOT via the OpenAI `tools[]`
+    // emulation field. With MCP the caller's tools appear in
+    // claude-code's native tool registry alongside Bash/Read/etc. and
+    // get first-class calling semantics.
     if (mcp) {
-      args.push('--mcp-config', mcp.configPath)
+      args.push('--mcp-config', mcp.configPath, '--strict-mcp-config')
       if (mode !== 'hosted-safe') {
         args.push('--allowedTools', buildMcpAllowList(mcp.serverNames))
       }
     }
 
-    // hosted-safe: force Claude Code into plan mode and hard-disable
-    // every tool that can touch the FS or shell. `plan` mode alone
-    // already bans Write/Edit/Bash/NotebookEdit, but we also pass the
-    // full disallowed list so a future upstream flag rename doesn't
-    // silently re-enable them.
+    // Per-mode permission posture. Native tools (Bash/Read/Edit/etc.)
+    // STAY ENABLED by design — the LLM should have full agentic
+    // capability and pick the right tool (native or MCP-exposed) per
+    // task. `--dangerously-skip-permissions` is the explicit ask:
+    // full permissions, every tool, no interactive grant prompts.
+    //
+    // Also pass `--bare` in byob mode to suppress claude-code's
+    // operator-side defaults that leak into the request: LSP service
+    // probes, `~/.claude/projects/<dir>/memory/*.md` auto-discovery,
+    // CLAUDE.md auto-discovery, plugin sync, background prefetches,
+    // keychain reads. The caller provides every context source it
+    // wants explicitly (system prompt, MCP servers, prompt content).
+    //
+    // The "easily swappable with a real sandbox" property holds: when
+    // the caller flips harness=sandbox, the same mcp config flows
+    // through TCloudSandbox's AgentProfile.mcp slot and the
+    // sandbox-host enforces isolation at the VM layer.
     if (mode === 'hosted-safe') {
       args.push(
         '--permission-mode', 'plan',
         '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
       )
     } else if (mode === 'byob') {
-      // byob = caller runs their own bridge and trusts the tool calls;
-      // the whole point of the mode is "full harness tools available"
-      // (see src/modes.ts). Claude Code's default permission mode is
-      // interactive approval, which in a non-TTY bridge pipeline hangs
-      // every Write/Edit call (worker emits `The file write requests
-      // need user approval` and no approver exists). Use bypass mode
-      // explicitly — matches what kimi.ts does implicitly by not
-      // exposing a permission flag at all.
-      args.push('--permission-mode', 'bypassPermissions')
+      args.push('--dangerously-skip-permissions')
     }
 
     if (session?.internalId) {
