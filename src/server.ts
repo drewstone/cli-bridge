@@ -22,6 +22,7 @@ import { ForgeBackend } from './backends/forge.js'
 import { PiBackend } from './backends/pi.js'
 import { PassthroughBackend } from './backends/passthrough.js'
 import { SandboxBackend } from './backends/sandbox.js'
+import { UrlTranslateBackend } from './backends/url-translate.js'
 import { createProfileCatalog, type ProfileCatalog } from './profiles/loader.js'
 import { mountChatCompletions } from './routes/chat-completions.js'
 import { mountHealth } from './routes/health.js'
@@ -30,6 +31,7 @@ import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
 import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
+import { mountTranslate } from './routes/translate.js'
 import { ContainerPool } from './executors/container-pool.js'
 import { createDockerSpawner } from './executors/docker.js'
 import type { Spawner } from './executors/types.js'
@@ -166,6 +168,13 @@ export async function buildApp(config: Config): Promise<{
       resolveProfile: (id) => catalog.get(id),
     }))
   }
+  if (config.backends.has('url-translate')) {
+    registry.register(new UrlTranslateBackend({
+      translationApiUrl: config.translateApiUrl,
+      translationApiKey: config.translateApiKey,
+      timeoutMs: config.cliTimeoutMsDefault,
+    }))
+  }
 
   const app = new Hono()
 
@@ -189,6 +198,13 @@ export async function buildApp(config: Config): Promise<{
   mountChatCompletions(app, { registry, sessions })
   mountCadRender(app)
   mountImagesGenerate(app)
+  mountTranslate(app, {
+    backendOpts: {
+      translationApiUrl: config.translateApiUrl,
+      translationApiKey: config.translateApiKey,
+      timeoutMs: config.cliTimeoutMsDefault,
+    },
+  })
 
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
@@ -202,6 +218,7 @@ export async function buildApp(config: Config): Promise<{
       '/v1/sessions',
       '/cad/render',
       '/images/generate',
+      '/translate',
     ],
   }))
 

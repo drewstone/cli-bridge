@@ -46,6 +46,10 @@ export interface Config {
   sandboxProfilesDir: string
   /** Per-task timeout sent to sandbox-api `/batch/run`. Default 5min. */
   sandboxTimeoutMs: number
+  /** Translation API URL for url-translate backend. */
+  translateApiUrl: string
+  /** Translation API key (optional for some providers). */
+  translateApiKey: string | null
   /**
    * Per-backend executor configuration. Every subprocess backend
    * (claude, kimi, codex, opencode, …) reads its own slot from this
@@ -148,6 +152,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
+    translateApiUrl: env.TRANSLATE_API_URL?.trim() ?? 'https://translation.googleapis.com/language/translate/v2',
+    translateApiKey: env.TRANSLATE_API_KEY?.trim() || null,
     executors: parseAllExecutors(env),
   }
 }
