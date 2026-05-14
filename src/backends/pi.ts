@@ -21,17 +21,19 @@
  *   {"type":"agent_start"}
  *   {"type":"turn_start"}
  *   {"type":"message_update","assistantMessageEvent":{
- *      "type":"thinking_delta"|"text_delta"|"tool_call_start"|...,
+ *      "type":"thinking_delta"|"text_delta"|"toolcall_start"|"toolcall_delta"|...,
  *      "delta":"...", "contentIndex":N, ... }}
  *   {"type":"turn_end","usage":{...}}
  *   {"type":"agent_end"}
  *
- * We currently surface text_delta as ChatDelta.content; thinking_delta is
- * dropped (matches how the kimi backend handles its `think` blocks for
- * non-thinking-aware callers). tool_call events are emitted as keepalives
- * for now — full tool-call mapping is a follow-up since pi's native tools
- * (read/bash/edit/write) execute INSIDE the CLI loop and don't need
- * OpenAI-tool-call round-trips through the bridge.
+ * Translations:
+ *   - text_delta            → ChatDelta.content (incremental)
+ *   - thinking_delta        → dropped (matches kimi)
+ *   - toolcall_start/delta  → ChatDelta.tool_calls (assembled per contentIndex,
+ *                             flushed when the next non-toolcall event arrives).
+ *                             Pi's tools execute INSIDE the CLI loop — the
+ *                             assembled emit is for observability + matrix
+ *                             progress tracking, not for round-trip exec.
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -170,8 +172,22 @@ export class PiBackend implements Backend {
       let internalSessionId: string | undefined
       let stderr = ''
       let emittedContent = false
+      let emittedToolCall = false
       let sawError: string | null = null
       let usage: { input?: number; output?: number } | undefined
+
+      // Buffered tool call. Pi streams arguments as JSON-fragment deltas
+      // across many toolcall_delta events; we accumulate then flush as a
+      // single OpenAI-shape tool_calls entry when the call boundary closes
+      // (next non-toolcall event, new toolcall_start at a different
+      // contentIndex, or turn/agent end).
+      let pendingTool: { id: string; name: string; contentIndex: number; args: string } | null = null
+      const flushPendingTool = (): { id: string; name: string; arguments: string } | null => {
+        if (!pendingTool) return null
+        const out = { id: pendingTool.id, name: pendingTool.name, arguments: pendingTool.args || '{}' }
+        pendingTool = null
+        return out
+      }
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
 
@@ -220,6 +236,9 @@ export class PiBackend implements Backend {
         // Final turn_end carries usage. Pi reports usage on the
         // `message_end` event with role: assistant via `partial.usage`.
         if (type === 'turn_end' || type === 'agent_end') {
+          // Flush any pending tool call before terminal usage roll-up.
+          const tc = flushPendingTool()
+          if (tc) { yield { tool_calls: [tc] }; emittedToolCall = true }
           const u = (ev.usage ?? (ev.partial as Record<string, unknown> | undefined)?.usage) as
             | Record<string, number>
             | undefined
@@ -229,27 +248,82 @@ export class PiBackend implements Backend {
           continue
         }
 
-        // Text comes through message_update events with
-        // assistantMessageEvent.type === 'text_delta' (or 'text_start',
-        // 'text_end' boundary markers we can ignore).
+        // message_update is the workhorse — it wraps text_delta,
+        // thinking_*, and toolcall_* sub-events. Each carries
+        // `assistantMessageEvent` with its own `type`.
         if (type === 'message_update') {
           const ame = ev.assistantMessageEvent as Record<string, unknown> | undefined
           if (!ame) continue
           const ameType = String(ame.type ?? '')
+          const contentIndex = Number(ame.contentIndex ?? -1)
+
           if (ameType === 'text_delta') {
-            // Use the incremental delta only — text_start carries the
+            // Boundary crossed — flush any in-progress tool call first.
+            const tc = flushPendingTool()
+            if (tc) { yield { tool_calls: [tc] }; emittedToolCall = true }
+            // Use the incremental delta only. text_start carries the
             // initial fragment in `partial.content[].text` and is followed
-            // immediately by text_delta events that already include it.
-            // Emitting both yields doubled output.
+            // immediately by text_delta events that include it; emitting
+            // both yields doubled output.
             const delta = typeof ame.delta === 'string' ? ame.delta : ''
             if (delta) {
               emittedContent = true
               yield { content: delta }
             }
+            continue
           }
-          // thinking_*, tool_call_*, message_start, message_end — drop
-          // for now. Future enhancement: surface thinking as a separate
-          // ChatDelta variant once the OpenAI o1-style schema lands.
+
+          if (ameType === 'toolcall_start') {
+            // New tool call — flush the previous one (different contentIndex).
+            const prev = flushPendingTool()
+            if (prev) { yield { tool_calls: [prev] }; emittedToolCall = true }
+            // Pi puts the assembled tool-use block as the last entry of
+            // `partial.content`. That entry carries the call id + name.
+            const partial = ame.partial as Record<string, unknown> | undefined
+            const content = (partial?.content as Array<Record<string, unknown>> | undefined) ?? []
+            const last = content[content.length - 1]
+            const id = String(last?.id ?? '')
+            const name = String(last?.name ?? last?.tool ?? '')
+            if (id && name) {
+              pendingTool = { id, name, contentIndex, args: '' }
+            }
+            continue
+          }
+
+          if (ameType === 'toolcall_delta') {
+            const delta = typeof ame.delta === 'string' ? ame.delta : ''
+            if (pendingTool && pendingTool.contentIndex === contentIndex) {
+              pendingTool.args += delta
+            } else {
+              // Toolcall_delta without a matching start — try to recover the
+              // id/name from partial.content[-1] so we don't drop the call.
+              const partial = ame.partial as Record<string, unknown> | undefined
+              const content = (partial?.content as Array<Record<string, unknown>> | undefined) ?? []
+              const last = content[content.length - 1]
+              const id = String(last?.id ?? '')
+              const name = String(last?.name ?? last?.tool ?? '')
+              if (id && name) {
+                const partialArgs = typeof last?.partialArgs === 'string' ? last.partialArgs : ''
+                pendingTool = { id, name, contentIndex, args: partialArgs }
+              }
+            }
+            continue
+          }
+
+          if (ameType === 'toolcall_end') {
+            // Pi may emit a separate end marker after the args complete.
+            const tc = flushPendingTool()
+            if (tc) { yield { tool_calls: [tc] }; emittedToolCall = true }
+            continue
+          }
+
+          // text_start, text_end, thinking_*, message_*, etc. Treat as
+          // boundary markers — flush any tool-call buffer but emit no
+          // content. thinking_* deltas remain dropped (chain-of-thought).
+          if (ameType !== 'thinking_delta' && ameType !== 'thinking_start' && ameType !== 'thinking_end') {
+            const tc = flushPendingTool()
+            if (tc) { yield { tool_calls: [tc] }; emittedToolCall = true }
+          }
           continue
         }
 
@@ -286,8 +360,13 @@ export class PiBackend implements Backend {
         throw new BackendError(`pi error: ${sawError}`, 'upstream')
       }
 
+      // Final flush — pi may end the stream without an explicit toolcall_end
+      // (e.g. if the last action was a tool call and then agent_end fires).
+      const finalTool = flushPendingTool()
+      if (finalTool) { yield { tool_calls: [finalTool] }; emittedToolCall = true }
+
       yield {
-        finish_reason: 'stop',
+        finish_reason: emittedToolCall && !emittedContent ? 'tool_calls' : 'stop',
         ...(usage ? { usage: { input_tokens: usage.input, output_tokens: usage.output } } : {}),
       }
     } finally {
@@ -315,22 +394,3 @@ export class PiBackend implements Backend {
   }
 }
 
-/**
- * Pi's `partial` object can carry assembled text in
- * `partial.content[N].text` — walk it for a last-resort delta when the
- * top-level `delta` field is missing on a text event.
- */
-function extractTextFromPartial(partial: unknown): string {
-  if (!partial || typeof partial !== 'object') return ''
-  const obj = partial as Record<string, unknown>
-  const content = obj.content
-  if (!Array.isArray(content)) return ''
-  let out = ''
-  for (const block of content) {
-    if (block && typeof block === 'object') {
-      const b = block as Record<string, unknown>
-      if (b.type === 'text' && typeof b.text === 'string') out += b.text
-    }
-  }
-  return out
-}
