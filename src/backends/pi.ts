@@ -139,10 +139,15 @@ export class PiBackend implements Backend {
     ]
     if (spec.provider) args.push('--provider', spec.provider)
     if (spec.model) args.push('--model', spec.model)
+    // Shot 1 of a session: omit --no-session so pi persists the session
+    // under ~/.pi/agent/sessions/<id>/session.jsonl. We capture the UUID
+    // from the first `session` event and re-pass it on subsequent shots
+    // via --session <uuid> (pi accepts partial UUIDs too). Passing
+    // --no-session here would make pi emit a UUID for the in-process
+    // session ONLY — disk has no record, so shot 2's --session lookup
+    // would fail with "No session found matching '<uuid>'".
     if (session?.internalId) {
       args.push('--session', session.internalId)
-    } else {
-      args.push('--no-session')
     }
     const thinking = thinkingFlagForEffort(req.effort)
     if (thinking) args.push('--thinking', thinking)
