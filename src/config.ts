@@ -133,7 +133,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ampBin: env.AMP_BIN ?? 'amp',
     forgeBin: env.FORGE_BIN ?? 'forge',
     piBin: env.PI_BIN ?? 'pi',
-    piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    // Pi's coding agent does many tool calls per shot. The bridge default
+    // (300s = 5min) killed long Fhenix UI builds mid-stream — bump to 30min
+    // so the bridge waits for pi to finish before SIGTERM. Override via
+    // PI_TIMEOUT_MS=<ms> when calling cli-bridge.
+    piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? '1800000', 10),
     cliTimeoutMsDefault: defaultTimeout,
     claudishUrl: env.CLAUDISH_URL?.trim() || null,
     openaiApiKey: env.OPENAI_API_KEY?.trim() || null,
