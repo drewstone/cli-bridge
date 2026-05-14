@@ -35,7 +35,6 @@ import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
-import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
 import { writeStdinPayload } from './stdin-payload.js'
 
 interface ClaudeStreamInit {
@@ -173,21 +172,18 @@ export class ClaudeBackend implements Backend {
     //
     //   1. `-p <text>` ARGV — claude-code's "single-shot text" mode.
     //      Single non-interactive turn. Forced to produce an output
-    //      and exit. This is the mode that correctly emits
-    //      tool-emulation markers (<<<TOOL_CALL>>>...) when caller
-    //      tools[] are registered. PREFERRED.
+    //      and exit. PREFERRED.
     //
     //   2. `--input-format stream-json` STDIN — claude-code's
-    //      "interactive agent loop" mode. The CLI uses its OWN
-    //      internal tool registry (ToolSearch, Bash, etc.) and the
-    //      emulation markers are NOT emitted reliably. FALLBACK only.
+    //      "interactive agent loop" mode. FALLBACK only, used when
+    //      the user text overflows the argv-per-string limit.
     //
     // We use argv when the user-message string fits the kernel's
     // per-arg limit (MAX_ARG_STRLEN = 128 KiB). Fall back to stdin
     // when it overflows. System content (agent profile preamble,
-    // tool-emulation directive, etc.) goes through
-    // --append-system-prompt regardless of which user-message
-    // transport is chosen — see buildArgs/composeStdinInput.
+    // JSON-mode directive, etc.) goes through --append-system-prompt
+    // regardless of which user-message transport is chosen — see
+    // buildArgs/composeStdinInput.
     const stdinInput = this.composeStdinInput(req, session)
     const userText = stdinInput.messages[0]?.content ?? ''
     const PROMPT_ARGV_LIMIT = 120 * 1024
@@ -239,8 +235,6 @@ export class ClaudeBackend implements Backend {
     const onAbort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', onAbort, { once: true })
 
-    const emulateTools = isEmulationEnabled(req)
-    const toolMarkerParser = emulateTools ? new ToolMarkerParser() : null
     let emittedAnyToolCall = false
     try {
       let internalSessionId: string | undefined
@@ -289,50 +283,22 @@ export class ClaudeBackend implements Backend {
           const content = a.message?.content ?? []
           for (const block of content) {
             if (block.type === 'text') {
-              if (toolMarkerParser) {
-                // Emulation: text blocks may contain TOOL_CALL markers.
-                // Surface only the prose between/around markers, and emit
-                // any complete tool calls as synthetic tool_calls deltas.
-                const { toolCalls, prose } = toolMarkerParser.feed(block.text)
-                if (prose) yield { content: prose }
-                if (toolCalls.length > 0) {
-                  emittedAnyToolCall = true
-                  yield { tool_calls: toolCalls }
-                }
-              } else {
-                yield { content: block.text }
-              }
+              yield { content: block.text }
             } else if (block.type === 'tool_use') {
-              // claude-code-cli emits `tool_use` for its OWN built-in
-              // tools (Read, Bash, Edit, ToolSearch, etc.) as it runs
-              // its internal agent loop. When tool-call emulation is
-              // active (caller passed tools[]), those internal calls
-              // are NOT meant for the caller — claude-code executes
-              // them itself within the same subprocess run and reads
-              // the results internally. Forwarding them as OpenAI
-              // tool_calls to the caller corrupts the conversation:
-              // the caller's harness sees phantom Read/Bash calls,
-              // can't execute them (the names aren't in its tools[]),
-              // returns empty/error results, and the model — which
-              // already saw the real internal results — gets a
-              // contradictory history on the next turn. Observed:
-              // multi-turn agent runs derail at turn 3 producing
-              // text-only output and finish_reason=stop.
-              //
-              // When emulation is OFF (no caller tools[] supplied,
-              // OR explicitly disabled via BRIDGE_DISABLE_TOOL_EMULATION),
-              // surfacing tool_use to the caller IS the contract —
-              // they want claude-code's native tool surface exposed
-              // as OpenAI tool_calls.
-              if (!toolMarkerParser) {
-                yield {
-                  tool_calls: [{
-                    id: block.id,
-                    name: block.name,
-                    arguments: JSON.stringify(block.input ?? {}),
-                  }],
-                }
+              // claude-code-cli emits `tool_use` for its own built-in
+              // tools (Read, Bash, Edit, ToolSearch, ...) and for any
+              // MCP server tools loaded via --mcp-config. Surface them
+              // to the caller as OpenAI tool_calls — that IS the
+              // contract for callers that registered MCP servers and
+              // want the model's tool surface visible.
+              yield {
+                tool_calls: [{
+                  id: block.id,
+                  name: block.name,
+                  arguments: JSON.stringify(block.input ?? {}),
+                }],
               }
+              emittedAnyToolCall = true
             }
           }
           continue
@@ -343,17 +309,8 @@ export class ClaudeBackend implements Backend {
           if (r.is_error) {
             yield { finish_reason: 'error', internal_session_id: internalSessionId }
           } else {
-            // In emulation mode, drain any trailing prose still in the
-            // parser buffer and pick the right finish_reason. tool_calls
-            // wins over stop when the model declared at least one.
-            if (toolMarkerParser) {
-              const tail = toolMarkerParser.flush()
-              if (tail.prose) yield { content: tail.prose }
-              if (tail.toolCalls.length > 0) {
-                emittedAnyToolCall = true
-                yield { tool_calls: tail.toolCalls }
-              }
-            }
+            // tool_calls wins over stop when the model emitted at least
+            // one tool_use block during this turn (native or MCP).
             yield {
               finish_reason: emittedAnyToolCall ? 'tool_calls' : 'stop',
               usage: r.usage,
@@ -406,12 +363,10 @@ export class ClaudeBackend implements Backend {
     opts?: { userTextForArgv?: string },
   ): string[] {
     // Two transport modes — see chat() for the rationale:
-    //   - argv (`-p <text>`):       single-shot text mode. Tool-emulation
-    //                               markers work reliably. Used when user
+    //   - argv (`-p <text>`):       single-shot text mode. Used when user
     //                               text fits MAX_ARG_STRLEN.
     //   - stdin (--input-format=stream-json): interactive agent-loop mode.
-    //                               Fallback only — emulation markers are
-    //                               unreliable in this mode.
+    //                               Fallback for oversized user text.
     const argvMode = opts?.userTextForArgv !== undefined
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
@@ -422,7 +377,6 @@ export class ClaudeBackend implements Backend {
     //   1. Caller's role:'system' messages (AI SDK sends them this way)
     //   2. agent_profile.prompt.systemPrompt preamble
     //   3. JSON-mode directive (when responseFormat: json_object)
-    //   4. Tool-emulation directive (when caller passed tools[])
     //
     // Why not stdin: an earlier version of this code flattened the
     // whole messages[] array (including role:'system') with `[role]`
@@ -439,7 +393,6 @@ export class ClaudeBackend implements Backend {
     // the cap, composeStdinInput's fallback wraps it into the user
     // message — degraded (may trip injection heuristics) but the
     // spawn still succeeds, which beats spawn E2BIG.
-    const emulateTools = isEmulationEnabled(req)
     const systemMessages = (req.messages ?? [])
       .filter((m) => m.role === 'system')
       .map((m) => contentToText(m.content))
@@ -448,7 +401,6 @@ export class ClaudeBackend implements Backend {
       ...systemMessages,
       renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
       wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
-      emulateTools ? renderToolEmulationDirective(req.tools!, req.tool_choice) : null,
     ].filter((value): value is string => Boolean(value))
     if (systemBlocks.length > 0) {
       const merged = systemBlocks.join('\n\n')
@@ -458,34 +410,12 @@ export class ClaudeBackend implements Backend {
       }
     }
 
-    // When emulating caller-supplied tools, signal the soft intent
-    // with `--allowedTools ''`. The CLI parser doesn't actually disable
-    // built-ins from an empty string — the model retains its default
-    // tool registry — but the emulation system-prompt directive
-    // ("use ONLY the caller tools above, emit markers, do not attempt
-    // Read/Bash/Edit/Write") is enough to make the model emit markers
-    // for the registered caller tools.
-    //
-    // We tried `--disallowedTools <full-builtin-list>` to enforce the
-    // intent at the CLI layer. It broke multi-turn agent loops: probes
-    // still returned tool_calls on the first request, but subsequent
-    // requests with assistant+tool history in the conversation
-    // returned text-only deltas with finish_reason=stop and the
-    // harness exited after 5-8 turns producing zero spawn events.
-    // Hypothesis: claude-code uses some of its built-in tools (Task?
-    // ToolSearch?) internally during multi-turn agent loops, and
-    // disabling them all stalls the loop. Soft intent works fine in
-    // practice — the working state pre-disallowedTools produced 15
-    // findings on the same audit task.
-    if (emulateTools) {
-      args.push('--allowedTools', '')
-    }
-
-    // MCP wiring — when the caller passed agent_profile.mcp, register
-    // the servers via --mcp-config and auto-allow their tools so byob
-    // mode doesn't hang on the per-call permission prompt. Hosted-safe
-    // mode keeps the gate (callers using hosted-safe explicitly want
-    // tool grants confirmed elsewhere).
+    // MCP wiring — when the caller passed `mcp.mcpServers` (or the
+    // agent profile carries one), register the servers via --mcp-config
+    // and auto-allow their tools so byob mode doesn't hang on the
+    // per-call permission prompt. Hosted-safe mode keeps the gate
+    // (callers using hosted-safe explicitly want tool grants confirmed
+    // elsewhere).
     if (mcp) {
       args.push('--mcp-config', mcp.configPath)
       if (mode !== 'hosted-safe') {
@@ -537,11 +467,11 @@ export class ClaudeBackend implements Backend {
    *
    * Default path: stdin carries ONLY user-side content (current turn
    * + multi-turn history). All system content — agent profile
-   * preamble, tool-emulation directive, JSON-mode directive — goes
-   * through `--append-system-prompt` in argv because claude-code-cli
-   * applies it as a real system slot. Folding system content into a
-   * synthetic `[SYSTEM INSTRUCTIONS]` user-side wrapper trips the
-   * model's prompt-injection heuristic and it refuses to call tools.
+   * preamble, JSON-mode directive — goes through
+   * `--append-system-prompt` in argv because claude-code-cli applies
+   * it as a real system slot. Folding system content into a synthetic
+   * `[SYSTEM INSTRUCTIONS]` user-side wrapper trips the model's
+   * prompt-injection heuristic and it refuses to call tools.
    *
    * Fallback path (very rare): when system content exceeds the argv
    * `--append-system-prompt` size cap (~120 KiB), `buildArgs` skips
@@ -551,13 +481,12 @@ export class ClaudeBackend implements Backend {
    *
    * Multi-turn `messages[]` arrays serialise as one user message per
    * element with `[role]` tags so tool-result content (role: 'tool')
-   * remains identifiable to the response-side emulation parser.
+   * stays identifiable to the model.
    */
   composeStdinInput(
     req: ChatRequest,
     session: SessionRecord | null,
   ): { messages: Array<{ role: 'user'; content: string }> } {
-    const emulateTools = isEmulationEnabled(req)
     const systemMessages = (req.messages ?? [])
       .filter((m) => m.role === 'system')
       .map((m) => contentToText(m.content))
@@ -566,7 +495,6 @@ export class ClaudeBackend implements Backend {
       ...systemMessages,
       renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
       wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
-      emulateTools ? renderToolEmulationDirective(req.tools!, req.tool_choice) : null,
     ].filter((value): value is string => Boolean(value))
 
     // Flatten only the non-system messages. `[role]` tags on user /

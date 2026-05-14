@@ -573,9 +573,8 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
   // The split below is the working invariant.
 
   it('uses -p argv (single-shot text mode) when caller passes user text under the cap', () => {
-    // Preferred path: claude-code emits tool-emulation markers
-    // reliably in argv single-shot mode. Stream-json stdin mode is
-    // a fallback only (markers are unreliable there).
+    // Preferred path: argv `-p` for short user text. The stream-json
+    // stdin path is a fallback for oversized user text only.
     const args = b.buildArgs(baseReq, null, 'byob', null, { userTextForArgv: 'summarize' })
     expect(args).toContain('-p')
     expect(args[args.indexOf('-p') + 1]).toBe('summarize')
@@ -701,32 +700,6 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     expect(messages[0]?.content).toContain('summarize')
   })
 
-  it('handles 16 verbose tools by routing emulation directive to argv (not E2BIG)', () => {
-    // Regression guard for the original E2BIG class: 16 tools with
-    // ~2 KB descriptions each → ~32 KB combined directive. Pre-fix,
-    // the whole prompt+directive went into `-p <argv>` and died with
-    // spawn E2BIG. Post-fix, the directive goes to
-    // --append-system-prompt (fits comfortably under 120 KiB) and
-    // stdin carries only the small user message.
-    const bigTools = Array.from({ length: 16 }, (_, i) => ({
-      type: 'function' as const,
-      function: {
-        name: `tool_${i}`,
-        description: 'x'.repeat(2_000),
-        parameters: { type: 'object' as const, properties: {}, required: [] },
-      },
-    }))
-    const args = b.buildArgs({ ...baseReq, tools: bigTools }, null, 'byob')
-    // Each individual argv string must stay under MAX_ARG_STRLEN
-    // (128 KiB). The directive lives in --append-system-prompt's
-    // value, which is one argv string — verify it fits.
-    const i = args.indexOf('--append-system-prompt')
-    expect(i).toBeGreaterThan(-1)
-    expect(Buffer.byteLength(args[i + 1] ?? '', 'utf8')).toBeLessThan(120 * 1024)
-    // Stdin stays minimal — user content only.
-    const { messages } = b.composeStdinInput({ ...baseReq, tools: bigTools }, null)
-    expect(messages[0]?.content).toBe('summarize')
-  })
 })
 
 describe('KimiBackend JSON mode (buildPrompt)', () => {

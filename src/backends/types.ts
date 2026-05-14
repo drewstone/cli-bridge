@@ -117,8 +117,7 @@ export interface ChatRequest {
    *
    * Servers a given backend cannot load locally (e.g. `http`/`sse`
    * transport on a CLI that only supports stdio) are dropped at
-   * materialisation time, NOT silently routed through marker
-   * emulation — fail loud, not theatre.
+   * materialisation time — fail loud, no silent fallback.
    */
   mcp?: McpRequestConfig
   /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */
@@ -141,20 +140,6 @@ export interface ChatRequest {
       }
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
-  /**
-   * OpenAI-style tool definitions. CLI harnesses don't natively expose
-   * caller-supplied tools to the model; when `BRIDGE_EMULATE_TOOL_CALLS=1`
-   * is set, supported backends translate these via prompt-marker emulation
-   * (see backends/tool-emulation.ts). Default off.
-   */
-  tools?: Array<{
-    type: 'function'
-    function: { name: string; description?: string; parameters?: unknown }
-  }>
-  /** OpenAI-style tool_choice — passed to the emulation layer. */
-  tool_choice?:
-    | 'auto' | 'none' | 'required'
-    | { type: 'function'; function: { name: string } }
 }
 
 export interface ChatDelta {

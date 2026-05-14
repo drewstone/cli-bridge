@@ -47,7 +47,6 @@ import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
-import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
 import { writeStdinPayload } from './stdin-payload.js'
 
 export interface KimiBackendOptions {
@@ -171,8 +170,6 @@ export class KimiBackend implements Backend {
     const onAbort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', onAbort, { once: true })
 
-    const emulateTools = isEmulationEnabled(req)
-    const toolMarkerParser = emulateTools ? new ToolMarkerParser() : null
     try {
       let internalSessionId: string | undefined
       let stderr = ''
@@ -263,14 +260,8 @@ export class KimiBackend implements Backend {
             if (!block || typeof block !== 'object') continue
             const blockType = String(block.type ?? '')
             if (blockType === 'text' && typeof block.text === 'string' && block.text) {
-              if (toolMarkerParser) {
-                const { toolCalls, prose } = toolMarkerParser.feed(block.text)
-                if (prose) { yield { content: prose }; emittedContent = true }
-                if (toolCalls.length > 0) { yield { tool_calls: toolCalls }; emittedToolCall = true }
-              } else {
-                yield { content: block.text }
-                emittedContent = true
-              }
+              yield { content: block.text }
+              emittedContent = true
             } else if (blockType === 'tool_use') {
               const id = String(block.id ?? block.tool_use_id ?? '')
               const name = String(block.name ?? block.tool ?? '')
@@ -291,14 +282,8 @@ export class KimiBackend implements Backend {
         } else {
           const text = extractText(ev)
           if (text) {
-            if (toolMarkerParser) {
-              const { toolCalls, prose } = toolMarkerParser.feed(text)
-              if (prose) { yield { content: prose }; emittedContent = true }
-              if (toolCalls.length > 0) { yield { tool_calls: toolCalls }; emittedToolCall = true }
-            } else {
-              yield { content: text }
-              emittedContent = true
-            }
+            yield { content: text }
+            emittedContent = true
           }
           const toolCall = extractToolUse(ev)
           if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
@@ -310,12 +295,6 @@ export class KimiBackend implements Backend {
           || type === 'session.completed'
           || type === 'completed'
         ) {
-          // Drain any trailing prose/markers buffered in the parser.
-          if (toolMarkerParser) {
-            const tail = toolMarkerParser.flush()
-            if (tail.prose) { yield { content: tail.prose }; emittedContent = true }
-            if (tail.toolCalls.length > 0) { yield { tool_calls: tail.toolCalls }; emittedToolCall = true }
-          }
           const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
           yield {
             finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
@@ -339,13 +318,6 @@ export class KimiBackend implements Backend {
       // we observed real assistant content, treat exit non-zero as OK.
       if (exitCode !== 0 && exitCode !== null && !emittedContent) {
         throw new BackendError(`kimi exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
-      }
-      // Drain marker parser at process exit (when no explicit completion
-      // event was seen).
-      if (toolMarkerParser) {
-        const tail = toolMarkerParser.flush()
-        if (tail.prose) { yield { content: tail.prose }; emittedContent = true }
-        if (tail.toolCalls.length > 0) { yield { tool_calls: tail.toolCalls }; emittedToolCall = true }
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`kimi produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
@@ -375,9 +347,6 @@ export class KimiBackend implements Backend {
     const flat = this.flattenPrompt(resolvePromptMessages(req, session))
     const preambles: string[] = []
     if (wantsJsonObject(req)) preambles.push(JSON_MODE_DIRECTIVE)
-    if (isEmulationEnabled(req)) {
-      preambles.push(renderToolEmulationDirective(req.tools!, req.tool_choice))
-    }
     return preambles.length > 0 ? `${preambles.join('\n\n')}\n\n${flat}` : flat
   }
 

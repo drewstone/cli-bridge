@@ -7,13 +7,11 @@
  *   Claude Code, Kimi, and other coding CLIs accept `--input-format
  *   stream-json` which reads NDJSON messages from stdin (one JSON
  *   object per line). The previous code path packed the entire prompt
- *   (including tool-emulation directives that grow with the caller's
- *   tools[]) into a single `--prompt <text>` argv argument, which
- *   collides with Linux's per-argv-string limit (`MAX_ARG_STRLEN` =
- *   PAGE_SIZE × 32 = 128 KiB on x86_64). Any caller passing more
- *   than a handful of OpenAI-style tools, a long system prompt, or
- *   multi-turn history hit `spawn E2BIG` with no clear error from
- *   the agent's perspective.
+ *   into a single `--prompt <text>` argv argument, which collides
+ *   with Linux's per-argv-string limit (`MAX_ARG_STRLEN` =
+ *   PAGE_SIZE × 32 = 128 KiB on x86_64). Any caller passing a long
+ *   system prompt or multi-turn history hit `spawn E2BIG` with no
+ *   clear error from the agent's perspective.
  *
  *   Routing through stdin eliminates the limit entirely — kernel
  *   stack-page accounting for argv+envp no longer applies to data

@@ -39,7 +39,6 @@ import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
-import { isEmulationEnabled, renderToolEmulationDirective, ToolMarkerParser } from './tool-emulation.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -101,11 +100,7 @@ export class CodexBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'codex hosted-safe requires verified --sandbox read-only audit')
 
-    const flatPrompt = this.flattenPrompt(resolvePromptMessages(req, session))
-    const emulateTools = isEmulationEnabled(req)
-    const prompt = emulateTools
-      ? `${renderToolEmulationDirective(req.tools!, req.tool_choice)}\n\n${flatPrompt}`
-      : flatPrompt
+    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const modelArg = this.extractModel(req.model)
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
@@ -163,7 +158,6 @@ export class CodexBackend implements Backend {
     const onAbort = () => child.kill('SIGTERM')
     signal.addEventListener('abort', onAbort, { once: true })
 
-    const toolMarkerParser = emulateTools ? new ToolMarkerParser() : null
     let emittedToolCall = false
     try {
       let internalSessionId: string | undefined
@@ -199,21 +193,10 @@ export class CodexBackend implements Backend {
 
         const text = extractText(ev)
         if (text) {
-          if (toolMarkerParser) {
-            const { toolCalls, prose } = toolMarkerParser.feed(text)
-            if (prose) yield { content: prose }
-            if (toolCalls.length > 0) { yield { tool_calls: toolCalls }; emittedToolCall = true }
-          } else {
-            yield { content: text }
-          }
+          yield { content: text }
         }
 
         if (type === 'turn.completed' || type === 'thread.completed') {
-          if (toolMarkerParser) {
-            const tail = toolMarkerParser.flush()
-            if (tail.prose) yield { content: tail.prose }
-            if (tail.toolCalls.length > 0) { yield { tool_calls: tail.toolCalls }; emittedToolCall = true }
-          }
           const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
           yield {
             finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
@@ -235,12 +218,6 @@ export class CodexBackend implements Backend {
       }
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(`codex exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
-      }
-      // Drain marker parser at process exit (no completion event seen).
-      if (toolMarkerParser) {
-        const tail = toolMarkerParser.flush()
-        if (tail.prose) yield { content: tail.prose }
-        if (tail.toolCalls.length > 0) { yield { tool_calls: tail.toolCalls }; emittedToolCall = true }
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
