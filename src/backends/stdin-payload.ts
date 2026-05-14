@@ -44,17 +44,40 @@ export type WriteStdinResult =
   | { ok: false; error: string }
 
 /**
- * Serialise `messages` as NDJSON in claude-code-cli's
- * `--input-format stream-json` schema and pipe them into `stdin`.
- * Closes the stream when done. Tolerates EPIPE and backpressure.
+ * NDJSON envelope shape for `--input-format stream-json`.
+ *
+ *  - 'claude'  → `{"type":"user","message":{"role":"user","content":"…"}}`
+ *               (Claude Code CLI; the original, wrapped, envelope).
+ *  - 'flat'    → `{"role":"user","content":"…"}`
+ *               (Kimi CLI 1.44.0; parses ONLY the flat shape, silently
+ *                emits zero output if handed claude's wrapped envelope.)
+ *
+ * Defaults to 'claude' to preserve existing callers (claude.ts).
+ */
+export type StdinPayloadFormat = 'claude' | 'flat'
+
+export interface WriteStdinOptions {
+  format?: StdinPayloadFormat
+}
+
+/**
+ * Serialise `messages` as NDJSON in the requested `--input-format
+ * stream-json` schema (see {@link StdinPayloadFormat}) and pipe them
+ * into `stdin`. Closes the stream when done. Tolerates EPIPE and
+ * backpressure.
  */
 export async function writeStdinPayload(
   stdin: Writable,
   messages: readonly StdinMessage[],
+  options?: WriteStdinOptions,
 ): Promise<WriteStdinResult> {
-  const lines = messages.map((m) =>
-    `${JSON.stringify({ type: 'user', message: { role: m.role, content: m.content } })}\n`,
-  )
+  const format = options?.format ?? 'claude'
+  const lines = messages.map((m) => {
+    const payload = format === 'flat'
+      ? { role: m.role, content: m.content }
+      : { type: 'user', message: { role: m.role, content: m.content } }
+    return `${JSON.stringify(payload)}\n`
+  })
   let bytesWritten = 0
   let pipeError: string | undefined
 

@@ -185,12 +185,18 @@ export class KimiBackend implements Backend {
         throw new BackendError('kimi subprocess has no stdin pipe', 'upstream')
       }
 
-      // Pipe the prompt via stdin instead of argv. kimi's NDJSON input
-      // schema matches claude-code's: {"type":"user","message":
-      // {"role":"user","content":"..."}}, one per line.
-      const stdinResult = await writeStdinPayload(child.stdin, [
-        { role: 'user', content: prompt },
-      ])
+      // Pipe the prompt via stdin instead of argv. Kimi 1.44.0's
+      // `--input-format stream-json` parser accepts ONLY the flat
+      // NDJSON shape `{"role":"user","content":"..."}` — handing it
+      // claude-code's wrapped `{"type":"user","message":{…}}` envelope
+      // makes the CLI return 0 bytes silently (no error, no exit
+      // failure). Force the flat shape here; claude.ts keeps the
+      // default wrapped envelope.
+      const stdinResult = await writeStdinPayload(
+        child.stdin,
+        [{ role: 'user', content: prompt }],
+        { format: 'flat' },
+      )
       if (!stdinResult.ok) {
         throw new BackendError(`kimi stdin write failed: ${stdinResult.error}`, 'upstream')
       }

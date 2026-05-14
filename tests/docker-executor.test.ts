@@ -21,6 +21,7 @@ import { buildDockerExecArgs } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
+import { writeStdinPayload } from '../src/backends/stdin-payload.js'
 
 // ─── Spawner abstraction ─────────────────────────────────────────────────
 
@@ -55,6 +56,69 @@ describe('hostSpawner', () => {
       OPENCODE_CONFIG: '/tmp/opencode.json',
       GH_TOKEN: 'ghp_test',
     })
+  })
+})
+
+// ─── writeStdinPayload NDJSON shape selector ─────────────────────────────
+
+/**
+ * Direct unit tests for the shared stdin helper. The wire shape is
+ * load-bearing — Claude Code CLI requires the wrapped envelope, Kimi
+ * CLI 1.44.0 requires the flat shape, and getting it wrong silently
+ * produces zero output (verified live 2026-05). These tests lock the
+ * contract independent of any backend.
+ */
+describe('writeStdinPayload', () => {
+  function collectLines(): { stdin: PassThrough; lines: () => string[] } {
+    const stdin = new PassThrough()
+    const chunks: string[] = []
+    stdin.on('data', (b: Buffer | string) => {
+      chunks.push(typeof b === 'string' ? b : b.toString('utf8'))
+    })
+    return {
+      stdin,
+      lines: () => chunks.join('').trim().split('\n').filter((l) => l.length > 0),
+    }
+  }
+
+  it('defaults to claude-wrapped envelope when no format is passed', async () => {
+    const cap = collectLines()
+    const result = await writeStdinPayload(cap.stdin, [{ role: 'user', content: 'hello' }])
+    expect(result.ok).toBe(true)
+    const parsed = cap.lines().map((l) => JSON.parse(l))
+    expect(parsed).toEqual([{ type: 'user', message: { role: 'user', content: 'hello' } }])
+  })
+
+  it("format:'claude' produces the wrapped envelope", async () => {
+    const cap = collectLines()
+    const result = await writeStdinPayload(
+      cap.stdin,
+      [{ role: 'user', content: 'hi' }, { role: 'user', content: 'there' }],
+      { format: 'claude' },
+    )
+    expect(result.ok).toBe(true)
+    const parsed = cap.lines().map((l) => JSON.parse(l))
+    expect(parsed).toEqual([
+      { type: 'user', message: { role: 'user', content: 'hi' } },
+      { type: 'user', message: { role: 'user', content: 'there' } },
+    ])
+  })
+
+  it("format:'flat' produces the kimi-1.44.0 shape — top-level role+content, no envelope", async () => {
+    const cap = collectLines()
+    const result = await writeStdinPayload(
+      cap.stdin,
+      [{ role: 'user', content: 'say PING' }],
+      { format: 'flat' },
+    )
+    expect(result.ok).toBe(true)
+    const parsed = cap.lines().map((l) => JSON.parse(l) as Record<string, unknown>)
+    expect(parsed).toEqual([{ role: 'user', content: 'say PING' }])
+    // Defensive — make sure neither envelope key leaks through.
+    for (const obj of parsed) {
+      expect(obj.type).toBeUndefined()
+      expect(obj.message).toBeUndefined()
+    }
   })
 })
 
@@ -283,6 +347,8 @@ interface StubSpawnerHandle {
   spawner: Spawner
   observedArgs: string[] | null
   observedOpts: Parameters<Spawner>[2] | null
+  /** Concatenated stdin chunks the backend wrote into the faux child. */
+  stdinChunks: string[]
   releaseCalls: number
 }
 
@@ -291,6 +357,7 @@ function createStubSpawner(lines: string[]): StubSpawnerHandle {
     spawner: null as never,
     observedArgs: null,
     observedOpts: null,
+    stdinChunks: [],
     releaseCalls: 0,
   }
   handle.spawner = async (_bin, args, opts) => {
@@ -299,6 +366,10 @@ function createStubSpawner(lines: string[]): StubSpawnerHandle {
     const stdout = Readable.from(lines.map((l) => `${l}\n`))
     const stderr = new PassThrough()
     const child = makeFakeChild(stdout, stderr, () => {})
+    const stdin = (child as unknown as { stdin: PassThrough }).stdin
+    stdin.on('data', (chunk: Buffer | string) => {
+      handle.stdinChunks.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'))
+    })
     const result: SpawnResult = {
       child,
       release: () => { handle.releaseCalls++ },
@@ -313,6 +384,7 @@ function createDelayedStubSpawner(closeAfterMs: number): StubSpawnerHandle {
     spawner: null as never,
     observedArgs: null,
     observedOpts: null,
+    stdinChunks: [],
     releaseCalls: 0,
   }
   handle.spawner = async (_bin, args, opts) => {
@@ -433,6 +505,40 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(stub.observedArgs).toContain('--mcp-config-file')
     expect(stub.observedOpts?.sessionId).toBe('kimi-sess')
     expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('KimiBackend writes FLAT-shape NDJSON to stdin (kimi 1.44.0 rejects claude-wrapped envelope)', async () => {
+    // Regression: kimi --print --input-format stream-json parses ONLY
+    // `{"role":"user","content":"…"}`. If we hand it claude-code's
+    // `{"type":"user","message":{…}}` envelope the CLI emits zero bytes
+    // silently — the bridge then surfaces "kimi produced no stream
+    // output", which from the caller's perspective looks like a model
+    // outage. Lock the wire shape here.
+    const stub = createStubSpawner([
+      JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: 'PING' }] }),
+      JSON.stringify({ type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }),
+    ])
+    const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const sink: Array<{ content?: string }> = []
+    for await (const d of backend.chat(
+      { model: 'kimi-code/kimi-k2.6', messages: [{ role: 'user', content: 'say PING' }] },
+      null,
+      ctrl.signal,
+    )) sink.push(d)
+
+    const stdinText = stub.stdinChunks.join('')
+    const ndjson = stdinText.trim().split('\n').filter((l) => l.length > 0)
+    expect(ndjson.length).toBeGreaterThan(0)
+    const parsed = ndjson.map((l) => JSON.parse(l) as Record<string, unknown>)
+    // Every line MUST be the flat shape — top-level `role` + `content`,
+    // never the wrapped `{type:"user", message:{…}}` envelope.
+    for (const obj of parsed) {
+      expect(obj.role).toBe('user')
+      expect(typeof obj.content).toBe('string')
+      expect(obj.type).toBeUndefined()
+      expect(obj.message).toBeUndefined()
+    }
   })
 
   it('KimiBackend surfaces buffered-stdout silence as keepalive deltas (not synthetic tool_calls)', async () => {
