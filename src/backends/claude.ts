@@ -36,6 +36,7 @@ import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
+import { killTree } from '../executors/process-tree.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -228,11 +229,10 @@ export class ClaudeBackend implements Backend {
     const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-    const timeoutHandle = setTimeout(() => {
-      child.kill('SIGTERM')
-    }, this.timeoutMs)
-
-    const onAbort = () => child.kill('SIGTERM')
+    // Tear down the whole process group (claude + every MCP/tool fork
+    // it owns). See backends/opencode.ts for rationale.
+    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.timeoutMs)
+    const onAbort = (): void => { void killTree(child) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     let emittedAnyToolCall = false
@@ -339,7 +339,10 @@ export class ClaudeBackend implements Backend {
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      if (child.exitCode === null) child.kill('SIGTERM')
+      // Always tear down the whole subtree before releasing the slot.
+      // Reaps MCP servers and tool sub-processes claude spawned. Pre-fix
+      // this was `child.kill('SIGTERM')` which leaked grand-children.
+      await killTree(child)
       releaseSpawner()
       mcpMaterialised?.cleanup()
     }
