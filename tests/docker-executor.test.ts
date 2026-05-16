@@ -19,6 +19,7 @@ import { OpencodeBackend } from '../src/backends/opencode.js'
 import { ContainerPool } from '../src/executors/container-pool.js'
 import { buildDockerExecArgs } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
+import { killTree } from '../src/executors/process-tree.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
 import { writeStdinPayload } from '../src/backends/stdin-payload.js'
@@ -36,6 +37,36 @@ describe('hostSpawner', () => {
     expect(() => result.release()).not.toThrow()
     // Drain so the test exits cleanly.
     await new Promise<void>((resolve) => result.child.once('close', () => resolve()))
+  })
+
+  // Regression: pre-fix, hostSpawner used the default attached-group
+  // spawn. SIGTERM to the direct child did not reach grand-children
+  // (claude/kimi/opencode each fork tool sub-processes), so on client
+  // abort we leaked entire process trees that survived as PPID=1
+  // orphans. Spawning with `detached: true` makes the child the leader
+  // of its own pgid; killTree then signals the negative pgid and the
+  // whole tree dies as a unit. This invariant must hold or every
+  // SIGTERM leaks grand-children again.
+  it('spawns each child as its own process-group leader (pgid == pid) so the whole tree is signalable', async () => {
+    const result = await hostSpawner('node', ['-e', 'setInterval(() => {}, 10)'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    try {
+      const pid = result.child.pid
+      expect(pid).toBeDefined()
+      // process.getpgid isn't exposed in Node's TypeScript surface
+      // consistently — read /proc/<pid>/stat directly. Format from
+      // proc(5): pid (comm) state ppid pgrp ...
+      const { readFileSync } = await import('node:fs')
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const fields = stat.match(/\d+ \([^)]+\) \S+ (\d+) (\d+)/)
+      expect(fields).not.toBeNull()
+      const pgid = Number(fields![2])
+      expect(pgid).toBe(pid)
+    } finally {
+      await killTree(result.child)
+      result.release()
+    }
   })
 
   it('keeps spawned host env below OS arg/env limits', () => {
@@ -58,6 +89,84 @@ describe('hostSpawner', () => {
     })
   })
 })
+
+// ─── killTree process-group teardown ─────────────────────────────────────
+
+/**
+ * killTree must reap the WHOLE process group, not just the direct
+ * child. Production-evidence regression: 9+ orphan `opencode run`
+ * processes (PPID=1, etime > 24h) accumulated because the bridge sent
+ * SIGTERM only to the direct child; opencode's tool/MCP forks survived
+ * and were reparented to init. Tests pin the contract.
+ */
+describe('killTree', () => {
+  it('kills the entire process group, including grandchildren', async () => {
+    // hostSpawner uses detached:true, so the spawned node becomes a
+    // pgrp leader. Its child (default attached) inherits that pgid.
+    // Signaling -pgid reaches both. Print grandchild pid to stdout so
+    // the test can verify it died after killTree returns.
+    const parent = await hostSpawner('node', [
+      '-e',
+      [
+        'const { spawn } = require("node:child_process");',
+        'const g = spawn("node", ["-e", "setInterval(() => {}, 100)"]);',
+        'process.stdout.write(String(g.pid) + "\\n");',
+        'setInterval(() => {}, 100);',
+      ].join(''),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] })
+    try {
+      const grandchildPid = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('grandchild pid never reported')), 5_000)
+        let buf = ''
+        parent.child.stdout?.on('data', (b) => {
+          buf += b.toString()
+          const m = buf.match(/(\d+)/)
+          if (m) {
+            clearTimeout(timer)
+            resolve(Number(m[1]))
+          }
+        })
+      })
+      expect(grandchildPid).toBeGreaterThan(0)
+      expect(processExists(grandchildPid)).toBe(true)
+
+      const started = Date.now()
+      await killTree(parent.child, { gracefulMs: 250 })
+      const elapsed = Date.now() - started
+
+      // SIGKILL after grace window — must return within a few seconds
+      // even though the grandchild is in setInterval forever.
+      expect(elapsed).toBeLessThan(5_000)
+
+      // Give the OS one scheduler tick to reap the processes.
+      await new Promise<void>((resolve) => setTimeout(resolve, 100))
+      expect(parent.child.exitCode !== null || parent.child.signalCode !== null).toBe(true)
+      expect(processExists(grandchildPid)).toBe(false)
+    } finally {
+      parent.release()
+    }
+  })
+
+  it('is idempotent — calling twice does not throw', async () => {
+    const result = await hostSpawner('node', ['-e', 'setInterval(() => {}, 50)'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    await killTree(result.child)
+    await expect(killTree(result.child)).resolves.toBeUndefined()
+    result.release()
+  })
+})
+
+function processExists(pid: number): boolean {
+  try {
+    // Signal 0 doesn't deliver but does check the pid exists + we have
+    // permission. ESRCH = not found.
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // ─── writeStdinPayload NDJSON shape selector ─────────────────────────────
 

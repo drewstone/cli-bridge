@@ -27,6 +27,7 @@ import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
+import { killTree } from '../executors/process-tree.js'
 
 export interface OpencodeBackendOptions {
   bin: string
@@ -140,8 +141,12 @@ export class OpencodeBackend implements Backend {
     const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-    const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
-    const onAbort = () => child.kill('SIGTERM')
+    // killTree kicks off the SIGTERM→grace→SIGKILL ladder against the
+    // ENTIRE process group (opencode + everything it forked). We fire
+    // and forget here — the actual await happens in the outer finally
+    // so the generator can still emit a clean final delta.
+    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void killTree(child) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
@@ -251,7 +256,12 @@ export class OpencodeBackend implements Backend {
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      if (child.exitCode === null) child.kill('SIGTERM')
+      // Always tear down the whole subtree before releasing the slot.
+      // killTree is idempotent and waits up to gracefulMs+500 for the
+      // process to actually exit, so by the time we hit releaseSpawner
+      // there's no orphan to leak. Pre-fix this was `child.kill('SIGTERM')`
+      // which left opencode's HTTP-client + MCP children alive.
+      await killTree(child)
       releaseSpawner()
       mcpMaterialised?.cleanup()
     }

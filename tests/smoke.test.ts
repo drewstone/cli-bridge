@@ -758,6 +758,109 @@ describe('GET /health', () => {
     const body = await res.json() as { status: string }
     expect(body.status).toBe('degraded')
   })
+
+  // Regression: the watchdog hits /health every 60s on every bridge.
+  // Pre-fix each call spawned `--version` on every CLI backend; under
+  // heavy load those spawns blocked >5s and `curl --max-time 5` then
+  // SIGKILL'd the bridge. Cache must return memoized state without
+  // re-probing within the TTL window.
+  it('caches probe results within the TTL window — repeated calls do not re-probe', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('claude'))
+    let probeCalls = 0
+    mountHealth(app, { registry }, {
+      cacheMs: 60_000,
+      probe: async (b) => {
+        probeCalls += 1
+        return await b.health()
+      },
+    })
+    await app.request('/health')
+    await app.request('/health')
+    await app.request('/health')
+    expect(probeCalls).toBe(1)
+  })
+
+  it('?force=1 bypasses the cache so debugging stays possible', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('claude'))
+    let probeCalls = 0
+    mountHealth(app, { registry }, {
+      cacheMs: 60_000,
+      probe: async (b) => {
+        probeCalls += 1
+        return await b.health()
+      },
+    })
+    await app.request('/health')
+    await app.request('/health?force=1')
+    expect(probeCalls).toBe(2)
+  })
+
+  it('re-probes after the TTL window expires', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('claude'))
+    let probeCalls = 0
+    let nowValue = 1_000_000
+    mountHealth(app, { registry }, {
+      cacheMs: 5_000,
+      now: () => nowValue,
+      probe: async (b) => {
+        probeCalls += 1
+        return await b.health()
+      },
+    })
+    await app.request('/health')
+    expect(probeCalls).toBe(1)
+    nowValue += 4_000 // within TTL
+    await app.request('/health')
+    expect(probeCalls).toBe(1)
+    nowValue += 2_000 // total +6s, past 5s TTL
+    await app.request('/health')
+    expect(probeCalls).toBe(2)
+  })
+
+  it('per-probe timeout short-circuits a wedged backend — /health still returns', async () => {
+    class HangingBackend extends FakeBackend {
+      override async health() {
+        // Promise that never resolves — simulates a wedged fork() that
+        // the kernel can't service because the box is overloaded.
+        await new Promise(() => undefined)
+        return { name: this.name, state: 'ready' as const }
+      }
+    }
+    const app = new Hono()
+    const registry = new BackendRegistry()
+      .register(new HangingBackend('opencode'))
+      .register(new FakeBackend('claude')) // one healthy
+    mountHealth(app, { registry }, { probeTimeoutMs: 100, cacheMs: 0 })
+    const started = Date.now()
+    const res = await app.request('/health')
+    const elapsed = Date.now() - started
+    // The endpoint must NOT block on the wedged probe.
+    expect(elapsed).toBeLessThan(500)
+    expect(res.status).toBe(200) // claude was still ready
+    const body = await res.json() as { backends: Array<{ name: string; state: string; detail?: string }> }
+    const opencode = body.backends.find((b) => b.name === 'opencode')
+    expect(opencode?.state).toBe('error')
+    expect(opencode?.detail).toContain('timed out')
+  })
+
+  it('synthesises an error state when a backend rejects (does not crash /health)', async () => {
+    class ThrowingBackend extends FakeBackend {
+      override async health(): Promise<never> {
+        throw new Error('binary not found at /nope')
+      }
+    }
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new ThrowingBackend('codex'))
+    mountHealth(app, { registry }, { cacheMs: 0 })
+    const res = await app.request('/health')
+    expect(res.status).toBe(503) // no healthy backends
+    const body = await res.json() as { backends: Array<{ name: string; state: string; detail?: string }> }
+    expect(body.backends[0]!.state).toBe('error')
+    expect(body.backends[0]!.detail).toContain('binary not found')
+  })
 })
 
 describe('GET /v1/models', () => {

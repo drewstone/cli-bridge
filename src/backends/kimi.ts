@@ -48,6 +48,7 @@ import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
+import { killTree } from '../executors/process-tree.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -166,8 +167,10 @@ export class KimiBackend implements Backend {
     const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-    const timeoutHandle = setTimeout(() => child.kill('SIGTERM'), this.opts.timeoutMs)
-    const onAbort = () => child.kill('SIGTERM')
+    // Tear down the whole process group (kimi + every tool/MCP subprocess
+    // it forks). See backends/opencode.ts for the rationale.
+    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void killTree(child) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
@@ -332,7 +335,9 @@ export class KimiBackend implements Backend {
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      if (child.exitCode === null) child.kill('SIGTERM')
+      // Always tear down the whole subtree (kimi + any MCP/tool forks)
+      // before releasing the slot. Idempotent; waits for actual exit.
+      await killTree(child)
       if (configFile) await cleanupConfigFile(configFile)
       mcpMaterialised?.cleanup()
       releaseSpawner()

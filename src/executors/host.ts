@@ -10,10 +10,25 @@ import { spawn } from 'node:child_process'
 import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
 
 export const hostSpawner: Spawner = async (bin, args, opts) => {
+  // `detached: true` makes the subprocess the leader of a NEW process
+  // group whose pgid equals its pid. That gives us a single handle —
+  // `kill(-pid, sig)` — that reaches every descendant the harness
+  // forks (model HTTP client, MCP servers, ripgrep, etc.) without us
+  // having to discover them. See executors/process-tree.ts for the
+  // contract. We do NOT call `child.unref()`; the bridge still owns
+  // the child for the lifetime of the chat() call, including stdio
+  // and exit-event delivery.
+  //
+  // Production evidence this was missing: 9+ orphan `opencode run`
+  // processes reparented to PID 1 with elapsed time > 24h, each
+  // holding 300–600 MB RSS. They were sub-trees of opencode that
+  // survived SIGTERM-to-direct-child because the signal never
+  // reached them.
   const child = spawn(bin, args, {
     stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
     cwd: opts.cwd,
     env: sanitizeHostEnv(opts.env),
+    detached: true,
   })
   // Attach a synchronous error capture INSIDE the spawner — Node fires
   // the 'error' event for spawn failures (ENOENT, EACCES) on
