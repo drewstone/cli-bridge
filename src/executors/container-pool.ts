@@ -47,6 +47,31 @@ export interface ContainerPoolOptions {
    */
   perSlotVolumePrefix?: string
   perSlotMountTarget?: string
+  /**
+   * Per-container memory cap, e.g. '4g' or '2048m'. Caps blast radius
+   * if a single CLI call (e.g. claude with a runaway context) tries to
+   * eat the host. Default: 4g. Set via BRIDGE_POOL_MEMORY env.
+   */
+  memory?: string
+  /**
+   * Per-container CPU cap, e.g. '2' or '1.5'. Default: 2. Set via
+   * BRIDGE_POOL_CPUS env.
+   */
+  cpus?: string
+  /**
+   * Max queued waiters (across all sticky/non-sticky). When the queue
+   * is full, acquire() rejects immediately so the HTTP layer returns
+   * 503 instead of stacking work that will never drain. Default:
+   * 4 × size; set via BRIDGE_POOL_MAX_QUEUE env.
+   */
+  maxQueueDepth?: number
+  /**
+   * Per-acquire deadline in milliseconds. A waiter that doesn't get
+   * a slot in this window rejects with a clear timeout error rather
+   * than hanging forever. Default: 60_000; set via
+   * BRIDGE_POOL_ACQUIRE_DEADLINE_MS env.
+   */
+  acquireDeadlineMs?: number
   /** Optional progress hook. */
   onProgress?: (msg: string) => void
 }
@@ -65,16 +90,26 @@ interface SlotState {
   lastSession: string | null
 }
 
+const DEFAULT_ACQUIRE_DEADLINE_MS = 60_000
+
+interface Waiter {
+  sessionId: string | undefined
+  resolve: (slot: SlotState) => void
+  reject: (err: Error) => void
+  timer: NodeJS.Timeout
+}
+
 export class ContainerPool {
   private readonly slots: SlotState[]
-  private readonly waiters: Array<{
-    sessionId: string | undefined
-    resolve: (slot: SlotState) => void
-  }> = []
+  private readonly waiters: Waiter[] = []
+  private readonly maxQueueDepth: number
+  private readonly acquireDeadlineMs: number
   private destroyed = false
 
-  private constructor(slots: SlotState[]) {
+  private constructor(slots: SlotState[], opts: ContainerPoolOptions) {
     this.slots = slots
+    this.maxQueueDepth = opts.maxQueueDepth ?? slots.length * 4
+    this.acquireDeadlineMs = opts.acquireDeadlineMs ?? DEFAULT_ACQUIRE_DEADLINE_MS
   }
 
   static async create(opts: ContainerPoolOptions): Promise<ContainerPool> {
@@ -86,10 +121,20 @@ export class ContainerPool {
     const slots = await Promise.all(
       slotIndices.map((i) => provisionSlot(opts, i, onProgress)),
     )
-    return new ContainerPool(slots)
+    return new ContainerPool(slots, opts)
   }
 
   get size(): number { return this.slots.length }
+
+  /** Diagnostics — caller surfaces this on /metrics. */
+  snapshot(): { size: number; in_flight: number; queued: number; max_queue: number } {
+    return {
+      size: this.slots.length,
+      in_flight: this.slots.filter((s) => s.busy).length,
+      queued: this.waiters.length,
+      max_queue: this.maxQueueDepth,
+    }
+  }
 
   async acquire(sessionId?: string): Promise<AcquiredSlot> {
     if (this.destroyed) throw new Error('container pool destroyed')
@@ -103,11 +148,34 @@ export class ContainerPool {
     const free = this.slots.find((s) => !s.busy)
     if (free) return this.markAcquired(free, sessionId)
 
-    // No free slot — queue.
-    return new Promise<AcquiredSlot>((resolve) => {
+    // No free slot — queue. Bound the queue so we never accept work the
+    // pool can't possibly drain.
+    if (this.waiters.length >= this.maxQueueDepth) {
+      throw new Error(
+        `container-pool: queue full (depth=${this.waiters.length}/${this.maxQueueDepth}, ` +
+          `in_flight=${this.slots.length}). Reduce parallel callers or raise BRIDGE_POOL_MAX_QUEUE.`,
+      )
+    }
+    return new Promise<AcquiredSlot>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.waiters.findIndex((w) => w.timer === timer)
+        if (idx >= 0) this.waiters.splice(idx, 1)
+        reject(
+          new Error(
+            `container-pool: acquire timeout after ${this.acquireDeadlineMs}ms ` +
+              `(in_flight=${this.slots.filter((s) => s.busy).length}/${this.slots.length}, ` +
+              `queued=${this.waiters.length}). Pool is saturated.`,
+          ),
+        )
+      }, this.acquireDeadlineMs).unref()
       this.waiters.push({
         sessionId,
-        resolve: (slot) => resolve(this.markAcquired(slot, sessionId)),
+        resolve: (slot) => {
+          clearTimeout(timer)
+          resolve(this.markAcquired(slot, sessionId))
+        },
+        reject,
+        timer,
       })
     })
   }
@@ -164,6 +232,14 @@ async function provisionSlot(
   await execFileAsync('docker', ['rm', '-f', name]).catch(() => {})
 
   const args = ['run', '-d', '--name', name, '--restart', 'unless-stopped']
+  // Per-container resource caps. Critical for shared-host benches:
+  // without these a single runaway CLI invocation (e.g. claude with a
+  // pathological prompt) can eat all host RAM and lock out sshd. Both
+  // env-overridable; defaults are conservative on a single 32GB box
+  // with poolSize=4.
+  const memory = opts.memory ?? '4g'
+  const cpus = opts.cpus ?? '2'
+  args.push('--memory', memory, '--memory-swap', memory, '--cpus', cpus)
   if (opts.oauthMode === 'share') {
     for (const m of opts.shareMounts ?? []) {
       args.push('-v', m)

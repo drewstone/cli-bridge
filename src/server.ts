@@ -37,6 +37,13 @@ export interface BuildAppExtras {
   shutdownHooks: Array<() => Promise<void>>
 }
 
+function parseEnvPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const n = parseInt(raw, 10)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
 /**
  * Build a Spawner for a backend, plus the shutdown hook that tears down
  * the underlying container pool when the bridge exits. Returns null when
@@ -51,11 +58,19 @@ async function buildExecutorForBackend(
   if (!cfg.image || !cfg.poolSize || !cfg.containerConfigDir) {
     throw new Error(`backend ${cfg.name} executor=docker but missing image/poolSize/containerConfigDir`)
   }
+  const memory = process.env.BRIDGE_POOL_MEMORY || '4g'
+  const cpus = process.env.BRIDGE_POOL_CPUS || '2'
+  const maxQueueDepth = parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4)
+  const acquireDeadlineMs = parseEnvPositiveInt('BRIDGE_POOL_ACQUIRE_DEADLINE_MS', 60_000)
   const pool = await ContainerPool.create({
     size: cfg.poolSize,
     image: cfg.image,
     namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
     oauthMode: cfg.oauthMode ?? 'share',
+    memory,
+    cpus,
+    maxQueueDepth,
+    acquireDeadlineMs,
     ...(cfg.oauthMode === 'share' || !cfg.oauthMode
       ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }
       : {
@@ -64,6 +79,10 @@ async function buildExecutorForBackend(
         }),
     onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
   })
+  console.log(
+    `[${cfg.name}-pool] caps memory=${memory} cpus=${cpus} ` +
+      `queue=${maxQueueDepth} acquire-deadline=${acquireDeadlineMs}ms`,
+  )
   extras.shutdownHooks.push(() => pool.destroy())
   return createDockerSpawner({ pool })
 }
