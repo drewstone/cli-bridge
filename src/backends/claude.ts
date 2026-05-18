@@ -261,7 +261,18 @@ export class ClaudeBackend implements Backend {
           throw new BackendError(`claude stdin write failed: ${writeResult.error}`, 'upstream')
         }
       }
-      for await (const event of readProcessLines({ child, stdout: child.stdout })) {
+      // Mirrors kimi/opencode (commits 9691568 / 20023c2): without a
+      // keepalive heartbeat, an upstream proxy can drop the SSE socket
+      // during long internal-think pauses when claude-code emits no
+      // stdout for >30s (stream-json is buffered). The progress event
+      // becomes a `keepalive` ChatDelta that the SSE writer renders as
+      // an `: keepalive` comment.
+      const progressIntervalMs = Math.max(10, Number(process.env.CLAUDE_PROGRESS_MS ?? 30_000))
+      for await (const event of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
+        if (event.kind === 'progress') {
+          yield { keepalive: { source: 'claude', elapsedMs: event.elapsedMs } }
+          continue
+        }
         if (event.kind !== 'line') continue
         const line = event.line
         if (!line.trim()) continue
