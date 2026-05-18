@@ -30,10 +30,18 @@ import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
 import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
+import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
 import { ContainerPool } from './executors/container-pool.js'
 import { createDockerSpawner } from './executors/docker.js'
 import type { Spawner } from './executors/types.js'
 import type { BackendExecutorConfig } from './config.js'
+
+function parseEnvPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const n = parseInt(raw, 10)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
 
 export interface BuildAppExtras {
   /** Disposers to await on graceful shutdown — pool teardown lives here. */
@@ -54,11 +62,21 @@ async function buildExecutorForBackend(
   if (!cfg.image || !cfg.poolSize || !cfg.containerConfigDir) {
     throw new Error(`backend ${cfg.name} executor=docker but missing image/poolSize/containerConfigDir`)
   }
+  const memory = process.env.BRIDGE_POOL_MEMORY || '4g'
+  const cpus = process.env.BRIDGE_POOL_CPUS || '2'
+  const maxQueueDepth = parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4)
+  const acquireDeadlineMs = parseEnvPositiveInt('BRIDGE_POOL_ACQUIRE_DEADLINE_MS', 60_000)
+  const slotMaxHoldMs = parseEnvPositiveInt('BRIDGE_SLOT_MAX_HOLD_MS', 600_000)
   const pool = await ContainerPool.create({
     size: cfg.poolSize,
     image: cfg.image,
     namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
     oauthMode: cfg.oauthMode ?? 'share',
+    memory,
+    cpus,
+    maxQueueDepth,
+    acquireDeadlineMs,
+    slotMaxHoldMs,
     ...(cfg.oauthMode === 'share' || !cfg.oauthMode
       ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }
       : {
@@ -67,6 +85,11 @@ async function buildExecutorForBackend(
         }),
     onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
   })
+  console.log(
+    `[${cfg.name}-pool] caps memory=${memory} cpus=${cpus} queue=${maxQueueDepth} ` +
+      `acquire-deadline=${acquireDeadlineMs}ms slot-hold=${slotMaxHoldMs}ms`,
+  )
+  registerPoolForMetrics(cfg.name, pool)
   extras.shutdownHooks.push(() => pool.destroy())
   return createDockerSpawner({ pool })
 }
@@ -189,6 +212,7 @@ export async function buildApp(config: Config): Promise<{
   mountChatCompletions(app, { registry, sessions })
   mountCadRender(app)
   mountImagesGenerate(app)
+  mountMetrics(app)
 
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
