@@ -2,7 +2,7 @@
 #
 # Each container in the pool runs `tail -f /dev/null` as its idle entrypoint;
 # cli-bridge dispatches real CLI invocations via `docker exec <slot> claude
-# -p …` (or kimi / codex / opencode equivalents). One image serves any
+# -p …` (or kimi / gemini / codex / opencode equivalents). One image serves any
 # backend, so a single pool can be reused or per-backend pools all share
 # the same image — your call via the per-backend image env knobs.
 #
@@ -16,11 +16,13 @@
 #
 # Build:
 #   docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest .
+#   docker build -f docker/Dockerfile.cli-runtime --build-arg CLI_BRIDGE_HARNESSES=codex,gemini -t cli-bridge-cli-runtime:codex-gemini .
 #
 # OAuth state lives at:
 #   /root/.claude            — Claude Code
 #   /root/.kimi              — Kimi CLI auth
 #   /root/.config/kimi       — Kimi CLI config
+#   /root/.gemini            — Gemini CLI auth/config
 #   /root/.codex             — OpenAI Codex
 #   /root/.config/opencode   — opencode
 #   /root/.opencode          — opencode binary install dir
@@ -30,37 +32,30 @@
 
 FROM node:22-slim
 
+ARG CLI_BRIDGE_HARNESSES=all
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        git ca-certificates dumb-init curl python3 \
   && rm -rf /var/lib/apt/lists/*
 
-# --- CLI installs (each pinned/latest at image-build time) ---
-
-# Claude Code — npm-installed.
-RUN npm install -g @anthropic-ai/claude-code@latest
-
-# OpenAI Codex — npm-installed.
-RUN npm install -g @openai/codex@latest
-
-# opencode — official installer drops the binary at /root/.opencode/bin.
-# Copy to /usr/local/bin so the binary survives a volume mount onto the
-# host's ~/.opencode if the bridge mounts it for OAuth state.
-RUN curl -fsSL https://opencode.ai/install | bash \
-  && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
-  && chmod +x /usr/local/bin/opencode
-
-# Kimi CLI — uv-managed Python tool. Symlink so PATH picks it up at runtime.
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-  && /root/.local/bin/uv tool install --python 3.13 kimi-cli \
-  && ln -sf /root/.local/bin/kimi /usr/local/bin/kimi \
-  && ln -sf /root/.local/bin/uv   /usr/local/bin/uv
+# --- CLI installs (latest at image-build time) ---
+# Source of truth lives in scripts/install-harness.sh so host installs,
+# subset images, and the all-in-one runtime cannot drift.
+COPY scripts/install-harness.sh /usr/local/share/cli-bridge/install-harness.sh
+RUN set -eu; \
+  if [ "$CLI_BRIDGE_HARNESSES" = "all" ]; then \
+    sh /usr/local/share/cli-bridge/install-harness.sh all; \
+  else \
+    echo "$CLI_BRIDGE_HARNESSES" | tr ',' ' ' | xargs -n1 sh /usr/local/share/cli-bridge/install-harness.sh; \
+  fi
 
 # OAuth + config volumes (mount from host or per-slot named volumes).
 VOLUME /root/.claude
 VOLUME /root/.codex
 VOLUME /root/.kimi
 VOLUME /root/.config/kimi
+VOLUME /root/.gemini
 VOLUME /root/.config/opencode
 VOLUME /root/.opencode
 

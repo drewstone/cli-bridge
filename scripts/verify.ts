@@ -11,7 +11,7 @@ import { buildApp } from '../src/server.js'
 async function main(): Promise<void> {
   const config = loadConfig({
     ...process.env,
-    BRIDGE_BACKENDS: process.env.BRIDGE_BACKENDS ?? 'claude,codex,opencode,kimi,passthrough',
+    BRIDGE_BACKENDS: process.env.BRIDGE_BACKENDS ?? 'claude,codex,opencode,kimi,gemini,passthrough',
   })
   const { registry, sessions, extras } = await buildApp(config)
 

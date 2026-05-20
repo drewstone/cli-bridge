@@ -1,0 +1,15 @@
+node_modules
+data
+dist
+build
+coverage
+.git
+.evolve
+artifacts
+audit
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+.env
+.env.*

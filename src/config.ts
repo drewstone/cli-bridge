@@ -23,6 +23,8 @@ export interface Config {
   opencodeTimeoutMs: number
   kimiBin: string
   kimiTimeoutMs: number
+  geminiBin: string
+  geminiTimeoutMs: number
   factoryBin: string
   ampBin: string
   forgeBin: string
@@ -48,7 +50,7 @@ export interface Config {
   sandboxTimeoutMs: number
   /**
    * Per-backend executor configuration. Every subprocess backend
-   * (claude, kimi, codex, opencode, …) reads its own slot from this
+   * (claude, kimi, codex, opencode, gemini, …) reads its own slot from this
    * map at startup. `host` (default) spawns the CLI on the host;
    * `docker` provisions a pool of pre-warmed containers and dispatches
    * each chat() via `docker exec`.
@@ -94,7 +96,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const bearer = env.BRIDGE_BEARER?.trim() || null
   const dataDir = resolve(env.BRIDGE_DATA_DIR ?? './data')
   const backends = new Set(
-    (env.BRIDGE_BACKENDS ?? 'claude,kimi,sandbox,passthrough')
+    (env.BRIDGE_BACKENDS ?? 'claude,kimi,gemini,sandbox,passthrough')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean),
@@ -129,6 +131,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     opencodeTimeoutMs: Number.parseInt(env.OPENCODE_TIMEOUT_MS ?? String(defaultTimeout), 10),
     kimiBin: env.KIMI_BIN ?? 'kimi',
     kimiTimeoutMs: Number.parseInt(env.KIMI_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    geminiBin: env.GEMINI_BIN ?? 'gemini',
+    geminiTimeoutMs: Number.parseInt(env.GEMINI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
     forgeBin: env.FORGE_BIN ?? 'forge',
@@ -149,7 +153,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 }
 
 /**
- * Per-backend executor defaults. All four subprocess backends share the
+ * Per-backend executor defaults. All subprocess backends share the
  * same default runtime image (`cli-bridge-cli-runtime`) — that image
  * has every CLI installed. Per-backend `<NAME>_DOCKER_IMAGE` env
  * overrides if you want a leaner per-backend image. The OAuth/config
@@ -170,6 +174,12 @@ const BACKEND_EXECUTOR_DEFAULTS: Record<string, { image: string; containerConfig
     containerConfigDir: '/root/.kimi',
     hostConfigEnvKey: 'HOME',
     defaultHostConfigDir: '.kimi',
+  },
+  gemini: {
+    image: SHARED_RUNTIME_IMAGE,
+    containerConfigDir: '/root/.gemini',
+    hostConfigEnvKey: 'HOME',
+    defaultHostConfigDir: '.gemini',
   },
   codex: {
     image: SHARED_RUNTIME_IMAGE,

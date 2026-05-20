@@ -103,7 +103,7 @@ export interface ChatRequest {
   /**
    * Standard MCP server passthrough. Canonical shape mirrors the
    * Claude Code `mcp-config.json` schema so the same JSON can be fed to
-   * every backend that supports MCP natively. Each backend translates
+   * every MCP-capable backend. Each backend translates
    * this into its native loader (claude `--mcp-config`, codex
    * `CODEX_HOME/config.toml`, opencode `OPENCODE_CONFIG`, kimi
    * `--mcp-config-file`).
@@ -115,9 +115,10 @@ export interface ChatRequest {
    * Also accepted via the `X-Mcp-Config` request header (JSON-encoded
    * same shape) for callers that cannot extend the body.
    *
-   * Servers a given backend cannot load locally (e.g. `http`/`sse`
-   * transport on a CLI that only supports stdio) are dropped at
-   * materialisation time — fail loud, no silent fallback.
+   * Servers a given backend cannot load locally (e.g. Gemini before a
+   * verified per-invocation MCP contract, or `http`/`sse` transport on
+   * a CLI that only supports stdio) are dropped at materialisation time
+   * by the backend materialiser — fail loud, no silent fallback.
    */
   mcp?: McpRequestConfig
   /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */
