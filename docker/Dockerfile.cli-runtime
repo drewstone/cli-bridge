@@ -16,6 +16,7 @@
 #
 # Build:
 #   docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest .
+#   docker build -f docker/Dockerfile.cli-runtime --build-arg CLI_BRIDGE_HARNESSES=codex,gemini -t cli-bridge-cli-runtime:codex-gemini .
 #
 # OAuth state lives at:
 #   /root/.claude            — Claude Code
@@ -31,35 +32,23 @@
 
 FROM node:22-slim
 
+ARG CLI_BRIDGE_HARNESSES=all
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        git ca-certificates dumb-init curl python3 \
   && rm -rf /var/lib/apt/lists/*
 
-# --- CLI installs (each pinned/latest at image-build time) ---
-
-# Claude Code — npm-installed.
-RUN npm install -g @anthropic-ai/claude-code@latest
-
-# OpenAI Codex — npm-installed.
-RUN npm install -g @openai/codex@latest
-
-# opencode — official installer drops the binary at /root/.opencode/bin.
-# Copy to /usr/local/bin so the binary survives a volume mount onto the
-# host's ~/.opencode if the bridge mounts it for OAuth state.
-RUN curl -fsSL https://opencode.ai/install | bash \
-  && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
-  && chmod +x /usr/local/bin/opencode
-
-# Kimi CLI — uv-managed Python tool. Symlink so PATH picks it up at runtime.
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-  && /root/.local/bin/uv tool install --python 3.13 kimi-cli \
-  && ln -sf /root/.local/bin/kimi /usr/local/bin/kimi \
-  && ln -sf /root/.local/bin/uv   /usr/local/bin/uv
-
-# Gemini CLI — official Google package. Keep this scoped package name
-# explicit; there have been typosquatted Gemini CLI packages in the wild.
-RUN npm install -g @google/gemini-cli@latest
+# --- CLI installs (latest at image-build time) ---
+# Source of truth lives in scripts/install-harness.sh so host installs,
+# subset images, and the all-in-one runtime cannot drift.
+COPY scripts/install-harness.sh /usr/local/share/cli-bridge/install-harness.sh
+RUN set -eu; \
+  if [ "$CLI_BRIDGE_HARNESSES" = "all" ]; then \
+    sh /usr/local/share/cli-bridge/install-harness.sh all; \
+  else \
+    echo "$CLI_BRIDGE_HARNESSES" | tr ',' ' ' | xargs -n1 sh /usr/local/share/cli-bridge/install-harness.sh; \
+  fi
 
 # OAuth + config volumes (mount from host or per-slot named volumes).
 VOLUME /root/.claude

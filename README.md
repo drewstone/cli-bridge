@@ -77,7 +77,16 @@ pnpm start
 # → http://127.0.0.1:3344  (was 8787; changed to dodge port collisions)
 ```
 
-**Prereqs:** Node 22+. For each backend you want enabled, install + log in on the host:
+**Prereqs:** Node 22+. For each backend you want enabled, install + log in on the host. The install commands below are wrapped by:
+
+```bash
+pnpm install:harness -- claude
+pnpm install:harness -- codex
+pnpm install:harness -- opencode
+pnpm install:harness -- kimi
+pnpm install:harness -- gemini
+pnpm install:harnesses      # all harnesses
+```
 
 | Backend | Install | Auth |
 |---|---|---|
@@ -87,6 +96,13 @@ pnpm start
 | `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
 | `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
 | `passthrough` | (none) | provider API keys in `.env` |
+
+For a Nix-provisioned host shell with the shared prerequisites:
+
+```bash
+nix-shell nix/harness-profile.nix
+sh scripts/install-harness.sh all
+```
 
 ## Quick test
 
@@ -372,7 +388,12 @@ gemini, codex, opencode — through the same `Spawner` abstraction.
 
 ```bash
 # 1. build the unified runtime image once (has all coding CLIs installed)
-docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest .
+pnpm docker:build:runtime
+
+# Or build a smaller subset/layerable image for a specific deployment.
+docker build -f docker/Dockerfile.cli-runtime \
+  --build-arg CLI_BRIDGE_HARNESSES=codex,gemini \
+  -t cli-bridge-cli-runtime:codex-gemini .
 
 # 2. enable per backend (any subset)
 cat >> .env <<'EOF'
