@@ -105,9 +105,9 @@ function normaliseMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): M
 
 /**
  * True when this spec describes a local stdio MCP server. cli-bridge's
- * three primary backends (claude, kimi, opencode) load stdio MCP via
- * their config-file loaders; remote http/sse MCP needs a per-backend
- * registration path that we don't model in the unified materialisers.
+ * MCP-enabled CLI backends load stdio MCP via their config-file
+ * loaders; remote http/sse MCP needs a per-backend registration path
+ * that we don't model in the unified materialisers.
  */
 export function isStdioMcpSpec(spec: McpServerSpec): boolean {
   if (spec.enabled === false) return false
@@ -177,12 +177,9 @@ export function materialiseMcpServersForClaudeKimi(
   specs: Record<string, McpServerSpec> | null,
 ): MaterialisedMcpConfig | null {
   if (!specs) return null
-  // claude-code accepts three transports in --mcp-config:
-  //   stdio: { command, args, env, timeout }
-  //   http:  { type: "http", url, headers }
-  //   sse:   { type: "sse",  url, headers }
-  // Materialise whichever applies per server. kimi-code reads the same
-  // file shape (claude-code-derived) so this helper is shared.
+  // claude/kimi per-request config is kept to stdio only. Remote
+  // http/sse MCP requires a separate CLI registration path and is not
+  // safe to smuggle through this shared materialiser.
   const mcpServers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs)) {
     if (isStdioMcpSpec(spec) && spec.command) {
@@ -190,13 +187,6 @@ export function materialiseMcpServersForClaudeKimi(
         command: spec.command,
         ...(spec.args && spec.args.length ? { args: spec.args } : {}),
         ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
-        ...(spec.timeout ? { timeout: spec.timeout } : {}),
-      }
-    } else if ((spec.type === 'http' || spec.type === 'sse') && typeof spec.url === 'string' && spec.url.length > 0) {
-      mcpServers[name] = {
-        type: spec.type,
-        url: spec.url,
-        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
         ...(spec.timeout ? { timeout: spec.timeout } : {}),
       }
     }

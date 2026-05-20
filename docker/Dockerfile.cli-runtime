@@ -2,7 +2,7 @@
 #
 # Each container in the pool runs `tail -f /dev/null` as its idle entrypoint;
 # cli-bridge dispatches real CLI invocations via `docker exec <slot> claude
-# -p …` (or kimi / codex / opencode equivalents). One image serves any
+# -p …` (or kimi / gemini / codex / opencode equivalents). One image serves any
 # backend, so a single pool can be reused or per-backend pools all share
 # the same image — your call via the per-backend image env knobs.
 #
@@ -21,6 +21,7 @@
 #   /root/.claude            — Claude Code
 #   /root/.kimi              — Kimi CLI auth
 #   /root/.config/kimi       — Kimi CLI config
+#   /root/.gemini            — Gemini CLI auth/config
 #   /root/.codex             — OpenAI Codex
 #   /root/.config/opencode   — opencode
 #   /root/.opencode          — opencode binary install dir
@@ -56,11 +57,16 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
   && ln -sf /root/.local/bin/kimi /usr/local/bin/kimi \
   && ln -sf /root/.local/bin/uv   /usr/local/bin/uv
 
+# Gemini CLI — official Google package. Keep this scoped package name
+# explicit; there have been typosquatted Gemini CLI packages in the wild.
+RUN npm install -g @google/gemini-cli@latest
+
 # OAuth + config volumes (mount from host or per-slot named volumes).
 VOLUME /root/.claude
 VOLUME /root/.codex
 VOLUME /root/.kimi
 VOLUME /root/.config/kimi
+VOLUME /root/.gemini
 VOLUME /root/.config/opencode
 VOLUME /root/.opencode
 

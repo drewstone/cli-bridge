@@ -138,7 +138,11 @@ describe('/metrics route', () => {
     mountMetrics(app)
     const res = await app.request('/metrics')
     expect(res.status).toBe(200)
-    const body = await res.json()
+    const body = await res.json() as {
+      ts: string
+      host_executor: { max: number }
+      pools: unknown
+    }
     expect(body.ts).toBeTypeOf('string')
     expect(body.host_executor).toBeDefined()
     expect(body.host_executor.max).toBeTypeOf('number')

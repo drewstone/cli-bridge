@@ -20,6 +20,7 @@ import { ClaudeBackend } from '../src/backends/claude.js'
 import { KimiBackend, thinkingFlagForEffort } from '../src/backends/kimi.js'
 import { CodexBackend, codexReasoningEffort } from '../src/backends/codex.js'
 import { OpencodeBackend, opencodeVariantForEffort } from '../src/backends/opencode.js'
+import { GeminiBackend, geminiSandboxFlag, geminiYoloFlag } from '../src/backends/gemini.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountSessions } from '../src/routes/sessions.js'
 import { mountHealth } from '../src/routes/health.js'
@@ -171,6 +172,24 @@ describe('OpencodeBackend model parsing', () => {
   })
 })
 
+describe('GeminiBackend model parsing', () => {
+  const b = new GeminiBackend({ bin: '/nonexistent', timeoutMs: 1000 })
+  it('matches bare name and prefix', () => {
+    expect(b.matches('gemini')).toBe(true)
+    expect(b.matches('gemini/gemini-2.5-pro')).toBe(true)
+    expect(b.matches('GEMINI/GEMINI-2.5-FLASH')).toBe(true)
+    expect(b.matches('gemini-fake')).toBe(false)
+    expect(b.matches('opencode/gemini-2.5-pro')).toBe(false)
+  })
+
+  it('extracts the model suffix and builds conservative coding args', () => {
+    expect(b.extractModel('gemini')).toBeNull()
+    expect(b.extractModel('gemini/gemini-2.5-pro')).toBe('gemini-2.5-pro')
+    expect(b.buildArgs('gemini/gemini-2.5-pro')).toContain('--prompt')
+    expect(b.buildArgs('gemini/gemini-2.5-pro')).toContain('--approval-mode=yolo')
+  })
+})
+
 describe('reasoning effort mapping', () => {
   it('maps opencode effort to provider variant', () => {
     expect(opencodeVariantForEffort('high')).toBe('high')
@@ -192,6 +211,27 @@ describe('reasoning effort mapping', () => {
     expect(codexReasoningEffort('xhigh')).toBe('high')
     expect(codexReasoningEffort('max')).toBe('high')
     expect(codexReasoningEffort(undefined)).toBeNull()
+  })
+
+  it('maps Gemini env flags without inventing hosted-safety defaults', () => {
+    const oldApproval = process.env.GEMINI_APPROVAL_MODE
+    const oldSandbox = process.env.GEMINI_SANDBOX
+    try {
+      process.env.GEMINI_APPROVAL_MODE = 'none'
+      process.env.GEMINI_SANDBOX = 'false'
+      expect(geminiYoloFlag()).toBeNull()
+      expect(geminiSandboxFlag()).toBeNull()
+
+      process.env.GEMINI_APPROVAL_MODE = 'yolo'
+      process.env.GEMINI_SANDBOX = 'docker'
+      expect(geminiYoloFlag()).toBe('--approval-mode=yolo')
+      expect(geminiSandboxFlag()).toBe('--sandbox=docker')
+    } finally {
+      if (oldApproval === undefined) delete process.env.GEMINI_APPROVAL_MODE
+      else process.env.GEMINI_APPROVAL_MODE = oldApproval
+      if (oldSandbox === undefined) delete process.env.GEMINI_SANDBOX
+      else process.env.GEMINI_SANDBOX = oldSandbox
+    }
   })
 })
 
@@ -610,18 +650,17 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     expect(args).not.toContain('--append-system-prompt')
   })
 
-  it('byob mode sets --permission-mode bypassPermissions (regression: without this every Write/Edit blocks)', () => {
+  it('byob mode sets --dangerously-skip-permissions (regression: without this every Write/Edit blocks)', () => {
     // 2026-04-24: gen44 claude smoke showed `The file write requests
     // need user approval` on every leaf. Root cause: claude CLI defaults
     // to interactive approval, which has no approver in the non-TTY
     // bridge pipeline. byob explicitly means "caller trusts the tools"
     // (see src/modes.ts), so bypass is correct.
     const args = b.buildArgs(baseReq, null, 'byob')
-    const i = args.indexOf('--permission-mode')
-    expect(i).toBeGreaterThan(-1)
-    expect(args[i + 1]).toBe('bypassPermissions')
+    expect(args).toContain('--dangerously-skip-permissions')
     // And must NOT carry hosted-safe's plan/disallowed-tools baggage
     expect(args).not.toContain('plan')
+    expect(args).not.toContain('--permission-mode')
     expect(args).not.toContain('--disallowed-tools')
   })
 

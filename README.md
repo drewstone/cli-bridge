@@ -12,6 +12,7 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 | `claudish/` | ✓ | Claude Code + [claudish](https://github.com/MadAppGang/claudish) — Claude's workflow, a different brain |
 | `codex/` | ✓ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
 | `opencode/` | ✓ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
+| `gemini/` | ✓ | [Gemini CLI](https://github.com/google-gemini/gemini-cli) — Google's official Gemini coding CLI |
 | `factory/` | ◦ | [Factory Droid](https://docs.factory.ai/) |
 | `amp/` | ◦ | [Sourcegraph Amp](https://ampcode.com/) |
 | `forge/` | ◦ | [Forge Code](https://github.com/antinomyhq/forge) |
@@ -41,6 +42,8 @@ claudish/zai@glm-4.6                       # Claude Code workflow, Z.AI brain
 codex/gpt-5-codex                    # Codex CLI, Codex model
 opencode/kimi-for-coding             # opencode + kimi-full plugin (Kimi Code sub)
 opencode/anthropic/claude-sonnet-4-5 # opencode's configured anthropic provider
+gemini/gemini-2.5-pro                # Gemini CLI with explicit model
+gemini/gemini-2.5-flash              # Gemini CLI Flash model
 
 openai/gpt-4o                        # passthrough — OpenAI API, metered
 zai/glm-4.6                          # passthrough — Z.AI API, metered
@@ -56,6 +59,7 @@ When reaching cli-bridge via tangle-router's `/api/chat`, prefix the whole thing
 bridge/claude/sonnet
 bridge/claudish/openrouter@deepseek/deepseek-r1
 bridge/opencode/kimi-for-coding
+bridge/gemini/gemini-2.5-pro
 ```
 
 The router's short-circuit strips the leading `bridge/` and forwards the `<harness>/<model>` as-is.
@@ -81,6 +85,7 @@ pnpm start
 | `claudish` | claude above + run `claudish` locally, point `CLAUDISH_URL` at it | claudish's own provider config |
 | `codex` | `brew install openai/homebrew-tap/codex` | `codex login` |
 | `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
+| `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
 | `passthrough` | (none) | provider API keys in `.env` |
 
 ## Quick test
@@ -113,7 +118,7 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
-- local harness backends (`claude-code`, `codex`, `kimi-code`) persist the full profile, honor the executable subset directly where possible, and compile the remaining context into a deterministic system-prompt preamble
+- local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`) persist the full profile, honor the executable subset directly where possible, and compile the remaining context into a deterministic system-prompt preamble
 
 Example:
 
@@ -315,8 +320,9 @@ intent always overrides profile defaults.
 | codex      | yes       | yes          | `CODEX_HOME=<tempdir>` with synthesised `config.toml`         |
 | kimi       | yes       | no           | `--mcp-config-file <tempfile>` (same shape as claude)         |
 | opencode   | yes       | no           | `OPENCODE_CONFIG=<tempfile>` (opencode's per-config schema)   |
+| gemini     | no        | no           | not wired until Gemini exposes/validates per-invocation MCP   |
 
-**stdio**: every backend loads stdio MCP servers — `command`, `args`,
+**stdio**: every MCP-enabled backend loads stdio MCP servers — `command`, `args`,
 and `env` round-trip through the materialised config file unchanged
 (verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
 
@@ -362,10 +368,10 @@ The Docker executor solves all three: each chat() runs inside a
 pre-warmed container slot, and session_id sticks the same caller to
 the same slot so `--resume` reads the same on-disk transcript
 turn-to-turn. Works for **every subprocess backend** — claude, kimi,
-codex, opencode — through the same `Spawner` abstraction.
+gemini, codex, opencode — through the same `Spawner` abstraction.
 
 ```bash
-# 1. build the unified runtime image once (has all four CLIs installed)
+# 1. build the unified runtime image once (has all coding CLIs installed)
 docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest .
 
 # 2. enable per backend (any subset)
@@ -374,6 +380,8 @@ CLAUDE_EXECUTOR=docker
 CLAUDE_DOCKER_POOL_SIZE=4
 KIMI_EXECUTOR=docker
 KIMI_DOCKER_POOL_SIZE=2
+GEMINI_EXECUTOR=docker
+GEMINI_DOCKER_POOL_SIZE=2
 CODEX_EXECUTOR=host
 OPENCODE_EXECUTOR=host
 EOF
@@ -384,7 +392,8 @@ EOF
 # 3. start as usual
 pnpm start
 # [cli-bridge] claude executor: docker pool size=4 image=cli-bridge-cli-runtime:latest
-# [cli-bridge] kimi   executor: docker pool size=2 image=cli-bridge-cli-runtime:latest
+# [cli-bridge] kimi    executor: docker pool size=2 image=cli-bridge-cli-runtime:latest
+# [cli-bridge] gemini  executor: docker pool size=2 image=cli-bridge-cli-runtime:latest
 ```
 
 OAuth mount modes:

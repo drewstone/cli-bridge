@@ -16,6 +16,7 @@ import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
 import { OpencodeBackend } from './backends/opencode.js'
 import { KimiBackend } from './backends/kimi.js'
+import { GeminiBackend } from './backends/gemini.js'
 import { FactoryBackend } from './backends/factory.js'
 import { AmpBackend } from './backends/amp.js'
 import { ForgeBackend } from './backends/forge.js'
@@ -150,6 +151,14 @@ export async function buildApp(config: Config): Promise<{
       bin: config.kimiBin,
       timeoutMs: config.kimiTimeoutMs,
       harness: 'kimi-code',
+      ...(spawner ? { spawner } : {}),
+    }))
+  }
+  if (config.backends.has('gemini')) {
+    const spawner = await buildExecutorForBackend(config.executors.gemini, extras)
+    registry.register(new GeminiBackend({
+      bin: config.geminiBin,
+      timeoutMs: config.geminiTimeoutMs,
       ...(spawner ? { spawner } : {}),
     }))
   }

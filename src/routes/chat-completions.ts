@@ -237,7 +237,7 @@ export function mountChatCompletions(
     c.req.raw.signal.addEventListener('abort', () => ac.abort(), { once: true })
 
     // Execution router: when the caller asks for `execution: 'sandbox'`
-    // on a host harness (claude/kimi/codex/...), delegate to the
+    // on a host harness (claude/kimi/gemini/codex/...), delegate to the
     // SandboxBackend instead of spawning the local CLI. The agent_profile
     // + prompt + cwd contract is identical — only the execution location
     // changes. Map the host harness → in-container backend type via
@@ -433,7 +433,7 @@ function errorResponse(c: Context, err: unknown): Response {
 
 /**
  * Map a host harness name (the `Backend.name` field — `claude`,
- * `kimi-code`, `codex`, `opencode`, `amp`, `factory`, `forge`) to the
+ * `kimi-code`, `gemini`, `codex`, `opencode`, `amp`, `factory`, `forge`) to the
  * matching in-container backend type the sandbox SDK accepts. The two
  * sets are mostly 1:1; the only divergence today is `factory` (host)
  * vs `factory-droids` (sandbox), which mirrors the upstream package

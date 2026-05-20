@@ -1,7 +1,7 @@
 /**
  * Execution-router tests — verifies that POST /v1/chat/completions with
  * `execution: 'sandbox'` on a host harness model id (claude-code/sonnet,
- * kimi-code/kimi-k2.6, …) delegates to the registered SandboxBackend
+ * kimi-code/kimi-k2.6, gemini/gemini-2.5-pro, …) delegates to the registered SandboxBackend
  * instead of spawning the local CLI.
  *
  * Stubs out both backends so the test never touches a real subprocess
@@ -113,6 +113,22 @@ describe('execution-router', () => {
       })
       expect(res.status).toBe(200)
       expect(sandbox.received[0]!.req.metadata?.sandboxBackendType).toBe('factory-droids')
+    } finally { cleanup() }
+  })
+
+  it('gemini harness is preserved as the in-container backend type', async () => {
+    const gemini = new StubBackend('gemini')
+    const sandbox = new StubBackend('sandbox')
+    const { app, cleanup } = buildApp([gemini, sandbox])
+    try {
+      const res = await postChat(app, {
+        model: 'gemini/gemini-2.5-pro',
+        messages: [{ role: 'user', content: 'hi' }],
+        execution: { kind: 'sandbox' },
+      })
+      expect(res.status).toBe(200)
+      expect(gemini.received).toHaveLength(0)
+      expect(sandbox.received[0]!.req.metadata?.sandboxBackendType).toBe('gemini')
     } finally { cleanup() }
   })
 

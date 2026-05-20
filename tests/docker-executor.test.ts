@@ -16,6 +16,7 @@ import { ClaudeBackend } from '../src/backends/claude.js'
 import { CodexBackend } from '../src/backends/codex.js'
 import { KimiBackend } from '../src/backends/kimi.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
+import { GeminiBackend } from '../src/backends/gemini.js'
 import { ContainerPool } from '../src/executors/container-pool.js'
 import { buildDockerExecArgs } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
@@ -47,7 +48,7 @@ describe('hostSpawner', () => {
   // of its own pgid; killTree then signals the negative pgid and the
   // whole tree dies as a unit. This invariant must hold or every
   // SIGTERM leaks grand-children again.
-  it('spawns each child as its own process-group leader (pgid == pid) so the whole tree is signalable', async () => {
+  it.skipIf(process.platform !== 'linux')('spawns each child as its own process-group leader (pgid == pid) so the whole tree is signalable', async () => {
     const result = await hostSpawner('node', ['-e', 'setInterval(() => {}, 10)'], {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -603,6 +604,7 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     const config = loadConfig({ HOME: '/home/test' })
     expect(config.executors.claude!.kind).toBe('host')
     expect(config.executors.kimi!.kind).toBe('host')
+    expect(config.executors.gemini!.kind).toBe('host')
     expect(config.executors.codex!.kind).toBe('host')
     expect(config.executors.opencode!.kind).toBe('host')
   })
@@ -611,6 +613,7 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     const config = loadConfig({ HOME: '/home/test', BRIDGE_DEFAULT_EXECUTOR: 'docker' })
     expect(config.executors.claude!.kind).toBe('docker')
     expect(config.executors.kimi!.kind).toBe('docker')
+    expect(config.executors.gemini!.kind).toBe('docker')
     expect(config.executors.codex!.kind).toBe('docker')
     expect(config.executors.opencode!.kind).toBe('docker')
   })
@@ -644,9 +647,9 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     expect(() => loadConfig({ HOME: '/home/test', CLAUDE_EXECUTOR: 'docker', CLAUDE_DOCKER_OAUTH_MOUNT: 'wat' as never })).toThrow(/CLAUDE_DOCKER_OAUTH_MOUNT/)
   })
 
-  it('all four subprocess backends share the same default runtime image', () => {
+  it('all subprocess backends share the same default runtime image', () => {
     const config = loadConfig({ HOME: '/home/test', BRIDGE_DEFAULT_EXECUTOR: 'docker' })
-    const images = ['claude', 'kimi', 'codex', 'opencode'].map((n) => config.executors[n]!.image)
+    const images = ['claude', 'kimi', 'gemini', 'codex', 'opencode'].map((n) => config.executors[n]!.image)
     expect(new Set(images).size).toBe(1)
     expect(images[0]).toBe('cli-bridge-cli-runtime:latest')
   })
@@ -765,6 +768,23 @@ describe('Spawner injection works across all subprocess backends', () => {
       ctrl.signal,
     )) deltas.push(d)
     expect(deltas.find((d) => d.internal_session_id === 'codex-th')).toBeDefined()
+    expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('GeminiBackend uses injected spawner + pipes prompt via stdin', async () => {
+    const stub = createStubSpawner(['gemini out'])
+    const backend = new GeminiBackend({ bin: 'gemini', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const deltas: Array<{ content?: string; finish_reason?: string }> = []
+    for await (const d of backend.chat(
+      { model: 'gemini/gemini-2.5-pro', messages: [{ role: 'user', content: 'hi gemini' }] },
+      null,
+      ctrl.signal,
+    )) deltas.push(d)
+    expect(deltas.some((d) => d.content?.includes('gemini out'))).toBe(true)
+    expect(stub.observedArgs).toContain('--model')
+    expect(stub.observedArgs).toContain('gemini-2.5-pro')
+    expect(stub.stdinChunks.join('')).toBe('hi gemini')
     expect(stub.releaseCalls).toBe(1)
   })
 
