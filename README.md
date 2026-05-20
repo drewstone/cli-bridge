@@ -336,7 +336,7 @@ intent always overrides profile defaults.
 | codex      | yes       | yes          | `CODEX_HOME=<tempdir>` with synthesised `config.toml`         |
 | kimi       | yes       | no           | `--mcp-config-file <tempfile>` (same shape as claude)         |
 | opencode   | yes       | no           | `OPENCODE_CONFIG=<tempfile>` (opencode's per-config schema)   |
-| gemini     | no        | no           | not wired until Gemini exposes/validates per-invocation MCP   |
+| gemini     | yes       | yes          | `GEMINI_CLI_SYSTEM_SETTINGS_PATH=<temp settings.json>`        |
 
 **stdio**: every MCP-enabled backend loads stdio MCP servers — `command`, `args`,
 and `env` round-trip through the materialised config file unchanged

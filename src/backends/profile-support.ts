@@ -310,6 +310,60 @@ export function materialiseMcpServersForOpencode(
   }
 }
 
+/**
+ * Materialise Gemini CLI's native per-invocation settings file.
+ *
+ * Gemini loads MCP servers from `settings.json` under the top-level
+ * `mcpServers` object. We pass this file via
+ * `GEMINI_CLI_SYSTEM_SETTINGS_PATH`, which is documented as the
+ * highest-precedence settings layer. This avoids mutating the
+ * operator's `~/.gemini/settings.json` while still using Gemini's
+ * standard MCP loader.
+ */
+export function materialiseMcpServersForGemini(
+  specs: Record<string, McpServerSpec> | null,
+): MaterialisedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers: Record<string, Record<string, unknown>> = {}
+  for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
+    const entry: Record<string, unknown> = {}
+    if (spec.command) {
+      entry.command = spec.command
+      if (spec.args && spec.args.length) entry.args = spec.args
+      if (spec.env && Object.keys(spec.env).length) entry.env = spec.env
+    } else if (spec.type === 'sse' && spec.url) {
+      entry.url = spec.url
+      if (spec.headers && Object.keys(spec.headers).length) entry.headers = spec.headers
+    } else if ((spec.type === 'http' || spec.url) && spec.url) {
+      entry.httpUrl = spec.url
+      if (spec.headers && Object.keys(spec.headers).length) entry.headers = spec.headers
+    } else {
+      continue
+    }
+    if (spec.timeout) entry.timeout = spec.timeout
+    mcpServers[name] = entry
+  }
+
+  const serverNames = Object.keys(mcpServers)
+  if (serverNames.length === 0) return null
+
+  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-gemini-'))
+  const configPath = join(dir, 'settings.json')
+  writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2))
+  return {
+    configPath,
+    serverNames,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best-effort cleanup
+      }
+    },
+  }
+}
+
 export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
   const configPath = join(dir, 'mcp-config.json')

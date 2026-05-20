@@ -16,7 +16,11 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { resolvePromptMessages } from './profile-support.js'
+import {
+  materialiseMcpServersForGemini,
+  resolveMcpServers,
+  resolvePromptMessages,
+} from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
@@ -90,11 +94,15 @@ export class GeminiBackend implements Backend {
     const model = this.extractModel(req.model)
     const args = this.buildArgs(req.model)
     if (model) args.push('--model', model)
+    const geminiSettings = materialiseMcpServersForGemini(resolveMcpServers(req, session))
 
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
-      env: process.env,
+      env: {
+        ...process.env,
+        ...(geminiSettings ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettings.configPath } : {}),
+      },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
     })
     const child = spawned.child
@@ -186,6 +194,7 @@ export class GeminiBackend implements Backend {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       await killTree(child)
+      geminiSettings?.cleanup()
       releaseSpawner()
     }
   }

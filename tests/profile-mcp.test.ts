@@ -22,6 +22,7 @@ import {
   materialiseMcpConfig,
   materialiseMcpServersForClaudeKimi,
   materialiseMcpServersForCodex,
+  materialiseMcpServersForGemini,
   materialiseMcpServersForOpencode,
   materialiseOpencodeMcpConfig,
   resolveMcpServers,
@@ -272,6 +273,62 @@ describe('materialiseMcpServersForOpencode', () => {
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.mcp).toEqual({})
     m.cleanup()
+  })
+})
+
+describe('materialiseMcpServersForGemini', () => {
+  it('writes Gemini settings.json with stdio MCP servers', () => {
+    const m = materialiseMcpServersForGemini({
+      echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
+    })
+    expect(m).not.toBeNull()
+    if (!m) return
+    expect(m.serverNames).toEqual(['echo'])
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written).toEqual({
+      mcpServers: {
+        echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
+      },
+    })
+    m.cleanup()
+    expect(existsSync(m.configPath)).toBe(false)
+    expect(() => m.cleanup()).not.toThrow()
+  })
+
+  it('maps Gemini streamable HTTP MCP as httpUrl', () => {
+    const m = materialiseMcpServersForGemini({
+      remote: { type: 'http', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer x' } },
+    })
+    expect(m).not.toBeNull()
+    if (!m) return
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.mcpServers.remote).toEqual({
+      httpUrl: 'https://example.com/mcp',
+      headers: { Authorization: 'Bearer x' },
+    })
+    m.cleanup()
+  })
+
+  it('maps Gemini SSE MCP as url', () => {
+    const m = materialiseMcpServersForGemini({
+      remote: { type: 'sse', url: 'https://example.com/sse', headers: { Authorization: 'Bearer x' } },
+    })
+    expect(m).not.toBeNull()
+    if (!m) return
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.mcpServers.remote).toEqual({
+      url: 'https://example.com/sse',
+      headers: { Authorization: 'Bearer x' },
+    })
+    m.cleanup()
+  })
+
+  it('drops disabled/malformed entries and returns null when empty', () => {
+    expect(materialiseMcpServersForGemini(null)).toBeNull()
+    expect(materialiseMcpServersForGemini({
+      disabled: { command: 'node', enabled: false },
+      malformed: { args: ['x'] },
+    })).toBeNull()
   })
 })
 

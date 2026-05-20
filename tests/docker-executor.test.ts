@@ -11,6 +11,7 @@
  */
 
 import { Readable, PassThrough } from 'node:stream'
+import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { CodexBackend } from '../src/backends/codex.js'
@@ -785,6 +786,35 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(stub.observedArgs).toContain('--model')
     expect(stub.observedArgs).toContain('gemini-2.5-pro')
     expect(stub.stdinChunks.join('')).toBe('hi gemini')
+    expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('GeminiBackend materialises MCP through GEMINI_CLI_SYSTEM_SETTINGS_PATH', async () => {
+    const stub = createStubSpawner(['gemini out'])
+    const backend = new GeminiBackend({ bin: 'gemini', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    let settingsPath: string | undefined
+    for await (const _d of backend.chat(
+      {
+        model: 'gemini/gemini-2.5-pro',
+        messages: [{ role: 'user', content: 'hi gemini' }],
+        mcp: { mcpServers: { echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } } } },
+      },
+      null,
+      ctrl.signal,
+    )) {
+      settingsPath = (stub.observedOpts?.env as NodeJS.ProcessEnv | undefined)?.GEMINI_CLI_SYSTEM_SETTINGS_PATH
+      if (settingsPath) {
+        const settings = JSON.parse(readFileSync(settingsPath, 'utf8'))
+        expect(settings.mcpServers.echo).toEqual({
+          command: 'node',
+          args: ['./echo.js'],
+          env: { FOO: 'bar' },
+        })
+      }
+    }
+    expect(settingsPath).toBeDefined()
+    expect(existsSync(settingsPath!)).toBe(false)
     expect(stub.releaseCalls).toBe(1)
   })
 
