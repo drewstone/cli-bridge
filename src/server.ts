@@ -248,7 +248,7 @@ function constantTimeEqual(a: string, b: string): boolean {
   return acc === 0
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+export async function startServer(): Promise<void> {
   const config = loadConfig()
   const { app, sessions, extras } = await buildApp(config)
   const server = serve({
@@ -330,4 +330,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       stack: err.stack?.split('\n').slice(0, 8).join('\n'),
     })
   })
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  await startServer()
 }
