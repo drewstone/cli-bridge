@@ -65,9 +65,11 @@ const BASE_HOST_ENV_KEYS = new Set([
   'LANG',
   'LC_ALL',
   'PWD',
+  'DBUS_SESSION_BUS_ADDRESS',
   'XDG_CONFIG_HOME',
   'XDG_CACHE_HOME',
   'XDG_DATA_HOME',
+  'XDG_RUNTIME_DIR',
   'NVM_DIR',
   'PNPM_HOME',
 ])
