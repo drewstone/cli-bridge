@@ -74,6 +74,7 @@ describe('hostSpawner', () => {
     const env = sanitizeHostEnv({
       HOME: '/home/drew',
       PATH: '/usr/bin',
+      DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
       ANTHROPIC_API_KEY: 'sk-test',
       OPENCODE_CONFIG: '/tmp/opencode.json',
       GH_TOKEN: 'ghp_test',
@@ -84,6 +85,7 @@ describe('hostSpawner', () => {
     expect(env).toEqual({
       HOME: '/home/drew',
       PATH: '/usr/bin',
+      DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
       ANTHROPIC_API_KEY: 'sk-test',
       OPENCODE_CONFIG: '/tmp/opencode.json',
       GH_TOKEN: 'ghp_test',
