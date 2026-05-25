@@ -23,7 +23,7 @@
  *   {"type":"message_update","assistantMessageEvent":{
  *      "type":"thinking_delta"|"text_delta"|"tool_call_start"|...,
  *      "delta":"...", "contentIndex":N, ... }}
- *   {"type":"turn_end","usage":{...}}
+ *   {"type":"turn_end","message":{"usage":{...}}}
  *   {"type":"agent_end"}
  *
  * We currently surface text_delta as ChatDelta.content; thinking_delta is
@@ -219,10 +219,14 @@ export class PiBackend implements Backend {
           continue
         }
 
-        // Final turn_end carries usage. Pi reports usage on the
-        // `message_end` event with role: assistant via `partial.usage`.
+        // Final turn_end / agent_end carries usage when pi reports it.
+        // Different pi versions have emitted usage on the event itself,
+        // on `message.usage`, or on `partial.usage`; accept all three
+        // shapes so backend-integrity guards see real token activity.
         if (type === 'turn_end' || type === 'agent_end') {
-          const u = (ev.usage ?? (ev.partial as Record<string, unknown> | undefined)?.usage) as
+          const message = ev.message as Record<string, unknown> | undefined
+          const partial = ev.partial as Record<string, unknown> | undefined
+          const u = (ev.usage ?? message?.usage ?? partial?.usage) as
             | Record<string, number>
             | undefined
           if (u) {
