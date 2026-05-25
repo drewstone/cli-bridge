@@ -62,7 +62,6 @@ class HostSemaphore {
       }, this.acquireDeadlineMs).unref()
       this.waiters.push({ resolve, reject, timer })
     })
-    this.inFlight += 1
   }
 
   release(): void {
