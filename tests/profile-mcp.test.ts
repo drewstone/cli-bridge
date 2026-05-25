@@ -4,8 +4,8 @@
  *
  *   - profiles without `.mcp` produce null (no temp file written)
  *   - explicitly disabled servers (enabled: false) are dropped
- *   - servers without `command` (remote http/sse) are dropped — local
- *     CLIs only support stdio MCP via --mcp-config
+ *   - claude/kimi materialisation preserves stdio MCP servers and drops
+ *     remote http/sse servers from their shared `mcp-config.json` shape
  *   - the produced JSON matches claude/kimi's expected
  *     `{ mcpServers: { name: { command, args, env } } }` shape
  *   - `cleanup()` is idempotent and removes the temp dir
@@ -35,10 +35,9 @@ describe('materialiseMcpConfig', () => {
     expect(materialiseMcpConfig({ name: 'p' } as AgentProfile)).toBeNull()
   })
 
-  it('returns null when every entry is filtered out (disabled or remote)', () => {
+  it('returns null when every entry is filtered out', () => {
     const profile: AgentProfile = {
       mcp: {
-        'remote-http': { transport: 'http', url: 'https://example.com/mcp' },
         'disabled-stdio': { command: '/usr/bin/foo', enabled: false },
       },
     }
@@ -227,7 +226,7 @@ describe('materialiseMcpServersForClaudeKimi', () => {
   it('writes the canonical {mcpServers:{...}} JSON shape', () => {
     const m = materialiseMcpServersForClaudeKimi({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
-      remote: { type: 'http', url: 'https://example.com' }, // dropped
+      remote: { type: 'http', url: 'https://example.com', headers: { Authorization: 'Bearer X' } },
     })
     expect(m).not.toBeNull()
     if (!m) return

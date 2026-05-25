@@ -31,6 +31,11 @@ export interface Config {
   piBin: string
   piTimeoutMs: number
   cliTimeoutMsDefault: number
+  admission: {
+    maxActive: number
+    maxQueue: number
+    queueTimeoutMs: number
+  }
   /**
    * When set, the `claudish` harness is registered and Claude Code is
    * spawned with ANTHROPIC_BASE_URL=<this> for `claudish/*` model ids.
@@ -139,6 +144,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     piBin: env.PI_BIN ?? 'pi',
     piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     cliTimeoutMsDefault: defaultTimeout,
+    admission: {
+      maxActive: parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 24),
+      maxQueue: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_QUEUE, 64),
+      queueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_QUEUE_TIMEOUT_MS, 30_000),
+    },
     claudishUrl: env.CLAUDISH_URL?.trim() || null,
     openaiApiKey: env.OPENAI_API_KEY?.trim() || null,
     anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || null,
@@ -150,6 +160,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
     executors: parseAllExecutors(env),
   }
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === '') return fallback
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`invalid positive integer: ${value}`)
+  }
+  return parsed
+}
+
+function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === '') return fallback
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`invalid non-negative integer: ${value}`)
+  }
+  return parsed
 }
 
 /**
