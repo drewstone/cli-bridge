@@ -60,6 +60,76 @@ const SLICE = 'cli-bridge-llm.slice'
 const DEFAULT_SCOPE_TASKS_MAX = 128
 const DEFAULT_SCOPE_MEMORY_MAX = '3G'
 const DEFAULT_SCOPE_RUNTIME_MAX_SEC = 7200
+const DEFAULT_SCOPE_MAX_CONCURRENCY = 4
+const DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS = 60_000
+const SYSTEMD_RUN_BIN = existsSync('/usr/bin/systemd-run') ? '/usr/bin/systemd-run' : '/bin/systemd-run'
+
+interface Waiter {
+  resolve: () => void
+  reject: (err: Error) => void
+  timer: NodeJS.Timeout
+}
+
+class ScopedSemaphore {
+  private inFlight = 0
+  private readonly waiters: Waiter[] = []
+  acquires = 0
+  timeouts = 0
+
+  constructor(
+    private readonly max: number,
+    private readonly acquireDeadlineMs: number,
+  ) {}
+
+  async acquire(): Promise<void> {
+    this.acquires += 1
+    if (this.inFlight < this.max) {
+      this.inFlight += 1
+      return
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.waiters.findIndex((w) => w.timer === timer)
+        if (idx >= 0) this.waiters.splice(idx, 1)
+        this.timeouts += 1
+        reject(
+          new Error(
+            `scoped-host-executor: acquire timeout after ${this.acquireDeadlineMs}ms ` +
+              `(in_flight=${this.inFlight}/${this.max}, queued=${this.waiters.length}). ` +
+              `Reduce parallel callers or raise CLI_BRIDGE_SCOPE_MAX_CONCURRENCY.`,
+          ),
+        )
+      }, this.acquireDeadlineMs).unref()
+      this.waiters.push({ resolve, reject, timer })
+    })
+    this.inFlight += 1
+  }
+
+  release(): void {
+    const next = this.waiters.shift()
+    if (next) {
+      clearTimeout(next.timer)
+      next.resolve()
+      return
+    }
+    if (this.inFlight > 0) this.inFlight -= 1
+  }
+
+  snapshot(): { in_flight: number; max: number; queued: number; acquires: number; timeouts: number } {
+    return {
+      in_flight: this.inFlight,
+      max: this.max,
+      queued: this.waiters.length,
+      acquires: this.acquires,
+      timeouts: this.timeouts,
+    }
+  }
+}
+
+const scopedSemaphore = new ScopedSemaphore(
+  positiveIntEnv('CLI_BRIDGE_SCOPE_MAX_CONCURRENCY', DEFAULT_SCOPE_MAX_CONCURRENCY),
+  positiveIntEnv('CLI_BRIDGE_SCOPE_ACQUIRE_DEADLINE_MS', DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS),
+)
 
 /** Result of the one-shot probe. `null` until first call, then cached. */
 let systemdRunUsable: boolean | null = null
@@ -146,6 +216,14 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     return hostSpawner(bin, args, opts)
   }
 
+  await scopedSemaphore.acquire()
+  let semaphoreReleased = false
+  const releaseSemaphore = (): void => {
+    if (semaphoreReleased) return
+    semaphoreReleased = true
+    scopedSemaphore.release()
+  }
+
   // Unit name MUST be unique per spawn; collisions would refuse to
   // start. Include pid + 12 random hex chars (96 bits of entropy).
   const unitName = `cli-bridge-${process.pid}-${randomBytes(6).toString('hex')}.scope`
@@ -169,23 +247,32 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     ...args,
   ]
 
-  const child = spawn('/usr/bin/systemd-run', wrapped, {
-    stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
-    cwd: opts.cwd,
-    env: sanitizeHostEnv(opts.env),
-    // `detached: true` makes the wrapper a process-group leader, so
-    // existing killTree() (kill -pgid) still works as the graceful
-    // first signal. The cgroup-kill in release() is the hard backstop.
-    detached: true,
-  })
+  let child
+  try {
+    child = spawn(SYSTEMD_RUN_BIN, wrapped, {
+      stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
+      cwd: opts.cwd,
+      env: sanitizeHostEnv(opts.env),
+      // `detached: true` makes the wrapper a process-group leader, so
+      // existing killTree() (kill -pgid) still works as the graceful
+      // first signal. The cgroup-kill in release() is the hard backstop.
+      detached: true,
+    })
+  } catch (err) {
+    releaseSemaphore()
+    throw err
+  }
 
   let spawnError: Error | null = null
   child.on('error', (err) => { spawnError = err })
+  child.once('exit', releaseSemaphore)
+  child.once('error', releaseSemaphore)
 
   let released = false
   const release = (): void => {
     if (released) return
     released = true
+    releaseSemaphore()
     // Fire-and-forget: writing 1 to cgroup.kill is synchronous from
     // the kernel's perspective; the actual SIGKILLs cascade
     // asynchronously and we don't need to await them. Errors are
@@ -203,6 +290,17 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     spawnError: () => spawnError,
   }
   return result
+}
+
+/** Diagnostics for /metrics. */
+export function scopedHostExecutorSnapshot(): {
+  in_flight: number
+  max: number
+  queued: number
+  acquires: number
+  timeouts: number
+} {
+  return scopedSemaphore.snapshot()
 }
 
 function positiveIntEnv(name: string, fallback: number): number {

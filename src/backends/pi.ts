@@ -40,7 +40,7 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
-import { hostSpawner } from '../executors/host.js'
+import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { killTree } from '../executors/process-tree.js'
@@ -48,7 +48,7 @@ import { killTree } from '../executors/process-tree.js'
 export interface PiBackendOptions {
   bin: string
   timeoutMs: number
-  /** Subprocess spawner. Defaults to host. */
+  /** Subprocess spawner. Defaults to scoped host. */
   spawner?: Spawner
 }
 
@@ -82,7 +82,7 @@ export class PiBackend implements Backend {
   private readonly spawner: Spawner
 
   constructor(private readonly opts: PiBackendOptions) {
-    this.spawner = opts.spawner ?? hostSpawner
+    this.spawner = opts.spawner ?? scopedHostSpawner
   }
 
   matches(model: string): boolean {

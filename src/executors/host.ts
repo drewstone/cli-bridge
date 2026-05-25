@@ -66,12 +66,13 @@ class HostSemaphore {
   }
 
   release(): void {
-    this.inFlight -= 1
     const next = this.waiters.shift()
     if (next) {
       clearTimeout(next.timer)
       next.resolve()
+      return
     }
+    this.inFlight -= 1
   }
 
   snapshot(): { in_flight: number; max: number; queued: number; acquires: number; timeouts: number } {
