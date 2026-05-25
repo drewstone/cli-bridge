@@ -12,6 +12,7 @@
 
 import type { Hono } from 'hono'
 import { hostExecutorSnapshot } from '../executors/host.js'
+import { scopedHostExecutorSnapshot } from '../executors/scoped-host.js'
 import type { ContainerPool } from '../executors/container-pool.js'
 
 const registeredPools = new Map<string, ContainerPool>()
@@ -27,6 +28,7 @@ export function mountMetrics(app: Hono): void {
     return c.json({
       ts: new Date().toISOString(),
       host_executor: hostExecutorSnapshot(),
+      scoped_host_executor: scopedHostExecutorSnapshot(),
       pools,
     })
   })

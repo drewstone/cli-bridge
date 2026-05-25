@@ -602,6 +602,15 @@ function makeFakeChild(
 // ─── per-backend executor config parsing ─────────────────────────────────
 
 describe('per-backend executor config (parseAllExecutors)', () => {
+  it('defaults host-chat admission to a box-safe cap', () => {
+    const config = loadConfig({ HOME: '/home/test' })
+    expect(config.admission).toEqual({
+      maxActive: 8,
+      maxQueue: 16,
+      queueTimeoutMs: 30_000,
+    })
+  })
+
   it('defaults all backends to host when no env is set', () => {
     const config = loadConfig({ HOME: '/home/test' })
     expect(config.executors.claude!.kind).toBe('host')

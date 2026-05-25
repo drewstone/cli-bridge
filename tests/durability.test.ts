@@ -17,6 +17,22 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
+async function waitFor(predicate: () => void, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastErr: unknown
+  while (Date.now() < deadline) {
+    try {
+      predicate()
+      return
+    } catch (err) {
+      lastErr = err
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  if (lastErr) throw lastErr
+  predicate()
+}
+
 describe('host executor semaphore', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -38,6 +54,38 @@ describe('host executor semaphore', () => {
       r.child.kill()
       r.release()
     }
+  })
+
+  it('reserves a freed slot for the queued waiter before admitting new callers', async () => {
+    process.env.BRIDGE_HOST_MAX_CONCURRENCY = '1'
+    process.env.BRIDGE_HOST_ACQUIRE_DEADLINE_MS = '2000'
+    vi.resetModules()
+    const { hostSpawner, hostExecutorSnapshot } = await import('../src/executors/host.js')
+
+    const holder = await hostSpawner('node', ['-e', 'setTimeout(()=>{},5000)'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const queued = hostSpawner('node', ['-e', 'setTimeout(()=>{},200)'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    await waitFor(() => {
+      expect(hostExecutorSnapshot().queued).toBe(1)
+    })
+
+    const t0 = Date.now()
+    holder.release()
+    holder.child.kill()
+    const late = await hostSpawner('node', ['-e', 'setTimeout(()=>{},10)'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(150)
+
+    const queuedResult = await queued
+    queuedResult.release()
+    queuedResult.child.kill()
+    late.release()
+    late.child.kill()
   })
 
   it('rejects with timeout when no slot frees within the deadline', async () => {
@@ -141,11 +189,14 @@ describe('/metrics route', () => {
     const body = await res.json() as {
       ts: string
       host_executor: { max: number }
+      scoped_host_executor: { max: number }
       pools: unknown
     }
     expect(body.ts).toBeTypeOf('string')
     expect(body.host_executor).toBeDefined()
     expect(body.host_executor.max).toBeTypeOf('number')
+    expect(body.scoped_host_executor).toBeDefined()
+    expect(body.scoped_host_executor.max).toBeTypeOf('number')
     expect(body.pools).toBeDefined()
   })
 })
