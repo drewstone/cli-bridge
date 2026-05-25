@@ -36,7 +36,7 @@ import {
   resolvePromptMessages,
 } from './profile-support.js'
 import { contentToText } from './content.js'
-import { hostSpawner } from '../executors/host.js'
+import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { killTree } from '../executors/process-tree.js'
@@ -52,7 +52,7 @@ export class CodexBackend implements Backend {
   readonly name = 'codex'
   private readonly spawner: Spawner
   constructor(private readonly opts: CodexBackendOptions) {
-    this.spawner = opts.spawner ?? hostSpawner
+    this.spawner = opts.spawner ?? scopedHostSpawner
   }
 
   matches(model: string): boolean {

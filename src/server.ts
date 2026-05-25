@@ -36,6 +36,7 @@ import { ContainerPool } from './executors/container-pool.js'
 import { createDockerSpawner } from './executors/docker.js'
 import type { Spawner } from './executors/types.js'
 import type { BackendExecutorConfig } from './config.js'
+import { AdmissionGate } from './admission.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -106,6 +107,7 @@ export async function buildApp(config: Config): Promise<{
   const registry = new BackendRegistry()
   const extras: BuildAppExtras = { shutdownHooks: [] }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
+  const admission = new AdmissionGate(config.admission)
 
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
@@ -214,11 +216,11 @@ export async function buildApp(config: Config): Promise<{
     })
   }
 
-  mountHealth(app, { registry })
+  mountHealth(app, { registry, admission })
   mountModels(app, { registry, catalog })
   mountSessions(app, { sessions })
   mountProfiles(app, { catalog })
-  mountChatCompletions(app, { registry, sessions })
+  mountChatCompletions(app, { registry, sessions, admission })
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)
@@ -248,7 +250,7 @@ function constantTimeEqual(a: string, b: string): boolean {
   return acc === 0
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+export async function startServer(): Promise<void> {
   const config = loadConfig()
   const { app, sessions, extras } = await buildApp(config)
   const server = serve({
@@ -267,6 +269,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(`[cli-bridge] listening on http://${info.address}:${info.port}  (host=${config.host})`)
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
+    console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue} queueTimeoutMs=${config.admission.queueTimeoutMs}`)
     for (const cfg of Object.values(config.executors)) {
       if (cfg.kind === 'docker') {
         console.log(`[cli-bridge] ${cfg.name} executor: docker pool size=${cfg.poolSize} image=${cfg.image}`)
@@ -324,10 +327,28 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     })
   })
   process.on('uncaughtException', (err) => {
+    if (isFatalServerStartupError(err)) {
+      console.error(`[cli-bridge] fatal server error — exiting`, {
+        message: err.message,
+        name: err.name,
+        code: (err as NodeJS.ErrnoException).code,
+      })
+      process.exit(1)
+    }
     console.error(`[cli-bridge] uncaughtException — keeping process alive`, {
       message: err.message,
       name: err.name,
       stack: err.stack?.split('\n').slice(0, 8).join('\n'),
     })
   })
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  await startServer()
+}
+
+function isFatalServerStartupError(err: Error): boolean {
+  const code = (err as NodeJS.ErrnoException).code
+  if (code === 'EADDRINUSE' || code === 'EACCES') return true
+  return /listen|address already in use/i.test(err.message)
 }

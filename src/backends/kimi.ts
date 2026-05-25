@@ -44,7 +44,7 @@ import {
   resolvePromptMessages,
 } from './profile-support.js'
 import { contentToText } from './content.js'
-import { hostSpawner } from '../executors/host.js'
+import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
@@ -67,7 +67,7 @@ export class KimiBackend implements Backend {
   constructor(private readonly opts: KimiBackendOptions) {
     this.name = opts.harness ?? 'kimi-code'
     this.prefix = `${this.name}/`
-    this.spawner = opts.spawner ?? hostSpawner
+    this.spawner = opts.spawner ?? scopedHostSpawner
   }
 
   matches(model: string): boolean {

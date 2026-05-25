@@ -35,6 +35,7 @@
 import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { Backend, BackendHealth } from '../backends/types.js'
+import type { AdmissionGate } from '../admission.js'
 
 const DEFAULT_HEALTH_CACHE_MS = 30_000
 const DEFAULT_PROBE_TIMEOUT_MS = 3_500
@@ -59,7 +60,7 @@ export interface MountHealthOptions {
 
 export function mountHealth(
   app: Hono,
-  deps: { registry: BackendRegistry },
+  deps: { registry: BackendRegistry; admission?: AdmissionGate },
   options: MountHealthOptions = {},
 ): void {
   const cacheMs = options.cacheMs ?? resolveEnvMs('BRIDGE_HEALTH_CACHE_MS', DEFAULT_HEALTH_CACHE_MS)
@@ -90,6 +91,7 @@ export function mountHealth(
     return c.json({
       status: any ? 'ok' : 'degraded',
       backends: probes,
+      ...(deps.admission ? { admission: deps.admission.snapshot() } : {}),
       ts: new Date(ts).toISOString(),
     }, any ? 200 : 503)
   })

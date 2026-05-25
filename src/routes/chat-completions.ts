@@ -23,6 +23,7 @@ import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
+import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -130,7 +131,7 @@ const chatRequestSchema = z.object({
 
 export function mountChatCompletions(
   app: Hono,
-  deps: { registry: BackendRegistry; sessions: SessionStore },
+  deps: { registry: BackendRegistry; sessions: SessionStore; admission?: AdmissionGate },
 ): void {
   app.post('/v1/chat/completions', async (c) => {
     let raw: unknown
@@ -242,7 +243,8 @@ export function mountChatCompletions(
     // + prompt + cwd contract is identical — only the execution location
     // changes. Map the host harness → in-container backend type via
     // `harnessToSandboxBackendType`.
-    let source
+    let source: AsyncIterable<ChatDelta>
+    let admissionLease: AdmissionLease | null = null
     if (req.execution?.kind === 'sandbox' && backend.name !== 'sandbox') {
       const sandboxBackend = deps.registry.byName('sandbox')
       if (!sandboxBackend) {
@@ -267,6 +269,13 @@ export function mountChatCompletions(
       }
       source = sandboxBackend.chat(delegatedReq, session, ac.signal)
     } else {
+      if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
+        try {
+          admissionLease = await deps.admission.acquire(ac.signal)
+        } catch (err) {
+          return admissionErrorResponse(c, err)
+        }
+      }
       source = backend.chat(req, session, ac.signal)
     }
 
@@ -300,6 +309,8 @@ export function mountChatCompletions(
           }
           yield { finish_reason: 'error' } satisfies ChatDelta
           console.error(`[cli-bridge] backend ${backend.name} failed:`, err)
+        } finally {
+          admissionLease?.release()
         }
       },
     }
@@ -325,19 +336,45 @@ export function mountChatCompletions(
     return streamSSE(c, async (stream) => {
       const meta = makeChunkMeta(req.model)
       const heartbeatMs = resolveSseHeartbeatMs()
+      let streamClosed = false
+      const abortStream = (): void => {
+        streamClosed = true
+        ac.abort()
+      }
+      const writeRaw = async (chunk: string): Promise<boolean> => {
+        if (streamClosed || ac.signal.aborted) return false
+        try {
+          await stream.write(chunk)
+          return true
+        } catch {
+          abortStream()
+          return false
+        }
+      }
+      const writeSse = async (data: string): Promise<boolean> => {
+        if (streamClosed || ac.signal.aborted) return false
+        try {
+          await stream.writeSSE({ data })
+          return true
+        } catch {
+          abortStream()
+          return false
+        }
+      }
       const heartbeat = setInterval(() => {
-        void stream.write(': keepalive\n\n').catch(() => {})
+        void writeRaw(': keepalive\n\n')
       }, heartbeatMs)
       try {
-        await stream.write(': connected\n\n')
+        if (!await writeRaw(': connected\n\n')) return
         for await (const delta of wrapped) {
+          if (ac.signal.aborted) break
           // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
           // render as SSE comment so the consumer (AI SDK, openai-node)
           // ignores it per spec instead of trying to route a fake tool
           // call. SSE comments also count as transport heartbeats.
           const comment = deltaToSseComment(delta)
           if (comment) {
-            await stream.write(comment).catch(() => {})
+            if (!await writeRaw(comment)) break
             continue
           }
           const chunk = deltaToOpenAIChunk(delta, meta)
@@ -348,22 +385,21 @@ export function mountChatCompletions(
           // deltaToOpenAIChunk returns a complete "data: …\n\n" line.
           // Strip the framing so streamSSE can re-add it.
           const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')
-          await stream.writeSSE({ data: payload })
+          if (!await writeSse(payload)) break
         }
       } catch (err) {
+        if (ac.signal.aborted) return
         const type = err instanceof ModeNotSupportedError
           ? 'mode_not_supported'
           : err instanceof BackendError
             ? err.code
             : 'server_error'
         const message = err instanceof Error ? err.message : String(err)
-        await stream.writeSSE({
-          data: JSON.stringify({ error: { message, type } }),
-        })
+        await writeSse(JSON.stringify({ error: { message, type } }))
       } finally {
         clearInterval(heartbeat)
       }
-      await stream.writeSSE({ data: '[DONE]' })
+      await writeSse('[DONE]')
     })
   })
 }
@@ -413,6 +449,9 @@ function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_
 }
 
 function errorResponse(c: Context, err: unknown): Response {
+  if (err instanceof AdmissionRejectedError) {
+    return admissionErrorResponse(c, err)
+  }
   if (err instanceof ModeNotSupportedError) {
     return c.json({ error: { message: err.message, type: 'mode_not_supported' } }, 501)
   }
@@ -429,6 +468,26 @@ function errorResponse(c: Context, err: unknown): Response {
   }
   const message = err instanceof Error ? err.message : String(err)
   return c.json({ error: { message, type: 'server_error' } }, 500)
+}
+
+function admissionErrorResponse(c: Context, err: unknown): Response {
+  if (!(err instanceof AdmissionRejectedError)) {
+    return errorResponse(c, err)
+  }
+  c.header('Retry-After', '5')
+  return c.json({
+    error: {
+      message: err.message,
+      type: 'admission_rejected',
+      reason: err.reason,
+      admission: err.snapshot,
+    },
+  }, 503)
+}
+
+function shouldApplyHostAdmission(backendName: string, req: ChatRequest): boolean {
+  if (req.execution?.kind === 'sandbox') return false
+  return backendName !== 'sandbox' && backendName !== 'passthrough'
 }
 
 /**

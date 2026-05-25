@@ -26,6 +26,7 @@ import { mountSessions } from '../src/routes/sessions.js'
 import { mountHealth } from '../src/routes/health.js'
 import { mountModels } from '../src/routes/models.js'
 import { contentToText } from '../src/backends/content.js'
+import { AdmissionGate } from '../src/admission.js'
 
 class FakeBackend implements Backend {
   constructor(readonly name: string) {}
@@ -56,6 +57,31 @@ class DelayedBackend extends FakeBackend {
     await new Promise((resolve) => setTimeout(resolve, this.delayMs))
     yield* super.chat(req, session)
   }
+}
+
+class BlockingBackend extends FakeBackend {
+  started = 0
+  private releases: Array<() => void> = []
+
+  override async *chat(req: ChatRequest, session: SessionRecord | null): AsyncIterable<ChatDelta> {
+    this.started += 1
+    await new Promise<void>((resolve) => this.releases.push(resolve))
+    yield* super.chat(req, session)
+  }
+
+  releaseOne(): void {
+    const release = this.releases.shift()
+    if (release) release()
+  }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error('waitFor timed out')
 }
 
 describe('SessionStore', () => {
@@ -350,6 +376,56 @@ describe('POST /v1/chat/completions', () => {
       }),
     })
     expect(res.status).toBe(404)
+  })
+
+  it('fails closed before spawning when host-chat admission queue is full', async () => {
+    const backend = new BlockingBackend('claude')
+    const admission = new AdmissionGate({ maxActive: 1, maxQueue: 1, queueTimeoutMs: 10_000 })
+    app = new Hono()
+    mountChatCompletions(app, {
+      registry: new BackendRegistry().register(backend),
+      sessions,
+      admission,
+    })
+
+    const body = JSON.stringify({
+      model: 'claude',
+      messages: [{ role: 'user', content: 'x' }],
+      stream: false,
+    })
+    const first = app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+    await waitFor(() => backend.started === 1)
+
+    const second = app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+    await waitFor(() => admission.snapshot().queued === 1)
+
+    const third = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+    expect(third.status).toBe(503)
+    const rejected = await third.json() as { error: { type: string; reason: string; admission: { active: number; queued: number } } }
+    expect(rejected.error.type).toBe('admission_rejected')
+    expect(rejected.error.reason).toBe('queue_full')
+    expect(rejected.error.admission.active).toBe(1)
+    expect(rejected.error.admission.queued).toBe(1)
+    expect(backend.started).toBe(1)
+
+    backend.releaseOne()
+    expect((await first).status).toBe(200)
+    await waitFor(() => backend.started === 2)
+    backend.releaseOne()
+    expect((await second).status).toBe(200)
+    expect(admission.snapshot()).toMatchObject({ active: 0, queued: 0 })
   })
 
   it('returns 400 on malformed JSON', async () => {
@@ -659,8 +735,8 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     const args = b.buildArgs(baseReq, null, 'byob')
     expect(args).toContain('--dangerously-skip-permissions')
     // And must NOT carry hosted-safe's plan/disallowed-tools baggage
-    expect(args).not.toContain('plan')
     expect(args).not.toContain('--permission-mode')
+    expect(args).not.toContain('plan')
     expect(args).not.toContain('--disallowed-tools')
   })
 
