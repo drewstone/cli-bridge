@@ -86,6 +86,7 @@ describe('host executor semaphore', () => {
     queuedResult.child.kill()
     late.release()
     late.child.kill()
+    expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
   })
 
   it('rejects with timeout when no slot frees within the deadline', async () => {
