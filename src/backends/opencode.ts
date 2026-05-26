@@ -28,6 +28,7 @@ import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { killTree } from '../executors/process-tree.js'
+import { probeCliVersion } from './health-probe.js'
 
 export interface OpencodeBackendOptions {
   bin: string
@@ -49,33 +50,13 @@ export class OpencodeBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    let release = (): void => {}
-    try {
-      const spawned = await this.spawner(this.opts.bin, ['--version'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      release = spawned.release
-      const child = spawned.child
-      return await new Promise<BackendHealth>((resolve) => {
-        let stdout = ''; let stderr = ''
-        child.stdout?.on('data', (b) => { stdout += b.toString() })
-        child.stderr?.on('data', (b) => { stderr += b.toString() })
-        child.on('error', (err) => {
-          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-        })
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-          } else {
-            resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
-          }
-        })
-      })
-    } catch (err) {
-      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
-    } finally {
-      release()
-    }
+    // Self-limiting probe — never leaks a host slot (resilience #529).
+    return probeCliVersion({
+      spawner: this.spawner,
+      bin: this.opts.bin,
+      name: this.name,
+      onReady: (stdout) => ({ name: this.name, state: 'ready', version: stdout.trim() || undefined }),
+    })
   }
 
   async *chat(
