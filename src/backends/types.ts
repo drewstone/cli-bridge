@@ -100,6 +100,12 @@ export interface ChatRequest {
   responseFormat?: { type: 'text' | 'json_object' }
   /** Optional caller-declared AgentProfile. Sandbox uses it natively; local harnesses honor a prompt/context subset. */
   agent_profile?: AgentProfile
+  /** Per-request env overrides forwarded into the spawned CLI's environment.
+   *  Filtered through `applyRequestEnvOverrides` — only keys on the search-axis
+   *  allowlist survive; secrets / PATH-like keys are dropped on the floor.
+   *  Used by VB to toggle TANGLE_SEARCH_DEFAULT_PROVIDER per profile in the
+   *  search-MCP A/B without running multiple bridge instances. */
+  env?: Record<string, string>
   /**
    * Standard MCP server passthrough. Canonical shape mirrors the
    * Claude Code `mcp-config.json` schema so the same JSON can be fed to

@@ -44,6 +44,7 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { killTree } from '../executors/process-tree.js'
+import { applyRequestEnvOverrides } from '../executors/request-env.js'
 import { probeCliVersion } from './health-probe.js'
 
 export interface PiBackendOptions {
@@ -129,10 +130,17 @@ export class PiBackend implements Backend {
     // (no stdin payload required for `--print` mode).
     args.push(prompt)
 
+    // Per-request env overrides (e.g. TANGLE_SEARCH_DEFAULT_PROVIDER for the
+    // pi-tangle-search A/B). Allowlist-gated; non-allowed keys are dropped on
+    // the floor with a forensic log entry. The bridge's boot env stays the base.
+    const merged = applyRequestEnvOverrides(process.env, req.env)
+    if (merged.dropped.length > 0) {
+      console.warn(`[pi] dropped ${merged.dropped.length} request-env override(s):`, merged.dropped)
+    }
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
-      env: process.env,
+      env: merged.env,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
     })
     const child = spawned.child

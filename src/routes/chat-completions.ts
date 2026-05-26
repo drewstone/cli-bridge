@@ -100,6 +100,18 @@ const chatRequestSchema = z.object({
     mcpServers: z.record(z.unknown()).optional(),
   }).passthrough().optional(),
   cwd: z.string().optional(),
+  /**
+   * Per-request env overrides forwarded to the spawned CLI's environment. Only
+   * keys matching `ENV_FORWARD_ALLOWLIST` (TANGLE_*, YOUCOM_*, EXA_*, TAVILY_*,
+   * PERPLEXITY_*, PARALLEL_*, BRAVE_*, SERPAPI_*, SERPER_*, GOOGLE_CSE_*,
+   * YDC_*) are forwarded; everything else is dropped on the floor (defense
+   * against PATH/LD_PRELOAD/NODE_OPTIONS injection on a bridge that serves
+   * multiple consumers). The forwarded values are merged ON TOP of the bridge's
+   * own env — they override but never delete. Used by VB to toggle
+   * TANGLE_SEARCH_DEFAULT_PROVIDER per profile in the search-MCP A/B without
+   * needing one bridge per arm.
+   */
+  env: z.record(z.string()).optional(),
   metadata: z.record(z.unknown()).optional(),
   /**
    * Where the harness runs.
