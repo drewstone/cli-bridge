@@ -19,6 +19,8 @@
 
 import { spawn } from 'node:child_process'
 import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
+import { getKillReason } from './process-tree.js'
+import { recordTaskDiagnostic } from './diagnostics.js'
 
 const DEFAULT_MAX = 4
 const DEFAULT_ACQUIRE_DEADLINE_MS = 60_000
@@ -126,6 +128,38 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     // the backend remembered to call release(). Idempotent double-call.
     child.once('exit', release)
     child.once('error', release)
+
+    // Pillar 0 — per-task diagnostic at the chokepoint (covers ALL backends):
+    // one record per spawned process with exit code/signal, kill reason,
+    // duration, and cwd (carries the caller's workspace id for cell
+    // correlation). Best-effort; never affects execution.
+    const startMs = Date.now()
+    child.once('exit', (code, signal) => {
+      recordTaskDiagnostic({
+        ts: new Date().toISOString(),
+        bin,
+        cwd: opts.cwd ?? null,
+        pid: child.pid ?? null,
+        durationMs: Date.now() - startMs,
+        exitCode: code,
+        signal: signal ?? null,
+        killReason: getKillReason(child),
+        termination: signal ? 'killed' : 'exit',
+      })
+    })
+    child.once('error', (err) => {
+      recordTaskDiagnostic({
+        ts: new Date().toISOString(),
+        bin,
+        cwd: opts.cwd ?? null,
+        pid: child.pid ?? null,
+        durationMs: Date.now() - startMs,
+        exitCode: null,
+        signal: null,
+        killReason: `spawn-error: ${err.message.slice(0, 120)}`,
+        termination: 'spawn-error',
+      })
+    })
     const result: SpawnResult = {
       child,
       release,

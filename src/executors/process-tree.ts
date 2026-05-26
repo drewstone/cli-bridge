@@ -46,6 +46,19 @@ import type { ChildProcess } from 'node:child_process'
 export const DEFAULT_GRACEFUL_TERMINATION_MS = 2000
 
 /**
+ * Why a child was killed, recorded so the executor's exit diagnostic can
+ * attribute a SIGTERM to its cause instead of leaving it a mystery. Keyed on
+ * the ChildProcess (WeakMap → no leak; entry GC'd with the process object).
+ */
+const killReasons = new WeakMap<ChildProcess, string>()
+
+/** The reason killTree was last called for this child, or null if it exited
+ *  naturally / was never killed by us. */
+export function getKillReason(child: ChildProcess): string | null {
+  return killReasons.get(child) ?? null
+}
+
+/**
  * Kill a child and every descendant it spawned. Idempotent — safe to
  * call multiple times. Returns once the child has actually exited (or
  * the grace+kill window has elapsed).
@@ -56,9 +69,14 @@ export const DEFAULT_GRACEFUL_TERMINATION_MS = 2000
  */
 export async function killTree(
   child: ChildProcess,
-  opts: { gracefulMs?: number } = {},
+  opts: { gracefulMs?: number; reason?: string } = {},
 ): Promise<void> {
   const gracefulMs = opts.gracefulMs ?? DEFAULT_GRACEFUL_TERMINATION_MS
+  // Record the cause BEFORE the early-returns so even a redundant kill call
+  // (idempotent) still attributes it. First-writer-wins: the CAUSAL reason
+  // (timeout/client-abort) must not be clobbered by the later request-end
+  // teardown that runs in the chat() finally on every request.
+  if (opts.reason && !killReasons.has(child)) killReasons.set(child, opts.reason)
   const pid = child.pid
   if (pid === undefined) return
   if (child.exitCode !== null || child.signalCode !== null) return
