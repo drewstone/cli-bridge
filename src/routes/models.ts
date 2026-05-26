@@ -56,6 +56,8 @@ const PI_MODELS: ReadonlyArray<ModelSpec> = [
   { id: 'zai-coding-paas/glm-5-turbo', note: 'GLM 5 Turbo via pi zai-coding-paas extension' },
   { id: 'zai-coding-paas/glm-5', note: 'GLM 5 via pi zai-coding-paas extension' },
   { id: 'zai-glm/glm-4.7', note: 'GLM 4.7 via pi zai-glm (Anthropic-compat)' },
+  { id: 'tangle-router/gemini-3-pro-preview', note: 'Gemini 3 Pro Preview via pi → tangle-router (TANGLE_API_KEY required)' },
+  { id: 'tangle-router/gemini-2.5-flash-lite', note: 'Gemini 2.5 Flash Lite via pi → tangle-router (TANGLE_API_KEY required)' },
 ]
 
 /** Routable provider prefixes = the distinct providers named in each fallback seed. */
