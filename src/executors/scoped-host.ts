@@ -55,6 +55,8 @@ import { writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { hostSpawner, sanitizeHostEnv } from './host.js'
 import type { Spawner, SpawnResult } from './types.js'
+import { getKillReason } from './process-tree.js'
+import { recordTaskDiagnostic } from './diagnostics.js'
 
 const SLICE = 'cli-bridge-llm.slice'
 const DEFAULT_SCOPE_TASKS_MAX = 128
@@ -266,6 +268,40 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   child.on('error', (err) => { spawnError = err })
   child.once('exit', releaseSemaphore)
   child.once('error', releaseSemaphore)
+
+  // Pillar 0 — per-task diagnostic on the scoped path too (systemd-active
+  // bridges run here, NOT through hostSpawner — the bare-host hook misses
+  // them). `bin` is the real CLI (claude/opencode/…), recorded straight; the
+  // systemd-run wrapper is an implementation detail the caller doesn't care
+  // about. cwd carries the caller's workspace id for cell correlation.
+  const recBin = bin
+  const startMs = Date.now()
+  child.once('exit', (code, signal) => {
+    recordTaskDiagnostic({
+      ts: new Date().toISOString(),
+      bin: recBin,
+      cwd: opts.cwd ?? null,
+      pid: child.pid ?? null,
+      durationMs: Date.now() - startMs,
+      exitCode: code,
+      signal: signal ?? null,
+      killReason: getKillReason(child),
+      termination: signal ? 'killed' : 'exit',
+    })
+  })
+  child.once('error', (err) => {
+    recordTaskDiagnostic({
+      ts: new Date().toISOString(),
+      bin: recBin,
+      cwd: opts.cwd ?? null,
+      pid: child.pid ?? null,
+      durationMs: Date.now() - startMs,
+      exitCode: null,
+      signal: null,
+      killReason: `spawn-error: ${err.message.slice(0, 120)}`,
+      termination: 'spawn-error',
+    })
+  })
 
   let released = false
   const release = (): void => {
