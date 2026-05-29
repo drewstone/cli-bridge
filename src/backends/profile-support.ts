@@ -156,11 +156,15 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
 
 /**
  * Write the canonical claude/kimi `mcp-config.json` shape from a
- * normalized `McpServerSpec` map. Filters out disabled and non-stdio
- * entries — claude `--mcp-config` and kimi `--mcp-config-file` both
- * speak the same `{mcpServers: {name: {command, args, env, timeout}}}`
- * schema and neither natively loads remote http/sse via this file
- * path.
+ * normalized `McpServerSpec` map. Filters out disabled entries.
+ *
+ * Both stdio and remote (http/sse) transports are emitted: Claude Code's
+ * `--mcp-config` JSON natively accepts `{type:'http'|'sse', url, headers}`
+ * entries alongside stdio `{command, args, env}` ones (mcp-config.json
+ * schema), so a remote MCP server (e.g. an HTTP tool host the caller runs)
+ * is forwarded as-is rather than silently dropped. (Earlier this path was
+ * stdio-only on the mistaken assumption that claude couldn't load remote
+ * servers from the config file — it can.)
  *
  * `timeout` (ms) is the per-MCP-server tool-call timeout. Claude Code
  * honors this in mcp-config.json — its default is 300_000ms which
@@ -177,11 +181,9 @@ export function materialiseMcpServersForClaudeKimi(
   specs: Record<string, McpServerSpec> | null,
 ): MaterialisedMcpConfig | null {
   if (!specs) return null
-  // claude/kimi per-request config is kept to stdio only. Remote
-  // http/sse MCP requires a separate CLI registration path and is not
-  // safe to smuggle through this shared materialiser.
   const mcpServers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
     if (isStdioMcpSpec(spec) && spec.command) {
       mcpServers[name] = {
         command: spec.command,
@@ -189,10 +191,22 @@ export function materialiseMcpServersForClaudeKimi(
         ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
         ...(spec.timeout ? { timeout: spec.timeout } : {}),
       }
+    } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
+      // Remote MCP server — Claude Code loads these from --mcp-config
+      // natively. Forward type/url/headers/timeout verbatim.
+      mcpServers[name] = {
+        type: spec.type,
+        url: spec.url,
+        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+      }
     }
     // unknown transport / missing required fields → drop silently
   }
   const serverNames = Object.keys(mcpServers)
+  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
+    console.error(`[cli-bridge mcp] materialised servers: ${serverNames.length ? serverNames.join(", ") : "(none)"} from specs: ${Object.keys(specs).join(", ") || "(empty)"}`)
+  }
   if (serverNames.length === 0) return null
 
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
