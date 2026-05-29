@@ -267,26 +267,37 @@ export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): Mate
 export function materialiseMcpServersForOpencode(
   specs: Record<string, McpServerSpec> | null,
 ): MaterialisedMcpConfig {
-  const opencodeMcp: Record<string, {
-    type: 'local'
-    command: string[]
-    environment?: Record<string, string>
-    enabled?: boolean
-    timeout?: number
-  }> = {}
+  const opencodeMcp: Record<string,
+    | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
+    | { type: 'remote'; url: string; headers?: Record<string, string>; enabled?: boolean }
+  > = {}
   if (specs) {
     for (const [name, spec] of Object.entries(specs)) {
-      if (!isStdioMcpSpec(spec)) continue
-      if (!spec.command) continue
-      const command: string[] = [spec.command, ...(spec.args ?? [])]
-      opencodeMcp[name] = {
-        type: 'local',
-        command,
-        ...(spec.env && Object.keys(spec.env).length ? { environment: spec.env } : {}),
-        enabled: true,
-        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+      if (spec.enabled === false) continue
+      if (isStdioMcpSpec(spec) && spec.command) {
+        opencodeMcp[name] = {
+          type: 'local',
+          command: [spec.command, ...(spec.args ?? [])],
+          ...(spec.env && Object.keys(spec.env).length ? { environment: spec.env } : {}),
+          enabled: true,
+          ...(spec.timeout ? { timeout: spec.timeout } : {}),
+        }
+      } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
+        // opencode loads remote MCP via `{type:'remote', url, headers}`
+        // (opencode.ai/config.json). Forward verbatim so an HTTP tool host
+        // is reachable, mirroring the claude/kimi remote fix (cli-bridge#48).
+        opencodeMcp[name] = {
+          type: 'remote',
+          url: spec.url,
+          ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+          enabled: true,
+        }
       }
+      // unknown transport / missing required fields → drop
     }
+  }
+  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
+    console.error(`[cli-bridge mcp opencode] materialised: ${Object.keys(opencodeMcp).join(', ') || '(none)'}`)
   }
   const serverNames = Object.keys(opencodeMcp)
 
