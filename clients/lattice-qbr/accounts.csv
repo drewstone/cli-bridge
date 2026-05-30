@@ -1,0 +1,31 @@
+account_id,account_name,arr,renewal_date,nps_score,nps_respondents,ae_owner
+A01,Meridian Financial,85000,2026-06-12,6,2,Marcus
+A02,Vantage Health Systems,120000,2026-07-01,7,5,Marcus
+A03,Crestline Manufacturing,42000,2026-05-28,3,1,Marcus
+A04,Olympia Advisors,65000,2026-08-15,9,8,Marcus
+A05,Dunmore Logistics,38000,2026-09-30,8,4,Marcus
+A06,Silverton Capital,95000,2026-06-01,,0,Marcus
+A07,Harlow Biotech,55000,2026-11-15,10,12,Marcus
+A08,Pemberton Legal,28000,2026-05-30,5,1,Marcus
+A09,Radiant Energy Co,72000,2026-10-01,7,3,Marcus
+A10,Crossway Insurance,110000,2026-07-20,4,6,Marcus
+A11,Pinebrook Realty,31000,2026-12-01,9,4,Marcus
+A12,Talonfield Corp,48000,2026-08-01,6,2,Marcus
+A13,Greystone Partners,88000,2026-06-25,8,7,Marcus
+A14,Cascade Pharma,67000,2026-09-15,7,5,Marcus
+A15,Northfield Equity,54000,2026-11-01,9,3,Marcus
+A16,Brightshore Media,22000,2026-07-10,4,9,Marcus
+A17,Summit Risk Group,91000,2026-06-08,6,4,Marcus
+A18,Foxwood Trading,43000,2026-10-20,8,2,Marcus
+A19,Ironclad Systems,76000,2026-08-30,5,11,Marcus
+A20,Waverly Compliance,33000,2026-09-01,9,6,Marcus
+A21,Halcyon Ventures,62000,2026-12-15,7,3,Marcus
+A22,Denbrook Analytics,47000,2026-07-25,8,5,Marcus
+A23,Larkmoor Advisory,59000,2026-06-20,6,1,Marcus
+A24,Cobalt Financial,83000,2026-08-10,9,7,Marcus
+A25,Thorngate Capital,39000,2026-11-20,7,4,Marcus
+A26,Redwood Compliance,70000,2026-09-25,4,8,Marcus
+A27,Fairview Holdings,44000,2026-10-05,8,3,Marcus
+A28,Glenmore Partners,56000,2026-07-15,6,2,Marcus
+A29,Astoria Risk,81000,2026-06-30,5,6,Marcus
+A30,Peregrine Advisory,37000,2026-12-01,9,5,Marcus

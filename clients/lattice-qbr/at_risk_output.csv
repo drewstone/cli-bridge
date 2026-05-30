@@ -1,0 +1,31 @@
+rank,account_id,account_name,arr,ae_owner,tier,data_score,qual_delta,score,data_flags,champion_left,rfp_active,expansion_likely,ae_note,renewal,usage,tickets,nps,top_reason
+1,A04,Olympia Advisors,65000,Marcus,WATCH,12,+35,47,,,✓,,procurement RFP'd 3 competitors last week — Sarah confirmed,renewal in 94d,usage GROWING (14d stale),0 tickets,NPS 9 promoter (n=8),RFP active — procurement evaluating competitors | renewal in 94d
+2,A10,Crossway Insurance,110000,Marcus,HIGH,83,+25,100,,✓,,,Mike Chen left Apr 22 — no successor named yet,renewal in 68d,"usage DECLINING steeply (>30% drop, 14d stale)",4 real tickets,NPS 4 detractor (n=6),"champion left | usage DECLINING steeply (>30% drop, 14d stale)"
+3,A17,Summit Risk Group,91000,Marcus,HIGH,92,+25,100,,✓,,,David Okafor left May 1 — replacement starts June,renewal in 26d,"usage DECLINING steeply (>30% drop, 14d stale)",3 real tickets (1 tagged bug excl.),NPS 6 detractor (n=4),"champion left | usage DECLINING steeply (>30% drop, 14d stale)"
+4,A01,Meridian Financial,85000,Marcus,HIGH,91,—,91,nps:excl(n=2),,,,,renewal in 30d,"usage DECLINING steeply (>30% drop, 14d stale)",3 real tickets,"NPS 6 (detractor, n=2 — excluded, low sample)","usage DECLINING steeply (>30% drop, 14d stale) | renewal in 30d"
+5,A06,Silverton Capital,95000,Marcus,HIGH,91,—,91,,,,,,renewal in 19d,"usage DECLINING steeply (>30% drop, 14d stale)",4 real tickets (2 tagged bug excl.),NPS: no data,"usage DECLINING steeply (>30% drop, 14d stale) | renewal in 19d"
+6,A03,Crestline Manufacturing,42000,Marcus,HIGH,81,—,81,nps:excl(n=1),,,,,renewal in 15d,"usage DECLINING steeply (>30% drop, 14d stale)",1 real ticket (2 tagged bug excl.),"NPS 3 (detractor, n=1 — excluded, low sample)","usage DECLINING steeply (>30% drop, 14d stale) | renewal in 15d"
+7,A13,Greystone Partners,88000,Marcus,HIGH,52,+25,77,,✓,,,Jennifer Park left Apr 8 — interim contact is admin assistant,renewal in 43d,usage FLAT (14d stale),0 tickets,NPS 8 passive (n=7),champion left | renewal in 43d
+8,A26,Redwood Compliance,70000,Marcus,HIGH,71,—,71,,,,,,renewal in 135d,"usage DECLINING steeply (>30% drop, 14d stale)",3 real tickets,NPS 4 detractor (n=8),"usage DECLINING steeply (>30% drop, 14d stale) | NPS 4 detractor (n=8)"
+9,A08,Pemberton Legal,28000,Marcus,HIGH,69,—,69,nps:excl(n=1),,,,,renewal in 17d,"usage DECLINING (>15% drop, 14d stale)",1 real ticket (1 tagged bug excl.),"NPS 5 (detractor, n=1 — excluded, low sample)","renewal in 17d | usage DECLINING (>15% drop, 14d stale)"
+10,A29,Astoria Risk,81000,Marcus,HIGH,63,—,63,,,,,,renewal in 48d,usage FLAT (14d stale),2 real tickets,NPS 5 detractor (n=6),renewal in 48d | NPS 5 detractor (n=6)
+11,A19,Ironclad Systems,76000,Marcus,WATCH,71,-15,56,,,,✓,expansion call booked — adding 2 product lines,renewal in 109d,"usage DECLINING steeply (>30% drop, 14d stale)",3 real tickets,NPS 5 detractor (n=11),"usage DECLINING steeply (>30% drop, 14d stale)"
+12,A02,Vantage Health Systems,120000,Marcus,WATCH,52,—,52,,,,,,renewal in 49d,usage FLAT (14d stale),0 tickets,NPS 7 passive (n=5),renewal in 49d | usage FLAT (14d stale)
+13,A23,Larkmoor Advisory,59000,Marcus,WATCH,52,—,52,nps:excl(n=1),,,,,renewal in 38d,usage FLAT (14d stale),0 tickets,"NPS 6 (detractor, n=1 — excluded, low sample)",renewal in 38d | usage FLAT (14d stale)
+14,A16,Brightshore Media,22000,Marcus,WATCH,48,—,48,,,,,,renewal in 58d,usage GROWING (14d stale),0 tickets,NPS 4 detractor (n=9),renewal in 58d | NPS 4 detractor (n=9)
+15,A28,Glenmore Partners,56000,Marcus,WATCH,46,—,46,nps:excl(n=2),,,,,renewal in 63d,usage FLAT (14d stale),2 real tickets,"NPS 6 (detractor, n=2 — excluded, low sample)",renewal in 63d | usage FLAT (14d stale)
+16,A22,Denbrook Analytics,47000,Marcus,WATCH,42,—,42,,,,,,renewal in 73d,usage FLAT (14d stale),0 tickets,NPS 8 passive (n=5),renewal in 73d | usage FLAT (14d stale)
+17,A12,Talonfield Corp,48000,Marcus,WATCH,41,—,41,nps:excl(n=2),,,,,renewal in 80d,usage FLAT (14d stale),0 tickets,"NPS 6 (detractor, n=2 — excluded, low sample)",renewal in 80d | usage FLAT (14d stale)
+18,A24,Cobalt Financial,83000,Marcus,WATCH,35,—,35,,,,,,renewal in 89d,usage FLAT (14d stale),0 tickets,NPS 9 promoter (n=7),renewal in 89d | usage FLAT (14d stale)
+19,A09,Radiant Energy Co,72000,Marcus,OK,30,—,30,,,,,,renewal in 141d,usage FLAT (14d stale),0 tickets,NPS 7 passive (n=3),usage FLAT (14d stale) | renewal in 141d
+20,A14,Cascade Pharma,67000,Marcus,OK,30,—,30,,,,,,renewal in 125d,usage FLAT (14d stale),0 tickets,NPS 7 passive (n=5),usage FLAT (14d stale) | renewal in 125d
+21,A27,Fairview Holdings,44000,Marcus,OK,30,—,30,,,,,,renewal in 145d,usage FLAT (14d stale),0 tickets,NPS 8 passive (n=3),usage FLAT (14d stale) | renewal in 145d
+22,A15,Northfield Equity,54000,Marcus,OK,23,—,23,,,,,,renewal in 172d,usage FLAT (14d stale),0 tickets,NPS 9 promoter (n=3),usage FLAT (14d stale) | renewal in 172d
+23,A21,Halcyon Ventures,62000,Marcus,OK,22,—,22,,,,,,renewal in 216d,usage FLAT (14d stale),0 tickets,NPS 7 passive (n=3),usage FLAT (14d stale) | NPS 7 passive (n=3)
+24,A25,Thorngate Capital,39000,Marcus,OK,22,—,22,,,,,,renewal in 191d,usage FLAT (14d stale),0 tickets,NPS 7 passive (n=4),usage FLAT (14d stale) | NPS 7 passive (n=4)
+25,A05,Dunmore Logistics,38000,Marcus,OK,20,—,20,,,,,,renewal in 140d,usage GROWING (14d stale),0 tickets,NPS 8 passive (n=4),renewal in 140d | NPS 8 passive (n=4)
+26,A18,Foxwood Trading,43000,Marcus,OK,15,—,15,nps:excl(n=2),,,,,renewal in 160d,usage GROWING (14d stale),0 tickets,"NPS 8 (passive, n=2 — excluded, low sample)",renewal in 160d
+27,A30,Peregrine Advisory,37000,Marcus,OK,14,—,14,,,,,,renewal in 202d,usage FLAT (14d stale),0 tickets,NPS 9 promoter (n=5),usage FLAT (14d stale)
+28,A20,Waverly Compliance,33000,Marcus,OK,12,—,12,,,,,,renewal in 111d,usage GROWING (14d stale),0 tickets,NPS 9 promoter (n=6),renewal in 111d
+29,A07,Harlow Biotech,55000,Marcus,OK,4,—,4,,,,,,renewal in 186d,usage GROWING (14d stale),0 tickets,NPS 10 promoter (n=12),
+30,A11,Pinebrook Realty,31000,Marcus,OK,4,—,4,,,,,,renewal in 202d,usage GROWING (14d stale),0 tickets,NPS 9 promoter (n=4),

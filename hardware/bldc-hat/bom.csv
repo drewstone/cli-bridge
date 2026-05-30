@@ -1,0 +1,74 @@
+Ref,Qty,Value,Description,Manufacturer,MPN,Mouser PN,LCSC PN,Package,Unit$,Ext$,Notes
+J1,1,2x20 HDR,RPi 40-pin header low-profile,Samtec,SSW-120-01-F-D,200-SSW-12001FD,,2x20 TH 2.54mm,3.50,3.50,HAT GPIO header — must use low-profile
+J2,1,XT30PW-M,24V power input connector,Amass,XT30PW-M,,,XT30 PCB mount,1.20,1.20,30A rated — solder directly to PCB
+J3,1,3-pos terminal,Motor phase output,Phoenix Contact,1984617,,C128386,3.5mm pitch 3-pos,1.80,1.80,Wire-to-board for motor leads
+J4,1,JST PH 5-pin,Hall sensor connector,JST,B5B-PH-K-S,,C131337,2.0mm pitch 5-pos,0.30,0.30,
+J5,1,2x3 header,JTAG/SWD debug (DNP),Wurth,61300211121,,C65114,2.54mm 2x3 TH,0.30,0.30,DNP — footprint only
+U1,1,DRV8305NDCA,3-phase gate driver 65V SPI,Texas Instruments,DRV8305NDCAR,595-DRV8305NDCAR,,HTSSOP-38,5.20,5.20,Verify availability — also DRV8305EDCA (OTP version)
+U2,1,LMR33630BDDA,Synchronous buck 4-36V 3A,Texas Instruments,LMR33630BDDA,595-LMR33630BDDA,,WSON-8 2x2mm,1.85,1.85,
+U3,1,AP2112K-3.3TRG1,600mA LDO 3.3V,Diodes Inc,AP2112K-3.3TRG1,621-AP2112K-3.3TRG1,C51118,SOT-25,0.28,0.28,DNP if using RPi 3V3 rail for VDD only
+U4,1,MCP3204-CI/SL,12-bit 4-ch SPI ADC,Microchip,MCP3204-CI/SL,579-MCP3204-CI/SL,C16368,SOIC-14,2.50,2.50,DNP — populate for current telemetry
+U5,1,M24C02-WMN6TP,2kbit I2C EEPROM (HAT ID),STMicroelectronics,M24C02-WMN6TP,511-M24C02-WMN6TP,C90069,SOT-23-5,0.28,0.28,Required for RPi HAT compliance
+Q1,1,BSZ033N04LSI,N-MOSFET 40V 43A 3.3mΩ (HS Phase A),Infineon,BSZ033N04LSIATMA1,726-BSZ033N04LSIATMA1,,TDSON-8 3x3mm,0.55,0.55,
+Q2,1,BSZ033N04LSI,N-MOSFET 40V 43A 3.3mΩ (HS Phase B),Infineon,BSZ033N04LSIATMA1,726-BSZ033N04LSIATMA1,,TDSON-8 3x3mm,0.55,0.55,
+Q3,1,BSZ033N04LSI,N-MOSFET 40V 43A 3.3mΩ (HS Phase C),Infineon,BSZ033N04LSIATMA1,726-BSZ033N04LSIATMA1,,TDSON-8 3x3mm,0.55,0.55,
+Q4,1,BSZ033N04LSI,N-MOSFET 40V 43A 3.3mΩ (LS Phase A),Infineon,BSZ033N04LSIATMA1,726-BSZ033N04LSIATMA1,,TDSON-8 3x3mm,0.55,0.55,
+Q5,1,BSZ033N04LSI,N-MOSFET 40V 43A 3.3mΩ (LS Phase B),Infineon,BSZ033N04LSIATMA1,726-BSZ033N04LSIATMA1,,TDSON-8 3x3mm,0.55,0.55,
+Q6,1,BSZ033N04LSI,N-MOSFET 40V 43A 3.3mΩ (LS Phase C),Infineon,BSZ033N04LSIATMA1,726-BSZ033N04LSIATMA1,,TDSON-8 3x3mm,0.55,0.55,
+Q_RPol,1,PSMN4R0-40BS,P-ch MOSFET 40V -7A (reverse polarity),Nexperia,PSMN4R0-40BS,,,SOT-669 / LFPAK33,0.45,0.45,Use with LTC4359 or standalone gate drive
+U_RPol,1,LTC4359ITS8,Ideal diode controller,Analog Devices,LTC4359ITS8,584-LTC4359ITS8,,TSOT-23-8,3.10,3.10,Drives Q_RPol for low Vdrop protection
+TVS1,1,SMAJ36A,36V 400W TVS unidirectional,Littelfuse,SMAJ36A,,C114830,SMA,0.25,0.25,Motor back-EMF suppression
+F1,1,7.5A fuse holder,PCB mount blade fuse + 7.5A fuse,Littelfuse,0481007.WT,,C2912142,PCB blade,0.60,0.60,Includes fuse
+D_BS1,1,BAT54AWT1G,Schottky 40V 200mA,onsemi,BAT54AWT1G,863-BAT54AWT1G,,SOD-323,0.12,0.12,Bootstrap diode phase A (40V rated — replaces BAT54S)
+D_BS2,1,BAT54AWT1G,Schottky 40V 200mA,onsemi,BAT54AWT1G,863-BAT54AWT1G,,SOD-323,0.12,0.12,Bootstrap diode phase B
+D_BS3,1,BAT54AWT1G,Schottky 40V 200mA,onsemi,BAT54AWT1G,863-BAT54AWT1G,,SOD-323,0.12,0.12,Bootstrap diode phase C
+L1,1,SLF12575T-6R8N4R0-PF,6.8µH 4A 35mΩ DCR power inductor,TDK,SLF12575T-6R8N4R0-PF,810-SLF12575T-6R8N4,C408392,12.5x12.5x7.5mm,1.20,1.20,Buck inductor — verify Isat ≥ 5A
+R1,1,100kΩ 1%,Buck FB top resistor,Vishay,CRCW0402100KFKED,,C25803,0402,0.02,0.02,
+R2,1,33.2kΩ 1%,Buck FB bottom resistor (sets 5.01V),Vishay,CRCW040233K2FKED,,C25892,0402,0.02,0.02,
+R3,1,10kΩ,DRV8305 MODE resistor,Vishay,CRCW040210K0FKED,,C25804,0402,0.02,0.02,
+R4,1,100kΩ,Q_RPol gate bias,Vishay,CRCW0402100KFKED,,C25803,0402,0.02,0.02,
+R5,1,1kΩ,Hall 5V current limit,Vishay,CRCW04021K00FKED,,C11702,0402,0.02,0.02,
+R6,1,10Ω,Gate resistor HS Phase A,Vishay,CRCW040210R0JNED,,C22859,0402,0.02,0.02,
+R7,1,10Ω,Gate resistor HS Phase B,Vishay,CRCW040210R0JNED,,C22859,0402,0.02,0.02,
+R8,1,10Ω,Gate resistor HS Phase C,Vishay,CRCW040210R0JNED,,C22859,0402,0.02,0.02,
+R9,1,10Ω,Gate resistor LS Phase A,Vishay,CRCW040210R0JNED,,C22859,0402,0.02,0.02,
+R10,1,10Ω,Gate resistor LS Phase B,Vishay,CRCW040210R0JNED,,C22859,0402,0.02,0.02,
+R11,1,10Ω,Gate resistor LS Phase C,Vishay,CRCW040210R0JNED,,C22859,0402,0.02,0.02,
+R12,1,10Ω,nFAULT pull-up to 3.3V,Vishay,CRCW040210R0JNED,,C22859,0402,0.02,0.02,
+R13,1,10kΩ,nSLEEP pull-down (default off),Vishay,CRCW040210K0FKED,,C25804,0402,0.02,0.02,
+R14,1,10kΩ,HALL_A pull-up to 3V3,Vishay,CRCW040210K0FKED,,C25804,0402,0.02,0.02,
+R15,1,10kΩ,HALL_B pull-up to 3V3,Vishay,CRCW040210K0FKED,,C25804,0402,0.02,0.02,
+R16,1,10kΩ,HALL_C pull-up to 3V3,Vishay,CRCW040210K0FKED,,C25804,0402,0.02,0.02,
+R17,1,100Ω,HALL_A RC filter series,Vishay,CRCW04020100FNED,,C17436,0402,0.02,0.02,
+R18,1,100Ω,HALL_B RC filter series,Vishay,CRCW04020100FNED,,C17436,0402,0.02,0.02,
+R19,1,100Ω,HALL_C RC filter series,Vishay,CRCW04020100FNED,,C17436,0402,0.02,0.02,
+R20,1,3.9kΩ,EEPROM SDA pull-up,Vishay,CRCW04023K90FKED,,C25900,0402,0.02,0.02,
+R21,1,3.9kΩ,EEPROM SCL pull-up,Vishay,CRCW04023K90FKED,,C25900,0402,0.02,0.02,
+R22,1,0Ω DNP,EEPROM WP (install to write-protect),Vishay,CRCW04020000Z0ED,,C17168,0402,0.02,0.02,DNP during bring-up; populate after EEPROM programming
+R_sh1,1,5mΩ 1%,Phase A current sense shunt,Susumu,RL3720T-R005-F,652-RL3720T-R005-F,,2512 Kelvin 4-term,0.85,0.85,3W rated; Kelvin connection mandatory
+R_sh2,1,5mΩ 1%,Phase B current sense shunt,Susumu,RL3720T-R005-F,652-RL3720T-R005-F,,2512 Kelvin 4-term,0.85,0.85,
+R_sh3,1,5mΩ 1%,Phase C current sense shunt,Susumu,RL3720T-R005-F,652-RL3720T-R005-F,,2512 Kelvin 4-term,0.85,0.85,
+R_LED1,1,1kΩ,Green LED current limit (5V → 2V @ 3mA),Vishay,CRCW04021K00FKED,,C11702,0402,0.02,0.02,
+R_LED2,1,1kΩ,Red LED current limit (3.3V → 2V @ 1.3mA),Vishay,CRCW04021K00FKED,,C11702,0402,0.02,0.02,
+R_ESD1,3,—,Dual ESD protection (SPI + GPIO lines),NXP,PRTR5V0U2X,771-PRTR5V0U2X,C12333,SC-88A,0.18,0.54,3 devices for 6 signal lines
+C1,4,100µF 35V,Bulk electrolytic — low ESR,Panasonic,EEU-FR1V101,,C3016,10x12.5mm radial,0.40,1.60,
+C2,4,4.7µF 10V X5R,HF decoupling 0805,Murata,GRM21BR61A475KE51L,,C15850,0805,0.06,0.24,
+C_BS1,3,100nF 50V X7R,Bootstrap hold-up caps 0402,TDK,CGA2B3X7R1H104K050BB,,C1608,0402,0.03,0.09,
+C_buck_in1,1,10µF 25V X5R,Buck converter input cap 0805,Murata,GRM21BR61E106KA73L,,C2682,0805,0.08,0.08,
+C_buck_in2,1,100nF 50V X7R,Buck input HF bypass 0402,TDK,CGA2B3X7R1H104K050BB,,C1608,0402,0.03,0.03,
+C_buck_out1,2,22µF 10V X5R,Buck output cap 0805,Murata,GRM21BR61A226ME44L,,C45783,0805,0.12,0.24,
+C_buck_out2,1,100nF 50V X7R,Buck output HF bypass 0402,TDK,CGA2B3X7R1H104K050BB,,C1608,0402,0.03,0.03,
+C_ldo_in,1,10µF 10V X5R,LDO input cap 0805,Murata,GRM21BR61A106KE19L,,C2682,0805,0.08,0.08,
+C_ldo_out,1,10µF 10V X5R,LDO output cap 0805,Murata,GRM21BR61A106KE19L,,C2682,0805,0.08,0.08,
+C_drv_vdd,2,100nF 50V X7R,DRV8305 VDD bypass 0402,TDK,CGA2B3X7R1H104K050BB,,C1608,0402,0.03,0.06,
+C_drv_pvdd,2,100nF 50V X7R,DRV8305 PVDD bypass 0402,TDK,CGA2B3X7R1H104K050BB,,C1608,0402,0.03,0.06,
+C_hall,3,10nF 50V X7R,Hall sensor RC filter caps 0402,TDK,GRM15XR71H103KA88D,,C57112,0402,0.02,0.06,
+C_adc,1,100nF 50V X7R,ADC bypass 0402,TDK,CGA2B3X7R1H104K050BB,,C1608,0402,0.03,0.03,
+LED1,1,Green 0805,5V power-on indicator,Kingbright,APT2012CGCK,,C2297,0805,0.08,0.08,
+LED2,1,Red 0805,nFAULT indicator,Kingbright,APT2012SURCK,,C2286,0805,0.08,0.08,
+TP1,11,Keystone 5015,Test point via pad,Keystone,5015,,C2905951,SMD pad,0.05,0.55,GND/5V/3V3/24V/PhA-C/CSA A-C/nFAULT
+,,,,,,,,,,,,
+,,TOTAL BOM COST (1 unit):,,,,,,,$38.24,,Does not include PCB or assembly
+,,JLCPCB 4-layer HAT PCB (5 pcs):,,,,,,,$55,,Estimated — verify on jlcpcb.com
+,,JLCPCB SMT assembly (1 side, 1 unit):,,,,,,,$40,,Estimated economic tier
+,,Prototype run cost (5 boards + assembly):,,,,,,,$350,,Estimated; verify with actual fab quote
