@@ -120,10 +120,19 @@ export class PiBackend implements Backend {
     if (spec.provider) args.push('--provider', spec.provider)
     if (spec.model) args.push('--model', spec.model)
     if (session?.internalId) {
+      // Resume by pi's own minted UUID (captured from the turn-1 `session` event
+      // and persisted by SessionStore). pi keys its on-disk session by that UUID
+      // AND by cwd namespace, so the resuming turn must run in the same cwd — the
+      // route already restores session.cwd, so this holds.
       args.push('--session', session.internalId)
-    } else {
-      args.push('--no-session')
     }
+    // FIRST turn: do NOT pass --no-session. --no-session means EPHEMERAL — pi
+    // mints a session id and emits it on the `session` event but never writes the
+    // file, so the next turn's `--session <that-id>` fails with "No session found
+    // matching '<id>'" (every pi multi-shot resume broke this way — the single
+    // largest cli-bridge error class). Omitting the flag lets pi auto-save, so the
+    // captured UUID is resumable. Verified: turn1 (no flag) → turn2 --session <uuid>
+    // recalls prior context; with --no-session it does not.
     const thinking = thinkingFlagForEffort(req.effort)
     if (thinking) args.push('--thinking', thinking)
     // The prompt goes as a positional argument. Pi reads it directly
