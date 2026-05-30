@@ -170,6 +170,7 @@ export class PiBackend implements Backend {
       let stderr = ''
       let emittedContent = false
       let sawError: string | null = null
+      let sawAnyEvent = false
       let usage: { input?: number; output?: number } | undefined
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
@@ -194,6 +195,7 @@ export class PiBackend implements Backend {
         } catch {
           continue
         }
+        sawAnyEvent = true
 
         const type = String(ev.type ?? '')
 
@@ -287,6 +289,19 @@ export class PiBackend implements Backend {
 
       if (sawError && !emittedContent) {
         throw new BackendError(`pi error: ${sawError}`, 'upstream')
+      }
+
+      // Exit 0 but pi emitted ZERO events (a 0-byte stream — no session, no
+      // content, no usage). Some provider/model paths (e.g.
+      // moonshot/kimi-k2-thinking, tangle-router/gemini-3-pro-preview) return an
+      // empty upstream response with exit 0. Yielding finish_reason:'stop' here
+      // would record a PHANTOM empty success; surface it as a typed upstream
+      // error so the consumer retries / scores it honestly. Note: a tool-only
+      // turn still emits session + tool_call + turn_end events, so this guards
+      // ONLY the genuinely-empty case (sawAnyEvent stays false), never a real
+      // turn that simply produced no assistant text.
+      if (!sawAnyEvent) {
+        throw new BackendError('pi produced no output (empty upstream response, exit 0)', 'upstream')
       }
 
       yield {

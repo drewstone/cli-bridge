@@ -85,6 +85,41 @@ describe('PiBackend', () => {
     ])
   })
 
+  it('throws on an empty exit-0 stream instead of a phantom finish_reason:stop', async () => {
+    // Some provider/model paths (moonshot/kimi-k2-thinking, gemini-3-pro-preview)
+    // return a 0-byte stream with exit 0. Treated as finish_reason:'stop' that is
+    // a phantom empty success; it must surface as a typed upstream error so the
+    // consumer retries / scores it honestly. (The #3 cli-bridge benchmark error.)
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([]), // exit 0, ZERO events emitted
+    })
+    await expect(collect(backend.chat({
+      model: 'pi/moonshot/kimi-k2-thinking',
+      messages: [{ role: 'user', content: 'x' }],
+    }, null, new AbortController().signal))).rejects.toThrow(/no output|empty upstream/i)
+  })
+
+  it('a tool-only turn (events but no assistant text) is NOT treated as empty', async () => {
+    // Guard the guard: an agent that only ran tools still emits session + turn_end
+    // events, so sawAnyEvent is true and the turn completes normally (no false error).
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-tool-1' },
+        { type: 'turn_end', message: { usage: { input: 3, output: 0 } } },
+        { type: 'agent_end' },
+      ]),
+    })
+    const deltas = await collect(backend.chat({
+      model: 'pi/deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'x' }],
+    }, null, new AbortController().signal))
+    expect(deltas.at(-1)).toEqual({ finish_reason: 'stop', usage: { input_tokens: 3, output_tokens: 0 } })
+  })
+
   it('also accepts prompt_tokens/completion_tokens usage from partial.usage', async () => {
     const backend = new PiBackend({
       bin: 'pi',
