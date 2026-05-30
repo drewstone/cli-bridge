@@ -4,7 +4,12 @@ export default {
     "pre-commit": {
       checks: [
         { id: "merge-conflict-markers", builtin: "merge-conflict-markers", required: true },
-        { id: "suspicious-secrets", builtin: "suspicious-secrets", required: true }
+        { id: "suspicious-secrets", builtin: "suspicious-secrets", required: true },
+        // Typecheck gate: cli-bridge is committed-then-restarted-LIVE by the benchmark
+        // harness, so a type-broken commit reaches the running bridge before CI fires
+        // (happened twice in one session). Uses the framework's generic `run` check —
+        // no shared-binary change. Bypass with --no-verify when genuinely needed.
+        { id: "typecheck", run: "npx tsc --noEmit", required: true, timeoutSec: 180 }
       ]
     },
     "pre-push": {
