@@ -291,17 +291,18 @@ export class PiBackend implements Backend {
         throw new BackendError(`pi error: ${sawError}`, 'upstream')
       }
 
-      // Exit 0 but pi emitted ZERO events (a 0-byte stream — no session, no
-      // content, no usage). Some provider/model paths (e.g.
-      // moonshot/kimi-k2-thinking, tangle-router/gemini-3-pro-preview) return an
-      // empty upstream response with exit 0. Yielding finish_reason:'stop' here
-      // would record a PHANTOM empty success; surface it as a typed upstream
-      // error so the consumer retries / scores it honestly. Note: a tool-only
-      // turn still emits session + tool_call + turn_end events, so this guards
-      // ONLY the genuinely-empty case (sawAnyEvent stays false), never a real
-      // turn that simply produced no assistant text.
-      if (!sawAnyEvent) {
-        throw new BackendError('pi produced no output (empty upstream response, exit 0)', 'upstream')
+      // Exit 0 but the turn produced NOTHING usable — no assistant text AND zero
+      // output tokens. Two real shapes hit this: a 0-byte stream (no events at
+      // all), and an empty COMPLETION where the model emits a turn_end carrying
+      // `usage.output === 0` with no content (verified live for
+      // moonshot/kimi-k2-thinking: turn_end usage 0/0, zero text). Yielding
+      // finish_reason:'stop' here records a PHANTOM empty success; surface a typed
+      // upstream error so the consumer scores/retries it honestly. Guard requires
+      // BOTH no-content AND zero-output-tokens, so a real text turn (emittedContent)
+      // or a token-producing tool turn (usage.output > 0) passes through untouched.
+      if (!emittedContent && (usage?.output ?? 0) === 0) {
+        const why = sawAnyEvent ? 'empty completion (0 output tokens, no content)' : 'empty upstream response (0-byte stream)'
+        throw new BackendError(`pi produced no output: ${why}`, 'upstream')
       }
 
       yield {
