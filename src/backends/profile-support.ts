@@ -182,6 +182,7 @@ export function materialiseMcpServersForClaudeKimi(
   // safe to smuggle through this shared materialiser.
   const mcpServers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
     if (isStdioMcpSpec(spec) && spec.command) {
       mcpServers[name] = {
         command: spec.command,
@@ -189,8 +190,23 @@ export function materialiseMcpServersForClaudeKimi(
         ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
         ...(spec.timeout ? { timeout: spec.timeout } : {}),
       }
+    } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
+      // Streamable-HTTP / SSE MCP. Both CLIs load this from the config file
+      // (kimi `--mcp-config-file`, claude `--mcp-config`) — kimi reads the
+      // `transport` key, claude reads `type`; we write BOTH so the shared
+      // materialiser is correct for either. (Verified: `kimi mcp add
+      // --transport http <url>` persists exactly {url, transport}.) This is
+      // the path physim's own tool server takes — dropping it (the old
+      // behavior) is why kimi got an empty tool surface and only emitted prose.
+      mcpServers[name] = {
+        type: spec.type,
+        transport: spec.type,
+        url: spec.url,
+        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+      }
     }
-    // unknown transport / missing required fields → drop silently
+    // missing required fields → drop silently
   }
   const serverNames = Object.keys(mcpServers)
   if (serverNames.length === 0) return null

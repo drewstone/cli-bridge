@@ -114,6 +114,12 @@ export class KimiBackend implements Backend {
       '--print',
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
+      // Non-interactive runs can't answer kimi's per-tool approval prompt, so
+      // without this kimi auto-denies every MCP/tool call and silently emits
+      // prose only (the claude-code parallel is --dangerously-skip-permissions).
+      // `-y` = "Automatically approve all actions". kimi only runs byob here, so
+      // auto-approve is the correct posture for this path.
+      '-y',
     ]
     if (configFile) {
       args.push('--config-file', configFile)
