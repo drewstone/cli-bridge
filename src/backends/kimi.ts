@@ -288,6 +288,31 @@ export class KimiBackend implements Backend {
             }
             // 'think' blocks are reasoning chain-of-thought; don't surface.
           }
+          // kimi (1.44) emits agentic tool calls in a TOP-LEVEL `tool_calls` field
+          // (OpenAI shape: [{type:'function', id, function:{name, arguments}}]), NOT
+          // as `tool_use` blocks inside content. Without surfacing them, every
+          // tool-call turn — whose content is just a `think` block — yields nothing,
+          // so a consumer's idle-cap fires before the agent ever emits a text block:
+          // the agentic-streaming dead-air bug (#50). Map to the same flat shape.
+          if (Array.isArray(ev.tool_calls)) {
+            for (const tc of ev.tool_calls as Array<Record<string, unknown>>) {
+              if (!tc || typeof tc !== 'object') continue
+              const fn = (tc.function ?? {}) as Record<string, unknown>
+              const id = String(tc.id ?? '')
+              const name = String(fn.name ?? tc.name ?? '')
+              const rawArgs = fn.arguments ?? tc.arguments ?? {}
+              if (id && name) {
+                yield {
+                  tool_calls: [{
+                    id,
+                    name,
+                    arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs),
+                  }],
+                }
+                emittedToolCall = true
+              }
+            }
+          }
         } else {
           const text = extractText(ev)
           if (text) {
