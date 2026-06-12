@@ -26,12 +26,10 @@
  *   {"type":"turn_end","message":{"usage":{...}}}
  *   {"type":"agent_end"}
  *
- * We currently surface text_delta as ChatDelta.content; thinking_delta is
- * dropped (matches how the kimi backend handles its `think` blocks for
- * non-thinking-aware callers). tool_call events are emitted as keepalives
- * for now — full tool-call mapping is a follow-up since pi's native tools
- * (read/bash/edit/write) execute INSIDE the CLI loop and don't need
- * OpenAI-tool-call round-trips through the bridge.
+ * We surface text_delta as ChatDelta.content and pi tool-call lifecycle events
+ * as OpenAI-shaped tool_calls so downstream trace consumers can observe native
+ * pi tool activity. thinking_delta is dropped (matches how the kimi backend
+ * handles its `think` blocks for non-thinking-aware callers).
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -172,8 +170,10 @@ export class PiBackend implements Backend {
       let internalSessionId: string | undefined
       let stderr = ''
       let emittedContent = false
+      let emittedToolCall = false
       let sawError: string | null = null
       let usage: { input?: number; output?: number } | undefined
+      const piToolCalls = new PiToolCallTracker()
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
 
@@ -253,9 +253,21 @@ export class PiBackend implements Backend {
               yield { content: delta }
             }
           }
-          // thinking_*, tool_call_*, message_start, message_end — drop
-          // for now. Future enhancement: surface thinking as a separate
-          // ChatDelta variant once the OpenAI o1-style schema lands.
+          const toolCall = piToolCalls.observe(ame, ameType)
+          if (toolCall) {
+            emittedToolCall = true
+            yield { tool_calls: [toolCall] }
+          }
+          // thinking_*, message_start, message_end — drop for now.
+          // Future enhancement: surface thinking as a separate ChatDelta
+          // variant once the OpenAI o1-style schema lands.
+          continue
+        }
+
+        const toolCall = piToolCalls.observe(ev, type)
+        if (toolCall) {
+          emittedToolCall = true
+          yield { tool_calls: [toolCall] }
           continue
         }
 
@@ -288,12 +300,12 @@ export class PiBackend implements Backend {
         throw new BackendError(`pi exit ${exitCode ?? 'unknown'}: ${detail}`, isAuth ? 'not_configured' : 'upstream')
       }
 
-      if (sawError && !emittedContent) {
+      if (sawError && !emittedContent && !emittedToolCall) {
         throw new BackendError(`pi error: ${sawError}`, 'upstream')
       }
 
       yield {
-        finish_reason: 'stop',
+        finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
         ...(usage ? { usage: { input_tokens: usage.input, output_tokens: usage.output } } : {}),
       }
     } finally {
@@ -340,4 +352,113 @@ function extractTextFromPartial(partial: unknown): string {
     }
   }
   return out
+}
+
+type ToolCallDelta = NonNullable<ChatDelta['tool_calls']>[number]
+
+class PiToolCallTracker {
+  private readonly emitted = new Set<string>()
+  private readonly byIndex = new Map<number, string>()
+  private nextSyntheticId = 0
+
+  observe(ev: Record<string, unknown>, eventType: string): ToolCallDelta | null {
+    const normalized = eventType.replace(/-/g, '_').toLowerCase()
+    if (!normalized.includes('tool_call')) return null
+
+    const id = this.pickToolCallId(ev) ?? this.idForContentIndex(ev)
+    const name = this.pickToolName(ev)
+    const args = this.pickToolArguments(ev)
+
+    if (!id || !name || this.emitted.has(id)) return null
+    this.emitted.add(id)
+    return {
+      id,
+      name,
+      arguments: stringifyToolArguments(args),
+    }
+  }
+
+  private pickToolCallId(ev: Record<string, unknown>): string | null {
+    for (const key of ['id', 'toolCallId', 'toolCallID', 'tool_call_id', 'callId', 'callID']) {
+      const value = ev[key]
+      if (typeof value === 'string' && value.length > 0) return value
+    }
+
+    const tool = this.pickNestedTool(ev)
+    if (tool) {
+      for (const key of ['id', 'toolCallId', 'toolCallID', 'tool_call_id', 'callId', 'callID']) {
+        const value = tool[key]
+        if (typeof value === 'string' && value.length > 0) return value
+      }
+    }
+
+    return null
+  }
+
+  private idForContentIndex(ev: Record<string, unknown>): string {
+    const raw = ev.contentIndex ?? ev.content_index ?? ev.index
+    const index = typeof raw === 'number' ? raw : Number(raw)
+    if (Number.isFinite(index)) {
+      const existing = this.byIndex.get(index)
+      if (existing) return existing
+      const id = `pi_call_${index}`
+      this.byIndex.set(index, id)
+      return id
+    }
+
+    this.nextSyntheticId += 1
+    return `pi_call_${this.nextSyntheticId}`
+  }
+
+  private pickToolName(ev: Record<string, unknown>): string | null {
+    for (const key of ['name', 'toolName', 'tool_name', 'tool']) {
+      const value = ev[key]
+      if (typeof value === 'string' && value.length > 0) return value
+    }
+
+    const tool = this.pickNestedTool(ev)
+    if (tool) {
+      for (const key of ['name', 'toolName', 'tool_name', 'tool']) {
+        const value = tool[key]
+        if (typeof value === 'string' && value.length > 0) return value
+      }
+    }
+
+    return null
+  }
+
+  private pickToolArguments(ev: Record<string, unknown>): unknown {
+    for (const key of ['input', 'arguments', 'args', 'parameters', 'delta']) {
+      if (ev[key] !== undefined) return ev[key]
+    }
+
+    const tool = this.pickNestedTool(ev)
+    if (tool) {
+      for (const key of ['input', 'arguments', 'args', 'parameters']) {
+        if (tool[key] !== undefined) return tool[key]
+      }
+    }
+
+    return {}
+  }
+
+  private pickNestedTool(ev: Record<string, unknown>): Record<string, unknown> | null {
+    for (const key of ['toolCall', 'tool_call', 'toolCallRequest', 'tool_call_request', 'tool']) {
+      const value = ev[key]
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return value as Record<string, unknown>
+      }
+    }
+    return null
+  }
+}
+
+function stringifyToolArguments(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value === undefined || value === null) return '{}'
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return '{}'
+  }
 }

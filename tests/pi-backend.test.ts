@@ -85,6 +85,83 @@ describe('PiBackend', () => {
     ])
   })
 
+  it('surfaces pi assistantMessageEvent tool_call_start as OpenAI tool_calls', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-tools-1' },
+        {
+          type: 'message_update',
+          assistantMessageEvent: {
+            type: 'tool_call_start',
+            id: 'call_read_1',
+            name: 'read',
+            input: { path: 'src/lib.rs' },
+            contentIndex: 0,
+          },
+        },
+        {
+          type: 'message_update',
+          assistantMessageEvent: {
+            type: 'tool_call_args_delta',
+            id: 'call_read_1',
+            name: 'read',
+            delta: '{"path":"src/lib.rs"}',
+            contentIndex: 0,
+          },
+        },
+        { type: 'turn_end', message: { usage: { input: 20, output: 8 } } },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/moonshot/kimi-k2.6',
+      messages: [{ role: 'user', content: 'inspect the file' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { internal_session_id: 'pi-tools-1' },
+      { tool_calls: [{ id: 'call_read_1', name: 'read', arguments: '{"path":"src/lib.rs"}' }] },
+      { finish_reason: 'tool_calls', usage: { input_tokens: 20, output_tokens: 8 } },
+    ])
+  })
+
+  it('surfaces pi nested tool_call_request events once', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'tool_call_request',
+          toolCall: {
+            id: 'call_bash_1',
+            name: 'bash',
+            arguments: { command: 'pnpm test' },
+          },
+        },
+        {
+          type: 'tool_call_response',
+          toolCall: {
+            id: 'call_bash_1',
+            name: 'bash',
+          },
+        },
+        { type: 'turn_end', message: { usage: { input: 10, output: 5 } } },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'run tests' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
+      { finish_reason: 'tool_calls', usage: { input_tokens: 10, output_tokens: 5 } },
+    ])
+  })
+
   it('also accepts prompt_tokens/completion_tokens usage from partial.usage', async () => {
     const backend = new PiBackend({
       bin: 'pi',
