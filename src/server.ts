@@ -21,6 +21,7 @@ import { FactoryBackend } from './backends/factory.js'
 import { AmpBackend } from './backends/amp.js'
 import { ForgeBackend } from './backends/forge.js'
 import { AcpBackend } from './backends/acp.js'
+import { NanoclawBackend } from './backends/nanoclaw.js'
 import { PiBackend } from './backends/pi.js'
 import { PassthroughBackend } from './backends/passthrough.js'
 import { SandboxBackend } from './backends/sandbox.js'
@@ -181,6 +182,10 @@ export async function buildApp(config: Config): Promise<{
   }
   if (config.backends.has('openclaw')) {
     registry.register(new AcpBackend({ name: 'openclaw', bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault }))
+  }
+  // NanoClaw: a Unix-socket client to the running NanoClaw daemon (not a spawned CLI).
+  if (config.backends.has('nanoclaw')) {
+    registry.register(new NanoclawBackend({ socketPath: config.nanoclawSocket, timeoutMs: config.cliTimeoutMsDefault }))
   }
   if (config.backends.has('pi')) {
     const spawner = await buildExecutorForBackend(config.executors.pi, extras)

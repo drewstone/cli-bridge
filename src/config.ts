@@ -31,6 +31,8 @@ export interface Config {
   /** ACP-protocol agents driven via `<bin> acp` (AcpBackend). */
   hermesBin: string
   openclawBin: string
+  /** NanoClaw daemon CLI-channel Unix socket (NanoclawBackend connects as a client). */
+  nanoclawSocket: string
   piBin: string
   piTimeoutMs: number
   cliTimeoutMsDefault: number
@@ -146,6 +148,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     forgeBin: env.FORGE_BIN ?? 'forge',
     hermesBin: env.HERMES_BIN ?? 'hermes',
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
+    nanoclawSocket: env.NANOCLAW_SOCKET ?? '',
     piBin: env.PI_BIN ?? 'pi',
     piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     cliTimeoutMsDefault: defaultTimeout,
