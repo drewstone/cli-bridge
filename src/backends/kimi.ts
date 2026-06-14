@@ -40,6 +40,7 @@ import type { SessionRecord } from '../sessions/store.js'
 import {
   materialiseEmptyMcpConfig,
   materialiseMcpServersForClaudeKimi,
+  provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
 } from './profile-support.js'
@@ -149,6 +150,9 @@ export class KimiBackend implements Backend {
     const thinkingFlag = thinkingFlagForEffort(req.effort)
     if (thinkingFlag) args.push(thinkingFlag)
 
+    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
+    // stays on kimi's existing path). Fail-safe.
+    provisionProfileWorkspace(req, session, 'kimi', req.cwd ?? session?.cwd ?? process.cwd())
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),

@@ -21,7 +21,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materialiseMcpServersForOpencode, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { materialiseMcpServersForOpencode, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
@@ -119,6 +119,9 @@ export class OpencodeBackend implements Backend {
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
 
+    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
+    // stays on opencode.json path). Fail-safe.
+    provisionProfileWorkspace(req, session, 'opencode', req.cwd ?? session?.cwd ?? process.cwd())
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),

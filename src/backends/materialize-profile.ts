@@ -144,8 +144,13 @@ const tomlStr = (s: string) => JSON.stringify(s) // valid TOML basic string
  * Build the WorkspacePlan for `profile` on `harness`. Pure — no IO. The caller
  * writes plan.files into the run cwd and applies plan.env/plan.flags to the spawn.
  */
-export function materializeProfile(profile: MaterializableProfile, harness: HarnessId): WorkspacePlan {
+export function materializeProfile(
+  profile: MaterializableProfile,
+  harness: HarnessId,
+  opts: { skip?: Unsupported['dimension'][] } = {},
+): WorkspacePlan {
   const h = canonicalHarness(harness)
+  const skip = new Set(opts.skip ?? [])
   const plan: WorkspacePlan = { harness: h, files: [], env: {}, flags: [], unsupported: [] }
   const add = (relPath: string, content: string, mode?: number) => plan.files.push({ relPath, content, ...(mode ? { mode } : {}) })
   const unsupported = (dimension: Unsupported['dimension'], reason: string) => plan.unsupported.push({ dimension, reason })
@@ -170,10 +175,10 @@ export function materializeProfile(profile: MaterializableProfile, harness: Harn
     add(`${dir}/${name}/SKILL.md`, normalizeSkillMd(name, raw))
   }
 
-  // 3) MCP → per-harness format (the divergence the matrix names).
+  // 3) MCP → per-harness format (the divergence the matrix names). Skippable so the
+  //    additive host-wiring can leave MCP on cli-bridge's existing per-harness path.
   const mcp = profile.mcp ?? {}
-  const mcpNames = Object.keys(mcp)
-  if (mcpNames.length) materializeMcp(h, mcp, plan, add, unsupported)
+  if (!skip.has('mcp') && Object.keys(mcp).length) materializeMcp(h, mcp, plan, add, unsupported)
 
   // 4) HOOKS → per-harness format; cwd-native only for claude/codex/gemini/opencode(plugin).
   const hooks = profile.hooks ?? {}

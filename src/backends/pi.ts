@@ -41,7 +41,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { resolvePromptMessages } from './profile-support.js'
+import { provisionProfileWorkspace, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
@@ -152,6 +152,8 @@ export class PiBackend implements Backend {
     // (no stdin payload required for `--print` mode).
     args.push(prompt)
 
+    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
+    provisionProfileWorkspace(req, session, 'pi', req.cwd ?? session?.cwd ?? process.cwd())
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
