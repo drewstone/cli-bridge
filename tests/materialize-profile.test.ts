@@ -5,8 +5,12 @@
  * lock the matrix down.
  */
 import { describe, it, expect } from 'vitest'
+import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   materializeProfile,
+  applyWorkspacePlan,
   normalizeSkillMd,
   type MaterializableProfile,
   type HarnessId,
@@ -111,5 +115,15 @@ describe('materializeProfile — verified per-harness routing', () => {
     const plan = materializeProfile({}, 'claude-code')
     expect(plan.files).toEqual([])
     expect(plan.unsupported).toEqual([])
+  })
+
+  it('applyWorkspacePlan writes every file (with parent dirs) + returns env/flags', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'apply-'))
+    const plan = materializeProfile(FULL, 'kimi-code')
+    const r = applyWorkspacePlan(plan, dir)
+    expect(existsSync(join(dir, '.kimi/skills/fhenix-core/SKILL.md'))).toBe(true)
+    expect(readFileSync(join(dir, '.kimi/skills/fhenix-core/SKILL.md'), 'utf8')).toContain('name: fhenix-core')
+    expect(r.flags).toEqual(expect.arrayContaining(['--mcp-config-file', '.kimi/mcp.json']))
+    expect(r.written).toContain('.kimi/skills/fhenix-core/SKILL.md')
   })
 })

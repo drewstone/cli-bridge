@@ -18,6 +18,9 @@
  * secret word, MCP tool called n>0, hook sentinel file) — see the canary tests.
  */
 
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+
 import type {
   AgentProfile,
   AgentProfileMcpServer,
@@ -207,6 +210,28 @@ function mergeJsonFiles(files: PlanFile[]): PlanFile[] {
     byPath.set(f.relPath, f) // non-JSON or parse-fail: last wins
   }
   return [...byPath.values()]
+}
+
+/**
+ * Apply a WorkspacePlan to a real workspace dir: write every file (creating parent
+ * dirs), and return the env + flags the caller must hand the spawn. This is the IO
+ * consumer of the pure `materializeProfile` — used by the cli-bridge host spawn, the
+ * agent-dev-container box, and VB. Returns `unsupported` so the caller can log/fail.
+ */
+export function applyWorkspacePlan(plan: WorkspacePlan, workspaceDir: string): {
+  env: Record<string, string>
+  flags: string[]
+  unsupported: Unsupported[]
+  written: string[]
+} {
+  const written: string[] = []
+  for (const f of plan.files) {
+    const abs = join(workspaceDir, f.relPath)
+    mkdirSync(dirname(abs), { recursive: true })
+    writeFileSync(abs, f.content, { mode: f.mode ?? 0o644 })
+    written.push(f.relPath)
+  }
+  return { env: plan.env, flags: plan.flags, unsupported: plan.unsupported, written }
 }
 
 // ─── Per-dimension routing (verified matrix) ────────────────────────────────
