@@ -28,6 +28,9 @@ export interface Config {
   factoryBin: string
   ampBin: string
   forgeBin: string
+  /** ACP-protocol agents driven via `<bin> acp` (AcpBackend). */
+  hermesBin: string
+  openclawBin: string
   piBin: string
   piTimeoutMs: number
   cliTimeoutMsDefault: number
@@ -141,6 +144,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
     forgeBin: env.FORGE_BIN ?? 'forge',
+    hermesBin: env.HERMES_BIN ?? 'hermes',
+    openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     piBin: env.PI_BIN ?? 'pi',
     piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     cliTimeoutMsDefault: defaultTimeout,
