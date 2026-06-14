@@ -4,6 +4,35 @@ import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/sandbox'
 import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { applyWorkspacePlan, materializeProfile, type HarnessId, type MaterializableProfile } from './materialize-profile.js'
+
+/**
+ * Provision an AgentProfile's CWD-NATIVE dimensions (skills, context, hooks, subagents,
+ * commands) into the run workspace before the harness spawns — the shared Phase-2 host
+ * wiring. MCP is SKIPPED here so cli-bridge's existing per-harness MCP path (config-dir +
+ * env) stays the source of truth (additive, can't regress MCP). Purely writes files into
+ * `cwd`; returns env/flags (empty for the non-MCP dimensions, which are all cwd-native)
+ * for the caller to apply if present. No-op when there's no profile or nothing to mount.
+ */
+export function provisionProfileWorkspace(
+  req: ChatRequest,
+  session: SessionRecord | null,
+  harness: HarnessId,
+  cwd: string,
+): { env: Record<string, string>; flags: string[]; written: string[] } {
+  try {
+    const profile = resolveAgentProfile(req, session) as MaterializableProfile | null
+    if (!profile) return { env: {}, flags: [], written: [] }
+    const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
+    if (!plan.files.length && !plan.flags.length) return { env: {}, flags: [], written: [] }
+    const applied = applyWorkspacePlan(plan, cwd)
+    return { env: applied.env, flags: applied.flags, written: applied.written }
+  } catch {
+    // FAIL-SAFE: a profile-materialization error must never break a live request.
+    // Worst case the run is un-provisioned (same as today), never crashed.
+    return { env: {}, flags: [], written: [] }
+  }
+}
 
 export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | null): AgentProfile | null {
   if (req.agent_profile && typeof req.agent_profile === 'object') return req.agent_profile

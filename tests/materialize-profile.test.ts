@@ -16,13 +16,17 @@ import {
   type HarnessId,
 } from '../src/backends/materialize-profile.js'
 
+const SKILL_BODY = '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.'
 const FULL: MaterializableProfile = {
   prompt: { systemPrompt: 'You are a build agent.', instructions: ['Prefer real artifacts.'] },
-  skills: { 'fhenix-core': '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.' },
+  // canonical shape — skills/commands under `resources` as refs (matches the box's providers)
+  resources: {
+    skills: [{ kind: 'inline', name: 'fhenix-core', content: SKILL_BODY }],
+    commands: [{ kind: 'inline', name: 'ship', content: 'Ship the build.' }],
+  },
   mcp: { echo: { command: 'echo-mcp', args: ['--stdio'], env: { K: 'v' } }, web: { url: 'https://mcp.example/sse' } },
   hooks: { PreToolUse: [{ command: 'touch .sentinel', matcher: '*' }] },
   subagents: { reviewer: { description: 'reviews diffs', model: 'deepseek', prompt: 'Review.' } },
-  commands: { ship: 'Ship the build.' },
 }
 
 const paths = (h: HarnessId) => materializeProfile(FULL, h).files.map((f) => f.relPath).sort()
@@ -31,7 +35,7 @@ const unsupportedDims = (h: HarnessId) => materializeProfile(FULL, h).unsupporte
 
 describe('materializeProfile — verified per-harness routing', () => {
   it('normalizeSkillMd → name+description frontmatter, body preserved, VB fm stripped', () => {
-    const md = normalizeSkillMd('fhenix-core', FULL.skills!['fhenix-core']!)
+    const md = normalizeSkillMd('fhenix-core', SKILL_BODY)
     expect(md).toMatch(/^---\nname: fhenix-core\ndescription: ".+"\n---\n/)
     expect(md).toContain('Use euint.')
     expect(md).not.toContain('skill: fhenix-core')

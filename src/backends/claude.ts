@@ -30,6 +30,7 @@ import {
   resolveAgentProfile,
   resolveMcpServers,
   type MaterialisedMcpConfig,
+  provisionProfileWorkspace,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -211,6 +212,10 @@ export class ClaudeBackend implements Backend {
     // Argv mode: stdin is ignored. Stdin mode: stdin is piped (we
     // write the NDJSON payload below). The split here matches the
     // contract claude-code-cli expects for each --input-format.
+    // Phase-2 host wiring: provision the profile's cwd-native dimensions (skills,
+    // context, hooks, subagents, commands) into the run workspace before spawn. MCP
+    // stays on the existing path. Fail-safe (never throws).
+    provisionProfileWorkspace(req, session, 'claude', req.cwd ?? session?.cwd ?? process.cwd())
     const spawned = await this.spawner(this.bin, args, {
       stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),

@@ -16,7 +16,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { resolvePromptMessages } from './profile-support.js'
+import { provisionProfileWorkspace, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
@@ -91,6 +91,8 @@ export class GeminiBackend implements Backend {
     const args = this.buildArgs(req.model)
     if (model) args.push('--model', model)
 
+    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
+    provisionProfileWorkspace(req, session, 'gemini', req.cwd ?? session?.cwd ?? process.cwd())
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),

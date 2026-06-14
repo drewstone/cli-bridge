@@ -32,6 +32,7 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   materialiseMcpServersForCodex,
+  provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
 } from './profile-support.js'
@@ -134,6 +135,9 @@ export class CodexBackend implements Backend {
       resolveCodexAuthPath(),
     )
 
+    // Phase-2 host wiring: provision cwd-native profile dimensions (skills/context/
+    // hooks/subagents/commands) before spawn. MCP stays on the path above. Fail-safe.
+    provisionProfileWorkspace(req, session, 'codex', req.cwd ?? session?.cwd ?? process.cwd())
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
