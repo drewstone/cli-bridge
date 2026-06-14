@@ -24,6 +24,8 @@ import { dirname, join } from 'node:path'
 import type {
   AgentProfile,
   AgentProfileMcpServer,
+  AgentProfileResourceRef,
+  AgentProfileResources,
   AgentSubagentProfile,
 } from '@tangle-network/sandbox'
 
@@ -37,16 +39,39 @@ export interface HookCommand {
   env?: Record<string, string>
 }
 
-/** The materializer input: the canonical AgentProfile + the content-bearing
- *  dimensions not yet promoted into the published type (skills/hooks/commands).
- *  When those land in @tangle-network/sandbox the field names already align. */
-export interface MaterializableProfile extends AgentProfile {
-  /** skill name → SKILL.md content (VB frontmatter or raw markdown; normalized here). */
-  skills?: Record<string, string>
+/** Resource-bearing dimensions, keyed the SAME way agent-dev-container's providers
+ *  (e.g. cursor's materializeCursorProfileResources) read them: arrays of resource
+ *  refs under `resources`. This is the canonical shape both layers share — NOT a
+ *  parallel top-level map — so the materializer is liftable to one shared package. */
+export interface MaterializableResources extends AgentProfileResources {
+  /** Skill refs → `<skillDir>/<name>/SKILL.md`. */
+  skills?: AgentProfileResourceRef[]
+  /** Slash-command refs → the harness command path. */
+  commands?: AgentProfileResourceRef[]
+  /** Sub-agent refs (ref form; structured `subagents` is also supported, below). */
+  agents?: AgentProfileResourceRef[]
+}
+
+/** The materializer input: the canonical AgentProfile with `resources` widened to carry
+ *  skills/commands/agents refs (matching the box's providers) + top-level `hooks` (the
+ *  dimension being promoted into the published type). Field shapes mirror what
+ *  agent-dev-container already materializes, so this is the SAME profile, one materializer. */
+export interface MaterializableProfile extends Omit<AgentProfile, 'resources'> {
+  resources?: MaterializableResources
   /** hook event (PreToolUse/PostToolUse/UserPromptSubmit/Stop/SessionStart/…) → commands. */
   hooks?: Record<string, HookCommand[]>
-  /** slash-command name → template body. */
-  commands?: Record<string, string>
+}
+
+/** Resolve an inline resource ref to {name, content}. github refs need an async fetch
+ *  (cursor's resolveProfileResource does this); the sync materializer can't, so a github
+ *  ref is reported unsupported and the caller pre-resolves it. Mirrors cursor's rule:
+ *  a ref with `content` (or kind 'inline') is inline. */
+function resolveInlineRef(ref: AgentProfileResourceRef): { name: string; content: string } | null {
+  const r = ref as { kind?: string; name?: unknown; content?: unknown; path?: unknown }
+  if (r.kind === 'inline' || typeof r.content === 'string') {
+    return { name: String(r.name ?? r.path ?? 'resource'), content: String(r.content ?? '') }
+  }
+  return null // github / unresolved
 }
 
 export type HarnessId =
@@ -167,12 +192,14 @@ export function materializeProfile(
     // gemini reads AGENTS.md only via settings; we write GEMINI.md so no extra step.
   }
 
-  // 2) SKILLS → native skill dir, or fail-closed (hermes has no cwd skill dir).
-  const skills = profile.skills ?? {}
-  for (const [name, raw] of Object.entries(skills)) {
+  // 2) SKILLS → native skill dir, from resources.skills refs (the box's shape), or
+  //    fail-closed (hermes has no cwd skill dir; github refs need async pre-resolution).
+  for (const ref of profile.resources?.skills ?? []) {
+    const r = resolveInlineRef(ref)
+    if (!r) { unsupported('skills', 'skill ref is not inline (github refs need async pre-resolution)'); continue }
     const dir = SKILL_DIR[h]
-    if (!dir) { unsupported('skills', `${h}: no cwd skill dir (skills live in a user/global dir); skill "${name}" not mounted`); continue }
-    add(`${dir}/${name}/SKILL.md`, normalizeSkillMd(name, raw))
+    if (!dir) { unsupported('skills', `${h}: no cwd skill dir (skills live in a user/global dir); skill "${r.name}" not mounted`); continue }
+    add(`${dir}/${r.name}/SKILL.md`, normalizeSkillMd(r.name, r.content))
   }
 
   // 3) MCP → per-harness format (the divergence the matrix names). Skippable so the
@@ -188,9 +215,12 @@ export function materializeProfile(
   const subagents = profile.subagents ?? {}
   for (const [name, sa] of Object.entries(subagents)) materializeSubagent(h, name, sa, add, unsupported)
 
-  // 6) COMMANDS → cwd-native for claude/opencode/gemini/pi; "commands are skills" on kimi.
-  const commands = profile.commands ?? {}
-  for (const [name, body] of Object.entries(commands)) materializeCommand(h, name, body, add, unsupported)
+  // 6) COMMANDS → cwd-native (resources.commands refs); "commands are skills" on kimi.
+  for (const ref of profile.resources?.commands ?? []) {
+    const r = resolveInlineRef(ref)
+    if (!r) { unsupported('commands', 'command ref is not inline (github needs pre-resolution)'); continue }
+    materializeCommand(h, r.name, r.content, add, unsupported)
+  }
 
   // Merge multi-writer JSON files (e.g. .claude/settings.json from both mcp and hooks)
   // so the second write can't clobber the first.
