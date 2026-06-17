@@ -14,6 +14,9 @@ importers:
       '@tangle-network/agent-interface':
         specifier: ^0.5.0
         version: 0.5.0
+      '@tangle-network/agent-profile-materialize':
+        specifier: ^0.1.0
+        version: 0.1.0
       better-sqlite3:
         specifier: ^12.0.0
         version: 12.9.0
@@ -485,6 +488,9 @@ packages:
 
   '@tangle-network/agent-interface@0.5.0':
     resolution: {integrity: sha512-gytbc/iETGmml/vQiw8C8R6kEd3AA1MDcDC0vZSP7MOyj1hy9zCtU3XNk2mV8NyyrLcHjYNQUzBisPL/pFReEw==}
+
+  '@tangle-network/agent-profile-materialize@0.1.0':
+    resolution: {integrity: sha512-a06QNAKRVtrYFfx+6+RSGvqvRsegCu9V4MRsslvf/FiMp1d6fwu5Yg11IHTkh7RfSB0J2O8y2hqoGzJ70nU9oA==}
 
   '@types/better-sqlite3@7.6.13':
     resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
@@ -1100,6 +1106,10 @@ snapshots:
   '@tangle-network/agent-interface@0.5.0':
     dependencies:
       zod: 4.4.3
+
+  '@tangle-network/agent-profile-materialize@0.1.0':
+    dependencies:
+      '@tangle-network/agent-interface': 0.5.0
 
   '@types/better-sqlite3@7.6.13':
     dependencies:

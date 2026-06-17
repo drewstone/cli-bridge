@@ -21,7 +21,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materialiseMcpServersForOpencode, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
@@ -89,7 +89,7 @@ export class OpencodeBackend implements Backend {
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const model = this.extractModel(req.model)
 
-    // Materialise MCP servers (request-body `mcp.mcpServers` ∪
+    // Materialize MCP servers (request-body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) into a temp opencode-shape config file.
     // opencode-cli has no per-invocation `--mcp-config-file` flag —
     // config layering is the only inline injection point. We set
@@ -100,7 +100,7 @@ export class OpencodeBackend implements Backend {
     //
     // Cleanup runs in the outer finally so the temp dir doesn't leak
     // when the subprocess crashes.
-    const mcpMaterialised = materialiseMcpServersForOpencode(resolveMcpServers(req, session))
+    const mcpMaterialized = materializeMcpServersForOpencode(resolveMcpServers(req, session))
 
     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
@@ -127,7 +127,7 @@ export class OpencodeBackend implements Backend {
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: {
         ...process.env,
-        ...(mcpMaterialised ? { OPENCODE_CONFIG: mcpMaterialised.configPath } : {}),
+        ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
     })
@@ -266,7 +266,7 @@ export class OpencodeBackend implements Backend {
       // which left opencode's HTTP-client + MCP children alive.
       await killTree(child)
       releaseSpawner()
-      mcpMaterialised?.cleanup()
+      mcpMaterialized?.cleanup()
     }
   }
 

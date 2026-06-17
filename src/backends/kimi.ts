@@ -38,8 +38,8 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
-  materialiseEmptyMcpConfig,
-  materialiseMcpServersForClaudeKimi,
+  materializeEmptyMcpConfig,
+  materializeMcpServersForClaudeKimi,
   provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
@@ -122,13 +122,13 @@ export class KimiBackend implements Backend {
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
     const configFile = await this.prepareConfigFile(req.model)
-    // Materialise agent_profile.mcp into a temp mcp-config.json. Same
+    // Materialize agent_profile.mcp into a temp mcp-config.json. Same
     // shape claude expects ({mcpServers: {name: {command,args,env}}});
     // kimi takes the path via --mcp-config-file. Cleanup runs in the
     // outer finally so the temp dir doesn't leak when the subprocess
     // crashes.
-    const mcpMaterialised =
-      materialiseMcpServersForClaudeKimi(resolveMcpServers(req, session)) ?? materialiseEmptyMcpConfig()
+    const mcpMaterialized =
+      materializeMcpServersForClaudeKimi(resolveMcpServers(req, session)) ?? materializeEmptyMcpConfig()
 
     const args = [
       '--print',
@@ -138,8 +138,8 @@ export class KimiBackend implements Backend {
     if (configFile) {
       args.push('--config-file', configFile)
     }
-    if (mcpMaterialised) {
-      args.push('--mcp-config-file', mcpMaterialised.configPath)
+    if (mcpMaterialized) {
+      args.push('--mcp-config-file', mcpMaterialized.configPath)
     }
     if (session?.internalId) {
       args.push('--resume', session.internalId)
@@ -368,7 +368,7 @@ export class KimiBackend implements Backend {
       // before releasing the slot. Idempotent; waits for actual exit.
       await killTree(child)
       if (configFile) await cleanupConfigFile(configFile)
-      mcpMaterialised?.cleanup()
+      mcpMaterialized?.cleanup()
       releaseSpawner()
     }
   }

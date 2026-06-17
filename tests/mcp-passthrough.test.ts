@@ -2,7 +2,7 @@
  * MCP passthrough — end-to-end verification that the standardised
  * request-body `mcp.mcpServers` field plus `X-Mcp-Config` header flow
  * through the chat-completions route into the backend's resolved
- * server map, and that each per-backend materialiser produces a
+ * server map, and that each per-backend materializer produces a
  * config file the upstream CLI would actually accept.
  *
  * Coverage:
@@ -14,15 +14,15 @@
  *   2. Route layer — `X-Mcp-Config` header is parsed, merged with the
  *      body (body wins on name collision).
  *
- *   3. Materialiser fidelity — each backend's config file format is
+ *   3. Materializer fidelity — each backend's config file format is
  *      valid for its CLI's loader (claude/kimi JSON, opencode JSON,
- *      codex TOML) AND the materialised stdio command actually spawns
+ *      codex TOML) AND the materialized stdio command actually spawns
  *      a working JSON-RPC MCP server when launched.
  *
  * (3) is the load-bearing test: it stands up a real Node-based stdio
- * MCP server, exec's the command line our materialiser writes, and
+ * MCP server, exec's the command line our materializer writes, and
  * confirms the server processes a JSON-RPC `initialize` request. If
- * the materialiser drops `args` or `env`, the spawn fails or the
+ * the materializer drops `args` or `env`, the spawn fails or the
  * server returns the wrong protocol version — the test catches both.
  */
 
@@ -38,15 +38,15 @@ import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import {
-  materialiseMcpServersForClaudeKimi,
-  materialiseMcpServersForCodex,
-  materialiseMcpServersForOpencode,
+  materializeMcpServersForClaudeKimi,
+  materializeMcpServersForCodex,
+  materializeMcpServersForOpencode,
   resolveMcpServers,
 } from '../src/backends/profile-support.js'
 
 /**
  * Captures the ChatRequest the route hands to the backend, so tests
- * can assert what the request layer normalised.
+ * can assert what the request layer normalized.
  */
 class CapturingBackend implements Backend {
   readonly name = 'capture'
@@ -207,7 +207,7 @@ describe('chat-completions route — mcp body field', () => {
 
 /**
  * Mini stdio MCP server — speaks just enough of the protocol to confirm
- * "the server was launched with the args/env our materialiser wrote and
+ * "the server was launched with the args/env our materializer wrote and
  * it processed a JSON-RPC frame". Not a full MCP impl — exit on the
  * first valid request.
  *
@@ -239,7 +239,7 @@ process.stdin.on('data', (chunk) => {
       result: {
         ok: true,
         gotMethod: req.method ?? null,
-        // Echo the env var the materialiser MUST forward, so tests can
+        // Echo the env var the materializer MUST forward, so tests can
         // assert env survived the spawn boundary.
         echoEnv: process.env.MCP_ECHO_KEY ?? null,
         // Echo argv[2] so tests can assert args survived.
@@ -316,7 +316,7 @@ async function probeStdioMcp(
   })
 }
 
-describe('per-backend materialiser produces a launchable stdio MCP server', () => {
+describe('per-backend materializer produces a launchable stdio MCP server', () => {
   let workDir: string
   let serverPath: string
 
@@ -341,7 +341,7 @@ describe('per-backend materialiser produces a launchable stdio MCP server', () =
 
   it('claude/kimi mcp-config.json — command+args+env survive the JSON round-trip', async () => {
     const specs = specsForServer()
-    const m = materialiseMcpServersForClaudeKimi(specs)
+    const m = materializeMcpServersForClaudeKimi(specs)
     expect(m).not.toBeNull()
     if (!m) return
     try {
@@ -360,7 +360,7 @@ describe('per-backend materialiser produces a launchable stdio MCP server', () =
 
   it('opencode opencode.json — command-as-array + environment survive the JSON round-trip', async () => {
     const specs = specsForServer()
-    const m = materialiseMcpServersForOpencode(specs)
+    const m = materializeMcpServersForOpencode(specs)
     try {
       const config = JSON.parse(readFileSync(m.configPath, 'utf-8')) as {
         mcp: Record<string, { command: string[]; environment?: Record<string, string> }>
@@ -390,7 +390,7 @@ describe('per-backend materialiser produces a launchable stdio MCP server', () =
       return
     }
     const specs = specsForServer()
-    const m = materialiseMcpServersForCodex(specs)
+    const m = materializeMcpServersForCodex(specs)
     expect(m).not.toBeNull()
     if (!m) return
     try {
@@ -407,7 +407,7 @@ describe('per-backend materialiser produces a launchable stdio MCP server', () =
 
   it('codex config.toml — TOML stanza parses back to a launchable spec', async () => {
     const specs = specsForServer()
-    const m = materialiseMcpServersForCodex(specs)
+    const m = materializeMcpServersForCodex(specs)
     expect(m).not.toBeNull()
     if (!m) return
     try {
@@ -415,7 +415,7 @@ describe('per-backend materialiser produces a launchable stdio MCP server', () =
       // Don't pull in a TOML lib — assert the lines we expect and
       // re-derive command/args/env from the source spec for the
       // spawn probe (the TOML file is what codex reads; spec is the
-      // truth our materialiser wrote it from).
+      // truth our materializer wrote it from).
       expect(toml).toContain('[mcp_servers.echo]')
       expect(toml).toContain(`command = "${process.execPath}"`)
       // Args entry must be a TOML array of strings.

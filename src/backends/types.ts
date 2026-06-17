@@ -59,7 +59,7 @@ export interface McpServerSpec {
   url?: string
   /** http/sse: extra request headers (auth, etc.). */
   headers?: Record<string, string>
-  /** Disable without removing the entry — drop at materialisation. */
+  /** Disable without removing the entry — drop at materialization. */
   enabled?: boolean
   /** Per-tool-call timeout in milliseconds. */
   timeout?: number
@@ -117,8 +117,8 @@ export interface ChatRequest {
    *
    * Servers a given backend cannot load locally (e.g. Gemini before a
    * verified per-invocation MCP contract, or `http`/`sse` transport on
-   * a CLI that only supports stdio) are dropped at materialisation time
-   * by the backend materialiser — fail loud, no silent fallback.
+   * a CLI that only supports stdio) are dropped at materialization time
+   * by the backend materializer — fail loud, no silent fallback.
    */
   mcp?: McpRequestConfig
   /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */

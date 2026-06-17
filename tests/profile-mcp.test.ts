@@ -1,10 +1,10 @@
 /**
- * Unit tests for `materialiseMcpConfig` + `buildMcpAllowList` in
+ * Unit tests for `materializeMcpConfig` + `buildMcpAllowList` in
  * profile-support.ts. Verifies:
  *
  *   - profiles without `.mcp` produce null (no temp file written)
  *   - explicitly disabled servers (enabled: false) are dropped
- *   - claude/kimi materialisation preserves stdio MCP servers and drops
+ *   - claude/kimi materialization preserves stdio MCP servers and drops
  *     remote http/sse servers from their shared `mcp-config.json` shape
  *   - the produced JSON matches claude/kimi's expected
  *     `{ mcpServers: { name: { command, args, env } } }` shape
@@ -19,20 +19,20 @@ import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
   buildMcpAllowList,
   isStdioMcpSpec,
-  materialiseMcpConfig,
-  materialiseMcpServersForClaudeKimi,
-  materialiseMcpServersForCodex,
-  materialiseMcpServersForOpencode,
-  materialiseOpencodeMcpConfig,
+  materializeMcpConfig,
+  materializeMcpServersForClaudeKimi,
+  materializeMcpServersForCodex,
+  materializeMcpServersForOpencode,
+  materializeOpencodeMcpConfig,
   resolveMcpServers,
 } from '../src/backends/profile-support.js'
 import type { ChatRequest } from '../src/backends/types.js'
 
-describe('materialiseMcpConfig', () => {
+describe('materializeMcpConfig', () => {
   it('returns null when the profile has no mcp section', () => {
-    expect(materialiseMcpConfig(null)).toBeNull()
-    expect(materialiseMcpConfig({} as AgentProfile)).toBeNull()
-    expect(materialiseMcpConfig({ name: 'p' } as AgentProfile)).toBeNull()
+    expect(materializeMcpConfig(null)).toBeNull()
+    expect(materializeMcpConfig({} as AgentProfile)).toBeNull()
+    expect(materializeMcpConfig({ name: 'p' } as AgentProfile)).toBeNull()
   })
 
   it('returns null when every entry is filtered out', () => {
@@ -41,7 +41,7 @@ describe('materialiseMcpConfig', () => {
         'disabled-stdio': { command: '/usr/bin/foo', enabled: false },
       },
     }
-    expect(materialiseMcpConfig(profile)).toBeNull()
+    expect(materializeMcpConfig(profile)).toBeNull()
   })
 
   it('writes a claude/kimi-shaped mcp-config.json for stdio servers', () => {
@@ -56,7 +56,7 @@ describe('materialiseMcpConfig', () => {
         ignored: { command: 'echo', enabled: false },
       },
     }
-    const m = materialiseMcpConfig(profile)
+    const m = materializeMcpConfig(profile)
     expect(m).not.toBeNull()
     if (!m) return
     expect(m.serverNames).toEqual(['coordinator'])
@@ -78,7 +78,7 @@ describe('materialiseMcpConfig', () => {
     const profile: AgentProfile = {
       mcp: { foo: { command: 'tsx', args: ['x.ts'] } },
     }
-    const m = materialiseMcpConfig(profile)
+    const m = materializeMcpConfig(profile)
     expect(m).not.toBeNull()
     if (!m) return
     m.cleanup()
@@ -94,7 +94,7 @@ describe('materialiseMcpConfig', () => {
         'good': { command: 'tsx', args: ['x.ts'] },
       },
     } as unknown as AgentProfile
-    const m = materialiseMcpConfig(profile)
+    const m = materializeMcpConfig(profile)
     expect(m).not.toBeNull()
     if (!m) return
     expect(m.serverNames).toEqual(['good'])
@@ -102,9 +102,9 @@ describe('materialiseMcpConfig', () => {
   })
 })
 
-describe('materialiseOpencodeMcpConfig', () => {
+describe('materializeOpencodeMcpConfig', () => {
   it('writes headless permissions even when no MCP servers are declared', () => {
-    const m = materialiseOpencodeMcpConfig(null)
+    const m = materializeOpencodeMcpConfig(null)
     expect(m).not.toBeNull()
     if (!m) return
     expect(m.serverNames).toEqual([])
@@ -222,9 +222,9 @@ describe('isStdioMcpSpec', () => {
   })
 })
 
-describe('materialiseMcpServersForClaudeKimi', () => {
+describe('materializeMcpServersForClaudeKimi', () => {
   it('writes the canonical {mcpServers:{...}} JSON shape', () => {
-    const m = materialiseMcpServersForClaudeKimi({
+    const m = materializeMcpServersForClaudeKimi({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
       remote: { type: 'http', url: 'https://example.com', headers: { Authorization: 'Bearer X' } },
     })
@@ -242,13 +242,13 @@ describe('materialiseMcpServersForClaudeKimi', () => {
   })
 
   it('returns null when given a null map (no entries at all)', () => {
-    expect(materialiseMcpServersForClaudeKimi(null)).toBeNull()
+    expect(materializeMcpServersForClaudeKimi(null)).toBeNull()
   })
 })
 
-describe('materialiseMcpServersForOpencode', () => {
+describe('materializeMcpServersForOpencode', () => {
   it('writes opencode shape with command-as-array + headless permissions', () => {
-    const m = materialiseMcpServersForOpencode({
+    const m = materializeMcpServersForOpencode({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } },
     })
     expect(m.serverNames).toEqual(['echo'])
@@ -266,7 +266,7 @@ describe('materialiseMcpServersForOpencode', () => {
   })
 
   it('returns a usable config even when the map is null (permission-only)', () => {
-    const m = materialiseMcpServersForOpencode(null)
+    const m = materializeMcpServersForOpencode(null)
     expect(m.serverNames).toEqual([])
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.mcp).toEqual({})
@@ -274,9 +274,9 @@ describe('materialiseMcpServersForOpencode', () => {
   })
 })
 
-describe('materialiseMcpServersForCodex', () => {
+describe('materializeMcpServersForCodex', () => {
   it('writes a TOML config.toml with stdio servers under [mcp_servers.<name>]', () => {
-    const m = materialiseMcpServersForCodex({
+    const m = materializeMcpServersForCodex({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } },
     })
     expect(m).not.toBeNull()
@@ -292,7 +292,7 @@ describe('materialiseMcpServersForCodex', () => {
   })
 
   it('writes streamable-http servers as url + http_headers', () => {
-    const m = materialiseMcpServersForCodex({
+    const m = materializeMcpServersForCodex({
       remote: { type: 'http', url: 'https://mcp.example.com/mcp', headers: { Authorization: 'Bearer X' } },
     })
     expect(m).not.toBeNull()
@@ -313,7 +313,7 @@ describe('materialiseMcpServersForCodex', () => {
     const srcAuth = join(srcDir, 'auth.json')
     fs.writeFileSync(srcAuth, '{"token":"test"}')
     try {
-      const m = materialiseMcpServersForCodex(
+      const m = materializeMcpServersForCodex(
         { echo: { command: 'node', args: ['echo.js'] } },
         srcAuth,
       )
@@ -328,11 +328,11 @@ describe('materialiseMcpServersForCodex', () => {
   })
 
   it('returns null when the map is null', () => {
-    expect(materialiseMcpServersForCodex(null)).toBeNull()
+    expect(materializeMcpServersForCodex(null)).toBeNull()
   })
 
   it('skips names that would require TOML key quoting (defence-in-depth)', () => {
-    const m = materialiseMcpServersForCodex({
+    const m = materializeMcpServersForCodex({
       'has space': { command: 'tsx' },
       'good-name': { command: 'tsx' },
     })

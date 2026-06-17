@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { applyWorkspacePlan, materializeProfile, type HarnessId, type MaterializableProfile } from './materialize-profile.js'
+import { applyWorkspacePlan, type HarnessId, materializeProfile } from '@tangle-network/agent-profile-materialize'
 
 /**
  * Provision an AgentProfile's CWD-NATIVE dimensions (skills, context, hooks, subagents,
@@ -21,7 +21,7 @@ export function provisionProfileWorkspace(
   cwd: string,
 ): { env: Record<string, string>; flags: string[]; written: string[] } {
   try {
-    const profile = resolveAgentProfile(req, session) as MaterializableProfile | null
+    const profile = resolveAgentProfile(req, session)
     if (!profile) return { env: {}, flags: [], written: [] }
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
     if (!plan.files.length && !plan.flags.length) return { env: {}, flags: [], written: [] }
@@ -74,7 +74,7 @@ export function resolveMcpServers(
   if (requestMcp && typeof requestMcp === 'object') {
     for (const [name, raw] of Object.entries(requestMcp)) {
       if (!name || !raw || typeof raw !== 'object') continue
-      merged[name] = normaliseMcpServerSpec(raw)
+      merged[name] = normalizeMcpServerSpec(raw)
     }
   }
 
@@ -107,7 +107,7 @@ function profileMcpToSpec(raw: AgentProfileMcpServer): McpServerSpec {
   return out
 }
 
-function normaliseMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): McpServerSpec {
+function normalizeMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): McpServerSpec {
   // Defensive copy — drop any unknown fields, coerce types loosely.
   const r = raw as Record<string, unknown>
   const out: McpServerSpec = {}
@@ -136,7 +136,7 @@ function normaliseMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): M
  * True when this spec describes a local stdio MCP server. cli-bridge's
  * MCP-enabled CLI backends load stdio MCP via their config-file
  * loaders; remote http/sse MCP needs a per-backend registration path
- * that we don't model in the unified materialisers.
+ * that we don't model in the unified materializers.
  */
 export function isStdioMcpSpec(spec: McpServerSpec): boolean {
   if (spec.enabled === false) return false
@@ -146,7 +146,7 @@ export function isStdioMcpSpec(spec: McpServerSpec): boolean {
 }
 
 /**
- * Materialise an `AgentProfile.mcp` map into a temp JSON file in the
+ * Materialize an `AgentProfile.mcp` map into a temp JSON file in the
  * canonical claude/kimi mcp-config shape:
  *
  *   { "mcpServers": { name: {command, args, env}, ... } }
@@ -163,15 +163,15 @@ export function isStdioMcpSpec(spec: McpServerSpec): boolean {
  * transports) are also dropped here because the local CLIs only support
  * stdio MCP servers via `--mcp-config`. Remote MCP servers would need a
  * separate registration path (claude has `claude mcp add --transport
- * http`) which we don't model in this materialiser.
+ * http`) which we don't model in this materializer.
  */
-export interface MaterialisedMcpConfig {
+export interface MaterializedMcpConfig {
   configPath: string
   serverNames: string[]
   cleanup(): void
 }
 
-export function materialiseMcpConfig(profile: AgentProfile | null): MaterialisedMcpConfig | null {
+export function materializeMcpConfig(profile: AgentProfile | null): MaterializedMcpConfig | null {
   if (!profile || typeof profile !== 'object') return null
   const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
   if (!mcp || typeof mcp !== 'object') return null
@@ -180,7 +180,7 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
     if (!name || !raw || typeof raw !== 'object') continue
     specs[name] = profileMcpToSpec(raw)
   }
-  return materialiseMcpServersForClaudeKimi(specs)
+  return materializeMcpServersForClaudeKimi(specs)
 }
 
 /**
@@ -206,9 +206,9 @@ export function materialiseMcpConfig(profile: AgentProfile | null): Materialised
  * the `--mcp-config` flag in that case rather than passing an empty
  * config.
  */
-export function materialiseMcpServersForClaudeKimi(
+export function materializeMcpServersForClaudeKimi(
   specs: Record<string, McpServerSpec> | null,
-): MaterialisedMcpConfig | null {
+): MaterializedMcpConfig | null {
   if (!specs) return null
   const mcpServers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs)) {
@@ -234,7 +234,7 @@ export function materialiseMcpServersForClaudeKimi(
   }
   const serverNames = Object.keys(mcpServers)
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {
-    console.error(`[cli-bridge mcp] materialised servers: ${serverNames.length ? serverNames.join(", ") : "(none)"} from specs: ${Object.keys(specs).join(", ") || "(empty)"}`)
+    console.error(`[cli-bridge mcp] materialized servers: ${serverNames.length ? serverNames.join(", ") : "(none)"} from specs: ${Object.keys(specs).join(", ") || "(empty)"}`)
   }
   if (serverNames.length === 0) return null
 
@@ -255,7 +255,7 @@ export function materialiseMcpServersForClaudeKimi(
 }
 
 /**
- * Same as `materialiseMcpConfig` but writes opencode's schema —
+ * Same as `materializeMcpConfig` but writes opencode's schema —
  * `{mcp: {<name>: {type:'local', command:[...], environment:{...}, enabled, timeout}}}`
  * instead of claude/kimi's `{mcpServers: {<name>: {command, args, env}}}`.
  *
@@ -266,7 +266,7 @@ export function materialiseMcpServersForClaudeKimi(
  *
  * Schema source: https://opencode.ai/config.json (`properties.mcp.additionalProperties`).
  */
-export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): MaterialisedMcpConfig {
+export function materializeOpencodeMcpConfig(profile: AgentProfile | null): MaterializedMcpConfig {
   const specs: Record<string, McpServerSpec> = {}
   if (profile && typeof profile === 'object') {
     const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
@@ -277,7 +277,7 @@ export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): Mate
       }
     }
   }
-  return materialiseMcpServersForOpencode(specs)
+  return materializeMcpServersForOpencode(specs)
 }
 
 /**
@@ -293,9 +293,9 @@ export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): Mate
  * Schema source: https://opencode.ai/config.json
  *   (`properties.mcp.additionalProperties`).
  */
-export function materialiseMcpServersForOpencode(
+export function materializeMcpServersForOpencode(
   specs: Record<string, McpServerSpec> | null,
-): MaterialisedMcpConfig {
+): MaterializedMcpConfig {
   const opencodeMcp: Record<string,
     | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
     | { type: 'remote'; url: string; headers?: Record<string, string>; enabled?: boolean }
@@ -326,7 +326,7 @@ export function materialiseMcpServersForOpencode(
     }
   }
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {
-    console.error(`[cli-bridge mcp opencode] materialised: ${Object.keys(opencodeMcp).join(', ') || '(none)'}`)
+    console.error(`[cli-bridge mcp opencode] materialized: ${Object.keys(opencodeMcp).join(', ') || '(none)'}`)
   }
   const serverNames = Object.keys(opencodeMcp)
 
@@ -364,7 +364,7 @@ export function materialiseMcpServersForOpencode(
   }
 }
 
-export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
+export function materializeEmptyMcpConfig(): MaterializedMcpConfig {
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
   const configPath = join(dir, 'mcp-config.json')
   writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2))
@@ -382,7 +382,7 @@ export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
 }
 
 /**
- * Materialise a `McpServerSpec` map into a temp `CODEX_HOME` directory
+ * Materialize a `McpServerSpec` map into a temp `CODEX_HOME` directory
  * containing a synthetic `config.toml`. Codex CLI accepts MCP servers
  * via the `[mcp_servers.<name>]` TOML stanza in `$CODEX_HOME/config.toml`
  * — there is no `--mcp-config` flag. We point codex at a temp HOME so
@@ -400,7 +400,7 @@ export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
  *
  * Returns null when no usable servers remain.
  */
-export interface MaterialisedCodexHome {
+export interface MaterializedCodexHome {
   /** Directory to pass via `CODEX_HOME` env. */
   homePath: string
   /** Names actually written. */
@@ -408,10 +408,10 @@ export interface MaterialisedCodexHome {
   cleanup(): void
 }
 
-export function materialiseMcpServersForCodex(
+export function materializeMcpServersForCodex(
   specs: Record<string, McpServerSpec> | null,
   authSourcePath?: string,
-): MaterialisedCodexHome | null {
+): MaterializedCodexHome | null {
   if (!specs) return null
 
   const lines: string[] = []

@@ -89,7 +89,7 @@ const chatRequestSchema = z.object({
    * `OPENCODE_CONFIG`). Validation is permissive (`z.unknown()` for
    * each spec) so callers can pass backend-specific fields without
    * cli-bridge silently stripping them — the per-backend
-   * materialisers normalise. Use the canonical `command/args/env`
+   * materializers normalize. Use the canonical `command/args/env`
    * (stdio) or `url/headers` (http) layout for cross-backend
    * portability.
    *
