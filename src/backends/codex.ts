@@ -31,7 +31,7 @@ import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
-  materialiseMcpServersForCodex,
+  materializeMcpServersForCodex,
   provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
@@ -130,7 +130,7 @@ export class CodexBackend implements Backend {
     // `auth.json` so the spawned codex still authenticates as the
     // operator. Cleanup runs in the outer finally so the temp dir
     // doesn't leak on subprocess crash.
-    const codexHome = materialiseMcpServersForCodex(
+    const codexHome = materializeMcpServersForCodex(
       resolveMcpServers(req, session),
       resolveCodexAuthPath(),
     )

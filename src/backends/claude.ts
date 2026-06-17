@@ -25,11 +25,11 @@ import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   buildMcpAllowList,
-  materialiseMcpServersForClaudeKimi,
+  materializeMcpServersForClaudeKimi,
   renderLocalHarnessProfilePreamble,
   resolveAgentProfile,
   resolveMcpServers,
-  type MaterialisedMcpConfig,
+  type MaterializedMcpConfig,
   provisionProfileWorkspace,
 } from './profile-support.js'
 import { contentToText } from './content.js'
@@ -190,17 +190,17 @@ export class ClaudeBackend implements Backend {
     const userText = stdinInput.messages[0]?.content ?? ''
     const PROMPT_ARGV_LIMIT = 120 * 1024
     const userFitsInArgv = Buffer.byteLength(userText, 'utf8') <= PROMPT_ARGV_LIMIT
-    // Materialise MCP servers (if any) into a temp config file BEFORE
+    // Materialize MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
     // up the temp dir after the subprocess exits.
     //
     // Merges request-body `mcp.mcpServers` and `agent_profile.mcp` into
     // one map; request-body wins on name collisions. See
     // `resolveMcpServers` for the contract.
-    const mcpMaterialised = materialiseMcpServersForClaudeKimi(
+    const mcpMaterialized = materializeMcpServersForClaudeKimi(
       resolveMcpServers(req, session),
     )
-    const args = this.buildArgs(req, session, mode, mcpMaterialised, {
+    const args = this.buildArgs(req, session, mode, mcpMaterialized, {
       userTextForArgv: userFitsInArgv ? userText : undefined,
     })
 
@@ -360,7 +360,7 @@ export class ClaudeBackend implements Backend {
       // this was `child.kill('SIGTERM')` which leaked grand-children.
       await killTree(child)
       releaseSpawner()
-      mcpMaterialised?.cleanup()
+      mcpMaterialized?.cleanup()
     }
   }
 
@@ -378,7 +378,7 @@ export class ClaudeBackend implements Backend {
     req: ChatRequest,
     session: SessionRecord | null,
     mode: BridgeMode,
-    mcp?: MaterialisedMcpConfig | null,
+    mcp?: MaterializedMcpConfig | null,
     opts?: { userTextForArgv?: string },
   ): string[] {
     // Two transport modes — see chat() for the rationale:
@@ -438,7 +438,7 @@ export class ClaudeBackend implements Backend {
     // MCP wiring — the canonical custom-tool surface. The caller
     // passes `mcp.mcpServers` in the request body (or via X-Mcp-Config
     // header, or via agent_profile.mcp); `resolveMcpServers` merges
-    // those sources into the `mcp` value materialised here. Every
+    // those sources into the `mcp` value materialized here. Every
     // backend translates the merged map into its native loader; for
     // claude that's `--mcp-config <path>`.
     //
@@ -518,7 +518,7 @@ export class ClaudeBackend implements Backend {
    * here. The model may treat it as injection (degraded behavior)
    * but the spawn still succeeds — better than `spawn E2BIG`.
    *
-   * Multi-turn `messages[]` arrays serialise as one user message per
+   * Multi-turn `messages[]` arrays serialize as one user message per
    * element with `[role]` tags so tool-result content (role: 'tool')
    * stays identifiable to the model.
    */

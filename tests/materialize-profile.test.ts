@@ -8,16 +8,16 @@ import { describe, it, expect } from 'vitest'
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
-  materializeProfile,
   applyWorkspacePlan,
-  normalizeSkillMd,
-  type MaterializableProfile,
   type HarnessId,
-} from '../src/backends/materialize-profile.js'
+  materializeProfile,
+  normalizeSkillMd,
+} from '@tangle-network/agent-profile-materialize'
 
 const SKILL_BODY = '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.'
-const FULL: MaterializableProfile = {
+const FULL: AgentProfile = {
   prompt: { systemPrompt: 'You are a build agent.', instructions: ['Prefer real artifacts.'] },
   // canonical shape — skills/commands under `resources` as refs (matches the box's providers)
   resources: {

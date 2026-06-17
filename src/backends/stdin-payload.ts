@@ -68,7 +68,7 @@ export interface WriteStdinOptions {
 }
 
 /**
- * Serialise `messages` in the requested wire shape (see
+ * Serialize `messages` in the requested wire shape (see
  * {@link StdinPayloadFormat}) and pipe them into `stdin`. Closes the
  * stream when done. Tolerates EPIPE and backpressure.
  */
