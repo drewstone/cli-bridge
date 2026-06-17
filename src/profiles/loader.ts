@@ -8,7 +8,7 @@
 
 import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
 import { join, basename, extname } from 'node:path'
-import type { AgentProfile } from '@tangle-network/sandbox'
+import type { AgentProfile } from '@tangle-network/agent-interface'
 
 export interface ProfileEntry {
   id: string
