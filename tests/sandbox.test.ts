@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 import { Hono } from 'hono'
-import type { AgentProfile } from '@tangle-network/sandbox'
+import type { AgentProfile } from '@tangle-network/agent-interface'
 import { SandboxBackend } from '../src/backends/sandbox.js'
 import { createProfileCatalog } from '../src/profiles/loader.js'
 import { mountProfiles } from '../src/routes/profiles.js'

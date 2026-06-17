@@ -16,7 +16,7 @@
 
 import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
-import type { AgentProfile } from '@tangle-network/sandbox'
+import type { AgentProfile } from '@tangle-network/agent-interface'
 
 export type ChatContentPart =
   | { type: 'text'; text: string }

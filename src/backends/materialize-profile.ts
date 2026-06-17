@@ -27,7 +27,7 @@ import type {
   AgentProfileResourceRef,
   AgentProfileResources,
   AgentSubagentProfile,
-} from '@tangle-network/sandbox'
+} from '@tangle-network/agent-interface'
 
 /** Hook command shape (promoted from agent-dev-container's inline schema). */
 export interface HookCommand {

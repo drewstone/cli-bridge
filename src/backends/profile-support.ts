@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/sandbox'
+import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { applyWorkspacePlan, materializeProfile, type HarnessId, type MaterializableProfile } from './materialize-profile.js'
