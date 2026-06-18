@@ -219,23 +219,26 @@ describe('GeminiBackend model parsing', () => {
 describe('reasoning effort mapping', () => {
   it('maps opencode effort to provider variant', () => {
     expect(opencodeVariantForEffort('high')).toBe('high')
-    expect(opencodeVariantForEffort('max')).toBe('max')
+    expect(opencodeVariantForEffort('ultracode')).toBe('ultracode')
+    expect(opencodeVariantForEffort('none')).toBe('none')
     expect(opencodeVariantForEffort(undefined)).toBeNull()
   })
 
   it('maps kimi effort to thinking flags', () => {
     expect(thinkingFlagForEffort('high')).toBe('--thinking')
-    expect(thinkingFlagForEffort('max')).toBe('--thinking')
+    expect(thinkingFlagForEffort('ultracode')).toBe('--thinking')
     expect(thinkingFlagForEffort('low')).toBe('--no-thinking')
     expect(thinkingFlagForEffort('minimal')).toBe('--no-thinking')
+    expect(thinkingFlagForEffort('none')).toBe('--no-thinking')
     expect(thinkingFlagForEffort('medium')).toBeNull()
     expect(thinkingFlagForEffort(undefined)).toBeNull()
   })
 
-  it('maps Codex unsupported max-style effort to the strongest supported config', () => {
+  it('clamps Codex effort to its supported ceiling/floor', () => {
     expect(codexReasoningEffort('high')).toBe('high')
     expect(codexReasoningEffort('xhigh')).toBe('high')
-    expect(codexReasoningEffort('max')).toBe('high')
+    expect(codexReasoningEffort('ultracode')).toBe('high')
+    expect(codexReasoningEffort('none')).toBe('minimal')
     expect(codexReasoningEffort(undefined)).toBeNull()
   })
 

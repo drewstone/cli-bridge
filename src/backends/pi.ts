@@ -76,7 +76,8 @@ function thinkingFlagForEffort(effort?: string): string | null {
   if (!effort) return null
   // pi accepts: off | minimal | low | medium | high | xhigh
   const allowed = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
-  const e = effort === 'max' ? 'xhigh' : effort
+  // Canonical ladder → pi's: none → off, ultracode → xhigh (pi's ceiling); the rest pass through.
+  const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'xhigh' : effort
   return allowed.has(e) ? e : null
 }
 

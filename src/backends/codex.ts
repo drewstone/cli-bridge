@@ -260,8 +260,9 @@ export class CodexBackend implements Backend {
 
 export function codexReasoningEffort(effort: ChatRequest['effort']): 'minimal' | 'low' | 'medium' | 'high' | null {
   if (!effort) return null
-  if (effort === 'xhigh' || effort === 'max') return 'high'
-  return effort
+  if (effort === 'none') return 'minimal' // codex can't disable reasoning — clamp `none` to its floor
+  if (effort === 'xhigh' || effort === 'ultracode') return 'high' // codex caps at `high`
+  return effort // minimal | low | medium | high pass straight through
 }
 
 /**

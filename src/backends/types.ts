@@ -16,7 +16,7 @@
 
 import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
-import type { AgentProfile } from '@tangle-network/agent-interface'
+import type { AgentProfile, ReasoningEffort } from '@tangle-network/agent-interface'
 
 export type ChatContentPart =
   | { type: 'text'; text: string }
@@ -39,7 +39,9 @@ export interface ChatMessage {
   name?: string
 }
 
-export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+// The canonical reasoning ladder lives in @tangle-network/agent-interface (none → ultracode);
+// cli-bridge re-exports it so the wire contract speaks one vocabulary across the stack.
+export type { ReasoningEffort }
 
 /**
  * One MCP server entry. Matches Claude Code's `mcp-config.json` so the

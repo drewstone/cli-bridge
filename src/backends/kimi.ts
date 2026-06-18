@@ -459,8 +459,8 @@ function ensureK2DefaultConfig(config: string): string {
 
 export function thinkingFlagForEffort(effort: ChatRequest['effort']): '--thinking' | '--no-thinking' | null {
   if (!effort || effort === 'medium') return null
-  if (effort === 'minimal' || effort === 'low') return '--no-thinking'
-  return '--thinking'
+  if (effort === 'none' || effort === 'minimal' || effort === 'low') return '--no-thinking'
+  return '--thinking' // high | xhigh | ultracode → kimi's "on"
 }
 
 async function cleanupConfigFile(file: string): Promise<void> {
