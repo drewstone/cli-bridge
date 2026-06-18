@@ -70,7 +70,8 @@ const chatRequestSchema = z.object({
   stream: z.boolean().optional(),
   temperature: z.number().optional(),
   max_tokens: z.number().optional(),
-  effort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+  // Mirrors the canonical ReasoningEffort ladder in @tangle-network/agent-interface.
+  effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
   mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
