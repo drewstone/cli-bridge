@@ -12,8 +12,8 @@ importers:
         specifier: ^1.13.0
         version: 1.19.14(hono@4.12.14)
       '@tangle-network/agent-interface':
-        specifier: ^0.9.0
-        version: 0.9.0
+        specifier: '>=0.10.0 <1.0.0'
+        version: 0.10.0
       '@tangle-network/agent-profile-materialize':
         specifier: ^0.1.0
         version: 0.1.0
@@ -486,11 +486,11 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@tangle-network/agent-interface@0.10.0':
+    resolution: {integrity: sha512-oiREgihkeX/xcGEtFfi9AkAfU2VzuF7SSla2s0iliXPUXyHCIIx6jwzHiYdwb1ZGCfvC+T+0SWOIa6fN5u195g==}
+
   '@tangle-network/agent-interface@0.5.0':
     resolution: {integrity: sha512-gytbc/iETGmml/vQiw8C8R6kEd3AA1MDcDC0vZSP7MOyj1hy9zCtU3XNk2mV8NyyrLcHjYNQUzBisPL/pFReEw==}
-
-  '@tangle-network/agent-interface@0.9.0':
-    resolution: {integrity: sha512-iwq8QsJh+EiunLQj5iyEmVFa+v/o3LarOx8qrpqIGt8H4Ga1ecU1sHTExxrgvWDCjq+j6rtOVvEm8uh6RSFcRg==}
 
   '@tangle-network/agent-profile-materialize@0.1.0':
     resolution: {integrity: sha512-a06QNAKRVtrYFfx+6+RSGvqvRsegCu9V4MRsslvf/FiMp1d6fwu5Yg11IHTkh7RfSB0J2O8y2hqoGzJ70nU9oA==}
@@ -1106,11 +1106,11 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.60.2':
     optional: true
 
-  '@tangle-network/agent-interface@0.5.0':
+  '@tangle-network/agent-interface@0.10.0':
     dependencies:
       zod: 4.4.3
 
-  '@tangle-network/agent-interface@0.9.0':
+  '@tangle-network/agent-interface@0.5.0':
     dependencies:
       zod: 4.4.3
 
