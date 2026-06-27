@@ -21,9 +21,9 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materialiseMcpServersForOpencode, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { materialiseMcpServersForOpencode, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
-import { scopedHostSpawner } from '../executors/scoped-host.js'
+import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
@@ -41,7 +41,7 @@ export class OpencodeBackend implements Backend {
   readonly name = 'opencode'
   private readonly spawner: Spawner
   constructor(private readonly opts: OpencodeBackendOptions) {
-    this.spawner = opts.spawner ?? scopedHostSpawner
+    this.spawner = opts.spawner ?? hostSpawner
   }
 
   matches(model: string): boolean {
@@ -81,7 +81,11 @@ export class OpencodeBackend implements Backend {
     //
     // Cleanup runs in the outer finally so the temp dir doesn't leak
     // when the subprocess crashes.
-    const mcpMaterialised = materialiseMcpServersForOpencode(resolveMcpServers(req, session))
+    const mcpMaterialised = materialiseMcpServersForOpencode(
+      resolveMcpServers(req, session),
+      resolveAgentProfile(req, session),
+      opencodeProviderHeaderConfig(model, attributionHeaders(req)),
+    )
 
     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
@@ -100,11 +104,21 @@ export class OpencodeBackend implements Backend {
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
 
+    // Apply the request profile's env to the agent's process — e.g. a no-web
+    // control arm that points proxy/registry vars at a dead port to block the
+    // agent's bash egress. Layered AFTER process.env so it overrides (the proxy
+    // block must win); string values only.
+    const profileEnv = (resolveAgentProfile(req, session) as { env?: Record<string, unknown> } | null)?.env
+    const profileEnvStrings: Record<string, string> =
+      profileEnv && typeof profileEnv === 'object'
+        ? Object.fromEntries(Object.entries(profileEnv).filter(([, v]) => typeof v === 'string') as [string, string][])
+        : {}
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: {
         ...process.env,
+        ...profileEnvStrings,
         ...(mcpMaterialised ? { OPENCODE_CONFIG: mcpMaterialised.configPath } : {}),
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
@@ -126,8 +140,8 @@ export class OpencodeBackend implements Backend {
     // ENTIRE process group (opencode + everything it forked). We fire
     // and forget here — the actual await happens in the outer finally
     // so the generator can still emit a clean final delta.
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
+    const timeoutHandle = setTimeout(() => { void killTree(child, { reason: 'timeout' }) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void killTree(child, { reason: 'client-abort' }) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
@@ -242,7 +256,7 @@ export class OpencodeBackend implements Backend {
       // process to actually exit, so by the time we hit releaseSpawner
       // there's no orphan to leak. Pre-fix this was `child.kill('SIGTERM')`
       // which left opencode's HTTP-client + MCP children alive.
-      await killTree(child)
+      await killTree(child, { reason: 'request-end' })
       releaseSpawner()
       mcpMaterialised?.cleanup()
     }
@@ -265,6 +279,7 @@ export class OpencodeBackend implements Backend {
 }
 
 export function opencodeVariantForEffort(effort: ChatRequest['effort']): string | null {
+  if (effort === 'low') return 'minimal'
   return effort ?? null
 }
 
@@ -312,6 +327,45 @@ function extractUsage(ev: Record<string, unknown>): ChatDelta['usage'] | null {
   return {
     input_tokens: tokens.input_tokens ?? tokens.input,
     output_tokens: tokens.output_tokens ?? tokens.output,
+  }
+}
+
+function attributionHeaders(req: ChatRequest): Record<string, string> {
+  const metadata = req.metadata ?? {}
+  const client = cleanHeaderValue(metadata.tangleClient)
+  const source = cleanHeaderValue(metadata.tangleSource)
+  return {
+    ...(client ? { 'x-tangle-client': client } : {}),
+    ...(source ? { 'x-tangle-source': source } : {}),
+  }
+}
+
+function cleanHeaderValue(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return trimmed.length > 256 ? trimmed.slice(0, 256) : trimmed
+}
+
+function opencodeProviderHeaderConfig(
+  model: string | null,
+  headers: Record<string, string>,
+): Record<string, unknown> {
+  if (!model || Object.keys(headers).length === 0) return {}
+  const slash = model.indexOf('/')
+  if (slash <= 0 || slash === model.length - 1) return {}
+  const provider = model.slice(0, slash)
+  const providerModel = model.slice(slash + 1)
+  return {
+    provider: {
+      [provider]: {
+        models: {
+          [providerModel]: {
+            headers,
+          },
+        },
+      },
+    },
   }
 }
 

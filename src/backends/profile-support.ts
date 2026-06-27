@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/sandbox'
+import type { AgentProfile, AgentProfileMcpServer, AgentSubagentProfile } from '@tangle-network/sandbox'
 import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 
@@ -250,7 +250,7 @@ export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): Mate
       }
     }
   }
-  return materialiseMcpServersForOpencode(specs)
+  return materialiseMcpServersForOpencode(specs, profile)
 }
 
 /**
@@ -268,50 +268,85 @@ export function materialiseOpencodeMcpConfig(profile: AgentProfile | null): Mate
  */
 export function materialiseMcpServersForOpencode(
   specs: Record<string, McpServerSpec> | null,
+  profile?: AgentProfile | null,
+  extraConfig: Record<string, unknown> = {},
 ): MaterialisedMcpConfig {
-  const opencodeMcp: Record<string, {
+  type OpencodeLocalMcp = {
     type: 'local'
     command: string[]
     environment?: Record<string, string>
     enabled?: boolean
     timeout?: number
-  }> = {}
+  }
+  type OpencodeRemoteMcp = {
+    type: 'remote'
+    url: string
+    headers?: Record<string, string>
+    enabled?: boolean
+  }
+  const opencodeMcp: Record<string, OpencodeLocalMcp | OpencodeRemoteMcp> = {}
   if (specs) {
     for (const [name, spec] of Object.entries(specs)) {
-      if (!isStdioMcpSpec(spec)) continue
-      if (!spec.command) continue
-      const command: string[] = [spec.command, ...(spec.args ?? [])]
-      opencodeMcp[name] = {
-        type: 'local',
-        command,
-        ...(spec.env && Object.keys(spec.env).length ? { environment: spec.env } : {}),
-        enabled: true,
-        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+      if (spec.enabled === false) continue
+      if (isStdioMcpSpec(spec) && spec.command) {
+        const command: string[] = [spec.command, ...(spec.args ?? [])]
+        opencodeMcp[name] = {
+          type: 'local',
+          command,
+          ...(spec.env && Object.keys(spec.env).length ? { environment: spec.env } : {}),
+          enabled: true,
+          ...(spec.timeout ? { timeout: spec.timeout } : {}),
+        }
+      } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
+        // Remote streamable-http / sse MCP. opencode loads this from its
+        // config file the same way claude/kimi do (`type:'remote'`), so a
+        // router-backed search MCP reaches opencode instead of being dropped
+        // as non-stdio. Schema: opencode.ai/config.json mcp.<name>.
+        opencodeMcp[name] = {
+          type: 'remote',
+          url: spec.url,
+          ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+          enabled: true,
+        }
       }
     }
   }
   const serverNames = Object.keys(opencodeMcp)
 
+  // Materialise AgentProfile.subagents into opencode's top-level `agent` map (a
+  // sibling of `mcp`, purely additive — the user's built-in agents survive). Each
+  // becomes mode:'subagent' the primary reaches via the native `task` tool; the
+  // subagent's imperative `description` is what the primary reads to decide to
+  // delegate. Used by the benchmark's search-subagent arm (a research-only agent
+  // that owns the search tools). Model is omitted unless set (inherits primary's).
+  const opencodeAgents: Record<string, Record<string, unknown>> = {}
+  const subagents = (profile as { subagents?: Record<string, AgentSubagentProfile> } | null | undefined)?.subagents
+  if (subagents && typeof subagents === 'object') {
+    for (const [name, sub] of Object.entries(subagents)) {
+      if (!name || !sub || typeof sub !== 'object') continue
+      opencodeAgents[name] = {
+        mode: 'subagent',
+        ...(typeof sub.description === 'string' && sub.description ? { description: sub.description } : {}),
+        ...(typeof sub.prompt === 'string' && sub.prompt ? { prompt: sub.prompt } : {}),
+        ...(typeof sub.model === 'string' && sub.model ? { model: sub.model } : {}),
+        ...(sub.tools && typeof sub.tools === 'object' ? { tools: sub.tools } : {}),
+        ...(sub.permissions && typeof sub.permissions === 'object' ? { permission: sub.permissions } : {}),
+        ...(typeof sub.maxSteps === 'number' ? { steps: sub.maxSteps } : {}),
+      }
+    }
+  }
+
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-'))
   const configPath = join(dir, 'opencode.json')
   // Headless benchmark and automation runs must never block on an
   // interactive permission prompt.
-  const headlessPermission: Record<string, 'allow' | 'ask' | 'deny'> = {
-    external_directory: 'allow',
-    bash: 'allow',
-    edit: 'allow',
-    read: 'allow',
-    write: 'allow',
-    webfetch: 'allow',
-    task: 'allow',
-    plan_enter: 'allow',
-    plan_exit: 'allow',
-    question: 'allow',
-  }
+  const headlessPermission = opencodePermissionMap(profile)
   writeFileSync(configPath, JSON.stringify({
     $schema: 'https://opencode.ai/config.json',
     permission: headlessPermission,
     mcp: opencodeMcp,
+    ...(Object.keys(opencodeAgents).length ? { agent: opencodeAgents } : {}),
+    ...extraConfig,
   }, null, 2))
   return {
     configPath,
@@ -324,6 +359,93 @@ export function materialiseMcpServersForOpencode(
       }
     },
   }
+}
+
+type OpencodePermission = 'allow' | 'ask' | 'deny'
+
+const OPENCODE_PERMISSION_KEYS = [
+  'external_directory',
+  'bash',
+  'edit',
+  'read',
+  'write',
+  'webfetch',
+  'task',
+  'plan_enter',
+  'plan_exit',
+  'question',
+] as const
+
+type OpencodePermissionKey = typeof OPENCODE_PERMISSION_KEYS[number]
+
+const OPENCODE_TOOL_ALIASES: Record<string, OpencodePermissionKey> = {
+  bash: 'bash',
+  shell: 'bash',
+  terminal: 'bash',
+  edit: 'edit',
+  multiedit: 'edit',
+  notebookedit: 'edit',
+  read: 'read',
+  write: 'write',
+  webfetch: 'webfetch',
+  websearch: 'webfetch',
+  fetch: 'webfetch',
+  task: 'task',
+  agent: 'task',
+}
+
+function opencodePermissionMap(profile: AgentProfile | null | undefined): Record<OpencodePermissionKey, OpencodePermission> {
+  const permissions: Record<OpencodePermissionKey, OpencodePermission> = {
+    external_directory: 'allow',
+    bash: 'allow',
+    edit: 'allow',
+    read: 'allow',
+    write: 'allow',
+    webfetch: 'allow',
+    task: 'allow',
+    plan_enter: 'allow',
+    plan_exit: 'allow',
+    question: 'allow',
+  }
+  const metadata = profile && typeof profile === 'object'
+    ? (profile as { metadata?: unknown }).metadata
+    : null
+  if (!metadata || typeof metadata !== 'object') return permissions
+  const record = metadata as Record<string, unknown>
+  const explicit = permissionRecord(record.opencodePermissions)
+    ?? permissionRecord((record.permissions as { opencode?: unknown } | undefined)?.opencode)
+  if (explicit) {
+    for (const [key, value] of Object.entries(explicit)) {
+      if (isOpencodePermissionKey(key) && isOpencodePermission(value)) permissions[key] = value
+    }
+  }
+
+  const denied = Array.isArray(record.disallowedTools) ? record.disallowedTools : []
+  for (const raw of denied) {
+    if (typeof raw !== 'string') continue
+    const normalized = raw.replace(/[^a-z0-9_*]/gi, '').toLowerCase()
+    if (normalized === '*' || normalized === 'all') {
+      for (const key of ['external_directory', 'bash', 'edit', 'read', 'write', 'webfetch', 'task'] as const) {
+        permissions[key] = 'deny'
+      }
+      continue
+    }
+    const key = OPENCODE_TOOL_ALIASES[normalized]
+    if (key) permissions[key] = 'deny'
+  }
+  return permissions
+}
+
+function permissionRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function isOpencodePermissionKey(value: string): value is OpencodePermissionKey {
+  return (OPENCODE_PERMISSION_KEYS as readonly string[]).includes(value)
+}
+
+function isOpencodePermission(value: unknown): value is OpencodePermission {
+  return value === 'allow' || value === 'ask' || value === 'deny'
 }
 
 export function materialiseEmptyMcpConfig(): MaterialisedMcpConfig {
