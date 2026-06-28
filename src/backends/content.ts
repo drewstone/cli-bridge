@@ -31,6 +31,24 @@ export function tokensFromChars(chars: number): number {
   return Math.max(0, Math.ceil(chars / 4))
 }
 
+/**
+ * Total characters the model actually reads for a request — message content PLUS
+ * assistant tool-call structures (id + name + arguments), which `flattenMessages`
+ * deliberately omits. Used only for usage estimation, where dropping tool calls
+ * would systematically undercount tool-heavy turns and make them look cheaper than
+ * they were. Counts the semantic payload, not JSON framing.
+ */
+export function estimateMessagesChars(messages: ChatMessage[]): number {
+  let n = 0
+  for (const m of messages) {
+    n += contentToText(m.content).length
+    for (const tc of m.tool_calls ?? []) {
+      n += (tc.id?.length ?? 0) + (tc.function?.name?.length ?? 0) + (tc.function?.arguments?.length ?? 0)
+    }
+  }
+  return n
+}
+
 export function collectSystemText(messages: ChatMessage[]): string {
   return messages
     .filter((m) => m.role === 'system')

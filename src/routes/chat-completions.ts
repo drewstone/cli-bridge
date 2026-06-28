@@ -23,7 +23,7 @@ import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
-import { flattenMessages, tokensFromChars } from '../backends/content.js'
+import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
 import type { Run, RunRegistry } from '../runs/registry.js'
 
@@ -320,8 +320,10 @@ export function mountChatCompletions(
       makeSource = (run) => backend.chat(req, session, run.signal)
     }
 
-    // Approximate input size once, for backends that report no usage (estimated in wrap).
-    const promptText = flattenMessages(req.messages, { includeSystem: true })
+    // Approximate input size once (content + tool-call structures), for backends that
+    // report no usage. Estimated in wrap; tool calls are included so tool-heavy turns
+    // are not systematically undercounted.
+    const promptChars = estimateMessagesChars(req.messages)
 
     // Persist internal session id as it flows in. Returns a new
     // AsyncIterable<ChatDelta> so the typed boundary stays clean.
@@ -337,7 +339,10 @@ export function mountChatCompletions(
           for await (const delta of source) {
             if (delta.usage) sawUsage = true
             completionChars += (delta.content?.length ?? 0)
-              + (delta.tool_calls?.reduce((s, tc) => s + (tc.arguments?.length ?? 0), 0) ?? 0)
+              + (delta.tool_calls?.reduce(
+                (s, tc) => s + (tc.id?.length ?? 0) + (tc.name?.length ?? 0) + (tc.arguments?.length ?? 0),
+                0,
+              ) ?? 0)
             if (delta.internal_session_id && req.session_id) {
               deps.sessions.upsert({
                 externalId: req.session_id,
@@ -361,7 +366,7 @@ export function mountChatCompletions(
           if (!sawUsage) {
             yield {
               usage: {
-                input_tokens: tokensFromChars(promptText.length),
+                input_tokens: tokensFromChars(promptChars),
                 output_tokens: tokensFromChars(completionChars),
                 estimated: true,
               },
