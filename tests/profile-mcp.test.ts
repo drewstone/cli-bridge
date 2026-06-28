@@ -223,18 +223,21 @@ describe('isStdioMcpSpec', () => {
 })
 
 describe('materializeMcpServersForClaudeKimi', () => {
-  it('writes the canonical {mcpServers:{...}} JSON shape', () => {
+  it('writes the canonical {mcpServers:{...}} JSON shape with stdio + remote servers', () => {
     const m = materializeMcpServersForClaudeKimi({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
       remote: { type: 'http', url: 'https://example.com', headers: { Authorization: 'Bearer X' } },
     })
     expect(m).not.toBeNull()
     if (!m) return
-    expect(m.serverNames).toEqual(['echo'])
+    // stdio servers AND remote http/sse servers are both forwarded — Claude Code
+    // (and kimi-code) load remote MCP from --mcp-config natively.
+    expect(m.serverNames).toEqual(['echo', 'remote'])
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written).toEqual({
       mcpServers: {
         echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
+        remote: { type: 'http', url: 'https://example.com', headers: { Authorization: 'Bearer X' } },
       },
     })
     m.cleanup()
