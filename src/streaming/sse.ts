@@ -55,12 +55,16 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     }))
   }
 
+  // A usage-only delta (no content/tool_calls/finish) is the OpenAI usage trailer:
+  // it must carry `choices: []`, not an empty choice, or strict clients misparse it
+  // as assistant output. Every other delta carries the single streaming choice.
+  const usageOnly = hasUsage && !hasContent && !hasToolCalls && !hasFinish
   const payload = {
     id: meta.id,
     object: 'chat.completion.chunk',
     created: meta.created,
     model: meta.model,
-    choices: [
+    choices: usageOnly ? [] : [
       {
         index: 0,
         delta: choiceDelta,
