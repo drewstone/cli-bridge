@@ -152,6 +152,13 @@ describe('applyJail fail-closed', () => {
     expect(r.bin).toBe('mybin')
     expect(r.args).toEqual(['--x'])
   })
+
+  it('fails closed when the backend is NoopJail (unsupported platform auto-selection)', async () => {
+    // selectJailBackend() returns NoopJail on non-Linux/macOS hosts; a write-jail
+    // request there must be rejected, not silently run unconfined.
+    await expect(applyJail('/bin/sh', ['-c', 'x'], jailedOpts, new NoopJail()))
+      .rejects.toThrow(/write-jail requested/)
+  })
 })
 
 describe('NoopJail.wrap', () => {

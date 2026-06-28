@@ -23,8 +23,16 @@ export { MacosSeatbeltJail } from './macos-seatbelt.js'
 export class NoopJail implements JailBackend {
   readonly name = 'noop'
 
+  /**
+   * Reports UNAVAILABLE: the no-op backend cannot confine anything, so a
+   * caller asking "can this host enforce a write-jail?" must hear "no". This
+   * is what lets applyJail() fail closed on unsupported platforms (where
+   * selectJailBackend returns NoopJail) instead of silently running
+   * unconfined. wrapInJail still uses it as the explicit pass-through
+   * fallback, which does not consult this flag.
+   */
   isAvailable(): boolean {
-    return true
+    return false
   }
 
   wrap(bin: string, args: string[], _spec: JailSpec): JailWrap {
