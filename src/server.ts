@@ -8,7 +8,7 @@
 
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { loadConfig, type Config } from './config.js'
+import { anyBackendSpawnsOnHost, loadConfig, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { BackendRegistry } from './backends/registry.js'
 import { ClaudeBackend } from './backends/claude.js'
@@ -319,7 +319,7 @@ export async function startServer(): Promise<void> {
     // /health reports ready. Only relevant when some backend actually spawns on the
     // host: docker/remote-only deployments never hit the host jail. Honor
     // BRIDGE_JAIL_FALLBACK=warn, which runs unconfined-with-warning instead.
-    const hasHostSpawn = Object.values(config.executors).some((e) => e.kind === 'host')
+    const hasHostSpawn = anyBackendSpawnsOnHost(config.backends, config.executors)
     if (config.jailMode === 'write-jail' && hasHostSpawn && !selectJailBackend().isAvailable()) {
       if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
         console.warn(

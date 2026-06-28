@@ -110,6 +110,31 @@ export interface BackendExecutorConfig {
   containerConfigDir?: string
 }
 
+/** Backends that never spawn a CLI on the host (remote HTTP, local proxy, or a
+ * socket to an already-running daemon), so the host write-jail never applies. */
+const NON_HOST_SPAWN_BACKENDS = new Set(['sandbox', 'passthrough', 'nanoclaw'])
+
+/**
+ * Whether any ENABLED backend will spawn a CLI on the host (and therefore be
+ * subject to the write-jail). True unless every enabled backend is remote/proxy
+ * or pinned to a docker executor. Errs toward true: an unrecognized backend is
+ * assumed to host-spawn, so the startup jail check fails closed rather than
+ * booting "healthy" and failing every request at runtime. Covers backends that
+ * are NOT in `executors` (e.g. ACP hermes/openclaw, factory, amp, forge), which
+ * default to host spawn.
+ */
+export function anyBackendSpawnsOnHost(
+  backends: Iterable<string>,
+  executors: Record<string, BackendExecutorConfig>,
+): boolean {
+  for (const name of backends) {
+    if (NON_HOST_SPAWN_BACKENDS.has(name)) continue
+    if (executors[name]?.kind === 'docker') continue
+    return true
+  }
+  return false
+}
+
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
