@@ -261,10 +261,17 @@ describe('resolveJailSpec', () => {
     expect(spec?.root).toBe(resolve(cwd, DEFAULT_JAIL_ROOT))
   })
 
-  it('honors a valid nested root', () => {
+  it('honors a nested root inside the .agent-home scratch namespace', () => {
     const cwd = '/home/user/project'
-    const spec = resolveJailSpec({ cwd, execMode: 'write-jail', execRoot: 'work/scratch', env: {} })
-    expect(spec?.root).toBe(resolve(cwd, 'work/scratch'))
+    const spec = resolveJailSpec({ cwd, execMode: 'write-jail', execRoot: '.agent-home/run1', env: {} })
+    expect(spec?.root).toBe(resolve(cwd, '.agent-home/run1'))
+  })
+
+  it('clamps a root that points at an arbitrary repo subtree to the scratch default', () => {
+    const cwd = '/home/user/project'
+    // 'src' is inside cwd but OUTSIDE .agent-home — must not become the writable jail.
+    const spec = resolveJailSpec({ cwd, execMode: 'write-jail', execRoot: 'src', env: {} })
+    expect(spec?.root).toBe(resolve(cwd, DEFAULT_JAIL_ROOT))
   })
 
   it('clamps a root that escapes cwd back to the in-cwd default (fail closed)', () => {

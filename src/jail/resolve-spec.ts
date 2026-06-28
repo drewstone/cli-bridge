@@ -4,7 +4,8 @@
  *
  *   mode: BRIDGE_JAIL_MODE=write-jail is a FLOOR (a request can only add
  *         confinement, never weaken it); otherwise execution.jail.mode decides.
- *   root: execution.jail.root  >  BRIDGE_JAIL_ROOT  >  '<cwd>/.agent-home'
+ *   root: must be a scratch dir within <cwd>/.agent-home (default the namespace
+ *         itself); an arbitrary repo subtree or any escape clamps to the default.
  *
  * Returns `null` when the effective mode is 'off' — the spawner then runs
  * the CLI exactly as before (no wrap, no env change). When 'write-jail',
@@ -14,7 +15,7 @@
  * writable mount outside its own working tree.
  */
 
-import { resolve } from 'node:path'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { resolveJailRoot } from './types.js'
 import type { JailSpec } from './types.js'
 
@@ -44,13 +45,17 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   if (mode !== 'write-jail') return null
 
   const projectDir = resolve(input.cwd)
+  const scratchBase = resolve(projectDir, DEFAULT_JAIL_ROOT)
   const requested = input.execRoot ?? env.BRIDGE_JAIL_ROOT ?? DEFAULT_JAIL_ROOT
-  // Clamp the writable root inside projectDir. resolveJailRoot throws if
-  // the resolved path escapes the base; for an untrusted per-request value
-  // we fail closed to the in-cwd default rather than honor the escape.
+  // The writable root must be a dedicated scratch dir INSIDE <cwd>/.agent-home,
+  // never an arbitrary repo subtree (which would make tracked files writable and
+  // clobber their .gitignore). Resolve under cwd, then require it within the
+  // scratch namespace; anything else (incl. resolveJailRoot rejecting an
+  // escape/self-root) fails closed to the scratch base itself.
   let root: string
   try {
-    root = resolveJailRoot(requested, projectDir)
+    const candidate = resolveJailRoot(requested, projectDir)
+    root = isWithin(scratchBase, candidate) ? candidate : resolveJailRoot(DEFAULT_JAIL_ROOT, projectDir)
   } catch {
     root = resolveJailRoot(DEFAULT_JAIL_ROOT, projectDir)
   }
@@ -60,4 +65,10 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
 /** Anything other than the exact 'write-jail' token is treated as 'off' (fail-safe). */
 function normalizeMode(value: string | undefined): JailMode {
   return (value ?? '').trim().toLowerCase() === 'write-jail' ? 'write-jail' : 'off'
+}
+
+/** Whether `p` is `base` itself or a descendant of it (lexical). */
+function isWithin(base: string, p: string): boolean {
+  const rel = relative(resolve(base), resolve(p))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }

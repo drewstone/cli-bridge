@@ -31,22 +31,29 @@ const AUTH_PATHS: Record<string, readonly string[]> = {
   'kimi-code': ['.kimi'],
   kimi: ['.kimi'],
   opencode: ['.config/opencode', '.local/share/opencode'],
-  codex: ['.codex'],
   gemini: ['.gemini'],
+  // codex is intentionally absent: codex.ts already points the spawned CLI at a
+  // synthetic CODEX_HOME and copies auth.json there, so it self-preserves auth.
+}
+
+/** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME
+ * override (matches how the backends resolve config/auth at runtime). */
+function backendHome(): string {
+  return process.env.HOME?.trim() || homedir()
 }
 
 /** Absolute host auth paths for a backend that actually exist on this host. */
 export function authSourcesFor(backendName: string): string[] {
-  const home = homedir()
+  const home = backendHome()
   return (AUTH_PATHS[backendName] ?? [])
     .map((rel) => join(home, rel))
     .filter((abs) => existsSync(abs))
 }
 
 /** The path, inside the jail HOME, where an auth source must appear (its
- * location relative to the real HOME). */
+ * location relative to the real HOME the CLI reads). */
 export function jailRelPath(source: string): string {
-  return relative(homedir(), source)
+  return relative(backendHome(), source)
 }
 
 /**

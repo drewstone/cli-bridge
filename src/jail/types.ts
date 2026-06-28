@@ -12,7 +12,7 @@
  * else the NoopJail passes argv through unchanged.
  */
 
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -125,8 +125,10 @@ export async function prepareJailHome(root: string): Promise<void> {
   await mkdir(root, { recursive: true })
   // The jail root sits inside the project (default <cwd>/.agent-home) and holds
   // scratch + (on macOS) copied credentials. Ignore the whole tree so neither
-  // work artifacts nor copied secrets can ever be committed.
-  await writeFile(join(root, '.gitignore'), '*\n')
+  // work artifacts nor copied secrets can ever be committed. Never clobber an
+  // existing .gitignore.
+  const gitignore = join(root, '.gitignore')
+  if (!existsSync(gitignore)) await writeFile(gitignore, '*\n')
   for (const rel of relDirs) {
     await mkdir(join(root, rel), { recursive: true })
   }
