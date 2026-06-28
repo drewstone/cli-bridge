@@ -2,7 +2,8 @@
  * Resolve a per-request write-jail spec from the request's
  * `execution.jail` config layered over the `BRIDGE_JAIL_*` env defaults.
  *
- *   mode: execution.jail.mode  >  BRIDGE_JAIL_MODE  >  'off'
+ *   mode: BRIDGE_JAIL_MODE=write-jail is a FLOOR (a request can only add
+ *         confinement, never weaken it); otherwise execution.jail.mode decides.
  *   root: execution.jail.root  >  BRIDGE_JAIL_ROOT  >  '<cwd>/.agent-home'
  *
  * Returns `null` when the effective mode is 'off' — the spawner then runs
@@ -35,7 +36,11 @@ export const DEFAULT_JAIL_ROOT = '.agent-home'
 
 export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   const env = input.env ?? process.env
-  const mode = normalizeMode(input.execMode ?? env.BRIDGE_JAIL_MODE)
+  // BRIDGE_JAIL_MODE=write-jail is an operator-set FLOOR, not a default a
+  // caller may weaken: a per-request mode can turn confinement ON, never OFF.
+  const mode = normalizeMode(env.BRIDGE_JAIL_MODE) === 'write-jail'
+    ? 'write-jail'
+    : normalizeMode(input.execMode)
   if (mode !== 'write-jail') return null
 
   const projectDir = resolve(input.cwd)

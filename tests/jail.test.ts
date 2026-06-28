@@ -188,6 +188,12 @@ describe('resolveJailSpec', () => {
     expect(resolveJailSpec({ cwd, env: { BRIDGE_JAIL_MODE: 'write-jail' } })).not.toBeNull()
   })
 
+  it('treats env BRIDGE_JAIL_MODE=write-jail as a floor a request cannot weaken to off', () => {
+    const cwd = '/home/user/project'
+    const spec = resolveJailSpec({ cwd, execMode: 'off', env: { BRIDGE_JAIL_MODE: 'write-jail' } })
+    expect(spec, 'a per-request off must not disable an operator-enforced write-jail').not.toBeNull()
+  })
+
   it('defaults the writable root to .agent-home inside cwd', () => {
     const cwd = '/home/user/project'
     const spec = resolveJailSpec({ cwd, execMode: 'write-jail', env: {} })
