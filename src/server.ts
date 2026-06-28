@@ -41,6 +41,7 @@ import type { Spawner } from './executors/types.js'
 import type { BackendExecutorConfig } from './config.js'
 import { AdmissionGate } from './admission.js'
 import { RunRegistry } from './runs/registry.js'
+import { selectJailBackend } from './jail/index.js'
 import { acquireInstanceLock, PortAlreadyBoundError } from './runtime/single-instance.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
@@ -313,6 +314,18 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
     console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue} queueTimeoutMs=${config.admission.queueTimeoutMs}`)
     console.log(`[cli-bridge] write-jail default: ${config.jailMode}${config.jailMode === 'write-jail' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
+    // Fail fast (don't go ready) if write-jail is the operator floor but no jail
+    // backend can run here — every host request would otherwise fail closed while
+    // /health reports ready.
+    if (config.jailMode === 'write-jail' && !selectJailBackend().isAvailable()) {
+      console.error(
+        '[cli-bridge] FATAL: BRIDGE_JAIL_MODE=write-jail but no write-jail backend can run on this ' +
+        'host — every host request would fail closed. Enable unprivileged user namespaces (Linux: ' +
+        '`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s /usr/bin/bwrap`), ' +
+        'ensure sandbox-exec exists (macOS), or unset BRIDGE_JAIL_MODE.',
+      )
+      process.exit(1)
+    }
     for (const cfg of Object.values(config.executors)) {
       if (cfg.kind === 'docker') {
         console.log(`[cli-bridge] ${cfg.name} executor: docker pool size=${cfg.poolSize} image=${cfg.image}`)

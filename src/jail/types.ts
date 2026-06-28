@@ -12,7 +12,7 @@
  * else the NoopJail passes argv through unchanged.
  */
 
-import { existsSync, realpathSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -114,6 +114,30 @@ export function jailEnv(root: string): Record<string, string> {
     XDG_DATA_HOME: join(root, '.local', 'share'),
     XDG_STATE_HOME: join(root, '.local', 'state'),
     XDG_RUNTIME_DIR: join(root, '.runtime'),
+  }
+}
+
+/**
+ * Ensure the jail root is git-ignored from the REPO's perspective. A .gitignore
+ * placed inside an untracked directory does not make Git ignore that directory
+ * itself, so we add a rule to the project's `.git/info/exclude` (local + untracked,
+ * no working-tree change). Best-effort and idempotent; a no-op outside a git repo
+ * or when `.git` is a file (worktree/submodule).
+ */
+export function ignoreJailRoot(projectDir: string, root: string): void {
+  try {
+    const gitDir = join(projectDir, '.git')
+    if (!existsSync(gitDir) || !statSync(gitDir).isDirectory()) return
+    const topSeg = relative(projectDir, root).split(sep)[0]
+    if (!topSeg || topSeg.startsWith('..')) return
+    const entry = `/${topSeg}/`
+    const excludeFile = join(gitDir, 'info', 'exclude')
+    const current = existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8') : ''
+    if (current.split(/\r?\n/).includes(entry)) return
+    mkdirSync(dirname(excludeFile), { recursive: true })
+    appendFileSync(excludeFile, `${current && !current.endsWith('\n') ? '\n' : ''}${entry}\n`)
+  } catch {
+    // best-effort: do not fail a jailed run because the ignore rule could not be written
   }
 }
 

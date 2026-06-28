@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -29,6 +29,7 @@ import {
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
 import { authSourcesFor, jailRelPath } from '../src/jail/auth-preserve.js'
+import { ignoreJailRoot } from '../src/jail/types.js'
 import type { JailBackend } from '../src/jail/index.js'
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
@@ -147,6 +148,16 @@ describe('resolveJailRoot containment', () => {
   it('accepts a normal nested descendant', async () => {
     const base = await realpath(await tempProjectDir())
     expect(resolveJailRoot('.agent-home', base)).toBe(join(base, '.agent-home'))
+  })
+
+  it('ignoreJailRoot adds the scratch dir to .git/info/exclude (in-dir .gitignore is ineffective)', async () => {
+    const base = await realpath(await tempProjectDir())
+    await mkdir(join(base, '.git', 'info'), { recursive: true })
+    ignoreJailRoot(base, join(base, '.agent-home'))
+    ignoreJailRoot(base, join(base, '.agent-home')) // idempotent
+    const exclude = await readFile(join(base, '.git', 'info', 'exclude'), 'utf8')
+    expect(exclude).toContain('/.agent-home/')
+    expect(exclude.match(/\/\.agent-home\//g)?.length).toBe(1)
   })
 })
 

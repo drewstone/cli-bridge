@@ -30,7 +30,7 @@ import { accessSync, constants, existsSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 import { jailRelPath } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
 const BWRAP_BIN = 'bwrap'
 
@@ -45,6 +45,7 @@ export class LinuxBwrapJail implements JailBackend {
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     const root = resolveJailRoot(spec.root, spec.projectDir)
     await prepareJailHome(root)
+    ignoreJailRoot(spec.projectDir, root)
 
     const bwrapArgs = [
       '--unshare-user',
