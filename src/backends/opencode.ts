@@ -130,6 +130,7 @@ export class OpencodeBackend implements Backend {
         ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
+      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
     })
     const child = spawned.child
     const releaseSpawner = spawned.release

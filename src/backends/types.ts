@@ -16,6 +16,7 @@
 
 import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
+import type { JailSpec } from '../jail/index.js'
 import type { AgentProfile, ReasoningEffort } from '@tangle-network/agent-interface'
 
 export type ChatContentPart =
@@ -133,7 +134,17 @@ export interface ChatRequest {
    * execution location changes.
    */
   execution?:
-    | { kind: 'host' }
+    | {
+        kind: 'host'
+        /**
+         * Per-request write-jail override. `mode: 'write-jail'` confines
+         * the spawned CLI's writes to `root` (default `<cwd>/.agent-home`),
+         * `'off'` disables jailing even when `BRIDGE_JAIL_MODE` defaults it
+         * on. `root` is clamped inside the request cwd. Resolved to a
+         * {@link JailSpec} on `jailSpec` by the chat route.
+         */
+        jail?: { mode?: 'off' | 'write-jail'; root?: string }
+      }
     | {
         kind: 'sandbox'
         repoUrl?: string
@@ -141,6 +152,14 @@ export interface ChatRequest {
         capability?: string
         ttlSeconds?: number
       }
+  /**
+   * Resolved write-jail spec for this turn, set by the chat route from
+   * `execution.jail` layered over the `BRIDGE_JAIL_*` env defaults (see
+   * `resolveJailSpec`). NOT part of the wire schema — the wire field is
+   * `execution.jail`. When present, the host/scoped-host spawners wrap the
+   * CLI in an OS write-jail; null/absent = no jail.
+   */
+  jailSpec?: JailSpec | null
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
 }
