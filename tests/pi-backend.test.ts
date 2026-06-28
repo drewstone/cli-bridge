@@ -85,6 +85,192 @@ describe('PiBackend', () => {
     ])
   })
 
+  it('surfaces pi assistantMessageEvent tool_call_start as OpenAI tool_calls', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-tools-1' },
+        {
+          type: 'message_update',
+          assistantMessageEvent: {
+            type: 'tool_call_start',
+            id: 'call_read_1',
+            name: 'read',
+            input: { path: 'src/lib.rs' },
+            contentIndex: 0,
+          },
+        },
+        {
+          type: 'message_update',
+          assistantMessageEvent: {
+            type: 'tool_call_args_delta',
+            id: 'call_read_1',
+            name: 'read',
+            delta: '{"path":"src/lib.rs"}',
+            contentIndex: 0,
+          },
+        },
+        { type: 'turn_end', message: { usage: { input: 20, output: 8 } } },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/moonshot/kimi-k2.6',
+      messages: [{ role: 'user', content: 'inspect the file' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { internal_session_id: 'pi-tools-1' },
+      { tool_calls: [{ id: 'call_read_1', name: 'read', arguments: '{"path":"src/lib.rs"}' }] },
+      { finish_reason: 'tool_calls', usage: { input_tokens: 20, output_tokens: 8 } },
+    ])
+  })
+
+  it('surfaces real pi toolcall_end frames nested under assistantMessageEvent.partial.content', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-real-tools-1' },
+        {
+          type: 'message_update',
+          assistantMessageEvent: {
+            type: 'toolcall_start',
+            contentIndex: 1,
+            partial: {
+              content: [
+                { type: 'text', text: '' },
+                {
+                  type: 'toolCall',
+                  id: 'call_read_1',
+                  name: 'read',
+                  arguments: {},
+                  partialArgs: '',
+                  streamIndex: 0,
+                },
+              ],
+            },
+          },
+        },
+        {
+          type: 'message_update',
+          assistantMessageEvent: {
+            type: 'toolcall_delta',
+            contentIndex: 1,
+            delta: '',
+            partial: {
+              content: [
+                { type: 'text', text: '' },
+                {
+                  type: 'toolCall',
+                  id: 'call_read_1',
+                  name: 'read',
+                  arguments: {},
+                  partialArgs: '',
+                  streamIndex: 0,
+                },
+              ],
+            },
+          },
+        },
+        {
+          type: 'message_update',
+          assistantMessageEvent: {
+            type: 'toolcall_end',
+            contentIndex: 1,
+            toolCall: {
+              type: 'toolCall',
+              id: 'call_read_1',
+              name: 'read',
+              arguments: { path: '/tmp/secret.txt' },
+            },
+          },
+        },
+        { type: 'turn_end', message: { usage: { input: 31, output: 12 } } },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'read the file' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { internal_session_id: 'pi-real-tools-1' },
+      { tool_calls: [{ id: 'call_read_1', name: 'read', arguments: '{"path":"/tmp/secret.txt"}' }] },
+      { finish_reason: 'tool_calls', usage: { input_tokens: 31, output_tokens: 12 } },
+    ])
+  })
+
+  it('surfaces real pi tool_execution_start events as OpenAI tool_calls', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'tool_execution_start',
+          toolCallId: 'call_bash_1',
+          toolName: 'bash',
+          args: { command: 'pnpm test' },
+        },
+        {
+          type: 'tool_execution_end',
+          toolCallId: 'call_bash_1',
+          toolName: 'bash',
+          result: 'ok',
+          isError: false,
+        },
+        { type: 'turn_end', message: { usage: { input: 10, output: 5 } } },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'run tests' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
+      { finish_reason: 'tool_calls', usage: { input_tokens: 10, output_tokens: 5 } },
+    ])
+  })
+
+  it('surfaces pi nested tool_call_request events once', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'tool_call_request',
+          toolCall: {
+            id: 'call_bash_1',
+            name: 'bash',
+            arguments: { command: 'pnpm test' },
+          },
+        },
+        {
+          type: 'tool_call_response',
+          toolCall: {
+            id: 'call_bash_1',
+            name: 'bash',
+          },
+        },
+        { type: 'turn_end', message: { usage: { input: 10, output: 5 } } },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/deepseek/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'run tests' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
+      { finish_reason: 'tool_calls', usage: { input_tokens: 10, output_tokens: 5 } },
+    ])
+  })
+
   it('throws on an empty exit-0 stream instead of a phantom finish_reason:stop', async () => {
     // Some provider/model paths (moonshot/kimi-k2-thinking, gemini-3-pro-preview)
     // return a 0-byte stream with exit 0. Treated as finish_reason:'stop' that is

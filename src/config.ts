@@ -8,6 +8,7 @@
  */
 
 import { resolve } from 'node:path'
+import { coresAwareConcurrency } from './concurrency-default.js'
 
 export interface Config {
   host: string
@@ -145,8 +146,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     cliTimeoutMsDefault: defaultTimeout,
     admission: {
-      maxActive: parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8),
-      maxQueue: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_QUEUE, 16),
+      // Admission gates concurrent chat requests before they reach the
+      // executor semaphores; keep its default >= executor concurrency so
+      // executors (with the memory-protection rationale) stay the real
+      // limiter rather than admission silently bottlenecking below them.
+      maxActive: parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, coresAwareConcurrency({ ratio: 0.75, min: 8, max: 24 })),
+      maxQueue: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_QUEUE, coresAwareConcurrency({ ratio: 1, min: 16, max: 32 })),
       queueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_QUEUE_TIMEOUT_MS, 30_000),
     },
     claudishUrl: env.CLAUDISH_URL?.trim() || null,

@@ -48,6 +48,13 @@ class FakeBackend implements Backend {
   }
 }
 
+class HangingHealthBackend extends FakeBackend {
+  override async health() {
+    await new Promise<never>(() => {})
+    return { name: this.name, state: 'ready' as const }
+  }
+}
+
 class DelayedBackend extends FakeBackend {
   constructor(name: string, private readonly delayMs: number) {
     super(name)
@@ -218,6 +225,7 @@ describe('GeminiBackend model parsing', () => {
 
 describe('reasoning effort mapping', () => {
   it('maps opencode effort to provider variant', () => {
+    expect(opencodeVariantForEffort('low')).toBe('minimal')
     expect(opencodeVariantForEffort('high')).toBe('high')
     expect(opencodeVariantForEffort('max')).toBe('max')
     expect(opencodeVariantForEffort(undefined)).toBeNull()
@@ -1020,6 +1028,27 @@ describe('GET /v1/models', () => {
     const body = await res.json() as { data: Array<unknown> }
     expect(body.data).toHaveLength(0)
   })
+
+  it('does not let one wedged backend health probe hang model listing', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry()
+      .register(new HangingHealthBackend('kimi-code'))
+      .register(new FakeBackend('opencode'))
+    process.env.BRIDGE_MODELS_PROBE_TIMEOUT_MS = '5'
+    try {
+      mountModels(app, { registry })
+      const started = Date.now()
+      const res = await app.request('/v1/models')
+      expect(Date.now() - started).toBeLessThan(500)
+      expect(res.status).toBe(200)
+      const body = await res.json() as { data: Array<{ id: string; backend: string }> }
+      const ids = new Set(body.data.map((m) => m.id))
+      expect(ids.has('opencode/zai-coding-plan/glm-5.1')).toBe(true)
+      expect(body.data.some((m) => m.backend === 'kimi-code')).toBe(false)
+    } finally {
+      delete process.env.BRIDGE_MODELS_PROBE_TIMEOUT_MS
+    }
+  })
 })
 
 describe('GET /v1/sessions', () => {
@@ -1058,6 +1087,38 @@ describe('GET /v1/sessions', () => {
     expect(res.status).toBe(200)
     const body = await res.json() as { data: unknown[] }
     expect(Array.isArray(body.data)).toBe(true)
+  })
+
+  it('redacts sensitive metadata from the admin listing', async () => {
+    sessions.upsert({
+      externalId: 'profile',
+      backend: 'claude',
+      internalId: 'i-profile',
+      metadata: {
+        agent_profile: {
+          mcp: {
+            delegation: {
+              env: {
+                TANGLE_API_KEY: 'sk-tan-real',
+                SAFE_PROJECT_ID: 'project-1',
+              },
+            },
+          },
+        },
+        forwardedAuthorization: 'Bearer real',
+      },
+    })
+
+    const res = await app.request('/v1/sessions')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<{ metadata: Record<string, unknown> }> }
+    expect(JSON.stringify(body.data)).not.toContain('sk-tan-real')
+    expect(JSON.stringify(body.data)).not.toContain('Bearer real')
+    expect(JSON.stringify(body.data)).toContain('[redacted]')
+    expect(JSON.stringify(body.data)).toContain('project-1')
+
+    const stored = sessions.get('profile', 'claude')
+    expect(JSON.stringify(stored?.metadata)).toContain('sk-tan-real')
   })
 
   it('deletes a session by externalId', async () => {

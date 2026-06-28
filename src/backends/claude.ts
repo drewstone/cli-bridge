@@ -69,6 +69,24 @@ interface ClaudeStreamResult {
 }
 type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamResult | { type: string }
 
+function disallowedToolsForProfile(profile: unknown): string[] {
+  const raw = valueAt(profile, ['metadata', 'disallowedTools'])
+    ?? valueAt(profile, ['permissions', 'disallowedTools'])
+  if (!Array.isArray(raw)) return []
+  return Array.from(new Set(raw
+    .map((value) => typeof value === 'string' ? value.trim() : '')
+    .filter(Boolean)))
+}
+
+function valueAt(value: unknown, path: string[]): unknown {
+  let current = value
+  for (const key of path) {
+    if (!current || typeof current !== 'object') return undefined
+    current = (current as Record<string, unknown>)[key]
+  }
+  return current
+}
+
 export interface ClaudeBackendOptions {
   bin: string
   timeoutMs: number
@@ -448,6 +466,7 @@ export class ClaudeBackend implements Backend {
     // the caller flips harness=sandbox, the same mcp config flows
     // through TCloudSandbox's AgentProfile.mcp slot and the
     // sandbox-host enforces isolation at the VM layer.
+    const profileDisallowedTools = disallowedToolsForProfile(resolveAgentProfile(req, session))
     if (mode === 'hosted-safe') {
       args.push(
         '--permission-mode', 'plan',
@@ -455,6 +474,9 @@ export class ClaudeBackend implements Backend {
       )
     } else if (mode === 'byob') {
       args.push('--dangerously-skip-permissions')
+      if (profileDisallowedTools.length > 0) {
+        args.push('--disallowed-tools', profileDisallowedTools.join(','))
+      }
     }
 
     if (session?.internalId) {

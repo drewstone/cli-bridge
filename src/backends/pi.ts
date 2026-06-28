@@ -23,15 +23,18 @@
  *   {"type":"message_update","assistantMessageEvent":{
  *      "type":"thinking_delta"|"text_delta"|"tool_call_start"|...,
  *      "delta":"...", "contentIndex":N, ... }}
+ *   {"type":"message_update","assistantMessageEvent":{
+ *      "type":"toolcall_start"|"toolcall_end",
+ *      "partial":{"content":[{"type":"toolCall",...}]},
+ *      "toolCall":{...} }}
+ *   {"type":"tool_execution_start","toolCallId":"...","toolName":"...","args":{...}}
  *   {"type":"turn_end","message":{"usage":{...}}}
  *   {"type":"agent_end"}
  *
- * We currently surface text_delta as ChatDelta.content; thinking_delta is
- * dropped (matches how the kimi backend handles its `think` blocks for
- * non-thinking-aware callers). tool_call events are emitted as keepalives
- * for now — full tool-call mapping is a follow-up since pi's native tools
- * (read/bash/edit/write) execute INSIDE the CLI loop and don't need
- * OpenAI-tool-call round-trips through the bridge.
+ * We surface text_delta as ChatDelta.content and pi tool-call lifecycle events
+ * as OpenAI-shaped tool_calls so downstream trace consumers can observe native
+ * pi tool activity. thinking_delta is dropped (matches how the kimi backend
+ * handles its `think` blocks for non-thinking-aware callers).
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -161,17 +164,19 @@ export class PiBackend implements Backend {
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
     // Group-kill on timeout/abort — see backends/opencode.ts.
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
+    const timeoutHandle = setTimeout(() => { void killTree(child, { reason: 'timeout' }) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void killTree(child, { reason: 'client-abort' }) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
       let internalSessionId: string | undefined
       let stderr = ''
       let emittedContent = false
+      let emittedToolCall = false
       let sawError: string | null = null
       let sawAnyEvent = false
       let usage: { input?: number; output?: number } | undefined
+      const piToolCalls = new PiToolCallTracker()
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
 
@@ -252,9 +257,21 @@ export class PiBackend implements Backend {
               yield { content: delta }
             }
           }
-          // thinking_*, tool_call_*, message_start, message_end — drop
-          // for now. Future enhancement: surface thinking as a separate
-          // ChatDelta variant once the OpenAI o1-style schema lands.
+          const toolCall = piToolCalls.observe(ame, ameType)
+          if (toolCall) {
+            emittedToolCall = true
+            yield { tool_calls: [toolCall] }
+          }
+          // thinking_*, message_start, message_end — drop for now.
+          // Future enhancement: surface thinking as a separate ChatDelta
+          // variant once the OpenAI o1-style schema lands.
+          continue
+        }
+
+        const toolCall = piToolCalls.observe(ev, type)
+        if (toolCall) {
+          emittedToolCall = true
+          yield { tool_calls: [toolCall] }
           continue
         }
 
@@ -287,7 +304,7 @@ export class PiBackend implements Backend {
         throw new BackendError(`pi exit ${exitCode ?? 'unknown'}: ${detail}`, isAuth ? 'not_configured' : 'upstream')
       }
 
-      if (sawError && !emittedContent) {
+      if (sawError && !emittedContent && !emittedToolCall) {
         throw new BackendError(`pi error: ${sawError}`, 'upstream')
       }
 
@@ -300,20 +317,20 @@ export class PiBackend implements Backend {
       // upstream error so the consumer scores/retries it honestly. Guard requires
       // BOTH no-content AND zero-output-tokens, so a real text turn (emittedContent)
       // or a token-producing tool turn (usage.output > 0) passes through untouched.
-      if (!emittedContent && (usage?.output ?? 0) === 0) {
+      if (!emittedContent && !emittedToolCall && (usage?.output ?? 0) === 0) {
         const why = sawAnyEvent ? 'empty completion (0 output tokens, no content)' : 'empty upstream response (0-byte stream)'
         throw new BackendError(`pi produced no output: ${why}`, 'upstream')
       }
 
       yield {
-        finish_reason: 'stop',
+        finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
         ...(usage ? { usage: { input_tokens: usage.input, output_tokens: usage.output } } : {}),
       }
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree before releasing the slot.
-      await killTree(child)
+      await killTree(child, { reason: 'request-end' })
       try { releaseSpawner() } catch { /* best effort */ }
     }
   }
@@ -353,4 +370,153 @@ function extractTextFromPartial(partial: unknown): string {
     }
   }
   return out
+}
+
+type ToolCallDelta = NonNullable<ChatDelta['tool_calls']>[number]
+
+class PiToolCallTracker {
+  private readonly emitted = new Set<string>()
+  private readonly byIndex = new Map<number, string>()
+  private nextSyntheticId = 0
+
+  observe(ev: Record<string, unknown>, eventType: string): ToolCallDelta | null {
+    const normalized = normalizePiEventType(eventType)
+    if (!isPiToolLifecycleEvent(normalized)) return null
+
+    const tool = this.pickNestedTool(ev)
+    const id = this.pickToolCallId(ev, tool) ?? this.idForContentIndex(ev)
+    const name = this.pickToolName(ev, tool)
+    const args = this.pickToolArguments(ev, tool)
+
+    if (!id || !name || this.emitted.has(id)) return null
+    if (this.shouldDefer(normalized, args)) return null
+    this.emitted.add(id)
+    return {
+      id,
+      name,
+      arguments: stringifyToolArguments(args),
+    }
+  }
+
+  private shouldDefer(normalized: string, args: unknown): boolean {
+    // Pi's real `toolcall_start` frame usually has id/name and an empty
+    // arguments object; `toolcall_delta` then streams partial JSON and may
+    // start with delta:"". Wait for `toolcall_end` / `tool_execution_start`
+    // with the complete args. Emitting early would make every downstream trace
+    // see `{}` or an incomplete path forever because tool calls are de-duped.
+    if (normalized.includes('delta')) return true
+    return normalized.includes('start') && !normalized.startsWith('tool_execution') && isEmptyToolArguments(args)
+  }
+
+  private pickToolCallId(ev: Record<string, unknown>, tool: Record<string, unknown> | null): string | null {
+    for (const key of ['id', 'toolCallId', 'toolCallID', 'tool_call_id', 'callId', 'callID']) {
+      const value = ev[key]
+      if (typeof value === 'string' && value.length > 0) return value
+    }
+
+    if (tool) {
+      for (const key of ['id', 'toolCallId', 'toolCallID', 'tool_call_id', 'callId', 'callID']) {
+        const value = tool[key]
+        if (typeof value === 'string' && value.length > 0) return value
+      }
+    }
+
+    return null
+  }
+
+  private idForContentIndex(ev: Record<string, unknown>): string {
+    const raw = ev.contentIndex ?? ev.content_index ?? ev.index
+    const index = typeof raw === 'number' ? raw : Number(raw)
+    if (Number.isFinite(index)) {
+      const existing = this.byIndex.get(index)
+      if (existing) return existing
+      const id = `pi_call_${index}`
+      this.byIndex.set(index, id)
+      return id
+    }
+
+    this.nextSyntheticId += 1
+    return `pi_call_${this.nextSyntheticId}`
+  }
+
+  private pickToolName(ev: Record<string, unknown>, tool: Record<string, unknown> | null): string | null {
+    for (const key of ['name', 'toolName', 'tool_name', 'tool']) {
+      const value = ev[key]
+      if (typeof value === 'string' && value.length > 0) return value
+    }
+
+    if (tool) {
+      for (const key of ['name', 'toolName', 'tool_name', 'tool']) {
+        const value = tool[key]
+        if (typeof value === 'string' && value.length > 0) return value
+      }
+    }
+
+    return null
+  }
+
+  private pickToolArguments(ev: Record<string, unknown>, tool: Record<string, unknown> | null): unknown {
+    for (const key of ['input', 'arguments', 'args', 'parameters', 'delta']) {
+      if (ev[key] !== undefined) return ev[key]
+    }
+
+    if (tool) {
+      for (const key of ['input', 'arguments', 'args', 'parameters', 'partialArgs']) {
+        if (tool[key] !== undefined) return tool[key]
+      }
+    }
+
+    return {}
+  }
+
+  private pickNestedTool(ev: Record<string, unknown>): Record<string, unknown> | null {
+    for (const key of ['toolCall', 'tool_call', 'toolCallRequest', 'tool_call_request', 'tool']) {
+      const value = ev[key]
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        return value as Record<string, unknown>
+      }
+    }
+    const partial = ev.partial
+    if (partial && typeof partial === 'object' && !Array.isArray(partial)) {
+      const content = (partial as Record<string, unknown>).content
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block && typeof block === 'object' && !Array.isArray(block)) {
+            const candidate = block as Record<string, unknown>
+            const kind = String(candidate.type ?? '').replace(/-/g, '_').toLowerCase()
+            if (kind === 'toolcall' || kind === 'tool_call') return candidate
+          }
+        }
+      }
+    }
+    return null
+  }
+}
+
+function normalizePiEventType(eventType: string): string {
+  return eventType.replace(/-/g, '_').toLowerCase()
+}
+
+function isPiToolLifecycleEvent(normalized: string): boolean {
+  return normalized.includes('tool_call')
+    || normalized.includes('toolcall')
+    || normalized.startsWith('tool_execution')
+}
+
+function isEmptyToolArguments(value: unknown): boolean {
+  if (value === undefined || value === null) return true
+  if (typeof value === 'string') return value.length === 0
+  if (typeof value !== 'object') return false
+  if (Array.isArray(value)) return value.length === 0
+  return Object.keys(value as Record<string, unknown>).length === 0
+}
+
+function stringifyToolArguments(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value === undefined || value === null) return '{}'
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return '{}'
+  }
 }

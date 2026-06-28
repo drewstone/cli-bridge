@@ -223,18 +223,24 @@ describe('isStdioMcpSpec', () => {
 })
 
 describe('materialiseMcpServersForClaudeKimi', () => {
-  it('writes the canonical {mcpServers:{...}} JSON shape', () => {
+  it('writes the canonical {mcpServers:{...}} JSON shape including remote MCP entries', () => {
     const m = materialiseMcpServersForClaudeKimi({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
       remote: { type: 'http', url: 'https://example.com', headers: { Authorization: 'Bearer X' } },
     })
     expect(m).not.toBeNull()
     if (!m) return
-    expect(m.serverNames).toEqual(['echo'])
+    expect(m.serverNames).toEqual(['echo', 'remote'])
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written).toEqual({
       mcpServers: {
         echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
+        remote: {
+          type: 'http',
+          transport: 'http',
+          url: 'https://example.com',
+          headers: { Authorization: 'Bearer X' },
+        },
       },
     })
     m.cleanup()
@@ -267,6 +273,85 @@ describe('materialiseMcpServersForOpencode', () => {
 
   it('returns a usable config even when the map is null (permission-only)', () => {
     const m = materialiseMcpServersForOpencode(null)
+    expect(m.serverNames).toEqual([])
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.mcp).toEqual({})
+    m.cleanup()
+  })
+
+  it('honors AgentProfile metadata for chat-only permission denial', () => {
+    const m = materialiseMcpServersForOpencode(null, {
+      name: 'opencode-chat-only',
+      metadata: {
+        opencodePermissions: {
+          bash: 'deny',
+          read: 'deny',
+          webfetch: 'deny',
+        },
+        disallowedTools: ['Write', 'Task'],
+      },
+    } as unknown as AgentProfile)
+
+    expect(m.serverNames).toEqual([])
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.permission).toMatchObject({
+      bash: 'deny',
+      read: 'deny',
+      webfetch: 'deny',
+      write: 'deny',
+      task: 'deny',
+      question: 'allow',
+    })
+    expect(written.mcp).toEqual({})
+    m.cleanup()
+  })
+
+  it('supports wildcard disallowedTools for vanilla baseline profiles', () => {
+    const m = materialiseMcpServersForOpencode(null, {
+      name: 'opencode-no-tools',
+      metadata: {
+        disallowedTools: ['*'],
+      },
+    } as unknown as AgentProfile)
+
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.permission).toMatchObject({
+      external_directory: 'deny',
+      bash: 'deny',
+      edit: 'deny',
+      read: 'deny',
+      write: 'deny',
+      webfetch: 'deny',
+      task: 'deny',
+    })
+    m.cleanup()
+  })
+
+  it('writes remote (http/sse) MCP as opencode type:remote with headers', () => {
+    const m = materialiseMcpServersForOpencode({
+      tangle_search: {
+        type: 'http',
+        url: 'https://router.tangle.tools/v1/search/mcp?provider=you',
+        headers: { Authorization: 'Bearer t-key' },
+      },
+    })
+    expect(m.serverNames).toEqual(['tangle_search'])
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.mcp).toEqual({
+      tangle_search: {
+        type: 'remote',
+        url: 'https://router.tangle.tools/v1/search/mcp?provider=you',
+        headers: { Authorization: 'Bearer t-key' },
+        enabled: true,
+      },
+    })
+    m.cleanup()
+  })
+
+  it('drops a disabled remote MCP entry', () => {
+    const m = materialiseMcpServersForOpencode({
+      off: { type: 'http', url: 'https://example.com/mcp', enabled: false },
+    })
     expect(m.serverNames).toEqual([])
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.mcp).toEqual({})

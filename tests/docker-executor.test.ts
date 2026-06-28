@@ -11,6 +11,7 @@
  */
 
 import { Readable, PassThrough } from 'node:stream'
+import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { CodexBackend } from '../src/backends/codex.js'
@@ -23,6 +24,7 @@ import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
 import { killTree } from '../src/executors/process-tree.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
+import { coresAwareConcurrency } from '../src/concurrency-default.js'
 import { writeStdinPayload } from '../src/backends/stdin-payload.js'
 
 // ─── Spawner abstraction ─────────────────────────────────────────────────
@@ -517,6 +519,7 @@ interface StubSpawnerHandle {
   spawner: Spawner
   observedArgs: string[] | null
   observedOpts: Parameters<Spawner>[2] | null
+  observedOpencodeConfig: string | null
   /** Concatenated stdin chunks the backend wrote into the faux child. */
   stdinChunks: string[]
   releaseCalls: number
@@ -527,12 +530,17 @@ function createStubSpawner(lines: string[]): StubSpawnerHandle {
     spawner: null as never,
     observedArgs: null,
     observedOpts: null,
+    observedOpencodeConfig: null,
     stdinChunks: [],
     releaseCalls: 0,
   }
   handle.spawner = async (_bin, args, opts) => {
     handle.observedArgs = args
     handle.observedOpts = opts
+    const configPath = opts?.env?.OPENCODE_CONFIG
+    if (typeof configPath === 'string') {
+      handle.observedOpencodeConfig = readFileSync(configPath, 'utf8')
+    }
     const stdout = Readable.from(lines.map((l) => `${l}\n`))
     const stderr = new PassThrough()
     const child = makeFakeChild(stdout, stderr, () => {})
@@ -554,12 +562,17 @@ function createDelayedStubSpawner(closeAfterMs: number): StubSpawnerHandle {
     spawner: null as never,
     observedArgs: null,
     observedOpts: null,
+    observedOpencodeConfig: null,
     stdinChunks: [],
     releaseCalls: 0,
   }
   handle.spawner = async (_bin, args, opts) => {
     handle.observedArgs = args
     handle.observedOpts = opts
+    const configPath = opts?.env?.OPENCODE_CONFIG
+    if (typeof configPath === 'string') {
+      handle.observedOpencodeConfig = readFileSync(configPath, 'utf8')
+    }
     const stdout = new PassThrough()
     const stderr = new PassThrough()
     const child = makeFakeChild(stdout, stderr, () => {})
@@ -605,8 +618,8 @@ describe('per-backend executor config (parseAllExecutors)', () => {
   it('defaults host-chat admission to a box-safe cap', () => {
     const config = loadConfig({ HOME: '/home/test' })
     expect(config.admission).toEqual({
-      maxActive: 8,
-      maxQueue: 16,
+      maxActive: coresAwareConcurrency({ ratio: 0.75, min: 8, max: 24 }),
+      maxQueue: coresAwareConcurrency({ ratio: 1, min: 16, max: 32 }),
       queueTimeoutMs: 30_000,
     })
   })
@@ -685,6 +698,28 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(deltas.find((d) => d.content === 'kimi here')).toBeDefined()
     expect(stub.observedArgs).toContain('--mcp-config-file')
     expect(stub.observedOpts?.sessionId).toBe('kimi-sess')
+    expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('KimiBackend does not surface user or tool-result content as assistant output', async () => {
+    const stub = createStubSpawner([
+      JSON.stringify({ role: 'user', content: './infra/nix/warm-package-caches.sh' }),
+      JSON.stringify({ role: 'tool', content: './infra/nix/README.md:31:warm-package-caches.sh' }),
+      JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: '{"recommendation":"ship"}' }] }),
+      JSON.stringify({ type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }),
+    ])
+    const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const content: string[] = []
+    for await (const d of backend.chat(
+      { model: 'kimi-code/kimi-k2.6', messages: [{ role: 'user', content: 'review' }] },
+      null,
+      ctrl.signal,
+    )) {
+      if (d.content) content.push(d.content)
+    }
+
+    expect(content).toEqual(['{"recommendation":"ship"}'])
     expect(stub.releaseCalls).toBe(1)
   })
 
@@ -916,6 +951,33 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(tool?.name).toBe('write')
     expect(JSON.parse(tool?.arguments ?? '{}')).toEqual({ filePath: '/tmp/hello.txt', content: 'hello' })
     expect(deltas.at(-1)?.usage).toEqual({ input_tokens: 25153, output_tokens: 77 })
+  })
+
+  it('OpencodeBackend writes router attribution headers into its temporary config', async () => {
+    const stub = createStubSpawner([
+      JSON.stringify({ type: 'text', sessionID: 'oc-3', part: { type: 'text', text: 'finished' } }),
+    ])
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    for await (const _ of backend.chat(
+      {
+        model: 'opencode/deepseek/deepseek-v4-pro',
+        messages: [{ role: 'user', content: 'hi' }],
+        metadata: {
+          tangleClient: 'pr-reviewer/1',
+          tangleSource: 'pr-reviewer:tangle-network/repo#7:deepseek:run-1',
+        },
+      },
+      null,
+      ctrl.signal,
+    )) { /* drain */ }
+
+    expect(stub.observedOpencodeConfig).toBeTruthy()
+    const config = JSON.parse(String(stub.observedOpencodeConfig))
+    expect(config.provider.deepseek.models['deepseek-v4-pro'].headers).toEqual({
+      'x-tangle-client': 'pr-reviewer/1',
+      'x-tangle-source': 'pr-reviewer:tangle-network/repo#7:deepseek:run-1',
+    })
   })
 
   it('OpencodeBackend surfaces buffered-stdout silence as keepalive deltas (not synthetic tool_calls)', async () => {

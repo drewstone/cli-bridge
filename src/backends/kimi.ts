@@ -156,8 +156,8 @@ export class KimiBackend implements Backend {
 
     // Tear down the whole process group (kimi + every tool/MCP subprocess
     // it forks). See backends/opencode.ts for the rationale.
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
+    const timeoutHandle = setTimeout(() => { void killTree(child, { reason: 'timeout' }) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void killTree(child, { reason: 'client-abort' }) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
@@ -249,7 +249,7 @@ export class KimiBackend implements Backend {
         // Walk the content array block-by-block — matches how we handle
         // Claude Code's stream-json. Generic extractText is a fallback
         // for events whose content is just a string.
-        const role = String(ev.role ?? '')
+        const role = String(ev.role ?? '').toLowerCase()
         const contentField = ev.content
         if (role === 'assistant' && Array.isArray(contentField)) {
           for (const block of contentField as Array<Record<string, unknown>>) {
@@ -275,7 +275,32 @@ export class KimiBackend implements Backend {
             }
             // 'think' blocks are reasoning chain-of-thought; don't surface.
           }
-        } else {
+          // kimi (1.44) emits agentic tool calls in a TOP-LEVEL `tool_calls` field
+          // (OpenAI shape: [{type:'function', id, function:{name, arguments}}]), NOT
+          // as `tool_use` blocks inside content. Without surfacing them, every
+          // tool-call turn — whose content is just a `think` block — yields nothing,
+          // so a consumer's idle-cap fires before the agent ever emits a text block:
+          // the agentic-streaming dead-air bug (#50). Map to the same flat shape.
+          if (Array.isArray(ev.tool_calls)) {
+            for (const tc of ev.tool_calls as Array<Record<string, unknown>>) {
+              if (!tc || typeof tc !== 'object') continue
+              const fn = (tc.function ?? {}) as Record<string, unknown>
+              const id = String(tc.id ?? '')
+              const name = String(fn.name ?? tc.name ?? '')
+              const rawArgs = fn.arguments ?? tc.arguments ?? {}
+              if (id && name) {
+                yield {
+                  tool_calls: [{
+                    id,
+                    name,
+                    arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs),
+                  }],
+                }
+                emittedToolCall = true
+              }
+            }
+          }
+        } else if (!role || role === 'assistant') {
           const text = extractText(ev)
           if (text) {
             yield { content: text }
@@ -324,7 +349,7 @@ export class KimiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       // Always tear down the whole subtree (kimi + any MCP/tool forks)
       // before releasing the slot. Idempotent; waits for actual exit.
-      await killTree(child)
+      await killTree(child, { reason: 'request-end' })
       if (configFile) await cleanupConfigFile(configFile)
       mcpMaterialised?.cleanup()
       releaseSpawner()

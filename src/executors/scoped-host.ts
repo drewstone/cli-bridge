@@ -57,12 +57,15 @@ import { hostSpawner, sanitizeHostEnv } from './host.js'
 import type { Spawner, SpawnResult } from './types.js'
 import { getKillReason } from './process-tree.js'
 import { recordTaskDiagnostic } from './diagnostics.js'
+import { coresAwareConcurrency } from '../concurrency-default.js'
 
 const SLICE = 'cli-bridge-llm.slice'
 const DEFAULT_SCOPE_TASKS_MAX = 128
 const DEFAULT_SCOPE_MEMORY_MAX = '3G'
 const DEFAULT_SCOPE_RUNTIME_MAX_SEC = 7200
-const DEFAULT_SCOPE_MAX_CONCURRENCY = 4
+// cores/2 clamped 4..16 — a fixed 4 starved the pr-reviewer's opencode
+// lane on the 32-core box (acquire timeouts at in_flight=4/4).
+const DEFAULT_SCOPE_MAX_CONCURRENCY = coresAwareConcurrency({ ratio: 0.5, min: 4, max: 16 })
 const DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS = 60_000
 const SYSTEMD_RUN_BIN = existsSync('/usr/bin/systemd-run') ? '/usr/bin/systemd-run' : '/bin/systemd-run'
 

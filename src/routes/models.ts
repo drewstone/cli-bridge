@@ -10,6 +10,7 @@
 import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { ProfileCatalog } from '../profiles/loader.js'
+import { boundedProbe } from './health.js'
 
 interface ModelEntry {
   id: string
@@ -26,7 +27,9 @@ const CODEX_MODELS = [
 ] as const
 
 const OPENCODE_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
+  { id: 'kimi-for-coding/k2p7', note: 'Kimi K2.7 via opencode provider (latest)' },
   { id: 'kimi-for-coding/k2p6', note: 'Kimi K2.6 via opencode provider' },
+  { id: 'zai-coding-plan/glm-5.2', note: 'GLM 5.2 via configured coding provider (latest)' },
   { id: 'zai-coding-plan/glm-5.1', note: 'GLM 5.1 via configured coding provider' },
   { id: 'zai-coding-plan/glm-5-turbo', note: 'GLM 5 Turbo via configured coding provider' },
   { id: 'deepseek/deepseek-v4-pro' },
@@ -57,10 +60,14 @@ export function mountModels(
 ): void {
   app.get('/v1/models', async (c) => {
     const data: ModelEntry[] = []
+    const probeTimeoutMs = resolveModelsProbeTimeoutMs()
+    const healthByBackend = new Map(
+      await Promise.all(deps.registry.all().map(async (b) => [b.name, await boundedProbe(b, probeTimeoutMs)] as const)),
+    )
 
     for (const b of deps.registry.all()) {
-      const health = await b.health()
-      if (health.state !== 'ready') continue
+      const health = healthByBackend.get(b.name)
+      if (health?.state !== 'ready') continue
 
       switch (b.name) {
         case 'claude-code':
@@ -147,4 +154,10 @@ export function mountModels(
 
     return c.json({ object: 'list', data })
   })
+}
+
+function resolveModelsProbeTimeoutMs(): number {
+  const raw = process.env.BRIDGE_MODELS_PROBE_TIMEOUT_MS ?? process.env.BRIDGE_HEALTH_PROBE_TIMEOUT_MS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3_500
 }

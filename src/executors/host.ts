@@ -8,12 +8,15 @@
  *      orphan to PID 1. Production evidence: 9+ orphan `opencode run`
  *      processes reparented to PID 1 with elapsed > 24h, each 300-600 MB.
  *   2. Process-wide counting semaphore so parallel clients can't
- *      fork-bomb the host. Default cap 4; each `claude --print` is
- *      500MB-2GB resident, so 16 unchecked spawns OOM a 32GB box and
- *      sshd can't fork a login shell. This is the box-protection layer.
+ *      fork-bomb the host. Each `claude --print` is 500MB-2GB resident,
+ *      so an unbounded spawn count OOMs the box and sshd can't fork a
+ *      login shell. This is the box-protection layer. The default cap
+ *      scales with logical cores (see coresAwareConcurrency) instead of
+ *      a fixed 4 — the fixed 4 starved the pr-reviewer's opencode lane
+ *      on the 32-core box.
  *
  * Tunables:
- *   BRIDGE_HOST_MAX_CONCURRENCY (default 4)
+ *   BRIDGE_HOST_MAX_CONCURRENCY (default: cores/2, clamped 4..16)
  *   BRIDGE_HOST_ACQUIRE_DEADLINE_MS (default 60_000)
  */
 
@@ -21,8 +24,9 @@ import { spawn } from 'node:child_process'
 import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
 import { getKillReason } from './process-tree.js'
 import { recordTaskDiagnostic } from './diagnostics.js'
+import { coresAwareConcurrency } from '../concurrency-default.js'
 
-const DEFAULT_MAX = 4
+const DEFAULT_MAX = coresAwareConcurrency({ ratio: 0.5, min: 4, max: 16 })
 const DEFAULT_ACQUIRE_DEADLINE_MS = 60_000
 
 interface Waiter {

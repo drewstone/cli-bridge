@@ -156,8 +156,8 @@ export class CodexBackend implements Backend {
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
     // Group-kill on timeout/abort — see backends/opencode.ts.
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
+    const timeoutHandle = setTimeout(() => { void killTree(child, { reason: 'timeout' }) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void killTree(child, { reason: 'client-abort' }) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     let emittedToolCall = false
@@ -227,7 +227,7 @@ export class CodexBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree — codex spawns sub-processes for MCP
       // tool calls, model HTTP I/O, etc. and we owe them a clean exit.
-      await killTree(child)
+      await killTree(child, { reason: 'request-end' })
       releaseSpawner()
       codexHome?.cleanup()
     }

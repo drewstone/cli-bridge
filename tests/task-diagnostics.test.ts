@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import { recordTaskDiagnostic, _resetDiagnosticsPathForTests, type TaskDiagnostic } from '../src/executors/diagnostics.js'
 import { hostSpawner } from '../src/executors/host.js'
@@ -78,5 +78,24 @@ describe('Pillar 0 — task diagnostics', () => {
     expect(rec.termination).toBe('exit')
     expect(rec.exitCode).toBe(0)
     expect(rec.killReason).toBeNull()
+  })
+
+  it('load-bearing local backends pass kill reasons into killTree', () => {
+    for (const file of ['codex.ts', 'kimi.ts', 'opencode.ts', 'pi.ts']) {
+      const src = readFileSync(resolve(process.cwd(), 'src/backends', file), 'utf8')
+      expect(src, `${file} timeout teardown must be attributable`)
+        .toMatch(/killTree\(child, \{ reason: 'timeout' \}\)/)
+      expect(src, `${file} client-abort teardown must be attributable`)
+        .toMatch(/killTree\(child, \{ reason: 'client-abort' \}\)/)
+      expect(src, `${file} request-end teardown must be attributable`)
+        .toMatch(/killTree\(child, \{ reason: 'request-end' \}\)/)
+    }
+  })
+
+  it('OpenCode defaults to hostSpawner because systemd scopes stall GLM streams', () => {
+    const src = readFileSync(resolve(process.cwd(), 'src/backends/opencode.ts'), 'utf8')
+    expect(src).toMatch(/import \{ hostSpawner \} from '\.\.\/executors\/host\.js'/)
+    expect(src).toMatch(/this\.spawner = opts\.spawner \?\? hostSpawner/)
+    expect(src).not.toMatch(/scopedHostSpawner/)
   })
 })
