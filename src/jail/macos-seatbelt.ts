@@ -45,29 +45,38 @@ export class MacosSeatbeltJail implements JailBackend {
     // The copies are removed in cleanup() so credentials never linger in the
     // project-local jail root.
     const copiedAuth = await copyAuthIntoJail(root, spec.authSources)
-    const writable = [root, ...SYSTEM_WRITABLE]
-    for (const path of spec.extraWritablePaths ?? []) {
-      writable.push(await canonicalize(path))
+    const removeCopiedAuth = async (): Promise<void> => {
+      for (const copied of copiedAuth) {
+        await rm(copied, { recursive: true, force: true })
+      }
     }
+    // From here on, any failure must remove the copied credentials — otherwise a
+    // throw before `cleanup` is returned leaves real auth under the repo jail root.
+    try {
+      const writable = [root, ...SYSTEM_WRITABLE]
+      for (const path of spec.extraWritablePaths ?? []) {
+        writable.push(await canonicalize(path))
+      }
 
-    const profile = buildProfile(writable)
-    const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
-    const profilePath = join(dir, 'profile.sb')
-    await writeFile(profilePath, profile, { mode: 0o600 })
+      const profile = buildProfile(writable)
+      const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
+      const profilePath = join(dir, 'profile.sb')
+      await writeFile(profilePath, profile, { mode: 0o600 })
 
-    return {
-      bin: SANDBOX_EXEC_BIN,
-      args: ['-f', profilePath, '-D', `HOME=${root}`, '-D', `WORK=${spec.projectDir}`, bin, ...args],
-      // sandbox-exec does NOT rewrite the child env; -D only parameterizes the
-      // profile. Return the real env so HOME/XDG actually point into the jail.
-      env: jailEnv(root),
-      cleanup: async () => {
-        await rm(dir, { recursive: true, force: true })
-        // Remove copied credentials from the project-local jail root.
-        for (const copied of copiedAuth) {
-          await rm(copied, { recursive: true, force: true })
-        }
-      },
+      return {
+        bin: SANDBOX_EXEC_BIN,
+        args: ['-f', profilePath, '-D', `HOME=${root}`, '-D', `WORK=${spec.projectDir}`, bin, ...args],
+        // sandbox-exec does NOT rewrite the child env; -D only parameterizes the
+        // profile. Return the real env so HOME/XDG actually point into the jail.
+        env: jailEnv(root),
+        cleanup: async () => {
+          await rm(dir, { recursive: true, force: true })
+          await removeCopiedAuth()
+        },
+      }
+    } catch (err) {
+      await removeCopiedAuth()
+      throw err
     }
   }
 }

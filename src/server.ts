@@ -316,9 +316,11 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] write-jail default: ${config.jailMode}${config.jailMode === 'write-jail' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
     // Fail fast (don't go ready) if write-jail is the operator floor but no jail
     // backend can run here — every host request would otherwise fail closed while
-    // /health reports ready. Honor BRIDGE_JAIL_FALLBACK=warn, which the request
-    // path uses to run unconfined-with-warning instead of failing closed.
-    if (config.jailMode === 'write-jail' && !selectJailBackend().isAvailable()) {
+    // /health reports ready. Only relevant when some backend actually spawns on the
+    // host: docker/remote-only deployments never hit the host jail. Honor
+    // BRIDGE_JAIL_FALLBACK=warn, which runs unconfined-with-warning instead.
+    const hasHostSpawn = Object.values(config.executors).some((e) => e.kind === 'host')
+    if (config.jailMode === 'write-jail' && hasHostSpawn && !selectJailBackend().isAvailable()) {
       if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
         console.warn(
           '[cli-bridge] WARNING: BRIDGE_JAIL_MODE=write-jail but no jail backend can run here; ' +
