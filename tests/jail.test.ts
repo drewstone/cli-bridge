@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -150,14 +150,33 @@ describe('resolveJailRoot containment', () => {
     expect(resolveJailRoot('.agent-home', base)).toBe(join(base, '.agent-home'))
   })
 
-  it('ignoreJailRoot adds the scratch dir to .git/info/exclude (in-dir .gitignore is ineffective)', async () => {
+  it('ignoreJailRoot adds an anchored, idempotent exclude entry', async () => {
     const base = await realpath(await tempProjectDir())
     await mkdir(join(base, '.git', 'info'), { recursive: true })
     ignoreJailRoot(base, join(base, '.agent-home'))
-    ignoreJailRoot(base, join(base, '.agent-home')) // idempotent
+    ignoreJailRoot(base, join(base, '.agent-home'))
     const exclude = await readFile(join(base, '.git', 'info', 'exclude'), 'utf8')
+    expect(exclude.match(/^\/\.agent-home\/$/gm)?.length).toBe(1)
+  })
+
+  it('ignoreJailRoot finds the repo when cwd is a subdirectory (anchored to repo root)', async () => {
+    const base = await realpath(await tempProjectDir())
+    await mkdir(join(base, '.git', 'info'), { recursive: true })
+    const sub = join(base, 'pkg', 'app')
+    await mkdir(sub, { recursive: true })
+    ignoreJailRoot(sub, join(sub, '.agent-home'))
+    const exclude = await readFile(join(base, '.git', 'info', 'exclude'), 'utf8')
+    expect(exclude).toContain('/pkg/app/.agent-home/')
+  })
+
+  it('ignoreJailRoot follows a .git FILE (worktree) to the real gitdir', async () => {
+    const base = await realpath(await tempProjectDir())
+    const realGit = join(base, 'realgit')
+    await mkdir(join(realGit, 'info'), { recursive: true })
+    await writeFile(join(base, '.git'), `gitdir: ${realGit}\n`)
+    ignoreJailRoot(base, join(base, '.agent-home'))
+    const exclude = await readFile(join(realGit, 'info', 'exclude'), 'utf8')
     expect(exclude).toContain('/.agent-home/')
-    expect(exclude.match(/\/\.agent-home\//g)?.length).toBe(1)
   })
 })
 

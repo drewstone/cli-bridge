@@ -126,18 +126,41 @@ export function jailEnv(root: string): Record<string, string> {
  */
 export function ignoreJailRoot(projectDir: string, root: string): void {
   try {
-    const gitDir = join(projectDir, '.git')
-    if (!existsSync(gitDir) || !statSync(gitDir).isDirectory()) return
-    const topSeg = relative(projectDir, root).split(sep)[0]
-    if (!topSeg || topSeg.startsWith('..')) return
-    const entry = `/${topSeg}/`
-    const excludeFile = join(gitDir, 'info', 'exclude')
+    const found = findGitDir(resolve(projectDir))
+    if (!found) return
+    // .git/info/exclude patterns are anchored at the repo root, so the entry is
+    // the jail root relative to THAT (handles cwd being a repo subdirectory).
+    const rel = relative(found.repoRoot, root).split(sep).join('/')
+    if (!rel || rel.startsWith('..')) return
+    const entry = `/${rel}/`
+    const excludeFile = join(found.gitDir, 'info', 'exclude')
     const current = existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8') : ''
     if (current.split(/\r?\n/).includes(entry)) return
     mkdirSync(dirname(excludeFile), { recursive: true })
     appendFileSync(excludeFile, `${current && !current.endsWith('\n') ? '\n' : ''}${entry}\n`)
   } catch {
     // best-effort: do not fail a jailed run because the ignore rule could not be written
+  }
+}
+
+/** Find the git dir + repo root for `start`, walking up parents. Handles a `.git`
+ * directory (normal repo) and a `.git` FILE (`gitdir: <path>` for worktrees /
+ * submodules). Returns null outside any repo. */
+function findGitDir(start: string): { gitDir: string; repoRoot: string } | null {
+  let dir = start
+  for (;;) {
+    const dotgit = join(dir, '.git')
+    if (existsSync(dotgit)) {
+      const st = statSync(dotgit)
+      if (st.isDirectory()) return { gitDir: dotgit, repoRoot: dir }
+      if (st.isFile()) {
+        const m = /^gitdir:\s*(.+)\s*$/m.exec(readFileSync(dotgit, 'utf8'))
+        if (m && m[1]) return { gitDir: resolve(dir, m[1].trim()), repoRoot: dir }
+      }
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return null
+    dir = parent
   }
 }
 
