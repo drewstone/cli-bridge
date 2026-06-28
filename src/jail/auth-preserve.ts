@@ -37,6 +37,10 @@ const AUTH_PATHS: Record<string, readonly string[]> = {
   // is active; in the common no-MCP case it reads ~/.codex, which the jail would
   // otherwise hide. Preserve it here so jailed codex authenticates either way.
   codex: ['.codex'],
+  // pi keeps provider registrations / model defaults in ~/.pi/agent (the same
+  // dir config.ts mounts into pi's docker containers). Without it a jailed pi
+  // run starts from an empty HOME and loses every persisted provider/default.
+  pi: ['.pi/agent'],
 }
 
 /** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME

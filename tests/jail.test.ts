@@ -228,6 +228,25 @@ describe('auth preservation', () => {
     }
   })
 
+  it('authSourcesFor(pi) preserves ~/.pi/agent so a jailed pi keeps its provider/model config', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-pihome-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    await mkdir(join(fakeHome, '.pi', 'agent'), { recursive: true })
+    await writeFile(join(fakeHome, '.pi', 'agent', 'config.json'), '{"provider":"x"}')
+    const prev = process.env.HOME
+    process.env.HOME = fakeHome
+    try {
+      const sources = authSourcesFor('pi')
+      expect(sources).toHaveLength(1)
+      // Lands at the jail's ~/.pi/agent, where pi (HOME=root) reads its state.
+      expect(sources[0]?.jailRel).toBe('.pi/agent')
+      expect(sources[0]?.source).toBe(join(fakeHome, '.pi', 'agent'))
+    } finally {
+      if (prev === undefined) delete process.env.HOME
+      else process.env.HOME = prev
+    }
+  })
+
   it('bwrap read-only-binds an auth source into the jail HOME at its relative path', async () => {
     const authDir = await mkdtemp(join(homedir(), '.cli-bridge-authtest-'))
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
