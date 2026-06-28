@@ -8,7 +8,7 @@
 
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { loadConfig, type Config } from './config.js'
+import { anyBackendSpawnsOnHost, loadConfig, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { BackendRegistry } from './backends/registry.js'
 import { ClaudeBackend } from './backends/claude.js'
@@ -31,6 +31,7 @@ import { mountHealth } from './routes/health.js'
 import { mountModels } from './routes/models.js'
 import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
+import { mountRuns } from './routes/runs.js'
 import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
 import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
@@ -39,6 +40,9 @@ import { createDockerSpawner } from './executors/docker.js'
 import type { Spawner } from './executors/types.js'
 import type { BackendExecutorConfig } from './config.js'
 import { AdmissionGate } from './admission.js'
+import { RunRegistry } from './runs/registry.js'
+import { selectJailBackend } from './jail/index.js'
+import { acquireInstanceLock, PortAlreadyBoundError } from './runtime/single-instance.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -102,11 +106,13 @@ export async function buildApp(config: Config): Promise<{
   app: Hono
   sessions: SessionStore
   registry: BackendRegistry
+  runs: RunRegistry
   catalog: ProfileCatalog
   extras: BuildAppExtras
 }> {
   const sessions = new SessionStore(config.dataDir)
   const registry = new BackendRegistry()
+  const runs = new RunRegistry()
   const extras: BuildAppExtras = { shutdownHooks: [] }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)
@@ -233,8 +239,9 @@ export async function buildApp(config: Config): Promise<{
   mountHealth(app, { registry, admission })
   mountModels(app, { registry, catalog })
   mountSessions(app, { sessions })
+  mountRuns(app, { runs })
   mountProfiles(app, { catalog })
-  mountChatCompletions(app, { registry, sessions, admission })
+  mountChatCompletions(app, { registry, sessions, runs, admission })
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)
@@ -249,12 +256,14 @@ export async function buildApp(config: Config): Promise<{
       '/v1/models',
       '/v1/chat/completions',
       '/v1/sessions',
+      '/v1/runs/:id',
+      '/v1/runs/:id/cancel',
       '/cad/render',
       '/images/generate',
     ],
   }))
 
-  return { app, sessions, registry, catalog, extras }
+  return { app, sessions, registry, runs, catalog, extras }
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -266,7 +275,27 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 export async function startServer(): Promise<void> {
   const config = loadConfig()
+
+  // Single-instance guard — refuse to start a second bridge on the same
+  // BRIDGE_PORT. Acquired BEFORE buildApp opens sessions.sqlite so two
+  // instances never share that DB. A clean exit here keeps systemd happy:
+  // Type=simple + Restart=always retries, and a dead predecessor's stale
+  // lock is reclaimed automatically (see single-instance.ts).
+  let instanceLock
+  try {
+    instanceLock = acquireInstanceLock(config.port)
+  } catch (err) {
+    if (err instanceof PortAlreadyBoundError) {
+      console.error(`[cli-bridge] ${err.message}`)
+      process.exit(1)
+    }
+    throw err
+  }
+
   const { app, sessions, extras } = await buildApp(config)
+  // Drop the lock on hard exit too — graceful shutdown also releases, but
+  // a process.exit() path (fatal error) must not strand the pidfile.
+  process.once('exit', () => instanceLock.release())
   const server = serve({
     fetch: app.fetch,
     hostname: config.host,
@@ -285,6 +314,28 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
     console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue} queueTimeoutMs=${config.admission.queueTimeoutMs}`)
     console.log(`[cli-bridge] write-jail default: ${config.jailMode}${config.jailMode === 'write-jail' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
+    // Fail fast (don't go ready) if write-jail is the operator floor but no jail
+    // backend can run here — every host request would otherwise fail closed while
+    // /health reports ready. Only relevant when some backend actually spawns on the
+    // host: docker/remote-only deployments never hit the host jail. Honor
+    // BRIDGE_JAIL_FALLBACK=warn, which runs unconfined-with-warning instead.
+    const hasHostSpawn = anyBackendSpawnsOnHost(config.backends, config.executors)
+    if (config.jailMode === 'write-jail' && hasHostSpawn && !selectJailBackend().isAvailable()) {
+      if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
+        console.warn(
+          '[cli-bridge] WARNING: BRIDGE_JAIL_MODE=write-jail but no jail backend can run here; ' +
+          'requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).',
+        )
+      } else {
+        console.error(
+          '[cli-bridge] FATAL: BRIDGE_JAIL_MODE=write-jail but no write-jail backend can run on this ' +
+          'host — every host request would fail closed. Enable unprivileged user namespaces (Linux: ' +
+          '`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s /usr/bin/bwrap`), ' +
+          'ensure sandbox-exec exists (macOS), set BRIDGE_JAIL_FALLBACK=warn, or unset BRIDGE_JAIL_MODE.',
+        )
+        process.exit(1)
+      }
+    }
     for (const cfg of Object.values(config.executors)) {
       if (cfg.kind === 'docker') {
         console.log(`[cli-bridge] ${cfg.name} executor: docker pool size=${cfg.poolSize} image=${cfg.image}`)
@@ -307,6 +358,7 @@ export async function startServer(): Promise<void> {
     }
     server.close(() => {
       sessions.close()
+      instanceLock.release()
       process.exit(0)
     })
     setTimeout(() => process.exit(1), 5000).unref()
@@ -363,7 +415,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 }
 
 function isFatalServerStartupError(err: Error): boolean {
+  // A second instance racing for the same port is fatal — exit cleanly so
+  // the operator sees the clear message rather than a survived exception.
+  if (err instanceof PortAlreadyBoundError) return true
   const code = (err as NodeJS.ErrnoException).code
   if (code === 'EADDRINUSE' || code === 'EACCES') return true
-  return /listen|address already in use/i.test(err.message)
+  return /listen|address already in use|already running on port/i.test(err.message)
 }

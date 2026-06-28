@@ -135,6 +135,18 @@ export class CodexBackend implements Backend {
       resolveCodexAuthPath(),
     )
 
+    // When MCP passthrough is active, the synthetic CODEX_HOME (merged MCP config
+    // + copied auth) is the source of truth. Register it as the jail's codex auth
+    // source so a CONFINED run gets it surfaced inside the jail with CODEX_HOME
+    // redirected there. The jail applies this only when it actually wraps; on
+    // docker/fallback paths the host `CODEX_HOME` env below is used unchanged.
+    if (req.jailSpec && codexHome) {
+      req.jailSpec.authSources = [
+        ...(req.jailSpec.authSources ?? []).filter((s) => s.envVar !== 'CODEX_HOME'),
+        { source: codexHome.homePath, jailRel: '.codex', envVar: 'CODEX_HOME' },
+      ]
+    }
+
     // Phase-2 host wiring: provision cwd-native profile dimensions (skills/context/
     // hooks/subagents/commands) before spawn. MCP stays on the path above. Fail-safe.
     provisionProfileWorkspace(req, session, 'codex', req.cwd ?? session?.cwd ?? process.cwd())

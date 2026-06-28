@@ -15,6 +15,7 @@
 
 import { selectJailBackend } from '../jail/index.js'
 import type { JailBackend } from '../jail/index.js'
+import { BackendError } from '../backends/types.js'
 import type { SpawnOpts } from './types.js'
 
 export interface JailedCommand {
@@ -54,9 +55,12 @@ export async function applyJail(
       }
       return { bin, args, env: opts.env }
     }
-    throw new Error(
+    // Typed BackendError (not a plain Error) so the chat wrapper surfaces it as a
+    // real config error (5xx / typed SSE), not an opaque finish_reason:'error'.
+    throw new BackendError(
       `write-jail requested but '${backend.name}' cannot run on this host, refusing to run ` +
       `unconfined. ${ENABLE_HINT} Or set BRIDGE_JAIL_FALLBACK=warn to run without confinement.`,
+      'not_configured',
     )
   }
 

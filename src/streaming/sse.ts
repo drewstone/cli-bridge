@@ -8,7 +8,6 @@
  */
 
 import type { ChatDelta } from '../backends/types.js'
-import { tokensFromChars } from '../backends/content.js'
 
 export interface ChunkMeta {
   id: string
@@ -56,19 +55,30 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     }))
   }
 
+  // A usage-only delta (no content/tool_calls/finish) is the OpenAI usage trailer:
+  // it must carry `choices: []`, not an empty choice, or strict clients misparse it
+  // as assistant output. Every other delta carries the single streaming choice.
+  const usageOnly = hasUsage && !hasContent && !hasToolCalls && !hasFinish
   const payload = {
     id: meta.id,
     object: 'chat.completion.chunk',
     created: meta.created,
     model: meta.model,
-    choices: [
+    choices: usageOnly ? [] : [
       {
         index: 0,
         delta: choiceDelta,
         finish_reason: delta.finish_reason ?? null,
       },
     ],
-    ...(delta.usage ? { usage: { prompt_tokens: delta.usage.input_tokens, completion_tokens: delta.usage.output_tokens } } : {}),
+    ...(delta.usage ? {
+      usage: {
+        prompt_tokens: delta.usage.input_tokens ?? 0,
+        completion_tokens: delta.usage.output_tokens ?? 0,
+        total_tokens: (delta.usage.input_tokens ?? 0) + (delta.usage.output_tokens ?? 0),
+        ...(delta.usage.estimated ? { estimated: true } : {}),
+      },
+    } : {}),
   }
   return `data: ${JSON.stringify(payload)}\n\n`
 }
@@ -108,7 +118,6 @@ export function makeChunkMeta(model: string): ChunkMeta {
 export async function collectNonStreaming(
   iter: AsyncIterable<ChatDelta>,
   model: string,
-  promptText = '',
 ): Promise<unknown> {
   let content = ''
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = []
@@ -125,22 +134,16 @@ export async function collectNonStreaming(
     if (d.usage) usage = d.usage
   }
 
-  // Backends whose CLI emits no usage (kimi-code, opencode) would otherwise
-  // report zero tokens, indistinguishable from a stub. Estimate from the text so
-  // cost is approximable; flag `estimated` so consumers never treat it as measured.
-  const completionChars = content.length + toolCalls.reduce((s, tc) => s + (tc.arguments?.length ?? 0), 0)
+  // Usage (estimated or measured) is produced upstream in the run source, so
+  // here we only normalise to the OpenAI shape, preserving the `estimated` flag.
   const usageOut = usage
     ? {
         prompt_tokens: usage.input_tokens ?? 0,
         completion_tokens: usage.output_tokens ?? 0,
         total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
+        ...(usage.estimated ? { estimated: true } : {}),
       }
-    : {
-        prompt_tokens: tokensFromChars(promptText.length),
-        completion_tokens: tokensFromChars(completionChars),
-        total_tokens: tokensFromChars(promptText.length) + tokensFromChars(completionChars),
-        estimated: true,
-      }
+    : undefined
 
   return {
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
@@ -165,6 +168,6 @@ export async function collectNonStreaming(
         finish_reason: finishReason ?? 'stop',
       },
     ],
-    usage: usageOut,
+    ...(usageOut ? { usage: usageOut } : {}),
   }
 }

@@ -28,9 +28,8 @@
 import { spawnSync } from 'node:child_process'
 import { accessSync, constants, existsSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
-import { jailRelPath } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
 const BWRAP_BIN = 'bwrap'
 
@@ -45,6 +44,7 @@ export class LinuxBwrapJail implements JailBackend {
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     const root = resolveJailRoot(spec.root, spec.projectDir)
     await prepareJailHome(root)
+    ignoreJailRoot(spec.projectDir, root)
 
     const bwrapArgs = [
       '--unshare-user',
@@ -74,10 +74,13 @@ export class LinuxBwrapJail implements JailBackend {
     // Make the backend's host auth readable inside the jail (read-only),
     // bound AFTER the writable root so these specific subpaths stay read-only.
     // HOME is the jail root, so ~/.claude etc. resolve to these binds.
-    for (const source of spec.authSources ?? []) {
-      if (existsSync(source)) {
-        bwrapArgs.push('--ro-bind', source, join(root, jailRelPath(source)))
-      }
+    for (const { source, jailRel, envVar } of spec.authSources ?? []) {
+      if (!existsSync(source)) continue
+      const dest = join(root, jailRel)
+      bwrapArgs.push('--ro-bind', source, dest)
+      // Point the backend's env var (e.g. CODEX_HOME) at the in-jail copy. Done
+      // here, where the jail truly applies, so non-jailed paths are untouched.
+      if (envVar) bwrapArgs.push('--setenv', envVar, dest)
     }
 
     // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.

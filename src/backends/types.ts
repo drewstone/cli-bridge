@@ -171,8 +171,12 @@ export interface ChatDelta {
   tool_calls?: Array<{ id: string; name: string; arguments: string }>
   /** Terminal reason. Emitted once on the final chunk. */
   finish_reason?: 'stop' | 'length' | 'tool_calls' | 'error' | 'timeout'
-  /** Backend-reported usage. Optional; present on final chunk when known. */
-  usage?: { input_tokens?: number; output_tokens?: number }
+  /**
+   * Token usage. Optional; present on the final chunk when known. `estimated`
+   * is set when the bridge derived it from text (~4 chars/token) because the
+   * backend CLI reported none — consumers price it as approximate, not measured.
+   */
+  usage?: { input_tokens?: number; output_tokens?: number; estimated?: boolean }
   /** Backend assigned id for this turn. Written to session store. */
   internal_session_id?: string
   /**

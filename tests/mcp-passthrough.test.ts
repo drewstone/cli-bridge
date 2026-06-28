@@ -34,6 +34,7 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
+import { RunRegistry } from '../src/runs/registry.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
@@ -74,7 +75,7 @@ describe('chat-completions route — mcp body field', () => {
     backend = new CapturingBackend()
     const registry = new BackendRegistry().register(backend)
     app = new Hono()
-    mountChatCompletions(app, { registry, sessions })
+    mountChatCompletions(app, { registry, sessions, runs: new RunRegistry() })
   })
   afterEach(() => {
     sessions.close()

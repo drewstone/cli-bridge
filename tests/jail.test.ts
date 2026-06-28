@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -28,7 +28,10 @@ import {
 } from '../src/jail/index.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
-import { authSourcesFor, jailRelPath } from '../src/jail/auth-preserve.js'
+import { authSourcesFor } from '../src/jail/auth-preserve.js'
+import { ignoreJailRoot } from '../src/jail/types.js'
+import { anyBackendSpawnsOnHost } from '../src/config.js'
+import type { BackendExecutorConfig } from '../src/config.js'
 import type { JailBackend } from '../src/jail/index.js'
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
@@ -119,6 +122,13 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(profile).toContain('(deny file-write* (subpath "/"))')
     expect(profile).toContain('(allow file-write*')
 
+    // Regression: shared temp trees must NOT be writable — a confined run could
+    // otherwise persist files outside the jail root. Temp goes to <root>/.tmp.
+    expect(profile, 'must not whitelist the per-user temp tree').not.toContain('/private/var/folders')
+    expect(profile, 'must not whitelist /private/tmp').not.toContain('/private/tmp')
+    // Standard device nodes stay writable so output redirection / RNG still work.
+    expect(profile).toContain('(literal "/dev/null")')
+
     // The root is canonicalized (realpath) before embedding in the profile.
     const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
     expect(profile).toContain(`(subpath "${expectedRoot}")`)
@@ -148,27 +158,96 @@ describe('resolveJailRoot containment', () => {
     const base = await realpath(await tempProjectDir())
     expect(resolveJailRoot('.agent-home', base)).toBe(join(base, '.agent-home'))
   })
+
+  it('ignoreJailRoot adds an anchored, idempotent exclude entry', async () => {
+    const base = await realpath(await tempProjectDir())
+    await mkdir(join(base, '.git', 'info'), { recursive: true })
+    ignoreJailRoot(base, join(base, '.agent-home'))
+    ignoreJailRoot(base, join(base, '.agent-home'))
+    const exclude = await readFile(join(base, '.git', 'info', 'exclude'), 'utf8')
+    expect(exclude.match(/^\/\.agent-home\/$/gm)?.length).toBe(1)
+  })
+
+  it('ignoreJailRoot finds the repo when cwd is a subdirectory (anchored to repo root)', async () => {
+    const base = await realpath(await tempProjectDir())
+    await mkdir(join(base, '.git', 'info'), { recursive: true })
+    const sub = join(base, 'pkg', 'app')
+    await mkdir(sub, { recursive: true })
+    ignoreJailRoot(sub, join(sub, '.agent-home'))
+    const exclude = await readFile(join(base, '.git', 'info', 'exclude'), 'utf8')
+    expect(exclude).toContain('/pkg/app/.agent-home/')
+  })
+
+  it('ignoreJailRoot follows a .git FILE (worktree) to the real gitdir', async () => {
+    const base = await realpath(await tempProjectDir())
+    const realGit = join(base, 'realgit')
+    await mkdir(join(realGit, 'info'), { recursive: true })
+    await writeFile(join(base, '.git'), `gitdir: ${realGit}\n`)
+    ignoreJailRoot(base, join(base, '.agent-home'))
+    const exclude = await readFile(join(realGit, 'info', 'exclude'), 'utf8')
+    expect(exclude).toContain('/.agent-home/')
+  })
 })
 
 describe('auth preservation', () => {
-  it('jailRelPath maps a host auth path to its $HOME-relative location', () => {
-    expect(jailRelPath(join(homedir(), '.claude'))).toBe('.claude')
-    expect(jailRelPath(join(homedir(), '.config', 'opencode'))).toBe(join('.config', 'opencode'))
-  })
-
   it('authSourcesFor maps registered harness aliases to the same creds, [] for unknown', () => {
     expect(authSourcesFor('totally-unknown-backend')).toEqual([])
     // The server registers 'claude-code'/'claudish'/'kimi-code', not 'claude'/'kimi'.
     expect(authSourcesFor('claude-code')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('claudish')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('kimi-code')).toEqual(authSourcesFor('kimi'))
-    for (const p of authSourcesFor('claude-code')) {
-      expect(existsSync(p), `${p} should exist`).toBe(true)
-      expect(p.startsWith(homedir())).toBe(true)
+    for (const { source, jailRel } of authSourcesFor('claude-code')) {
+      expect(existsSync(source), `${source} should exist`).toBe(true)
+      expect(source.startsWith(homedir())).toBe(true)
+      // jailRel must be a relative location strictly inside the jail root.
+      expect(jailRel.startsWith('/'), `${jailRel} must be relative`).toBe(false)
+      expect(jailRel.startsWith('..'), `${jailRel} must not escape the root`).toBe(false)
     }
-    // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex).
-    for (const p of authSourcesFor('codex')) {
-      expect(p.endsWith('.codex')).toBe(true)
+    // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex),
+    // and tagged so the jail redirects CODEX_HOME at the in-jail copy.
+    for (const { source, jailRel, envVar } of authSourcesFor('codex')) {
+      expect(source.endsWith('.codex')).toBe(true)
+      expect(jailRel).toBe('.codex')
+      expect(envVar).toBe('CODEX_HOME')
+    }
+  })
+
+  it('authSourcesFor(codex) honors a custom CODEX_HOME outside HOME, mapped to the jail ~/.codex', async () => {
+    const ext = await mkdtemp(join(tmpdir(), 'cli-bridge-codexhome-'))
+    cleanups.push(() => rm(ext, { recursive: true, force: true }))
+    await writeFile(join(ext, 'auth.json'), '{}')
+    const prev = process.env.CODEX_HOME
+    process.env.CODEX_HOME = ext
+    try {
+      const codexEntries = authSourcesFor('codex').filter((e) => e.jailRel === '.codex')
+      // Exactly one .codex entry, pointing at the custom CODEX_HOME (not ~/.codex),
+      // still placed at the jail's ~/.codex so a confined codex (HOME=root) finds it,
+      // and tagged with the env var the jail will redirect.
+      expect(codexEntries).toHaveLength(1)
+      expect(codexEntries[0]?.source).toBe(resolve(ext))
+      expect(codexEntries[0]?.envVar).toBe('CODEX_HOME')
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = prev
+    }
+  })
+
+  it('authSourcesFor(pi) preserves ~/.pi/agent so a jailed pi keeps its provider/model config', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-pihome-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    await mkdir(join(fakeHome, '.pi', 'agent'), { recursive: true })
+    await writeFile(join(fakeHome, '.pi', 'agent', 'config.json'), '{"provider":"x"}')
+    const prev = process.env.HOME
+    process.env.HOME = fakeHome
+    try {
+      const sources = authSourcesFor('pi')
+      expect(sources).toHaveLength(1)
+      // Lands at the jail's ~/.pi/agent, where pi (HOME=root) reads its state.
+      expect(sources[0]?.jailRel).toBe('.pi/agent')
+      expect(sources[0]?.source).toBe(join(fakeHome, '.pi', 'agent'))
+    } finally {
+      if (prev === undefined) delete process.env.HOME
+      else process.env.HOME = prev
     }
   })
 
@@ -177,12 +256,49 @@ describe('auth preservation', () => {
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
     const projectDir = await tempProjectDir()
     const root = join(projectDir, '.agent-home')
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], { root, projectDir, authSources: [authDir] })
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{ source: authDir, jailRel: '.claude' }],
+    })
     const expectedRoot = resolveJailRoot(root, projectDir)
     expect(
-      seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, jailRelPath(authDir))),
+      seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.claude')),
       'auth source ro-bound into the jail HOME',
     ).toBeGreaterThanOrEqual(0)
+  })
+
+  it('bwrap redirects an auth env var (CODEX_HOME) at the in-jail copy — only when it wraps', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{ source: authDir, jailRel: '.codex', envVar: 'CODEX_HOME' }],
+    })
+    const expectedRoot = resolveJailRoot(root, projectDir)
+    expect(seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.codex'))).toBeGreaterThanOrEqual(0)
+    expect(
+      seqIndex(wrap.args, '--setenv', 'CODEX_HOME', join(expectedRoot, '.codex')),
+      'CODEX_HOME redirected to the in-jail copy',
+    ).toBeGreaterThanOrEqual(0)
+  })
+
+  it('seatbelt returns an auth env var (CODEX_HOME) pointing at the in-jail copy', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{ source: authDir, jailRel: '.codex', envVar: 'CODEX_HOME' }],
+    })
+    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
+    expect(wrap.env?.CODEX_HOME).toBe(join(expectedRoot, '.codex'))
   })
 })
 
@@ -288,5 +404,40 @@ describe('resolveJailSpec', () => {
         resolve(cwd, DEFAULT_JAIL_ROOT),
       )
     }
+  })
+})
+
+describe('anyBackendSpawnsOnHost (startup jail fail-fast gate)', () => {
+  const docker = (name: string): BackendExecutorConfig => ({ name, kind: 'docker' })
+  const host = (name: string): BackendExecutorConfig => ({ name, kind: 'host' })
+
+  it('is true for the default host-CLI backends', () => {
+    expect(anyBackendSpawnsOnHost(new Set(['claude', 'kimi', 'gemini']), {})).toBe(true)
+  })
+
+  it('is true for ACP backends absent from the executor map (hermes/openclaw)', () => {
+    // Regression: hermes/openclaw forward the jailSpec to the host spawner but are
+    // not in config.executors, so an executor-only check missed them and let an
+    // ACP-only write-jail deployment boot "healthy" then fail every request.
+    expect(anyBackendSpawnsOnHost(new Set(['hermes', 'openclaw']), {})).toBe(true)
+    expect(anyBackendSpawnsOnHost(new Set(['sandbox', 'passthrough', 'hermes']), {})).toBe(true)
+  })
+
+  it('is false when every enabled backend is remote/proxy (no host spawn)', () => {
+    expect(anyBackendSpawnsOnHost(new Set(['sandbox', 'passthrough', 'nanoclaw']), {})).toBe(false)
+  })
+
+  it('is false when the only host-CLI backend is pinned to a docker executor', () => {
+    expect(anyBackendSpawnsOnHost(new Set(['claude', 'sandbox']), { claude: docker('claude') })).toBe(false)
+  })
+
+  it('is true when at least one host-CLI backend keeps a host executor', () => {
+    expect(
+      anyBackendSpawnsOnHost(new Set(['claude', 'kimi']), { claude: docker('claude'), kimi: host('kimi') }),
+    ).toBe(true)
+  })
+
+  it('is false for an empty backend set', () => {
+    expect(anyBackendSpawnsOnHost(new Set<string>(), {})).toBe(false)
   })
 })

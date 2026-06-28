@@ -21,6 +21,7 @@ import { describe, expect, it } from 'vitest'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
+import { RunRegistry } from '../src/runs/registry.js'
 import type { Backend, BackendHealth, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -47,7 +48,7 @@ function buildApp(backends: Backend[]): { app: Hono; cleanup: () => void } {
   const registry = new BackendRegistry()
   for (const b of backends) registry.register(b)
   const app = new Hono()
-  mountChatCompletions(app, { registry, sessions })
+  mountChatCompletions(app, { registry, sessions, runs: new RunRegistry() })
   return { app, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 

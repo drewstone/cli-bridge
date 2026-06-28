@@ -23,10 +23,11 @@ import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
-import { flattenMessages, tokensFromChars } from '../backends/content.js'
+import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
+import type { Run, RunRegistry } from '../runs/registry.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -77,6 +78,19 @@ const chatRequestSchema = z.object({
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
+  /**
+   * Durable-run id. Decouples the JOB from this HTTP connection. A
+   * client disconnect never kills the run; a reconnect/retry that reuses
+   * the same `run_id` RE-ATTACHES to the same in-flight subprocess
+   * (idempotent dispatch) instead of cold-starting a second one.
+   *
+   * Absent → a fresh run id is minted per request (today's behavior,
+   * minus the kill-on-disconnect). Also accepted via `X-Run-Id`.
+   *
+   * Reconnect replay: send `Last-Event-ID: <seq>` (or `X-Last-Event-Id`)
+   * with the same run_id to replay only the deltas missed since `seq`.
+   */
+  run_id: z.string().optional(),
   mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
   // OpenAI-compatible shape — wire is snake_case, TS is camelCase. We
   // translate to responseFormat when we build the ChatRequest below.
@@ -150,7 +164,7 @@ const chatRequestSchema = z.object({
 
 export function mountChatCompletions(
   app: Hono,
-  deps: { registry: BackendRegistry; sessions: SessionStore; admission?: AdmissionGate },
+  deps: { registry: BackendRegistry; sessions: SessionStore; runs: RunRegistry; admission?: AdmissionGate },
 ): void {
   app.post('/v1/chat/completions', async (c) => {
     let raw: unknown
@@ -213,7 +227,7 @@ export function mountChatCompletions(
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
-    const { response_format, agent_profile, cwd, execution, mcp: bodyMcp, ...rest } = parsed.data
+    const { response_format, agent_profile, cwd, execution, mcp: bodyMcp, run_id: bodyRunId, ...rest } = parsed.data
     // MCP can arrive in the body OR the `X-Mcp-Config` header. Body
     // wins on conflict — header is for callers that can't extend the
     // request body (e.g. forwarding through a third-party gateway that
@@ -257,8 +271,22 @@ export function mountChatCompletions(
       req.cwd = session.cwd
     }
 
-    const ac = new AbortController()
-    c.req.raw.signal.addEventListener('abort', () => ac.abort(), { once: true })
+    // Durable-run id: connection-independent job identity. A reconnect or
+    // retry reusing this id RE-ATTACHES to the same in-flight subprocess.
+    const runId = bodyRunId ?? c.req.header('x-run-id') ?? crypto.randomUUID()
+    // Last-Event-ID (standard SSE reconnect header) or the X-Last-Event-Id
+    // alias: the highest seq the client already saw. Replay starts after it.
+    const afterSeq = parseLastEventId(
+      c.req.header('last-event-id') ?? c.req.header('x-last-event-id'),
+    )
+
+    // Idempotent dispatch. A known run id re-attaches with zero new work —
+    // no second subprocess, no second admission slot. Only a genuinely new
+    // id reaches the setup-and-pump path below.
+    const existing = deps.runs.get(runId)
+    if (existing) {
+      return respondFromRun(c, existing, req, runId, afterSeq, false)
+    }
 
     // Execution router: when the caller asks for `execution: 'sandbox'`
     // on a host harness (claude/kimi/gemini/codex/...), delegate to the
@@ -266,8 +294,12 @@ export function mountChatCompletions(
     // + prompt + cwd contract is identical — only the execution location
     // changes. Map the host harness → in-container backend type via
     // `harnessToSandboxBackendType`.
-    let source: AsyncIterable<ChatDelta>
+    //
+    // `run.signal` (NOT the HTTP socket) drives the backend's abort
+    // contract. A client disconnect leaves this signal untouched, so the
+    // subprocess keeps running; only an explicit cancel aborts it.
     let admissionLease: AdmissionLease | null = null
+    let makeSource: ((run: Run) => AsyncIterable<ChatDelta>) | null = null
     if (req.execution?.kind === 'sandbox' && backend.name !== 'sandbox') {
       const sandboxBackend = deps.registry.byName('sandbox')
       if (!sandboxBackend) {
@@ -290,7 +322,7 @@ export function mountChatCompletions(
           sandboxBackendType,
         },
       }
-      source = sandboxBackend.chat(delegatedReq, session, ac.signal)
+      makeSource = (run) => sandboxBackend.chat(delegatedReq, session, run.signal)
     } else {
       // Host execution: resolve the write-jail spec from execution.jail
       // (host variant) layered over the BRIDGE_JAIL_* env defaults, using
@@ -309,23 +341,40 @@ export function mountChatCompletions(
       if (req.jailSpec) req.jailSpec.authSources = authSourcesFor(backend.name)
       if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
         try {
-          admissionLease = await deps.admission.acquire(ac.signal)
+          // Admission is held by the JOB, not the connection — release it
+          // when the run finishes, not when the client drops. Acquire is
+          // cancellable only by an explicit shutdown, so pass no signal.
+          admissionLease = await deps.admission.acquire()
         } catch (err) {
           return admissionErrorResponse(c, err)
         }
       }
-      source = backend.chat(req, session, ac.signal)
+      makeSource = (run) => backend.chat(req, session, run.signal)
     }
+
+    // Approximate input size once (content + tool-call structures), for backends that
+    // report no usage. Estimated in wrap; tool calls are included so tool-heavy turns
+    // are not systematically undercounted.
+    const promptChars = estimateMessagesChars(req.messages)
 
     // Persist internal session id as it flows in. Returns a new
     // AsyncIterable<ChatDelta> so the typed boundary stays clean.
-    // Typed backend/mode errors re-throw so the outer handler can return
-    // a real HTTP status or SSE error frame. Unknown errors terminate
-    // with finish_reason='error' so we do not leak internals.
-    const wrapped: AsyncIterable<ChatDelta> = {
+    // Typed backend/mode errors are converted to a terminal error delta
+    // INSIDE the run buffer (the run owns the stream now — there is no
+    // outer iterator to re-throw to). The route reader surfaces the right
+    // HTTP/SSE shape from the buffered finish_reason.
+    const wrap = (source: AsyncIterable<ChatDelta>): AsyncIterable<ChatDelta> => ({
       [Symbol.asyncIterator]: async function* () {
+        let sawUsage = false
+        let completionChars = 0
         try {
           for await (const delta of source) {
+            if (delta.usage) sawUsage = true
+            completionChars += (delta.content?.length ?? 0)
+              + (delta.tool_calls?.reduce(
+                (s, tc) => s + (tc.id?.length ?? 0) + (tc.name?.length ?? 0) + (tc.arguments?.length ?? 0),
+                0,
+              ) ?? 0)
             if (delta.internal_session_id && req.session_id) {
               deps.sessions.upsert({
                 externalId: req.session_id,
@@ -341,6 +390,20 @@ export function mountChatCompletions(
             }
             yield delta
           }
+          // Backends whose CLI reports no usage (kimi-code, opencode) would leave
+          // every reader with zero tokens, indistinguishable from a stub. Estimate
+          // from the text (~4 chars/token) and emit a usage delta flagged `estimated`
+          // so cost ledgers approximate spend without mistaking it for measured truth.
+          // It is buffered in the run, so reconnecting readers receive it too.
+          if (!sawUsage) {
+            yield {
+              usage: {
+                input_tokens: tokensFromChars(promptChars),
+                output_tokens: tokensFromChars(completionChars),
+                estimated: true,
+              },
+            } satisfies ChatDelta
+          }
         } catch (err) {
           if (err instanceof ModeNotSupportedError || err instanceof BackendError) {
             throw err
@@ -348,121 +411,146 @@ export function mountChatCompletions(
           yield { finish_reason: 'error' } satisfies ChatDelta
           console.error(`[cli-bridge] backend ${backend.name} failed:`, err)
         } finally {
+          // Admission is released when the JOB ends — pump() consumes this
+          // source to completion regardless of client connection state.
           admissionLease?.release()
         }
       },
-    }
-
-    // Surface mode in response headers so clients can confirm what actually ran.
-    c.header('X-Bridge-Mode', req.mode ?? 'byob')
-
-    // Approximate input size once, for backends that report no usage (estimated below).
-    const promptText = flattenMessages(req.messages, { includeSystem: true })
-
-    // OpenAI's /v1/chat/completions defaults `stream: false` when the
-    // field is omitted. cli-bridge previously inverted that (defaulted
-    // to SSE), which silently broke every off-the-shelf OpenAI SDK
-    // (ai-sdk, agent-eval's callLlm, openai-node) that POSTs without
-    // explicit stream. Match OpenAI's contract: only stream when the
-    // caller asked for it (`stream: true`).
-    if (req.stream !== true) {
-      try {
-        const body = await collectNonStreaming(wrapped, req.model, promptText)
-        return c.json(body)
-      } catch (err) {
-        return errorResponse(c, err)
-      }
-    }
-
-    return streamSSE(c, async (stream) => {
-      const meta = makeChunkMeta(req.model)
-      const heartbeatMs = resolveSseHeartbeatMs()
-      let streamClosed = false
-      const abortStream = (): void => {
-        streamClosed = true
-        ac.abort()
-      }
-      const writeRaw = async (chunk: string): Promise<boolean> => {
-        if (streamClosed || ac.signal.aborted) return false
-        try {
-          await stream.write(chunk)
-          return true
-        } catch {
-          abortStream()
-          return false
-        }
-      }
-      const writeSse = async (data: string): Promise<boolean> => {
-        if (streamClosed || ac.signal.aborted) return false
-        try {
-          await stream.writeSSE({ data })
-          return true
-        } catch {
-          abortStream()
-          return false
-        }
-      }
-      const heartbeat = setInterval(() => {
-        void writeRaw(': keepalive\n\n')
-      }, heartbeatMs)
-      let sawUsage = false
-      let completionChars = 0
-      try {
-        if (!await writeRaw(': connected\n\n')) return
-        for await (const delta of wrapped) {
-          if (ac.signal.aborted) break
-          if (delta.usage) sawUsage = true
-          completionChars += (delta.content?.length ?? 0)
-            + (delta.tool_calls?.reduce((s, tc) => s + (tc.arguments?.length ?? 0), 0) ?? 0)
-          // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
-          // render as SSE comment so the consumer (AI SDK, openai-node)
-          // ignores it per spec instead of trying to route a fake tool
-          // call. SSE comments also count as transport heartbeats.
-          const comment = deltaToSseComment(delta)
-          if (comment) {
-            if (!await writeRaw(comment)) break
-            continue
-          }
-          const chunk = deltaToOpenAIChunk(delta, meta)
-          // Metadata-only deltas (e.g. internal_session_id) yield null —
-          // the route already consumed the metadata above; nothing to
-          // write to the OpenAI-visible stream.
-          if (!chunk) continue
-          // deltaToOpenAIChunk returns a complete "data: …\n\n" line.
-          // Strip the framing so streamSSE can re-add it.
-          const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')
-          if (!await writeSse(payload)) break
-        }
-        // Backends that emit no usage (kimi-code, opencode) would leave consumers
-        // with zero tokens, indistinguishable from a stub. Emit an estimated usage
-        // chunk (flagged) so cost ledgers can approximate spend.
-        if (!sawUsage && !ac.signal.aborted) {
-          const prompt_tokens = tokensFromChars(promptText.length)
-          const completion_tokens = tokensFromChars(completionChars)
-          await writeSse(JSON.stringify({
-            id: meta.id,
-            object: 'chat.completion.chunk',
-            created: meta.created,
-            model: req.model,
-            choices: [],
-            usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens, estimated: true },
-          }))
-        }
-      } catch (err) {
-        if (ac.signal.aborted) return
-        const type = err instanceof ModeNotSupportedError
-          ? 'mode_not_supported'
-          : err instanceof BackendError
-            ? err.code
-            : 'server_error'
-        const message = err instanceof Error ? err.message : String(err)
-        await writeSse(JSON.stringify({ error: { message, type } }))
-      } finally {
-        clearInterval(heartbeat)
-      }
-      await writeSse('[DONE]')
     })
+
+    // Register + start the durable run. getOrCreate is idempotent: a
+    // racing duplicate (same run_id arriving twice) re-attaches to the
+    // first run and never invokes the factory twice. The run pumps the
+    // source to completion on its own — the client connection below is
+    // just one of possibly many readers.
+    const run = deps.runs.getOrCreate(runId, (r) => {
+      void r.pump(wrap(makeSource!(r)))
+    })
+
+    return respondFromRun(c, run, req, runId, afterSeq, true)
   })
+}
+
+/**
+ * Render a (possibly already-running) durable run to this request. The
+ * client attaches as a reader from `afterSeq`; a disconnect ends the
+ * reader but NEVER the run. Streaming and non-streaming both read the
+ * same buffered, seq-numbered delta log.
+ */
+async function respondFromRun(
+  c: Context,
+  run: Run,
+  req: ChatRequest,
+  runId: string,
+  afterSeq: number,
+  isFresh: boolean,
+): Promise<Response> {
+  // Surface mode + run id so clients can reconnect/cancel by run id.
+  c.header('X-Bridge-Mode', req.mode ?? 'byob')
+  c.header('X-Run-Id', runId)
+
+  // OpenAI's /v1/chat/completions defaults `stream: false` when the field
+  // is omitted. Only stream when the caller asked for it (`stream: true`);
+  // otherwise drain the run's buffer to a single completion body.
+  if (req.stream !== true) {
+    // A non-streaming response is a single JSON body, so a dispatch-time
+    // typed error (mode rejected, spawn/config failure — thrown before any
+    // delta) must become a real HTTP status, not a 200 with an error
+    // payload. Only the fresh dispatcher does this; a re-attaching client
+    // (run already known) drains the buffered terminal error instead. The
+    // gate resolves the moment output starts or the run settles, so a
+    // healthy long job is never blocked past its first delta.
+    if (isFresh) {
+      await run.whenStarted()
+      const dispatchErr = run.dispatchError()
+      if (dispatchErr !== undefined) return errorResponse(c, dispatchErr)
+    }
+    try {
+      const deltas = mapSeq(run.attach(afterSeq))
+      const body = await collectNonStreaming(deltas, req.model)
+      return c.json(body)
+    } catch (err) {
+      return errorResponse(c, err)
+    }
+  }
+
+  return streamSSE(c, async (stream) => {
+    const meta = makeChunkMeta(req.model)
+    const heartbeatMs = resolveSseHeartbeatMs()
+    // `clientGone` ends THIS reader on a write failure (socket closed). It
+    // does NOT cancel the run — that is the whole point of the decoupling.
+    let clientGone = false
+    const writeRaw = async (chunk: string): Promise<boolean> => {
+      if (clientGone) return false
+      try {
+        await stream.write(chunk)
+        return true
+      } catch {
+        clientGone = true
+        return false
+      }
+    }
+    // SSE `id:` carries the per-run seq so the client's next reconnect can
+    // send it back as Last-Event-ID and replay exactly what it missed.
+    const writeSse = async (data: string, id?: number): Promise<boolean> => {
+      if (clientGone) return false
+      try {
+        await stream.writeSSE(id !== undefined ? { data, id: String(id) } : { data })
+        return true
+      } catch {
+        clientGone = true
+        return false
+      }
+    }
+    const heartbeat = setInterval(() => {
+      void writeRaw(': keepalive\n\n')
+    }, heartbeatMs)
+    try {
+      if (!await writeRaw(': connected\n\n')) return
+      for await (const { seq, delta } of run.attach(afterSeq)) {
+        if (clientGone) break
+        // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
+        // render as SSE comment so the consumer (AI SDK, openai-node)
+        // ignores it per spec instead of trying to route a fake tool
+        // call. SSE comments also count as transport heartbeats.
+        const comment = deltaToSseComment(delta)
+        if (comment) {
+          if (!await writeRaw(comment)) break
+          continue
+        }
+        const chunk = deltaToOpenAIChunk(delta, meta)
+        // Metadata-only deltas (e.g. internal_session_id) yield null —
+        // consumed by the run/session store; nothing to write here.
+        if (!chunk) continue
+        // deltaToOpenAIChunk returns a complete "data: …\n\n" line. Strip
+        // the framing so streamSSE can re-add it (with the seq as id).
+        const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')
+        if (!await writeSse(payload, seq)) break
+      }
+    } catch (err) {
+      if (clientGone) return
+      const message = err instanceof Error ? err.message : String(err)
+      await writeSse(JSON.stringify({ error: { message, type: 'server_error' } }))
+    } finally {
+      clearInterval(heartbeat)
+    }
+    await writeSse('[DONE]')
+  })
+}
+
+/** Unwrap SeqDelta → ChatDelta for the non-streaming collector. */
+async function* mapSeq(iter: AsyncIterable<{ delta: ChatDelta }>): AsyncIterable<ChatDelta> {
+  for await (const { delta } of iter) yield delta
+}
+
+/**
+ * Parse a `Last-Event-ID` / `X-Last-Event-Id` reconnect header into a
+ * seq. Non-numeric / absent → 0 (replay from the start of the buffer).
+ */
+function parseLastEventId(value: string | undefined): number {
+  if (!value) return 0
+  const n = Number.parseInt(value, 10)
+  return Number.isInteger(n) && n >= 0 ? n : 0
 }
 
 function resolveSseHeartbeatMs(): number {

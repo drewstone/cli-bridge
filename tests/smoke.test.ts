@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import { Hono } from 'hono'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
+import { RunRegistry } from '../src/runs/registry.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
@@ -276,7 +277,7 @@ describe('POST /v1/chat/completions', () => {
       .register(new FakeBackend('claude'))
       .register(new FakeBackend('claudish'))
     app = new Hono()
-    mountChatCompletions(app, { registry, sessions })
+    mountChatCompletions(app, { registry, sessions, runs: new RunRegistry() })
   })
   afterEach(() => {
     sessions.close()
@@ -313,7 +314,7 @@ describe('POST /v1/chat/completions', () => {
     app = new Hono()
     mountChatCompletions(
       app,
-      { registry: new BackendRegistry().register(new DelayedBackend('slow', 40)), sessions },
+      { registry: new BackendRegistry().register(new DelayedBackend('slow', 40)), sessions, runs: new RunRegistry() },
     )
     try {
       const res = await app.request('/v1/chat/completions', {
@@ -388,6 +389,7 @@ describe('POST /v1/chat/completions', () => {
     mountChatCompletions(app, {
       registry: new BackendRegistry().register(backend),
       sessions,
+      runs: new RunRegistry(),
       admission,
     })
 
@@ -545,7 +547,7 @@ describe('POST /v1/chat/completions', () => {
     const kimi = new KimiBackend({ bin: '/nonexistent', timeoutMs: 1000, harness: 'kimi-code' })
     const registry = new BackendRegistry().register(kimi)
     const appLocal = new Hono()
-    mountChatCompletions(appLocal, { registry, sessions })
+    mountChatCompletions(appLocal, { registry, sessions, runs: new RunRegistry() })
 
     const res = await appLocal.request('/v1/chat/completions', {
       method: 'POST',

@@ -63,6 +63,21 @@ describe('deltaToOpenAIChunk', () => {
       function: { name: 'lookup', arguments: '{"q":"x"}' },
     })
   })
+
+  it('emits a usage-only delta as an OpenAI usage trailer (choices: []), preserving the estimated flag', () => {
+    const out = deltaToOpenAIChunk({ usage: { input_tokens: 100, output_tokens: 13, estimated: true } }, meta)
+    expect(out).not.toBeNull()
+    const payload = JSON.parse(out!.slice('data: '.length).replace(/\n\n$/, ''))
+    // Must be an empty choices array, NOT a fake empty choice, or strict clients
+    // misparse the trailer as assistant output.
+    expect(payload.choices).toEqual([])
+    expect(payload.usage).toMatchObject({
+      prompt_tokens: 100,
+      completion_tokens: 13,
+      total_tokens: 113,
+      estimated: true,
+    })
+  })
 })
 
 describe('collectNonStreaming', () => {
