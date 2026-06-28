@@ -25,7 +25,20 @@ import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
 const SANDBOX_EXEC_BIN = 'sandbox-exec'
-const SYSTEM_WRITABLE = ['/private/tmp', '/private/var/folders']
+// Device nodes a normal process writes to (output redirection, RNG, tracing,
+// the controlling tty). These are not filesystem locations a confined run can
+// persist files to, so allowing them does not weaken the "writes confined to
+// the jail root" guarantee. We deliberately do NOT allow the shared temp trees
+// (/private/tmp, /private/var/folders): the CLI's temp writes are redirected to
+// TMPDIR=<root>/.tmp (jailEnv), which sits inside the writable root.
+const DEVICE_WRITABLE = [
+  '/dev/null',
+  '/dev/zero',
+  '/dev/random',
+  '/dev/urandom',
+  '/dev/dtracehelper',
+  '/dev/tty',
+]
 
 export class MacosSeatbeltJail implements JailBackend {
   readonly name = 'seatbelt'
@@ -53,7 +66,7 @@ export class MacosSeatbeltJail implements JailBackend {
     // From here on, any failure must remove the copied credentials — otherwise a
     // throw before `cleanup` is returned leaves real auth under the repo jail root.
     try {
-      const writable = [root, ...SYSTEM_WRITABLE]
+      const writable = [root]
       for (const path of spec.extraWritablePaths ?? []) {
         writable.push(await canonicalize(path))
       }
@@ -82,15 +95,19 @@ export class MacosSeatbeltJail implements JailBackend {
 }
 
 function buildProfile(writable: string[]): string {
-  const allow = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
+  const allowSubpaths = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
+  const allowDevices = DEVICE_WRITABLE.map((path) => `  (literal "${sbplEscape(path)}")`).join('\n')
   return [
     '(version 1)',
     '(allow default)',
     '',
-    '; Confine writes to the jail root and explicit writable paths.',
+    '; Deny all writes, then re-allow only the jail root + explicit writable paths',
+    '; (subpaths) and standard device nodes (literals). Shared temp trees stay',
+    '; denied; the CLI writes temp to TMPDIR=<root>/.tmp instead.',
     '(deny file-write* (subpath "/"))',
     '(allow file-write*',
-    allow,
+    allowSubpaths,
+    allowDevices,
     ')',
     '',
   ].join('\n')

@@ -16,7 +16,8 @@
 import { existsSync } from 'node:fs'
 import { cp } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, relative } from 'node:path'
+import { join, resolve } from 'node:path'
+import type { JailAuthSource } from './types.js'
 
 /**
  * $HOME-relative auth/config paths per REGISTERED backend name. Aliases that
@@ -44,18 +45,31 @@ function backendHome(): string {
   return process.env.HOME?.trim() || homedir()
 }
 
-/** Absolute host auth paths for a backend that actually exist on this host. */
-export function authSourcesFor(backendName: string): string[] {
+/** Auth sources for a backend that actually exist on this host, each mapped to
+ * the jail-relative location the confined CLI reads. */
+export function authSourcesFor(backendName: string): JailAuthSource[] {
   const home = backendHome()
-  return (AUTH_PATHS[backendName] ?? [])
-    .map((rel) => join(home, rel))
-    .filter((abs) => existsSync(abs))
-}
-
-/** The path, inside the jail HOME, where an auth source must appear (its
- * location relative to the real HOME the CLI reads). */
-export function jailRelPath(source: string): string {
-  return relative(backendHome(), source)
+  const out: JailAuthSource[] = []
+  for (const rel of AUTH_PATHS[backendName] ?? []) {
+    const source = join(home, rel)
+    // rel is already a POSIX-style jail-relative target ('.claude', '.config/opencode').
+    if (existsSync(source)) out.push({ source, jailRel: rel })
+  }
+  if (backendName === 'codex') {
+    // codex.ts honors $CODEX_HOME (src/backends/codex.ts) and only falls back to
+    // ~/.codex when it is unset. Mirror that: when CODEX_HOME points elsewhere,
+    // surface THAT directory at the jail's ~/.codex (where a confined codex with
+    // HOME=root looks), replacing the default entry rather than copying the wrong
+    // creds. Without this, a custom-CODEX_HOME install loses its auth in the jail.
+    const codexHome = process.env.CODEX_HOME?.trim()
+    if (codexHome) {
+      const source = resolve(codexHome)
+      const idx = out.findIndex((e) => e.jailRel === '.codex')
+      if (idx >= 0) out.splice(idx, 1)
+      if (existsSync(source)) out.push({ source, jailRel: '.codex' })
+    }
+  }
+  return out
 }
 
 /**
@@ -65,11 +79,11 @@ export function jailRelPath(source: string): string {
  * the copied destination paths so the caller can remove them on cleanup — the
  * jail root is project-local, so copied credentials must NOT linger there.
  */
-export async function copyAuthIntoJail(root: string, sources: string[] | undefined): Promise<string[]> {
+export async function copyAuthIntoJail(root: string, sources: JailAuthSource[] | undefined): Promise<string[]> {
   const copied: string[] = []
-  for (const source of sources ?? []) {
+  for (const { source, jailRel } of sources ?? []) {
     if (!existsSync(source)) continue
-    const dest = join(root, jailRelPath(source))
+    const dest = join(root, jailRel)
     await cp(source, dest, { recursive: true, force: true, errorOnExist: false })
     copied.push(dest)
   }

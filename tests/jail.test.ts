@@ -28,7 +28,7 @@ import {
 } from '../src/jail/index.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
-import { authSourcesFor, jailRelPath } from '../src/jail/auth-preserve.js'
+import { authSourcesFor } from '../src/jail/auth-preserve.js'
 import { ignoreJailRoot } from '../src/jail/types.js'
 import { anyBackendSpawnsOnHost } from '../src/config.js'
 import type { BackendExecutorConfig } from '../src/config.js'
@@ -122,6 +122,13 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(profile).toContain('(deny file-write* (subpath "/"))')
     expect(profile).toContain('(allow file-write*')
 
+    // Regression: shared temp trees must NOT be writable — a confined run could
+    // otherwise persist files outside the jail root. Temp goes to <root>/.tmp.
+    expect(profile, 'must not whitelist the per-user temp tree').not.toContain('/private/var/folders')
+    expect(profile, 'must not whitelist /private/tmp').not.toContain('/private/tmp')
+    // Standard device nodes stay writable so output redirection / RNG still work.
+    expect(profile).toContain('(literal "/dev/null")')
+
     // The root is canonicalized (realpath) before embedding in the profile.
     const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
     expect(profile).toContain(`(subpath "${expectedRoot}")`)
@@ -183,24 +190,41 @@ describe('resolveJailRoot containment', () => {
 })
 
 describe('auth preservation', () => {
-  it('jailRelPath maps a host auth path to its $HOME-relative location', () => {
-    expect(jailRelPath(join(homedir(), '.claude'))).toBe('.claude')
-    expect(jailRelPath(join(homedir(), '.config', 'opencode'))).toBe(join('.config', 'opencode'))
-  })
-
   it('authSourcesFor maps registered harness aliases to the same creds, [] for unknown', () => {
     expect(authSourcesFor('totally-unknown-backend')).toEqual([])
     // The server registers 'claude-code'/'claudish'/'kimi-code', not 'claude'/'kimi'.
     expect(authSourcesFor('claude-code')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('claudish')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('kimi-code')).toEqual(authSourcesFor('kimi'))
-    for (const p of authSourcesFor('claude-code')) {
-      expect(existsSync(p), `${p} should exist`).toBe(true)
-      expect(p.startsWith(homedir())).toBe(true)
+    for (const { source, jailRel } of authSourcesFor('claude-code')) {
+      expect(existsSync(source), `${source} should exist`).toBe(true)
+      expect(source.startsWith(homedir())).toBe(true)
+      // jailRel must be a relative location strictly inside the jail root.
+      expect(jailRel.startsWith('/'), `${jailRel} must be relative`).toBe(false)
+      expect(jailRel.startsWith('..'), `${jailRel} must not escape the root`).toBe(false)
     }
     // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex).
-    for (const p of authSourcesFor('codex')) {
-      expect(p.endsWith('.codex')).toBe(true)
+    for (const { source, jailRel } of authSourcesFor('codex')) {
+      expect(source.endsWith('.codex')).toBe(true)
+      expect(jailRel).toBe('.codex')
+    }
+  })
+
+  it('authSourcesFor(codex) honors a custom CODEX_HOME outside HOME, mapped to the jail ~/.codex', async () => {
+    const ext = await mkdtemp(join(tmpdir(), 'cli-bridge-codexhome-'))
+    cleanups.push(() => rm(ext, { recursive: true, force: true }))
+    await writeFile(join(ext, 'auth.json'), '{}')
+    const prev = process.env.CODEX_HOME
+    process.env.CODEX_HOME = ext
+    try {
+      const codexEntries = authSourcesFor('codex').filter((e) => e.jailRel === '.codex')
+      // Exactly one .codex entry, pointing at the custom CODEX_HOME (not ~/.codex),
+      // still placed at the jail's ~/.codex so a confined codex (HOME=root) finds it.
+      expect(codexEntries).toHaveLength(1)
+      expect(codexEntries[0]?.source).toBe(resolve(ext))
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = prev
     }
   })
 
@@ -209,10 +233,14 @@ describe('auth preservation', () => {
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
     const projectDir = await tempProjectDir()
     const root = join(projectDir, '.agent-home')
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], { root, projectDir, authSources: [authDir] })
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{ source: authDir, jailRel: '.claude' }],
+    })
     const expectedRoot = resolveJailRoot(root, projectDir)
     expect(
-      seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, jailRelPath(authDir))),
+      seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.claude')),
       'auth source ro-bound into the jail HOME',
     ).toBeGreaterThanOrEqual(0)
   })
