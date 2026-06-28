@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
@@ -411,6 +411,7 @@ export interface MaterializedCodexHome {
 export function materializeMcpServersForCodex(
   specs: Record<string, McpServerSpec> | null,
   authSourcePath?: string,
+  baseParent?: string,
 ): MaterializedCodexHome | null {
   if (!specs) return null
 
@@ -459,9 +460,13 @@ export function materializeMcpServersForCodex(
   }
   if (serverNames.length === 0) return null
 
-  // Codex aborts if CODEX_HOME is under the system tmpdir on some
-  // platforms — use the user's HOME/.cache as a stable parent.
-  const baseDir = mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
+  // Codex aborts if CODEX_HOME is under the system tmpdir on some platforms —
+  // use the user's HOME/.cache as a stable parent. When jailing, the caller
+  // passes the jail root so the synthetic CODEX_HOME (config + auth) lands
+  // INSIDE the writable jail instead of on the read-only host.
+  const parent = baseParent ?? stableTmpRoot()
+  mkdirSync(parent, { recursive: true })
+  const baseDir = mkdtempSync(join(parent, 'cli-bridge-codex-'))
   writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n')
 
   if (authSourcePath) {

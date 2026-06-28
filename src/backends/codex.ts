@@ -41,6 +41,7 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { killTree } from '../executors/process-tree.js'
+import { resolveJailRoot } from '../jail/types.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -130,10 +131,20 @@ export class CodexBackend implements Backend {
     // `auth.json` so the spawned codex still authenticates as the
     // operator. Cleanup runs in the outer finally so the temp dir
     // doesn't leak on subprocess crash.
+    // When jailing, codex's CODEX_HOME must live INSIDE the jail root: HOME is
+    // remapped to the (read-only-host) jail, so a host CODEX_HOME would be
+    // unwritable and the operator's real creds unreachable. Resolve the root the
+    // same way the jail backend will (pure path math) and steer codex there:
+    //   - MCP active: materialize the synthetic CODEX_HOME under the jail root.
+    //   - no MCP: point CODEX_HOME at <root>/.codex, where the jail copies/binds
+    //     the operator's ~/.codex (or custom CODEX_HOME) via authSourcesFor.
+    const jailRoot = req.jailSpec ? resolveJailRoot(req.jailSpec.root, req.jailSpec.projectDir) : undefined
     const codexHome = materializeMcpServersForCodex(
       resolveMcpServers(req, session),
       resolveCodexAuthPath(),
+      jailRoot,
     )
+    const codexHomeEnv = codexHome?.homePath ?? (jailRoot ? join(jailRoot, '.codex') : undefined)
 
     // Phase-2 host wiring: provision cwd-native profile dimensions (skills/context/
     // hooks/subagents/commands) before spawn. MCP stays on the path above. Fail-safe.
@@ -143,7 +154,7 @@ export class CodexBackend implements Backend {
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: {
         ...process.env,
-        ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
+        ...(codexHomeEnv ? { CODEX_HOME: codexHomeEnv } : {}),
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),

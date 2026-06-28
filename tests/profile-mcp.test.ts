@@ -331,6 +331,24 @@ describe('materializeMcpServersForCodex', () => {
     expect(materializeMcpServersForCodex(null)).toBeNull()
   })
 
+  it('materializes the synthetic CODEX_HOME under a provided base parent (jail root)', () => {
+    const fs = require('node:fs') as typeof import('node:fs')
+    const os = require('node:os') as typeof import('node:os')
+    // A not-yet-existing jail-root-like dir: the function must create it.
+    const jailRoot = join(fs.mkdtempSync(join(os.tmpdir(), 'cb-jail-')), '.agent-home')
+    try {
+      const m = materializeMcpServersForCodex({ echo: { command: 'node' } }, undefined, jailRoot)
+      expect(m).not.toBeNull()
+      if (!m) return
+      // CODEX_HOME lands INSIDE the jail root so a confined codex can read+write it.
+      expect(m.homePath.startsWith(jailRoot)).toBe(true)
+      expect(existsSync(join(m.homePath, 'config.toml'))).toBe(true)
+      m.cleanup()
+    } finally {
+      fs.rmSync(jailRoot, { recursive: true, force: true })
+    }
+  })
+
   it('skips names that would require TOML key quoting (defence-in-depth)', () => {
     const m = materializeMcpServersForCodex({
       'has space': { command: 'tsx' },
