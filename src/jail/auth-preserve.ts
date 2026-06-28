@@ -72,6 +72,10 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
       if (idx >= 0) out.splice(idx, 1)
       if (existsSync(source)) out.push({ source, jailRel: '.codex' })
     }
+    // Redirect CODEX_HOME at the in-jail copy so a confined codex reads creds
+    // there rather than the (read-only) host path. The jail applies this only
+    // when it actually wraps — docker/fallback runs keep the host CODEX_HOME.
+    for (const e of out) if (e.jailRel === '.codex') e.envVar = 'CODEX_HOME'
   }
   return out
 }

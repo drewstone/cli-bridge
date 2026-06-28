@@ -16,7 +16,7 @@
  * removes it (and its temp dir) after the spawn completes.
  */
 
-import { accessSync, constants } from 'node:fs'
+import { accessSync, constants, existsSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -71,6 +71,13 @@ export class MacosSeatbeltJail implements JailBackend {
         writable.push(await canonicalize(path))
       }
 
+      // Point any backend env var (e.g. CODEX_HOME) at the in-jail copy. Done
+      // here, where the jail truly applies, so non-jailed paths are untouched.
+      const authEnv: Record<string, string> = {}
+      for (const { source, jailRel, envVar } of spec.authSources ?? []) {
+        if (envVar && existsSync(source)) authEnv[envVar] = join(root, jailRel)
+      }
+
       const profile = buildProfile(writable)
       const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
       const profilePath = join(dir, 'profile.sb')
@@ -81,7 +88,7 @@ export class MacosSeatbeltJail implements JailBackend {
         args: ['-f', profilePath, '-D', `HOME=${root}`, '-D', `WORK=${spec.projectDir}`, bin, ...args],
         // sandbox-exec does NOT rewrite the child env; -D only parameterizes the
         // profile. Return the real env so HOME/XDG actually point into the jail.
-        env: jailEnv(root),
+        env: { ...jailEnv(root), ...authEnv },
         cleanup: async () => {
           await rm(dir, { recursive: true, force: true })
           await removeCopiedAuth()

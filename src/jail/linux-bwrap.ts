@@ -74,10 +74,13 @@ export class LinuxBwrapJail implements JailBackend {
     // Make the backend's host auth readable inside the jail (read-only),
     // bound AFTER the writable root so these specific subpaths stay read-only.
     // HOME is the jail root, so ~/.claude etc. resolve to these binds.
-    for (const { source, jailRel } of spec.authSources ?? []) {
-      if (existsSync(source)) {
-        bwrapArgs.push('--ro-bind', source, join(root, jailRel))
-      }
+    for (const { source, jailRel, envVar } of spec.authSources ?? []) {
+      if (!existsSync(source)) continue
+      const dest = join(root, jailRel)
+      bwrapArgs.push('--ro-bind', source, dest)
+      // Point the backend's env var (e.g. CODEX_HOME) at the in-jail copy. Done
+      // here, where the jail truly applies, so non-jailed paths are untouched.
+      if (envVar) bwrapArgs.push('--setenv', envVar, dest)
     }
 
     // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.

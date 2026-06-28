@@ -203,10 +203,12 @@ describe('auth preservation', () => {
       expect(jailRel.startsWith('/'), `${jailRel} must be relative`).toBe(false)
       expect(jailRel.startsWith('..'), `${jailRel} must not escape the root`).toBe(false)
     }
-    // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex).
-    for (const { source, jailRel } of authSourcesFor('codex')) {
+    // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex),
+    // and tagged so the jail redirects CODEX_HOME at the in-jail copy.
+    for (const { source, jailRel, envVar } of authSourcesFor('codex')) {
       expect(source.endsWith('.codex')).toBe(true)
       expect(jailRel).toBe('.codex')
+      expect(envVar).toBe('CODEX_HOME')
     }
   })
 
@@ -219,9 +221,11 @@ describe('auth preservation', () => {
     try {
       const codexEntries = authSourcesFor('codex').filter((e) => e.jailRel === '.codex')
       // Exactly one .codex entry, pointing at the custom CODEX_HOME (not ~/.codex),
-      // still placed at the jail's ~/.codex so a confined codex (HOME=root) finds it.
+      // still placed at the jail's ~/.codex so a confined codex (HOME=root) finds it,
+      // and tagged with the env var the jail will redirect.
       expect(codexEntries).toHaveLength(1)
       expect(codexEntries[0]?.source).toBe(resolve(ext))
+      expect(codexEntries[0]?.envVar).toBe('CODEX_HOME')
     } finally {
       if (prev === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = prev
@@ -262,6 +266,39 @@ describe('auth preservation', () => {
       seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.claude')),
       'auth source ro-bound into the jail HOME',
     ).toBeGreaterThanOrEqual(0)
+  })
+
+  it('bwrap redirects an auth env var (CODEX_HOME) at the in-jail copy — only when it wraps', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{ source: authDir, jailRel: '.codex', envVar: 'CODEX_HOME' }],
+    })
+    const expectedRoot = resolveJailRoot(root, projectDir)
+    expect(seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.codex'))).toBeGreaterThanOrEqual(0)
+    expect(
+      seqIndex(wrap.args, '--setenv', 'CODEX_HOME', join(expectedRoot, '.codex')),
+      'CODEX_HOME redirected to the in-jail copy',
+    ).toBeGreaterThanOrEqual(0)
+  })
+
+  it('seatbelt returns an auth env var (CODEX_HOME) pointing at the in-jail copy', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{ source: authDir, jailRel: '.codex', envVar: 'CODEX_HOME' }],
+    })
+    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
+    expect(wrap.env?.CODEX_HOME).toBe(join(expectedRoot, '.codex'))
   })
 })
 

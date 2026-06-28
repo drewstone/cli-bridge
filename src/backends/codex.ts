@@ -41,7 +41,6 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { killTree } from '../executors/process-tree.js'
-import { resolveJailRoot } from '../jail/types.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -131,20 +130,22 @@ export class CodexBackend implements Backend {
     // `auth.json` so the spawned codex still authenticates as the
     // operator. Cleanup runs in the outer finally so the temp dir
     // doesn't leak on subprocess crash.
-    // When jailing, codex's CODEX_HOME must live INSIDE the jail root: HOME is
-    // remapped to the (read-only-host) jail, so a host CODEX_HOME would be
-    // unwritable and the operator's real creds unreachable. Resolve the root the
-    // same way the jail backend will (pure path math) and steer codex there:
-    //   - MCP active: materialize the synthetic CODEX_HOME under the jail root.
-    //   - no MCP: point CODEX_HOME at <root>/.codex, where the jail copies/binds
-    //     the operator's ~/.codex (or custom CODEX_HOME) via authSourcesFor.
-    const jailRoot = req.jailSpec ? resolveJailRoot(req.jailSpec.root, req.jailSpec.projectDir) : undefined
     const codexHome = materializeMcpServersForCodex(
       resolveMcpServers(req, session),
       resolveCodexAuthPath(),
-      jailRoot,
     )
-    const codexHomeEnv = codexHome?.homePath ?? (jailRoot ? join(jailRoot, '.codex') : undefined)
+
+    // When MCP passthrough is active, the synthetic CODEX_HOME (merged MCP config
+    // + copied auth) is the source of truth. Register it as the jail's codex auth
+    // source so a CONFINED run gets it surfaced inside the jail with CODEX_HOME
+    // redirected there. The jail applies this only when it actually wraps; on
+    // docker/fallback paths the host `CODEX_HOME` env below is used unchanged.
+    if (req.jailSpec && codexHome) {
+      req.jailSpec.authSources = [
+        ...(req.jailSpec.authSources ?? []).filter((s) => s.envVar !== 'CODEX_HOME'),
+        { source: codexHome.homePath, jailRel: '.codex', envVar: 'CODEX_HOME' },
+      ]
+    }
 
     // Phase-2 host wiring: provision cwd-native profile dimensions (skills/context/
     // hooks/subagents/commands) before spawn. MCP stays on the path above. Fail-safe.
@@ -154,7 +155,7 @@ export class CodexBackend implements Backend {
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: {
         ...process.env,
-        ...(codexHomeEnv ? { CODEX_HOME: codexHomeEnv } : {}),
+        ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),

@@ -43,6 +43,12 @@ export interface JailAuthSource {
    * so the confined CLI finds it at the same logical location. Always inside
    * the root, even when `source` lives outside the operator HOME. */
   jailRel: string
+  /** Optional env var the jail must point at this source's IN-JAIL location
+   * (`<root>/<jailRel>`). Set ONLY by the jail backend when it actually wraps,
+   * so e.g. codex's `CODEX_HOME` is redirected into the jail for confined runs
+   * but left untouched on docker / fallback-passthrough paths that ignore the
+   * jail. */
+  envVar?: string
 }
 
 export interface JailWrap {
