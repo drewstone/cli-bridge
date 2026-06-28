@@ -12,7 +12,8 @@
  * else the NoopJail passes argv through unchanged.
  */
 
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { mkdir } from 'node:fs/promises'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export interface JailSpec {
   /** Writable scratch root; becomes HOME inside the jail. Must resolve
@@ -65,4 +66,33 @@ export function resolveJailRoot(root: string, base: string): string {
     throw new Error(`jail root '${resolvedRoot}' escapes allowed base '${resolvedBase}'`)
   }
   return resolvedRoot
+}
+
+/**
+ * Environment a jailed process must see so a stateful CLI writes INTO the
+ * jail rather than the host. HOME plus the XDG base dirs are all redirected
+ * under `root` — otherwise CLIs that target `$HOME`, `$XDG_CONFIG_HOME`, or
+ * `$XDG_CACHE_HOME` hit the read-only host filesystem and fail. Both
+ * backends apply these (bwrap via --setenv, seatbelt via JailWrap.env).
+ */
+export function jailEnv(root: string): Record<string, string> {
+  return {
+    HOME: root,
+    XDG_CONFIG_HOME: join(root, '.config'),
+    XDG_CACHE_HOME: join(root, '.cache'),
+    XDG_DATA_HOME: join(root, '.local', 'share'),
+    XDG_STATE_HOME: join(root, '.local', 'state'),
+    XDG_RUNTIME_DIR: join(root, '.runtime'),
+  }
+}
+
+/** Create the jail root and the redirected HOME/XDG dirs so a CLI that
+ * expects them to exist does not fail on first write. */
+export async function prepareJailHome(root: string): Promise<void> {
+  // Mirror the XDG layout produced by jailEnv() so a CLI finds the dirs ready.
+  const relDirs = ['.config', '.cache', join('.local', 'share'), join('.local', 'state'), '.runtime']
+  await mkdir(root, { recursive: true })
+  for (const rel of relDirs) {
+    await mkdir(join(root, rel), { recursive: true })
+  }
 }

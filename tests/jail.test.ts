@@ -26,6 +26,8 @@ import {
   resolveJailRoot,
 } from '../src/jail/index.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
+import { applyJail } from '../src/executors/jail-support.js'
+import type { JailBackend } from '../src/jail/index.js'
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
 function seqIndex(argv: string[], ...seq: string[]): number {
@@ -75,6 +77,8 @@ describe('LinuxBwrapJail.wrap', () => {
     expect(argv).toContain('--ro-bind')
     expect(seqIndex(argv, '--bind', expectedRoot), 'writable --bind of the jail root').toBeGreaterThanOrEqual(0)
     expect(seqIndex(argv, '--setenv', 'HOME', expectedRoot), 'HOME set to the jail root').toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--setenv', 'XDG_CONFIG_HOME', join(expectedRoot, '.config')), 'XDG_CONFIG_HOME redirected into the jail').toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--setenv', 'XDG_CACHE_HOME', join(expectedRoot, '.cache')), 'XDG_CACHE_HOME redirected into the jail').toBeGreaterThanOrEqual(0)
     expect(seqIndex(argv, '--chdir', projectDir), 'chdir into the project dir').toBeGreaterThanOrEqual(0)
 
     // The original command is the tail of the argv.
@@ -110,6 +114,43 @@ describe('MacosSeatbeltJail.wrap', () => {
     // The root is canonicalized (realpath) before embedding in the profile.
     const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
     expect(profile).toContain(`(subpath "${expectedRoot}")`)
+
+    // sandbox-exec does not rewrite the child env, so the wrapper MUST return
+    // HOME + XDG pointing into the jail (else stateful CLIs write to real $HOME).
+    expect(wrap.env?.HOME).toBe(expectedRoot)
+    expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(expectedRoot, '.config'))
+    expect(wrap.env?.XDG_CACHE_HOME).toBe(join(expectedRoot, '.cache'))
+  })
+})
+
+describe('applyJail fail-closed', () => {
+  const unavailable: JailBackend = {
+    name: 'stub',
+    isAvailable: () => false,
+    wrap: () => { throw new Error('should not wrap when unavailable') },
+  }
+  const jailedOpts = { jail: { root: '/proj/.agent-home', projectDir: '/proj' } } as never
+
+  it('throws (refuses to run unconfined) when a jail is requested but the backend is unavailable', async () => {
+    await expect(applyJail('/bin/sh', ['-c', 'x'], jailedOpts, unavailable))
+      .rejects.toThrow(/write-jail requested/)
+  })
+
+  it('runs unconfined (pass-through) only when BRIDGE_JAIL_FALLBACK=warn is set', async () => {
+    process.env.BRIDGE_JAIL_FALLBACK = 'warn'
+    try {
+      const r = await applyJail('/bin/sh', ['-c', 'x'], jailedOpts, unavailable)
+      expect(r.bin).toBe('/bin/sh')
+      expect(r.args).toEqual(['-c', 'x'])
+    } finally {
+      delete process.env.BRIDGE_JAIL_FALLBACK
+    }
+  })
+
+  it('is a pure pass-through when no jail is requested (never throws)', async () => {
+    const r = await applyJail('mybin', ['--x'], {} as never, unavailable)
+    expect(r.bin).toBe('mybin')
+    expect(r.args).toEqual(['--x'])
   })
 })
 

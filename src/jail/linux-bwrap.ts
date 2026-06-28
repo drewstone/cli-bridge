@@ -26,10 +26,9 @@
 
 import { spawnSync } from 'node:child_process'
 import { accessSync, constants } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { resolveJailRoot } from './types.js'
+import { jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
 const BWRAP_BIN = 'bwrap'
 
@@ -43,7 +42,7 @@ export class LinuxBwrapJail implements JailBackend {
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     const root = resolveJailRoot(spec.root, spec.projectDir)
-    await mkdir(root, { recursive: true })
+    await prepareJailHome(root)
 
     const bwrapArgs = [
       '--unshare-user',
@@ -66,8 +65,12 @@ export class LinuxBwrapJail implements JailBackend {
     // Writable root last so it wins over any read-only mount above it.
     bwrapArgs.push('--bind', root, root)
 
+    // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.
+    for (const [key, value] of Object.entries(jailEnv(root))) {
+      bwrapArgs.push('--setenv', key, value)
+    }
+
     bwrapArgs.push(
-      '--setenv', 'HOME', root,
       '--chdir', spec.projectDir,
       '--die-with-parent',
       bin, ...args,

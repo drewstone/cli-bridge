@@ -21,7 +21,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { resolveJailRoot } from './types.js'
+import { jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
 const SANDBOX_EXEC_BIN = 'sandbox-exec'
 const SYSTEM_WRITABLE = ['/private/tmp', '/private/var/folders']
@@ -35,6 +35,9 @@ export class MacosSeatbeltJail implements JailBackend {
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     const root = await canonicalize(resolveJailRoot(spec.root, spec.projectDir))
+    // Create the redirected HOME/XDG dirs under the (canonical) root so the CLI
+    // can write to them; they sit inside `root`, already in the writable set.
+    await prepareJailHome(root)
     const writable = [root, ...SYSTEM_WRITABLE]
     for (const path of spec.extraWritablePaths ?? []) {
       writable.push(await canonicalize(path))
@@ -48,6 +51,9 @@ export class MacosSeatbeltJail implements JailBackend {
     return {
       bin: SANDBOX_EXEC_BIN,
       args: ['-f', profilePath, '-D', `HOME=${root}`, '-D', `WORK=${spec.projectDir}`, bin, ...args],
+      // sandbox-exec does NOT rewrite the child env; -D only parameterizes the
+      // profile. Return the real env so HOME/XDG actually point into the jail.
+      env: jailEnv(root),
       cleanup: async () => {
         await rm(dir, { recursive: true, force: true })
       },

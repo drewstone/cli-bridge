@@ -14,6 +14,7 @@
  */
 
 import { selectJailBackend } from '../jail/index.js'
+import type { JailBackend } from '../jail/index.js'
 import type { SpawnOpts } from './types.js'
 
 export interface JailedCommand {
@@ -24,26 +25,39 @@ export interface JailedCommand {
   cleanup?: () => Promise<void> | void
 }
 
-let warnedUnavailable = false
+const ENABLE_HINT =
+  'On Linux, enable unprivileged user namespaces once: ' +
+  '`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist in /etc/sysctl.d) ' +
+  'or `sudo chmod u+s /usr/bin/bwrap`.'
+let warnedFallback = false
 
-export async function applyJail(bin: string, args: string[], opts: SpawnOpts): Promise<JailedCommand> {
+export async function applyJail(
+  bin: string,
+  args: string[],
+  opts: SpawnOpts,
+  backend: JailBackend = selectJailBackend(),
+): Promise<JailedCommand> {
   if (!opts.jail) return { bin, args, env: opts.env }
 
-  const backend = selectJailBackend()
   if (!(await backend.isAvailable())) {
-    // A write-jail was requested but cannot run here. Do NOT silently run
-    // unconfined — warn loudly (once) so the operator knows confinement is
-    // off and how to turn it on, then pass through.
-    if (!warnedUnavailable) {
-      warnedUnavailable = true
-      console.warn(
-        `[cli-bridge] write-jail requested but '${backend.name}' cannot run on this host — ` +
-        'commands run WITHOUT filesystem confinement. On Linux, enable unprivileged user ' +
-        'namespaces once: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` ' +
-        '(persist in /etc/sysctl.d) or `sudo chmod u+s /usr/bin/bwrap`.',
-      )
+    // A write-jail was REQUESTED but cannot be enforced on this host. Running
+    // unconfined would be a silent security downgrade, so fail closed by
+    // default. Operators who knowingly accept unconfined execution can opt out
+    // with BRIDGE_JAIL_FALLBACK=warn.
+    if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
+      if (!warnedFallback) {
+        warnedFallback = true
+        console.warn(
+          `[cli-bridge] write-jail requested but '${backend.name}' unavailable — running ` +
+          `UNCONFINED (BRIDGE_JAIL_FALLBACK=warn). ${ENABLE_HINT}`,
+        )
+      }
+      return { bin, args, env: opts.env }
     }
-    return { bin, args, env: opts.env }
+    throw new Error(
+      `write-jail requested but '${backend.name}' cannot run on this host, refusing to run ` +
+      `unconfined. ${ENABLE_HINT} Or set BRIDGE_JAIL_FALLBACK=warn to run without confinement.`,
+    )
   }
 
   const wrap = await backend.wrap(bin, args, opts.jail)
