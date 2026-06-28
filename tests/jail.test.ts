@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -128,6 +128,25 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(wrap.env?.HOME).toBe(expectedRoot)
     expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(expectedRoot, '.config'))
     expect(wrap.env?.XDG_CACHE_HOME).toBe(join(expectedRoot, '.cache'))
+  })
+})
+
+describe('resolveJailRoot containment', () => {
+  it('rejects a root equal to the base (would make the whole repo writable)', async () => {
+    const base = await realpath(await tempProjectDir())
+    expect(() => resolveJailRoot('.', base)).toThrow(/dedicated subdirectory/)
+    expect(() => resolveJailRoot(base, base)).toThrow(/dedicated subdirectory/)
+  })
+
+  it('rejects a repo-local symlink whose real path escapes the base', async () => {
+    const base = await realpath(await tempProjectDir())
+    await symlink('/tmp', join(base, 'scratch'))
+    expect(() => resolveJailRoot('scratch', base)).toThrow()
+  })
+
+  it('accepts a normal nested descendant', async () => {
+    const base = await realpath(await tempProjectDir())
+    expect(resolveJailRoot('.agent-home', base)).toBe(join(base, '.agent-home'))
   })
 })
 
@@ -250,7 +269,7 @@ describe('resolveJailSpec', () => {
 
   it('clamps a root that escapes cwd back to the in-cwd default (fail closed)', () => {
     const cwd = '/home/user/project'
-    const escapeAttempts = ['../../etc', '../outside', '/etc']
+    const escapeAttempts = ['../../etc', '../outside', '/etc', '.']
     for (const execRoot of escapeAttempts) {
       const spec = resolveJailSpec({ cwd, execMode: 'write-jail', execRoot, env: {} })
       expect(spec, `escape attempt ${execRoot} should still produce a spec`).not.toBeNull()

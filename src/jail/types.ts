@@ -12,8 +12,9 @@
  * else the NoopJail passes argv through unchanged.
  */
 
+import { realpathSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export interface JailSpec {
   /** Writable scratch root; becomes HOME inside the jail. Must resolve
@@ -63,14 +64,38 @@ export interface JailBackend {
  */
 export function resolveJailRoot(root: string, base: string): string {
   if (!root) throw new Error('jail root must be a non-empty path')
-  const resolvedBase = resolve(base)
-  const resolvedRoot = isAbsolute(root) ? resolve(root) : resolve(resolvedBase, root)
+  // Canonicalize BOTH paths (resolve symlinks on the existing prefix) before
+  // comparing, so a repo-local symlink (e.g. scratch -> /tmp) cannot look
+  // in-base lexically while physically pointing outside it.
+  const resolvedBase = canonicalize(resolve(base))
+  const resolvedRoot = canonicalize(isAbsolute(root) ? resolve(root) : resolve(resolvedBase, root))
   const rel = relative(resolvedBase, resolvedRoot)
-  const escapes = rel.startsWith(`..${sep}`) || rel === '..' || isAbsolute(rel)
-  if (escapes) {
-    throw new Error(`jail root '${resolvedRoot}' escapes allowed base '${resolvedBase}'`)
+  // Must be a STRICT descendant of base: never the base itself (rel === '',
+  // which would make the whole working tree writable) and never an escape.
+  const ok = rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
+  if (!ok) {
+    throw new Error(`jail root '${resolvedRoot}' must be a dedicated subdirectory inside '${resolvedBase}'`)
   }
   return resolvedRoot
+}
+
+/** Resolve symlinks on the deepest EXISTING ancestor of `p`, then re-append the
+ * not-yet-created tail. Lets us canonicalize a jail root that does not exist
+ * yet while still catching a symlinked ancestor that points outside the base. */
+function canonicalize(p: string): string {
+  const tail: string[] = []
+  let cur = p
+  for (;;) {
+    try {
+      const real = realpathSync(cur)
+      return tail.length ? join(real, ...tail.reverse()) : real
+    } catch {
+      const parent = dirname(cur)
+      if (parent === cur) return p
+      tail.push(basename(cur))
+      cur = parent
+    }
+  }
 }
 
 /**
