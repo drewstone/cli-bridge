@@ -8,6 +8,7 @@
  */
 
 import type { ChatDelta } from '../backends/types.js'
+import { tokensFromChars } from '../backends/content.js'
 
 export interface ChunkMeta {
   id: string
@@ -107,6 +108,7 @@ export function makeChunkMeta(model: string): ChunkMeta {
 export async function collectNonStreaming(
   iter: AsyncIterable<ChatDelta>,
   model: string,
+  promptText = '',
 ): Promise<unknown> {
   let content = ''
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = []
@@ -122,6 +124,23 @@ export async function collectNonStreaming(
     if (d.finish_reason) finishReason = d.finish_reason
     if (d.usage) usage = d.usage
   }
+
+  // Backends whose CLI emits no usage (kimi-code, opencode) would otherwise
+  // report zero tokens, indistinguishable from a stub. Estimate from the text so
+  // cost is approximable; flag `estimated` so consumers never treat it as measured.
+  const completionChars = content.length + toolCalls.reduce((s, tc) => s + (tc.arguments?.length ?? 0), 0)
+  const usageOut = usage
+    ? {
+        prompt_tokens: usage.input_tokens ?? 0,
+        completion_tokens: usage.output_tokens ?? 0,
+        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
+      }
+    : {
+        prompt_tokens: tokensFromChars(promptText.length),
+        completion_tokens: tokensFromChars(completionChars),
+        total_tokens: tokensFromChars(promptText.length) + tokensFromChars(completionChars),
+        estimated: true,
+      }
 
   return {
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
@@ -146,12 +165,6 @@ export async function collectNonStreaming(
         finish_reason: finishReason ?? 'stop',
       },
     ],
-    ...(usage ? {
-      usage: {
-        prompt_tokens: usage.input_tokens ?? 0,
-        completion_tokens: usage.output_tokens ?? 0,
-        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
-      },
-    } : {}),
+    usage: usageOut,
   }
 }
