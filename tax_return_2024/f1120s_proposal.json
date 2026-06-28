@@ -1,0 +1,43 @@
+{
+  "form_id": "f1120s",
+  "title": "Form 1120-S — U.S. Income Tax Return for an S Corporation — 2024 (provisional)",
+  "rationale": "Provisional S corporation return for Whitfield Media LLC. Ordinary business income of $180,000 is taken from the Schedule K-1. Known deductions include officer compensation ($95,000), employer solo 401(k) contribution ($23,750), and shareholder health insurance included in officer compensation ($14,400). Gross receipts and any other ordinary business expenses are not stated; this return is provisional pending entity books.",
+  "payload": {
+    "fields": [
+      {"name": "Gross receipts or sales", "line": "1a", "value": "MISSING", "status": "pending_entity_books"},
+      {"name": "Returns and allowances", "line": "1b", "value": "$0", "status": "no_source_reported"},
+      {"name": "Balance", "line": "1c", "value": "MISSING", "status": "pending_entity_books"},
+      {"name": "Cost of goods sold", "line": "2", "value": "$0", "status": "no_source_reported"},
+      {"name": "Gross profit", "line": "3", "value": "MISSING", "status": "pending_entity_books"},
+      {"name": "Net gain (loss) from Form 4797", "line": "4", "value": "$0", "status": "no_source_reported"},
+      {"name": "Other income (loss)", "line": "5", "value": "$0", "status": "no_source_reported"},
+      {"name": "Total income (loss)", "line": "6", "value": "MISSING", "status": "pending_entity_books"},
+      {"name": "Compensation of officers", "line": "7", "value": "$95,000", "note": "Includes $14,400 shareholder health insurance per Notice 2008-1"},
+      {"name": "Salaries and wages", "line": "8", "value": "$0", "status": "no_other_wages_reported"},
+      {"name": "Repairs and maintenance", "line": "9", "value": "$0", "status": "no_source_reported"},
+      {"name": "Bad debts", "line": "10", "value": "$0", "status": "no_source_reported"},
+      {"name": "Rents", "line": "11", "value": "$0", "status": "no_source_reported"},
+      {"name": "Taxes and licenses", "line": "12", "value": "$0", "status": "no_source_reported"},
+      {"name": "Interest", "line": "13", "value": "$0", "status": "no_source_reported"},
+      {"name": "Depreciation", "line": "14", "value": "$0", "status": "no_source_reported"},
+      {"name": "Depletion", "line": "15", "value": "$0", "status": "no_source_reported"},
+      {"name": "Advertising", "line": "16", "value": "$0", "status": "no_source_reported"},
+      {"name": "Pension, profit-sharing, etc., plans", "line": "17", "value": "$23,750", "note": "Employer solo 401(k) contribution"},
+      {"name": "Employee benefit programs", "line": "18", "value": "$0", "note": "Health insurance included in line 7 officer compensation"},
+      {"name": "Other deductions", "line": "19", "value": "$0", "status": "no_source_reported"},
+      {"name": "Total deductions", "line": "20", "value": "MISSING", "status": "pending_entity_books"},
+      {"name": "Ordinary business income (loss)", "line": "21", "value": "$180,000"}
+    ]
+  },
+  "citation_ids": [
+    "cite_k1_whitfield_2024",
+    "cite_w2_whitfield_2024",
+    "cite_solo_401k_employer",
+    "cite_notice_2008_1_health_insurance"
+  ],
+  "review_flags": [
+    "Entity books are required to complete gross receipts and total deductions; the return currently balances only the known items against K-1 ordinary income.",
+    "Confirm Whitfield Media LLC EIN and S-election date before filing.",
+    "Verify whether the $14,400 health insurance is paid by the S-corp and properly included in officer wages."
+  ]
+}

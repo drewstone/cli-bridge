@@ -1,0 +1,30 @@
+{
+  "form_id": "ca_8283",
+  "title": "California Form 8283 — Noncash Charitable Contributions — 2024",
+  "rationale": "A noncash charitable contribution of appreciated stock with a claimed value of $15,000 requires Form 8283 because the amount exceeds $500. Because the amount exceeds $5,000, a qualified appraisal is required under IRC §170(f)(11) and the appraisal summary must be completed in Section B, Part IV. The stock donation is also reported on California Schedule A (540) / Schedule CA (540), Part II, line 12.",
+  "payload": {
+    "fields": [
+      {"name": "Donee organization name", "line": "donee_name", "value": "MISSING", "status": "required"},
+      {"name": "Description of donated property", "line": "property_description", "value": "Publicly traded stock (appreciated securities)", "status": "provisional"},
+      {"name": "Date of contribution", "line": "date_contribution", "value": "MISSING", "status": "required"},
+      {"name": "Date acquired by donor", "line": "date_acquired", "value": "MISSING", "status": "required"},
+      {"name": "Fair market value", "line": "fmv", "value": "$15,000"},
+      {"name": "Section A or B", "line": "section", "value": "Section B", "note": "FMV exceeds $5,000"},
+      {"name": "Qualified appraisal required", "line": "appraisal_required", "value": "YES", "note": "IRC §170(f)(11); Reg. §1.170A-13(c)"},
+      {"name": "Appraiser information", "line": "appraiser", "value": "MISSING", "status": "required"},
+      {"name": "Charitable contribution carry to Schedule A line 12", "line": "schedule_a_line", "value": "$15,000"}
+    ]
+  },
+  "citation_ids": [
+    "cite_charitable_2024",
+    "cite_irc_170",
+    "cite_irc_170_f_11",
+    "cite_form_8283_instructions"
+  ],
+  "review_flags": [
+    "ACTION REQUIRED: Obtain a qualified appraisal for the $15,000 stock donation before filing; Section B Part IV of Form 8283 must be completed.",
+    "Verify the stock was held long-term (more than one year) so the full fair market value is deductible, subject to AGI limitations.",
+    "Confirm the donee is a qualified charitable organization under IRC §170(c).",
+    "Obtain contemporaneous written acknowledgment from the charity if required."
+  ]
+}

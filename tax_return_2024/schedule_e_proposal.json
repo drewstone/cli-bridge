@@ -1,0 +1,31 @@
+{
+  "form_id": "schedule_e",
+  "title": "Schedule E (Form 1040) — Supplemental Income and Loss",
+  "rationale": "Whitfield Media LLC, an S corporation, reports $180,000 of ordinary business income in Box 1 of its Schedule K-1. The shareholder materially participates through full-time employment as the sole owner/officer, so the activity is nonpassive. The $180,000 flows through Schedule E Part II to Schedule 1 line 5.",
+  "payload": {
+    "fields": [
+      {"name": "Part I — Income or Loss From Rental Real Estate and Royalties — Rents received", "line": "3a", "value": "$0", "status": "no_rental_reported"},
+      {"name": "Part I — Expenses total", "line": "20", "value": "$0", "status": "no_rental_reported"},
+      {"name": "Part I — Total rental real estate and royalty income or loss", "line": "26", "value": "$0", "status": "no_rental_reported"},
+      {"name": "Part II — Partnerships and S corporations — A. Name: Whitfield Media LLC", "line": "28A", "value": "Whitfield Media LLC", "note": "EIN missing"},
+      {"name": "Part II — Partnerships and S corporations — B. EIN: Whitfield Media LLC", "line": "28B", "value": "", "status": "missing"},
+      {"name": "Part II — Partnerships and S corporations — C. Check if applicable: P or S", "line": "28C", "value": "S", "note": "S corporation"},
+      {"name": "Part II — Partnerships and S corporations — E. Passive activity: Whitfield Media LLC", "line": "28E_whitfield", "value": "No", "note": "Nonpassive; shareholder materially participates as sole owner/officer"},
+      {"name": "Part II — Partnerships and S corporations — F. Passive loss allowed: Whitfield Media LLC", "line": "28F_whitfield", "value": "$0", "status": "not_applicable"},
+      {"name": "Part II — Partnerships and S corporations — Box 1 ordinary business income: Whitfield Media LLC", "line": "28_box1_whitfield", "value": "$180,000"},
+      {"name": "Part II — Partnerships and S corporations — Box 2 rental real estate: Whitfield Media LLC", "line": "28_box2_whitfield", "value": "$0"},
+      {"name": "Part II — Total income or loss from partnerships and S corporations", "line": "28_total", "value": "$180,000"},
+      {"name": "Part II — Total income or loss from estates and trusts", "line": "32", "value": "$0", "status": "no_source_reported"},
+      {"name": "Part II — Total income or loss from REMICs", "line": "37", "value": "$0", "status": "no_source_reported"},
+      {"name": "Part II — Total supplemental income or loss", "line": "41", "value": "$180,000"}
+    ]
+  },
+  "citation_ids": [
+    "cite_k1_whitfield_2024",
+    "cite_irc_469_material_participation"
+  ],
+  "review_flags": [
+    "Confirm Whitfield Media LLC EIN from the 1120-S return before filing.",
+    "Verify the taxpayer materially participates in the S corporation (officer role, hours, compensation); if passive, losses may be limited under IRC §469."
+  ]
+}

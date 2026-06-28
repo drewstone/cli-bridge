@@ -1,0 +1,72 @@
+{
+  "practice": "Brightleaf Dental",
+  "agent_name": "Sam",
+  "agent_identity": "Front-desk receptionist at Brightleaf Dental",
+  "campaign_type": "inbound_call_answer_and_book",
+  "active_hours": {
+    "timezone": "America/New_York",
+    "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+    "open": "08:00",
+    "close": "17:00",
+    "lunch_start": "12:30",
+    "lunch_end": "13:30"
+  },
+  "languages": {
+    "primary": "en-US",
+    "warm_transfer": {
+      "es": "Rosa"
+    }
+  },
+  "recording": {
+    "enabled": true,
+    "disclosure_required": true,
+    "disclosure_text": "This call may be recorded for quality and training purposes."
+  },
+  "insurance": {
+    "in_network": ["Delta Dental"],
+    "accepted_plans": "most PPO plans",
+    "not_accepted": ["Medicaid", "Medicare (dental)", "HMO plans"],
+    "membership_plan_available": true
+  },
+  "emergency_policy": {
+    "same_day_available": true,
+    "slots_held_until": "10:00",
+    "after_hours_line": "[CONFIGURE]",
+    "er_direct_criteria": [
+      "facial swelling with fever",
+      "difficulty breathing",
+      "trauma with unconsciousness",
+      "uncontrolled bleeding"
+    ]
+  },
+  "appointment_durations_minutes": {
+    "new_patient_exam": 45,
+    "routine_cleaning": 30,
+    "emergency_visit": 30,
+    "filling": 45,
+    "crown_prep": 60,
+    "crown_seat": 30,
+    "extraction_simple": 45,
+    "root_canal": 60,
+    "whitening_consult": 15
+  },
+  "staff": {
+    "dr_patel": { "role": "Dentist / Owner", "transfer_for": ["clinical", "treatment_planning"] },
+    "jen": { "role": "Clinical Assistant", "transfer_for": ["prescription_refills", "post_op"] },
+    "maria": { "role": "Billing / Insurance", "transfer_for": ["insurance", "billing", "payment_plans"] },
+    "lisa": { "role": "Office Manager", "transfer_for": ["complaints", "records", "legal"] },
+    "rosa": { "role": "Front Desk / Spanish", "transfer_for": ["spanish_language"] }
+  },
+  "integration_status": {
+    "calendar_pms": "NOT_CONNECTED",
+    "sms_reminders": "NOT_CONNECTED",
+    "insurance_verification_api": "NOT_CONNECTED",
+    "after_hours_routing": "NOT_CONFIGURED"
+  },
+  "compliance": {
+    "hipaa": true,
+    "dnc_scrubbing": true,
+    "recording_consent": true,
+    "minor_guardian_required": true
+  }
+}

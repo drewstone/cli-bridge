@@ -1,0 +1,148 @@
+{
+  "citations": [
+    {
+      "citation_id": "cite_w2_whitfield_2024",
+      "source_type": "user_document",
+      "document_id": "w2_whitfield_media_2024",
+      "quote": "w2 (Whitfield Media LLC): box_1_wages=95000, box_2_federal_withheld=14250, box_3_ss_wages=95000, box_4_ss_withheld=5890, box_5_medicare_wages=95000, box_6_medicare_withheld=1377.5, box_12.W=14400, box_13_retirement_plan=false",
+      "authority": "IRC §§61, 3402; Notice 2008-1",
+      "supports": "Form 1040 line 1a wages of $95,000; line 25a federal withholding of $14,250; Box 12.W reported. Notice 2008-1 requires S-corp shareholder health insurance to be included in Box 1 but excluded from Box 3/5."
+    },
+    {
+      "citation_id": "cite_w2_lakewood_2024",
+      "source_type": "user_document",
+      "document_id": "w2_lakewood_isd_2024",
+      "quote": "w2 (Lakewood ISD): box_1_wages=62000, box_2_federal_withheld=7440, box_3_ss_wages=62000, box_4_ss_withheld=3844, box_5_medicare_wages=62000, box_6_medicare_withheld=899, box_13_retirement_plan=true",
+      "authority": "IRC §§61, 3402",
+      "supports": "Form 1040 line 1a wages of $62,000; line 25a federal withholding of $7,440."
+    },
+    {
+      "citation_id": "cite_k1_whitfield_2024",
+      "source_type": "user_document",
+      "document_id": "k1_whitfield_media_2024",
+      "quote": "k1 (Whitfield Media LLC): form=1065, box_1_ordinary_income=180000, box_2_rental_real_estate=0, section_199a_qbi=180000, section_199a_w2_wages=95000, section_199a_ubia=12000",
+      "authority": "IRC §§1366, 702; Form 1040 Schedule E instructions",
+      "supports": "Schedule E Part II ordinary business income of $180,000; §199A QBI of $180,000, W-2 wages of $95,000, UBIA of $12,000. Taxpayer confirms entity is an S corporation despite K-1 label."
+    },
+    {
+      "citation_id": "cite_solo_401k_employer",
+      "source_type": "user_document",
+      "document_id": "canonical-case-facts",
+      "quote": "solo_401k_employer=23750",
+      "authority": "IRC §404(a)(3)(A)(i)",
+      "supports": "Employer solo 401(k) contribution of $23,750 deducted on Form 1120-S line 17."
+    },
+    {
+      "citation_id": "cite_charitable_2024",
+      "source_type": "user_document",
+      "document_id": "canonical-case-facts",
+      "quote": "charitable_cash=8000, charitable_stock=15000",
+      "authority": "IRC §170; Reg. §1.170A-13",
+      "supports": "California and federal charitable contributions of $8,000 cash and $15,000 appreciated stock."
+    },
+    {
+      "citation_id": "cite_notice_2008_1_health_insurance",
+      "source_type": "authority",
+      "document_id": "notice_2008_1",
+      "quote": "An S corporation may deduct the premiums paid or furnished for accident and health insurance coverage for a 2-percent shareholder-employee. The premiums are included in the shareholder-employee's wages for income tax withholding purposes, but are not wages subject to social security and Medicare taxes if the plan is established for the benefit of employees.",
+      "authority": "Notice 2008-1, Q/A-1, Q/A-3",
+      "supports": "Schedule 1 line 17 self-employed health insurance deduction of $14,400; amount included in W-2 Box 1 but should be excluded from Box 3/5."
+    },
+    {
+      "citation_id": "cite_irc_162_l",
+      "source_type": "authority",
+      "document_id": "irc_162_l",
+      "quote": "In the case of an employee of an S corporation who owns more than 2 percent of the outstanding stock of such corporation, the deduction under subsection (a) shall be allowed to such employee and shall be equal to the amount paid during the taxable year for insurance which constitutes medical care for the taxpayer, his spouse, and dependents, and for any child (as defined in section 152(f)(1)) of the taxpayer who as of the end of the taxable year has not attained age 27.",
+      "authority": "IRC §162(l)(1)(B)",
+      "supports": "Above-the-line deduction for S-corp 2-percent shareholder health insurance on Schedule 1 line 17."
+    },
+    {
+      "citation_id": "cite_irc_170",
+      "source_type": "authority",
+      "document_id": "irc_170",
+      "quote": "There shall be allowed as a deduction any charitable contribution payment of which is made within the taxable year and which is made to or for the use of a qualified charitable organization.",
+      "authority": "IRC §170(a)(1)",
+      "supports": "Federal and California charitable contribution deduction for $8,000 cash and $15,000 appreciated stock."
+    },
+    {
+      "citation_id": "cite_irc_170_f_11",
+      "source_type": "authority",
+      "document_id": "irc_170_f_11",
+      "quote": "No deduction shall be allowed under subsection (a) for any contribution of property for which a deduction of more than $5,000 is claimed unless the taxpayer substantiates the contribution with a qualified appraisal.",
+      "authority": "IRC §170(f)(11)(A); Reg. §1.170A-13(c)",
+      "supports": "$15,000 stock donation requires Form 8283 Section B and a qualified appraisal."
+    },
+    {
+      "citation_id": "cite_irc_469_material_participation",
+      "source_type": "authority",
+      "document_id": "irc_469",
+      "quote": "An individual shall be treated, for purposes of this paragraph, as materially participating in any activity if the individual participates in the activity for more than 500 hours during such taxable year.",
+      "authority": "IRC §469(h)(1); Reg. §1.469-5T(a)(1)",
+      "supports": "Whitfield Media LLC K-1 income treated as nonpassive because the sole owner/officer materially participates."
+    },
+    {
+      "citation_id": "cite_form_8995_qbi",
+      "source_type": "authority",
+      "document_id": "form_8995_instructions",
+      "quote": "Use Form 8995 to figure your qualified business income deduction. You qualify to use this form if your taxable income before the qualified business income deduction is equal to or less than the threshold amount.",
+      "authority": "IRC §199A; Form 8995 Instructions",
+      "supports": "Form 8995 simplified computation for QBI deduction of $36,000."
+    },
+    {
+      "citation_id": "cite_rev_proc_2023_34_std_ded",
+      "source_type": "authority",
+      "document_id": "rev_proc_2023_34",
+      "quote": "For taxable years beginning in 2024, the standard deduction amount under section 63(c)(2)(A) for married individuals filing a joint return is $29,200.",
+      "authority": "Rev. Proc. 2023-34, §3.17",
+      "supports": "Federal Form 1040 line 12 standard deduction of $29,200 for MFJ."
+    },
+    {
+      "citation_id": "cite_rev_proc_2023_34_qbi_threshold",
+      "source_type": "authority",
+      "document_id": "rev_proc_2023_34",
+      "quote": "For taxable years beginning in 2024, the threshold amount under section 199A(e)(2) for married individuals filing a joint return is $383,900.",
+      "authority": "Rev. Proc. 2023-34, §3.20",
+      "supports": "2024 MFJ threshold for simplified Form 8995 computation; taxable income before QBI ($293,400) is below threshold."
+    },
+    {
+      "citation_id": "cite_ca_199a_nonconformity",
+      "source_type": "authority",
+      "document_id": "ftb_schedule_ca_2024",
+      "quote": "In general, for taxable years beginning on or after January 1, 2015, California law conforms to the Internal Revenue Code as of January 1, 2015. California law does not conform to the federal qualified business income deduction under IRC Section 199A enacted by the TCJA.",
+      "authority": "California R&TC §17052 et seq.; 2024 Instructions for Schedule CA (540), General Information",
+      "supports": "California adds back the $36,000 federal QBI deduction on Schedule CA (540), increasing California AGI."
+    },
+    {
+      "citation_id": "cite_ca_std_deduction_2024",
+      "source_type": "authority",
+      "document_id": "ftb_540_2024",
+      "quote": "California Standard Deduction Chart for Most People — Married/RDP filing jointly: $11,080.",
+      "authority": "2024 Instructions for Form 540, California Standard Deduction Chart",
+      "supports": "California Form 540 line 18 standard deduction for MFJ is $11,080."
+    },
+    {
+      "citation_id": "cite_ca_schedule_y_2024",
+      "source_type": "authority",
+      "document_id": "ftb_540_2024",
+      "quote": "Schedule Y — Married/RDP Filing Jointly: If taxable income is over $141,212 but not over $721,318, tax is $6,217.44 + 9.30% of the amount over $141,212.",
+      "authority": "2024 Instructions for Form 540, 2024 California Tax Rate Schedules, Schedule Y",
+      "supports": "California Form 540 line 31 tax computation on taxable income of $335,600."
+    },
+    {
+      "citation_id": "cite_ca_itemized_limitation_2024",
+      "source_type": "authority",
+      "document_id": "ftb_schedule_ca_2024",
+      "quote": "Is the amount on Form 540, line 13 more than the amount shown below for your filing status? Married/RDP filing jointly or qualifying surviving spouse/RDP: $489,719. If no, transfer line 28 to line 29; do not complete the Itemized Deductions Worksheet.",
+      "authority": "2024 Instructions for Schedule CA (540), Part II, line 29",
+      "supports": "Federal AGI ($322,600) is below the MFJ itemized deduction limitation threshold ($489,719), so no reduction applies."
+    },
+    {
+      "citation_id": "cite_form_8283_instructions",
+      "source_type": "authority",
+      "document_id": "form_8283_instructions",
+      "quote": "File Form 8283 if the amount of your deduction for all noncash gifts is more than $500. A qualified appraisal is required for donated property (other than certain publicly traded stock) for which you claim a deduction of more than $5,000.",
+      "authority": "IRS Form 8283 Instructions; IRC §170(f)(11)",
+      "supports": "$15,000 stock donation requires Form 8283 and a qualified appraisal."
+    }
+  ]
+}

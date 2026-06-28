@@ -1,0 +1,33 @@
+{
+  "form_id": "ca_schedule_a",
+  "title": "California Schedule A (540) Itemized Deductions — 2024",
+  "rationale": "California itemized deductions are computed on Schedule CA (540), Part II. Charitable contributions total $23,000 ($8,000 cash + $15,000 appreciated stock). No medical expenses, taxes, mortgage interest, or other itemized deductions were provided. The $23,000 total exceeds the California MFJ standard deduction of $11,080, so itemizing wins. Federal AGI is below the MFJ limitation threshold ($489,719), so itemized deductions are not reduced.",
+  "payload": {
+    "fields": [
+      {"name": "Medical and dental expenses", "line": "1", "value": "$0", "status": "no_source_reported"},
+      {"name": "State and local income taxes or general sales taxes", "line": "5", "value": "$0", "status": "state_income_tax_zero"},
+      {"name": "Real estate taxes", "line": "6", "value": "$0", "status": "no_source_reported"},
+      {"name": "Personal property taxes", "line": "7", "value": "$0", "status": "no_source_reported"},
+      {"name": "Home mortgage interest and points", "line": "8", "value": "$0", "status": "no_source_reported"},
+      {"name": "Gifts by cash or check", "line": "11", "value": "$8,000"},
+      {"name": "Gifts other than by cash or check", "line": "12", "value": "$15,000"},
+      {"name": "Total charitable contributions", "line": "14", "value": "$23,000"},
+      {"name": "Casualty and theft losses", "line": "15", "value": "$0", "status": "no_source_reported"},
+      {"name": "Other itemized deductions", "line": "16", "value": "$0", "status": "no_source_reported"},
+      {"name": "Total itemized deductions", "line": "17", "value": "$23,000"},
+      {"name": "Itemized deduction limitation reduction", "line": "limitation", "value": "$0", "note": "Federal AGI below MFJ threshold"},
+      {"name": "California itemized deductions to Schedule CA line 28", "line": "net", "value": "$23,000"}
+    ]
+  },
+  "citation_ids": [
+    "cite_charitable_2024",
+    "cite_irc_170",
+    "cite_ca_std_deduction_2024",
+    "cite_ca_itemized_limitation_2024"
+  ],
+  "review_flags": [
+    "Confirm no additional California itemized deductions (property tax, mortgage interest, medical expenses exceeding 7.5% of CA AGI, etc.).",
+    "Appreciated stock donation of $15,000 requires Form 8283 and a qualified appraisal if the claimed value exceeds $5,000.",
+    "If additional itemized deductions are provided, re-run the itemized-vs-standard comparison and the itemized deduction limitation worksheet."
+  ]
+}

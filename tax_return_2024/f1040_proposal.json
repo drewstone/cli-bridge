@@ -1,0 +1,41 @@
+{
+  "form_id": "f1040",
+  "title": "Form 1040 U.S. Individual Income Tax Return — 2024 MFJ core values",
+  "rationale": "Computed from cited W-2 wages, Schedule E K-1 ordinary income from Whitfield Media LLC, S-corp shareholder health insurance deduction under Notice 2008-1/IRC §162(l), and §199A QBI deduction. Federal standard deduction wins over itemized because total itemized deductions ($23,000 charitable + $0 state tax) are less than the MFJ standard deduction.",
+  "payload": {
+    "fields": [
+      {"name": "Filing status", "line": "filing_status", "value": "Married filing jointly"},
+      {"name": "Wages, salaries, tips (Form W-2, Box 1)", "line": "1a", "value": "$157,000", "note": "$95,000 Whitfield Media LLC + $62,000 Lakewood ISD"},
+      {"name": "Taxable interest", "line": "2b", "value": "$0", "status": "no_source_reported"},
+      {"name": "Ordinary dividends", "line": "3b", "value": "$0", "status": "no_source_reported"},
+      {"name": "Schedule D net capital gain or loss", "line": "7", "value": "$0", "status": "no_source_reported"},
+      {"name": "Other income (Schedule 1, line 10)", "line": "8", "value": "$180,000", "note": "Schedule E K-1 ordinary business income"},
+      {"name": "Total income", "line": "9", "value": "$337,000"},
+      {"name": "Adjustments to income", "line": "10", "value": "$14,400", "note": "S-corp shareholder health insurance, Schedule 1 line 26"},
+      {"name": "Adjusted gross income (AGI)", "line": "11", "value": "$322,600"},
+      {"name": "Standard deduction", "line": "12", "value": "$29,200", "note": "2024 MFJ standard deduction"},
+      {"name": "Qualified business income deduction", "line": "13", "value": "$36,000", "note": "Form 8995; simplified method applies"},
+      {"name": "Taxable income", "line": "15", "value": "$257,400"},
+      {"name": "Tax", "line": "16", "value": "$47,861"},
+      {"name": "Total other taxes", "line": "23", "value": "$0", "status": "no_se_or_amt_reported"},
+      {"name": "Total tax", "line": "24", "value": "$47,861"},
+      {"name": "Federal income tax withheld (Form W-2, Box 2)", "line": "25a", "value": "$21,690", "note": "$14,250 + $7,440"},
+      {"name": "Total payments", "line": "33", "value": "$21,690"},
+      {"name": "Amount owed", "line": "37", "value": "$26,171"}
+    ]
+  },
+  "citation_ids": [
+    "cite_w2_whitfield_2024",
+    "cite_w2_lakewood_2024",
+    "cite_k1_whitfield_2024",
+    "cite_notice_2008_1_health_insurance",
+    "cite_irc_162_l",
+    "cite_rev_proc_2023_34_std_ded",
+    "cite_form_8995_qbi"
+  ],
+  "review_flags": [
+    "Verify no additional federal withholding or estimated tax payments.",
+    "AMT computation (Form 6251) pending; ISO/AMT, high wages, or large adjustments could trigger it.",
+    "Confirm the $14,400 Box 12 code W is S-corp health insurance and not an HSA contribution."
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "session": "2024-mfj-whitfield-media",
+  "tax_year": 2024,
+  "filing_status": "mfj",
+  "resident_state": "CA",
+  "source_states": ["CA"],
+  "forms": [
+    {
+      "form_id": "f1040",
+      "title": "Form 1040 U.S. Individual Income Tax Return — 2024 MFJ core values",
+      "rationale": "Computed from cited W-2 wages, Schedule E K-1 ordinary income from Whitfield Media LLC, S-corp shareholder health insurance deduction under Notice 2008-1/IRC §162(l), and §199A QBI deduction.",
+      "citation_ids": ["cite_w2_whitfield_2024", "cite_w2_lakewood_2024", "cite_k1_whitfield_2024", "cite_notice_2008_1_health_insurance", "cite_irc_162_l", "cite_rev_proc_2023_34_std_ded", "cite_form_8995_qbi"],
+      "payload_file": "tax_return_2024/f1040_proposal.json",
+      "status": "queued"
+    },
+    {
+      "form_id": "schedule_1",
+      "title": "Schedule 1 (Form 1040) — Additional Income and Adjustments to Income",
+      "rationale": "Schedule E net K-1 ordinary income of $180,000 flows to Schedule 1 line 5 and then line 10. S-corp shareholder health insurance of $14,400 is deducted on line 17 and flows to line 26.",
+      "citation_ids": ["cite_k1_whitfield_2024", "cite_notice_2008_1_health_insurance", "cite_irc_162_l"],
+      "payload_file": "tax_return_2024/schedule_1_proposal.json",
+      "status": "queued"
+    },
+    {
+      "form_id": "schedule_e",
+      "title": "Schedule E (Form 1040) — Supplemental Income and Loss",
+      "rationale": "Whitfield Media LLC, an S corporation, reports $180,000 of ordinary business income in Box 1 of its Schedule K-1. The shareholder materially participates as the sole owner/officer, so the activity is nonpassive.",
+      "citation_ids": ["cite_k1_whitfield_2024", "cite_irc_469_material_participation"],
+      "payload_file": "tax_return_2024/schedule_e_proposal.json",
+      "status": "queued"
+    },
+    {
+      "form_id": "f1120s",
+      "title": "Form 1120-S — U.S. Income Tax Return for an S Corporation — 2024 (provisional)",
+      "rationale": "Provisional S corporation return for Whitfield Media LLC. Ordinary business income of $180,000 is taken from the Schedule K-1. Known deductions include officer compensation ($95,000) and employer solo 401(k) contribution ($23,750). Gross receipts and other expenses are pending entity books.",
+      "citation_ids": ["cite_k1_whitfield_2024", "cite_w2_whitfield_2024", "cite_solo_401k_employer"],
+      "payload_file": "tax_return_2024/f1120s_proposal.json",
+      "status": "queued"
+    },
+    {
+      "form_id": "f8995",
+      "title": "Form 8995 — Qualified Business Income Deduction — 2024 computed line values",
+      "rationale": "Form 8995 uses the simplified computation because 2024 MFJ taxable income before the QBI deduction ($293,400) is at or below the $383,900 threshold. The W-2 wage/UBIA limitation does not apply.",
+      "citation_ids": ["cite_k1_whitfield_2024", "cite_form_8995_qbi", "cite_rev_proc_2023_34_qbi_threshold"],
+      "payload_file": "tax_return_2024/f8995_proposal.json",
+      "status": "queued"
+    }
+  ],
+  "pending_forms": [
+    {
+      "form_id": "ca_540",
+      "title": "California Form 540 — California Resident Income Tax Return — 2024",
+      "rationale": "Full-year California resident return. Federal AGI increased by California's nonconformity add-back for the federal §199A QBI deduction.",
+      "payload_file": "tax_return_2024/ca_540_proposal.json",
+      "status": "pending_user_request"
+    },
+    {
+      "form_id": "ca_schedule_ca",
+      "title": "California Schedule CA (540) — California Adjustments — Residents — 2024",
+      "rationale": "California does not conform to IRC §199A; the $36,000 federal QBI deduction is added back on Schedule CA (540), Part I, Section B, line 8z, column C.",
+      "payload_file": "tax_return_2024/ca_schedule_ca_proposal.json",
+      "status": "pending_user_request"
+    },
+    {
+      "form_id": "ca_schedule_a",
+      "title": "California Schedule A (540) Itemized Deductions — 2024",
+      "rationale": "California itemized deductions total $23,000 from charitable contributions, exceeding the MFJ standard deduction of $11,080.",
+      "payload_file": "tax_return_2024/ca_schedule_a_proposal.json",
+      "status": "pending_user_request"
+    },
+    {
+      "form_id": "ca_8283",
+      "title": "California Form 8283 — Noncash Charitable Contributions — 2024",
+      "rationale": "$15,000 appreciated stock donation requires Form 8283 Section B and a qualified appraisal.",
+      "payload_file": "tax_return_2024/ca_8283_proposal.json",
+      "status": "pending_user_request"
+    }
+  ],
+  "business_obligations_note": "Whitfield Media LLC is a California S corporation. California Form 100S (California S Corporation Franchise or Income Tax Return) and the $800 minimum franchise tax are likely required; this is separate from the personal return and will be queued after entity books are provided.",
+  "citations_file": "tax_return_2024/citations.json"
+}

@@ -1,0 +1,44 @@
+{
+  "form_id": "schedule_1",
+  "title": "Schedule 1 (Form 1040) — Additional Income and Adjustments to Income",
+  "rationale": "Schedule E net K-1 ordinary income of $180,000 flows to Schedule 1 line 5 and then line 10. S-corp shareholder health insurance of $14,400 is deducted on line 17 and flows to line 26. Net effect on Form 1040: $180,000 additional income less $14,400 adjustments = $165,600.",
+  "payload": {
+    "fields": [
+      {"name": "Taxable refunds, credits, or offsets", "line": "1", "value": "$0", "status": "no_source_reported"},
+      {"name": "Alimony received", "line": "2a", "value": "$0", "status": "no_source_reported"},
+      {"name": "Business income or loss (Schedule C)", "line": "3", "value": "$0", "status": "no_source_reported"},
+      {"name": "Other gains or losses", "line": "4", "value": "$0", "status": "no_source_reported"},
+      {"name": "Rental real estate, royalties, partnerships, S corporations, trusts, etc. (Schedule E)", "line": "5", "value": "$180,000", "note": "Whitfield Media LLC K-1 Box 1 ordinary business income, nonpassive"},
+      {"name": "Farm income or loss (Schedule F)", "line": "6", "value": "$0", "status": "no_source_reported"},
+      {"name": "Unemployment compensation", "line": "7", "value": "$0", "status": "no_source_reported"},
+      {"name": "Other income", "line": "8", "value": "$0", "status": "no_source_reported"},
+      {"name": "Total other income", "line": "9", "value": "$180,000"},
+      {"name": "Combine lines 1 through 9", "line": "10", "value": "$180,000"},
+      {"name": "Educator expenses", "line": "11", "value": "$0", "status": "no_source_reported"},
+      {"name": "Certain business expenses of reservists, performing artists, and fee-basis officials", "line": "12", "value": "$0", "status": "no_source_reported"},
+      {"name": "Health savings account deduction", "line": "13", "value": "$0", "status": "no_source_reported"},
+      {"name": "Moving expenses", "line": "14", "value": "$0", "status": "no_source_reported"},
+      {"name": "Deductible part of self-employment tax", "line": "15", "value": "$0", "status": "no_se_reported"},
+      {"name": "Self-employed SEP, SIMPLE, and qualified plans", "line": "16", "value": "$0", "status": "s_corp_employer_plan_on_1120s"},
+      {"name": "Self-employed health insurance deduction", "line": "17", "value": "$14,400", "note": "S-corp shareholder health insurance included in W-2 Box 1 per Notice 2008-1"},
+      {"name": "Penalty on early withdrawal of savings", "line": "18", "value": "$0", "status": "no_source_reported"},
+      {"name": "Alimony paid", "line": "19", "value": "$0", "status": "no_source_reported"},
+      {"name": "IRA deduction", "line": "20", "value": "$0", "status": "no_source_reported"},
+      {"name": "Student loan interest deduction", "line": "21", "value": "$0", "status": "no_source_reported"},
+      {"name": "Adjustments to income", "line": "22", "value": "$14,400"},
+      {"name": "Reserved", "line": "23", "value": "$0", "status": "no_source_reported"},
+      {"name": "Reserved", "line": "24", "value": "$0", "status": "no_source_reported"},
+      {"name": "Reserved", "line": "25", "value": "$0", "status": "no_source_reported"},
+      {"name": "Total adjustments", "line": "26", "value": "$14,400"}
+    ]
+  },
+  "citation_ids": [
+    "cite_k1_whitfield_2024",
+    "cite_notice_2008_1_health_insurance",
+    "cite_irc_162_l"
+  ],
+  "review_flags": [
+    "Verify that $14,400 was actually S-corp health insurance premiums paid/reimbursed and included in W-2 Box 1; W-2 Box 12 code W is the HSA code.",
+    "If $14,400 is instead an HSA contribution, remove line 17 and report on Form 8889; excess contribution rules would apply."
+  ]
+}

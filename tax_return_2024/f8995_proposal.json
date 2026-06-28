@@ -1,0 +1,27 @@
+{
+  "form_id": "f8995",
+  "title": "Form 8995 — Qualified Business Income Deduction — 2024 computed line values",
+  "rationale": "Form 8995 uses the simplified computation because 2024 MFJ taxable income before the QBI deduction ($293,400) is at or below the $383,900 threshold. The W-2 wage/UBIA limitation therefore does not apply; the deduction is the lesser of 20% of QBI ($36,000) or 20% of taxable income before the deduction ($58,680).",
+  "payload": {
+    "fields": [
+      {"name": "Trade, business, or aggregation name", "line": "1a", "value": "Whitfield Media LLC"},
+      {"name": "Qualified business income or loss", "line": "1b", "value": "$180,000"},
+      {"name": "Total qualified business income or loss", "line": "3", "value": "$180,000"},
+      {"name": "Multiply line 3 by 20%", "line": "4", "value": "$36,000"},
+      {"name": "Taxable income before qualified business income deduction", "line": "5", "value": "$293,400"},
+      {"name": "Multiply line 5 by 20%", "line": "6", "value": "$58,680"},
+      {"name": "Qualified business income deduction before REIT/PTP component", "line": "7", "value": "$36,000"},
+      {"name": "Qualified REIT dividends and PTP income or loss", "line": "8", "value": "$0"},
+      {"name": "Total qualified business income deduction", "line": "9", "value": "$36,000"}
+    ]
+  },
+  "citation_ids": [
+    "cite_k1_whitfield_2024",
+    "cite_form_8995_qbi",
+    "cite_rev_proc_2023_34_qbi_threshold"
+  ],
+  "review_flags": [
+    "Taxable income before QBI ($293,400) is below the 2024 MFJ simplified-method threshold ($383,900), so the W-2 wage/UBIA limitation does not apply. If the threshold is exceeded upon audit, recompute on Form 8995-A.",
+    "K-1 reports $95,000 W-2 wages and $12,000 UBIA; retained for potential limitation if facts change."
+  ]
+}

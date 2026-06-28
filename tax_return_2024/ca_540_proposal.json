@@ -1,0 +1,38 @@
+{
+  "form_id": "ca_540",
+  "title": "California Form 540 — California Resident Income Tax Return — 2024",
+  "rationale": "Full-year California resident return. Federal AGI of $322,600 is increased by $36,000 for California's nonconformity to the federal §199A QBI deduction (Schedule CA line 8z column C), yielding California AGI of $358,600. California itemized deductions ($23,000 charitable) exceed the MFJ standard deduction ($11,080), so itemized deductions are used. Tax is computed under 2024 Schedule Y. Exemption credit is provisional pending verification of the FTB pre-printed amount.",
+  "payload": {
+    "fields": [
+      {"name": "Filing status", "line": "filing_status", "value": "Married/RDP filing jointly"},
+      {"name": "Federal adjusted gross income (Form 1040, line 11)", "line": "13", "value": "$322,600"},
+      {"name": "Subtractions from federal AGI", "line": "14_col_b", "value": "$0", "status": "no_subtractions"},
+      {"name": "Additions to federal AGI — §199A QBI deduction nonconformity", "line": "14_col_c", "value": "$36,000", "note": "Schedule CA (540), Part I, Section B, line 8z, column C"},
+      {"name": "California adjusted gross income", "line": "17", "value": "$358,600"},
+      {"name": "California itemized deductions", "line": "18", "value": "$23,000", "note": "Schedule CA (540), Part II, line 29; charitable contributions $23,000"},
+      {"name": "Taxable income", "line": "19", "value": "$335,600"},
+      {"name": "Tax", "line": "31", "value": "$24,296", "note": "Schedule Y: $6,217.44 + 9.3% × ($335,600 − $141,212)"},
+      {"name": "Exemption credits", "line": "32", "value": "$280", "status": "provisional", "note": "2 personal exemptions × $140; verify FTB pre-printed amount"},
+      {"name": "Tax after exemption credits", "line": "35", "value": "$24,016", "status": "provisional"},
+      {"name": "California income tax withheld", "line": "71", "value": "$0", "status": "missing"},
+      {"name": "2024 estimated tax payments and amount applied from 2023 return", "line": "72", "value": "$0", "status": "missing"},
+      {"name": "Total payments", "line": "91", "value": "$0", "status": "missing"},
+      {"name": "Balance due / overpaid", "line": "94_115", "value": "$24,016", "status": "provisional"}
+    ]
+  },
+  "citation_ids": [
+    "cite_w2_whitfield_2024",
+    "cite_w2_lakewood_2024",
+    "cite_k1_whitfield_2024",
+    "cite_ca_199a_nonconformity",
+    "cite_ca_std_deduction_2024",
+    "cite_ca_schedule_y_2024",
+    "cite_charitable_2024"
+  ],
+  "review_flags": [
+    "California exemption credit amount ($280) is provisional; verify against FTB pre-printed Form 540.",
+    "California withholding and estimated tax payments are missing; final balance due/refund cannot be determined.",
+    "California itemized deduction limitation does not apply because federal AGI ($322,600) is below the MFJ threshold ($489,719).",
+    "Verify no other California additions/subtractions (e.g., HSA, foreign income, moving expenses) before finalizing Schedule CA (540)."
+  ]
+}

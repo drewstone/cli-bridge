@@ -1,0 +1,34 @@
+{
+  "form_id": "ca_schedule_ca",
+  "title": "California Schedule CA (540) — California Adjustments — Residents — 2024",
+  "rationale": "California does not conform to the federal qualified business income deduction under IRC §199A. The $36,000 QBI deduction taken on federal Form 1040 line 13 is added back as an addition on Schedule CA (540), Part I, Section B, line 8z, column C. All other federal amounts flow through column A with no adjustment unless additional facts are provided.",
+  "payload": {
+    "fields": [
+      {"name": "Part I, Section A — Wages, salaries, tips, etc. (federal column A)", "line": "1a_col_a", "value": "$157,000"},
+      {"name": "Part I, Section B — Other income — line 8z, column C §199A QBI add-back", "line": "8z_col_c", "value": "$36,000", "note": "California nonconformity to IRC §199A"},
+      {"name": "Part I, Section B — Other income total (column C)", "line": "9a_col_c", "value": "$36,000"},
+      {"name": "Part I, line 27 — Total (federal column A)", "line": "27_col_a", "value": "$322,600"},
+      {"name": "Part I, line 27 — Total (column B subtractions)", "line": "27_col_b", "value": "$0"},
+      {"name": "Part I, line 27 — Total (column C additions)", "line": "27_col_c", "value": "$36,000"},
+      {"name": "California adjusted gross income", "line": "27_net", "value": "$358,600"},
+      {"name": "Part II, line 11 — Gifts by cash or check", "line": "11", "value": "$8,000"},
+      {"name": "Part II, line 12 — Gifts other than by cash or check", "line": "12", "value": "$15,000"},
+      {"name": "Part II, line 28 — Total itemized deductions before limitation", "line": "28", "value": "$23,000"},
+      {"name": "Part II, line 29 — California itemized deductions", "line": "29", "value": "$23,000", "note": "No limitation; federal AGI below threshold"},
+      {"name": "Part II, line 30 — Amount from line 29 or standard deduction", "line": "30", "value": "$23,000"}
+    ]
+  },
+  "citation_ids": [
+    "cite_w2_whitfield_2024",
+    "cite_w2_lakewood_2024",
+    "cite_k1_whitfield_2024",
+    "cite_ca_199a_nonconformity",
+    "cite_ca_std_deduction_2024",
+    "cite_charitable_2024"
+  ],
+  "review_flags": [
+    "The QBI add-back is the only California adjustment identified from current facts; verify no HSA, moving expense, foreign income, or other nonconformity items.",
+    "If federal Schedule A is not filed, a federal Schedule A must be completed for California itemized deduction purposes and attached to the return.",
+    "Federal AGI ($322,600) is below the MFJ itemized deduction limitation threshold ($489,719), so no reduction applies."
+  ]
+}
