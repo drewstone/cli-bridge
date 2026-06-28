@@ -21,6 +21,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process'
+import type { JailSpec } from '../jail/index.js'
 
 /** What the spawner produces. Compatible with node's ChildProcess. */
 export type SpawnedChild = ChildProcess
@@ -34,6 +35,15 @@ export interface SpawnOpts {
   stdio?: ['ignore' | 'pipe' | 'inherit', 'pipe' | 'inherit', 'pipe' | 'inherit']
   /** Sticky session id (Docker variant uses this to route to a warm slot). */
   sessionId?: string
+  /**
+   * Resolved write-jail spec for this spawn. When set, the host and
+   * scoped-host spawners wrap `(bin, args)` via `wrapInJail` before
+   * spawning and run the wrap's cleanup in `release()`. Absent/null = no
+   * jail; the spawn is byte-identical to the unjailed path. Resolved by
+   * the chat route (see `resolveJailSpec`); ignored by the Docker spawner,
+   * which already provides container-level isolation.
+   */
+  jail?: JailSpec | null
 }
 
 export interface SpawnResult {

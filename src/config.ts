@@ -78,6 +78,21 @@ export interface Config {
    * override individually. Default: host.
    */
   executors: Record<string, BackendExecutorConfig>
+  /**
+   * Default write-jail mode for host-executed CLIs, from
+   * `BRIDGE_JAIL_MODE` (off|write-jail, default off). A per-request
+   * `execution.jail.mode` overrides this. In `write-jail` the host
+   * filesystem is read-only and the CLI's writes are confined to the
+   * jail root (bwrap on Linux, sandbox-exec on macOS; no-op elsewhere).
+   */
+  jailMode: 'off' | 'write-jail'
+  /**
+   * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
+   * resolve under the request cwd; absolute paths must stay inside it.
+   * Null falls back to `<cwd>/.agent-home`. A per-request
+   * `execution.jail.root` overrides this.
+   */
+  jailRoot: string | null
 }
 
 export interface BackendExecutorConfig {
@@ -167,7 +182,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
     executors: parseAllExecutors(env),
+    jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
+    jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
   }
+}
+
+function parseJailMode(value: string | undefined): 'off' | 'write-jail' {
+  if (value === undefined || value === '') return 'off'
+  if (value === 'off' || value === 'write-jail') return value
+  throw new Error(`invalid BRIDGE_JAIL_MODE: ${value} — expected off|write-jail`)
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {

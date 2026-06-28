@@ -18,6 +18,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { applyJail } from './jail-support.js'
 import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
 
 const DEFAULT_MAX = 4
@@ -100,20 +101,30 @@ const hostSemaphore = new HostSemaphore(
 export const hostSpawner: Spawner = async (bin, args, opts) => {
   await hostSemaphore.acquire()
   let released = false
+  let jailCleanup: (() => Promise<void> | void) | undefined
   const release = (): void => {
     if (released) return
     released = true
     hostSemaphore.release()
+    // Idempotent: release() guards on `released`, so the jail cleanup
+    // (e.g. an SBPL profile temp dir) fires exactly once whether release
+    // is triggered by the backend's finally block or the child exit/error
+    // listeners below.
+    if (jailCleanup) void Promise.resolve(jailCleanup()).catch(() => {})
   }
   try {
+    // Wrap (bin, args) in the OS write-jail when a spec is present;
+    // otherwise this is a pass-through and (bin, args, env) are unchanged.
+    const jailed = await applyJail(bin, args, opts)
+    jailCleanup = jailed.cleanup
     // detached: true → child is the leader of a new process group whose
     // pgid equals its pid. kill(-pid, sig) reaches every descendant. We
     // do NOT call child.unref() — the bridge still owns the child for
     // the lifetime of the chat() call.
-    const child = spawn(bin, args, {
+    const child = spawn(jailed.bin, jailed.args, {
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: sanitizeHostEnv(opts.env),
+      env: sanitizeHostEnv(jailed.env),
       detached: true,
     })
     // Synchronous error capture — Node fires 'error' on nextTick for spawn
