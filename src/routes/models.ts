@@ -27,6 +27,7 @@ const CODEX_MODELS = [
 
 const OPENCODE_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
   { id: 'kimi-for-coding/k2p6', note: 'Kimi K2.6 via opencode provider' },
+  { id: 'zai-coding-plan/glm-5.2', note: 'GLM 5.2 via configured coding provider' },
   { id: 'zai-coding-plan/glm-5.1', note: 'GLM 5.1 via configured coding provider' },
   { id: 'zai-coding-plan/glm-5-turbo', note: 'GLM 5 Turbo via configured coding provider' },
   { id: 'deepseek/deepseek-v4-pro' },
