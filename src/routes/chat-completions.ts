@@ -23,6 +23,7 @@ import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
+import { flattenMessages, tokensFromChars } from '../backends/content.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
 import type { Run, RunRegistry } from '../runs/registry.js'
 
@@ -204,6 +205,8 @@ export function mountChatCompletions(
     // identity. Header is `X-Tangle-Forwarded-Authorization` and is set
     // by tangle-router on bridge dispatch (sandbox path).
     const forwardedAuthz = c.req.header('x-tangle-forwarded-authorization')
+    const tangleClient = c.req.header('x-tangle-client')
+    const tangleSource = c.req.header('x-tangle-source')
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
@@ -225,6 +228,8 @@ export function mountChatCompletions(
       ...(execution ? { execution: execution as ChatRequest['execution'] } : {}),
       metadata: {
         ...(parsed.data.metadata ?? {}),
+        ...(tangleClient ? { tangleClient } : {}),
+        ...(tangleSource ? { tangleSource } : {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
       },
     }
@@ -315,6 +320,9 @@ export function mountChatCompletions(
       makeSource = (run) => backend.chat(req, session, run.signal)
     }
 
+    // Approximate input size once, for backends that report no usage (estimated in wrap).
+    const promptText = flattenMessages(req.messages, { includeSystem: true })
+
     // Persist internal session id as it flows in. Returns a new
     // AsyncIterable<ChatDelta> so the typed boundary stays clean.
     // Typed backend/mode errors are converted to a terminal error delta
@@ -323,8 +331,13 @@ export function mountChatCompletions(
     // HTTP/SSE shape from the buffered finish_reason.
     const wrap = (source: AsyncIterable<ChatDelta>): AsyncIterable<ChatDelta> => ({
       [Symbol.asyncIterator]: async function* () {
+        let sawUsage = false
+        let completionChars = 0
         try {
           for await (const delta of source) {
+            if (delta.usage) sawUsage = true
+            completionChars += (delta.content?.length ?? 0)
+              + (delta.tool_calls?.reduce((s, tc) => s + (tc.arguments?.length ?? 0), 0) ?? 0)
             if (delta.internal_session_id && req.session_id) {
               deps.sessions.upsert({
                 externalId: req.session_id,
@@ -339,6 +352,20 @@ export function mountChatCompletions(
               })
             }
             yield delta
+          }
+          // Backends whose CLI reports no usage (kimi-code, opencode) would leave
+          // every reader with zero tokens, indistinguishable from a stub. Estimate
+          // from the text (~4 chars/token) and emit a usage delta flagged `estimated`
+          // so cost ledgers approximate spend without mistaking it for measured truth.
+          // It is buffered in the run, so reconnecting readers receive it too.
+          if (!sawUsage) {
+            yield {
+              usage: {
+                input_tokens: tokensFromChars(promptText.length),
+                output_tokens: tokensFromChars(completionChars),
+                estimated: true,
+              },
+            } satisfies ChatDelta
           }
         } catch (err) {
           if (err instanceof ModeNotSupportedError || err instanceof BackendError) {

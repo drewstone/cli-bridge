@@ -20,6 +20,17 @@ export function flattenMessages(messages: ChatMessage[], options: { includeSyste
   return visibleMessages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
 }
 
+/**
+ * Rough token estimate (~4 chars/token) for backends whose CLI emits no usage
+ * (kimi-code, opencode). A floor, not exact: the input estimate sees only the
+ * request messages, not the backend's injected system prompt or tool schemas.
+ * Callers flag the resulting usage `estimated` so cost ledgers price it as
+ * approximate, never as measured provider truth.
+ */
+export function tokensFromChars(chars: number): number {
+  return Math.max(0, Math.ceil(chars / 4))
+}
+
 export function collectSystemText(messages: ChatMessage[]): string {
   return messages
     .filter((m) => m.role === 'system')

@@ -67,7 +67,14 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
         finish_reason: delta.finish_reason ?? null,
       },
     ],
-    ...(delta.usage ? { usage: { prompt_tokens: delta.usage.input_tokens, completion_tokens: delta.usage.output_tokens } } : {}),
+    ...(delta.usage ? {
+      usage: {
+        prompt_tokens: delta.usage.input_tokens ?? 0,
+        completion_tokens: delta.usage.output_tokens ?? 0,
+        total_tokens: (delta.usage.input_tokens ?? 0) + (delta.usage.output_tokens ?? 0),
+        ...(delta.usage.estimated ? { estimated: true } : {}),
+      },
+    } : {}),
   }
   return `data: ${JSON.stringify(payload)}\n\n`
 }
@@ -123,6 +130,17 @@ export async function collectNonStreaming(
     if (d.usage) usage = d.usage
   }
 
+  // Usage (estimated or measured) is produced upstream in the run source, so
+  // here we only normalise to the OpenAI shape, preserving the `estimated` flag.
+  const usageOut = usage
+    ? {
+        prompt_tokens: usage.input_tokens ?? 0,
+        completion_tokens: usage.output_tokens ?? 0,
+        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
+        ...(usage.estimated ? { estimated: true } : {}),
+      }
+    : undefined
+
   return {
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
     object: 'chat.completion',
@@ -146,12 +164,6 @@ export async function collectNonStreaming(
         finish_reason: finishReason ?? 'stop',
       },
     ],
-    ...(usage ? {
-      usage: {
-        prompt_tokens: usage.input_tokens ?? 0,
-        completion_tokens: usage.output_tokens ?? 0,
-        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
-      },
-    } : {}),
+    ...(usageOut ? { usage: usageOut } : {}),
   }
 }
