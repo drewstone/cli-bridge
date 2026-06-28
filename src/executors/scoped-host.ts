@@ -54,6 +54,7 @@ import { randomBytes } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { hostSpawner, sanitizeHostEnv } from './host.js'
+import { applyJail } from './jail-support.js'
 import type { Spawner, SpawnResult } from './types.js'
 
 const SLICE = 'cli-bridge-llm.slice'
@@ -230,6 +231,20 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   const runtimeMaxSec = positiveIntEnv('CLI_BRIDGE_SCOPE_RUNTIME_MAX_SEC', DEFAULT_SCOPE_RUNTIME_MAX_SEC)
   const memoryMax = process.env.CLI_BRIDGE_SCOPE_MEMORY_MAX || DEFAULT_SCOPE_MEMORY_MAX
 
+  // Wrap (bin, args) in the OS write-jail FIRST (when a spec is present),
+  // then put the wrapped command inside the systemd scope: the cgroup
+  // contains the launcher → CLI tree, so cgroup.kill still reaps it.
+  // Pass-through (jailed.bin/args === bin/args) when no jail spec.
+  let jailCleanup: (() => Promise<void> | void) | undefined
+  let jailed
+  try {
+    jailed = await applyJail(bin, args, opts)
+    jailCleanup = jailed.cleanup
+  } catch (err) {
+    releaseSemaphore()
+    throw err
+  }
+
   const wrapped: string[] = [
     '--user',
     '--scope',
@@ -242,8 +257,8 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     `--property=RuntimeMaxSec=${runtimeMaxSec}`,
     '--property=OOMPolicy=stop',
     '--',
-    bin,
-    ...args,
+    jailed.bin,
+    ...jailed.args,
   ]
 
   let child
@@ -251,7 +266,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     child = spawn(SYSTEMD_RUN_BIN, wrapped, {
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: sanitizeHostEnv(opts.env),
+      env: sanitizeHostEnv(jailed.env),
       // `detached: true` makes the wrapper a process-group leader, so
       // existing killTree() (kill -pgid) still works as the graceful
       // first signal. The cgroup-kill in release() is the hard backstop.
@@ -259,6 +274,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     })
   } catch (err) {
     releaseSemaphore()
+    if (jailCleanup) void Promise.resolve(jailCleanup()).catch(() => {})
     throw err
   }
 
@@ -281,6 +297,10 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     if (pid !== undefined) {
       void killCgroup(pid, unitName).catch(() => {})
     }
+    // Idempotent via the `released` guard: jail temp state is torn down
+    // exactly once regardless of which path (finally / exit / error)
+    // fires release first.
+    if (jailCleanup) void Promise.resolve(jailCleanup()).catch(() => {})
   }
 
   const result: SpawnResult = {

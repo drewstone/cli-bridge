@@ -221,6 +221,7 @@ export class ClaudeBackend implements Backend {
       cwd: req.cwd ?? session?.cwd ?? process.cwd(),
       env: childEnv,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
+      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
     })
     const child = spawned.child
     const releaseSpawner = spawned.release

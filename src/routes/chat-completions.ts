@@ -24,6 +24,7 @@ import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
 import { flattenMessages, tokensFromChars } from '../backends/content.js'
+import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
@@ -128,6 +129,18 @@ const chatRequestSchema = z.object({
     capability: z.string().optional(),
     /** When kind=sandbox, the sandbox TTL in seconds (default 30 min). */
     ttlSeconds: z.number().int().positive().optional(),
+    /**
+     * When kind=host, an optional per-request write-jail override.
+     *   mode: 'write-jail' confines the spawned CLI's writes; 'off'
+     *         disables jailing even when BRIDGE_JAIL_MODE defaults it on.
+     *   root: writable jail root (default <cwd>/.agent-home), clamped
+     *         inside the request cwd.
+     * Layered over the BRIDGE_JAIL_MODE / BRIDGE_JAIL_ROOT env defaults.
+     */
+    jail: z.object({
+      mode: z.enum(['off', 'write-jail']).optional(),
+      root: z.string().optional(),
+    }).optional(),
   }).optional(),
 })
 
@@ -275,6 +288,18 @@ export function mountChatCompletions(
       }
       source = sandboxBackend.chat(delegatedReq, session, ac.signal)
     } else {
+      // Host execution: resolve the write-jail spec from execution.jail
+      // (host variant) layered over the BRIDGE_JAIL_* env defaults, using
+      // the same cwd the backend will spawn in (req.cwd already folds in
+      // session.cwd above; backends fall back to process.cwd()). The
+      // resolved spec rides on req.jailSpec down to the spawn seam; null
+      // means no jail and the spawn is unchanged.
+      req.jailSpec = resolveJailSpec({
+        execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
+        execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
+        cwd: req.cwd ?? process.cwd(),
+        env: process.env,
+      })
       if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
         try {
           admissionLease = await deps.admission.acquire(ac.signal)
