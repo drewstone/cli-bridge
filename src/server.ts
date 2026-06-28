@@ -316,15 +316,23 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] write-jail default: ${config.jailMode}${config.jailMode === 'write-jail' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
     // Fail fast (don't go ready) if write-jail is the operator floor but no jail
     // backend can run here — every host request would otherwise fail closed while
-    // /health reports ready.
+    // /health reports ready. Honor BRIDGE_JAIL_FALLBACK=warn, which the request
+    // path uses to run unconfined-with-warning instead of failing closed.
     if (config.jailMode === 'write-jail' && !selectJailBackend().isAvailable()) {
-      console.error(
-        '[cli-bridge] FATAL: BRIDGE_JAIL_MODE=write-jail but no write-jail backend can run on this ' +
-        'host — every host request would fail closed. Enable unprivileged user namespaces (Linux: ' +
-        '`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s /usr/bin/bwrap`), ' +
-        'ensure sandbox-exec exists (macOS), or unset BRIDGE_JAIL_MODE.',
-      )
-      process.exit(1)
+      if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
+        console.warn(
+          '[cli-bridge] WARNING: BRIDGE_JAIL_MODE=write-jail but no jail backend can run here; ' +
+          'requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).',
+        )
+      } else {
+        console.error(
+          '[cli-bridge] FATAL: BRIDGE_JAIL_MODE=write-jail but no write-jail backend can run on this ' +
+          'host — every host request would fail closed. Enable unprivileged user namespaces (Linux: ' +
+          '`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s /usr/bin/bwrap`), ' +
+          'ensure sandbox-exec exists (macOS), set BRIDGE_JAIL_FALLBACK=warn, or unset BRIDGE_JAIL_MODE.',
+        )
+        process.exit(1)
+      }
     }
     for (const cfg of Object.values(config.executors)) {
       if (cfg.kind === 'docker') {
