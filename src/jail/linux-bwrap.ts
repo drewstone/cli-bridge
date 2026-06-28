@@ -1,12 +1,13 @@
 /**
  * Linux write-jail via bubblewrap (bwrap).
  *
- * The host root is mounted read-only, `/dev` and a fresh `/tmp` tmpfs are
- * provided, networking is shared (so API calls resolve DNS and connect),
- * and exactly one subtree — the jail root — is bind-mounted writable and
- * exported as HOME. The CLI is chdir'd into the read-only project dir.
- * Writes anywhere except the jail root (and any extraWritablePaths) hit a
- * read-only filesystem and fail.
+ * The host root is mounted read-only, `/dev` is provided, networking is
+ * shared (so API calls resolve DNS and connect), and exactly one subtree —
+ * the jail root — is bind-mounted writable and exported as HOME. The CLI is
+ * chdir'd into the read-only project dir. Writes anywhere except the jail
+ * root (and any extraWritablePaths) hit a read-only filesystem and fail. We
+ * deliberately do NOT tmpfs /tmp (the bridge materializes runtime config
+ * there before spawn); the CLI's temp writes go to TMPDIR=<root>/.tmp.
  *
  * Runs UNPRIVILEGED: `--unshare-user` creates a user namespace mapping the
  * caller's uid to itself, so files in the jail are owned by the real user
@@ -51,9 +52,13 @@ export class LinuxBwrapJail implements JailBackend {
       '--unshare-ipc',
       '--unshare-uts',
       '--share-net',
+      // Host root is read-only. Note we do NOT tmpfs /tmp: the bridge
+      // materializes runtime config (MCP config, kimi config.toml,
+      // OPENCODE_CONFIG) under the host tmpdir before spawn, and the CLI must
+      // still read those paths. /tmp stays readable (read-only) via this bind;
+      // the CLI's own temp WRITES are redirected to TMPDIR=<root>/.tmp (jailEnv).
       '--ro-bind', '/', '/',
       '--dev', '/dev',
-      '--tmpfs', '/tmp',
       '--ro-bind', spec.projectDir, spec.projectDir,
     ]
 

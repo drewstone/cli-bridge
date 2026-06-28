@@ -83,6 +83,7 @@ export function resolveJailRoot(root: string, base: string): string {
 export function jailEnv(root: string): Record<string, string> {
   return {
     HOME: root,
+    TMPDIR: join(root, '.tmp'),
     XDG_CONFIG_HOME: join(root, '.config'),
     XDG_CACHE_HOME: join(root, '.cache'),
     XDG_DATA_HOME: join(root, '.local', 'share'),
@@ -95,7 +96,7 @@ export function jailEnv(root: string): Record<string, string> {
  * expects them to exist does not fail on first write. */
 export async function prepareJailHome(root: string): Promise<void> {
   // Mirror the XDG layout produced by jailEnv() so a CLI finds the dirs ready.
-  const relDirs = ['.config', '.cache', join('.local', 'share'), join('.local', 'state'), '.runtime']
+  const relDirs = ['.tmp', '.config', '.cache', join('.local', 'share'), join('.local', 'state'), '.runtime']
   await mkdir(root, { recursive: true })
   for (const rel of relDirs) {
     await mkdir(join(root, rel), { recursive: true })

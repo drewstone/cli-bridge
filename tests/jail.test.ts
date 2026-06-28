@@ -81,6 +81,8 @@ describe('LinuxBwrapJail.wrap', () => {
     expect(seqIndex(argv, '--setenv', 'HOME', expectedRoot), 'HOME set to the jail root').toBeGreaterThanOrEqual(0)
     expect(seqIndex(argv, '--setenv', 'XDG_CONFIG_HOME', join(expectedRoot, '.config')), 'XDG_CONFIG_HOME redirected into the jail').toBeGreaterThanOrEqual(0)
     expect(seqIndex(argv, '--setenv', 'XDG_CACHE_HOME', join(expectedRoot, '.cache')), 'XDG_CACHE_HOME redirected into the jail').toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--setenv', 'TMPDIR', join(expectedRoot, '.tmp')), 'TMPDIR redirected into the jail').toBeGreaterThanOrEqual(0)
+    expect(argv, 'no tmpfs shadowing /tmp (would hide materialized configs)').not.toContain('--tmpfs')
     expect(seqIndex(argv, '--chdir', projectDir), 'chdir into the project dir').toBeGreaterThanOrEqual(0)
 
     // The original command is the tail of the argv.
@@ -131,9 +133,13 @@ describe('auth preservation', () => {
     expect(jailRelPath(join(homedir(), '.config', 'opencode'))).toBe(join('.config', 'opencode'))
   })
 
-  it('authSourcesFor returns only existing host paths, and [] for unknown backends', () => {
+  it('authSourcesFor maps registered harness aliases to the same creds, [] for unknown', () => {
     expect(authSourcesFor('totally-unknown-backend')).toEqual([])
-    for (const p of authSourcesFor('claude')) {
+    // The server registers 'claude-code'/'claudish'/'kimi-code', not 'claude'/'kimi'.
+    expect(authSourcesFor('claude-code')).toEqual(authSourcesFor('claude'))
+    expect(authSourcesFor('claudish')).toEqual(authSourcesFor('claude'))
+    expect(authSourcesFor('kimi-code')).toEqual(authSourcesFor('kimi'))
+    for (const p of authSourcesFor('claude-code')) {
       expect(existsSync(p), `${p} should exist`).toBe(true)
       expect(p.startsWith(homedir())).toBe(true)
     }

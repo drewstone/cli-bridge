@@ -18,9 +18,17 @@ import { cp } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, relative } from 'node:path'
 
-/** $HOME-relative auth/config paths per backend name. */
+/**
+ * $HOME-relative auth/config paths per REGISTERED backend name. Aliases that
+ * share the same on-disk credentials are listed explicitly (claude-code /
+ * claudish / claude all read ~/.claude; kimi-code / kimi read ~/.kimi) rather
+ * than fuzzy-matched, so the credential mapping is exact and auditable.
+ */
 const AUTH_PATHS: Record<string, readonly string[]> = {
+  'claude-code': ['.claude', '.claude.json'],
+  claudish: ['.claude', '.claude.json'],
   claude: ['.claude', '.claude.json'],
+  'kimi-code': ['.kimi'],
   kimi: ['.kimi'],
   opencode: ['.config/opencode', '.local/share/opencode'],
   codex: ['.codex'],
