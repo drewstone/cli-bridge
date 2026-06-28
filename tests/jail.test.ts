@@ -166,6 +166,10 @@ describe('auth preservation', () => {
       expect(existsSync(p), `${p} should exist`).toBe(true)
       expect(p.startsWith(homedir())).toBe(true)
     }
+    // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex).
+    for (const p of authSourcesFor('codex')) {
+      expect(p.endsWith('.codex')).toBe(true)
+    }
   })
 
   it('bwrap read-only-binds an auth source into the jail HOME at its relative path', async () => {

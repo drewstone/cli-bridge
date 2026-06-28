@@ -32,8 +32,10 @@ const AUTH_PATHS: Record<string, readonly string[]> = {
   kimi: ['.kimi'],
   opencode: ['.config/opencode', '.local/share/opencode'],
   gemini: ['.gemini'],
-  // codex is intentionally absent: codex.ts already points the spawned CLI at a
-  // synthetic CODEX_HOME and copies auth.json there, so it self-preserves auth.
+  // codex.ts only synthesizes a CODEX_HOME (with copied auth) when MCP passthrough
+  // is active; in the common no-MCP case it reads ~/.codex, which the jail would
+  // otherwise hide. Preserve it here so jailed codex authenticates either way.
+  codex: ['.codex'],
 }
 
 /** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME
