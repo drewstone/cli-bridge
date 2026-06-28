@@ -132,8 +132,11 @@ const chatRequestSchema = z.object({
     ttlSeconds: z.number().int().positive().optional(),
     /**
      * When kind=host, an optional per-request write-jail override.
-     *   mode: 'write-jail' confines the spawned CLI's writes; 'off'
-     *         disables jailing even when BRIDGE_JAIL_MODE defaults it on.
+     *   mode: 'write-jail' turns confinement ON for this request. NOTE:
+     *         `BRIDGE_JAIL_MODE=write-jail` is an operator FLOOR — a
+     *         per-request 'off' can NOT disable it (a request can only add
+     *         confinement, never weaken the server policy). 'off' takes
+     *         effect only when no env floor is set.
      *   root: writable jail root (default <cwd>/.agent-home), clamped
      *         inside the request cwd.
      * Layered over the BRIDGE_JAIL_MODE / BRIDGE_JAIL_ROOT env defaults.

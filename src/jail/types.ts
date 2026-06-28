@@ -12,7 +12,7 @@
  * else the NoopJail passes argv through unchanged.
  */
 
-import { mkdir } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export interface JailSpec {
@@ -98,6 +98,10 @@ export async function prepareJailHome(root: string): Promise<void> {
   // Mirror the XDG layout produced by jailEnv() so a CLI finds the dirs ready.
   const relDirs = ['.tmp', '.config', '.cache', join('.local', 'share'), join('.local', 'state'), '.runtime']
   await mkdir(root, { recursive: true })
+  // The jail root sits inside the project (default <cwd>/.agent-home) and holds
+  // scratch + (on macOS) copied credentials. Ignore the whole tree so neither
+  // work artifacts nor copied secrets can ever be committed.
+  await writeFile(join(root, '.gitignore'), '*\n')
   for (const rel of relDirs) {
     await mkdir(join(root, rel), { recursive: true })
   }

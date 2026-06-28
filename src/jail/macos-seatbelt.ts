@@ -41,7 +41,9 @@ export class MacosSeatbeltJail implements JailBackend {
     await prepareJailHome(root)
     // sandbox-exec cannot bind-mount, so copy the backend's host auth into the
     // jail HOME (writable, under root) — the CLI authenticates as the operator.
-    await copyAuthIntoJail(root, spec.authSources)
+    // The copies are removed in cleanup() so credentials never linger in the
+    // project-local jail root.
+    const copiedAuth = await copyAuthIntoJail(root, spec.authSources)
     const writable = [root, ...SYSTEM_WRITABLE]
     for (const path of spec.extraWritablePaths ?? []) {
       writable.push(await canonicalize(path))
@@ -60,6 +62,10 @@ export class MacosSeatbeltJail implements JailBackend {
       env: jailEnv(root),
       cleanup: async () => {
         await rm(dir, { recursive: true, force: true })
+        // Remove copied credentials from the project-local jail root.
+        for (const copied of copiedAuth) {
+          await rm(copied, { recursive: true, force: true })
+        }
       },
     }
   }

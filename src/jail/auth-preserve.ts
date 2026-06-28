@@ -49,12 +49,20 @@ export function jailRelPath(source: string): string {
   return relative(homedir(), source)
 }
 
-/** Copy each auth source into the jail HOME at its $HOME-relative path. Used
- * on macOS where sandbox-exec cannot bind-mount; the copy lands under the
- * (writable) jail root, so the CLI can both read its creds and write state. */
-export async function copyAuthIntoJail(root: string, sources: string[] | undefined): Promise<void> {
+/**
+ * Copy each auth source into the jail HOME at its $HOME-relative path. Used on
+ * macOS where sandbox-exec cannot bind-mount; the copy lands under the
+ * (writable) jail root so the CLI can read its creds and write state. Returns
+ * the copied destination paths so the caller can remove them on cleanup — the
+ * jail root is project-local, so copied credentials must NOT linger there.
+ */
+export async function copyAuthIntoJail(root: string, sources: string[] | undefined): Promise<string[]> {
+  const copied: string[] = []
   for (const source of sources ?? []) {
     if (!existsSync(source)) continue
-    await cp(source, join(root, jailRelPath(source)), { recursive: true, force: true, errorOnExist: false })
+    const dest = join(root, jailRelPath(source))
+    await cp(source, dest, { recursive: true, force: true, errorOnExist: false })
+    copied.push(dest)
   }
+  return copied
 }

@@ -88,6 +88,10 @@ describe('LinuxBwrapJail.wrap', () => {
     // The original command is the tail of the argv.
     expect(argv.slice(-3)).toEqual(['/bin/sh', '-c', cmd])
 
+    // The jail root is gitignored so scratch/copied-creds never get committed.
+    const gi = await readFile(join(expectedRoot, '.gitignore'), 'utf8')
+    expect(gi).toContain('*')
+
     // The project dir is exposed read-only.
     expect(seqIndex(argv, '--ro-bind', projectDir, projectDir)).toBeGreaterThanOrEqual(0)
   })
