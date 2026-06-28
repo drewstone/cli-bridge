@@ -20,6 +20,7 @@ import { accessSync, constants } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { copyAuthIntoJail } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
@@ -38,6 +39,9 @@ export class MacosSeatbeltJail implements JailBackend {
     // Create the redirected HOME/XDG dirs under the (canonical) root so the CLI
     // can write to them; they sit inside `root`, already in the writable set.
     await prepareJailHome(root)
+    // sandbox-exec cannot bind-mount, so copy the backend's host auth into the
+    // jail HOME (writable, under root) — the CLI authenticates as the operator.
+    await copyAuthIntoJail(root, spec.authSources)
     const writable = [root, ...SYSTEM_WRITABLE]
     for (const path of spec.extraWritablePaths ?? []) {
       writable.push(await canonicalize(path))

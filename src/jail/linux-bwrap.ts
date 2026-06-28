@@ -25,8 +25,9 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants } from 'node:fs'
+import { accessSync, constants, existsSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
+import { jailRelPath } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
@@ -64,6 +65,15 @@ export class LinuxBwrapJail implements JailBackend {
     }
     // Writable root last so it wins over any read-only mount above it.
     bwrapArgs.push('--bind', root, root)
+
+    // Make the backend's host auth readable inside the jail (read-only),
+    // bound AFTER the writable root so these specific subpaths stay read-only.
+    // HOME is the jail root, so ~/.claude etc. resolve to these binds.
+    for (const source of spec.authSources ?? []) {
+      if (existsSync(source)) {
+        bwrapArgs.push('--ro-bind', source, join(root, jailRelPath(source)))
+      }
+    }
 
     // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.
     for (const [key, value] of Object.entries(jailEnv(root))) {

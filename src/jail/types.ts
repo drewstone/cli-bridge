@@ -26,6 +26,11 @@ export interface JailSpec {
   extraWritablePaths?: string[]
   /** Extra absolute paths to expose read-only beyond the host default. */
   extraReadablePaths?: string[]
+  /** Absolute host paths holding the backend CLI's auth/config, made
+   * available inside the jail at their $HOME-relative location (read-only
+   * bind on Linux, copy on macOS) so a confined run still authenticates as
+   * the operator. Populated per backend by {@link authSourcesFor}. */
+  authSources?: string[]
 }
 
 export interface JailWrap {

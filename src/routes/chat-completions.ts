@@ -25,6 +25,7 @@ import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
 import { flattenMessages, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
+import { authSourcesFor } from '../jail/auth-preserve.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
@@ -300,6 +301,9 @@ export function mountChatCompletions(
         cwd: req.cwd ?? process.cwd(),
         env: process.env,
       })
+      // Preserve this backend's host credentials inside the jail so the
+      // confined CLI still authenticates as the operator.
+      if (req.jailSpec) req.jailSpec.authSources = authSourcesFor(backend.name)
       if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
         try {
           admissionLease = await deps.admission.acquire(ac.signal)

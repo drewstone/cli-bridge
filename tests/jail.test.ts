@@ -15,8 +15,9 @@
  *   - resolveJailSpec: null when off; root clamped inside cwd.
  */
 
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
@@ -27,6 +28,7 @@ import {
 } from '../src/jail/index.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
+import { authSourcesFor, jailRelPath } from '../src/jail/auth-preserve.js'
 import type { JailBackend } from '../src/jail/index.js'
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
@@ -120,6 +122,34 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(wrap.env?.HOME).toBe(expectedRoot)
     expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(expectedRoot, '.config'))
     expect(wrap.env?.XDG_CACHE_HOME).toBe(join(expectedRoot, '.cache'))
+  })
+})
+
+describe('auth preservation', () => {
+  it('jailRelPath maps a host auth path to its $HOME-relative location', () => {
+    expect(jailRelPath(join(homedir(), '.claude'))).toBe('.claude')
+    expect(jailRelPath(join(homedir(), '.config', 'opencode'))).toBe(join('.config', 'opencode'))
+  })
+
+  it('authSourcesFor returns only existing host paths, and [] for unknown backends', () => {
+    expect(authSourcesFor('totally-unknown-backend')).toEqual([])
+    for (const p of authSourcesFor('claude')) {
+      expect(existsSync(p), `${p} should exist`).toBe(true)
+      expect(p.startsWith(homedir())).toBe(true)
+    }
+  })
+
+  it('bwrap read-only-binds an auth source into the jail HOME at its relative path', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-authtest-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], { root, projectDir, authSources: [authDir] })
+    const expectedRoot = resolveJailRoot(root, projectDir)
+    expect(
+      seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, jailRelPath(authDir))),
+      'auth source ro-bound into the jail HOME',
+    ).toBeGreaterThanOrEqual(0)
   })
 })
 
