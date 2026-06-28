@@ -23,6 +23,7 @@ import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
+import { flattenMessages, tokensFromChars } from '../backends/content.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
@@ -190,6 +191,8 @@ export function mountChatCompletions(
     // identity. Header is `X-Tangle-Forwarded-Authorization` and is set
     // by tangle-router on bridge dispatch (sandbox path).
     const forwardedAuthz = c.req.header('x-tangle-forwarded-authorization')
+    const tangleClient = c.req.header('x-tangle-client')
+    const tangleSource = c.req.header('x-tangle-source')
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
@@ -211,6 +214,8 @@ export function mountChatCompletions(
       ...(execution ? { execution: execution as ChatRequest['execution'] } : {}),
       metadata: {
         ...(parsed.data.metadata ?? {}),
+        ...(tangleClient ? { tangleClient } : {}),
+        ...(tangleSource ? { tangleSource } : {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
       },
     }
@@ -319,6 +324,9 @@ export function mountChatCompletions(
     // Surface mode in response headers so clients can confirm what actually ran.
     c.header('X-Bridge-Mode', req.mode ?? 'byob')
 
+    // Approximate input size once, for backends that report no usage (estimated below).
+    const promptText = flattenMessages(req.messages, { includeSystem: true })
+
     // OpenAI's /v1/chat/completions defaults `stream: false` when the
     // field is omitted. cli-bridge previously inverted that (defaulted
     // to SSE), which silently broke every off-the-shelf OpenAI SDK
@@ -327,7 +335,7 @@ export function mountChatCompletions(
     // caller asked for it (`stream: true`).
     if (req.stream !== true) {
       try {
-        const body = await collectNonStreaming(wrapped, req.model)
+        const body = await collectNonStreaming(wrapped, req.model, promptText)
         return c.json(body)
       } catch (err) {
         return errorResponse(c, err)
@@ -365,10 +373,15 @@ export function mountChatCompletions(
       const heartbeat = setInterval(() => {
         void writeRaw(': keepalive\n\n')
       }, heartbeatMs)
+      let sawUsage = false
+      let completionChars = 0
       try {
         if (!await writeRaw(': connected\n\n')) return
         for await (const delta of wrapped) {
           if (ac.signal.aborted) break
+          if (delta.usage) sawUsage = true
+          completionChars += (delta.content?.length ?? 0)
+            + (delta.tool_calls?.reduce((s, tc) => s + (tc.arguments?.length ?? 0), 0) ?? 0)
           // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
           // render as SSE comment so the consumer (AI SDK, openai-node)
           // ignores it per spec instead of trying to route a fake tool
@@ -387,6 +400,21 @@ export function mountChatCompletions(
           // Strip the framing so streamSSE can re-add it.
           const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')
           if (!await writeSse(payload)) break
+        }
+        // Backends that emit no usage (kimi-code, opencode) would leave consumers
+        // with zero tokens, indistinguishable from a stub. Emit an estimated usage
+        // chunk (flagged) so cost ledgers can approximate spend.
+        if (!sawUsage && !ac.signal.aborted) {
+          const prompt_tokens = tokensFromChars(promptText.length)
+          const completion_tokens = tokensFromChars(completionChars)
+          await writeSse(JSON.stringify({
+            id: meta.id,
+            object: 'chat.completion.chunk',
+            created: meta.created,
+            model: req.model,
+            choices: [],
+            usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens, estimated: true },
+          }))
         }
       } catch (err) {
         if (ac.signal.aborted) return
