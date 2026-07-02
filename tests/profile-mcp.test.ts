@@ -23,6 +23,7 @@ import {
   materializeMcpServersForClaudeKimi,
   materializeMcpServersForCodex,
   materializeMcpServersForOpencode,
+  materializeMcpServersForPi,
   materializeOpencodeMcpConfig,
   resolveMcpServers,
 } from '../src/backends/profile-support.js'
@@ -274,6 +275,79 @@ describe('materializeMcpServersForOpencode', () => {
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.mcp).toEqual({})
     m.cleanup()
+  })
+})
+
+describe('materializeMcpServersForPi', () => {
+  const fs = require('node:fs') as typeof import('node:fs')
+  const os = require('node:os') as typeof import('node:os')
+
+  it('writes the canonical {mcpServers} shape to <cwd>/.pi/mcp.json and removes it on cleanup', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      const m = materializeMcpServersForPi({
+        echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } },
+      }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      expect(m.configPath).toBe(join(cwd, '.pi', 'mcp.json'))
+      expect(m.serverNames).toEqual(['echo'])
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(written).toEqual({
+        mcpServers: { echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } } },
+      })
+      m.cleanup()
+      expect(existsSync(m.configPath)).toBe(false)
+      // The run created `.pi`, so cleanup removes it too.
+      expect(existsSync(join(cwd, '.pi'))).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('merges into a pre-existing .pi/mcp.json (request wins) and restores original bytes on cleanup', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.pi'))
+      const originalBytes = JSON.stringify({
+        mcpServers: {
+          existing: { command: 'existing-cmd' },
+          echo: { command: 'stale-should-be-overridden' },
+        },
+        directTools: ['existing_tool'],
+      })
+      fs.writeFileSync(join(cwd, '.pi', 'mcp.json'), originalBytes)
+
+      const m = materializeMcpServersForPi({ echo: { command: 'node' } }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(written).toEqual({
+        mcpServers: {
+          existing: { command: 'existing-cmd' },
+          echo: { command: 'node' },
+        },
+        // Non-mcpServers adapter settings in the original file survive the merge.
+        directTools: ['existing_tool'],
+      })
+      m.cleanup()
+      expect(readFileSync(m.configPath, 'utf-8')).toBe(originalBytes)
+      expect(existsSync(join(cwd, '.pi'))).toBe(true)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null when the map is null or every entry filters out', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      expect(materializeMcpServersForPi(null, cwd)).toBeNull()
+      expect(materializeMcpServersForPi({ off: { command: 'x', enabled: false } }, cwd)).toBeNull()
+      // No .pi dir is created for a no-op materialization.
+      expect(existsSync(join(cwd, '.pi'))).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
   })
 })
 

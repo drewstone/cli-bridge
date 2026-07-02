@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
@@ -206,10 +206,17 @@ export function materializeMcpConfig(profile: AgentProfile | null): Materialized
  * the `--mcp-config` flag in that case rather than passing an empty
  * config.
  */
-export function materializeMcpServersForClaudeKimi(
-  specs: Record<string, McpServerSpec> | null,
-): MaterializedMcpConfig | null {
-  if (!specs) return null
+/**
+ * Build the canonical `mcpServers` object from a normalized spec map:
+ * stdio entries as `{command, args, env, timeout}`, remote http/sse
+ * entries as `{type, url, headers, timeout}`. Disabled and malformed
+ * entries are dropped. Shared by the claude/kimi temp-file materializer
+ * and the pi workspace materializer (pi-mcp-adapter reads the same
+ * `{mcpServers}` shape from `.mcp.json` / `.pi/mcp.json`).
+ */
+export function buildCanonicalMcpServers(
+  specs: Record<string, McpServerSpec>,
+): Record<string, Record<string, unknown>> {
   const mcpServers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs)) {
     if (spec.enabled === false) continue
@@ -232,6 +239,14 @@ export function materializeMcpServersForClaudeKimi(
     }
     // unknown transport / missing required fields → drop silently
   }
+  return mcpServers
+}
+
+export function materializeMcpServersForClaudeKimi(
+  specs: Record<string, McpServerSpec> | null,
+): MaterializedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers = buildCanonicalMcpServers(specs)
   const serverNames = Object.keys(mcpServers)
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {
     console.error(`[cli-bridge mcp] materialized servers: ${serverNames.length ? serverNames.join(", ") : "(none)"} from specs: ${Object.keys(specs).join(", ") || "(empty)"}`)
@@ -247,6 +262,76 @@ export function materializeMcpServersForClaudeKimi(
     cleanup: () => {
       try {
         rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best-effort cleanup
+      }
+    },
+  }
+}
+
+/**
+ * Materialize MCP servers for the pi backend by writing the canonical
+ * `{mcpServers}` JSON to `<cwd>/.pi/mcp.json` — pi's project-level MCP
+ * override file, read by the `pi-mcp-adapter` extension (pi's CLI has
+ * no `--mcp-config` flag; the adapter's config discovery is the only
+ * per-invocation MCP path).
+ *
+ * The file lives in the run workspace, not a temp dir, because the
+ * adapter discovers config by cwd. If `.pi/mcp.json` already exists
+ * (caller-provisioned workspace), the requested servers are merged in
+ * (request wins on name collisions) and `cleanup()` restores the
+ * original bytes; otherwise `cleanup()` removes the file and, when we
+ * created it, the `.pi` directory.
+ *
+ * Returns null when no usable servers remain. Callers must verify the
+ * adapter is installed BEFORE mounting (see `piMcpAdapterAvailable` in
+ * backends/pi.ts) — writing config a runner never reads would recreate
+ * the silent-drop bug this materializer exists to fix.
+ */
+export function materializeMcpServersForPi(
+  specs: Record<string, McpServerSpec> | null,
+  cwd: string,
+): MaterializedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers = buildCanonicalMcpServers(specs)
+  const serverNames = Object.keys(mcpServers)
+  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
+    console.error(`[cli-bridge mcp pi] materialized servers: ${serverNames.join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
+  }
+  if (serverNames.length === 0) return null
+
+  const piDir = join(cwd, '.pi')
+  const createdDir = !existsSync(piDir)
+  mkdirSync(piDir, { recursive: true })
+  const configPath = join(piDir, 'mcp.json')
+  const originalBytes = readFileMaybe(configPath)
+
+  let merged: Record<string, unknown> = { mcpServers }
+  if (originalBytes !== null) {
+    try {
+      const original = JSON.parse(originalBytes) as Record<string, unknown>
+      const originalServers = (original.mcpServers ?? {}) as Record<string, unknown>
+      merged = { ...original, mcpServers: { ...originalServers, ...mcpServers } }
+    } catch {
+      // Unparseable existing file — overwrite for the run; cleanup
+      // restores the original bytes verbatim either way.
+    }
+  }
+  writeFileSync(configPath, JSON.stringify(merged, null, 2))
+
+  return {
+    configPath,
+    serverNames,
+    cleanup: () => {
+      try {
+        if (originalBytes !== null) {
+          writeFileSync(configPath, originalBytes)
+        } else {
+          rmSync(configPath, { force: true })
+          // Only remove `.pi` when this run created it AND nothing else
+          // landed in it meanwhile (rmdirSync refuses non-empty dirs).
+          if (createdDir) rmdirSync(piDir)
+        }
       } catch {
         // best-effort cleanup
       }
@@ -509,10 +594,7 @@ function stableTmpRoot(): string {
 
 function readFileMaybe(path: string): string | null {
   try {
-    // Avoid bringing in another import; lazy-require via dynamic globals.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('node:fs') as typeof import('node:fs')
-    return fs.readFileSync(path, 'utf-8')
+    return readFileSync(path, 'utf-8')
   } catch {
     return null
   }

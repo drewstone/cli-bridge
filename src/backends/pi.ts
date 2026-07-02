@@ -15,6 +15,19 @@
  * MOONSHOT_API_KEY etc. must be set in the bridge's environment (sourced
  * via the kick-script's `.env` chain).
  *
+ * MCP: pi's CLI has no `--mcp-config` flag — MCP support comes from the
+ * `pi-mcp-adapter` extension, which discovers the canonical `{mcpServers}`
+ * JSON from `<cwd>/.mcp.json` / `<cwd>/.pi/mcp.json`. When a request
+ * carries MCP servers (X-Mcp-Config header, body `mcp.mcpServers`, or
+ * `agent_profile.mcp`), the bridge writes `<cwd>/.pi/mcp.json` for the
+ * run and removes/restores it afterwards. If the adapter is NOT
+ * installed the request is REJECTED (`not_configured`) instead of
+ * silently dropping the servers — a run whose tools never existed must
+ * fail loudly, not score zero structurally. Detection: `pi-mcp-adapter`
+ * in the pi agent dir's npm node_modules or `settings.json` packages
+ * (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`); override with
+ * `CLI_BRIDGE_PI_MCP_ADAPTER=1|0`.
+ *
  * Event shapes we parse (from `pi --print --mode json`):
  *
  *   {"type":"session","id":"<uuid>",...}
@@ -37,11 +50,20 @@
  * handles its `think` blocks for non-thinking-aware callers).
  */
 
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { provisionProfileWorkspace, resolvePromptMessages } from './profile-support.js'
+import {
+  buildCanonicalMcpServers,
+  materializeMcpServersForPi,
+  provisionProfileWorkspace,
+  resolveMcpServers,
+  resolvePromptMessages,
+} from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
@@ -79,6 +101,33 @@ function thinkingFlagForEffort(effort?: string): string | null {
   // Canonical ladder → pi's: none → off, ultracode → xhigh (pi's ceiling); the rest pass through.
   const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'xhigh' : effort
   return allowed.has(e) ? e : null
+}
+
+/**
+ * True when pi can actually consume MCP config — i.e. the
+ * `pi-mcp-adapter` extension is installed. Pi itself ships no MCP
+ * support, so mounting `.pi/mcp.json` without the adapter is a silent
+ * no-op; callers use this to fail loudly instead.
+ *
+ * `CLI_BRIDGE_PI_MCP_ADAPTER=1|0` overrides detection for nonstandard
+ * installs (e.g. the adapter vendored under a local package path whose
+ * name doesn't contain "pi-mcp-adapter").
+ */
+export function piMcpAdapterAvailable(): boolean {
+  const override = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+  if (override === '1' || override === 'true') return true
+  if (override === '0' || override === 'false') return false
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')
+  if (existsSync(join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter'))) return true
+  try {
+    const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf-8')) as { packages?: unknown }
+    if (Array.isArray(settings.packages)) {
+      return settings.packages.some((p) => typeof p === 'string' && p.includes('pi-mcp-adapter'))
+    }
+  } catch {
+    // unreadable/absent settings — fall through to "not detected"
+  }
+  return false
 }
 
 export class PiBackend implements Backend {
@@ -153,15 +202,44 @@ export class PiBackend implements Backend {
     // (no stdin payload required for `--print` mode).
     args.push(prompt)
 
+    const runCwd = req.cwd ?? session?.cwd ?? process.cwd()
+
+    // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
+    // `agent_profile.mcp`) mount as `<cwd>/.pi/mcp.json` for the
+    // pi-mcp-adapter extension. FAIL-LOUD, not fail-safe: if the caller
+    // requested MCP tools pi can't provide, reject the request — a
+    // silently tool-less run scores zero for the wrong reason.
+    const mcpSpecs = resolveMcpServers(req, session)
+    const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []
+    if (requestedMcpNames.length > 0 && !piMcpAdapterAvailable()) {
+      throw new BackendError(
+        `backend pi cannot mount MCP servers: pi-mcp-adapter extension not installed `
+        + `(run \`pi install npm:pi-mcp-adapter\` or set CLI_BRIDGE_PI_MCP_ADAPTER=1); `
+        + `requested: ${requestedMcpNames.join(', ')}`,
+        'not_configured',
+      )
+    }
+    const mcpMounted = requestedMcpNames.length > 0
+      ? materializeMcpServersForPi(mcpSpecs, runCwd)
+      : null
+
     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
-    provisionProfileWorkspace(req, session, 'pi', req.cwd ?? session?.cwd ?? process.cwd())
-    const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
-      env: process.env,
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
+    provisionProfileWorkspace(req, session, 'pi', runCwd)
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      spawned = await this.spawner(this.opts.bin, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: runCwd,
+        env: process.env,
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+    } catch (err) {
+      // `.pi/mcp.json` lives in the caller's workspace, not a temp dir —
+      // never leave it behind when the subprocess failed to spawn.
+      mcpMounted?.cleanup()
+      throw err
+    }
     const child = spawned.child
     const releaseSpawner = spawned.release
 
@@ -323,6 +401,7 @@ export class PiBackend implements Backend {
       // Reap the whole subtree before releasing the slot.
       await killTree(child)
       try { releaseSpawner() } catch { /* best effort */ }
+      mcpMounted?.cleanup()
     }
   }
 
