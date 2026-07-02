@@ -1,10 +1,10 @@
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { PiBackend } from '../src/backends/pi.js'
+import { PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
 import { BackendError } from '../src/backends/types.js'
 import type { ChatDelta } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
@@ -396,6 +396,50 @@ describe('PiBackend', () => {
       if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
       else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
       rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('detects the adapter installed via a local path in settings.json packages', () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'pi-agent-dir-'))
+    const adapterDir = mkdtempSync(join(tmpdir(), 'pi-adapter-local-'))
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    process.env.PI_CODING_AGENT_DIR = agentDir
+    try {
+      // Local-path install whose path does NOT contain "pi-mcp-adapter" —
+      // detection must resolve the package.json name instead.
+      writeFileSync(join(adapterDir, 'package.json'), JSON.stringify({ name: 'pi-mcp-adapter' }))
+      writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: [adapterDir] }))
+      expect(piMcpAdapterAvailable()).toBe(true)
+
+      // A local path whose package is something else is not the adapter.
+      writeFileSync(join(adapterDir, 'package.json'), JSON.stringify({ name: 'some-other-ext' }))
+      expect(piMcpAdapterAvailable()).toBe(false)
+
+      // Relative specs resolve against the agent dir, not process cwd.
+      mkdirSync(join(agentDir, 'exts', 'local-adapter'), { recursive: true })
+      writeFileSync(
+        join(agentDir, 'exts', 'local-adapter', 'package.json'),
+        JSON.stringify({ name: 'pi-mcp-adapter' }),
+      )
+      writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: ['./exts/local-adapter'] }))
+      expect(piMcpAdapterAvailable()).toBe(true)
+
+      // Windows-style absolute specs are recognized as local paths (never
+      // treated as npm names) and fail safe when unreadable on POSIX.
+      writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: ['C:\\adapters\\mcp'] }))
+      expect(piMcpAdapterAvailable()).toBe(false)
+      writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: [`file://${adapterDir}`] }))
+      writeFileSync(join(adapterDir, 'package.json'), JSON.stringify({ name: 'pi-mcp-adapter' }))
+      expect(piMcpAdapterAvailable()).toBe(true)
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+      if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
+      rmSync(agentDir, { recursive: true, force: true })
+      rmSync(adapterDir, { recursive: true, force: true })
     }
   })
 

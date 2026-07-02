@@ -52,7 +52,7 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -122,7 +122,27 @@ export function piMcpAdapterAvailable(): boolean {
   try {
     const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf-8')) as { packages?: unknown }
     if (Array.isArray(settings.packages)) {
-      return settings.packages.some((p) => typeof p === 'string' && p.includes('pi-mcp-adapter'))
+      return settings.packages.some((p) => {
+        if (typeof p !== 'string') return false
+        if (p.includes('pi-mcp-adapter')) return true
+        // Local-path installs (`/some/dir`, `./rel`, `file:…`, `path:…`) may
+        // not carry the adapter's name in the path — resolve the
+        // package.json name. Relative specs resolve against the agent dir
+        // (where settings.json lives), NOT the bridge process cwd.
+        const spec = p.replace(/^(file|path):(\/\/)?/, '')
+        // `isAbsolute` covers POSIX and (on Windows builds) drive-letter
+        // forms; the explicit drive-letter check keeps a Windows-authored
+        // settings.json from being misread as an npm name elsewhere.
+        const winAbsolute = /^[A-Za-z]:[\\/]/.test(spec)
+        if (!isAbsolute(spec) && !winAbsolute && !spec.startsWith('.')) return false
+        const localPath = isAbsolute(spec) || winAbsolute ? spec : join(agentDir, spec)
+        try {
+          const pkg = JSON.parse(readFileSync(join(localPath, 'package.json'), 'utf-8')) as { name?: unknown }
+          return pkg.name === 'pi-mcp-adapter'
+        } catch {
+          return false
+        }
+      })
     }
   } catch {
     // unreadable/absent settings — fall through to "not detected"

@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
+import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { applyWorkspacePlan, type HarnessId, materializeProfile } from '@tangle-network/agent-profile-materialize'
 
@@ -279,15 +280,55 @@ export function materializeMcpServersForClaudeKimi(
  * The file lives in the run workspace, not a temp dir, because the
  * adapter discovers config by cwd. If `.pi/mcp.json` already exists
  * (caller-provisioned workspace), the requested servers are merged in
- * (request wins on name collisions) and `cleanup()` restores the
- * original bytes; otherwise `cleanup()` removes the file and, when we
- * created it, the `.pi` directory.
+ * (request wins on name collisions) and the LAST active mount's
+ * `cleanup()` restores the original bytes; otherwise it removes the
+ * file and, when the first mount created it, the `.pi` directory.
+ *
+ * Concurrency: pi discovers config strictly by cwd, so two overlapping
+ * runs in one workspace would either share request-scoped server
+ * definitions (leaking one run's tools/secrets into the other) or race
+ * on restore. Neither is acceptable — a `.pi/mcp.json.lock` file
+ * (O_EXCL, holds `{pid}`) enforces ONE active MCP mount per cwd across
+ * processes. A second overlapping mount fails loud with instructions to
+ * use distinct cwds; a lock whose pid is dead is stolen (crashed run).
  *
  * Returns null when no usable servers remain. Callers must verify the
  * adapter is installed BEFORE mounting (see `piMcpAdapterAvailable` in
  * backends/pi.ts) — writing config a runner never reads would recreate
  * the silent-drop bug this materializer exists to fix.
  */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    // EPERM = alive but owned by another user — still very much alive.
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * Host-side write into a workspace-controlled path. `.pi/mcp.json` lives
+ * inside the request's cwd, which a sandboxed agent can mutate — if it
+ * swaps the file for a symlink, a plain `writeFileSync` from the HOST
+ * process would write through the link to any host path the bridge user
+ * can touch. `O_NOFOLLOW` makes open fail (ELOOP) on a symlink instead;
+ * callers treat that as fail-closed. (`O_NOFOLLOW` is 0 on Windows —
+ * symlink creation there needs elevated rights, and the jail concern is
+ * the POSIX sandbox path.)
+ */
+function writeFileNoFollow(path: string, bytes: string): void {
+  const fd = openSync(
+    path,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | (fsConstants.O_NOFOLLOW ?? 0),
+  )
+  try {
+    writeFileSync(fd, bytes)
+  } finally {
+    closeSync(fd)
+  }
+}
+
 export function materializeMcpServersForPi(
   specs: Record<string, McpServerSpec> | null,
   cwd: string,
@@ -301,11 +342,164 @@ export function materializeMcpServersForPi(
   if (serverNames.length === 0) return null
 
   const piDir = join(cwd, '.pi')
-  const createdDir = !existsSync(piDir)
-  mkdirSync(piDir, { recursive: true })
   const configPath = join(piDir, 'mcp.json')
-  const originalBytes = readFileMaybe(configPath)
+  const lockPath = `${configPath}.lock`
 
+  const fail = (detail: string): never => {
+    throw new BackendError(
+      `backend pi failed to prepare MCP config at ${configPath}: ${detail}`,
+      'not_configured',
+    )
+  }
+
+  let createdDir = false
+  try {
+    createdDir = !existsSync(piDir)
+    mkdirSync(piDir, { recursive: true })
+    // `writeFileNoFollow` only guards the FINAL path component; a
+    // workspace that pre-created `.pi` as a symlink to a host directory
+    // would still redirect every write under it. lstat does not follow —
+    // require a real directory, not a link to one.
+    if (!lstatSync(piDir).isDirectory()) {
+      fail(`${piDir} exists but is not a real directory (symlink or file planted by the workspace)`)
+    }
+  } catch (err) {
+    if (err instanceof BackendError) throw err
+    fail(err instanceof Error ? err.message : String(err))
+  }
+
+  // Exclusive per-cwd lock (cross-process): `wx` refuses to overwrite.
+  // The lock is written ONCE, atomically, with its full metadata — the
+  // TRUE pre-mount state (`originalBytes`) — so a crashed run's
+  // request-scoped config never outlives it: whoever steals a stale lock
+  // rolls the workspace back to that recorded state instead of adopting
+  // the dead run's mounted config as "original". There is deliberately
+  // no in-place rewrite of a held lock (a truncate/write window would
+  // let a concurrent EEXIST reader misparse a LIVE lock as stale); the
+  // one post-acquire correction path goes through temp-file + rename,
+  // which readers see atomically. An unreadable lock is FAIL-CLOSED
+  // (contention error), never stolen.
+  const writeLockAtomic = (payload: { pid: number; originalBytes: string | null }): void => {
+    const tmpPath = `${lockPath}.${process.pid}.tmp`
+    // `wx` refuses a pre-planted symlink at the tmp path; rename replaces
+    // the lock atomically without following links.
+    rmSync(tmpPath, { force: true })
+    writeFileSync(tmpPath, JSON.stringify(payload), { flag: 'wx' })
+    renameSync(tmpPath, lockPath)
+  }
+
+  // Guarded read of a workspace-controlled path. A plain `readFileSync`
+  // would follow symlinks and BLOCK FOREVER on a planted FIFO (host-side
+  // DoS before any timeout starts). Open no-follow + non-blocking, fstat
+  // the fd (no swap race), reject non-regular files and oversized bytes.
+  const MAX_WORKSPACE_READ = 1024 * 1024
+  const readWorkspaceFileMaybe = (path: string): string | null => {
+    let fd: number
+    try {
+      fd = openSync(
+        path,
+        fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0),
+      )
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') return null
+      return fail(`${path} is not readable as a regular file (${code ?? 'unknown error'})`)
+    }
+    try {
+      const st = fstatSync(fd)
+      if (!st.isFile()) fail(`${path} is not a regular file (workspace planted a special file)`)
+      if (st.size > MAX_WORKSPACE_READ) fail(`${path} exceeds the ${MAX_WORKSPACE_READ}-byte cap`)
+      return readFileSync(fd, 'utf-8')
+    } finally {
+      closeSync(fd)
+    }
+  }
+
+  const tryAcquire = (): boolean => {
+    try {
+      writeFileSync(
+        lockPath,
+        JSON.stringify({ pid: process.pid, originalBytes: readWorkspaceFileMaybe(configPath) }),
+        { flag: 'wx' },
+      )
+      return true
+    } catch (err) {
+      if (err instanceof BackendError) throw err
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        fail(err instanceof Error ? err.message : String(err))
+      }
+      return false
+    }
+  }
+
+  if (!tryAcquire()) {
+    let stale: { pid?: number; originalBytes?: string | null } | null = null
+    try {
+      stale = JSON.parse(readWorkspaceFileMaybe(lockPath) ?? '') as { pid?: number; originalBytes?: string | null }
+    } catch {
+      // Unreadable/corrupt lock: FAIL-CLOSED. Stealing here could kill a
+      // live mount mid-run; a human (or a dead-pid check on a later
+      // retry) resolves genuine corruption.
+      throw new BackendError(
+        `backend pi cannot mount MCP servers at ${configPath}: lock file ${lockPath} exists but is `
+        + `unreadable; if no pi run is active in this cwd, remove it manually`,
+        'not_configured',
+      )
+    }
+    const holderPid = stale?.pid ?? null
+    if (holderPid === null || pidAlive(holderPid)) {
+      throw new BackendError(
+        `backend pi cannot mount MCP servers at ${configPath}: another run${holderPid !== null ? ` (pid ${holderPid})` : ''} holds the `
+        + `mount for this cwd; pi supports one MCP-mounted run per workspace — use distinct cwds`,
+        'not_configured',
+      )
+    }
+    // Stale lock from a dead/crashed run: roll the config back to the
+    // dead run's recorded pre-mount state (or remove it when unknown —
+    // leaked request-scoped servers must not persist), then steal.
+    try {
+      if (stale && typeof stale.originalBytes === 'string') {
+        writeFileNoFollow(configPath, stale.originalBytes)
+      } else {
+        // unlink removes a symlink itself, never its target — safe.
+        rmSync(configPath, { force: true })
+      }
+      rmSync(lockPath, { force: true })
+      if (!tryAcquire()) {
+        fail('lost race stealing stale lock: another run acquired it first')
+      }
+    } catch (retryErr) {
+      if (retryErr instanceof BackendError) throw retryErr
+      fail(`lost race stealing stale lock: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`)
+    }
+  }
+
+  const releaseLock = (): void => {
+    try {
+      rmSync(lockPath, { force: true })
+    } catch {
+      // best-effort
+    }
+  }
+
+  // We hold the lock; re-read the config in case it changed between the
+  // pre-acquire snapshot and acquisition, and correct the recorded
+  // pre-mount state atomically if so.
+  const originalBytes = readWorkspaceFileMaybe(configPath)
+  try {
+    let recorded: string | null | undefined
+    try {
+      recorded = (JSON.parse(readWorkspaceFileMaybe(lockPath) ?? '') as { originalBytes?: string | null }).originalBytes
+    } catch {
+      recorded = undefined
+    }
+    if (recorded !== originalBytes) {
+      writeLockAtomic({ pid: process.pid, originalBytes })
+    }
+  } catch (err) {
+    releaseLock()
+    fail(err instanceof Error ? err.message : String(err))
+  }
   let merged: Record<string, unknown> = { mcpServers }
   if (originalBytes !== null) {
     try {
@@ -317,21 +511,44 @@ export function materializeMcpServersForPi(
       // restores the original bytes verbatim either way.
     }
   }
-  writeFileSync(configPath, JSON.stringify(merged, null, 2))
+  try {
+    writeFileNoFollow(configPath, JSON.stringify(merged, null, 2))
+  } catch (err) {
+    releaseLock()
+    fail(err instanceof Error ? err.message : String(err))
+  }
 
+  let cleaned = false
   return {
     configPath,
     serverNames,
     cleanup: () => {
+      if (cleaned) return
+      cleaned = true
       try {
         if (originalBytes !== null) {
-          writeFileSync(configPath, originalBytes)
+          // No-follow: the workspace may have swapped the config for a
+          // symlink mid-run; never restore THROUGH it from the host.
+          writeFileNoFollow(configPath, originalBytes)
         } else {
           rmSync(configPath, { force: true })
-          // Only remove `.pi` when this run created it AND nothing else
-          // landed in it meanwhile (rmdirSync refuses non-empty dirs).
-          if (createdDir) rmdirSync(piDir)
         }
+      } catch (err) {
+        // FAIL-CLOSED: restore failed (e.g. symlink planted mid-run).
+        // Keep the lock — its recorded originalBytes let a later mount's
+        // stale-lock recovery retry the rollback once this pid exits;
+        // releasing it now would let the tampered config masquerade as
+        // workspace-original state.
+        if (process.env.CLI_BRIDGE_DEBUG_MCP) {
+          console.error(`[cli-bridge mcp pi] cleanup restore failed for ${configPath}; keeping lock: ${err instanceof Error ? err.message : String(err)}`)
+        }
+        return
+      }
+      releaseLock()
+      try {
+        // Only remove `.pi` when this run created it AND nothing else
+        // landed in it meanwhile (rmdirSync refuses non-empty dirs).
+        if (originalBytes === null && createdDir) rmdirSync(piDir)
       } catch {
         // best-effort cleanup
       }
