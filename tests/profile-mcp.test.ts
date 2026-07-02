@@ -13,6 +13,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { execSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { AgentProfile } from '@tangle-network/agent-interface'
@@ -23,6 +24,7 @@ import {
   materializeMcpServersForClaudeKimi,
   materializeMcpServersForCodex,
   materializeMcpServersForOpencode,
+  materializeMcpServersForPi,
   materializeOpencodeMcpConfig,
   resolveMcpServers,
 } from '../src/backends/profile-support.js'
@@ -274,6 +276,271 @@ describe('materializeMcpServersForOpencode', () => {
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.mcp).toEqual({})
     m.cleanup()
+  })
+})
+
+describe('materializeMcpServersForPi', () => {
+  const fs = require('node:fs') as typeof import('node:fs')
+  const os = require('node:os') as typeof import('node:os')
+
+  it('writes the canonical {mcpServers} shape to <cwd>/.pi/mcp.json and removes it on cleanup', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      const m = materializeMcpServersForPi({
+        echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } },
+      }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      expect(m.configPath).toBe(join(cwd, '.pi', 'mcp.json'))
+      expect(m.serverNames).toEqual(['echo'])
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(written).toEqual({
+        mcpServers: { echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } } },
+      })
+      m.cleanup()
+      expect(existsSync(m.configPath)).toBe(false)
+      // The run created `.pi`, so cleanup removes it too.
+      expect(existsSync(join(cwd, '.pi'))).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('merges into a pre-existing .pi/mcp.json (request wins) and restores original bytes on cleanup', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.pi'))
+      const originalBytes = JSON.stringify({
+        mcpServers: {
+          existing: { command: 'existing-cmd' },
+          echo: { command: 'stale-should-be-overridden' },
+        },
+        directTools: ['existing_tool'],
+      })
+      fs.writeFileSync(join(cwd, '.pi', 'mcp.json'), originalBytes)
+
+      const m = materializeMcpServersForPi({ echo: { command: 'node' } }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(written).toEqual({
+        mcpServers: {
+          existing: { command: 'existing-cmd' },
+          echo: { command: 'node' },
+        },
+        // Non-mcpServers adapter settings in the original file survive the merge.
+        directTools: ['existing_tool'],
+      })
+      m.cleanup()
+      expect(readFileSync(m.configPath, 'utf-8')).toBe(originalBytes)
+      expect(existsSync(join(cwd, '.pi'))).toBe(true)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null when the map is null or every entry filters out', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      expect(materializeMcpServersForPi(null, cwd)).toBeNull()
+      expect(materializeMcpServersForPi({ off: { command: 'x', enabled: false } }, cwd)).toBeNull()
+      // No .pi dir is created for a no-op materialization.
+      expect(existsSync(join(cwd, '.pi'))).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects an overlapping mount in the same cwd, allows a new mount after cleanup', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      const a = materializeMcpServersForPi({ alpha: { command: 'a-cmd' } }, cwd)
+      expect(a).not.toBeNull()
+      if (!a) return
+      // A live lock (our own pid) blocks any second mount in this cwd —
+      // request-scoped servers must never be shared across runs.
+      expect(() => materializeMcpServersForPi({ beta: { command: 'b-cmd' } }, cwd))
+        .toThrow(/one MCP-mounted run per workspace/)
+      const afterReject = JSON.parse(readFileSync(a.configPath, 'utf-8'))
+      expect(Object.keys(afterReject.mcpServers)).toEqual(['alpha'])
+
+      a.cleanup()
+      expect(existsSync(a.configPath)).toBe(false)
+      expect(existsSync(join(cwd, '.pi'))).toBe(false)
+
+      // Sequential reuse of the cwd works once the lock is released.
+      const b = materializeMcpServersForPi({ beta: { command: 'b-cmd' } }, cwd)
+      expect(b).not.toBeNull()
+      b?.cleanup()
+      // Double cleanup is a no-op.
+      a.cleanup()
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('steals a stale lock left by a dead process', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.pi'))
+      // PID 2^22-ish beyond pid_max on default Linux — guaranteed dead.
+      fs.writeFileSync(join(cwd, '.pi', 'mcp.json.lock'), JSON.stringify({ pid: 3999999 }))
+      const m = materializeMcpServersForPi({ echo: { command: 'node' } }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      const lock = JSON.parse(readFileSync(join(cwd, '.pi', 'mcp.json.lock'), 'utf-8'))
+      expect(lock.pid).toBe(process.pid)
+      m.cleanup()
+      expect(existsSync(join(cwd, '.pi', 'mcp.json.lock'))).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('crash recovery: a dead run\'s leaked config is discarded, not adopted as original', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.pi'))
+      // Simulate a crashed run: its request-scoped config (with a secret)
+      // still on disk, its lock recording that there was NO original file.
+      fs.writeFileSync(
+        join(cwd, '.pi', 'mcp.json'),
+        JSON.stringify({ mcpServers: { leaked: { command: 'x', env: { SECRET: 'dead-run-secret' } } } }),
+      )
+      fs.writeFileSync(join(cwd, '.pi', 'mcp.json.lock'), JSON.stringify({ pid: 3999999, originalBytes: null }))
+
+      const m = materializeMcpServersForPi({ echo: { command: 'node' } }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      // The dead run's server must NOT survive into the new mount.
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(Object.keys(written.mcpServers)).toEqual(['echo'])
+      m.cleanup()
+      // Rolled-back original was "no file" — cleanup removes the config.
+      expect(existsSync(m.configPath)).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('crash recovery: the dead run\'s recorded pre-mount file is restored before remounting', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.pi'))
+      const trueOriginal = JSON.stringify({ mcpServers: { workspace: { command: 'ws-cmd' } } })
+      fs.writeFileSync(
+        join(cwd, '.pi', 'mcp.json'),
+        JSON.stringify({ mcpServers: { workspace: { command: 'ws-cmd' }, leaked: { command: 'x' } } }),
+      )
+      fs.writeFileSync(
+        join(cwd, '.pi', 'mcp.json.lock'),
+        JSON.stringify({ pid: 3999999, originalBytes: trueOriginal }),
+      )
+
+      const m = materializeMcpServersForPi({ echo: { command: 'node' } }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      // New mount merges into the TRUE original (workspace server), with the
+      // dead run's `leaked` server rolled back out.
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(Object.keys(written.mcpServers).sort()).toEqual(['echo', 'workspace'])
+      m.cleanup()
+      expect(readFileSync(m.configPath, 'utf-8')).toBe(trueOriginal)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('never restores through a symlink planted at the config path mid-run (fail-closed, lock kept)', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    const victim = join(cwd, 'victim.txt')
+    try {
+      fs.writeFileSync(victim, 'host file that must not be overwritten')
+      fs.mkdirSync(join(cwd, '.pi'))
+      const originalBytes = JSON.stringify({ mcpServers: { existing: { command: 'x' } } })
+      fs.writeFileSync(join(cwd, '.pi', 'mcp.json'), originalBytes)
+
+      const m = materializeMcpServersForPi({ echo: { command: 'node' } }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      // Sandboxed agent swaps the config for a symlink to a host file.
+      fs.rmSync(m.configPath)
+      fs.symlinkSync(victim, m.configPath)
+
+      m.cleanup()
+      // The victim file is untouched and the lock is retained fail-closed.
+      expect(readFileSync(victim, 'utf-8')).toBe('host file that must not be overwritten')
+      expect(existsSync(`${m.configPath}.lock`)).toBe(true)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('fails fast on a FIFO planted at the config path instead of blocking the host', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.pi'))
+      execSync(`mkfifo ${JSON.stringify(join(cwd, '.pi', 'mcp.json'))}`)
+      // A plain readFileSync here would block forever on the open FIFO.
+      expect(() => materializeMcpServersForPi({ echo: { command: 'node' } }, cwd))
+        .toThrow(/not a regular file|not readable as a regular file/)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects an oversized workspace config instead of slurping it', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.pi'))
+      fs.writeFileSync(join(cwd, '.pi', 'mcp.json'), 'x'.repeat(2 * 1024 * 1024))
+      expect(() => materializeMcpServersForPi({ echo: { command: 'node' } }, cwd))
+        .toThrow(/byte cap/)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to mount when .pi itself is a symlinked directory', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    const hostDir = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-host-'))
+    try {
+      fs.symlinkSync(hostDir, join(cwd, '.pi'))
+      expect(() => materializeMcpServersForPi({ echo: { command: 'node' } }, cwd))
+        .toThrow(/not a real directory/)
+      // Nothing was written through the link into the host directory.
+      expect(fs.readdirSync(hostDir)).toEqual([])
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+      fs.rmSync(hostDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to mount over a symlink planted at the config path before the run', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    const victim = join(cwd, 'victim.txt')
+    try {
+      fs.writeFileSync(victim, 'do not clobber')
+      fs.mkdirSync(join(cwd, '.pi'))
+      fs.symlinkSync(victim, join(cwd, '.pi', 'mcp.json'))
+      expect(() => materializeMcpServersForPi({ echo: { command: 'node' } }, cwd))
+        .toThrow(/backend pi failed to prepare MCP config/)
+      expect(readFileSync(victim, 'utf-8')).toBe('do not clobber')
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('wraps fs failures in a typed BackendError instead of a raw fs throw', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      // A FILE named `.pi` makes mkdirSync fail deterministically (ENOTDIR/EEXIST).
+      fs.writeFileSync(join(cwd, '.pi'), 'not a directory')
+      expect(() => materializeMcpServersForPi({ echo: { command: 'node' } }, cwd))
+        .toThrow(/backend pi failed to prepare MCP config/)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
   })
 })
 
