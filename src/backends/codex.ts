@@ -210,6 +210,14 @@ export class CodexBackend implements Backend {
           continue
         }
 
+        const toolCall = extractToolCall(ev)
+        if (toolCall) {
+          yield { tool_calls: [toolCall] }
+          emittedToolCall = true
+          // Fall through to extractText: a tool item can also carry a
+          // string result payload, which consumers audit as evidence.
+        }
+
         const text = extractText(ev)
         if (text) {
           yield { content: text }
@@ -289,6 +297,64 @@ export function codexReasoningEffort(effort: ChatRequest['effort']): 'minimal' |
 function resolveCodexAuthPath(): string | undefined {
   const home = process.env.CODEX_HOME ?? (process.env.HOME ? join(process.env.HOME, '.codex') : undefined)
   return home ? join(home, 'auth.json') : undefined
+}
+
+/**
+ * Item types that carry tool activity rather than assistant text.
+ * `codex exec --json` reports each tool invocation as an
+ * `item.completed` whose `item.type` names the tool class:
+ *   command_execution — {command, aggregated_output, exit_code, status}
+ *   mcp_tool_call     — {server, tool, arguments?, status}
+ *   web_search        — {query}
+ *   file_change       — {changes:[{path,kind}], status}
+ * These must surface as ChatDelta.tool_calls (not flattened to text):
+ * downstream consumers audit tool usage per call — a treatment gate
+ * cannot distinguish "agent never searched" from "stream dropped the
+ * call" unless the call is a first-class delta.
+ */
+function extractToolCall(
+  ev: Record<string, unknown>,
+): { id: string; name: string; arguments: string } | null {
+  if (String(ev.type ?? '') !== 'item.completed') return null
+  const item = ev.item as Record<string, unknown> | undefined
+  if (!item) return null
+  const itemType = String(item.type ?? '')
+  const id = String(item.id ?? '')
+  switch (itemType) {
+    case 'command_execution':
+      return {
+        id,
+        name: 'bash',
+        arguments: JSON.stringify({ command: item.command ?? '' }),
+      }
+    case 'mcp_tool_call': {
+      const server = String(item.server ?? '')
+      const tool = String(item.tool ?? '')
+      if (!server && !tool) return null
+      // Matches the MCP convention consumers key on: <server>_<tool>.
+      const name = server && tool ? `${server}_${tool}` : server || tool
+      const args = item.arguments ?? {}
+      return {
+        id,
+        name,
+        arguments: typeof args === 'string' ? args : JSON.stringify(args),
+      }
+    }
+    case 'web_search':
+      return {
+        id,
+        name: 'websearch',
+        arguments: JSON.stringify({ query: item.query ?? '' }),
+      }
+    case 'file_change':
+      return {
+        id,
+        name: 'apply_patch',
+        arguments: JSON.stringify({ changes: item.changes ?? [] }),
+      }
+    default:
+      return null
+  }
 }
 
 /**
