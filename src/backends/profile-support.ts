@@ -148,7 +148,7 @@ export function isStdioMcpSpec(spec: McpServerSpec): boolean {
 
 /**
  * Materialize an `AgentProfile.mcp` map into a temp JSON file in the
- * canonical claude/kimi mcp-config shape:
+ * standard mcp-config.json shape (any CLI taking --mcp-config-file):
  *
  *   { "mcpServers": { name: {command, args, env}, ... } }
  *
@@ -181,7 +181,7 @@ export function materializeMcpConfig(profile: AgentProfile | null): Materialized
     if (!name || !raw || typeof raw !== 'object') continue
     specs[name] = profileMcpToSpec(raw)
   }
-  return materializeMcpServersForClaudeKimi(specs)
+  return writeMcpConfigFile(specs)
 }
 
 /**
@@ -243,7 +243,7 @@ export function buildCanonicalMcpServers(
   return mcpServers
 }
 
-export function materializeMcpServersForClaudeKimi(
+export function writeMcpConfigFile(
   specs: Record<string, McpServerSpec> | null,
 ): MaterializedMcpConfig | null {
   if (!specs) return null
