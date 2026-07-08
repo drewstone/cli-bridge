@@ -23,7 +23,7 @@ import type { Spawner } from '../executors/types.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { killTree } from '../executors/process-tree.js'
 import { contentToText } from './content.js'
-import { resolvePromptMessages } from './profile-support.js'
+import { buildAcpMcpServers, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 
 export interface AcpBackendOptions {
   /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
@@ -112,6 +112,12 @@ export class AcpBackend implements Backend {
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
     const promptText = renderPrompt(resolvePromptMessages(req, session))
+    // MCP servers (request-body `mcp.mcpServers` ∪ `agent_profile.mcp`)
+    // are passed INLINE to session/new — ACP's native mount point, no
+    // temp file. Schema verified live against `hermes acp`: remote is
+    // `{type, name, url, headers:[{name,value}]}`, stdio is
+    // `{name, command, args, env:[{name,value}]}`.
+    const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session))
 
     const spawned = await this.spawner(this.bin, this.acpArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -188,7 +194,7 @@ export class AcpBackend implements Backend {
       // Drive the protocol; deltas flow through `queue` as session/update arrives.
       const driver = (async () => {
         await request('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } })
-        const sess = (await request('session/new', { cwd, mcpServers: [] })) as { sessionId?: string }
+        const sess = (await request('session/new', { cwd, mcpServers })) as { sessionId?: string }
         const sessionId = sess?.sessionId
         if (sessionId) push({ internal_session_id: sessionId })
         const result = (await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: promptText }] })) as { stopReason?: unknown }

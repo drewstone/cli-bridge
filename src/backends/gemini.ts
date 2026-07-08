@@ -16,10 +16,11 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { provisionProfileWorkspace, resolvePromptMessages } from './profile-support.js'
+import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
+import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { killTree } from '../executors/process-tree.js'
@@ -45,37 +46,7 @@ export class GeminiBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    let release = (): void => {}
-    try {
-      const spawned = await this.spawner(this.opts.bin, ['--version'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      release = spawned.release
-      const child = spawned.child
-      return await new Promise<BackendHealth>((resolve) => {
-        let stdout = ''; let stderr = ''
-        child.stdout?.on('data', (b) => { stdout += b.toString() })
-        child.stderr?.on('data', (b) => { stderr += b.toString() })
-        child.on('error', (err) => {
-          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-        })
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-          } else {
-            resolve({
-              name: this.name,
-              state: 'error',
-              detail: `exit ${code}: ${stderr.slice(0, 200) || stdout.slice(0, 200)}`,
-            })
-          }
-        })
-      })
-    } catch (err) {
-      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
-    } finally {
-      release()
-    }
+    return versionHealth(this.name, this.opts.bin, this.spawner)
   }
 
   async *chat(
@@ -90,12 +61,21 @@ export class GeminiBackend implements Backend {
     const model = this.extractModel(req.model)
     const args = this.buildArgs(req.model)
     if (model) args.push('--model', model)
+    const cwd = req.cwd ?? session?.cwd ?? process.cwd()
+
+    // Materialize MCP servers (request-body `mcp.mcpServers` ∪
+    // `agent_profile.mcp`) into the project-scope `<cwd>/.gemini/settings.json`.
+    // Gemini CLI has no per-invocation MCP flag — it discovers MCP by cwd,
+    // layering the project settings over the user's global ones. Cleanup in
+    // the outer finally restores the workspace so it never leaks. Fail-loud:
+    // a symlink/lock violation throws rather than silently dropping MCP.
+    const mcpMaterialized = materializeMcpServersForGemini(resolveMcpServers(req, session), cwd)
 
     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
-    provisionProfileWorkspace(req, session, 'gemini', req.cwd ?? session?.cwd ?? process.cwd())
+    provisionProfileWorkspace(req, session, 'gemini', cwd)
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
+      cwd,
       env: process.env,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
@@ -115,6 +95,7 @@ export class GeminiBackend implements Backend {
     try {
       let stderr = ''
       let emittedContent = false
+      let emittedToolCall = false
       child.stderr?.on('data', (b) => { stderr += b.toString() })
       if (spawnErrorMessage) {
         throw new BackendError(`gemini spawn failed: ${spawnErrorMessage}`, 'upstream')
@@ -162,8 +143,13 @@ export class GeminiBackend implements Backend {
             yield { content: text }
             emittedContent = true
           }
+          const toolCall = extractToolCall(parsed)
+          if (toolCall) {
+            yield { tool_calls: [toolCall] }
+            emittedToolCall = true
+          }
           if (type === 'completed' || type === 'turn.completed' || type === 'result') {
-            yield { finish_reason: sawError ? 'error' : 'stop' }
+            yield { finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop') }
             return
           }
         } else {
@@ -181,15 +167,16 @@ export class GeminiBackend implements Backend {
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(`gemini exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
       }
-      if (!emittedContent) {
+      if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`gemini produced no output: ${stderr.slice(0, 300)}`, 'upstream')
       }
-      yield { finish_reason: 'stop' }
+      yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       await killTree(child)
       releaseSpawner()
+      mcpMaterialized?.cleanup()
     }
   }
 
@@ -199,7 +186,13 @@ export class GeminiBackend implements Backend {
   }
 
   buildArgs(fullModel: string): string[] {
-    const args = ['--prompt', 'Complete the request provided on stdin.']
+    // `--output-format stream-json` makes gemini emit machine-readable
+    // NDJSON events (assistant text + tool calls) instead of best-effort
+    // text, so a fired MCP tool call (e.g. you.com search) surfaces as a
+    // provable tool_call rather than vanishing into prose. The line parser
+    // falls back to treating any non-JSON line as content, so an
+    // unexpected event shape degrades to text rather than an empty result.
+    const args = ['--prompt', 'Complete the request provided on stdin.', '--output-format', 'stream-json']
     const sandbox = geminiSandboxFlag()
     if (sandbox) args.push(sandbox)
     const yolo = geminiYoloFlag()
@@ -249,6 +242,35 @@ function parseMaybeJson(line: string): Record<string, unknown> | null {
     return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
   } catch {
     return null
+  }
+}
+
+function extractToolCall(ev: Record<string, unknown>): { id: string; name: string; arguments: string } | null {
+  // gemini stream-json surfaces tool invocations either as a dedicated
+  // event (`type: 'tool_call' | 'tool_use' | 'function_call'`) or as a
+  // `functionCall`/`toolCall` object on the event. Parse defensively —
+  // extract only when a name is present, and normalize args to a string.
+  const type = String(ev.type ?? ev.event ?? '')
+  const holder =
+    (ev.functionCall as Record<string, unknown> | undefined)
+    ?? (ev.function_call as Record<string, unknown> | undefined)
+    ?? (ev.toolCall as Record<string, unknown> | undefined)
+    ?? (ev.tool_call as Record<string, unknown> | undefined)
+    ?? (/tool|function/i.test(type) ? ev : undefined)
+  if (!holder) return null
+  const name = holder.name ?? holder.tool ?? (holder.function as Record<string, unknown> | undefined)?.name
+  if (typeof name !== 'string' || !name) return null
+  const rawArgs =
+    holder.args
+    ?? holder.arguments
+    ?? holder.input
+    ?? (holder.function as Record<string, unknown> | undefined)?.arguments
+    ?? {}
+  const id = String(holder.id ?? holder.callId ?? holder.call_id ?? `${name}-${Math.random().toString(36).slice(2, 10)}`)
+  return {
+    id,
+    name,
+    arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs),
   }
 }
 

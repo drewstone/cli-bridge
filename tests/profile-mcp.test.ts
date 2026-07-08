@@ -21,7 +21,7 @@ import {
   buildMcpAllowList,
   isStdioMcpSpec,
   materializeMcpConfig,
-  materializeMcpServersForClaudeKimi,
+  writeMcpConfigFile,
   materializeMcpServersForCodex,
   materializeMcpServersForOpencode,
   materializeMcpServersForPi,
@@ -224,9 +224,9 @@ describe('isStdioMcpSpec', () => {
   })
 })
 
-describe('materializeMcpServersForClaudeKimi', () => {
+describe('writeMcpConfigFile', () => {
   it('writes the canonical {mcpServers:{...}} JSON shape with stdio + remote servers', () => {
-    const m = materializeMcpServersForClaudeKimi({
+    const m = writeMcpConfigFile({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
       remote: { type: 'http', url: 'https://example.com', headers: { Authorization: 'Bearer X' } },
     })
@@ -247,7 +247,7 @@ describe('materializeMcpServersForClaudeKimi', () => {
   })
 
   it('returns null when given a null map (no entries at all)', () => {
-    expect(materializeMcpServersForClaudeKimi(null)).toBeNull()
+    expect(writeMcpConfigFile(null)).toBeNull()
   })
 })
 

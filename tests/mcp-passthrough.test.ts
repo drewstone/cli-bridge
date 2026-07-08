@@ -39,7 +39,7 @@ import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import {
-  materializeMcpServersForClaudeKimi,
+  writeMcpConfigFile,
   materializeMcpServersForCodex,
   materializeMcpServersForOpencode,
   resolveMcpServers,
@@ -342,7 +342,7 @@ describe('per-backend materializer produces a launchable stdio MCP server', () =
 
   it('claude/kimi mcp-config.json — command+args+env survive the JSON round-trip', async () => {
     const specs = specsForServer()
-    const m = materializeMcpServersForClaudeKimi(specs)
+    const m = writeMcpConfigFile(specs)
     expect(m).not.toBeNull()
     if (!m) return
     try {
