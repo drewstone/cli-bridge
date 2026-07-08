@@ -25,7 +25,7 @@ import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   buildMcpAllowList,
-  materializeMcpServersForClaudeKimi,
+  writeMcpConfigFile,
   renderLocalHarnessProfilePreamble,
   resolveAgentProfile,
   resolveMcpServers,
@@ -197,7 +197,7 @@ export class ClaudeBackend implements Backend {
     // Merges request-body `mcp.mcpServers` and `agent_profile.mcp` into
     // one map; request-body wins on name collisions. See
     // `resolveMcpServers` for the contract.
-    const mcpMaterialized = materializeMcpServersForClaudeKimi(
+    const mcpMaterialized = writeMcpConfigFile(
       resolveMcpServers(req, session),
     )
     const args = this.buildArgs(req, session, mode, mcpMaterialized, {

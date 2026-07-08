@@ -8,6 +8,7 @@
  */
 
 import { resolve } from 'node:path'
+import { tmpdir } from 'node:os'
 
 export interface Config {
   host: string
@@ -21,6 +22,15 @@ export interface Config {
   codexTimeoutMs: number
   opencodeBin: string
   opencodeTimeoutMs: number
+  opencodeDataHomeMode: 'inherit' | 'bridge' | 'run' | 'auto'
+  opencodeBridgeDataHome: string
+  opencodeAuthFile: string
+  opencodeAdmission: {
+    maxActive: number
+    maxQueue: number
+    queueTimeoutMs: number
+    lockDir: string
+  }
   kimiBin: string
   kimiTimeoutMs: number
   geminiBin: string
@@ -179,13 +189,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     codexTimeoutMs: Number.parseInt(env.CODEX_TIMEOUT_MS ?? String(defaultTimeout), 10),
     opencodeBin: env.OPENCODE_BIN ?? 'opencode',
     opencodeTimeoutMs: Number.parseInt(env.OPENCODE_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    opencodeDataHomeMode: parseOpencodeDataHomeMode(env.OPENCODE_DATA_HOME_MODE),
+    opencodeBridgeDataHome: resolve(env.OPENCODE_BRIDGE_DATA_HOME ?? `${env.HOME ?? process.cwd()}/.local/share/cli-bridge/opencode-data`),
+    opencodeAuthFile: resolve(env.OPENCODE_AUTH_FILE ?? `${env.HOME ?? process.cwd()}/.local/share/opencode/auth.json`),
+    opencodeAdmission: {
+      maxActive: parsePositiveInt(env.OPENCODE_MAX_ACTIVE, 1),
+      maxQueue: parseNonNegativeInt(env.OPENCODE_MAX_QUEUE, 16),
+      queueTimeoutMs: parseNonNegativeInt(env.OPENCODE_QUEUE_TIMEOUT_MS, 30_000),
+      lockDir: resolve(env.OPENCODE_HOST_LOCK_DIR ?? `${tmpdir()}/cli-bridge-opencode-slots`),
+    },
     kimiBin: env.KIMI_BIN ?? 'kimi',
     kimiTimeoutMs: Number.parseInt(env.KIMI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     geminiBin: env.GEMINI_BIN ?? 'gemini',
     geminiTimeoutMs: Number.parseInt(env.GEMINI_TIMEOUT_MS ?? String(defaultTimeout), 10),
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
-    forgeBin: env.FORGE_BIN ?? 'forge',
+    forgeBin: env.FORGE_BIN ?? 'forgecode',
     hermesBin: env.HERMES_BIN ?? 'hermes',
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     nanoclawSocket: env.NANOCLAW_SOCKET ?? '',
@@ -210,6 +229,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
   }
+}
+
+function parseOpencodeDataHomeMode(value: string | undefined): 'inherit' | 'bridge' | 'run' | 'auto' {
+  if (value === undefined || value === '') return 'auto'
+  if (value === 'inherit' || value === 'bridge' || value === 'run' || value === 'auto') return value
+  throw new Error(`invalid OPENCODE_DATA_HOME_MODE: ${value} — expected inherit|bridge|run|auto`)
 }
 
 function parseJailMode(value: string | undefined): 'off' | 'write-jail' {

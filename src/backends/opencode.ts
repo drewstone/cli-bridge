@@ -17,6 +17,9 @@
  * right headers so Moonshot's backend accepts the call.
  */
 
+import { randomUUID } from 'node:crypto'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -28,10 +31,20 @@ import type { Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { killTree } from '../executors/process-tree.js'
+import { AdmissionGate, type AdmissionGateOptions } from '../admission.js'
+import { acquireHostSlot, type HostSlotLease, type HostSlotOptions } from '../runtime/host-slot.js'
+
+export interface OpencodeAdmissionOptions extends AdmissionGateOptions {
+  lockDir: string
+}
 
 export interface OpencodeBackendOptions {
   bin: string
   timeoutMs: number
+  dataHomeMode?: 'inherit' | 'bridge' | 'run' | 'auto'
+  bridgeDataHome?: string
+  authFile?: string
+  admission?: OpencodeAdmissionOptions
   /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
   spawner?: Spawner
 }
@@ -39,8 +52,19 @@ export interface OpencodeBackendOptions {
 export class OpencodeBackend implements Backend {
   readonly name = 'opencode'
   private readonly spawner: Spawner
+  private readonly admission: AdmissionGate | null
+  private readonly hostSlot: HostSlotOptions | null
   constructor(private readonly opts: OpencodeBackendOptions) {
     this.spawner = opts.spawner ?? scopedHostSpawner
+    this.admission = opts.admission ? new AdmissionGate(opts.admission) : null
+    this.hostSlot = opts.admission
+      ? {
+          name: 'opencode',
+          maxActive: opts.admission.maxActive,
+          lockDir: opts.admission.lockDir,
+          queueTimeoutMs: opts.admission.queueTimeoutMs,
+        }
+      : null
   }
 
   matches(model: string): boolean {
@@ -119,156 +143,228 @@ export class OpencodeBackend implements Backend {
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
 
-    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
-    // stays on opencode.json path). Fail-safe.
-    provisionProfileWorkspace(req, session, 'opencode', req.cwd ?? session?.cwd ?? process.cwd())
-    const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
-      env: {
-        ...process.env,
-        ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
-      },
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
-    const child = spawned.child
-    const releaseSpawner = spawned.release
-
-    // The spawner registers a synchronous 'error' listener to prevent
-    // uncaught exceptions on spawn ENOENT/EACCES; we both attach our
-    // own listener (for races where the spawner doesn't expose
-    // spawnError) and consult spawned.spawnError() after first I/O for
-    // the captured event.
-    let spawnErrorMessage = ''
-    child.on('error', (err) => { spawnErrorMessage = err.message })
-    const earlySpawnError = spawned.spawnError?.()
-    if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
-
-    // killTree kicks off the SIGTERM→grace→SIGKILL ladder against the
-    // ENTIRE process group (opencode + everything it forked). We fire
-    // and forget here — the actual await happens in the outer finally
-    // so the generator can still emit a clean final delta.
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
-    signal.addEventListener('abort', onAbort, { once: true })
-
+    const runSlot = await this.acquireRunSlot(signal)
     try {
-      let internalSessionId: string | undefined
-      let stderr = ''
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
-      if (spawnErrorMessage) {
-        throw new BackendError(`opencode spawn failed: ${spawnErrorMessage}`, 'upstream')
+      // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
+      // stays on opencode.json path). Fail-safe.
+      provisionProfileWorkspace(req, session, 'opencode', req.cwd ?? session?.cwd ?? process.cwd())
+      const dataHome = this.prepareDataHome(req, session)
+      let spawned: Awaited<ReturnType<Spawner>>
+      try {
+        spawned = await this.spawner(this.opts.bin, args, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          cwd: req.cwd ?? session?.cwd ?? process.cwd(),
+          env: {
+            ...process.env,
+            ...(dataHome ? { XDG_DATA_HOME: dataHome.path } : {}),
+            ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
+          },
+          ...(req.session_id ? { sessionId: req.session_id } : {}),
+          ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        })
+      } catch (err) {
+        dataHome?.cleanup()
+        throw err
       }
-      if (!child.stdout) {
-        throw new BackendError('opencode subprocess has no stdout pipe', 'upstream')
-      }
-      if (!child.stdin) {
-        throw new BackendError('opencode subprocess has no stdin pipe', 'upstream')
-      }
+      const child = spawned.child
+      const releaseSpawner = spawned.release
 
-      // Pipe the composed prompt as raw stdin bytes. opencode reads
-      // stdin to EOF as the literal message when no positional argv
-      // is supplied to `run`. See writeStdinPayload comments for the
-      // EPIPE / backpressure contract.
-      const stdinResult = await writeStdinPayload(
-        child.stdin,
-        [{ role: 'user', content: prompt }],
-        { format: 'raw' },
-      )
-      if (!stdinResult.ok) {
-        throw new BackendError(`opencode stdin write failed: ${stdinResult.error}`, 'upstream')
-      }
-      let sawError: string | null = null
-      let emittedContent = false
-      let emittedToolCall = false
-      let usage: ChatDelta['usage']
-      const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
+      // The spawner registers a synchronous 'error' listener to prevent
+      // uncaught exceptions on spawn ENOENT/EACCES; we both attach our
+      // own listener (for races where the spawner doesn't expose
+      // spawnError) and consult spawned.spawnError() after first I/O for
+      // the captured event.
+      let spawnErrorMessage = ''
+      child.on('error', (err) => { spawnErrorMessage = err.message })
+      const earlySpawnError = spawned.spawnError?.()
+      if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-      for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
-        if (next.kind === 'progress') {
-          // Subprocess liveness signal — opencode has emitted no stdout
-          // for `progressIntervalMs`. Yield as keepalive so the SSE
-          // writer renders an SSE comment that keeps the socket alive
-          // without injecting a fake OpenAI tool_call into the response.
-          // See ChatDelta.keepalive (backends/types.ts) for the contract.
-          yield {
-            keepalive: { source: 'opencode', elapsedMs: next.elapsedMs },
+      // killTree kicks off the SIGTERM→grace→SIGKILL ladder against the
+      // ENTIRE process group (opencode + everything it forked). We fire
+      // and forget here — the actual await happens in the outer finally
+      // so the generator can still emit a clean final delta.
+      const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
+      const onAbort = (): void => { void killTree(child) }
+      signal.addEventListener('abort', onAbort, { once: true })
+
+      try {
+        let internalSessionId: string | undefined
+        let stderr = ''
+        child.stderr?.on('data', (b) => { stderr += b.toString() })
+        if (spawnErrorMessage) {
+          throw new BackendError(`opencode spawn failed: ${spawnErrorMessage}`, 'upstream')
+        }
+        if (!child.stdout) {
+          throw new BackendError('opencode subprocess has no stdout pipe', 'upstream')
+        }
+        if (!child.stdin) {
+          throw new BackendError('opencode subprocess has no stdin pipe', 'upstream')
+        }
+
+        // Pipe the composed prompt as raw stdin bytes. opencode reads
+        // stdin to EOF as the literal message when no positional argv
+        // is supplied to `run`. See writeStdinPayload comments for the
+        // EPIPE / backpressure contract.
+        const stdinResult = await writeStdinPayload(
+          child.stdin,
+          [{ role: 'user', content: prompt }],
+          { format: 'raw' },
+        )
+        if (!stdinResult.ok) {
+          throw new BackendError(`opencode stdin write failed: ${stdinResult.error}`, 'upstream')
+        }
+        let sawError: string | null = null
+        let emittedContent = false
+        let emittedToolCall = false
+        let usage: ChatDelta['usage']
+        const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
+
+        for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
+          if (next.kind === 'progress') {
+            // Subprocess liveness signal — opencode has emitted no stdout
+            // for `progressIntervalMs`. Yield as keepalive so the SSE
+            // writer renders an SSE comment that keeps the socket alive
+            // without injecting a fake OpenAI tool_call into the response.
+            // See ChatDelta.keepalive (backends/types.ts) for the contract.
+            yield {
+              keepalive: { source: 'opencode', elapsedMs: next.elapsedMs },
+            }
+            continue
           }
-          continue
-        }
 
-        const line = next.line
-        if (!line.trim()) continue
-        let ev: Record<string, unknown>
-        try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
+          const line = next.line
+          if (!line.trim()) continue
+          let ev: Record<string, unknown>
+          try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
 
-        // opencode emits a mix of event types. Session id comes early
-        // on a session.created / session.started event, or as a top
-        // level session field on many events.
-        const sessId = pickSessionId(ev)
-        if (sessId && !internalSessionId) {
-          internalSessionId = sessId
-          yield { internal_session_id: internalSessionId }
-        }
-
-        const type = String(ev.type ?? '')
-        if (type === 'error' || ev.error) {
-          sawError = String(ev.message ?? (ev.error as Record<string, unknown> | undefined)?.message ?? 'opencode error')
-          continue
-        }
-
-        const text = extractText(ev)
-        if (text) {
-          yield { content: text }
-          emittedContent = true
-        }
-        const toolCall = extractToolUse(ev)
-        if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
-        const eventUsage = extractUsage(ev)
-        if (eventUsage) usage = eventUsage
-
-        if (
-          type === 'message.completed'
-          || type === 'turn.completed'
-          || type === 'session.completed'
-          || type === 'run.completed'
-        ) {
-          yield {
-            finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
-            usage,
-            internal_session_id: internalSessionId,
+          // opencode emits a mix of event types. Session id comes early
+          // on a session.created / session.started event, or as a top
+          // level session field on many events.
+          const sessId = pickSessionId(ev)
+          if (sessId && !internalSessionId) {
+            internalSessionId = sessId
+            yield { internal_session_id: internalSessionId }
           }
+
+          const type = String(ev.type ?? '')
+          if (type === 'error' || ev.error) {
+            sawError = String(ev.message ?? (ev.error as Record<string, unknown> | undefined)?.message ?? 'opencode error')
+            continue
+          }
+
+          const text = extractText(ev)
+          if (text) {
+            yield { content: text }
+            emittedContent = true
+          }
+          const toolCall = extractToolUse(ev)
+          if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
+          const eventUsage = extractUsage(ev)
+          if (eventUsage) usage = eventUsage
+
+          if (
+            type === 'message.completed'
+            || type === 'turn.completed'
+            || type === 'session.completed'
+            || type === 'run.completed'
+            || (type === 'step_finish' && !emittedToolCall)
+          ) {
+            yield {
+              finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
+              usage,
+              internal_session_id: internalSessionId,
+            }
+            return
+          }
+        }
+
+        const exitCode = await waitForProcessClose(child)
+
+        if (signal.aborted) {
+          yield { finish_reason: 'error', internal_session_id: internalSessionId }
           return
         }
+        if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
+        if (exitCode !== 0 && exitCode !== null) {
+          throw new BackendError(`opencode exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+        }
+        if (!emittedContent && !emittedToolCall) {
+          throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
+        }
+        yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', usage, internal_session_id: internalSessionId }
+      } finally {
+        clearTimeout(timeoutHandle)
+        signal.removeEventListener('abort', onAbort)
+        // Always tear down the whole subtree before releasing the slot.
+        // killTree is idempotent and waits up to gracefulMs+500 for the
+        // process to actually exit, so by the time we hit releaseSpawner
+        // there's no orphan to leak. Pre-fix this was `child.kill('SIGTERM')`
+        // which left opencode's HTTP-client + MCP children alive.
+        await killTree(child)
+        releaseSpawner()
+        dataHome?.cleanup()
       }
-
-      const exitCode = await waitForProcessClose(child)
-
-      if (signal.aborted) {
-        yield { finish_reason: 'error', internal_session_id: internalSessionId }
-        return
-      }
-      if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
-      if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(`opencode exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
-      }
-      if (!emittedContent && !emittedToolCall) {
-        throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
-      }
-      yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', usage, internal_session_id: internalSessionId }
     } finally {
-      clearTimeout(timeoutHandle)
-      signal.removeEventListener('abort', onAbort)
-      // Always tear down the whole subtree before releasing the slot.
-      // killTree is idempotent and waits up to gracefulMs+500 for the
-      // process to actually exit, so by the time we hit releaseSpawner
-      // there's no orphan to leak. Pre-fix this was `child.kill('SIGTERM')`
-      // which left opencode's HTTP-client + MCP children alive.
-      await killTree(child)
-      releaseSpawner()
+      runSlot.release()
       mcpMaterialized?.cleanup()
     }
+  }
+
+  private async acquireRunSlot(signal: AbortSignal): Promise<{ release(): void }> {
+    if (!this.admission) return { release: () => {} }
+
+    const localLease = await this.admission.acquire(signal)
+    let hostLease: HostSlotLease | null = null
+    try {
+      if (this.hostSlot) {
+        hostLease = await acquireHostSlot(this.hostSlot, signal)
+      }
+      return {
+        release: () => {
+          hostLease?.release()
+          localLease.release()
+        },
+      }
+    } catch (err) {
+      localLease.release()
+      throw err
+    }
+  }
+
+  private prepareDataHome(req: ChatRequest, session: SessionRecord | null): { path: string; cleanup: () => void } | null {
+    const configuredMode = this.opts.dataHomeMode ?? 'inherit'
+    const mode = configuredMode === 'auto'
+      ? (req.session_id ? 'bridge' : 'run')
+      : configuredMode
+    if (mode === 'inherit') return null
+    if (!this.opts.bridgeDataHome) {
+      throw new BackendError('opencode data isolation requires bridgeDataHome', 'not_configured')
+    }
+
+    const root = mode === 'run'
+      ? join(this.opts.bridgeDataHome, 'runs', safePathSegment(session?.externalId ?? randomUUID()))
+      : this.opts.bridgeDataHome
+    const opencodeDir = join(root, 'opencode')
+    mkdirSync(opencodeDir, { recursive: true, mode: 0o700 })
+    this.copyAuthFile(opencodeDir)
+    return {
+      path: root,
+      cleanup: mode === 'run' ? () => { rmSync(root, { recursive: true, force: true }) } : () => {},
+    }
+  }
+
+  private copyAuthFile(opencodeDir: string): void {
+    const source = this.opts.authFile
+    if (!source || !existsSync(source)) return
+
+    const target = join(opencodeDir, 'auth.json')
+    if (existsSync(target)) {
+      const sourceStat = statSync(source)
+      const targetStat = statSync(target)
+      if (sourceStat.size === targetStat.size && sourceStat.mtimeMs <= targetStat.mtimeMs) return
+    }
+    copyFileSync(source, target)
+    chmodSync(target, 0o600)
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
@@ -285,6 +381,10 @@ export class OpencodeBackend implements Backend {
     }
     return null
   }
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_.-]+/g, '_').slice(0, 120) || 'run'
 }
 
 export function opencodeVariantForEffort(effort: ChatRequest['effort']): string | null {

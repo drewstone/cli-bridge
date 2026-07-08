@@ -152,6 +152,10 @@ export async function buildApp(config: Config): Promise<{
     registry.register(new OpencodeBackend({
       bin: config.opencodeBin,
       timeoutMs: config.opencodeTimeoutMs,
+      dataHomeMode: config.opencodeDataHomeMode,
+      bridgeDataHome: config.opencodeBridgeDataHome,
+      authFile: config.opencodeAuthFile,
+      admission: config.opencodeAdmission,
       ...(spawner ? { spawner } : {}),
     }))
   }
@@ -313,6 +317,9 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
     console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue} queueTimeoutMs=${config.admission.queueTimeoutMs}`)
+    if (config.backends.has('opencode')) {
+      console.log(`[cli-bridge] opencode admission: maxActive=${config.opencodeAdmission.maxActive} maxQueue=${config.opencodeAdmission.maxQueue} queueTimeoutMs=${config.opencodeAdmission.queueTimeoutMs} lockDir=${config.opencodeAdmission.lockDir}`)
+    }
     console.log(`[cli-bridge] write-jail default: ${config.jailMode}${config.jailMode === 'write-jail' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
     // Fail fast (don't go ready) if write-jail is the operator floor but no jail
     // backend can run here — every host request would otherwise fail closed while

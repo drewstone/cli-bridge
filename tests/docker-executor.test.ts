@@ -11,6 +11,9 @@
  */
 
 import { Readable, PassThrough } from 'node:stream'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { CodexBackend } from '../src/backends/codex.js'
@@ -24,6 +27,7 @@ import { killTree } from '../src/executors/process-tree.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
 import { writeStdinPayload } from '../src/backends/stdin-payload.js'
+import type { ChatDelta } from '../src/backends/types.js'
 
 // ─── Spawner abstraction ─────────────────────────────────────────────────
 
@@ -522,6 +526,17 @@ interface StubSpawnerHandle {
   releaseCalls: number
 }
 
+interface ControlledOpencodeCall {
+  finish(text: string): void
+}
+
+interface ControlledOpencodeSpawnerHandle {
+  spawner: Spawner
+  calls: ControlledOpencodeCall[]
+  maxConcurrent: number
+  releaseCalls: number
+}
+
 function createStubSpawner(lines: string[]): StubSpawnerHandle {
   const handle: StubSpawnerHandle = {
     spawner: null as never,
@@ -547,6 +562,59 @@ function createStubSpawner(lines: string[]): StubSpawnerHandle {
     return result
   }
   return handle
+}
+
+function createControlledOpencodeSpawner(): ControlledOpencodeSpawnerHandle {
+  const handle: ControlledOpencodeSpawnerHandle = {
+    spawner: null as never,
+    calls: [],
+    maxConcurrent: 0,
+    releaseCalls: 0,
+  }
+  let active = 0
+  handle.spawner = async () => {
+    active += 1
+    handle.maxConcurrent = Math.max(handle.maxConcurrent, active)
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const child = makeFakeChild(stdout, stderr, () => {})
+    handle.calls.push({
+      finish(text: string): void {
+        stdout.write(`${JSON.stringify({ type: 'session.created', session_id: `oc-${handle.calls.length}` })}\n`)
+        stdout.write(`${JSON.stringify({ type: 'message', text })}\n`)
+        stdout.write(`${JSON.stringify({ type: 'run.completed' })}\n`)
+        stdout.end()
+      },
+    })
+    return {
+      child,
+      release: () => {
+        active -= 1
+        handle.releaseCalls += 1
+      },
+    }
+  }
+  return handle
+}
+
+async function collectOpencodeDeltas(backend: OpencodeBackend, content: string): Promise<ChatDelta[]> {
+  const deltas: ChatDelta[] = []
+  const ctrl = new AbortController()
+  for await (const d of backend.chat(
+    { model: 'opencode/zai-coding-plan/glm-5.2', messages: [{ role: 'user', content }] },
+    null,
+    ctrl.signal,
+  )) deltas.push(d)
+  return deltas
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise<void>((resolve) => setTimeout(resolve, 10))
+  }
+  expect(predicate()).toBe(true)
 }
 
 function createDelayedStubSpawner(closeAfterMs: number): StubSpawnerHandle {
@@ -609,6 +677,23 @@ describe('per-backend executor config (parseAllExecutors)', () => {
       maxQueue: 16,
       queueTimeoutMs: 30_000,
     })
+  })
+
+  it('defaults opencode to auto data-home isolation instead of the operator session DB', () => {
+    const config = loadConfig({ HOME: '/home/test' })
+    expect(config.opencodeDataHomeMode).toBe('auto')
+    expect(config.opencodeBridgeDataHome).toBe('/home/test/.local/share/cli-bridge/opencode-data')
+    expect(config.opencodeAuthFile).toBe('/home/test/.local/share/opencode/auth.json')
+    expect(config.opencodeAdmission).toMatchObject({
+      maxActive: 1,
+      maxQueue: 16,
+      queueTimeoutMs: 30_000,
+    })
+    expect(config.opencodeAdmission.lockDir).toContain('cli-bridge-opencode-slots')
+  })
+
+  it('rejects invalid OPENCODE_DATA_HOME_MODE with a clear message', () => {
+    expect(() => loadConfig({ HOME: '/home/test', OPENCODE_DATA_HOME_MODE: 'global' as never })).toThrow(/OPENCODE_DATA_HOME_MODE/)
   })
 
   it('defaults all backends to host when no env is set', () => {
@@ -816,6 +901,147 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(deltas.find((d) => d.internal_session_id === 'oc-1')).toBeDefined()
     expect(stub.observedArgs).not.toContain('--dangerously-skip-permissions')
     expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('OpencodeBackend uses bridge-owned XDG_DATA_HOME and copies auth.json before spawn', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-test-'))
+    try {
+      const authFile = join(temp, 'auth.json')
+      const dataHome = join(temp, 'bridge-data')
+      writeFileSync(authFile, '{"provider":"test"}')
+      const stub = createStubSpawner([
+        JSON.stringify({ type: 'session.created', session_id: 'oc-isolated' }),
+        JSON.stringify({ type: 'message', text: 'isolated opencode' }),
+        JSON.stringify({ type: 'run.completed' }),
+      ])
+      const backend = new OpencodeBackend({
+        bin: 'opencode',
+        timeoutMs: 5000,
+        dataHomeMode: 'bridge',
+        bridgeDataHome: dataHome,
+        authFile,
+        spawner: stub.spawner,
+      })
+      const ctrl = new AbortController()
+      for await (const _d of backend.chat(
+        { model: 'opencode/zai-coding-plan/glm-5.2', messages: [{ role: 'user', content: 'hi' }] },
+        null,
+        ctrl.signal,
+      )) {
+        // drain
+      }
+
+      expect(stub.observedOpts?.env?.XDG_DATA_HOME).toBe(dataHome)
+      expect(existsSync(join(dataHome, 'opencode', 'auth.json'))).toBe(true)
+      expect(stub.releaseCalls).toBe(1)
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
+  it('OpencodeBackend auto-isolates stateless calls into a cleaned per-run data home', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-auto-test-'))
+    try {
+      const authFile = join(temp, 'auth.json')
+      const dataHome = join(temp, 'bridge-data')
+      writeFileSync(authFile, '{"provider":"test"}')
+      const stub = createStubSpawner([
+        JSON.stringify({ type: 'session.created', session_id: 'oc-auto' }),
+        JSON.stringify({ type: 'message', text: 'auto isolated' }),
+        JSON.stringify({ type: 'run.completed' }),
+      ])
+      const backend = new OpencodeBackend({
+        bin: 'opencode',
+        timeoutMs: 5000,
+        dataHomeMode: 'auto',
+        bridgeDataHome: dataHome,
+        authFile,
+        spawner: stub.spawner,
+      })
+      const ctrl = new AbortController()
+      for await (const _d of backend.chat(
+        { model: 'opencode/zai-coding-plan/glm-5.2', messages: [{ role: 'user', content: 'hi' }] },
+        null,
+        ctrl.signal,
+      )) {
+        // drain
+      }
+
+      const observedDataHome = stub.observedOpts?.env?.XDG_DATA_HOME
+      expect(observedDataHome).toContain(join(dataHome, 'runs'))
+      expect(existsSync(observedDataHome!)).toBe(false)
+      expect(stub.releaseCalls).toBe(1)
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
+  it('OpencodeBackend serializes concurrent runs through a host-wide admission slot', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-slot-test-'))
+    try {
+      const stub = createControlledOpencodeSpawner()
+      const backend = new OpencodeBackend({
+        bin: 'opencode',
+        timeoutMs: 5000,
+        admission: {
+          maxActive: 1,
+          maxQueue: 4,
+          queueTimeoutMs: 5000,
+          lockDir: temp,
+        },
+        spawner: stub.spawner,
+      })
+      const first = collectOpencodeDeltas(backend, 'first')
+      await waitFor(() => stub.calls.length === 1)
+
+      const second = collectOpencodeDeltas(backend, 'second')
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      expect(stub.calls.length).toBe(1)
+
+      stub.calls[0]!.finish('one')
+      const firstDeltas = await first
+      await waitFor(() => stub.calls.length === 2)
+      stub.calls[1]!.finish('two')
+      const secondDeltas = await second
+
+      expect(firstDeltas.find((d) => d.content === 'one')).toBeDefined()
+      expect(secondDeltas.find((d) => d.content === 'two')).toBeDefined()
+      expect(stub.maxConcurrent).toBe(1)
+      expect(stub.releaseCalls).toBe(2)
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
+  it('OpencodeBackend treats no-tool step_finish as terminal on OpenCode 1.17 streams', async () => {
+    const stub = createStubSpawner([
+      JSON.stringify({ type: 'session.created', session_id: 'oc-step-finish' }),
+      JSON.stringify({ type: 'text', sessionID: 'oc-step-finish', part: { type: 'text', text: 'OK' } }),
+      JSON.stringify({
+        type: 'step_finish',
+        sessionID: 'oc-step-finish',
+        part: {
+          type: 'step-finish',
+          reason: 'stop',
+          tokens: { input: 10, output: 1 },
+        },
+      }),
+    ])
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const deltas: ChatDelta[] = []
+    for await (const d of backend.chat(
+      { model: 'opencode/zai-coding-plan/glm-5.2', messages: [{ role: 'user', content: 'hi' }] },
+      null,
+      ctrl.signal,
+    )) deltas.push(d)
+
+    expect(deltas.find((d) => d.content === 'OK')).toBeDefined()
+    expect(deltas.at(-1)).toMatchObject({
+      finish_reason: 'stop',
+      usage: { input_tokens: 10, output_tokens: 1 },
+      internal_session_id: 'oc-step-finish',
+    })
   })
 
   it('OpencodeBackend pipes the prompt via stdin, never argv (E2BIG regression)', async () => {

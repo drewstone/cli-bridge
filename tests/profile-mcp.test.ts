@@ -1,130 +1,36 @@
 /**
- * Unit tests for `materializeMcpConfig` + `buildMcpAllowList` in
+ * Unit tests for the MCP materializers + `buildMcpAllowList` in
  * profile-support.ts. Verifies:
  *
- *   - profiles without `.mcp` produce null (no temp file written)
  *   - explicitly disabled servers (enabled: false) are dropped
- *   - claude/kimi materialization preserves stdio MCP servers and drops
- *     remote http/sse servers from their shared `mcp-config.json` shape
- *   - the produced JSON matches claude/kimi's expected
- *     `{ mcpServers: { name: { command, args, env } } }` shape
+ *   - claude/kimi materialization preserves stdio MCP servers and forwards
+ *     remote http/sse servers in the shared `mcp-config.json` shape
+ *   - the produced JSON matches the expected per-harness shape
  *   - `cleanup()` is idempotent and removes the temp dir
  *   - allow-list builder produces the `mcp__<server>` glob format
+ *   - the cwd-native (gemini/factory) + inline (acp) builders emit each
+ *     CLI's schema
  */
 
 import { describe, expect, it } from 'vitest'
 import { execSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
+  buildAcpMcpServers,
   buildMcpAllowList,
   isStdioMcpSpec,
-  materializeMcpConfig,
-  materializeMcpServersForClaudeKimi,
+  writeMcpConfigFile,
   materializeMcpServersForCodex,
+  materializeMcpServersForFactory,
+  materializeMcpServersForGemini,
   materializeMcpServersForOpencode,
   materializeMcpServersForPi,
-  materializeOpencodeMcpConfig,
   resolveMcpServers,
 } from '../src/backends/profile-support.js'
 import type { ChatRequest } from '../src/backends/types.js'
-
-describe('materializeMcpConfig', () => {
-  it('returns null when the profile has no mcp section', () => {
-    expect(materializeMcpConfig(null)).toBeNull()
-    expect(materializeMcpConfig({} as AgentProfile)).toBeNull()
-    expect(materializeMcpConfig({ name: 'p' } as AgentProfile)).toBeNull()
-  })
-
-  it('returns null when every entry is filtered out', () => {
-    const profile: AgentProfile = {
-      mcp: {
-        'disabled-stdio': { command: '/usr/bin/foo', enabled: false },
-      },
-    }
-    expect(materializeMcpConfig(profile)).toBeNull()
-  })
-
-  it('writes a claude/kimi-shaped mcp-config.json for stdio servers', () => {
-    const profile: AgentProfile = {
-      mcp: {
-        coordinator: {
-          command: 'tsx',
-          args: ['/absolute/path/coordinator-mcp.ts'],
-          env: { OUTDIR: '/tmp/x', SCENARIO: 'foo' },
-        },
-        // Mixed in a disabled entry to confirm it doesn't leak.
-        ignored: { command: 'echo', enabled: false },
-      },
-    }
-    const m = materializeMcpConfig(profile)
-    expect(m).not.toBeNull()
-    if (!m) return
-    expect(m.serverNames).toEqual(['coordinator'])
-    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
-    expect(written).toEqual({
-      mcpServers: {
-        coordinator: {
-          command: 'tsx',
-          args: ['/absolute/path/coordinator-mcp.ts'],
-          env: { OUTDIR: '/tmp/x', SCENARIO: 'foo' },
-        },
-      },
-    })
-    m.cleanup()
-    expect(existsSync(m.configPath)).toBe(false)
-  })
-
-  it('cleanup() is idempotent — second call must not throw even if the dir is gone', () => {
-    const profile: AgentProfile = {
-      mcp: { foo: { command: 'tsx', args: ['x.ts'] } },
-    }
-    const m = materializeMcpConfig(profile)
-    expect(m).not.toBeNull()
-    if (!m) return
-    m.cleanup()
-    expect(() => m.cleanup()).not.toThrow()
-  })
-
-  it('drops malformed entries silently rather than throwing', () => {
-    const profile = {
-      mcp: {
-        'no-command': { args: ['x'] },
-        'bad-command-type': { command: 123 as never },
-        'string-instead-of-object': 'oops' as never,
-        'good': { command: 'tsx', args: ['x.ts'] },
-      },
-    } as unknown as AgentProfile
-    const m = materializeMcpConfig(profile)
-    expect(m).not.toBeNull()
-    if (!m) return
-    expect(m.serverNames).toEqual(['good'])
-    m.cleanup()
-  })
-})
-
-describe('materializeOpencodeMcpConfig', () => {
-  it('writes headless permissions even when no MCP servers are declared', () => {
-    const m = materializeOpencodeMcpConfig(null)
-    expect(m).not.toBeNull()
-    if (!m) return
-    expect(m.serverNames).toEqual([])
-
-    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
-    expect(written.permission).toMatchObject({
-      external_directory: 'allow',
-      bash: 'allow',
-      edit: 'allow',
-      read: 'allow',
-      write: 'allow',
-      webfetch: 'allow',
-    })
-    expect(written.mcp).toEqual({})
-    m.cleanup()
-    expect(existsSync(m.configPath)).toBe(false)
-  })
-})
 
 describe('buildMcpAllowList', () => {
   it('formats each name as mcp__<name> joined by commas', () => {
@@ -224,9 +130,9 @@ describe('isStdioMcpSpec', () => {
   })
 })
 
-describe('materializeMcpServersForClaudeKimi', () => {
+describe('writeMcpConfigFile', () => {
   it('writes the canonical {mcpServers:{...}} JSON shape with stdio + remote servers', () => {
-    const m = materializeMcpServersForClaudeKimi({
+    const m = writeMcpConfigFile({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, timeout: 5000 },
       remote: { type: 'http', url: 'https://example.com', headers: { Authorization: 'Bearer X' } },
     })
@@ -247,7 +153,7 @@ describe('materializeMcpServersForClaudeKimi', () => {
   })
 
   it('returns null when given a null map (no entries at all)', () => {
-    expect(materializeMcpServersForClaudeKimi(null)).toBeNull()
+    expect(writeMcpConfigFile(null)).toBeNull()
   })
 })
 
@@ -610,5 +516,105 @@ describe('materializeMcpServersForCodex', () => {
     if (!m) return
     expect(m.serverNames).toEqual(['good-name'])
     m.cleanup()
+  })
+})
+
+describe('materializeMcpServersForGemini', () => {
+  it('writes remote http servers under httpUrl + trust into <cwd>/.gemini/settings.json', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cb-gem-mcp-'))
+    try {
+      const m = materializeMcpServersForGemini({
+        youcom: { type: 'http', url: 'https://you.example/mcp', headers: { Authorization: 'Bearer X' } },
+      }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      expect(m.configPath).toBe(join(cwd, '.gemini', 'settings.json'))
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(written.mcpServers).toEqual({
+        youcom: { httpUrl: 'https://you.example/mcp', headers: { Authorization: 'Bearer X' }, trust: true },
+      })
+      m.cleanup()
+      expect(existsSync(m.configPath)).toBe(false)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('writes stdio servers as command/args/env and preserves an existing settings key on merge', () => {
+    const fs = require('node:fs') as typeof import('node:fs')
+    const cwd = mkdtempSync(join(tmpdir(), 'cb-gem-mcp-'))
+    try {
+      fs.mkdirSync(join(cwd, '.gemini'))
+      fs.writeFileSync(join(cwd, '.gemini', 'settings.json'), JSON.stringify({ theme: 'dark' }))
+      const m = materializeMcpServersForGemini({ echo: { command: 'node', args: ['e.js'], env: { A: 'b' } } }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(written.theme).toBe('dark')
+      expect(written.mcpServers.echo).toEqual({ command: 'node', args: ['e.js'], env: { A: 'b' }, trust: true })
+      m.cleanup()
+      // Original settings restored verbatim (no mcpServers key).
+      expect(JSON.parse(readFileSync(m.configPath, 'utf-8'))).toEqual({ theme: 'dark' })
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null when no usable servers remain', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cb-gem-mcp-'))
+    try {
+      expect(materializeMcpServersForGemini(null, cwd)).toBeNull()
+      expect(materializeMcpServersForGemini({ off: { command: 'x', enabled: false } }, cwd)).toBeNull()
+      expect(existsSync(join(cwd, '.gemini'))).toBe(false)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('materializeMcpServersForFactory', () => {
+  it('writes droid mcp.json shape (type + disabled) into <cwd>/.factory/mcp.json', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cb-fac-mcp-'))
+    try {
+      const m = materializeMcpServersForFactory({
+        youcom: { type: 'http', url: 'https://you.example/mcp', headers: { Authorization: 'Bearer X' } },
+        echo: { command: 'node', args: ['e.js'] },
+      }, cwd)
+      expect(m).not.toBeNull()
+      if (!m) return
+      expect(m.configPath).toBe(join(cwd, '.factory', 'mcp.json'))
+      const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      expect(written.mcpServers.youcom).toEqual({
+        type: 'http', url: 'https://you.example/mcp', headers: { Authorization: 'Bearer X' }, disabled: false,
+      })
+      expect(written.mcpServers.echo).toEqual({ type: 'stdio', command: 'node', args: ['e.js'], disabled: false })
+      m.cleanup()
+      expect(existsSync(join(cwd, '.factory'))).toBe(false)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('buildAcpMcpServers', () => {
+  it('emits remote servers with type + list-shaped headers (ACP HttpMcpServer schema)', () => {
+    expect(buildAcpMcpServers({
+      youcom: { type: 'http', url: 'https://you.example/mcp', headers: { Authorization: 'Bearer X' } },
+    })).toEqual([
+      { type: 'http', name: 'youcom', url: 'https://you.example/mcp', headers: [{ name: 'Authorization', value: 'Bearer X' }] },
+    ])
+  })
+
+  it('emits stdio servers with list-shaped env and drops disabled entries', () => {
+    expect(buildAcpMcpServers({
+      echo: { command: 'node', args: ['e.js'], env: { A: 'b' } },
+      off: { command: 'x', enabled: false },
+    })).toEqual([
+      { name: 'echo', command: 'node', args: ['e.js'], env: [{ name: 'A', value: 'b' }] },
+    ])
+  })
+
+  it('returns an empty array for a null map', () => {
+    expect(buildAcpMcpServers(null)).toEqual([])
   })
 })

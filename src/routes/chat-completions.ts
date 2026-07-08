@@ -405,7 +405,7 @@ export function mountChatCompletions(
             } satisfies ChatDelta
           }
         } catch (err) {
-          if (err instanceof ModeNotSupportedError || err instanceof BackendError) {
+          if (err instanceof ModeNotSupportedError || err instanceof BackendError || err instanceof AdmissionRejectedError) {
             throw err
           }
           yield { finish_reason: 'error' } satisfies ChatDelta

@@ -82,55 +82,43 @@ export function resolveMcpServers(
   return Object.keys(merged).length > 0 ? merged : null
 }
 
-function profileMcpToSpec(raw: AgentProfileMcpServer): McpServerSpec {
-  // AgentProfileMcpServer uses `transport`; McpServerSpec uses `type`.
-  // Rename and forward only the fields we model.
-  const out: McpServerSpec = {}
-  if (raw.transport) out.type = raw.transport
-  if (typeof raw.command === 'string') out.command = raw.command
-  if (Array.isArray(raw.args)) out.args = raw.args.filter((a): a is string => typeof a === 'string')
-  if (raw.env && typeof raw.env === 'object') {
-    out.env = Object.fromEntries(
-      Object.entries(raw.env).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
-  }
-  if (typeof raw.url === 'string') out.url = raw.url
-  if (raw.headers && typeof raw.headers === 'object') {
-    out.headers = Object.fromEntries(
-      Object.entries(raw.headers).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
-  }
-  if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled
-  const timeoutRaw = (raw as { timeout?: unknown }).timeout
-  if (typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0) {
-    out.timeout = timeoutRaw
-  }
-  return out
+function stringRecord(value: unknown): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).filter(([, v]) => typeof v === 'string'),
+  ) as Record<string, string>
 }
 
-function normalizeMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): McpServerSpec {
-  // Defensive copy — drop any unknown fields, coerce types loosely.
-  const r = raw as Record<string, unknown>
+/**
+ * Copy the fields we model from a loose record into a normalized
+ * `McpServerSpec`, dropping unknown fields and coercing types loosely.
+ * Both `profileMcpToSpec` (AgentProfileMcpServer, after its
+ * `transport`→`type` rename) and `normalizeMcpServerSpec` (request-body
+ * spec) delegate here — the only per-source difference is the input
+ * typing and the transport rename, not the field set.
+ */
+function copyMcpSpecFields(r: Record<string, unknown>): McpServerSpec {
   const out: McpServerSpec = {}
   if (r.type === 'stdio' || r.type === 'http' || r.type === 'sse') out.type = r.type
   if (typeof r.command === 'string') out.command = r.command
   if (Array.isArray(r.args)) out.args = (r.args as unknown[]).filter((a): a is string => typeof a === 'string')
-  if (r.env && typeof r.env === 'object') {
-    out.env = Object.fromEntries(
-      Object.entries(r.env as Record<string, unknown>).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
-  }
+  if (r.env && typeof r.env === 'object') out.env = stringRecord(r.env)
   if (typeof r.url === 'string') out.url = r.url
-  if (r.headers && typeof r.headers === 'object') {
-    out.headers = Object.fromEntries(
-      Object.entries(r.headers as Record<string, unknown>).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
-  }
+  if (r.headers && typeof r.headers === 'object') out.headers = stringRecord(r.headers)
   if (typeof r.enabled === 'boolean') out.enabled = r.enabled
-  if (typeof r.timeout === 'number' && Number.isFinite(r.timeout) && r.timeout > 0) {
-    out.timeout = r.timeout
-  }
+  if (typeof r.timeout === 'number' && Number.isFinite(r.timeout) && r.timeout > 0) out.timeout = r.timeout
   return out
+}
+
+function profileMcpToSpec(raw: AgentProfileMcpServer): McpServerSpec {
+  // AgentProfileMcpServer uses `transport`; McpServerSpec uses `type`.
+  // Pre-map the rename, then share the field copier.
+  const r: Record<string, unknown> = { ...(raw as Record<string, unknown>) }
+  if (raw.transport) r.type = raw.transport
+  return copyMcpSpecFields(r)
+}
+
+function normalizeMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): McpServerSpec {
+  return copyMcpSpecFields(raw as Record<string, unknown>)
 }
 
 /**
@@ -148,7 +136,7 @@ export function isStdioMcpSpec(spec: McpServerSpec): boolean {
 
 /**
  * Materialize an `AgentProfile.mcp` map into a temp JSON file in the
- * canonical claude/kimi mcp-config shape:
+ * standard mcp-config.json shape (any CLI that takes --mcp-config-file):
  *
  *   { "mcpServers": { name: {command, args, env}, ... } }
  *
@@ -172,20 +160,37 @@ export interface MaterializedMcpConfig {
   cleanup(): void
 }
 
-export function materializeMcpConfig(profile: AgentProfile | null): MaterializedMcpConfig | null {
-  if (!profile || typeof profile !== 'object') return null
-  const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
-  if (!mcp || typeof mcp !== 'object') return null
-  const specs: Record<string, McpServerSpec> = {}
-  for (const [name, raw] of Object.entries(mcp)) {
-    if (!name || !raw || typeof raw !== 'object') continue
-    specs[name] = profileMcpToSpec(raw)
+/**
+ * Create a private temp dir and write one config file into it. Shared FS
+ * boilerplate for every temp-file materializer — the per-harness schema
+ * transform is the caller's; only the mkdtemp → write → best-effort
+ * cleanup scaffold is common here. `parentDir` overrides the tmpdir root
+ * (codex needs `~/.cache` so its "CODEX_HOME not under /tmp" guard passes).
+ */
+function writeTempConfigDir(
+  prefix: string,
+  filename: string,
+  bytes: string,
+  parentDir: string = tmpdir(),
+): { dir: string; path: string; cleanup(): void } {
+  const dir = mkdtempSync(join(parentDir, prefix))
+  const path = join(dir, filename)
+  writeFileSync(path, bytes)
+  return {
+    dir,
+    path,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best-effort cleanup
+      }
+    },
   }
-  return materializeMcpServersForClaudeKimi(specs)
 }
 
 /**
- * Write the canonical claude/kimi `mcp-config.json` shape from a
+ * Write the standard `mcp-config.json` shape from a
  * normalized `McpServerSpec` map. Filters out disabled entries.
  *
  * Both stdio and remote (http/sse) transports are emitted: Claude Code's
@@ -211,7 +216,7 @@ export function materializeMcpConfig(profile: AgentProfile | null): Materialized
  * Build the canonical `mcpServers` object from a normalized spec map:
  * stdio entries as `{command, args, env, timeout}`, remote http/sse
  * entries as `{type, url, headers, timeout}`. Disabled and malformed
- * entries are dropped. Shared by the claude/kimi temp-file materializer
+ * entries are dropped. Shared by the config-file materializer (claude, kimi)
  * and the pi workspace materializer (pi-mcp-adapter reads the same
  * `{mcpServers}` shape from `.mcp.json` / `.pi/mcp.json`).
  */
@@ -243,7 +248,7 @@ export function buildCanonicalMcpServers(
   return mcpServers
 }
 
-export function materializeMcpServersForClaudeKimi(
+export function writeMcpConfigFile(
   specs: Record<string, McpServerSpec> | null,
 ): MaterializedMcpConfig | null {
   if (!specs) return null
@@ -254,20 +259,8 @@ export function materializeMcpServersForClaudeKimi(
   }
   if (serverNames.length === 0) return null
 
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
-  const configPath = join(dir, 'mcp-config.json')
-  writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2))
-  return {
-    configPath,
-    serverNames,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
-  }
+  const { path, cleanup } = writeTempConfigDir('cli-bridge-mcp-', 'mcp-config.json', JSON.stringify({ mcpServers }, null, 2))
+  return { configPath: path, serverNames, cleanup }
 }
 
 /**
@@ -329,25 +322,53 @@ function writeFileNoFollow(path: string, bytes: string): void {
   }
 }
 
-export function materializeMcpServersForPi(
-  specs: Record<string, McpServerSpec> | null,
+/**
+ * Mount a `{mcpServers}` object into a CWD-NATIVE config file
+ * (`<cwd>/<subdir>/<filename>`) that a CLI discovers by working directory
+ * rather than a per-invocation flag. Shared by every cwd-native MCP
+ * backend — pi (`.pi/mcp.json`), gemini (`.gemini/settings.json`), and
+ * droid/factory (`.factory/mcp.json`) — because the FS discipline is
+ * identical; only the schema of the `mcpServers` values differs, and the
+ * caller has already transformed those.
+ *
+ * The file lives in the run workspace, not a temp dir, because the CLI
+ * discovers config by cwd. When the file already exists (caller-
+ * provisioned workspace, or the user's own project settings), the
+ * requested servers are merged into its `mcpServers` map (request wins on
+ * name collisions) and every other top-level key is preserved; the
+ * mount's `cleanup()` restores the original bytes verbatim, otherwise it
+ * removes the file and, when this mount created it, the `<subdir>`
+ * directory. This is why the user's own `~/.factory/mcp.json` or
+ * `~/.gemini/settings.json` is never touched — we only write the
+ * project-scoped file the CLI layers on top.
+ *
+ * Concurrency: the CLI discovers config strictly by cwd, so two
+ * overlapping runs in one workspace would either share request-scoped
+ * server definitions (leaking one run's tools/secrets into the other) or
+ * race on restore. Neither is acceptable — a `<filename>.lock` file
+ * (O_EXCL, holds `{pid, originalBytes}`) enforces ONE active MCP mount
+ * per cwd across processes. A second overlapping mount fails loud with
+ * instructions to use distinct cwds; a lock whose pid is dead is stolen
+ * (crashed run) after rolling the workspace back to its recorded
+ * pre-mount state.
+ *
+ * Returns null when `mcpServers` is empty.
+ */
+function mountCwdNativeMcp(
   cwd: string,
+  opts: { subdir: string; filename: string; backendName: string; mcpServers: Record<string, unknown> },
 ): MaterializedMcpConfig | null {
-  if (!specs) return null
-  const mcpServers = buildCanonicalMcpServers(specs)
+  const { subdir, filename, backendName, mcpServers } = opts
   const serverNames = Object.keys(mcpServers)
-  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
-    console.error(`[cli-bridge mcp pi] materialized servers: ${serverNames.join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
-  }
   if (serverNames.length === 0) return null
 
-  const piDir = join(cwd, '.pi')
-  const configPath = join(piDir, 'mcp.json')
+  const piDir = join(cwd, subdir)
+  const configPath = join(piDir, filename)
   const lockPath = `${configPath}.lock`
 
   const fail = (detail: string): never => {
     throw new BackendError(
-      `backend pi failed to prepare MCP config at ${configPath}: ${detail}`,
+      `backend ${backendName} failed to prepare MCP config at ${configPath}: ${detail}`,
       'not_configured',
     )
   }
@@ -441,16 +462,16 @@ export function materializeMcpServersForPi(
       // live mount mid-run; a human (or a dead-pid check on a later
       // retry) resolves genuine corruption.
       throw new BackendError(
-        `backend pi cannot mount MCP servers at ${configPath}: lock file ${lockPath} exists but is `
-        + `unreadable; if no pi run is active in this cwd, remove it manually`,
+        `backend ${backendName} cannot mount MCP servers at ${configPath}: lock file ${lockPath} exists but is `
+        + `unreadable; if no ${backendName} run is active in this cwd, remove it manually`,
         'not_configured',
       )
     }
     const holderPid = stale?.pid ?? null
     if (holderPid === null || pidAlive(holderPid)) {
       throw new BackendError(
-        `backend pi cannot mount MCP servers at ${configPath}: another run${holderPid !== null ? ` (pid ${holderPid})` : ''} holds the `
-        + `mount for this cwd; pi supports one MCP-mounted run per workspace — use distinct cwds`,
+        `backend ${backendName} cannot mount MCP servers at ${configPath}: another run${holderPid !== null ? ` (pid ${holderPid})` : ''} holds the `
+        + `mount for this cwd; ${backendName} supports one MCP-mounted run per workspace — use distinct cwds`,
         'not_configured',
       )
     }
@@ -540,14 +561,14 @@ export function materializeMcpServersForPi(
         // releasing it now would let the tampered config masquerade as
         // workspace-original state.
         if (process.env.CLI_BRIDGE_DEBUG_MCP) {
-          console.error(`[cli-bridge mcp pi] cleanup restore failed for ${configPath}; keeping lock: ${err instanceof Error ? err.message : String(err)}`)
+          console.error(`[cli-bridge mcp ${backendName}] cleanup restore failed for ${configPath}; keeping lock: ${err instanceof Error ? err.message : String(err)}`)
         }
         return
       }
       releaseLock()
       try {
-        // Only remove `.pi` when this run created it AND nothing else
-        // landed in it meanwhile (rmdirSync refuses non-empty dirs).
+        // Only remove `<subdir>` when this run created it AND nothing
+        // else landed in it meanwhile (rmdirSync refuses non-empty dirs).
         if (originalBytes === null && createdDir) rmdirSync(piDir)
       } catch {
         // best-effort cleanup
@@ -557,29 +578,164 @@ export function materializeMcpServersForPi(
 }
 
 /**
- * Same as `materializeMcpConfig` but writes opencode's schema —
- * `{mcp: {<name>: {type:'local', command:[...], environment:{...}, enabled, timeout}}}`
- * instead of claude/kimi's `{mcpServers: {<name>: {command, args, env}}}`.
+ * Materialize MCP servers for the pi backend by writing the canonical
+ * `{mcpServers}` JSON to `<cwd>/.pi/mcp.json` — pi's project-level MCP
+ * override file, read by the `pi-mcp-adapter` extension (pi's CLI has no
+ * `--mcp-config` flag; the adapter's config discovery is the only
+ * per-invocation MCP path). Delegates the cwd-native FS discipline
+ * (merge, lock, no-follow write, cleanup) to `mountCwdNativeMcp`.
  *
- * opencode-cli loads the file via the `OPENCODE_CONFIG` env var (which
- * cli-bridge's opencode backend sets when it spawns the CLI). The file
- * is layered on top of the user's global ~/.config/opencode/opencode.json,
- * so we only need to declare the MCP servers we want to add.
- *
- * Schema source: https://opencode.ai/config.json (`properties.mcp.additionalProperties`).
+ * Callers MUST verify the adapter is installed BEFORE mounting (see
+ * `piMcpAdapterAvailable` in backends/pi.ts) — writing config a runner
+ * never reads would recreate the silent-drop bug this exists to fix.
  */
-export function materializeOpencodeMcpConfig(profile: AgentProfile | null): MaterializedMcpConfig {
-  const specs: Record<string, McpServerSpec> = {}
-  if (profile && typeof profile === 'object') {
-    const mcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
-    if (mcp && typeof mcp === 'object') {
-      for (const [name, raw] of Object.entries(mcp)) {
-        if (!name || !raw || typeof raw !== 'object') continue
-        specs[name] = profileMcpToSpec(raw)
+export function materializeMcpServersForPi(
+  specs: Record<string, McpServerSpec> | null,
+  cwd: string,
+): MaterializedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers = buildCanonicalMcpServers(specs)
+  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
+    console.error(`[cli-bridge mcp pi] materialized servers: ${Object.keys(mcpServers).join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
+  }
+  return mountCwdNativeMcp(cwd, { subdir: '.pi', filename: 'mcp.json', backendName: 'pi', mcpServers })
+}
+
+/**
+ * Build the Gemini CLI `mcpServers` object from a normalized spec map.
+ * Gemini's settings.json uses a DIFFERENT remote key than the canonical
+ * shape: HTTP endpoints go under `httpUrl` (not `url`), SSE endpoints
+ * under `url`; both take a `headers` object. `trust: true` is set so the
+ * CLI does not block a headless run on a per-tool confirmation prompt.
+ * stdio servers use `{command, args, env}`. Disabled/malformed entries
+ * are dropped.
+ */
+function buildGeminiMcpServers(specs: Record<string, McpServerSpec>): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {}
+  for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
+    if (isStdioMcpSpec(spec) && spec.command) {
+      out[name] = {
+        command: spec.command,
+        ...(spec.args && spec.args.length ? { args: spec.args } : {}),
+        ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+        trust: true,
+      }
+    } else if (spec.type === 'http' && spec.url) {
+      out[name] = {
+        httpUrl: spec.url,
+        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+        trust: true,
+      }
+    } else if (spec.type === 'sse' && spec.url) {
+      out[name] = {
+        url: spec.url,
+        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
+        trust: true,
       }
     }
   }
-  return materializeMcpServersForOpencode(specs)
+  return out
+}
+
+/**
+ * Materialize MCP servers for the gemini backend by merging them into the
+ * project-scope `<cwd>/.gemini/settings.json`, which Gemini CLI layers on
+ * top of the user's global `~/.gemini/settings.json`. cwd-native (no
+ * per-invocation MCP flag), so it shares pi's lock + no-follow discipline
+ * via `mountCwdNativeMcp`; every non-`mcpServers` settings key already in
+ * the file is preserved. Returns null when no usable servers remain.
+ */
+export function materializeMcpServersForGemini(
+  specs: Record<string, McpServerSpec> | null,
+  cwd: string,
+): MaterializedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers = buildGeminiMcpServers(specs)
+  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
+    console.error(`[cli-bridge mcp gemini] materialized servers: ${Object.keys(mcpServers).join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
+  }
+  return mountCwdNativeMcp(cwd, { subdir: '.gemini', filename: 'settings.json', backendName: 'gemini', mcpServers })
+}
+
+/**
+ * Build the droid (Factory) `mcpServers` object. droid's `mcp.json` is
+ * nearly canonical — stdio entries carry an explicit `type:'stdio'` and
+ * every entry an explicit `disabled:false`, both of which the canonical
+ * shape omits. Remote entries are `{type:'http'|'sse', url, headers}`.
+ */
+function buildFactoryMcpServers(specs: Record<string, McpServerSpec>): Record<string, Record<string, unknown>> {
+  const out: Record<string, Record<string, unknown>> = {}
+  for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
+    if (isStdioMcpSpec(spec) && spec.command) {
+      out[name] = {
+        type: 'stdio',
+        command: spec.command,
+        args: spec.args ?? [],
+        ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
+        disabled: false,
+      }
+    } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
+      out[name] = {
+        type: spec.type,
+        url: spec.url,
+        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
+        disabled: false,
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * Materialize MCP servers for the droid/Factory backend by merging them
+ * into the project-scope `<cwd>/.factory/mcp.json`, which `droid exec`
+ * discovers by cwd (verified against the CLI: config candidates include
+ * `join(cwd, '.factory', 'mcp.json')`). This never touches the user's
+ * `~/.factory/mcp.json`. cwd-native, so it shares pi's lock + no-follow
+ * discipline via `mountCwdNativeMcp`. Returns null when no usable servers
+ * remain.
+ */
+export function materializeMcpServersForFactory(
+  specs: Record<string, McpServerSpec> | null,
+  cwd: string,
+): MaterializedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers = buildFactoryMcpServers(specs)
+  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
+    console.error(`[cli-bridge mcp factory] materialized servers: ${Object.keys(mcpServers).join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
+  }
+  return mountCwdNativeMcp(cwd, { subdir: '.factory', filename: 'mcp.json', backendName: 'factory', mcpServers })
+}
+
+/**
+ * Build the ACP `session/new` `mcpServers` param array from a normalized
+ * spec map. ACP takes MCP servers INLINE as a JSON-RPC param (no temp
+ * file). The schema (verified live against `hermes acp`, protocol v1)
+ * differs from the config-file shapes:
+ *   - remote:  `{type:'http'|'sse', name, url, headers:[{name,value}]}`
+ *   - stdio:   `{name, command, args, env:[{name,value}]}`
+ * Note `headers`/`env` are LISTS of `{name,value}` pairs, not objects.
+ * Disabled/malformed entries are dropped.
+ */
+export function buildAcpMcpServers(specs: Record<string, McpServerSpec> | null): Array<Record<string, unknown>> {
+  if (!specs) return []
+  const pairs = (map: Record<string, string> | undefined): Array<{ name: string; value: string }> =>
+    Object.entries(map ?? {}).map(([name, value]) => ({ name, value }))
+  const out: Array<Record<string, unknown>> = []
+  for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
+    if (isStdioMcpSpec(spec) && spec.command) {
+      out.push({ name, command: spec.command, args: spec.args ?? [], env: pairs(spec.env) })
+    } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
+      out.push({ type: spec.type, name, url: spec.url, headers: pairs(spec.headers) })
+    }
+  }
+  return out
 }
 
 /**
@@ -632,8 +788,6 @@ export function materializeMcpServersForOpencode(
   }
   const serverNames = Object.keys(opencodeMcp)
 
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-'))
-  const configPath = join(dir, 'opencode.json')
   // Headless benchmark and automation runs must never block on an
   // interactive permission prompt.
   const headlessPermission: Record<string, 'allow' | 'ask' | 'deny'> = {
@@ -648,39 +802,17 @@ export function materializeMcpServersForOpencode(
     plan_exit: 'allow',
     question: 'allow',
   }
-  writeFileSync(configPath, JSON.stringify({
+  const { path, cleanup } = writeTempConfigDir('cli-bridge-opencode-', 'opencode.json', JSON.stringify({
     $schema: 'https://opencode.ai/config.json',
     permission: headlessPermission,
     mcp: opencodeMcp,
   }, null, 2))
-  return {
-    configPath,
-    serverNames,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
-  }
+  return { configPath: path, serverNames, cleanup }
 }
 
 export function materializeEmptyMcpConfig(): MaterializedMcpConfig {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
-  const configPath = join(dir, 'mcp-config.json')
-  writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2))
-  return {
-    configPath,
-    serverNames: [],
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
-  }
+  const { path, cleanup } = writeTempConfigDir('cli-bridge-mcp-', 'mcp-config.json', JSON.stringify({ mcpServers: {} }))
+  return { configPath: path, serverNames: [], cleanup }
 }
 
 /**
@@ -763,8 +895,12 @@ export function materializeMcpServersForCodex(
 
   // Codex aborts if CODEX_HOME is under the system tmpdir on some
   // platforms — use the user's HOME/.cache as a stable parent.
-  const baseDir = mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
-  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n')
+  const { dir: baseDir, cleanup } = writeTempConfigDir(
+    'cli-bridge-codex-',
+    'config.toml',
+    lines.join('\n\n') + '\n',
+    stableTmpRoot(),
+  )
 
   if (authSourcePath) {
     try {
@@ -777,17 +913,7 @@ export function materializeMcpServersForCodex(
     }
   }
 
-  return {
-    homePath: baseDir,
-    serverNames,
-    cleanup: () => {
-      try {
-        rmSync(baseDir, { recursive: true, force: true })
-      } catch {
-        // best-effort
-      }
-    },
-  }
+  return { homePath: baseDir, serverNames, cleanup }
 }
 
 function stableTmpRoot(): string {

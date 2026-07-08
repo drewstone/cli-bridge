@@ -59,9 +59,9 @@ import type { Spawner, SpawnResult } from './types.js'
 
 const SLICE = 'cli-bridge-llm.slice'
 const DEFAULT_SCOPE_TASKS_MAX = 128
-const DEFAULT_SCOPE_MEMORY_MAX = '3G'
+const DEFAULT_SCOPE_MEMORY_MAX = '4G'
 const DEFAULT_SCOPE_RUNTIME_MAX_SEC = 7200
-const DEFAULT_SCOPE_MAX_CONCURRENCY = 4
+const DEFAULT_SCOPE_MAX_CONCURRENCY = 16
 const DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS = 60_000
 const SYSTEMD_RUN_BIN = existsSync('/usr/bin/systemd-run') ? '/usr/bin/systemd-run' : '/bin/systemd-run'
 
