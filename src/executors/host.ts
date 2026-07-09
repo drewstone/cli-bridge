@@ -124,7 +124,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     const child = spawn(jailed.bin, jailed.args, {
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: sanitizeHostEnv(jailed.env),
+      env: sanitizeHostEnv(jailed.env, opts.cwd),
       detached: true,
     })
     // Synchronous error capture — Node fires 'error' on nextTick for spawn
@@ -160,7 +160,7 @@ export function hostExecutorSnapshot(): {
   return hostSemaphore.snapshot()
 }
 
-export function sanitizeHostEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv | undefined {
+export function sanitizeHostEnv(env: NodeJS.ProcessEnv | undefined, cwd?: string): NodeJS.ProcessEnv | undefined {
   if (!env) return undefined
 
   const out: NodeJS.ProcessEnv = {}
@@ -176,6 +176,13 @@ export function sanitizeHostEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.Proc
       out[key] = value
     }
   }
+
+  // PWD must agree with the spawn cwd. The inherited value is the BRIDGE
+  // daemon's cwd, and some CLIs resolve their working directory from $PWD
+  // instead of getcwd() — opencode does, so a stale PWD makes the agent
+  // operate (read/WRITE) in the bridge's own directory instead of the
+  // request workspace, silently escaping every per-request cwd.
+  if (cwd) out.PWD = cwd
 
   return out
 }
