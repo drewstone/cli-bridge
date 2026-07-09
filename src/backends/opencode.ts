@@ -21,7 +21,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import type { Spawner } from '../executors/types.js'
@@ -100,7 +100,10 @@ export class OpencodeBackend implements Backend {
     //
     // Cleanup runs in the outer finally so the temp dir doesn't leak
     // when the subprocess crashes.
-    const mcpMaterialized = materializeMcpServersForOpencode(resolveMcpServers(req, session))
+    const mcpMaterialized = materializeMcpServersForOpencode(
+      resolveMcpServers(req, session),
+      (resolveAgentProfile(req, session) as { permissions?: Record<string, unknown> } | null)?.permissions,
+    )
 
     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg

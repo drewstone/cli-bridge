@@ -579,7 +579,10 @@ export function materializeOpencodeMcpConfig(profile: AgentProfile | null): Mate
       }
     }
   }
-  return materializeMcpServersForOpencode(specs)
+  const permissions = profile && typeof profile === 'object'
+    ? (profile as { permissions?: Record<string, unknown> }).permissions
+    : undefined
+  return materializeMcpServersForOpencode(specs, permissions)
 }
 
 /**
@@ -597,6 +600,7 @@ export function materializeOpencodeMcpConfig(profile: AgentProfile | null): Mate
  */
 export function materializeMcpServersForOpencode(
   specs: Record<string, McpServerSpec> | null,
+  callerPermissions?: Record<string, unknown> | null,
 ): MaterializedMcpConfig {
   const opencodeMcp: Record<string,
     | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
@@ -635,7 +639,7 @@ export function materializeMcpServersForOpencode(
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-'))
   const configPath = join(dir, 'opencode.json')
   // Headless benchmark and automation runs must never block on an
-  // interactive permission prompt.
+  // interactive permission prompt, so every tool defaults to `allow`.
   const headlessPermission: Record<string, 'allow' | 'ask' | 'deny'> = {
     external_directory: 'allow',
     bash: 'allow',
@@ -647,6 +651,18 @@ export function materializeMcpServersForOpencode(
     plan_enter: 'allow',
     plan_exit: 'allow',
     question: 'allow',
+  }
+  // The caller's agent_profile.permissions override the headless defaults —
+  // an explicit `deny` is load-bearing (the search benchmark's no-web arm
+  // sets webfetch:'deny' to remove native web). Without this, the hardcoded
+  // `allow` above silently kept webfetch on and the "offline" arm still
+  // fetched. Only known permission verbs are honored, per-key.
+  if (callerPermissions && typeof callerPermissions === 'object') {
+    for (const [key, value] of Object.entries(callerPermissions)) {
+      if (value === 'allow' || value === 'ask' || value === 'deny') {
+        headlessPermission[key] = value
+      }
+    }
   }
   writeFileSync(configPath, JSON.stringify({
     $schema: 'https://opencode.ai/config.json',

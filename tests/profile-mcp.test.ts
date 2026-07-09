@@ -124,6 +124,22 @@ describe('materializeOpencodeMcpConfig', () => {
     m.cleanup()
     expect(existsSync(m.configPath)).toBe(false)
   })
+
+  it('honors agent_profile.permissions over the headless allow defaults', () => {
+    // The no-web arm sets webfetch:'deny'; it must reach opencode's config,
+    // not be overwritten by the hardcoded headless 'allow'.
+    const m = materializeOpencodeMcpConfig({
+      permissions: { webfetch: 'deny', websearch: 'deny' },
+    } as unknown as Parameters<typeof materializeOpencodeMcpConfig>[0])
+    expect(m).not.toBeNull()
+    if (!m) return
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.permission.webfetch).toBe('deny')
+    expect(written.permission.websearch).toBe('deny')
+    // untouched keys keep their headless default
+    expect(written.permission.bash).toBe('allow')
+    m.cleanup()
+  })
 })
 
 describe('buildMcpAllowList', () => {
