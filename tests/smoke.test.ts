@@ -1000,7 +1000,12 @@ describe('GET /v1/models', () => {
     const registry = new BackendRegistry()
       .register(new FakeBackend('codex'))
       .register(new FakeBackend('opencode'))
-    mountModels(app, { registry })
+    // opencode/pi catalogs are discovered live from the CLI; point the bin at a
+    // missing binary so discovery deterministically falls back to the curated
+    // seed. This asserts the fallback contract (never empty, curated set,
+    // provider filtering); live discovery is environment-dependent and covered
+    // by lib/model-discovery's own tests.
+    mountModels(app, { registry, opencodeBin: '/nonexistent/opencode' })
     const res = await app.request('/v1/models')
     expect(res.status).toBe(200)
     const body = await res.json() as { data: Array<{ id: string; backend: string }> }

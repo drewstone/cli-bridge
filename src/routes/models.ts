@@ -10,6 +10,7 @@
 import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { ProfileCatalog } from '../profiles/loader.js'
+import { discoverModels, parseOpencodeModels, parsePiModels, type ModelSpec } from '../lib/model-discovery.js'
 
 interface ModelEntry {
   id: string
@@ -25,15 +26,23 @@ const CODEX_MODELS = [
   'gpt-5.5',
 ] as const
 
-const OPENCODE_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
+// The opencode/pi catalogs are discovered live from each CLI's own model list
+// (see lib/model-discovery.ts). These curated arrays are the never-empty
+// FALLBACK seed used when discovery fails, and they also define which provider
+// prefixes are routable — discovery keeps only models under these providers,
+// dropping the CLI's free tiers and unconfigured providers.
+const OPENCODE_MODELS: ReadonlyArray<ModelSpec> = [
   { id: 'kimi-for-coding/k2p6', note: 'Kimi K2.6 via opencode provider' },
+  { id: 'kimi-for-coding/k2p7', note: 'Kimi K2.7 via opencode provider' },
+  { id: 'kimi-for-coding/k3', note: 'Kimi K3 via opencode provider' },
+  { id: 'zai-coding-plan/glm-5.2', note: 'GLM 5.2 via configured coding provider' },
   { id: 'zai-coding-plan/glm-5.1', note: 'GLM 5.1 via configured coding provider' },
   { id: 'zai-coding-plan/glm-5-turbo', note: 'GLM 5 Turbo via configured coding provider' },
   { id: 'deepseek/deepseek-v4-pro' },
   { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek v4 light/flash tier' },
 ]
 
-const PI_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
+const PI_MODELS: ReadonlyArray<ModelSpec> = [
   { id: 'deepseek/deepseek-v4-pro', note: 'DeepSeek V4 Pro via pi' },
   { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek V4 Flash via pi' },
   { id: 'moonshot/kimi-k2.5', note: 'Moonshot Kimi K2.5 via pi' },
@@ -49,9 +58,14 @@ const PI_MODELS: ReadonlyArray<{ id: string; note?: string }> = [
   { id: 'zai-glm/glm-4.7', note: 'GLM 4.7 via pi zai-glm (Anthropic-compat)' },
 ]
 
+/** Routable provider prefixes = the distinct providers named in each fallback seed. */
+const providersOf = (specs: readonly ModelSpec[]): string[] => [...new Set(specs.map((m) => m.id.split('/')[0]!))]
+const OPENCODE_PROVIDERS = providersOf(OPENCODE_MODELS)
+const PI_PROVIDERS = providersOf(PI_MODELS)
+
 export function mountModels(
   app: Hono,
-  deps: { registry: BackendRegistry; catalog?: ProfileCatalog },
+  deps: { registry: BackendRegistry; catalog?: ProfileCatalog; opencodeBin?: string; piBin?: string },
 ): void {
   app.get('/v1/models', async (c) => {
     const data: ModelEntry[] = []
@@ -87,8 +101,15 @@ export function mountModels(
             data.push({ id: `codex/${model}`, object: 'model', backend: b.name })
           }
           break
-        case 'opencode':
-          for (const model of OPENCODE_MODELS) {
+        case 'opencode': {
+          const models = await discoverModels('opencode', {
+            bin: deps.opencodeBin ?? 'opencode',
+            args: ['models'],
+            providers: OPENCODE_PROVIDERS,
+            parse: parseOpencodeModels,
+            fallback: OPENCODE_MODELS,
+          })
+          for (const model of models) {
             data.push({
               id: `opencode/${model.id}`,
               object: 'model',
@@ -97,8 +118,16 @@ export function mountModels(
             })
           }
           break
-        case 'pi':
-          for (const model of PI_MODELS) {
+        }
+        case 'pi': {
+          const models = await discoverModels('pi', {
+            bin: deps.piBin ?? 'pi',
+            args: ['--list-models'],
+            providers: PI_PROVIDERS,
+            parse: parsePiModels,
+            fallback: PI_MODELS,
+          })
+          for (const model of models) {
             data.push({
               id: `pi/${model.id}`,
               object: 'model',
@@ -107,6 +136,7 @@ export function mountModels(
             })
           }
           break
+        }
         case 'factory':
           data.push({ id: 'factory/droid', object: 'model', backend: b.name, note: 'stubbed' })
           break
