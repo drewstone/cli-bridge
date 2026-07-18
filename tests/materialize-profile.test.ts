@@ -5,7 +5,7 @@
  * lock the matrix down.
  */
 import { describe, it, expect } from 'vitest'
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile } from '@tangle-network/agent-interface'
@@ -15,6 +15,7 @@ import {
   materializeProfile,
   normalizeSkillMd,
 } from '@tangle-network/agent-profile-materialize'
+import { provisionProfileWorkspace } from '../src/backends/profile-support.js'
 
 const SKILL_BODY = '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.'
 const FULL: AgentProfile = {
@@ -45,23 +46,31 @@ describe('materializeProfile — verified per-harness routing', () => {
     const p = paths('claude-code')
     expect(p).toContain('CLAUDE.md')
     expect(p).toContain('.claude/skills/fhenix-core/SKILL.md')
-    expect(p).toContain('.mcp.json')
-    expect(p).toContain('.claude/settings.json') // merged: enabledMcpjsonServers + hooks
+    expect(p).toContain('.tangle/claude-mcp.json')
+    expect(p).toContain('.tangle/claude-settings.json')
     expect(p).toContain('.claude/agents/reviewer.md')
     expect(p).toContain('.claude/commands/ship.md')
-    // settings.json must carry BOTH mcp-enable AND hooks (merge, not clobber)
-    const settings = JSON.parse(materializeProfile(FULL, 'claude-code').files.find((f) => f.relPath === '.claude/settings.json')!.content)
-    expect(settings.enabledMcpjsonServers).toContain('echo')
+    const plan = materializeProfile(FULL, 'claude-code')
+    const mcp = JSON.parse(plan.files.find((f) => f.relPath === '.tangle/claude-mcp.json')!.content)
+    const settings = JSON.parse(plan.files.find((f) => f.relPath === '.tangle/claude-settings.json')!.content)
+    expect(mcp.mcpServers.echo.command).toBe('echo-mcp')
     expect(settings.hooks.PreToolUse).toBeTruthy()
+    expect(plan.flags).toEqual(expect.arrayContaining([
+      '--mcp-config',
+      '.tangle/claude-mcp.json',
+      '--settings',
+      '.tangle/claude-settings.json',
+    ]))
   })
 
-  it('codex: skills (.codex/skills) + config.toml mcp + hooks.json + agents.toml', () => {
+  it('codex: skills + agent file with typed MCP, hook, and agent flags', () => {
     expect(has('codex', '.codex/skills/fhenix-core/SKILL.md')).toBe(true)
-    expect(has('codex', '.codex/config.toml')).toBe(true)
-    expect(has('codex', '.codex/hooks.json')).toBe(true)
     expect(has('codex', '.codex/agents/reviewer.toml')).toBe(true)
-    expect(materializeProfile(FULL, 'codex').files.find((f) => f.relPath === '.codex/config.toml')!.content).toContain('trust_level = "trusted"')
-    expect(unsupportedDims('codex')).toContain('commands') // project commands unsupported
+    const plan = materializeProfile(FULL, 'codex')
+    expect(plan.flags.join('\n')).toContain('mcp_servers=')
+    expect(plan.flags.join('\n')).toContain('hooks.PreToolUse=')
+    expect(plan.flags.join('\n')).toContain('agents.reviewer.config_file=')
+    expect(unsupportedDims('codex')).toContain('commands')
   })
 
   it('gemini: GEMINI.md (NOT AGENTS.md) + .gemini/settings.json + .gemini/commands/*.toml', () => {
@@ -72,16 +81,16 @@ describe('materializeProfile — verified per-harness routing', () => {
     expect(has('gemini', '.gemini/commands/ship.toml')).toBe(true)
     const settings = JSON.parse(materializeProfile(FULL, 'gemini').files.find((f) => f.relPath === '.gemini/settings.json')!.content)
     expect(settings.mcpServers.echo).toBeTruthy()
-    expect(settings.hooks.PreToolUse).toBeTruthy()
+    expect(unsupportedDims('gemini')).toContain('hooks')
   })
 
   it('opencode: AGENTS.md + .opencode/skills + opencode.json mcp + plugin hook + agent', () => {
-    expect(has('opencode', 'AGENTS.md')).toBe(true)
+    expect(has('opencode', '.opencode/profile-instructions.md')).toBe(true)
     expect(has('opencode', '.opencode/skills/fhenix-core/SKILL.md')).toBe(true)
     expect(has('opencode', 'opencode.json')).toBe(true)
-    expect(has('opencode', '.opencode/agent/reviewer.md')).toBe(true)
-    expect(has('opencode', '.opencode/command/ship.md')).toBe(true)
-    expect(paths('opencode').some((p) => p.startsWith('.opencode/plugin/'))).toBe(true)
+    expect(has('opencode', '.opencode/agents/reviewer.md')).toBe(true)
+    expect(has('opencode', '.opencode/commands/ship.md')).toBe(true)
+    expect(unsupportedDims('opencode')).toContain('hooks')
   })
 
   it('kimi-code: skills cwd-native, but MCP needs the --mcp-config-file FLAG (no cwd discovery)', () => {
@@ -95,7 +104,7 @@ describe('materializeProfile — verified per-harness routing', () => {
     const plan = materializeProfile(FULL, 'hermes')
     expect(plan.files.map((f) => f.relPath)).toContain('HERMES.md')
     expect(plan.unsupported.map((u) => u.dimension)).toContain('skills') // ~/.hermes/skills only
-    expect(plan.env.HERMES_ENABLE_PROJECT_PLUGINS).toBe('1')
+    expect(plan.unsupported.map((u) => u.dimension)).toContain('hooks')
   })
 
   it('openclaw: AGENTS.md + skills/ (workspace) but mcp/hooks/subagents are central-config (fail-closed)', () => {
@@ -129,5 +138,44 @@ describe('materializeProfile — verified per-harness routing', () => {
     expect(readFileSync(join(dir, '.kimi/skills/fhenix-core/SKILL.md'), 'utf8')).toContain('name: fhenix-core')
     expect(r.flags).toEqual(expect.arrayContaining(['--mcp-config-file', '.kimi/mcp.json']))
     expect(r.written).toContain('.kimi/skills/fhenix-core/SKILL.md')
+  })
+
+  it('fails closed on unsafe profile paths when failOnError is set', () => {
+    const root = mkdtempSync(join(tmpdir(), 'profile-fail-closed-'))
+    const escaped = join(root, '..', 'escaped', 'SKILL.md')
+    try {
+      expect(() => provisionProfileWorkspace({
+        model: 'claude-code/opus',
+        messages: [{ role: 'user', content: 'work' }],
+        agent_profile: {
+          resources: {
+            failOnError: true,
+            skills: [{ kind: 'inline', name: '../../../escaped', content: 'unsafe' }],
+          },
+        },
+      }, null, 'claude-code', root)).toThrow(/materialization failed/)
+      expect(existsSync(escaped)).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('marks optional profile materialization as degraded instead of indistinguishable success', () => {
+    const root = mkdtempSync(join(tmpdir(), 'profile-degraded-'))
+    try {
+      const result = provisionProfileWorkspace({
+        model: 'claude-code/opus',
+        messages: [{ role: 'user', content: 'work' }],
+        agent_profile: {
+          resources: {
+            skills: [{ kind: 'inline', name: '../../../escaped', content: 'unsafe' }],
+          },
+        },
+      }, null, 'claude-code', root)
+      expect(result.degraded).toMatch(/canonical|relative/)
+      expect(result.written).toEqual([])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })

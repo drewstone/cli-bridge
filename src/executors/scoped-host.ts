@@ -49,10 +49,12 @@
  *   module load — cheap and definitive.
  */
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { posix } from 'node:path'
+import { promisify } from 'node:util'
 import { hostSpawner, sanitizeHostEnv } from './host.js'
 import { applyJail } from './jail-support.js'
 import type { Spawner, SpawnResult } from './types.js'
@@ -64,6 +66,8 @@ const DEFAULT_SCOPE_RUNTIME_MAX_SEC = 7200
 const DEFAULT_SCOPE_MAX_CONCURRENCY = 4
 const DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS = 60_000
 const SYSTEMD_RUN_BIN = existsSync('/usr/bin/systemd-run') ? '/usr/bin/systemd-run' : '/bin/systemd-run'
+const SYSTEMCTL_BIN = existsSync('/usr/bin/systemctl') ? '/usr/bin/systemctl' : '/bin/systemctl'
+const execFileAsync = promisify(execFile)
 
 interface Waiter {
   resolve: () => void
@@ -161,32 +165,92 @@ function probeSystemdRun(): boolean {
   }
 }
 
-/**
- * Resolve the cgroup filesystem path for our spawned wrapper by
- * reading `/proc/<pid>/cgroup`. Works for cgroup v2 unified hierarchy
- * (the only mode systemd 250+ supports for user managers).
- *
- * Returns `null` if the process is gone or the cgroup couldn't be
- * resolved; callers degrade to `systemctl --user stop <unit>`.
- */
-function resolveCgroupPath(pid: number): string | null {
+/** Resolve a process's cgroup-v2 path from `/proc/<pid>/cgroup`. */
+function resolveProcessControlGroup(pid: number): string | null {
   try {
     const raw = readFileSync(`/proc/${pid}/cgroup`, 'utf8')
-    // cgroup v2 line format: "0::/user.slice/.../scope-unit.scope"
     const line = raw.split('\n').find((l) => l.startsWith('0::'))
     if (!line) return null
-    const rel = line.slice(3)
-    const abs = `/sys/fs/cgroup${rel}`
-    return statSync(abs).isDirectory() ? abs : null
+    const controlGroup = line.slice(3)
+    return controlGroup.startsWith('/') ? controlGroup : null
   } catch {
     return null
   }
 }
 
-async function killCgroup(pid: number, unitName: string): Promise<void> {
-  const cgPath = resolveCgroupPath(pid)
-  if (cgPath) {
+function isCanonicalControlGroup(value: string): boolean {
+  return value.startsWith('/') && value !== '/' && posix.normalize(value) === value && !/[\0\r\n]/.test(value)
+}
+
+function isOwnedScopeUnitName(unitName: string): boolean {
+  return /^cli-bridge-[1-9]\d*-[0-9a-f]{12}\.scope$/.test(unitName)
+}
+
+function isSameOrAncestor(candidate: string, path: string): boolean {
+  const rel = posix.relative(candidate, path)
+  return rel === '' || (rel !== '..' && !rel.startsWith('../') && !posix.isAbsolute(rel))
+}
+
+/**
+ * Prove a systemd-reported cgroup belongs to the exact random scope this
+ * process created. A PID-derived path is insufficient: when systemd-run fails,
+ * its wrapper remains in the caller's service/tmux cgroup.
+ */
+export function isOwnedScopeControlGroup(
+  controlGroup: string,
+  unitName: string,
+  currentControlGroup: string | null,
+): boolean {
+  if (!isOwnedScopeUnitName(unitName)) return false
+  if (!isCanonicalControlGroup(controlGroup)) return false
+  if (!currentControlGroup || !isCanonicalControlGroup(currentControlGroup)) return false
+
+  const parts = controlGroup.split('/').filter(Boolean)
+  if (parts.at(-1) !== unitName || parts.at(-2) !== SLICE) return false
+
+  const normalizedCurrent = posix.normalize(currentControlGroup)
+  if (normalizedCurrent !== currentControlGroup || /[\0\r\n]/.test(normalizedCurrent)) return false
+  // Never target the bridge's own cgroup or any of its ancestors. Killing a
+  // descendant is safe; killing an ancestor terminates the bridge and its
+  // interactive caller along with the intended child.
+  return !isSameOrAncestor(controlGroup, normalizedCurrent)
+}
+
+async function resolveUnitControlGroup(unitName: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      SYSTEMCTL_BIN,
+      ['--user', 'show', '--property=ControlGroup', '--value', unitName],
+      { encoding: 'utf8', timeout: 3000, maxBuffer: 4096 },
+    )
+    const lines = stdout.trim().split('\n')
+    if (lines.length !== 1 || !lines[0]) return null
+    return lines[0]
+  } catch {
+    return null
+  }
+}
+
+async function stopScopeUnit(unitName: string): Promise<void> {
+  if (!isOwnedScopeUnitName(unitName)) return
+  try {
+    await execFileAsync(
+      SYSTEMCTL_BIN,
+      ['--user', '--quiet', 'stop', unitName],
+      { encoding: 'utf8', timeout: 3000, maxBuffer: 4096 },
+    )
+  } catch {
+    // The unit may already have exited and auto-collected.
+  }
+}
+
+async function killCgroup(unitName: string): Promise<void> {
+  const controlGroup = await resolveUnitControlGroup(unitName)
+  const currentControlGroup = resolveProcessControlGroup(process.pid)
+  if (controlGroup && isOwnedScopeControlGroup(controlGroup, unitName, currentControlGroup)) {
+    const cgPath = `/sys/fs/cgroup${controlGroup}`
     try {
+      if (!statSync(cgPath).isDirectory()) throw new Error('scope cgroup is not a directory')
       // cgroup.kill (Linux 5.14+) SIGKILLs every task in the cgroup
       // atomically. Faster than walking cgroup.procs and ignores
       // pgid manipulation by descendants.
@@ -196,19 +260,9 @@ async function killCgroup(pid: number, unitName: string): Promise<void> {
       // fall through to systemctl
     }
   }
-  // Fallback: ask systemd to stop the unit. Slower (DBus round-trip)
-  // but works on kernels older than 5.14 or when /proc/<pid> is
-  // already gone.
-  await new Promise<void>((resolve) => {
-    const p = spawn('systemctl', ['--user', '--quiet', 'stop', unitName], {
-      stdio: 'ignore',
-      detached: true,
-    })
-    p.on('error', () => resolve())
-    p.on('exit', () => resolve())
-    // Don't block shutdown forever on a hung systemctl.
-    setTimeout(() => { try { p.kill('SIGKILL') } catch {}; resolve() }, 3000).unref?.()
-  })
+  // Safe fallback: stop only the exact random unit. Never infer a kill target
+  // from the launcher's PID when ownership could not be proven.
+  await stopScopeUnit(unitName)
 }
 
 export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
@@ -293,10 +347,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     // asynchronously and we don't need to await them. Errors are
     // swallowed because by the time release() runs the scope may
     // have already auto-collected if the child exited cleanly.
-    const pid = child.pid
-    if (pid !== undefined) {
-      void killCgroup(pid, unitName).catch(() => {})
-    }
+    void killCgroup(unitName).catch(() => {})
     // Idempotent via the `released` guard: jail temp state is torn down
     // exactly once regardless of which path (finally / exit / error)
     // fires release first.

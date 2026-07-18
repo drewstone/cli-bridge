@@ -399,6 +399,7 @@ docker build -f docker/Dockerfile.cli-runtime \
 cat >> .env <<'EOF'
 CLAUDE_EXECUTOR=docker
 CLAUDE_DOCKER_POOL_SIZE=4
+CLAUDE_DOCKER_WORKSPACE_ROOT=/tmp/cli-bridge-workspaces
 KIMI_EXECUTOR=docker
 KIMI_DOCKER_POOL_SIZE=2
 GEMINI_EXECUTOR=docker
@@ -423,6 +424,13 @@ OAuth mount modes:
   Simplest; concurrent token-refresh can race on the same session DB.
 - `per-slot` — each slot gets its own named docker volume. Full OAuth
   isolation; one `<cli> /login` per slot on first run.
+
+Coding runs can expose one dedicated host workspace tree with
+`<NAME>_DOCKER_WORKSPACE_ROOT=/absolute/path`. The bridge canonicalizes an
+existing directory, rejects `/`, mounts it read-write at the identical path in
+every worker, and rejects request `cwd` values outside it. OAuth remains a
+separate mount controlled by the mode above. Use a narrow per-experiment root,
+not a home or repository parent directory.
 
 ### Topology guide
 

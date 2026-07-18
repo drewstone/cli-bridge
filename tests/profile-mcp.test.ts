@@ -40,7 +40,7 @@ describe('materializeMcpConfig', () => {
   it('returns null when every entry is filtered out', () => {
     const profile: AgentProfile = {
       mcp: {
-        'disabled-stdio': { command: '/usr/bin/foo', enabled: false },
+        'disabled-stdio': { enabled: false },
       },
     }
     expect(materializeMcpConfig(profile)).toBeNull()
@@ -55,7 +55,7 @@ describe('materializeMcpConfig', () => {
           env: { OUTDIR: '/tmp/x', SCENARIO: 'foo' },
         },
         // Mixed in a disabled entry to confirm it doesn't leak.
-        ignored: { command: 'echo', enabled: false },
+        ignored: { enabled: false },
       },
     }
     const m = materializeMcpConfig(profile)

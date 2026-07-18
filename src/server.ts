@@ -85,6 +85,7 @@ async function buildExecutorForBackend(
     maxQueueDepth,
     acquireDeadlineMs,
     slotMaxHoldMs,
+    ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
     ...(cfg.oauthMode === 'share' || !cfg.oauthMode
       ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }
       : {
@@ -99,7 +100,10 @@ async function buildExecutorForBackend(
   )
   registerPoolForMetrics(cfg.name, pool)
   extras.shutdownHooks.push(() => pool.destroy())
-  return createDockerSpawner({ pool })
+  return createDockerSpawner({
+    pool,
+    ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
+  })
 }
 
 export async function buildApp(config: Config): Promise<{

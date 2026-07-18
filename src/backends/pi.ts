@@ -66,7 +66,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import type { Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { killTree } from '../executors/process-tree.js'
 
@@ -222,7 +222,7 @@ export class PiBackend implements Backend {
     // (no stdin payload required for `--print` mode).
     args.push(prompt)
 
-    const runCwd = req.cwd ?? session?.cwd ?? process.cwd()
+    const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
 
     // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) mount as `<cwd>/.pi/mcp.json` for the
@@ -244,13 +244,14 @@ export class PiBackend implements Backend {
       : null
 
     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
-    provisionProfileWorkspace(req, session, 'pi', runCwd)
+    const provisioned = provisionProfileWorkspace(req, session, 'pi', runCwd)
+    args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
-        env: process.env,
+        env: { ...process.env, ...provisioned.env },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })

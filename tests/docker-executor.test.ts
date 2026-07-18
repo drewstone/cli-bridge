@@ -10,6 +10,9 @@
  * full chat() loop without spawning anything.
  */
 
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Readable, PassThrough } from 'node:stream'
 import { describe, expect, it } from 'vitest'
 import { ClaudeBackend } from '../src/backends/claude.js'
@@ -17,8 +20,8 @@ import { CodexBackend } from '../src/backends/codex.js'
 import { KimiBackend } from '../src/backends/kimi.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
-import { ContainerPool } from '../src/executors/container-pool.js'
-import { buildDockerExecArgs } from '../src/executors/docker.js'
+import { buildContainerRunArgs, ContainerPool } from '../src/executors/container-pool.js'
+import { assertDockerWorkspaceCwd, buildDockerExecArgs } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
 import { killTree } from '../src/executors/process-tree.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
@@ -325,6 +328,68 @@ describe('buildDockerExecArgs', () => {
   it('respects binPrefix when specified', () => {
     const args = buildDockerExecArgs('cid', 'claude', ['-p', 'x'], {}, '/usr/local/bin/')
     expect(args).toContain('/usr/local/bin/claude')
+  })
+})
+
+describe('Docker workspace confinement', () => {
+  const poolOpts = {
+    size: 1,
+    image: 'runtime:latest',
+    namePrefix: 'test-pool',
+    oauthMode: 'share' as const,
+    shareMounts: ['/home/test/.claude:/root/.claude'],
+  }
+
+  it('bind-mounts exactly one configured workspace root read-write at the identical path', () => {
+    const args = buildContainerRunArgs({ ...poolOpts, workspaceRoot: '/tmp/research-workspaces' }, 0)
+    const mountIndex = args.indexOf('--mount')
+    expect(mountIndex).toBeGreaterThan(-1)
+    expect(args[mountIndex + 1]).toBe(
+      'type=bind,source=/tmp/research-workspaces,target=/tmp/research-workspaces',
+    )
+    expect(args[mountIndex + 1]).not.toContain('readonly')
+    expect(args).toContain('/home/test/.claude:/root/.claude')
+  })
+
+  it('keeps the workspace bind when OAuth uses an isolated per-slot volume', () => {
+    const args = buildContainerRunArgs({
+      ...poolOpts,
+      oauthMode: 'per-slot',
+      shareMounts: undefined,
+      perSlotVolumePrefix: 'test-oauth',
+      perSlotMountTarget: '/root/.claude',
+      workspaceRoot: '/tmp/research-workspaces',
+    }, 2)
+    expect(args).toContain('type=bind,source=/tmp/research-workspaces,target=/tmp/research-workspaces')
+    expect(args).toContain('test-oauth-2:/root/.claude')
+  })
+
+  it('rejects unsafe bind roots at the pool boundary', () => {
+    expect(() => buildContainerRunArgs({ ...poolOpts, workspaceRoot: '/' }, 0)).toThrow(/invalid Docker workspace root/)
+    expect(() => buildContainerRunArgs({ ...poolOpts, workspaceRoot: '/tmp/has,comma' }, 0)).toThrow(/invalid Docker workspace root/)
+  })
+
+  it('canonicalizes nested cwd and rejects lexical and symlink escapes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-root-'))
+    const outside = mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-outside-'))
+    const task = join(root, 'task-1')
+    const inRootLink = join(root, 'task-link')
+    const outsideLink = join(root, 'outside-link')
+    mkdirSync(task)
+    symlinkSync(task, inRootLink)
+    symlinkSync(outside, outsideLink)
+    try {
+      expect(assertDockerWorkspaceCwd(root, task)).toBe(realpathSync(task))
+      expect(assertDockerWorkspaceCwd(root, inRootLink)).toBe(realpathSync(task))
+      expect(assertDockerWorkspaceCwd(root, undefined)).toBeUndefined()
+      expect(() => assertDockerWorkspaceCwd(root, 'task-1')).toThrow(/must be absolute/)
+      expect(() => assertDockerWorkspaceCwd(root, `${root}-escape`)).toThrow(/does not exist|outside configured workspace root/)
+      expect(() => assertDockerWorkspaceCwd(root, join(root, '..', 'escape'))).toThrow(/does not exist|outside configured workspace root/)
+      expect(() => assertDockerWorkspaceCwd(root, outsideLink)).toThrow(/outside configured workspace root/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 })
 
@@ -648,6 +713,91 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     expect(c.containerConfigDir).toBe('/root/.claude')
     expect(c.hostConfigDir).toContain('/.claude')
     expect(c.namePrefix).toBe('cli-bridge-claude-pool')
+  })
+
+  it('loads and canonicalizes an existing Docker workspace directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-workspace-'))
+    try {
+      const config = loadConfig({
+        HOME: '/home/test',
+        CLAUDE_EXECUTOR: 'docker',
+        CLAUDE_DOCKER_WORKSPACE_ROOT: root,
+      })
+      expect(config.executors.claude!.workspaceRoot).toBe(root)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects workspace roots that are inactive, relative, missing, files, or filesystem root', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-workspace-invalid-'))
+    const file = join(root, 'file')
+    writeFileSync(file, 'not a directory')
+    try {
+      expect(() => loadConfig({
+        HOME: '/home/test',
+        CLAUDE_DOCKER_WORKSPACE_ROOT: root,
+      })).toThrow(/requires CLAUDE_EXECUTOR=docker/)
+      expect(() => loadConfig({
+        HOME: '/home/test',
+        CLAUDE_EXECUTOR: 'docker',
+        CLAUDE_DOCKER_WORKSPACE_ROOT: 'relative/path',
+      })).toThrow(/expected an absolute path/)
+      expect(() => loadConfig({
+        HOME: '/home/test',
+        CLAUDE_EXECUTOR: 'docker',
+        CLAUDE_DOCKER_WORKSPACE_ROOT: join(root, 'missing'),
+      })).toThrow(/path does not exist/)
+      expect(() => loadConfig({
+        HOME: '/home/test',
+        CLAUDE_EXECUTOR: 'docker',
+        CLAUDE_DOCKER_WORKSPACE_ROOT: file,
+      })).toThrow(/path is not a directory/)
+      expect(() => loadConfig({
+        HOME: '/home/test',
+        CLAUDE_EXECUTOR: 'docker',
+        CLAUDE_DOCKER_WORKSPACE_ROOT: '/',
+      })).toThrow(/refusing to expose filesystem root/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects host or container OAuth/config overlap, including symlink aliases', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-home-'))
+    const oauth = join(home, '.claude')
+    const separate = mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-workspace-'))
+    const oauthAlias = join(home, 'oauth-alias')
+    mkdirSync(oauth)
+    symlinkSync(oauth, oauthAlias)
+    try {
+      for (const oauthMode of ['share', 'per-slot'] as const) {
+        expect(() => loadConfig({
+          HOME: home,
+          CLAUDE_EXECUTOR: 'docker',
+          CLAUDE_DOCKER_OAUTH_MOUNT: oauthMode,
+          CLAUDE_DOCKER_WORKSPACE_ROOT: home,
+        })).toThrow(/must not overlap/)
+        expect(() => loadConfig({
+          HOME: home,
+          CLAUDE_EXECUTOR: 'docker',
+          CLAUDE_DOCKER_OAUTH_MOUNT: oauthMode,
+          CLAUDE_DOCKER_HOST_CONFIG_DIR: oauthAlias,
+          CLAUDE_DOCKER_WORKSPACE_ROOT: oauth,
+        })).toThrow(/must not overlap/)
+        expect(() => loadConfig({
+          HOME: home,
+          CLAUDE_EXECUTOR: 'docker',
+          CLAUDE_DOCKER_OAUTH_MOUNT: oauthMode,
+          CLAUDE_DOCKER_HOST_CONFIG_DIR: oauth,
+          CLAUDE_DOCKER_CONTAINER_CONFIG_DIR: join(separate, '.claude'),
+          CLAUDE_DOCKER_WORKSPACE_ROOT: separate,
+        })).toThrow(/must not overlap/)
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+      rmSync(separate, { recursive: true, force: true })
+    }
   })
 
   it('rejects invalid <NAME>_EXECUTOR with a clear message', () => {

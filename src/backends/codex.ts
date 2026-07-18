@@ -38,7 +38,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import type { Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { killTree } from '../executors/process-tree.js'
 
@@ -96,6 +96,7 @@ export class CodexBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
     // Codex has `--sandbox` flags but we haven't verified end-to-end that
     // every FS/shell tool is gated under read-only. Reject hosted-safe
     // until that audit lands — never fake safety.
@@ -149,12 +150,14 @@ export class CodexBackend implements Backend {
 
     // Phase-2 host wiring: provision cwd-native profile dimensions (skills/context/
     // hooks/subagents/commands) before spawn. MCP stays on the path above. Fail-safe.
-    provisionProfileWorkspace(req, session, 'codex', req.cwd ?? session?.cwd ?? process.cwd())
+    const provisioned = provisionProfileWorkspace(req, session, 'codex', cwd)
+    args.push(...provisioned.flags)
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
+      cwd,
       env: {
         ...process.env,
+        ...provisioned.env,
         ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),

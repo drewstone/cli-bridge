@@ -19,7 +19,7 @@ import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
-import type { Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
@@ -61,7 +61,7 @@ export class GeminiBackend implements Backend {
     const model = this.extractModel(req.model)
     const args = this.buildArgs(req.model)
     if (model) args.push('--model', model)
-    const cwd = req.cwd ?? session?.cwd ?? process.cwd()
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
 
     // Materialize MCP servers (request-body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) into the project-scope `<cwd>/.gemini/settings.json`.
@@ -72,11 +72,12 @@ export class GeminiBackend implements Backend {
     const mcpMaterialized = materializeMcpServersForGemini(resolveMcpServers(req, session), cwd)
 
     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
-    provisionProfileWorkspace(req, session, 'gemini', cwd)
+    const provisioned = provisionProfileWorkspace(req, session, 'gemini', cwd)
+    args.push(...provisioned.flags)
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd,
-      env: process.env,
+      env: { ...process.env, ...provisioned.env },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
     })

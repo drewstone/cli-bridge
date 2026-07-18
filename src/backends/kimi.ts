@@ -46,7 +46,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import type { Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { killTree } from '../executors/process-tree.js'
@@ -111,6 +111,7 @@ export class KimiBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
@@ -152,11 +153,12 @@ export class KimiBackend implements Backend {
 
     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
     // stays on kimi's existing path). Fail-safe.
-    provisionProfileWorkspace(req, session, 'kimi', req.cwd ?? session?.cwd ?? process.cwd())
+    const provisioned = provisionProfileWorkspace(req, session, 'kimi', cwd)
+    args.push(...provisioned.flags)
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
-      env: process.env,
+      cwd,
+      env: { ...process.env, ...provisioned.env },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
     })
