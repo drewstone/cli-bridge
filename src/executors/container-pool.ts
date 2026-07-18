@@ -65,6 +65,10 @@ export interface ContainerPoolOptions {
    * at the identical absolute path in every slot, independently of OAuth.
    */
   workspaceRoot?: string
+  /** Optional numeric non-root identity, e.g. `1000:1000`. */
+  containerUser?: string
+  /** Writable absolute HOME for the configured container identity. */
+  containerHome?: string
   /** Per-container memory cap, e.g. '4g'. Default 4g. */
   memory?: string
   /** Per-container CPU cap, e.g. '2'. Default 2. */
@@ -383,6 +387,18 @@ export function buildContainerRunArgs(
     '--memory', memory, '--memory-swap', memory,
     '--cpus', cpus,
   ]
+  if (Boolean(opts.containerUser) !== Boolean(opts.containerHome)) {
+    throw new Error('container user and home must be configured together')
+  }
+  if (opts.containerUser && opts.containerHome) {
+    if (!/^[1-9][0-9]*:[1-9][0-9]*$/u.test(opts.containerUser)) {
+      throw new Error('invalid non-root container user')
+    }
+    if (!isSafeWorkspaceBindPath(opts.containerHome)) {
+      throw new Error('invalid non-root container home')
+    }
+    args.push('--user', opts.containerUser, '--env', `HOME=${opts.containerHome}`)
+  }
   if (opts.workspaceRoot) {
     if (!isSafeWorkspaceBindPath(opts.workspaceRoot)) {
       throw new Error(`invalid Docker workspace root: ${opts.workspaceRoot}`)
