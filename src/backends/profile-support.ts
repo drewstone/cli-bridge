@@ -2,7 +2,7 @@ import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
-import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
+import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
@@ -18,7 +18,7 @@ import {
  * wiring. MCP is SKIPPED here so cli-bridge's existing per-harness MCP path (config-dir +
  * env) stays the source of truth (additive, can't regress MCP). Purely writes files into
  * `cwd`; returns env/flags (empty for the non-MCP dimensions, which are all cwd-native)
- * for the caller to apply if present. No-op when there's no profile or nothing to mount.
+ * for the caller to apply if present. No-op only when there is no profile.
  */
 export function provisionProfileWorkspace(
   req: ChatRequest,
@@ -31,31 +31,36 @@ export function provisionProfileWorkspace(
   written: string[]
   unsupported?: unknown[]
   workspacePlanDigest?: string
-  degraded?: string
+  receipt?: ProfileMaterializationReceipt
 } {
+  delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
   if (!profile) return { env: {}, flags: [], written: [] }
   try {
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
-    if (profile.resources?.failOnError) assertWorkspacePlanSupported(plan)
-    if (!plan.files.length && !plan.flags.length) return { env: {}, flags: [], written: [] }
+    assertWorkspacePlanSupported(plan)
     const applied = applyWorkspacePlan(plan, cwd)
+    const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
+    const receipt: ProfileMaterializationReceipt = {
+      schema: 'cli-bridge.profile-materialization.v1',
+      harness,
+      workspacePlanDigest: applied.workspacePlanDigest,
+      files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
+      unsupported: applied.unsupported,
+    }
+    req.profile_materialization_receipt = receipt
+    console.info(`[cli-bridge] profile materialization receipt ${JSON.stringify(receipt)}`)
     return {
       env: applied.env,
       flags: applied.flags,
       written: applied.written,
       unsupported: applied.unsupported,
-      ...('workspacePlanDigest' in applied && typeof applied.workspacePlanDigest === 'string'
-        ? { workspacePlanDigest: applied.workspacePlanDigest }
-        : {}),
+      workspacePlanDigest: applied.workspacePlanDigest,
+      receipt,
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (profile.resources?.failOnError) {
-      throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
-    }
-    console.warn(`[cli-bridge] AgentProfile workspace materialization degraded: ${message}`)
-    return { env: {}, flags: [], written: [], degraded: message }
+    throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
   }
 }
 

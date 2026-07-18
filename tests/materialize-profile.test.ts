@@ -16,6 +16,7 @@ import {
   normalizeSkillMd,
 } from '@tangle-network/agent-profile-materialize'
 import { provisionProfileWorkspace } from '../src/backends/profile-support.js'
+import type { ChatRequest } from '../src/backends/types.js'
 
 const SKILL_BODY = '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.'
 const FULL: AgentProfile = {
@@ -140,7 +141,7 @@ describe('materializeProfile — verified per-harness routing', () => {
     expect(r.written).toContain('.kimi/skills/fhenix-core/SKILL.md')
   })
 
-  it('fails closed on unsafe profile paths when failOnError is set', () => {
+  it('fails closed on unsafe profile paths', () => {
     const root = mkdtempSync(join(tmpdir(), 'profile-fail-closed-'))
     const escaped = join(root, '..', 'escaped', 'SKILL.md')
     try {
@@ -149,7 +150,6 @@ describe('materializeProfile — verified per-harness routing', () => {
         messages: [{ role: 'user', content: 'work' }],
         agent_profile: {
           resources: {
-            failOnError: true,
             skills: [{ kind: 'inline', name: '../../../escaped', content: 'unsafe' }],
           },
         },
@@ -160,20 +160,28 @@ describe('materializeProfile — verified per-harness routing', () => {
     }
   })
 
-  it('marks optional profile materialization as degraded instead of indistinguishable success', () => {
-    const root = mkdtempSync(join(tmpdir(), 'profile-degraded-'))
+  it('returns and retains a safe receipt for the exact applied workspace plan', () => {
+    const root = mkdtempSync(join(tmpdir(), 'profile-receipt-'))
     try {
-      const result = provisionProfileWorkspace({
+      const req: ChatRequest = {
         model: 'claude-code/opus',
         messages: [{ role: 'user', content: 'work' }],
         agent_profile: {
           resources: {
-            skills: [{ kind: 'inline', name: '../../../escaped', content: 'unsafe' }],
+            skills: [{ kind: 'inline' as const, name: 'receipt-skill', content: 'Use the receipt.' }],
           },
         },
-      }, null, 'claude-code', root)
-      expect(result.degraded).toMatch(/canonical|relative/)
-      expect(result.written).toEqual([])
+      }
+      const result = provisionProfileWorkspace(req, null, 'claude-code', root)
+      expect(result.receipt).toMatchObject({
+        schema: 'cli-bridge.profile-materialization.v1',
+        harness: 'claude-code',
+        files: [{ path: '.claude/skills/receipt-skill/SKILL.md', mode: 0o644 }],
+        unsupported: [],
+      })
+      expect(result.receipt?.workspacePlanDigest).toMatch(/^(?:sha256:)?[a-f0-9]{64}$/u)
+      expect(req.profile_materialization_receipt).toEqual(result.receipt)
+      expect(existsSync(join(root, '.claude/skills/receipt-skill/SKILL.md'))).toBe(true)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

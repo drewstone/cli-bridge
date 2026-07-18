@@ -29,6 +29,8 @@ import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { killTree } from '../executors/process-tree.js'
 
+type UsageReceipt = NonNullable<ChatDelta['usage']>
+
 export interface OpencodeBackendOptions {
   bin: string
   timeoutMs: number
@@ -188,7 +190,8 @@ export class OpencodeBackend implements Backend {
       let sawError: string | null = null
       let emittedContent = false
       let emittedToolCall = false
-      let usage: ChatDelta['usage']
+      let stepUsage: UsageReceipt | undefined
+      let fallbackUsage: UsageReceipt | undefined
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
 
       for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
@@ -219,6 +222,11 @@ export class OpencodeBackend implements Backend {
         }
 
         const type = String(ev.type ?? '')
+        const eventUsage = extractUsage(ev)
+        if (eventUsage) {
+          if (isStepReceipt(ev)) stepUsage = addUsage(stepUsage, eventUsage)
+          else fallbackUsage = eventUsage
+        }
         if (type === 'error' || ev.error) {
           sawError = String(ev.message ?? (ev.error as Record<string, unknown> | undefined)?.message ?? 'opencode error')
           continue
@@ -231,8 +239,6 @@ export class OpencodeBackend implements Backend {
         }
         const toolCall = extractToolUse(ev)
         if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
-        const eventUsage = extractUsage(ev)
-        if (eventUsage) usage = eventUsage
 
         if (
           type === 'message.completed'
@@ -242,7 +248,7 @@ export class OpencodeBackend implements Backend {
         ) {
           yield {
             finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
-            usage,
+            usage: stepUsage ?? fallbackUsage,
             internal_session_id: internalSessionId,
           }
           return
@@ -262,7 +268,11 @@ export class OpencodeBackend implements Backend {
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
       }
-      yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', usage, internal_session_id: internalSessionId }
+      yield {
+        finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
+        usage: stepUsage ?? fallbackUsage,
+        internal_session_id: internalSessionId,
+      }
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
@@ -328,20 +338,81 @@ function extractToolUse(ev: Record<string, unknown>): { id: string; name: string
   }
 }
 
-function extractUsage(ev: Record<string, unknown>): ChatDelta['usage'] | null {
-  const direct = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
-  if (direct) return direct
+function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
+  const direct = ev.usage as Record<string, unknown> | undefined
+  if (direct) {
+    return usageFromValues({
+      input_tokens: direct.input_tokens ?? direct.input,
+      output_tokens: direct.output_tokens ?? direct.output,
+      cost: direct.cost ?? ev.cost,
+    })
+  }
 
   const part = ev.part as Record<string, unknown> | undefined
-  const tokens = part?.tokens as
-    | { input?: number; output?: number; input_tokens?: number; output_tokens?: number }
-    | undefined
-  if (!tokens) return null
+  const tokens = part?.tokens as Record<string, unknown> | undefined
+  const cache = tokens?.cache as Record<string, unknown> | undefined
 
+  return usageFromValues({
+    // OpenCode reports input/output *excluding* cache and reasoning.
+    // OpenAI totals include those categories, so reconstruct full compute.
+    input_tokens: sumKnown([
+      tokens?.input_tokens ?? tokens?.input,
+      cache?.read,
+      cache?.write,
+    ]),
+    output_tokens: sumKnown([
+      tokens?.output_tokens ?? tokens?.output,
+      tokens?.reasoning,
+    ]),
+    cost: part?.cost ?? ev.cost,
+  })
+}
+
+function usageFromValues(values: Record<string, unknown>): UsageReceipt | null {
+  const inputTokens = nonnegativeFinite(values.input_tokens)
+  const outputTokens = nonnegativeFinite(values.output_tokens)
+  const cost = nonnegativeFinite(values.cost)
+  if (inputTokens === undefined && outputTokens === undefined && cost === undefined) return null
   return {
-    input_tokens: tokens.input_tokens ?? tokens.input,
-    output_tokens: tokens.output_tokens ?? tokens.output,
+    ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+    ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+    ...(cost !== undefined ? { cost } : {}),
   }
+}
+
+function isStepReceipt(ev: Record<string, unknown>): boolean {
+  const type = String(ev.type ?? '')
+  const partType = String((ev.part as Record<string, unknown> | undefined)?.type ?? '')
+  return type === 'step_finish'
+    || type === 'step-finish'
+    || partType === 'step_finish'
+    || partType === 'step-finish'
+}
+
+function addUsage(total: UsageReceipt | undefined, next: UsageReceipt): UsageReceipt {
+  const sum = (left: number | undefined, right: number | undefined): number | undefined =>
+    left === undefined ? right : right === undefined ? left : left + right
+  return {
+    input_tokens: sum(total?.input_tokens, next.input_tokens),
+    output_tokens: sum(total?.output_tokens, next.output_tokens),
+    cost: sum(total?.cost, next.cost),
+  }
+}
+
+function nonnegativeFinite(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function sumKnown(values: unknown[]): number | undefined {
+  let total = 0
+  let sawValue = false
+  for (const value of values) {
+    const numeric = nonnegativeFinite(value)
+    if (numeric === undefined) continue
+    total += numeric
+    sawValue = true
+  }
+  return sawValue ? total : undefined
 }
 
 function extractText(ev: Record<string, unknown>): string | null {

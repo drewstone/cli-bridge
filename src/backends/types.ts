@@ -77,6 +77,17 @@ export interface McpRequestConfig {
   mcpServers?: Record<string, McpServerSpec>
 }
 
+/** Safe proof of the exact AgentProfile workspace plan applied before spawn. */
+export interface ProfileMaterializationReceipt {
+  schema: 'cli-bridge.profile-materialization.v1'
+  harness: string
+  /** Covers planned file contents/modes, flags, environment, and unsupported dimensions. */
+  workspacePlanDigest: string
+  /** Relative paths only; profile contents and environment values never cross the API. */
+  files: Array<{ path: string; mode: number }>
+  unsupported: Array<{ dimension: string; reason: string }>
+}
+
 export interface ChatRequest {
   model: string
   messages: ChatMessage[]
@@ -162,6 +173,8 @@ export interface ChatRequest {
   jailSpec?: JailSpec | null
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
+  /** Internal receipt populated by profile provisioning before the harness spawns. */
+  profile_materialization_receipt?: ProfileMaterializationReceipt
 }
 
 export interface ChatDelta {
@@ -176,7 +189,15 @@ export interface ChatDelta {
    * is set when the bridge derived it from text (~4 chars/token) because the
    * backend CLI reported none — consumers price it as approximate, not measured.
    */
-  usage?: { input_tokens?: number; output_tokens?: number; estimated?: boolean }
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    /** Backend-reported USD cost. Omitted when the backend did not report one. */
+    cost?: number
+    estimated?: boolean
+  }
+  /** Safe proof of the AgentProfile files applied before this run. */
+  profile_materialization?: ProfileMaterializationReceipt
   /** Backend assigned id for this turn. Written to session store. */
   internal_session_id?: string
   /**

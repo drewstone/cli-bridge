@@ -69,6 +69,27 @@ interface ClaudeStreamResult {
 }
 type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamResult | { type: string }
 
+const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 300
+
+function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
+  const fallback = 'provider returned an error result'
+  if (!detail) return fallback
+
+  // Provider messages are useful diagnostics, but they are untrusted output:
+  // keep one bounded printable line and remove common credential shapes.
+  const sanitized = detail
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f-\x9f]+/gu, ' ')
+    .replace(/\b(Bearer\s+)[^\s,;]+/giu, '$1<redacted>')
+    .replace(/\bsk-(?:ant-)?[A-Za-z0-9_-]{8,}\b/gu, '<redacted>')
+    .replace(/\s+/gu, ' ')
+    .trim()
+
+  return (sanitized || fallback).slice(0, MAX_UPSTREAM_ERROR_DETAIL_CHARS)
+}
+
 export interface ClaudeBackendOptions {
   bin: string
   timeoutMs: number
@@ -294,7 +315,6 @@ export class ClaudeBackend implements Backend {
 
         if (msg.type === 'system' && (msg as ClaudeStreamInit).subtype === 'init') {
           internalSessionId = (msg as ClaudeStreamInit).session_id
-          yield { internal_session_id: internalSessionId }
           continue
         }
 
@@ -327,7 +347,8 @@ export class ClaudeBackend implements Backend {
         if (msg.type === 'result') {
           const r = msg as ClaudeStreamResult
           if (r.is_error) {
-            yield { finish_reason: 'error', internal_session_id: internalSessionId }
+            const detail = sanitizeUpstreamErrorDetail(r.result)
+            throw new BackendError(`claude upstream error: ${detail}`, 'upstream')
           } else {
             // tool_calls wins over stop when the model emitted at least
             // one tool_use block during this turn (native or MCP).

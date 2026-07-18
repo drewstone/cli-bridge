@@ -285,7 +285,7 @@ export function mountChatCompletions(
     // id reaches the setup-and-pump path below.
     const existing = deps.runs.get(runId)
     if (existing) {
-      return respondFromRun(c, existing, req, runId, afterSeq, false)
+      return respondFromRun(c, existing, req, runId, afterSeq)
     }
 
     // Execution router: when the caller asks for `execution: 'sandbox'`
@@ -366,10 +366,12 @@ export function mountChatCompletions(
     const wrap = (source: AsyncIterable<ChatDelta>): AsyncIterable<ChatDelta> => ({
       [Symbol.asyncIterator]: async function* () {
         let sawUsage = false
+        let failed = false
         let completionChars = 0
         try {
           for await (const delta of source) {
             if (delta.usage) sawUsage = true
+            if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') failed = true
             completionChars += (delta.content?.length ?? 0)
               + (delta.tool_calls?.reduce(
                 (s, tc) => s + (tc.id?.length ?? 0) + (tc.name?.length ?? 0) + (tc.arguments?.length ?? 0),
@@ -388,14 +390,14 @@ export function mountChatCompletions(
                 },
               })
             }
-            yield delta
+            yield delta.finish_reason && req.profile_materialization_receipt
+              ? { ...delta, profile_materialization: req.profile_materialization_receipt }
+              : delta
           }
-          // Backends whose CLI reports no usage (kimi-code, opencode) would leave
-          // every reader with zero tokens, indistinguishable from a stub. Estimate
-          // from the text (~4 chars/token) and emit a usage delta flagged `estimated`
-          // so cost ledgers approximate spend without mistaking it for measured truth.
-          // It is buffered in the run, so reconnecting readers receive it too.
-          if (!sawUsage) {
+          // Successful backends whose CLI reports no usage (kimi-code, opencode)
+          // get a bounded estimate. A failure without measured usage stays unknown:
+          // inventing tokens after error/timeout masks the real terminal condition.
+          if (!sawUsage && !failed) {
             yield {
               usage: {
                 input_tokens: tokensFromChars(promptChars),
@@ -427,7 +429,7 @@ export function mountChatCompletions(
       void r.pump(wrap(makeSource!(r)))
     })
 
-    return respondFromRun(c, run, req, runId, afterSeq, true)
+    return respondFromRun(c, run, req, runId, afterSeq)
   })
 }
 
@@ -443,7 +445,6 @@ async function respondFromRun(
   req: ChatRequest,
   runId: string,
   afterSeq: number,
-  isFresh: boolean,
 ): Promise<Response> {
   // Surface mode + run id so clients can reconnect/cancel by run id.
   c.header('X-Bridge-Mode', req.mode ?? 'byob')
@@ -456,15 +457,11 @@ async function respondFromRun(
     // A non-streaming response is a single JSON body, so a dispatch-time
     // typed error (mode rejected, spawn/config failure — thrown before any
     // delta) must become a real HTTP status, not a 200 with an error
-    // payload. Only the fresh dispatcher does this; a re-attaching client
-    // (run already known) drains the buffered terminal error instead. The
-    // gate resolves the moment output starts or the run settles, so a
-    // healthy long job is never blocked past its first delta.
-    if (isFresh) {
-      await run.whenStarted()
-      const dispatchErr = run.dispatchError()
-      if (dispatchErr !== undefined) return errorResponse(c, dispatchErr)
-    }
+    // payload. Re-attaching readers receive the same typed error, and the
+    // check resolves once output starts or the run settles.
+    await run.whenStarted()
+    const dispatchErr = run.dispatchError()
+    if (dispatchErr !== undefined) return errorResponse(c, dispatchErr)
     try {
       const deltas = mapSeq(run.attach(afterSeq))
       const body = await collectNonStreaming(deltas, req.model)
@@ -509,6 +506,20 @@ async function respondFromRun(
       if (!await writeRaw(': connected\n\n')) return
       for await (const { seq, delta } of run.attach(afterSeq)) {
         if (clientGone) break
+        // pump() records a typed pre-output failure and one buffered terminal
+        // marker. Replace that marker with one OpenAI error frame so provider
+        // detail survives without duplicating terminal chunks.
+        const dispatchErr = delta.finish_reason === 'error' ? run.dispatchError() : undefined
+        if (dispatchErr !== undefined) {
+          const message = dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr)
+          const type = dispatchErr instanceof BackendError
+            ? dispatchErr.code
+            : dispatchErr instanceof ModeNotSupportedError
+              ? 'mode_not_supported'
+              : 'server_error'
+          await writeSse(JSON.stringify({ error: { message, type } }), seq)
+          break
+        }
         // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
         // render as SSE comment so the consumer (AI SDK, openai-node)
         // ignores it per spec instead of trying to route a fake tool

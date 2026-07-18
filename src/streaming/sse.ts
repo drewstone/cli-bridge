@@ -28,19 +28,20 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   const hasFinish = delta.finish_reason !== undefined
   const hasUsage = !!delta.usage
   const hasSessionId = !!delta.internal_session_id
+  const hasProfileMaterialization = !!delta.profile_materialization
 
   // Pure keepalive deltas don't go on the OpenAI wire — surface as SSE
   // comments via `deltaToSseComment` instead. `internal_session_id`-only
   // deltas are also non-OpenAI metadata (consumed by the session store)
   // and are intentionally skipped here.
-  if (!hasContent && !hasToolCalls && !hasFinish && !hasUsage) {
+  if (!hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
   // internal_session_id-only deltas: the session id is bookkeeping for
   // the bridge's own store, not OpenAI surface area. Skip to avoid
   // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
   // some agent harnesses) reject as malformed.
-  if (hasSessionId && !hasContent && !hasToolCalls && !hasFinish && !hasUsage) {
+  if (hasSessionId && !hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
 
@@ -55,16 +56,15 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     }))
   }
 
-  // A usage-only delta (no content/tool_calls/finish) is the OpenAI usage trailer:
-  // it must carry `choices: []`, not an empty choice, or strict clients misparse it
-  // as assistant output. Every other delta carries the single streaming choice.
-  const usageOnly = hasUsage && !hasContent && !hasToolCalls && !hasFinish
+  // Usage/profile metadata without content/tool_calls/finish carries `choices: []`,
+  // not an empty choice, so strict OpenAI clients do not parse it as output.
+  const metadataOnly = (hasUsage || hasProfileMaterialization) && !hasContent && !hasToolCalls && !hasFinish
   const payload = {
     id: meta.id,
     object: 'chat.completion.chunk',
     created: meta.created,
     model: meta.model,
-    choices: usageOnly ? [] : [
+    choices: metadataOnly ? [] : [
       {
         index: 0,
         delta: choiceDelta,
@@ -76,9 +76,13 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
         prompt_tokens: delta.usage.input_tokens ?? 0,
         completion_tokens: delta.usage.output_tokens ?? 0,
         total_tokens: (delta.usage.input_tokens ?? 0) + (delta.usage.output_tokens ?? 0),
+        ...(delta.usage.cost !== undefined ? { cost: delta.usage.cost } : {}),
         ...(delta.usage.estimated ? { estimated: true } : {}),
       },
     } : {}),
+    ...(delta.profile_materialization
+      ? { profile_materialization: delta.profile_materialization }
+      : {}),
   }
   return `data: ${JSON.stringify(payload)}\n\n`
 }
@@ -123,6 +127,7 @@ export async function collectNonStreaming(
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = []
   let finishReason: string | null = null
   let usage: ChatDelta['usage']
+  let profileMaterialization: ChatDelta['profile_materialization']
 
   for await (const d of iter) {
     // Backend-liveness signals are transport-layer and have no place in
@@ -132,6 +137,7 @@ export async function collectNonStreaming(
     if (d.tool_calls) toolCalls.push(...d.tool_calls)
     if (d.finish_reason) finishReason = d.finish_reason
     if (d.usage) usage = d.usage
+    if (d.profile_materialization) profileMaterialization = d.profile_materialization
   }
 
   // Usage (estimated or measured) is produced upstream in the run source, so
@@ -141,6 +147,7 @@ export async function collectNonStreaming(
         prompt_tokens: usage.input_tokens ?? 0,
         completion_tokens: usage.output_tokens ?? 0,
         total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
+        ...(usage.cost !== undefined ? { cost: usage.cost } : {}),
         ...(usage.estimated ? { estimated: true } : {}),
       }
     : undefined
@@ -169,5 +176,6 @@ export async function collectNonStreaming(
       },
     ],
     ...(usageOut ? { usage: usageOut } : {}),
+    ...(profileMaterialization ? { profile_materialization: profileMaterialization } : {}),
   }
 }
