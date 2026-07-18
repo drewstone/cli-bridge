@@ -22,7 +22,12 @@ const systemdRunAvailable =
   !!process.env.XDG_RUNTIME_DIR &&
   existsSync(`${process.env.XDG_RUNTIME_DIR}/systemd/private`)
 
-const describeReal = systemdRunAvailable ? describe : describe.skip
+// Real cgroup teardown can kill the invoking interactive scope when a developer
+// runs this suite from tmux through another agent service. Keep it out of the
+// default test command; CI or a disposable host must opt in explicitly.
+const describeReal = systemdRunAvailable && process.env.CLI_BRIDGE_REAL_CGROUP_TESTS === '1'
+  ? describe
+  : describe.skip
 
 /** Read /proc/<pid>/cgroup → "/user.slice/.../cli-bridge-...scope" or null. */
 function cgroupOf(pid: number): string | null {

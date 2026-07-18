@@ -391,6 +391,8 @@ export class ClaudeBackend implements Backend {
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
       : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
+    const effort = claudeEffort(req.effort)
+    if (effort) args.push('--effort', effort)
 
     // Fold every system source into --append-system-prompt so
     // claude-code-cli applies them as a real system slot. Sources:
@@ -572,4 +574,18 @@ export class ClaudeBackend implements Backend {
     }
     return null
   }
+}
+
+/**
+ * Map the shared effort ladder onto Claude Code's exact CLI values.
+ * Claude cannot disable effort or express `minimal`, so both clamp to its
+ * lowest supported level. `ultracode` maps to Claude's explicit maximum.
+ */
+export function claudeEffort(
+  effort: ChatRequest['effort'],
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
+  if (!effort) return null
+  if (effort === 'none' || effort === 'minimal') return 'low'
+  if (effort === 'ultracode') return 'max'
+  return effort
 }

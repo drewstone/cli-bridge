@@ -60,6 +60,11 @@ export interface ContainerPoolOptions {
   shareMounts?: string[]
   perSlotVolumePrefix?: string
   perSlotMountTarget?: string
+  /**
+   * Optional canonical host workspace root. It is bind-mounted read-write
+   * at the identical absolute path in every slot, independently of OAuth.
+   */
+  workspaceRoot?: string
   /** Per-container memory cap, e.g. '4g'. Default 4g. */
   memory?: string
   /** Per-container CPU cap, e.g. '2'. Default 2. */
@@ -340,26 +345,7 @@ async function provisionSlot(
   // Tear down any stale container with the same name (idempotent).
   await execFileAsync('docker', ['rm', '-f', name]).catch(() => {})
 
-  const memory = opts.memory ?? '4g'
-  const cpus = opts.cpus ?? '2'
-  // restart=on-failure:3 instead of unless-stopped — caps the docker-level
-  // restart loop so a poisoned image can't churn the daemon forever.
-  const args = [
-    'run', '-d',
-    '--name', name,
-    '--restart', 'on-failure:3',
-    '--memory', memory, '--memory-swap', memory,
-    '--cpus', cpus,
-  ]
-  if (opts.oauthMode === 'share') {
-    for (const m of opts.shareMounts ?? []) args.push('-v', m)
-  } else {
-    if (!opts.perSlotVolumePrefix || !opts.perSlotMountTarget) {
-      throw new Error('per-slot oauthMode requires perSlotVolumePrefix + perSlotMountTarget')
-    }
-    args.push('-v', `${opts.perSlotVolumePrefix}-${index}:${opts.perSlotMountTarget}`)
-  }
-  args.push(opts.image, 'tail', '-f', '/dev/null')
+  const args = buildContainerRunArgs(opts, index, name)
 
   onProgress(`[slot ${index}] docker run ${name}`)
   const r = await execFileAsync('docker', args)
@@ -378,6 +364,50 @@ async function provisionSlot(
     generation: 0,
     consecutiveFailures: 0,
   }
+}
+
+/** Compose `docker run` argv without invoking Docker. */
+export function buildContainerRunArgs(
+  opts: ContainerPoolOptions,
+  index: number,
+  name = `${opts.namePrefix}-${index}`,
+): string[] {
+  const memory = opts.memory ?? '4g'
+  const cpus = opts.cpus ?? '2'
+  // restart=on-failure:3 instead of unless-stopped — caps the docker-level
+  // restart loop so a poisoned image can't churn the daemon forever.
+  const args = [
+    'run', '-d',
+    '--name', name,
+    '--restart', 'on-failure:3',
+    '--memory', memory, '--memory-swap', memory,
+    '--cpus', cpus,
+  ]
+  if (opts.workspaceRoot) {
+    if (!isSafeWorkspaceBindPath(opts.workspaceRoot)) {
+      throw new Error(`invalid Docker workspace root: ${opts.workspaceRoot}`)
+    }
+    // Docker bind mounts are read-write unless `readonly` is present.
+    // Source and target intentionally match so request cwd needs no rewrite.
+    args.push(
+      '--mount',
+      `type=bind,source=${opts.workspaceRoot},target=${opts.workspaceRoot}`,
+    )
+  }
+  if (opts.oauthMode === 'share') {
+    for (const m of opts.shareMounts ?? []) args.push('-v', m)
+  } else {
+    if (!opts.perSlotVolumePrefix || !opts.perSlotMountTarget) {
+      throw new Error('per-slot oauthMode requires perSlotVolumePrefix + perSlotMountTarget')
+    }
+    args.push('-v', `${opts.perSlotVolumePrefix}-${index}:${opts.perSlotMountTarget}`)
+  }
+  args.push(opts.image, 'tail', '-f', '/dev/null')
+  return args
+}
+
+function isSafeWorkspaceBindPath(path: string): boolean {
+  return path.startsWith('/') && path !== '/' && !path.includes(',')
 }
 
 async function destroySlot(containerId: string): Promise<void> {

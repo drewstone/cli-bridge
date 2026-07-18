@@ -14,6 +14,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 import type { ContainerPool } from './container-pool.js'
 import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
 
@@ -25,10 +26,13 @@ export interface DockerSpawnerOptions {
    * so the default is empty.
    */
   binPrefixInContainer?: string
+  /** Host workspace root mounted into each slot at the same path. */
+  workspaceRoot?: string
 }
 
 export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
   return async (bin, args, spawnOpts) => {
+    assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd)
     const slot = await opts.pool.acquire(spawnOpts.sessionId)
     let released = false
     const release = (): void => {
@@ -49,6 +53,23 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       release()
       throw err
     }
+  }
+}
+
+/**
+ * Fail before acquiring a slot when a request points outside the only host
+ * workspace exposed to the container. Calls without cwd (for example
+ * `<cli> --version` health checks) run against the container filesystem.
+ */
+export function assertDockerWorkspaceCwd(workspaceRoot: string | undefined, cwd: string | undefined): void {
+  if (!workspaceRoot || !cwd) return
+  if (!isAbsolute(cwd)) {
+    throw new Error(`Docker executor cwd must be absolute when workspace root is configured: ${cwd}`)
+  }
+  const canonicalCwd = resolve(cwd)
+  const rel = relative(workspaceRoot, canonicalCwd)
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`Docker executor cwd ${cwd} is outside configured workspace root ${workspaceRoot}`)
   }
 }
 

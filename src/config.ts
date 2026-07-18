@@ -7,7 +7,8 @@
  * keys is the failure mode we refuse to allow.
  */
 
-import { resolve } from 'node:path'
+import { realpathSync, statSync } from 'node:fs'
+import { isAbsolute, parse, resolve } from 'node:path'
 
 export interface Config {
   host: string
@@ -73,6 +74,7 @@ export interface Config {
    *   `<NAME>_DOCKER_NAME_PREFIX=<prefix>`
    *   `<NAME>_DOCKER_HOST_CONFIG_DIR=<host path>`  (share mode only)
    *   `<NAME>_DOCKER_CONTAINER_CONFIG_DIR=<container path>`  (mount target)
+   *   `<NAME>_DOCKER_WORKSPACE_ROOT=<absolute host path>`  (read-write, same container path)
    *
    * `BRIDGE_DEFAULT_EXECUTOR` sets the fallback for backends that don't
    * override individually. Default: host.
@@ -108,6 +110,11 @@ export interface BackendExecutorConfig {
   hostConfigDir?: string
   /** Mount target inside the container, e.g. /root/.claude or /root/.config/opencode. */
   containerConfigDir?: string
+  /**
+   * Canonical host directory exposed read-write to Docker workers at the
+   * identical absolute path. Requests with a cwd outside this root fail.
+   */
+  workspaceRoot?: string
 }
 
 /** Backends that never spawn a CLI on the host (remote HTTP, local proxy, or a
@@ -295,6 +302,11 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
     if (!defaults) continue
     const upper = name.toUpperCase()
     const kind = parseExecutor(`${upper}_EXECUTOR`, env[`${upper}_EXECUTOR`], defaultKind)
+    const workspaceRootKey = `${upper}_DOCKER_WORKSPACE_ROOT`
+    const rawWorkspaceRoot = env[workspaceRootKey]?.trim()
+    if (rawWorkspaceRoot && kind !== 'docker') {
+      throw new Error(`${workspaceRootKey} requires ${upper}_EXECUTOR=docker`)
+    }
     const cfg: BackendExecutorConfig = { name, kind }
     if (kind === 'docker') {
       cfg.image = env[`${upper}_DOCKER_IMAGE`] ?? defaults.image
@@ -304,10 +316,34 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
       const hostBase = env[defaults.hostConfigEnvKey] ?? '/root'
       cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.defaultHostConfigDir}`)
       cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? defaults.containerConfigDir
+      if (rawWorkspaceRoot) cfg.workspaceRoot = parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
     }
     out[name] = cfg
   }
   return out
+}
+
+function parseDockerWorkspaceRoot(key: string, value: string): string {
+  if (!isAbsolute(value)) {
+    throw new Error(`invalid ${key}: expected an absolute path, got ${value}`)
+  }
+  if (value.includes(',')) {
+    throw new Error(`invalid ${key}: commas are not supported in Docker bind paths`)
+  }
+
+  let canonical: string
+  try {
+    canonical = realpathSync(value)
+  } catch {
+    throw new Error(`invalid ${key}: path does not exist: ${value}`)
+  }
+  if (!statSync(canonical).isDirectory()) {
+    throw new Error(`invalid ${key}: path is not a directory: ${value}`)
+  }
+  if (canonical === parse(canonical).root) {
+    throw new Error(`invalid ${key}: refusing to expose filesystem root ${canonical}`)
+  }
+  return canonical
 }
 
 function parseExecutor(key: string, value: string | undefined, fallback: 'host' | 'docker'): 'host' | 'docker' {

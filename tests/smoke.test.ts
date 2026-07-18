@@ -17,7 +17,7 @@ import { SessionStore } from '../src/sessions/store.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
-import { ClaudeBackend } from '../src/backends/claude.js'
+import { ClaudeBackend, claudeEffort } from '../src/backends/claude.js'
 import { KimiBackend, thinkingFlagForEffort } from '../src/backends/kimi.js'
 import { CodexBackend, codexReasoningEffort } from '../src/backends/codex.js'
 import { OpencodeBackend, opencodeVariantForEffort } from '../src/backends/opencode.js'
@@ -218,6 +218,17 @@ describe('GeminiBackend model parsing', () => {
 })
 
 describe('reasoning effort mapping', () => {
+  it('maps every shared effort value onto Claude Code supported argv values', () => {
+    expect(claudeEffort('none')).toBe('low')
+    expect(claudeEffort('minimal')).toBe('low')
+    expect(claudeEffort('low')).toBe('low')
+    expect(claudeEffort('medium')).toBe('medium')
+    expect(claudeEffort('high')).toBe('high')
+    expect(claudeEffort('xhigh')).toBe('xhigh')
+    expect(claudeEffort('ultracode')).toBe('max')
+    expect(claudeEffort(undefined)).toBeNull()
+  })
+
   it('maps opencode effort to provider variant', () => {
     expect(opencodeVariantForEffort('high')).toBe('high')
     expect(opencodeVariantForEffort('ultracode')).toBe('ultracode')
@@ -704,6 +715,19 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     // Argv mode must NOT include --input-format stream-json — that would
     // flip claude-code into interactive agent-loop mode.
     expect(args).not.toContain('--input-format')
+  })
+
+  it('forwards xhigh effort to Claude Code argv', () => {
+    const args = b.buildArgs(
+      { ...baseReq, effort: 'xhigh' },
+      null,
+      'byob',
+      null,
+      { userTextForArgv: 'summarize' },
+    )
+    const effortIndex = args.indexOf('--effort')
+    expect(effortIndex).toBeGreaterThan(-1)
+    expect(args[effortIndex + 1]).toBe('xhigh')
   })
 
   it('falls back to --input-format stream-json when user text is too large for argv', () => {
