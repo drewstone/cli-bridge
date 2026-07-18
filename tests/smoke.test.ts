@@ -730,6 +730,36 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     expect(args[effortIndex + 1]).toBe('xhigh')
   })
 
+  it('uses AgentProfile effort and lets an explicit request override it', () => {
+    const profileRequest = {
+      ...baseReq,
+      agent_profile: { model: { reasoningEffort: 'xhigh' } } as const,
+    }
+    const profileArgs = b.buildArgs(profileRequest, null, 'byob')
+    expect(profileArgs.slice(profileArgs.indexOf('--effort'), profileArgs.indexOf('--effort') + 2))
+      .toEqual(['--effort', 'xhigh'])
+
+    const overrideArgs = b.buildArgs({ ...profileRequest, effort: 'low' }, null, 'byob')
+    expect(overrideArgs.slice(overrideArgs.indexOf('--effort'), overrideArgs.indexOf('--effort') + 2))
+      .toEqual(['--effort', 'low'])
+  })
+
+  it('uses effort from a resumed session AgentProfile', () => {
+    const session = {
+      externalId: 'r385-session',
+      backend: 'claude-code',
+      internalId: 'internal',
+      cwd: null,
+      turns: 1,
+      createdAt: 1,
+      lastUsedAt: 1,
+      metadata: { agent_profile: { model: { reasoningEffort: 'high' } } },
+    }
+    const args = b.buildArgs(baseReq, session, 'byob')
+    expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2))
+      .toEqual(['--effort', 'high'])
+  })
+
   it('falls back to --input-format stream-json when user text is too large for argv', () => {
     const args = b.buildArgs(baseReq, null, 'byob')
     expect(args).toContain('--print')

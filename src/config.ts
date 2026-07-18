@@ -8,7 +8,7 @@
  */
 
 import { realpathSync, statSync } from 'node:fs'
-import { isAbsolute, parse, resolve } from 'node:path'
+import { isAbsolute, parse, relative, resolve, sep } from 'node:path'
 
 export interface Config {
   host: string
@@ -316,11 +316,55 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
       const hostBase = env[defaults.hostConfigEnvKey] ?? '/root'
       cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.defaultHostConfigDir}`)
       cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? defaults.containerConfigDir
-      if (rawWorkspaceRoot) cfg.workspaceRoot = parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
+      if (rawWorkspaceRoot) {
+        cfg.workspaceRoot = parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
+        assertDockerMountsDoNotOverlap(
+          workspaceRootKey,
+          cfg.workspaceRoot,
+          cfg.hostConfigDir,
+          cfg.containerConfigDir,
+        )
+      }
     }
     out[name] = cfg
   }
   return out
+}
+
+function canonicalOrResolvedPath(value: string): string {
+  try {
+    return realpathSync(value)
+  } catch {
+    return resolve(value)
+  }
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const rel = relative(left, right)
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
+}
+
+function assertDockerMountsDoNotOverlap(
+  workspaceKey: string,
+  workspaceRoot: string,
+  hostConfigDir: string,
+  containerConfigDir: string,
+): void {
+  const canonicalHostConfig = canonicalOrResolvedPath(hostConfigDir)
+  if (pathsOverlap(workspaceRoot, canonicalHostConfig) || pathsOverlap(canonicalHostConfig, workspaceRoot)) {
+    throw new Error(
+      `invalid ${workspaceKey}: workspace and host OAuth/config directories must not overlap`,
+    )
+  }
+  if (!isAbsolute(containerConfigDir)) {
+    throw new Error(`invalid ${workspaceKey}: Docker config mount target must be absolute`)
+  }
+  const canonicalContainerConfig = resolve(containerConfigDir)
+  if (pathsOverlap(workspaceRoot, canonicalContainerConfig) || pathsOverlap(canonicalContainerConfig, workspaceRoot)) {
+    throw new Error(
+      `invalid ${workspaceKey}: workspace and container OAuth/config directories must not overlap`,
+    )
+  }
 }
 
 function parseDockerWorkspaceRoot(key: string, value: string): string {

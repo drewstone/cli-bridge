@@ -67,4 +67,16 @@ export interface SpawnResult {
   spawnError?(): Error | null
 }
 
-export type Spawner = (bin: string, args: string[], opts: SpawnOpts) => Promise<SpawnResult>
+export interface Spawner {
+  (bin: string, args: string[], opts: SpawnOpts): Promise<SpawnResult>
+  /**
+   * Resolve and validate a requested cwd before any backend writes profile or
+   * MCP files into it. Docker spawners use this to enforce their bind root.
+   */
+  resolveCwd?(cwd: string | undefined): string | undefined
+}
+
+/** Apply an executor's cwd policy before any workspace materialization. */
+export function resolveSpawnerCwd(spawner: Spawner, cwd: string | undefined): string | undefined {
+  return spawner.resolveCwd?.(cwd) ?? cwd
+}

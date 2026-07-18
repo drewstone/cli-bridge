@@ -12,11 +12,11 @@ importers:
         specifier: ^1.13.0
         version: 1.19.14(hono@4.12.14)
       '@tangle-network/agent-interface':
-        specifier: '>=0.10.0 <1.0.0'
-        version: 0.10.0
+        specifier: ^0.30.0
+        version: 0.30.0
       '@tangle-network/agent-profile-materialize':
-        specifier: ^0.1.0
-        version: 0.1.0
+        specifier: ^0.5.1
+        version: 0.5.1
       better-sqlite3:
         specifier: ^12.0.0
         version: 12.9.0
@@ -348,6 +348,10 @@ packages:
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
 
+  '@noble/hashes@1.8.0':
+    resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
+    engines: {node: ^14.21.3 || >=16}
+
   '@rollup/rollup-android-arm-eabi@4.60.2':
     resolution: {integrity: sha512-dnlp69efPPg6Uaw2dVqzWRfAWRnYVb1XJ8CyyhIbZeaq4CA5/mLeZ1IEt9QqQxmbdvagjLIm2ZL8BxXv5lH4Yw==}
     cpu: [arm]
@@ -486,14 +490,11 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@tangle-network/agent-interface@0.10.0':
-    resolution: {integrity: sha512-oiREgihkeX/xcGEtFfi9AkAfU2VzuF7SSla2s0iliXPUXyHCIIx6jwzHiYdwb1ZGCfvC+T+0SWOIa6fN5u195g==}
+  '@tangle-network/agent-interface@0.30.0':
+    resolution: {integrity: sha512-GmwPwamrzOFPn+Qx7W0nt9QRUF9VUiZrMNLmF6QpL23R+7TD21HllPblVOYB5MVqA728FpDLXit3HfqY8mStwg==}
 
-  '@tangle-network/agent-interface@0.5.0':
-    resolution: {integrity: sha512-gytbc/iETGmml/vQiw8C8R6kEd3AA1MDcDC0vZSP7MOyj1hy9zCtU3XNk2mV8NyyrLcHjYNQUzBisPL/pFReEw==}
-
-  '@tangle-network/agent-profile-materialize@0.1.0':
-    resolution: {integrity: sha512-a06QNAKRVtrYFfx+6+RSGvqvRsegCu9V4MRsslvf/FiMp1d6fwu5Yg11IHTkh7RfSB0J2O8y2hqoGzJ70nU9oA==}
+  '@tangle-network/agent-profile-materialize@0.5.1':
+    resolution: {integrity: sha512-gU4J6mglvy9bpBAnErOruO1goF1cSzGGd06Oo5CFSj7RjR1SXWDFMYQtVLSd/O68ldCVAMVIMq5b4rwboMBbcw==}
 
   '@types/better-sqlite3@7.6.13':
     resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
@@ -1031,6 +1032,8 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
+  '@noble/hashes@1.8.0': {}
+
   '@rollup/rollup-android-arm-eabi@4.60.2':
     optional: true
 
@@ -1106,17 +1109,14 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.60.2':
     optional: true
 
-  '@tangle-network/agent-interface@0.10.0':
+  '@tangle-network/agent-interface@0.30.0':
     dependencies:
+      '@noble/hashes': 1.8.0
       zod: 4.4.3
 
-  '@tangle-network/agent-interface@0.5.0':
+  '@tangle-network/agent-profile-materialize@0.5.1':
     dependencies:
-      zod: 4.4.3
-
-  '@tangle-network/agent-profile-materialize@0.1.0':
-    dependencies:
-      '@tangle-network/agent-interface': 0.5.0
+      '@tangle-network/agent-interface': 0.30.0
 
   '@types/better-sqlite3@7.6.13':
     dependencies:

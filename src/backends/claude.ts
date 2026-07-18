@@ -34,7 +34,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import type { Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { killTree } from '../executors/process-tree.js'
@@ -158,6 +158,7 @@ export class ClaudeBackend implements Backend {
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
     const mode: BridgeMode = req.mode ?? 'byob'
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
 
     // hosted-sandboxed requires the sandbox launcher which is a separate
     // code path (src/sandbox.ts, not yet landed). Fail loud until that's
@@ -215,10 +216,12 @@ export class ClaudeBackend implements Backend {
     // Phase-2 host wiring: provision the profile's cwd-native dimensions (skills,
     // context, hooks, subagents, commands) into the run workspace before spawn. MCP
     // stays on the existing path. Fail-safe (never throws).
-    provisionProfileWorkspace(req, session, 'claude', req.cwd ?? session?.cwd ?? process.cwd())
+    const provisioned = provisionProfileWorkspace(req, session, 'claude', cwd)
+    Object.assign(childEnv, provisioned.env)
+    args.push(...provisioned.flags)
     const spawned = await this.spawner(this.bin, args, {
       stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
+      cwd,
       env: childEnv,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
@@ -391,7 +394,9 @@ export class ClaudeBackend implements Backend {
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
       : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
-    const effort = claudeEffort(req.effort)
+    const effort = claudeEffort(
+      req.effort ?? resolveAgentProfile(req, session)?.model?.reasoningEffort,
+    )
     if (effort) args.push('--effort', effort)
 
     // Fold every system source into --append-system-prompt so

@@ -12,6 +12,7 @@
     "start": "tsx src/server.ts",
     "build": "tsc --noEmit",
     "test": "vitest run",
+    "test:scoped-host-real": "CLI_BRIDGE_REAL_CGROUP_TESTS=1 vitest run tests/scoped-host.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "verify": "tsx scripts/verify.ts",
@@ -21,8 +22,8 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
-    "@tangle-network/agent-interface": ">=0.10.0 <1.0.0",
-    "@tangle-network/agent-profile-materialize": "^0.1.0",
+    "@tangle-network/agent-interface": "^0.30.0",
+    "@tangle-network/agent-profile-materialize": "^0.5.1",
     "better-sqlite3": "^12.0.0",
     "hono": "^4.9.0",
     "zod": "^3.24.0"

@@ -24,7 +24,7 @@ import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import type { Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { killTree } from '../executors/process-tree.js'
@@ -83,6 +83,7 @@ export class OpencodeBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
@@ -124,12 +125,14 @@ export class OpencodeBackend implements Backend {
 
     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
     // stays on opencode.json path). Fail-safe.
-    provisionProfileWorkspace(req, session, 'opencode', req.cwd ?? session?.cwd ?? process.cwd())
+    const provisioned = provisionProfileWorkspace(req, session, 'opencode', cwd)
+    args.push(...provisioned.flags)
     const spawned = await this.spawner(this.opts.bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
+      cwd,
       env: {
         ...process.env,
+        ...provisioned.env,
         ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),

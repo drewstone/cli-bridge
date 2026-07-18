@@ -14,7 +14,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { realpathSync, statSync } from 'node:fs'
+import { isAbsolute, relative, sep } from 'node:path'
 import type { ContainerPool } from './container-pool.js'
 import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
 
@@ -31,8 +32,8 @@ export interface DockerSpawnerOptions {
 }
 
 export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
-  return async (bin, args, spawnOpts) => {
-    assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd)
+  const spawner: Spawner = async (bin, args, spawnOpts) => {
+    const cwd = assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd)
     const slot = await opts.pool.acquire(spawnOpts.sessionId)
     let released = false
     const release = (): void => {
@@ -41,7 +42,13 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       slot.release()
     }
     try {
-      const dockerArgs = buildDockerExecArgs(slot.containerId, bin, args, spawnOpts, opts.binPrefixInContainer)
+      const dockerArgs = buildDockerExecArgs(
+        slot.containerId,
+        bin,
+        args,
+        { ...spawnOpts, ...(cwd ? { cwd } : {}) },
+        opts.binPrefixInContainer,
+      )
       const child = spawn('docker', dockerArgs, {
         stdio: spawnOpts.stdio ?? ['ignore', 'pipe', 'pipe'],
       })
@@ -54,6 +61,8 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       throw err
     }
   }
+  spawner.resolveCwd = (cwd) => assertDockerWorkspaceCwd(opts.workspaceRoot, cwd)
+  return spawner
 }
 
 /**
@@ -61,16 +70,28 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
  * workspace exposed to the container. Calls without cwd (for example
  * `<cli> --version` health checks) run against the container filesystem.
  */
-export function assertDockerWorkspaceCwd(workspaceRoot: string | undefined, cwd: string | undefined): void {
-  if (!workspaceRoot || !cwd) return
+export function assertDockerWorkspaceCwd(
+  workspaceRoot: string | undefined,
+  cwd: string | undefined,
+): string | undefined {
+  if (!workspaceRoot || !cwd) return cwd
   if (!isAbsolute(cwd)) {
     throw new Error(`Docker executor cwd must be absolute when workspace root is configured: ${cwd}`)
   }
-  const canonicalCwd = resolve(cwd)
+  let canonicalCwd: string
+  try {
+    canonicalCwd = realpathSync(cwd)
+  } catch {
+    throw new Error(`Docker executor cwd does not exist: ${cwd}`)
+  }
+  if (!statSync(canonicalCwd).isDirectory()) {
+    throw new Error(`Docker executor cwd is not a directory: ${cwd}`)
+  }
   const rel = relative(workspaceRoot, canonicalCwd)
   if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new Error(`Docker executor cwd ${cwd} is outside configured workspace root ${workspaceRoot}`)
   }
+  return canonicalCwd
 }
 
 /**

@@ -10,7 +10,7 @@
  * full chat() loop without spawning anything.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable, PassThrough } from 'node:stream'
@@ -369,12 +369,27 @@ describe('Docker workspace confinement', () => {
     expect(() => buildContainerRunArgs({ ...poolOpts, workspaceRoot: '/tmp/has,comma' }, 0)).toThrow(/invalid Docker workspace root/)
   })
 
-  it('allows nested cwd and health calls, but rejects relative or sibling paths', () => {
-    expect(() => assertDockerWorkspaceCwd('/tmp/research-workspaces', '/tmp/research-workspaces/task-1')).not.toThrow()
-    expect(() => assertDockerWorkspaceCwd('/tmp/research-workspaces', undefined)).not.toThrow()
-    expect(() => assertDockerWorkspaceCwd('/tmp/research-workspaces', 'task-1')).toThrow(/must be absolute/)
-    expect(() => assertDockerWorkspaceCwd('/tmp/research-workspaces', '/tmp/research-workspaces-escape')).toThrow(/outside configured workspace root/)
-    expect(() => assertDockerWorkspaceCwd('/tmp/research-workspaces', '/tmp/research-workspaces/../escape')).toThrow(/outside configured workspace root/)
+  it('canonicalizes nested cwd and rejects lexical and symlink escapes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-root-'))
+    const outside = mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-outside-'))
+    const task = join(root, 'task-1')
+    const inRootLink = join(root, 'task-link')
+    const outsideLink = join(root, 'outside-link')
+    mkdirSync(task)
+    symlinkSync(task, inRootLink)
+    symlinkSync(outside, outsideLink)
+    try {
+      expect(assertDockerWorkspaceCwd(root, task)).toBe(realpathSync(task))
+      expect(assertDockerWorkspaceCwd(root, inRootLink)).toBe(realpathSync(task))
+      expect(assertDockerWorkspaceCwd(root, undefined)).toBeUndefined()
+      expect(() => assertDockerWorkspaceCwd(root, 'task-1')).toThrow(/must be absolute/)
+      expect(() => assertDockerWorkspaceCwd(root, `${root}-escape`)).toThrow(/does not exist|outside configured workspace root/)
+      expect(() => assertDockerWorkspaceCwd(root, join(root, '..', 'escape'))).toThrow(/does not exist|outside configured workspace root/)
+      expect(() => assertDockerWorkspaceCwd(root, outsideLink)).toThrow(/outside configured workspace root/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 })
 
@@ -745,6 +760,43 @@ describe('per-backend executor config (parseAllExecutors)', () => {
       })).toThrow(/refusing to expose filesystem root/)
     } finally {
       rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects host or container OAuth/config overlap, including symlink aliases', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-home-'))
+    const oauth = join(home, '.claude')
+    const separate = mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-workspace-'))
+    const oauthAlias = join(home, 'oauth-alias')
+    mkdirSync(oauth)
+    symlinkSync(oauth, oauthAlias)
+    try {
+      for (const oauthMode of ['share', 'per-slot'] as const) {
+        expect(() => loadConfig({
+          HOME: home,
+          CLAUDE_EXECUTOR: 'docker',
+          CLAUDE_DOCKER_OAUTH_MOUNT: oauthMode,
+          CLAUDE_DOCKER_WORKSPACE_ROOT: home,
+        })).toThrow(/must not overlap/)
+        expect(() => loadConfig({
+          HOME: home,
+          CLAUDE_EXECUTOR: 'docker',
+          CLAUDE_DOCKER_OAUTH_MOUNT: oauthMode,
+          CLAUDE_DOCKER_HOST_CONFIG_DIR: oauthAlias,
+          CLAUDE_DOCKER_WORKSPACE_ROOT: oauth,
+        })).toThrow(/must not overlap/)
+        expect(() => loadConfig({
+          HOME: home,
+          CLAUDE_EXECUTOR: 'docker',
+          CLAUDE_DOCKER_OAUTH_MOUNT: oauthMode,
+          CLAUDE_DOCKER_HOST_CONFIG_DIR: oauth,
+          CLAUDE_DOCKER_CONTAINER_CONFIG_DIR: join(separate, '.claude'),
+          CLAUDE_DOCKER_WORKSPACE_ROOT: separate,
+        })).toThrow(/must not overlap/)
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+      rmSync(separate, { recursive: true, force: true })
     }
   })
 

@@ -5,7 +5,12 @@ import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-
 import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { applyWorkspacePlan, type HarnessId, materializeProfile } from '@tangle-network/agent-profile-materialize'
+import {
+  applyWorkspacePlan,
+  assertWorkspacePlanSupported,
+  type HarnessId,
+  materializeProfile,
+} from '@tangle-network/agent-profile-materialize'
 
 /**
  * Provision an AgentProfile's CWD-NATIVE dimensions (skills, context, hooks, subagents,
@@ -20,18 +25,37 @@ export function provisionProfileWorkspace(
   session: SessionRecord | null,
   harness: HarnessId,
   cwd: string,
-): { env: Record<string, string>; flags: string[]; written: string[] } {
+): {
+  env: Record<string, string>
+  flags: string[]
+  written: string[]
+  unsupported?: unknown[]
+  workspacePlanDigest?: string
+  degraded?: string
+} {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return { env: {}, flags: [], written: [] }
   try {
-    const profile = resolveAgentProfile(req, session)
-    if (!profile) return { env: {}, flags: [], written: [] }
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
+    if (profile.resources?.failOnError) assertWorkspacePlanSupported(plan)
     if (!plan.files.length && !plan.flags.length) return { env: {}, flags: [], written: [] }
     const applied = applyWorkspacePlan(plan, cwd)
-    return { env: applied.env, flags: applied.flags, written: applied.written }
-  } catch {
-    // FAIL-SAFE: a profile-materialization error must never break a live request.
-    // Worst case the run is un-provisioned (same as today), never crashed.
-    return { env: {}, flags: [], written: [] }
+    return {
+      env: applied.env,
+      flags: applied.flags,
+      written: applied.written,
+      unsupported: applied.unsupported,
+      ...('workspacePlanDigest' in applied && typeof applied.workspacePlanDigest === 'string'
+        ? { workspacePlanDigest: applied.workspacePlanDigest }
+        : {}),
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (profile.resources?.failOnError) {
+      throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
+    }
+    console.warn(`[cli-bridge] AgentProfile workspace materialization degraded: ${message}`)
+    return { env: {}, flags: [], written: [], degraded: message }
   }
 }
 
