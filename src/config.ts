@@ -75,6 +75,8 @@ export interface Config {
    *   `<NAME>_DOCKER_HOST_CONFIG_DIR=<host path>`  (share mode only)
    *   `<NAME>_DOCKER_CONTAINER_CONFIG_DIR=<container path>`  (mount target)
    *   `<NAME>_DOCKER_WORKSPACE_ROOT=<absolute host path>`  (read-write, same container path)
+   *   `<NAME>_DOCKER_USER=<positive uid>:<positive gid>`  (non-root container identity)
+   *   `<NAME>_DOCKER_HOME=<absolute container path>`  (required with Docker user)
    *
    * `BRIDGE_DEFAULT_EXECUTOR` sets the fallback for backends that don't
    * override individually. Default: host.
@@ -110,6 +112,10 @@ export interface BackendExecutorConfig {
   hostConfigDir?: string
   /** Mount target inside the container, e.g. /root/.claude or /root/.config/opencode. */
   containerConfigDir?: string
+  /** Optional numeric non-root identity used by the pool container and every docker exec. */
+  containerUser?: string
+  /** Writable HOME exposed to the configured container identity. */
+  containerHome?: string
   /**
    * Canonical host directory exposed read-write to Docker workers at the
    * identical absolute path. Requests with a cwd outside this root fail.
@@ -304,8 +310,13 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
     const kind = parseExecutor(`${upper}_EXECUTOR`, env[`${upper}_EXECUTOR`], defaultKind)
     const workspaceRootKey = `${upper}_DOCKER_WORKSPACE_ROOT`
     const rawWorkspaceRoot = env[workspaceRootKey]?.trim()
-    if (rawWorkspaceRoot && kind !== 'docker') {
-      throw new Error(`${workspaceRootKey} requires ${upper}_EXECUTOR=docker`)
+    const containerUserKey = `${upper}_DOCKER_USER`
+    const containerHomeKey = `${upper}_DOCKER_HOME`
+    const rawContainerUser = env[containerUserKey]?.trim()
+    const rawContainerHome = env[containerHomeKey]?.trim()
+    if ((rawWorkspaceRoot || rawContainerUser || rawContainerHome) && kind !== 'docker') {
+      const configuredKey = rawWorkspaceRoot ? workspaceRootKey : rawContainerUser ? containerUserKey : containerHomeKey
+      throw new Error(`${configuredKey} requires ${upper}_EXECUTOR=docker`)
     }
     const cfg: BackendExecutorConfig = { name, kind }
     if (kind === 'docker') {
@@ -316,6 +327,20 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
       const hostBase = env[defaults.hostConfigEnvKey] ?? '/root'
       cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.defaultHostConfigDir}`)
       cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? defaults.containerConfigDir
+      if (Boolean(rawContainerUser) !== Boolean(rawContainerHome)) {
+        throw new Error(`${containerUserKey} and ${containerHomeKey} must be configured together`)
+      }
+      if (rawContainerUser && rawContainerHome) {
+        cfg.containerUser = parseDockerUser(containerUserKey, rawContainerUser)
+        cfg.containerHome = parseDockerHome(containerHomeKey, rawContainerHome)
+        const configRelativeToHome = relative(cfg.containerHome, resolve(cfg.containerConfigDir))
+        if (configRelativeToHome === ''
+          || configRelativeToHome === '..'
+          || configRelativeToHome.startsWith(`..${sep}`)
+          || isAbsolute(configRelativeToHome)) {
+          throw new Error(`${upper}_DOCKER_CONTAINER_CONFIG_DIR must be a child of ${containerHomeKey}`)
+        }
+      }
       if (rawWorkspaceRoot) {
         cfg.workspaceRoot = parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
         assertDockerMountsDoNotOverlap(
@@ -329,6 +354,23 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
     out[name] = cfg
   }
   return out
+}
+
+function parseDockerUser(key: string, value: string): string {
+  const match = /^([1-9][0-9]*):([1-9][0-9]*)$/u.exec(value)
+  const uid = Number(match?.[1])
+  const gid = Number(match?.[2])
+  if (!match || !Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid > 2_147_483_647 || gid > 2_147_483_647) {
+    throw new Error(`invalid ${key}: expected positive numeric uid:gid`)
+  }
+  return `${uid}:${gid}`
+}
+
+function parseDockerHome(key: string, value: string): string {
+  if (!isAbsolute(value) || value === '/' || value.includes(',')) {
+    throw new Error(`invalid ${key}: expected an absolute non-root path without commas`)
+  }
+  return resolve(value)
 }
 
 function canonicalOrResolvedPath(value: string): string {

@@ -85,6 +85,8 @@ async function buildExecutorForBackend(
     maxQueueDepth,
     acquireDeadlineMs,
     slotMaxHoldMs,
+    ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
+    ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
     ...(cfg.oauthMode === 'share' || !cfg.oauthMode
       ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }

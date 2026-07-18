@@ -351,6 +351,24 @@ describe('Docker workspace confinement', () => {
     expect(args).toContain('/home/test/.claude:/root/.claude')
   })
 
+  it('runs every pool process as the configured non-root identity with a writable HOME', () => {
+    const args = buildContainerRunArgs({
+      ...poolOpts,
+      containerUser: '1000:1000',
+      containerHome: '/tmp/cli-home',
+    }, 0)
+    expect(args.slice(args.indexOf('--user'), args.indexOf('--user') + 4)).toEqual([
+      '--user', '1000:1000', '--env', 'HOME=/tmp/cli-home',
+    ])
+  })
+
+  it('rejects root, named, incomplete, and unsafe container identities', () => {
+    expect(() => buildContainerRunArgs({ ...poolOpts, containerUser: '0:0', containerHome: '/tmp/home' }, 0)).toThrow(/non-root container user/)
+    expect(() => buildContainerRunArgs({ ...poolOpts, containerUser: 'node:node', containerHome: '/tmp/home' }, 0)).toThrow(/non-root container user/)
+    expect(() => buildContainerRunArgs({ ...poolOpts, containerUser: '1000:1000' }, 0)).toThrow(/configured together/)
+    expect(() => buildContainerRunArgs({ ...poolOpts, containerUser: '1000:1000', containerHome: '/' }, 0)).toThrow(/container home/)
+  })
+
   it('keeps the workspace bind when OAuth uses an isolated per-slot volume', () => {
     const args = buildContainerRunArgs({
       ...poolOpts,
@@ -713,6 +731,33 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     expect(c.containerConfigDir).toBe('/root/.claude')
     expect(c.hostConfigDir).toContain('/.claude')
     expect(c.namePrefix).toBe('cli-bridge-claude-pool')
+  })
+
+  it('loads an explicit non-root Docker identity and HOME', () => {
+    const config = loadConfig({
+      HOME: '/home/test',
+      CLAUDE_EXECUTOR: 'docker',
+      CLAUDE_DOCKER_USER: '1000:1000',
+      CLAUDE_DOCKER_HOME: '/tmp/claude-home',
+      CLAUDE_DOCKER_CONTAINER_CONFIG_DIR: '/tmp/claude-home/.claude',
+    })
+    const c = config.executors.claude!
+    expect(c.containerUser).toBe('1000:1000')
+    expect(c.containerHome).toBe('/tmp/claude-home')
+  })
+
+  it('rejects incomplete, root, named, unsafe, and mismatched Docker identities', () => {
+    const base = { HOME: '/home/test', CLAUDE_EXECUTOR: 'docker' }
+    expect(() => loadConfig({ ...base, CLAUDE_DOCKER_USER: '1000:1000' })).toThrow(/configured together/)
+    expect(() => loadConfig({ ...base, CLAUDE_DOCKER_USER: '0:0', CLAUDE_DOCKER_HOME: '/tmp/home' })).toThrow(/positive numeric/)
+    expect(() => loadConfig({ ...base, CLAUDE_DOCKER_USER: 'node:node', CLAUDE_DOCKER_HOME: '/tmp/home' })).toThrow(/positive numeric/)
+    expect(() => loadConfig({ ...base, CLAUDE_DOCKER_USER: '1000:1000', CLAUDE_DOCKER_HOME: '/' })).toThrow(/absolute non-root path/)
+    expect(() => loadConfig({
+      ...base,
+      CLAUDE_DOCKER_USER: '1000:1000',
+      CLAUDE_DOCKER_HOME: '/tmp/home',
+      CLAUDE_DOCKER_CONTAINER_CONFIG_DIR: '/root/.claude',
+    })).toThrow(/must be a child/)
   })
 
   it('loads and canonicalizes an existing Docker workspace directory', () => {
