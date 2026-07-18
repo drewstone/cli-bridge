@@ -10,16 +10,18 @@
  * full chat() loop without spawning anything.
  */
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable, PassThrough } from 'node:stream'
 import { describe, expect, it } from 'vitest'
 import { ClaudeBackend } from '../src/backends/claude.js'
+import { BackendError, type ChatDelta } from '../src/backends/types.js'
 import { CodexBackend } from '../src/backends/codex.js'
 import { KimiBackend } from '../src/backends/kimi.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
+import { PiBackend } from '../src/backends/pi.js'
 import { buildContainerRunArgs, ContainerPool } from '../src/executors/container-pool.js'
 import { assertDockerWorkspaceCwd, buildDockerExecArgs } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
@@ -532,14 +534,14 @@ describe('ContainerPool.create rejects pool size < 1', async () => {
 // ─── ClaudeBackend chat() against a stub spawner ────────────────────────
 
 describe('ClaudeBackend with injected spawner', () => {
-  it('streams stream-json deltas + emits internal_session_id from system:init', async () => {
+  it('retains the system:init session id on the successful terminal delta', async () => {
     const stubLines = [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'internal-uuid', model: 'sonnet' }),
       JSON.stringify({
         type: 'assistant',
         message: { id: 'm1', content: [{ type: 'text', text: 'hello world' }] },
       }),
-      JSON.stringify({ type: 'result', subtype: 'success', session_id: 'internal-uuid', usage: { input_tokens: 5, output_tokens: 10 } }),
+      JSON.stringify({ type: 'result', subtype: 'success', usage: { input_tokens: 5, output_tokens: 10 } }),
     ]
     const stubSpawner = createStubSpawner(stubLines)
     const backend = new ClaudeBackend({
@@ -557,6 +559,47 @@ describe('ClaudeBackend with injected spawner', () => {
     expect(deltas.find((d) => d.internal_session_id === 'internal-uuid')).toBeDefined()
     expect(deltas.find((d) => d.content === 'hello world')).toBeDefined()
     expect(deltas.find((d) => d.finish_reason === 'stop')).toBeDefined()
+    expect(stubSpawner.releaseCalls).toBe(1)
+  })
+
+  it('surfaces a Claude rate-limit result as one typed failure with safe provider detail', async () => {
+    const stubSpawner = createStubSpawner([
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'rate-limited-session',
+      }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'error_during_execution',
+        session_id: 'rate-limited-session',
+        is_error: true,
+        result: 'Monthly spend limit reached.\nTry again at 1:40 PM.\u0000',
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }),
+    ])
+    const backend = new ClaudeBackend({
+      bin: 'claude', timeoutMs: 5000, harness: 'claude-code', spawner: stubSpawner.spawner,
+    })
+    const deltas: ChatDelta[] = []
+    let failure: unknown
+    try {
+      for await (const delta of backend.chat(
+        { model: 'claude-code/opus', messages: [{ role: 'user', content: 'hi' }] },
+        null,
+        new AbortController().signal,
+      )) {
+        deltas.push(delta)
+      }
+    } catch (err) {
+      failure = err
+    }
+
+    expect(failure).toBeInstanceOf(BackendError)
+    expect(failure).toMatchObject({ code: 'upstream' })
+    expect((failure as Error).message).toContain('Monthly spend limit reached. Try again at 1:40 PM.')
+    expect((failure as Error).message).not.toMatch(/[\n\u0000]/u)
+    expect(deltas).toEqual([])
     expect(stubSpawner.releaseCalls).toBe(1)
   })
 
@@ -863,7 +906,105 @@ describe('per-backend executor config (parseAllExecutors)', () => {
 
 // ─── non-claude backends respect injected Spawner ────────────────────────
 
+function subprocessBackendCases(spawner: Spawner) {
+  return [
+    { model: 'claude/opus', backend: new ClaudeBackend({ bin: 'claude', timeoutMs: 100, spawner }) },
+    { model: 'opencode/test/model', backend: new OpencodeBackend({ bin: 'opencode', timeoutMs: 100, spawner }) },
+    { model: 'kimi-code/kimi-for-coding', backend: new KimiBackend({ bin: 'kimi', timeoutMs: 100, spawner }) },
+    { model: 'codex/default', backend: new CodexBackend({ bin: 'codex', timeoutMs: 100, spawner }) },
+    { model: 'gemini/gemini-2.5-pro', backend: new GeminiBackend({ bin: 'gemini', timeoutMs: 100, spawner }) },
+    { model: 'pi/openai/gpt-5', backend: new PiBackend({ bin: 'pi', timeoutMs: 100, spawner }) },
+  ]
+}
+
 describe('Spawner injection works across all subprocess backends', () => {
+  it('rejects an unsafe profile before materializing MCP secrets or spawning any backend', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-pre-spawn-'))
+    const originalTmpdir = process.env.TMPDIR
+    const originalPiAdapter = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    let spawnCalls = 0
+    const refusingSpawner: Spawner = async () => {
+      spawnCalls++
+      throw new Error('backend must not spawn for an invalid profile')
+    }
+    const cases = subprocessBackendCases(refusingSpawner)
+
+    process.env.TMPDIR = root
+    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    try {
+      for (const { model, backend } of cases) {
+        await expect(async () => {
+          for await (const _ of backend.chat({
+            model,
+            cwd: root,
+            messages: [{ role: 'user', content: 'work' }],
+            mcp: {
+              mcpServers: {
+                secret: { command: 'node', env: { TOKEN: 'secret-witness' } },
+              },
+            },
+            agent_profile: {
+              resources: {
+                skills: [{ kind: 'inline', name: '../../../unsafe', content: 'unsafe' }],
+              },
+            },
+          }, null, new AbortController().signal)) { /* drain */ }
+        }).rejects.toThrow(/AgentProfile workspace materialization failed/)
+      }
+
+      expect(spawnCalls).toBe(0)
+      expect(readdirSync(root, { recursive: true })).toEqual([])
+    } finally {
+      if (originalTmpdir === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = originalTmpdir
+      if (originalPiAdapter === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = originalPiAdapter
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('removes every MCP config and lock when the spawner rejects before returning a child', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-spawn-reject-'))
+    const originalTmpdir = process.env.TMPDIR
+    const originalPiAdapter = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    let spawnCalls = 0
+    const refusingSpawner: Spawner = async () => {
+      spawnCalls++
+      throw new Error('backend spawn refused')
+    }
+
+    process.env.TMPDIR = root
+    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    try {
+      for (const { model, backend } of subprocessBackendCases(refusingSpawner)) {
+        await expect(async () => {
+          for await (const _ of backend.chat({
+            model,
+            cwd: root,
+            messages: [{ role: 'user', content: 'work' }],
+            mcp: {
+              mcpServers: {
+                secret: { command: 'node', env: { TOKEN: 'secret-witness' } },
+              },
+            },
+          }, null, new AbortController().signal)) { /* drain */ }
+        }).rejects.toThrow('backend spawn refused')
+
+        const residue = readdirSync(root, { recursive: true })
+          .map(String)
+          .filter((path) => path !== '.gemini' && path !== '.pi')
+        expect(residue).toEqual([])
+      }
+      expect(spawnCalls).toBe(6)
+    } finally {
+      if (originalTmpdir === undefined) delete process.env.TMPDIR
+      else process.env.TMPDIR = originalTmpdir
+      if (originalPiAdapter === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = originalPiAdapter
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('KimiBackend uses injected spawner + forwards session_id', async () => {
     const stub = createStubSpawner([
       JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: 'kimi here' }] }),
@@ -1062,7 +1203,7 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(stub.releaseCalls).toBe(1)
   })
 
-  it('OpencodeBackend translates opencode tool parts with callID and step token usage', async () => {
+  it('OpencodeBackend translates tool parts and preserves a reported step receipt', async () => {
     const stub = createStubSpawner([
       JSON.stringify({ type: 'step_start', sessionID: 'oc-2', part: { type: 'step-start' } }),
       JSON.stringify({
@@ -1081,10 +1222,21 @@ describe('Spawner injection works across all subprocess backends', () => {
       }),
       JSON.stringify({
         type: 'step_finish',
+        timestamp: 1,
         sessionID: 'oc-2',
         part: {
+          id: 'part-step-1',
+          sessionID: 'oc-2',
+          messageID: 'message-1',
           type: 'step-finish',
-          tokens: { total: 27045, input: 25153, output: 77, reasoning: 23 },
+          reason: 'tool-calls',
+          tokens: {
+            total: 27045,
+            input: 25153,
+            output: 77,
+            reasoning: 23,
+            cache: { read: 1792, write: 0 },
+          },
           cost: 0.04437406,
         },
       }),
@@ -1097,7 +1249,7 @@ describe('Spawner injection works across all subprocess backends', () => {
       internal_session_id?: string
       finish_reason?: string
       tool_calls?: Array<{ id: string; name: string; arguments: string }>
-      usage?: { input_tokens?: number; output_tokens?: number }
+      usage?: { input_tokens?: number; output_tokens?: number; cost?: number }
     }> = []
     for await (const d of backend.chat(
       { model: 'opencode/deepseek/deepseek-v4-pro', messages: [{ role: 'user', content: 'hi' }] },
@@ -1110,7 +1262,71 @@ describe('Spawner injection works across all subprocess backends', () => {
     const tool = deltas.flatMap((d) => d.tool_calls ?? []).find((tc) => tc.id === 'call_abc123')
     expect(tool?.name).toBe('write')
     expect(JSON.parse(tool?.arguments ?? '{}')).toEqual({ filePath: '/tmp/hello.txt', content: 'hello' })
-    expect(deltas.at(-1)?.usage).toEqual({ input_tokens: 25153, output_tokens: 77 })
+    expect(deltas.at(-1)?.usage).toEqual({
+      input_tokens: 26945,
+      output_tokens: 100,
+      cost: 0.04437406,
+    })
+  })
+
+  it('OpencodeBackend aggregates every step receipt across a multi-step run', async () => {
+    const stub = createStubSpawner([
+      JSON.stringify({
+        type: 'step_finish',
+        timestamp: 1,
+        sessionID: 'oc-multi-step',
+        part: {
+          id: 'part-step-1',
+          sessionID: 'oc-multi-step',
+          messageID: 'message-1',
+          type: 'step-finish',
+          reason: 'tool-calls',
+          tokens: {
+            total: 165,
+            input: 100,
+            output: 20,
+            reasoning: 5,
+            cache: { read: 30, write: 10 },
+          },
+          cost: 0.01,
+        },
+      }),
+      JSON.stringify({
+        type: 'step_finish',
+        timestamp: 2,
+        sessionID: 'oc-multi-step',
+        part: {
+          id: 'part-step-2',
+          sessionID: 'oc-multi-step',
+          messageID: 'message-2',
+          type: 'step-finish',
+          reason: 'stop',
+          tokens: {
+            total: 57,
+            input: 40,
+            output: 5,
+            reasoning: 2,
+            cache: { read: 8, write: 2 },
+          },
+          cost: 0.02,
+        },
+      }),
+      JSON.stringify({ type: 'text', part: { type: 'text', text: 'finished' } }),
+    ])
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
+    const deltas: ChatDelta[] = []
+    for await (const delta of backend.chat(
+      { model: 'opencode/zai-coding-plan/glm-5.1', messages: [{ role: 'user', content: 'hi' }] },
+      null,
+      new AbortController().signal,
+    )) deltas.push(delta)
+
+    const receipt = deltas.at(-1)?.usage as (ChatDelta['usage'] & { cost?: number }) | undefined
+    expect(receipt).toMatchObject({ input_tokens: 190, output_tokens: 32 })
+    expect(receipt?.cost).toBeCloseTo(0.03, 12)
+    expect(receipt?.estimated).toBeUndefined()
+    expect(deltas.filter((delta) => delta.finish_reason)).toHaveLength(1)
+    expect(stub.releaseCalls).toBe(1)
   })
 
   it('OpencodeBackend surfaces buffered-stdout silence as keepalive deltas (not synthetic tool_calls)', async () => {

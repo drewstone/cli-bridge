@@ -239,13 +239,15 @@ export class PiBackend implements Backend {
         'not_configured',
       )
     }
+
+    // Reject unsupported profile plans before mounting MCP credentials
+    // into the caller's project-scoped .pi directory.
+    const provisioned = provisionProfileWorkspace(req, session, 'pi', runCwd)
+    args.push(...provisioned.flags)
+
     const mcpMounted = requestedMcpNames.length > 0
       ? materializeMcpServersForPi(mcpSpecs, runCwd)
       : null
-
-    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
-    const provisioned = provisionProfileWorkspace(req, session, 'pi', runCwd)
-    args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       spawned = await this.spawner(this.opts.bin, args, {

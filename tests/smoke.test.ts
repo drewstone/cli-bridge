@@ -16,6 +16,7 @@ import { BackendRegistry } from '../src/backends/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
+import { BackendError } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend, claudeEffort } from '../src/backends/claude.js'
 import { KimiBackend, thinkingFlagForEffort } from '../src/backends/kimi.js'
@@ -57,6 +58,47 @@ class DelayedBackend extends FakeBackend {
   override async *chat(req: ChatRequest, session: SessionRecord | null): AsyncIterable<ChatDelta> {
     await new Promise((resolve) => setTimeout(resolve, this.delayMs))
     yield* super.chat(req, session)
+  }
+}
+
+class TerminalFailureBackend extends FakeBackend {
+  constructor(name: string, private readonly reason: 'error' | 'timeout') {
+    super(name)
+  }
+
+  override async *chat(): AsyncIterable<ChatDelta> {
+    yield { finish_reason: this.reason }
+  }
+}
+
+class TypedFailureBackend extends FakeBackend {
+  calls = 0
+
+  override async *chat(): AsyncIterable<ChatDelta> {
+    this.calls += 1
+    throw new BackendError('claude upstream error: Monthly spend limit reached.', 'upstream')
+  }
+}
+
+class MeasuredReceiptBackend extends FakeBackend {
+  override async *chat(): AsyncIterable<ChatDelta> {
+    yield {
+      finish_reason: 'stop',
+      usage: { input_tokens: 140, output_tokens: 25, cost: 0.03 },
+    } as ChatDelta
+  }
+}
+
+class MaterializationReceiptBackend extends FakeBackend {
+  override async *chat(req: ChatRequest): AsyncIterable<ChatDelta> {
+    req.profile_materialization_receipt = {
+      schema: 'cli-bridge.profile-materialization.v1',
+      harness: 'receipt',
+      workspacePlanDigest: 'a'.repeat(64),
+      files: [{ path: '.agent/skill.md', mode: 0o644 }],
+      unsupported: [],
+    }
+    yield { finish_reason: 'stop', usage: { input_tokens: 1, output_tokens: 1 } }
   }
 }
 
@@ -364,6 +406,176 @@ describe('POST /v1/chat/completions', () => {
     const body = await res.json() as { choices: Array<{ message: { content: string } }> }
     expect(body.choices[0]?.message.content).toContain('[claude]')
     expect(body.choices[0]?.message.content).toContain('hi')
+  })
+
+  it.each(['error', 'timeout'] as const)(
+    'never estimates usage after a backend %s terminal state',
+    async (reason) => {
+      const backend = new TerminalFailureBackend('terminal', reason)
+      const appLocal = new Hono()
+      mountChatCompletions(appLocal, {
+        registry: new BackendRegistry().register(backend),
+        sessions,
+        runs: new RunRegistry(),
+      })
+      const requestBody = {
+        model: 'terminal/test',
+        messages: [{ role: 'user', content: 'hi' }],
+      }
+
+      const nonStreaming = await appLocal.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      })
+      expect(nonStreaming.status).toBe(200)
+      const body = await nonStreaming.json() as {
+        choices: Array<{ finish_reason: string }>
+        usage?: unknown
+      }
+      expect(body.choices[0]?.finish_reason).toBe(reason)
+      expect(body.usage).toBeUndefined()
+
+      const streaming = await appLocal.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...requestBody, stream: true }),
+      })
+      expect(streaming.status).toBe(200)
+      const text = await streaming.text()
+      expect(text.match(new RegExp(`"finish_reason":"${reason}"`, 'gu'))).toHaveLength(1)
+      expect(text).not.toContain('"estimated":true')
+      expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
+    },
+  )
+
+  it('returns one SSE error for a typed pre-stream failure with provider detail', async () => {
+    const appLocal = new Hono()
+    mountChatCompletions(appLocal, {
+      registry: new BackendRegistry().register(new TypedFailureBackend('typed')),
+      sessions,
+      runs: new RunRegistry(),
+    })
+    const response = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'typed/test',
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    const text = await response.text()
+    expect(text.match(/"error":\{"message":"claude upstream error: Monthly spend limit reached\.","type":"upstream"\}/gu)).toHaveLength(1)
+    expect(text).not.toContain('"finish_reason":"error"')
+    expect(text).not.toContain('"estimated":true')
+    expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
+  })
+
+  it('replays the same typed HTTP failure without dispatching a second backend call', async () => {
+    const backend = new TypedFailureBackend('typed')
+    const appLocal = new Hono()
+    mountChatCompletions(appLocal, {
+      registry: new BackendRegistry().register(backend),
+      sessions,
+      runs: new RunRegistry(),
+    })
+    const request = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'typed/test',
+        messages: [{ role: 'user', content: 'hi' }],
+        run_id: 'typed-failure-replay',
+      }),
+    })
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await appLocal.request(request.clone())
+      expect(response.status).toBe(502)
+      await expect(response.json()).resolves.toEqual({
+        error: {
+          type: 'upstream',
+          message: 'claude upstream error: Monthly spend limit reached.',
+        },
+      })
+    }
+    expect(backend.calls).toBe(1)
+  })
+
+  it('preserves a backend-reported USD cost in streaming and non-streaming usage', async () => {
+    const appLocal = new Hono()
+    mountChatCompletions(appLocal, {
+      registry: new BackendRegistry().register(new MeasuredReceiptBackend('receipt')),
+      sessions,
+      runs: new RunRegistry(),
+    })
+    const requestBody = {
+      model: 'receipt/test',
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+
+    const nonStreaming = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    })
+    expect(nonStreaming.status).toBe(200)
+    const body = await nonStreaming.json() as {
+      usage?: { prompt_tokens: number; completion_tokens: number; cost?: number }
+    }
+    expect(body.usage).toMatchObject({ prompt_tokens: 140, completion_tokens: 25 })
+    expect(body.usage?.cost).toBeCloseTo(0.03, 12)
+
+    const streaming = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...requestBody, stream: true }),
+    })
+    expect(streaming.status).toBe(200)
+    const text = await streaming.text()
+    expect(text).toContain('"prompt_tokens":140')
+    expect(text).toContain('"completion_tokens":25')
+    expect(text).toContain('"cost":0.03')
+    expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
+  })
+
+  it('preserves the applied profile receipt in streaming and non-streaming responses', async () => {
+    const appLocal = new Hono()
+    mountChatCompletions(appLocal, {
+      registry: new BackendRegistry().register(new MaterializationReceiptBackend('receipt')),
+      sessions,
+      runs: new RunRegistry(),
+    })
+    const requestBody = {
+      model: 'receipt/test',
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+
+    const nonStreaming = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    })
+    const body = await nonStreaming.json() as {
+      profile_materialization?: { workspacePlanDigest?: string; files?: unknown[] }
+    }
+    expect(body.profile_materialization).toMatchObject({
+      workspacePlanDigest: 'a'.repeat(64),
+      files: [{ path: '.agent/skill.md', mode: 0o644 }],
+    })
+
+    const streaming = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...requestBody, stream: true }),
+    })
+    const text = await streaming.text()
+    expect(text.match(/"profile_materialization"/gu)).toHaveLength(1)
+    expect(text).toContain('"workspacePlanDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"')
+    expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
   })
 
   it('routes `claudish/google@gemini-2.0-flash` to claudish — not claude', async () => {
