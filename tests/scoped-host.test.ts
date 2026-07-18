@@ -14,7 +14,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { describe, expect, it } from 'vitest'
-import { scopedHostSpawner } from '../src/executors/scoped-host.js'
+import { isOwnedScopeControlGroup, scopedHostSpawner } from '../src/executors/scoped-host.js'
 import { killTree } from '../src/executors/process-tree.js'
 
 const systemdRunAvailable =
@@ -28,6 +28,33 @@ const systemdRunAvailable =
 const describeReal = systemdRunAvailable && process.env.CLI_BRIDGE_REAL_CGROUP_TESTS === '1'
   ? describe
   : describe.skip
+
+describe('scopedHostSpawner — cgroup ownership proof', () => {
+  const unit = 'cli-bridge-1234-a1b2c3d4e5f6.scope'
+  const owned = `/user.slice/user-1000.slice/user@1000.service/cli.slice/cli-bridge.slice/cli-bridge-llm.slice/${unit}`
+  const bridge = '/user.slice/user-1000.slice/user@1000.service/app.slice/cli-bridge.service'
+
+  it('accepts only the exact random unit directly under the dedicated slice', () => {
+    expect(isOwnedScopeControlGroup(owned, unit, bridge)).toBe(true)
+    expect(isOwnedScopeControlGroup(owned.replace(unit, 'cli-bridge-1234-ffffffffffff.scope'), unit, bridge)).toBe(false)
+    expect(isOwnedScopeControlGroup(owned.replace('cli-bridge-llm.slice', 'app.slice'), unit, bridge)).toBe(false)
+    expect(isOwnedScopeControlGroup(`${owned}/child`, unit, bridge)).toBe(false)
+  })
+
+  it('rejects malformed, relative, traversal, and unverifiable paths', () => {
+    expect(isOwnedScopeControlGroup(owned.slice(1), unit, bridge)).toBe(false)
+    expect(isOwnedScopeControlGroup(`${owned}/../${unit}`, unit, bridge)).toBe(false)
+    expect(isOwnedScopeControlGroup(`${owned}\n`, unit, bridge)).toBe(false)
+    expect(isOwnedScopeControlGroup(owned, 'not-our-unit.scope', bridge)).toBe(false)
+    expect(isOwnedScopeControlGroup(owned, unit, null)).toBe(false)
+    expect(isOwnedScopeControlGroup(owned, unit, `${bridge}/../other.service`)).toBe(false)
+  })
+
+  it('never authorizes the bridge current cgroup or any ancestor of it', () => {
+    expect(isOwnedScopeControlGroup(owned, unit, owned)).toBe(false)
+    expect(isOwnedScopeControlGroup(owned, unit, `${owned}/nested-child`)).toBe(false)
+  })
+})
 
 /** Read /proc/<pid>/cgroup → "/user.slice/.../cli-bridge-...scope" or null. */
 function cgroupOf(pid: number): string | null {
