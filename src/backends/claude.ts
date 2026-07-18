@@ -212,6 +212,11 @@ export class ClaudeBackend implements Backend {
     const userText = stdinInput.messages[0]?.content ?? ''
     const PROMPT_ARGV_LIMIT = 120 * 1024
     const userFitsInArgv = Buffer.byteLength(userText, 'utf8') <= PROMPT_ARGV_LIMIT
+
+    // Validate and apply the profile before allocating request-scoped MCP
+    // files. A rejected plan must never strand a config containing secrets.
+    const provisioned = provisionProfileWorkspace(req, session, 'claude', cwd)
+
     // Materialize MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
     // up the temp dir after the subprocess exits.
@@ -234,19 +239,21 @@ export class ClaudeBackend implements Backend {
     // Argv mode: stdin is ignored. Stdin mode: stdin is piped (we
     // write the NDJSON payload below). The split here matches the
     // contract claude-code-cli expects for each --input-format.
-    // Phase-2 host wiring: provision the profile's cwd-native dimensions (skills,
-    // context, hooks, subagents, commands) into the run workspace before spawn. MCP
-    // stays on the existing path. Fail-safe (never throws).
-    const provisioned = provisionProfileWorkspace(req, session, 'claude', cwd)
     Object.assign(childEnv, provisioned.env)
     args.push(...provisioned.flags)
-    const spawned = await this.spawner(this.bin, args, {
-      stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
-      cwd,
-      env: childEnv,
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      spawned = await this.spawner(this.bin, args, {
+        stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: childEnv,
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+    } catch (error) {
+      mcpMaterialized?.cleanup()
+      throw error
+    }
     const child = spawned.child
     const releaseSpawner = spawned.release
 

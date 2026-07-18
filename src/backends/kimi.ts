@@ -122,26 +122,16 @@ export class KimiBackend implements Backend {
     // on the previous `--prompt <text>` path).
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
-    const configFile = await this.prepareConfigFile(req.model)
-    // Materialize agent_profile.mcp into a temp mcp-config.json. Same
-    // shape claude expects ({mcpServers: {name: {command,args,env}}});
-    // kimi takes the path via --mcp-config-file. Cleanup runs in the
-    // outer finally so the temp dir doesn't leak when the subprocess
-    // crashes.
-    const mcpMaterialized =
-      writeMcpConfigFile(resolveMcpServers(req, session)) ?? materializeEmptyMcpConfig()
+
+    // Reject unsupported profile plans before creating either temporary
+    // Kimi config. Both files can contain provider or MCP credentials.
+    const provisioned = provisionProfileWorkspace(req, session, 'kimi', cwd)
 
     const args = [
       '--print',
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
     ]
-    if (configFile) {
-      args.push('--config-file', configFile)
-    }
-    if (mcpMaterialized) {
-      args.push('--mcp-config-file', mcpMaterialized.configPath)
-    }
     if (session?.internalId) {
       args.push('--resume', session.internalId)
     }
@@ -150,18 +140,30 @@ export class KimiBackend implements Backend {
     }
     const thinkingFlag = thinkingFlagForEffort(req.effort)
     if (thinkingFlag) args.push(thinkingFlag)
-
-    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
-    // stays on kimi's existing path). Fail-safe.
-    const provisioned = provisionProfileWorkspace(req, session, 'kimi', cwd)
     args.push(...provisioned.flags)
-    const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd,
-      env: { ...process.env, ...provisioned.env },
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
+
+    let configFile: string | null = null
+    let mcpMaterialized: ReturnType<typeof writeMcpConfigFile> = null
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      configFile = await this.prepareConfigFile(req.model)
+      mcpMaterialized =
+        writeMcpConfigFile(resolveMcpServers(req, session)) ?? materializeEmptyMcpConfig()
+      if (configFile) args.push('--config-file', configFile)
+      if (mcpMaterialized) args.push('--mcp-config-file', mcpMaterialized.configPath)
+
+      spawned = await this.spawner(this.opts.bin, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: { ...process.env, ...provisioned.env },
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+    } catch (error) {
+      if (configFile) await cleanupConfigFile(configFile)
+      mcpMaterialized?.cleanup()
+      throw error
+    }
     const child = spawned.child
     const releaseSpawner = spawned.release
 

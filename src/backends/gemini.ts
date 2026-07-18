@@ -63,6 +63,11 @@ export class GeminiBackend implements Backend {
     if (model) args.push('--model', model)
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
 
+    // Validate the profile before touching project-scoped Gemini settings,
+    // which can contain MCP headers and other credentials.
+    const provisioned = provisionProfileWorkspace(req, session, 'gemini', cwd)
+    args.push(...provisioned.flags)
+
     // Materialize MCP servers (request-body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) into the project-scope `<cwd>/.gemini/settings.json`.
     // Gemini CLI has no per-invocation MCP flag — it discovers MCP by cwd,
@@ -71,16 +76,19 @@ export class GeminiBackend implements Backend {
     // a symlink/lock violation throws rather than silently dropping MCP.
     const mcpMaterialized = materializeMcpServersForGemini(resolveMcpServers(req, session), cwd)
 
-    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
-    const provisioned = provisionProfileWorkspace(req, session, 'gemini', cwd)
-    args.push(...provisioned.flags)
-    const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd,
-      env: { ...process.env, ...provisioned.env },
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      spawned = await this.spawner(this.opts.bin, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: { ...process.env, ...provisioned.env },
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+    } catch (error) {
+      mcpMaterialized?.cleanup()
+      throw error
+    }
     const child = spawned.child
     const releaseSpawner = spawned.release
 

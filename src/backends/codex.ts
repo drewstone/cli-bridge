@@ -124,6 +124,11 @@ export class CodexBackend implements Backend {
     }
     args.push(prompt)
 
+    // Reject unsupported profile plans before copying auth or writing MCP
+    // credentials into a synthetic CODEX_HOME.
+    const provisioned = provisionProfileWorkspace(req, session, 'codex', cwd)
+    args.push(...provisioned.flags)
+
     // MCP server passthrough — codex has no `--mcp-config` flag.
     // Servers are loaded from `$CODEX_HOME/config.toml`'s
     // `[mcp_servers.<name>]` stanzas. We synthesise a temp HOME
@@ -148,21 +153,23 @@ export class CodexBackend implements Backend {
       ]
     }
 
-    // Phase-2 host wiring: provision cwd-native profile dimensions (skills/context/
-    // hooks/subagents/commands) before spawn. MCP stays on the path above. Fail-safe.
-    const provisioned = provisionProfileWorkspace(req, session, 'codex', cwd)
-    args.push(...provisioned.flags)
-    const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      cwd,
-      env: {
-        ...process.env,
-        ...provisioned.env,
-        ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
-      },
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      spawned = await this.spawner(this.opts.bin, args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd,
+        env: {
+          ...process.env,
+          ...provisioned.env,
+          ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
+        },
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+    } catch (error) {
+      codexHome?.cleanup()
+      throw error
+    }
     const child = spawned.child
     const releaseSpawner = spawned.release
 

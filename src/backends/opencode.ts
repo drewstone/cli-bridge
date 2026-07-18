@@ -92,6 +92,10 @@ export class OpencodeBackend implements Backend {
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const model = this.extractModel(req.model)
 
+    // Reject unsupported profile plans before writing a request-scoped
+    // opencode.json that may contain MCP credentials.
+    const provisioned = provisionProfileWorkspace(req, session, 'opencode', cwd)
+
     // Materialize MCP servers (request-body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) into a temp opencode-shape config file.
     // opencode-cli has no per-invocation `--mcp-config-file` flag —
@@ -125,21 +129,24 @@ export class OpencodeBackend implements Backend {
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
 
-    // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
-    // stays on opencode.json path). Fail-safe.
-    const provisioned = provisionProfileWorkspace(req, session, 'opencode', cwd)
     args.push(...provisioned.flags)
-    const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd,
-      env: {
-        ...process.env,
-        ...provisioned.env,
-        ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
-      },
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      spawned = await this.spawner(this.opts.bin, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: {
+          ...process.env,
+          ...provisioned.env,
+          ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
+        },
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+    } catch (error) {
+      mcpMaterialized?.cleanup()
+      throw error
+    }
     const child = spawned.child
     const releaseSpawner = spawned.release
 
