@@ -21,7 +21,7 @@ import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { Spawner } from '../executors/types.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { killTree } from '../executors/process-tree.js'
+import { terminateSpawned } from '../executors/process-tree.js'
 import { contentToText } from './content.js'
 import { buildAcpMcpServers, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 
@@ -96,7 +96,7 @@ export class AcpBackend implements Backend {
       child.stdout?.on('data', (b) => { out += b.toString() })
       child.stderr?.on('data', (b) => { out += b.toString() })
       const code = await new Promise<number>((resolve) => {
-        const t = setTimeout(() => { void killTree(child); resolve(124) }, 5000)
+        const t = setTimeout(() => { void terminateSpawned(spawned); resolve(124) }, 5000)
         child.on('exit', (c) => { clearTimeout(t); resolve(c ?? 0) })
         child.on('error', () => { clearTimeout(t); resolve(1) })
       })
@@ -131,8 +131,8 @@ export class AcpBackend implements Backend {
     let spawnErrorMessage = spawned.spawnError?.()?.message ?? ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
 
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
+    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.timeoutMs)
+    const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
@@ -219,7 +219,7 @@ export class AcpBackend implements Backend {
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      void killTree(child)
+      await terminateSpawned(spawned)
       release()
     }
   }

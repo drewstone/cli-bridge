@@ -49,6 +49,16 @@ export interface SpawnOpts {
 export interface SpawnResult {
   child: SpawnedChild
   /**
+   * Terminate the executor-owned workload and wait until it cannot keep
+   * running. Host executors kill the child process group; Docker executors
+   * recycle the request's exclusive container slot because killing the local
+   * `docker exec` client does not stop the process inside the container.
+   *
+   * Calls are idempotent. Backends MUST await this before `release()` and
+   * before returning a terminal response.
+   */
+  terminate?(): Promise<void>
+  /**
    * Release the executor's resources (e.g. pool slot). MUST be called
    * exactly once when the backend's chat() call completes — success,
    * failure, or abort. The implementation is idempotent so double-call

@@ -68,7 +68,7 @@ import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
-import { killTree } from '../executors/process-tree.js'
+import { terminateSpawned } from '../executors/process-tree.js'
 
 export interface PiBackendOptions {
   bin: string
@@ -272,8 +272,8 @@ export class PiBackend implements Backend {
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
     // Group-kill on timeout/abort — see backends/opencode.ts.
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
+    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
@@ -422,7 +422,7 @@ export class PiBackend implements Backend {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree before releasing the slot.
-      await killTree(child)
+      await terminateSpawned(spawned)
       try { releaseSpawner() } catch { /* best effort */ }
       mcpMounted?.cleanup()
     }
