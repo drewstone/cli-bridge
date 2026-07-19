@@ -50,6 +50,16 @@ RUN set -eu; \
     echo "$CLI_BRIDGE_HARNESSES" | tr ',' ' ' | xargs -n1 sh /usr/local/share/cli-bridge/install-harness.sh; \
   fi
 
+# Docker creates parents of nested bind mounts as root. Pre-create the XDG
+# directories so an explicitly configured uid 1000 worker can initialize CLI
+# state beside a mounted /home/node/.local/share/<backend> directory.
+RUN mkdir -p \
+      /home/node/.cache \
+      /home/node/.config \
+      /home/node/.local/share \
+      /home/node/.local/state \
+  && chown -R node:node /home/node
+
 # OAuth + config volumes (mount from host or per-slot named volumes).
 VOLUME /root/.claude
 VOLUME /root/.codex
