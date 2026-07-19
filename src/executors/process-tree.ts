@@ -34,13 +34,13 @@
  *
  *   The kill-to-pgid trick only works if the child was spawned
  *   with `detached: true` (its own pgid). We force that for every
- *   host-spawned process. For docker-pooled spawns the equivalent
- *   is `docker stop <container>`, but harness sub-trees there are
- *   confined by the container so they cannot escape — no separate
- *   tree-kill needed inside the container.
+ *   host-spawned process. A Docker-backed child is only the local
+ *   `docker exec` attach client, so its executor overrides termination
+ *   and awaits restart of the request's exclusive container slot.
  */
 
 import type { ChildProcess } from 'node:child_process'
+import type { SpawnResult } from './types.js'
 
 /** Time we give a subprocess to exit gracefully before SIGKILL. */
 export const DEFAULT_GRACEFUL_TERMINATION_MS = 2000
@@ -78,6 +78,26 @@ export async function killTree(
     // Wait briefly so child.exitCode is populated before we return.
     await waitForExitOrTimeout(child, 500)
   }
+}
+
+const terminationBySpawn = new WeakMap<SpawnResult, Promise<void>>()
+
+/**
+ * Ask the executor to terminate the workload it owns, then wait for proof of
+ * termination. A host child PID is sufficient for host executors. Docker must
+ * override this because that PID belongs to the local `docker exec` client,
+ * not to the command that continues running inside the container.
+ */
+export function terminateSpawned(spawned: SpawnResult): Promise<void> {
+  const active = terminationBySpawn.get(spawned)
+  if (active) return active
+
+  const termination = (spawned.terminate?.() ?? killTree(spawned.child)).catch((error) => {
+    terminationBySpawn.delete(spawned)
+    throw error
+  })
+  terminationBySpawn.set(spawned, termination)
+  return termination
 }
 
 /**

@@ -23,7 +23,7 @@ import { OpencodeBackend } from '../src/backends/opencode.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
 import { PiBackend } from '../src/backends/pi.js'
 import { buildContainerRunArgs, ContainerPool } from '../src/executors/container-pool.js'
-import { assertDockerWorkspaceCwd, buildDockerExecArgs } from '../src/executors/docker.js'
+import { assertDockerWorkspaceCwd, buildDockerExecArgs, createDockerSpawner } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
 import { killTree } from '../src/executors/process-tree.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
@@ -330,6 +330,52 @@ describe('buildDockerExecArgs', () => {
   it('respects binPrefix when specified', () => {
     const args = buildDockerExecArgs('cid', 'claude', ['-p', 'x'], {}, '/usr/local/bin/')
     expect(args).toContain('/usr/local/bin/claude')
+  })
+})
+
+describe('Docker cancellation ownership', () => {
+  it('does not return a slot until container restart has completed', async () => {
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const child = makeFakeChild(stdout, stderr, () => {})
+    let slotReleases = 0
+    let restartCalls = 0
+    let finishRestart!: () => void
+    const restartBlocked = new Promise<void>((resolve) => { finishRestart = resolve })
+    const pool = {
+      acquire: async () => ({
+        containerId: 'container-under-test',
+        slotIndex: 0,
+        release: () => { slotReleases += 1 },
+      }),
+    } as unknown as ContainerPool
+    const spawner = createDockerSpawner({
+      pool,
+      spawnProcess: (() => child) as unknown as typeof import('node:child_process').spawn,
+      restartContainer: async (containerId) => {
+        expect(containerId).toBe('container-under-test')
+        restartCalls += 1
+        await restartBlocked
+      },
+    })
+
+    const spawned = await spawner('opencode', ['run'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    spawned.release()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    expect(restartCalls).toBe(1)
+    expect(slotReleases).toBe(0)
+
+    finishRestart()
+    await spawned.terminate?.()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(slotReleases).toBe(1)
+
+    // Concurrent timeout/abort/finally calls share one restart.
+    await spawned.terminate?.()
+    spawned.release()
+    expect(restartCalls).toBe(1)
+    expect(slotReleases).toBe(1)
   })
 })
 
@@ -716,6 +762,7 @@ function makeFakeChild(
   const stdin = new PassThrough()
   ;(ee as unknown as { stdin: PassThrough }).stdin = stdin
   ;(ee as unknown as { exitCode: number | null }).exitCode = null
+  ;(ee as unknown as { signalCode: NodeJS.Signals | null }).signalCode = null
   ;(ee as unknown as { kill: () => void }).kill = () => { onKill() }
   // Emit close once stdout drains so chat()'s exit-code wait resolves.
   stdout.on('end', () => {
@@ -1152,6 +1199,55 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(deltas.find((d) => d.internal_session_id === 'oc-1')).toBeDefined()
     expect(stub.observedArgs).not.toContain('--dangerously-skip-permissions')
     expect(stub.releaseCalls).toBe(1)
+  })
+
+  it('OpencodeBackend does not finish an aborted request before executor termination', async () => {
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const child = makeFakeChild(stdout, stderr, () => {})
+    let terminateCalls = 0
+    let releaseCalls = 0
+    let finishTermination!: () => void
+    const terminationBlocked = new Promise<void>((resolve) => { finishTermination = resolve })
+    const spawner: Spawner = async () => ({
+      child,
+      terminate: async () => {
+        terminateCalls += 1
+        await terminationBlocked
+      },
+      release: () => { releaseCalls += 1 },
+    })
+    const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner })
+    const controller = new AbortController()
+    const iterator = backend.chat(
+      { model: 'opencode/zai-coding-plan/glm-5.2', messages: [{ role: 'user', content: 'work' }] },
+      null,
+      controller.signal,
+    )[Symbol.asyncIterator]()
+
+    const firstDelta = iterator.next()
+    stdout.write(`${JSON.stringify({ type: 'session.created', session_id: 'cancel-test' })}\n`)
+    await expect(firstDelta).resolves.toMatchObject({
+      done: false,
+      value: { internal_session_id: 'cancel-test' },
+    })
+
+    controller.abort()
+    let settled = false
+    const drain = (async () => {
+      while (!(await iterator.next()).done) { /* drain */ }
+    })().finally(() => { settled = true })
+    stdout.end()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    expect(terminateCalls).toBe(1)
+    expect(releaseCalls).toBe(0)
+    expect(settled).toBe(false)
+
+    finishTermination()
+    await drain
+    expect(releaseCalls).toBe(1)
+    expect(settled).toBe(true)
   })
 
   it('OpencodeBackend pipes the prompt via stdin, never argv (E2BIG regression)', async () => {

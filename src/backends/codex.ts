@@ -40,7 +40,7 @@ import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
-import { killTree } from '../executors/process-tree.js'
+import { terminateSpawned } from '../executors/process-tree.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -183,8 +183,8 @@ export class CodexBackend implements Backend {
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
     // Group-kill on timeout/abort — see backends/opencode.ts.
-    const timeoutHandle = setTimeout(() => { void killTree(child) }, this.opts.timeoutMs)
-    const onAbort = (): void => { void killTree(child) }
+    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.opts.timeoutMs)
+    const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
     let emittedToolCall = false
@@ -262,7 +262,7 @@ export class CodexBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree — codex spawns sub-processes for MCP
       // tool calls, model HTTP I/O, etc. and we owe them a clean exit.
-      await killTree(child)
+      await terminateSpawned(spawned)
       releaseSpawner()
       codexHome?.cleanup()
     }

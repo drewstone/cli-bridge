@@ -13,11 +13,15 @@
  * without stomping on each other's working directories or ~/.tmp scratch.
  */
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, sep } from 'node:path'
+import { promisify } from 'node:util'
 import type { ContainerPool } from './container-pool.js'
+import { killTree } from './process-tree.js'
 import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
+
+const execFileAsync = promisify(execFile)
 
 export interface DockerSpawnerOptions {
   pool: ContainerPool
@@ -29,6 +33,10 @@ export interface DockerSpawnerOptions {
   binPrefixInContainer?: string
   /** Host workspace root mounted into each slot at the same path. */
   workspaceRoot?: string
+  /** Test-only replacement for the real `docker restart` operation. */
+  restartContainer?: (containerId: string) => Promise<void>
+  /** Test-only replacement for spawning the local Docker attach client. */
+  spawnProcess?: typeof spawn
 }
 
 export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
@@ -36,7 +44,9 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
     const cwd = assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd)
     const slot = await opts.pool.acquire(spawnOpts.sessionId)
     let released = false
-    const release = (): void => {
+    let terminationFinished = false
+    let terminationPromise: Promise<void> | null = null
+    const releaseNow = (): void => {
       if (released) return
       released = true
       slot.release()
@@ -49,20 +59,84 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
         { ...spawnOpts, ...(cwd ? { cwd } : {}) },
         opts.binPrefixInContainer,
       )
-      const child = spawn('docker', dockerArgs, {
+      const child = (opts.spawnProcess ?? spawn)('docker', dockerArgs, {
         stdio: spawnOpts.stdio ?? ['ignore', 'pipe', 'pipe'],
       })
+      const terminate = (): Promise<void> => {
+        if (terminationPromise) return terminationPromise
+        terminationPromise = terminateDockerExecution(
+          child,
+          slot.containerId,
+          opts.restartContainer ?? restartDockerContainer,
+        ).then(() => {
+          terminationFinished = true
+        }).catch((error) => {
+          terminationPromise = null
+          throw error
+        })
+        return terminationPromise
+      }
+      const release = (): void => {
+        if (released) return
+        if (terminationFinished) {
+          releaseNow()
+          return
+        }
+        // A local `docker exec` close is not proof that the command inside
+        // the container stopped. Delay slot reuse until executor-owned
+        // termination has completed. On failure the slot remains busy and
+        // the pool watchdog recycles it instead of routing work into a
+        // contaminated container.
+        void terminate().then(releaseNow).catch(() => {})
+      }
       child.once('close', release)
       child.once('error', release)
-      const result: SpawnResult = { child, release }
+      const result: SpawnResult = { child, terminate, release }
       return result
     } catch (err) {
-      release()
+      releaseNow()
       throw err
     }
   }
   spawner.resolveCwd = (cwd) => assertDockerWorkspaceCwd(opts.workspaceRoot, cwd)
   return spawner
+}
+
+/**
+ * Stop one Docker-backed request with container-level certainty.
+ *
+ * The local child is only the attached `docker exec` client. Sending it a
+ * signal closes the pipes but leaves the actual CLI and its descendants alive
+ * inside the container. Each pool slot is exclusive to one request, so an
+ * awaited zero-timeout restart is the smallest reliable unit that kills every
+ * descendant, including children that created their own process group. Docker
+ * restart preserves the container filesystem and mounted authentication data.
+ */
+export async function terminateDockerExecution(
+  child: ChildProcess,
+  containerId: string,
+  restartContainer: (containerId: string) => Promise<void> = restartDockerContainer,
+): Promise<void> {
+  const cleanExit = child.exitCode === 0 && child.signalCode === null
+  if (!cleanExit) {
+    await restartContainer(containerId)
+  }
+  // Reap the local attach client too. After restart it normally exits on its
+  // own; killTree is the bounded fallback and waits for the close event.
+  await killTree(child)
+}
+
+async function restartDockerContainer(containerId: string): Promise<void> {
+  try {
+    await execFileAsync('docker', ['restart', '--time', '0', containerId], {
+      timeout: 30_000,
+      killSignal: 'SIGKILL',
+      maxBuffer: 1024 * 1024,
+    })
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`docker executor could not terminate container ${containerId}: ${detail}`)
+  }
 }
 
 /**
