@@ -88,6 +88,7 @@ async function buildExecutorForBackend(
     ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
     ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
+    ...(cfg.network ? { network: cfg.network } : {}),
     ...(cfg.oauthMode === 'share' || !cfg.oauthMode
       ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }
       : {

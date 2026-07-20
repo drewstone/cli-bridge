@@ -9,6 +9,7 @@
 
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, parse, relative, resolve, sep } from 'node:path'
+import { assertDockerNetworkName } from './executors/docker-network.js'
 
 export interface Config {
   host: string
@@ -75,6 +76,7 @@ export interface Config {
    *   `<NAME>_DOCKER_HOST_CONFIG_DIR=<host path>`  (share mode only)
    *   `<NAME>_DOCKER_CONTAINER_CONFIG_DIR=<container path>`  (mount target)
    *   `<NAME>_DOCKER_WORKSPACE_ROOT=<absolute host path>`  (read-write, same container path)
+   *   `<NAME>_DOCKER_NETWORK=<existing Docker network name>`
    *   `<NAME>_DOCKER_USER=<positive uid>:<positive gid>`  (non-root container identity)
    *   `<NAME>_DOCKER_HOME=<absolute container path>`  (required with Docker user)
    *
@@ -121,6 +123,8 @@ export interface BackendExecutorConfig {
    * identical absolute path. Requests with a cwd outside this root fail.
    */
   workspaceRoot?: string
+  /** Existing Docker network joined by every pool container. */
+  network?: string
 }
 
 /** Backends that never spawn a CLI on the host (remote HTTP, local proxy, or a
@@ -310,13 +314,20 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
     const kind = parseExecutor(`${upper}_EXECUTOR`, env[`${upper}_EXECUTOR`], defaultKind)
     const workspaceRootKey = `${upper}_DOCKER_WORKSPACE_ROOT`
     const rawWorkspaceRoot = env[workspaceRootKey]?.trim()
+    const networkKey = `${upper}_DOCKER_NETWORK`
+    const rawNetwork = env[networkKey]
     const containerUserKey = `${upper}_DOCKER_USER`
     const containerHomeKey = `${upper}_DOCKER_HOME`
     const rawContainerUser = env[containerUserKey]?.trim()
     const rawContainerHome = env[containerHomeKey]?.trim()
-    if ((rawWorkspaceRoot || rawContainerUser || rawContainerHome) && kind !== 'docker') {
-      const configuredKey = rawWorkspaceRoot ? workspaceRootKey : rawContainerUser ? containerUserKey : containerHomeKey
-      throw new Error(`${configuredKey} requires ${upper}_EXECUTOR=docker`)
+    const configuredDockerOnlyKey = [
+      rawWorkspaceRoot && workspaceRootKey,
+      rawNetwork && networkKey,
+      rawContainerUser && containerUserKey,
+      rawContainerHome && containerHomeKey,
+    ].find((key): key is string => Boolean(key))
+    if (configuredDockerOnlyKey && kind !== 'docker') {
+      throw new Error(`${configuredDockerOnlyKey} requires ${upper}_EXECUTOR=docker`)
     }
     const cfg: BackendExecutorConfig = { name, kind }
     if (kind === 'docker') {
@@ -327,6 +338,9 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
       const hostBase = env[defaults.hostConfigEnvKey] ?? '/root'
       cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.defaultHostConfigDir}`)
       cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? defaults.containerConfigDir
+      if (rawNetwork !== undefined && rawNetwork !== '') {
+        cfg.network = assertDockerNetworkName(rawNetwork, networkKey)
+      }
       if (Boolean(rawContainerUser) !== Boolean(rawContainerHome)) {
         throw new Error(`${containerUserKey} and ${containerHomeKey} must be configured together`)
       }

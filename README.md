@@ -400,6 +400,7 @@ cat >> .env <<'EOF'
 CLAUDE_EXECUTOR=docker
 CLAUDE_DOCKER_POOL_SIZE=4
 CLAUDE_DOCKER_WORKSPACE_ROOT=/tmp/cli-bridge-workspaces
+CLAUDE_DOCKER_NETWORK=research-services
 KIMI_EXECUTOR=docker
 KIMI_DOCKER_POOL_SIZE=2
 GEMINI_EXECUTOR=docker
@@ -431,6 +432,11 @@ existing directory, rejects `/`, mounts it read-write at the identical path in
 every worker, and rejects request `cwd` values outside it. OAuth remains a
 separate mount controlled by the mode above. Use a narrow per-experiment root,
 not a home or repository parent directory.
+
+Pool workers can join one existing Docker network with
+`<NAME>_DOCKER_NETWORK=<network-name>`. The bridge passes the validated name to
+`docker run --network`; it does not create or remove the network. Leave this
+unset to retain Docker's default networking behavior.
 
 ### Topology guide
 
