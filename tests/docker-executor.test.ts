@@ -379,7 +379,7 @@ describe('Docker cancellation ownership', () => {
   })
 })
 
-describe('Docker workspace confinement', () => {
+describe('Docker container run configuration', () => {
   const poolOpts = {
     size: 1,
     image: 'runtime:latest',
@@ -387,6 +387,20 @@ describe('Docker workspace confinement', () => {
     oauthMode: 'share' as const,
     shareMounts: ['/home/test/.claude:/root/.claude'],
   }
+
+  it('joins one configured Docker network and leaves the default unchanged when absent', () => {
+    const configured = buildContainerRunArgs({ ...poolOpts, network: 'r391-task_net.1' }, 0)
+    expect(configured.slice(configured.indexOf('--network'), configured.indexOf('--network') + 2)).toEqual([
+      '--network', 'r391-task_net.1',
+    ])
+    expect(buildContainerRunArgs(poolOpts, 0)).not.toContain('--network')
+  })
+
+  it('rejects unsafe Docker network values at the pool boundary', () => {
+    for (const network of ['-leading-dash', 'has space', 'container:peer', 'name/segment', 'x'.repeat(256)]) {
+      expect(() => buildContainerRunArgs({ ...poolOpts, network }, 0)).toThrow(/invalid Docker network/)
+    }
+  })
 
   it('bind-mounts exactly one configured workspace root read-write at the identical path', () => {
     const args = buildContainerRunArgs({ ...poolOpts, workspaceRoot: '/tmp/research-workspaces' }, 0)
@@ -834,6 +848,27 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     const c = config.executors.claude!
     expect(c.containerUser).toBe('1000:1000')
     expect(c.containerHome).toBe('/tmp/claude-home')
+  })
+
+  it('loads a backend Docker network only in Docker mode', () => {
+    const config = loadConfig({
+      HOME: '/home/test',
+      OPENCODE_EXECUTOR: 'docker',
+      OPENCODE_DOCKER_NETWORK: 'r391-task_net.1',
+    })
+    expect(config.executors.opencode!.network).toBe('r391-task_net.1')
+    expect(config.executors.claude!.network).toBeUndefined()
+    expect(() => loadConfig({
+      HOME: '/home/test',
+      OPENCODE_DOCKER_NETWORK: 'r391-task-net',
+    })).toThrow(/OPENCODE_DOCKER_NETWORK requires OPENCODE_EXECUTOR=docker/)
+  })
+
+  it('rejects unsafe backend Docker network names', () => {
+    const base = { HOME: '/home/test', OPENCODE_EXECUTOR: 'docker' }
+    for (const network of ['-leading-dash', 'has space', 'container:peer', 'name/segment', 'x'.repeat(256)]) {
+      expect(() => loadConfig({ ...base, OPENCODE_DOCKER_NETWORK: network })).toThrow(/invalid OPENCODE_DOCKER_NETWORK/)
+    }
   })
 
   it('rejects incomplete, root, named, unsafe, and mismatched Docker identities', () => {

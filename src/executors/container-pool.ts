@@ -38,6 +38,7 @@
 
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { assertDockerNetworkName } from './docker-network.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -65,6 +66,8 @@ export interface ContainerPoolOptions {
    * at the identical absolute path in every slot, independently of OAuth.
    */
   workspaceRoot?: string
+  /** Existing Docker network joined by every pool container. */
+  network?: string
   /** Optional numeric non-root identity, e.g. `1000:1000`. */
   containerUser?: string
   /** Writable absolute HOME for the configured container identity. */
@@ -151,6 +154,7 @@ export class ContainerPool {
 
   static async create(opts: ContainerPoolOptions): Promise<ContainerPool> {
     if (opts.size < 1) throw new Error('pool size must be >= 1')
+    if (opts.network !== undefined) assertDockerNetworkName(opts.network)
     const onProgress = opts.onProgress ?? (() => {})
     onProgress(`provisioning container pool size=${opts.size} image=${opts.image} (parallel)`)
 
@@ -387,6 +391,9 @@ export function buildContainerRunArgs(
     '--memory', memory, '--memory-swap', memory,
     '--cpus', cpus,
   ]
+  if (opts.network !== undefined) {
+    args.push('--network', assertDockerNetworkName(opts.network))
+  }
   if (Boolean(opts.containerUser) !== Boolean(opts.containerHome)) {
     throw new Error('container user and home must be configured together')
   }
