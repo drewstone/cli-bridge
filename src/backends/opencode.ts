@@ -100,10 +100,46 @@ export class OpencodeBackend implements Backend {
     //
     // Cleanup runs in the outer finally so the temp dir doesn't leak
     // when the subprocess crashes.
+    const resolvedProfile = resolveAgentProfile(req, session) as
+      | { permissions?: Record<string, unknown>; env?: Record<string, string> }
+      | null
     const mcpMaterialized = materializeMcpServersForOpencode(
       resolveMcpServers(req, session),
-      (resolveAgentProfile(req, session) as { permissions?: Record<string, unknown> } | null)?.permissions,
+      resolvedProfile?.permissions,
     )
+
+    // Egress enforcement for the offline arm. opencode ignores the config
+    // `permission.webfetch:'deny'` we write (its native WebFetch/WebSearch fire
+    // regardless), so a benchmark's no-web arm must be enforced at the network
+    // layer on THIS process, not just the agent's bash.
+    //
+    // LIMITATION (known, tracked): this closes HTTP/1.1 egress (curl/pip/npm and
+    // any proxy-respecting client) from the opencode process, but opencode's
+    // native WebFetch uses an HTTP/2/3 fetch path that ignores HTTP(S)_PROXY, so
+    // it is NOT fully blocked here. A complete no-web arm for opencode needs
+    // network-namespace isolation with a model-host allowlist (bwrap --unshare-net
+    // + forwarded model endpoint), not just proxy env. Until then, treat opencode
+    // offline results as web-reachable. When the caller's
+    // agent_profile.env sets a dead HTTP(S) proxy, apply it to opencode's own
+    // process env so its WebFetch fails on any external host — but keep the
+    // model-provider host(s) and localhost reachable via NO_PROXY, or the coder
+    // could not call its own model. Provider hosts come from
+    // OPENCODE_OFFLINE_ALLOW_HOSTS (comma list); localhost is always allowed.
+    const profileEnv = resolvedProfile?.env ?? {}
+    const offlineProxy = profileEnv.HTTPS_PROXY ?? profileEnv.https_proxy
+    const egressEnv: Record<string, string> = {}
+    if (offlineProxy) {
+      const allowHosts = [
+        '127.0.0.1', 'localhost', '::1',
+        ...(process.env.OPENCODE_OFFLINE_ALLOW_HOSTS ?? '').split(',').map((h) => h.trim()).filter(Boolean),
+      ]
+      const noProxy = [...new Set(allowHosts)].join(',')
+      for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) {
+        egressEnv[key] = offlineProxy
+      }
+      egressEnv.NO_PROXY = noProxy
+      egressEnv.no_proxy = noProxy
+    }
 
     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
@@ -131,6 +167,7 @@ export class OpencodeBackend implements Backend {
       env: {
         ...process.env,
         ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
+        ...egressEnv,
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
