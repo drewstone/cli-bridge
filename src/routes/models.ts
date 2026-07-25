@@ -58,6 +58,7 @@ const PI_MODELS: ReadonlyArray<ModelSpec> = [
   { id: 'zai-glm/glm-4.7', note: 'GLM 4.7 via pi zai-glm (Anthropic-compat)' },
   { id: 'tangle-router/gemini-3-pro-preview', note: 'Gemini 3 Pro Preview via pi → tangle-router (TANGLE_API_KEY required)' },
   { id: 'tangle-router/gemini-2.5-flash-lite', note: 'Gemini 2.5 Flash Lite via pi → tangle-router (TANGLE_API_KEY required)' },
+  { id: 'tangle-router/gpt-5-mini', note: 'GPT-5 Mini via pi → tangle-router (TANGLE_API_KEY required)' },
 ]
 
 /** Routable provider prefixes = the distinct providers named in each fallback seed. */
