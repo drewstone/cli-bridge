@@ -145,18 +145,20 @@ const chatRequestSchema = z.object({
     /** When kind=sandbox, the sandbox TTL in seconds (default 30 min). */
     ttlSeconds: z.number().int().positive().optional(),
     /**
-     * When kind=host, an optional per-request write-jail override.
-     *   mode: 'write-jail' turns confinement ON for this request. NOTE:
-     *         `BRIDGE_JAIL_MODE=write-jail` is an operator FLOOR — a
-     *         per-request 'off' can NOT disable it (a request can only add
-     *         confinement, never weaken the server policy). 'off' takes
-     *         effect only when no env floor is set.
+     * When kind=host, an optional per-request jail override.
+     *   mode: 'write-jail' confines WRITES to the jail root; 'fs-jail' also
+     *         confines READS to a minimal system+toolchain allowlist so the
+     *         CLI cannot read the host repo or sibling run scratch dirs. NOTE:
+     *         the operator env floor (`BRIDGE_JAIL_MODE`, or `WORKER_FS_JAIL=1`
+     *         for fs-jail) can only be RAISED by a request, never lowered — a
+     *         per-request 'off' or 'write-jail' cannot weaken a higher floor.
+     *         'off' takes effect only when no env floor is set.
      *   root: writable jail root (default <cwd>/.agent-home), clamped
      *         inside the request cwd.
-     * Layered over the BRIDGE_JAIL_MODE / BRIDGE_JAIL_ROOT env defaults.
+     * Layered over the BRIDGE_JAIL_MODE / WORKER_FS_JAIL / BRIDGE_JAIL_ROOT env defaults.
      */
     jail: z.object({
-      mode: z.enum(['off', 'write-jail']).optional(),
+      mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
       root: z.string().optional(),
     }).optional(),
   }).optional(),

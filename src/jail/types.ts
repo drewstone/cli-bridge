@@ -27,6 +27,17 @@ export interface JailSpec {
   extraWritablePaths?: string[]
   /** Extra absolute paths to expose read-only beyond the host default. */
   extraReadablePaths?: string[]
+  /**
+   * Confine READS as well as writes (an "fs-jail"). When true, the Linux
+   * (bwrap) backend does NOT mount the whole host root read-only; it binds
+   * only a minimal allowlist of system + language-toolchain paths, a FRESH
+   * empty tmpfs at `/tmp`, and the workspace (`projectDir`) read-WRITE. A
+   * jailed CLI then cannot read the host repo (benchmark task definitions /
+   * grader answer keys) or sibling run scratch trees under `/tmp` — only the
+   * paths its runtimes legitimately need. Linux-only: the macOS seatbelt and
+   * noop backends confine writes only and ignore this flag.
+   */
+  readConfine?: boolean
   /** Host auth/config sources made available inside the jail (read-only bind
    * on Linux, copy on macOS) so a confined run still authenticates as the
    * operator. Each carries an explicit jail-relative target so a source OUTSIDE

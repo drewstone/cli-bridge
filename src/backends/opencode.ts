@@ -22,6 +22,8 @@ import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { registerJailReadable } from '../jail/index.js'
+import { dirname } from 'node:path'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
@@ -111,6 +113,9 @@ export class OpencodeBackend implements Backend {
       resolveMcpServers(req, session),
       (resolveAgentProfile(req, session) as { permissions?: Record<string, unknown> } | null)?.permissions,
     )
+    // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
+    // expose its dir read-only so the confined opencode can still read it.
+    if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
 
     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
