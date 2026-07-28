@@ -215,7 +215,7 @@ export class ClaudeBackend implements Backend {
 
     // Validate and apply the profile before allocating request-scoped MCP
     // files. A rejected plan must never strand a config containing secrets.
-    const provisioned = provisionProfileWorkspace(req, session, 'claude', cwd)
+    const provisioned = provisionProfileWorkspace(req, session, 'claude-code', cwd)
 
     // Materialize MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean

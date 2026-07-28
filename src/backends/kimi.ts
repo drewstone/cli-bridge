@@ -125,7 +125,7 @@ export class KimiBackend implements Backend {
 
     // Reject unsupported profile plans before creating either temporary
     // Kimi config. Both files can contain provider or MCP credentials.
-    const provisioned = provisionProfileWorkspace(req, session, 'kimi', cwd)
+    const provisioned = provisionProfileWorkspace(req, session, 'kimi-code', cwd)
 
     const args = [
       '--print',

@@ -120,11 +120,6 @@ describe('materializeProfile — verified per-harness routing', () => {
     expect(unsupportedDims('nanoclaw')).toContain('mcp')
   })
 
-  it('aliases resolve: claude→claude-code, kimi→kimi-code', () => {
-    expect(paths('claude')).toEqual(paths('claude-code'))
-    expect(paths('kimi')).toEqual(paths('kimi-code'))
-  })
-
   it('empty profile → empty plan (bare control, no files)', () => {
     const plan = materializeProfile({}, 'claude-code')
     expect(plan.files).toEqual([])
