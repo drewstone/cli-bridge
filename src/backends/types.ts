@@ -177,6 +177,32 @@ export interface ChatRequest {
   profile_materialization_receipt?: ProfileMaterializationReceipt
 }
 
+/**
+ * The terminal `finish_reason` for a CLI stream that ended on its own, plus the
+ * reason when the CLI reported one.
+ *
+ * Every JSON-event backend held the same expression — `sawError ? 'error' :
+ * (emittedToolCall ? 'tool_calls' : 'stop')` — and every one of them DROPPED
+ * `sawError`'s text on the floor. The CLI had said exactly what went wrong one
+ * event earlier; the bridge turned it into a bare `finish_reason: 'error'` and
+ * the caller got HTTP 200 with an empty completion. One implementation, so the
+ * next backend inherits the reason instead of the bug.
+ *
+ * `Run.pump` still guarantees a non-empty reason on any terminal error delta;
+ * this is what makes that reason the CLI's own words rather than the bridge's
+ * admission that it cannot attribute the failure.
+ */
+export function terminalOutcome(
+  label: string,
+  sawError: string | null,
+  emittedToolCall: boolean,
+): Pick<ChatDelta, 'finish_reason' | 'error'> {
+  if (sawError !== null) {
+    return { finish_reason: 'error', error: { message: `${label}: ${sawError}`, type: 'upstream' } }
+  }
+  return { finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }
+}
+
 export interface ChatDelta {
   /** Incremental text appended to the assistant message. */
   content?: string

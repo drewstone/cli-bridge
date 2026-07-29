@@ -137,6 +137,35 @@ export async function describeCliExit(
   return `${label} exited ${exitCode}: ${stderr.slice(0, 300)}`
 }
 
+/**
+ * One observation about an executor, with the action that fixes it.
+ *
+ * Shared by the startup preflight and the readiness probe so a condition
+ * discovered in either place reads the same and carries its own remedy. A
+ * finding whose message does not contain what to do about it just moves the
+ * guessing somewhere else.
+ */
+export interface ExecutorFinding {
+  /** Stable identifier for the check, e.g. 'auth-mount-credentials'. */
+  check: string
+  /** What was observed. */
+  detail: string
+  /** The concrete action that fixes it. */
+  remedy: string
+}
+
+/** What an executor reports after TAKING the request path. */
+export interface ExecutorReadiness {
+  /**
+   * The directory a request that names no cwd resolves to, under this
+   * executor's own policy. A probe must spawn here, because this is where a
+   * request spawns.
+   */
+  cwd: string | undefined
+  /** Non-empty means a request would fail. Every entry carries its remedy. */
+  findings: ExecutorFinding[]
+}
+
 export interface Spawner {
   (bin: string, args: string[], opts: SpawnOpts): Promise<SpawnResult>
   /**
@@ -152,6 +181,28 @@ export interface Spawner {
    * cwd") the caller had already followed.
    */
   resolveCwd?(cwd: string | undefined): string | undefined
+  /**
+   * Prove this executor can serve a REQUEST, by taking the request path.
+   *
+   * The defect this exists to close: readiness used to be a LIST of checks, and
+   * what was on the list was one slot, one mount kind, one caller shape. Three
+   * items were off it, and the list could not be completed by adding a fourth,
+   * because the probe took a path no request could take — `<bin> --version`
+   * with no cwd, so the executor's own `resolveCwd` was never called, the
+   * workspace assertion every request crosses was skipped, and a
+   * credential-independent command answered `ready` for a pool holding no
+   * credentials.
+   *
+   * An implementation must therefore use the SAME cwd policy, the SAME
+   * assertions and a REAL slot from the same pool a request would get. Anything
+   * a request would hit, this hits first — which is what makes new request-path
+   * checks reach /health without anyone remembering to add them.
+   *
+   * Absent (the host executor) means the executor has no configuration a
+   * request can trip over beyond spawning the binary, which `versionHealth`
+   * already covers.
+   */
+  probeRequestPath?(): Promise<ExecutorReadiness>
 }
 
 /**
@@ -165,4 +216,41 @@ export interface Spawner {
 export function resolveSpawnerCwd(spawner: Spawner, cwd: string | undefined): string | undefined {
   if (spawner.resolveCwd) return spawner.resolveCwd(cwd)
   return cwd ?? process.cwd()
+}
+
+/**
+ * Take the request path on behalf of a health probe.
+ *
+ * Two things happen here, in the order a request does them: the executor's cwd
+ * policy runs (its refusal is a readiness finding, not an exception), and the
+ * executor's own request-path probe runs against a real slot. The returned
+ * `cwd` is what the probe must then spawn in — the same directory a cwd-less
+ * request gets — so `/health` cannot pass through a door requests never use.
+ */
+export async function probeExecutorReadiness(spawner: Spawner): Promise<ExecutorReadiness> {
+  if (spawner.probeRequestPath) return await spawner.probeRequestPath()
+  try {
+    return { cwd: resolveSpawnerCwd(spawner, undefined), findings: [] }
+  } catch (error) {
+    return { cwd: undefined, findings: [cwdPolicyFinding(error)] }
+  }
+}
+
+/**
+ * An executor that refuses to resolve a cwd-less request is not ready, and the
+ * refusal already names the setting to change — so it is reported verbatim
+ * rather than restated.
+ */
+export function cwdPolicyFinding(error: unknown): ExecutorFinding {
+  const message = error instanceof Error ? error.message : String(error)
+  return {
+    check: 'executor-cwd-policy',
+    detail: message,
+    remedy: 'change the setting named above; a request with no cwd resolves through this same policy',
+  }
+}
+
+/** One line per finding, so a caller reads the observation and its remedy together. */
+export function formatExecutorFindings(findings: ExecutorFinding[]): string {
+  return findings.map((f) => `[${f.check}] ${f.detail} — fix: ${f.remedy}`).join('; ')
 }

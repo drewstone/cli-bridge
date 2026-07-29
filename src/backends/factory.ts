@@ -21,7 +21,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
-import { BackendError } from './types.js'
+import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForFactory, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
@@ -151,7 +151,7 @@ export class FactoryBackend implements Backend {
 
         if (type === 'result') {
           yield {
-            finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
+            ...terminalOutcome('factory', sawError, emittedToolCall),
             internal_session_id: internalSessionId,
           }
           return

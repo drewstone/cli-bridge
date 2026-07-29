@@ -423,17 +423,23 @@ describe('POST /v1/chat/completions', () => {
         messages: [{ role: 'user', content: 'hi' }],
       }
 
+      // This backend YIELDS a bare terminal failure instead of throwing, which
+      // is what every subprocess backend does after an upstream error event.
+      // The status assertions here used to read 200 — this test pinned the
+      // defect as correct behaviour, and a benchmark harness reading that 200
+      // scored the cell 0.000. The INTENT is unchanged and is the reason the
+      // test exists: a failure must never carry invented token usage.
       const nonStreaming = await appLocal.request('/v1/chat/completions', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(requestBody),
       })
-      expect(nonStreaming.status).toBe(200)
+      expect(nonStreaming.status).toBe(reason === 'timeout' ? 504 : 502)
       const body = await nonStreaming.json() as {
-        choices: Array<{ finish_reason: string }>
+        error?: { message: string; type: string }
         usage?: unknown
       }
-      expect(body.choices[0]?.finish_reason).toBe(reason)
+      expect(body.error?.message ?? '').not.toBe('')
       expect(body.usage).toBeUndefined()
 
       const streaming = await appLocal.request('/v1/chat/completions', {
@@ -443,7 +449,9 @@ describe('POST /v1/chat/completions', () => {
       })
       expect(streaming.status).toBe(200)
       const text = await streaming.text()
-      expect(text.match(new RegExp(`"finish_reason":"${reason}"`, 'gu'))).toHaveLength(1)
+      // One machine-readable error frame carrying the reason, in place of the
+      // bare finish marker that told the caller nothing.
+      expect(text.match(/data: \{"error":/gu)).toHaveLength(1)
       expect(text).not.toContain('"estimated":true')
       expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
     },

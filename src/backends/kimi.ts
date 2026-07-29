@@ -35,7 +35,7 @@ import { dirname, join } from 'node:path'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
-import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
+import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
@@ -315,7 +315,7 @@ export class KimiBackend implements Backend {
         ) {
           const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
           yield {
-            finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
+            ...terminalOutcome('kimi', sawError, emittedToolCall),
             usage,
             internal_session_id: internalSessionId,
           }

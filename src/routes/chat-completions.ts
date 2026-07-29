@@ -35,6 +35,7 @@ import {
   RunReplayCursorError,
   type RunRegistry,
 } from '../runs/registry.js'
+import { BackendReportedFailureError } from '../runs/error-shape.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -546,9 +547,12 @@ async function respondFromRun(
         // was a 200 whose whole explanation was `finish_reason: "error"`.
         const failure = run.failure()
         if (!completionHasOutput(body)) {
-          return failure !== undefined
-            ? errorResponse(c, failure)
-            : c.json({ error: body.error }, 500)
+          if (failure !== undefined) return errorResponse(c, failure)
+          // No recorded failure and no output: the only way to get here is a
+          // run the CALLER cancelled. That is not a server fault, so it must not
+          // wear a 5xx — but it must not wear a 200 with an empty message
+          // either, which is what a benchmark harness would score 0.000.
+          return c.json({ error: body.error }, run.snapshot().status === 'cancelled' ? 409 : 500)
         }
       }
       return c.json(body)
@@ -603,7 +607,11 @@ async function respondFromRun(
         // failure at ANY point in the stream — not only before the first delta —
         // becomes one OpenAI error frame here, and a reconnecting reader replays
         // the same reason instead of a bare terminal marker.
-        if (delta.finish_reason === 'error' && delta.error) {
+        //
+        // BOTH terminal failure reasons, because enumerating one of them is the
+        // same defect one level down: a `timeout` delta carrying a reason was
+        // written out as an ordinary chunk and the frame never appeared.
+        if ((delta.finish_reason === 'error' || delta.finish_reason === 'timeout') && delta.error) {
           await writeSse(JSON.stringify({ error: delta.error }), seq)
           break
         }
@@ -816,6 +824,14 @@ function errorResponse(c: Context, err: unknown): Response {
   // the setting to change, so it must reach the caller and not only the log.
   if (err instanceof ExecutorConfigurationError) {
     return c.json({ error: { message: err.message, type: err.code } }, 501)
+  }
+  // A failure the backend YIELDED as a terminal error delta rather than throwing.
+  // It reaches here through `run.failure()`, and it is an upstream fault by
+  // construction — the CLI ran and ended badly — so 502, or 504 when the reason
+  // is a timeout. Falling through to the generic 500 below would have relabelled
+  // every upstream fault as a bridge fault.
+  if (err instanceof BackendReportedFailureError) {
+    return c.json({ error: { message: err.message, type: err.code } }, err.code === 'timeout' ? 504 : 502)
   }
   if (err instanceof BackendError) {
     // Hono's typed status gate treats 499 as an unofficial code; collapse

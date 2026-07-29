@@ -25,6 +25,53 @@ export function describeRunFailure(error: unknown): { message: string; type: str
   return { message, type: failureType(error) }
 }
 
+/**
+ * The failure a backend ENDED a run with by yielding a terminal error delta
+ * rather than throwing.
+ *
+ * It exists so `Run.failure()` is populated for both routes into a terminal
+ * error, because the reader turns exactly that value into an HTTP status.
+ * Measured on af03d59: opencode yields `{ finish_reason: 'error' }` with no
+ * reason on abort and after an error event, the registry's catch block never
+ * ran, and the caller received HTTP 200 with `content: ""` and no `error` key —
+ * which a benchmark harness scores 0.000, indistinguishable from a model that
+ * answered nothing.
+ */
+export class BackendReportedFailureError extends Error {
+  constructor(message: string, readonly code: string) {
+    super(message)
+    this.name = 'BackendReportedFailureError'
+  }
+}
+
+/**
+ * The reason for a terminal error/timeout delta, guaranteed non-empty.
+ *
+ * A backend that knows its reason attaches it and this preserves it verbatim.
+ * One that does not gets a reason that says so plainly and names where to look,
+ * because "the bridge cannot attribute this" is honest and an empty message is
+ * not. `label` is the backend/CLI name when known.
+ */
+export function reasonForTerminalDelta(
+  finishReason: 'error' | 'timeout',
+  existing: { message: string; type: string } | undefined,
+  label: string,
+): { message: string; type: string } {
+  if (existing && existing.message.length > 0) return existing
+  if (finishReason === 'timeout') {
+    return {
+      message: `${label} timed out before it produced a terminal answer`,
+      type: 'timeout',
+    }
+  }
+  return {
+    message:
+      `${label} ended the run with finish_reason "error" and reported no reason, so the bridge cannot attribute ` +
+      `it; check the bridge log for this run id`,
+    type: 'unattributed_backend_error',
+  }
+}
+
 function failureType(error: unknown): string {
   if (typeof error !== 'object' || error === null) return 'server_error'
   const code = (error as { code?: unknown }).code

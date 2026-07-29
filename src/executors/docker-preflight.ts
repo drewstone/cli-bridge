@@ -35,6 +35,7 @@ import { mkdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
+import type { ExecutorFinding } from './types.js'
 
 export interface DockerPreflightMount {
   /** Host path for a bind, or docker volume name for a per-slot volume. */
@@ -72,14 +73,29 @@ export interface DockerPreflightTarget {
   buildCommand: string
 }
 
-export interface PreflightFinding {
-  /** Stable identifier for the check, e.g. 'runtime-image'. */
-  check: string
-  /** What was observed. */
-  detail: string
-  /** The concrete action that fixes it. */
-  remedy: string
-}
+/**
+ * One finding, in the shape every executor reports. Aliased rather than
+ * redeclared so a startup finding and a readiness finding cannot drift apart:
+ * `/health` renders exactly what the startup preflight would have printed.
+ */
+export type PreflightFinding = ExecutorFinding
+
+/**
+ * How far to probe, and how hard to judge what is found.
+ *
+ *   `full`         — everything, at startup, before the port opens.
+ *   `credentials`  — only what is genuinely per-slot, for slots 1..N at startup.
+ *   `request-path` — what a REQUEST depends on, for a live readiness verdict:
+ *                    this slot's credential mounts and the workspace bind. The
+ *                    `<bin> --version` exec is deliberately absent because the
+ *                    caller (`versionHealth`) runs it through the real spawner
+ *                    immediately afterwards, in this same resolved cwd.
+ *
+ * `request-path` also judges missing credentials differently, and that is the
+ * point of the distinction rather than an accident of it — see
+ * `checkCredentialPresence`.
+ */
+export type PreflightScope = 'full' | 'credentials' | 'request-path'
 
 export class DockerPreflightError extends Error {
   constructor(readonly backend: string, readonly findings: PreflightFinding[]) {
@@ -139,6 +155,11 @@ export async function preflightDockerImage(
   }
 
   for (const mount of target.mounts) {
+    // Binds only, because this phase stats the HOST path and a docker volume has
+    // none. It is NOT the credential check — that one runs against every mount
+    // regardless of kind, inside the container, in `checkCredentialMounts`. The
+    // distinction is worth stating: skipping volumes here reads like the bug
+    // where the empty-credential warning was skipped for volumes, and it is not.
     if (mount.kind !== 'bind') continue
     findings.push(...checkBindSource(target, mount))
   }
@@ -244,12 +265,26 @@ export async function preflightDockerSlot(
    * the image and the configured user, identical in every slot. Per-slot OAUTH
    * volumes are NOT identical — each slot has its own — so probing slot 0 alone
    * was evidence about one slot while traffic was routed to all of them.
+   *
+   * `request-path` is the live readiness verdict; see `PreflightScope`.
    */
-  opts: { scope?: 'full' | 'credentials' } = {},
+  opts: { scope?: PreflightScope } = {},
 ): Promise<PreflightFinding[]> {
   const findings: PreflightFinding[] = []
-  if ((opts.scope ?? 'full') === 'credentials') {
-    return await checkCredentialMounts(target, containerId, cli, warnings)
+  const scope = opts.scope ?? 'full'
+  if (scope === 'credentials') {
+    return await checkCredentialMounts(target, containerId, cli, warnings, 'warn')
+  }
+  if (scope === 'request-path') {
+    // Exactly what a request depends on and nothing a request does not: this
+    // slot's credentials, and the workspace bind still being live. Adding the
+    // image-invariant checks here would spend four docker execs per /health on
+    // properties that cannot have changed since startup.
+    findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings, 'fail')))
+    if (target.workspaceRoot) {
+      findings.push(...(await checkWorkspaceMount(target, containerId, cli)))
+    }
+    return findings
   }
 
   // --- identity + HOME agreement -----------------------------------------
@@ -307,7 +342,7 @@ export async function preflightDockerSlot(
   }
 
   // --- credential mounts land inside HOME, are usable, and hold credentials
-  findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings)))
+  findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings, 'warn')))
 
   // --- the workspace bind is proven LIVE at the exec path ----------------
   if (target.workspaceRoot) {
@@ -367,17 +402,25 @@ export async function preflightDockerSlot(
  *   3. It actually holds credentials. Checking the named credential FILE rather
  *      than non-emptiness matters: measured on this host, ~/.config/opencode has
  *      6 entries and no auth.json (opencode keeps it in ~/.local/share/opencode),
- *      so the old check passed on a mount that cannot authenticate. Missing
- *      credentials are a WARNING, not a finding — a first run legitimately has
- *      none and the operator logs in — but they must be said out loud, because
- *      the failure they produce is a model-shaped one: the CLI starts,
- *      authenticates against nothing, and the caller gets an empty completion.
+ *      so the old check passed on a mount that cannot authenticate. The failure
+ *      that produces is a model-shaped one: the CLI starts, authenticates
+ *      against nothing, and the caller gets an empty completion.
+ *
+ * `missingCredentials` decides what absence MEANS, and the two answers are both
+ * right for their own caller. At startup it is a warning: a first run
+ * legitimately has no credentials, and the remedy is to log in inside a pool
+ * container — which requires the pool to exist, so refusing to start would
+ * remove the only route to the fix. For a readiness verdict it is a finding: the
+ * requests are what /health is answering about, and every one of them will come
+ * back empty. Measured on this host, that difference is the whole bug — the
+ * startup warning went to stdout and /health went on reporting `ready`.
  */
 async function checkCredentialMounts(
   target: DockerPreflightTarget,
   containerId: string,
   cli: DockerCli,
   warnings: string[],
+  missingCredentials: 'warn' | 'fail',
 ): Promise<PreflightFinding[]> {
   const findings: PreflightFinding[] = []
   for (const mount of target.mounts) {
@@ -425,7 +468,7 @@ async function checkCredentialMounts(
         remedy: mountPermissionRemedy(target, mount, 'writable'),
       })
     }
-    findings.push(...(await checkCredentialPresence(target, mount, containerId, cli, warnings)))
+    findings.push(...(await checkCredentialPresence(target, mount, containerId, cli, warnings, missingCredentials)))
   }
   return findings
 }
@@ -457,28 +500,38 @@ async function checkCredentialPresence(
   containerId: string,
   cli: DockerCli,
   warnings: string[],
+  missingCredentials: 'warn' | 'fail',
 ): Promise<PreflightFinding[]> {
   const loginHint =
     `log in on the host so the credentials land in ${mount.source}, or run ` +
     `\`docker exec -it <slot> ${target.bin} auth login\` inside the pool container`
+  /** One absence, reported as a warning or a finding depending on who asked. */
+  const report = (check: string, detail: string): PreflightFinding[] => {
+    if (missingCredentials === 'warn') {
+      warnings.push(`${target.backend}: ${detail} — ${loginHint}.`)
+      return []
+    }
+    return [{ check, detail: `${target.backend}: ${detail}`, remedy: loginHint }]
+  }
   if (mount.credentialFile) {
     const path = `${mount.target}/${mount.credentialFile}`
     const present = await cli(containerShell(containerId, `test -e ${shellQuote(path)}`))
     if (present.code !== 0) {
-      warnings.push(
-        `${target.backend}: ${path} does not exist, so ${target.bin} has NO credentials in ` +
-        `${mount.source} -> ${mount.target}. It will start and authenticate against nothing, which surfaces as an ` +
-        `empty completion rather than an auth error — ${loginHint}.`,
+      return report(
+        'auth-mount-credentials',
+        `${path} does not exist, so ${target.bin} has NO credentials in ${mount.source} -> ${mount.target}. ` +
+        `It will start and authenticate against nothing, which surfaces as an empty completion rather than an ` +
+        `auth error`,
       )
     }
     return []
   }
   const listing = await cli(containerShell(containerId, `ls -A ${shellQuote(mount.target)} 2>/dev/null | head -1`))
   if (listing.code === 0 && listing.stdout.trim() === '') {
-    warnings.push(
-      `${target.backend}: credential mount ${mount.source} -> ${mount.target} is EMPTY. ` +
-      `${target.bin} will start but have nothing to authenticate with, which surfaces as an empty completion ` +
-      `rather than an auth error — ${loginHint}.`,
+    return report(
+      'auth-mount-empty',
+      `credential mount ${mount.source} -> ${mount.target} is EMPTY. ${target.bin} will start but have nothing ` +
+      `to authenticate with, which surfaces as an empty completion rather than an auth error`,
     )
   }
   return []

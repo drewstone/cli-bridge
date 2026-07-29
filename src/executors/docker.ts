@@ -20,8 +20,17 @@ import { promisify } from 'node:util'
 import type { ContainerPool } from './container-pool.js'
 import { dockerCli, type DockerCli } from './docker-cli.js'
 import { diagnoseDockerExecFailure, isAmbiguousDockerExit } from './docker-exec-diagnosis.js'
+import { preflightDockerSlot, type DockerPreflightTarget } from './docker-preflight.js'
 import { killTree } from './process-tree.js'
-import { ExecutorConfigurationError, type SpawnOpts, type SpawnResult, type Spawner } from './types.js'
+import {
+  cwdPolicyFinding,
+  ExecutorConfigurationError,
+  type ExecutorFinding,
+  type ExecutorReadiness,
+  type SpawnOpts,
+  type SpawnResult,
+  type Spawner,
+} from './types.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -45,6 +54,16 @@ export interface DockerSpawnerOptions {
   spawnProcess?: typeof spawn
   /** Injectable docker command runner used by exec-failure diagnosis. */
   cli?: DockerCli
+  /**
+   * The probe configuration for one slot, derived from the SAME values the pool
+   * received. Supplied as a function of the slot index because per-slot
+   * credential volumes are not identical between slots — probing slot 0's for
+   * every slot was evidence about one slot while traffic went to all of them.
+   *
+   * Without it, `probeRequestPath` still exercises the cwd policy but cannot
+   * inspect mounts, so it is required for a complete readiness verdict.
+   */
+  preflightTarget?: (slotIndex: number) => DockerPreflightTarget
 }
 
 export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
@@ -160,6 +179,59 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
   spawner.resolveCwd = (cwd) => cwd === undefined
     ? opts.workspaceRoot
     : assertDockerWorkspaceCwd(opts.workspaceRoot, cwd, naming)
+
+  /**
+   * Readiness by taking the request path.
+   *
+   * A request resolves its cwd through `resolveCwd`, gets a slot from this pool,
+   * and then depends on that slot's credential mounts and workspace bind. So the
+   * cwd policy runs here — its refusal is the verdict — and then every live
+   * container is probed for what a request depends on.
+   *
+   * EVERY container, and without acquiring, for two reasons that pull the same
+   * way. Acquiring would make /health queue behind real traffic, so a busy pool
+   * would look unhealthy and the probe could time out on a bridge that is
+   * working perfectly. And probing the ONE slot a request happens to get would
+   * repeat the defect the startup preflight already had to fix — evidence about
+   * one slot while traffic is routed to all of them. The request path's slot
+   * SELECTION is still exercised, immediately after this, by the `<bin>
+   * --version` spawn `versionHealth` runs through this very spawner.
+   */
+  spawner.probeRequestPath = async (): Promise<ExecutorReadiness> => {
+    let cwd: string | undefined
+    try {
+      cwd = spawner.resolveCwd!(undefined)
+    } catch (error) {
+      // The executor refuses cwd-less requests as configured. There is no point
+      // probing a container to confirm it; the refusal already names the setting.
+      return { cwd: undefined, findings: [cwdPolicyFinding(error)] }
+    }
+    const preflightTarget = opts.preflightTarget
+    if (!preflightTarget) return { cwd, findings: [] }
+    const containerIds = opts.pool.liveContainerIds()
+    if (containerIds.length === 0) {
+      return {
+        cwd,
+        findings: [{
+          check: 'pool-slots',
+          detail: `the ${naming.backend ?? 'docker'} container pool has no live slot, so every request would fail to acquire one`,
+          remedy: 'check the Docker daemon and the bridge log for the pool\'s recreate attempts',
+        }],
+      }
+    }
+    // In parallel: a serial sweep of N slots × M mounts would spend more than
+    // the /health probe ceiling on a healthy pool.
+    const perSlot = await Promise.all(containerIds.map(async (containerId, slotIndex) =>
+      await preflightDockerSlot(
+        preflightTarget(slotIndex),
+        containerId,
+        cli,
+        [],
+        { scope: 'request-path' },
+      )))
+    const findings: ExecutorFinding[] = perSlot.flat()
+    return { cwd, findings }
+  }
   return spawner
 }
 
@@ -251,21 +323,32 @@ export interface WorkspaceCwdContext {
 }
 
 /**
- * Fail before acquiring a slot when a request's cwd is not a path the container
- * can actually enter. Calls without cwd (for example `<cli> --version` health
- * checks) run against the container filesystem and are always allowed.
+ * Fail before acquiring a slot when a resolved cwd is not a path the container
+ * can actually enter. A cwd-less call resolves through `resolveCwd` first, so by
+ * the time this runs the directory is one the executor itself chose or the
+ * caller supplied.
  *
  * Two rejections, both of which used to surface as `<cli> exited 127`:
  *
- *   - No workspace is mounted at all, but the request carries a cwd. The
- *     executor would pass `--workdir <host path>` to a container that has never
- *     heard of it; Docker fails with 127 — byte-identical to "command not
- *     found" — and the caller reads it as a broken CLI install. Worse, if the
- *     host path happens to exist inside the image (/tmp, /root), the CLI runs
- *     against the container's throwaway filesystem and the caller's files are
- *     silently discarded. Both outcomes are worse than refusing.
+ *   - No workspace is mounted at all, but a cwd reached the executor. It would
+ *     pass `--workdir <host path>` to a container that has never heard of it;
+ *     Docker fails with 127 — byte-identical to "command not found" — and the
+ *     caller reads it as a broken CLI install. Worse, if the host path happens
+ *     to exist inside the image (/tmp, /root), the CLI runs against the
+ *     container's throwaway filesystem and the caller's files are silently
+ *     discarded. Both outcomes are worse than refusing.
  *   - The cwd resolves outside the configured workspace root, so it is not
  *     inside the bind mount even though a mount exists.
+ *
+ * Both messages state WHERE the directory came from and offer only remedies the
+ * reader can carry out. Measured on this host, the no-workspace message used to
+ * say "this request asks to run in /home/drew/code/cli-bridge-preflight" — the
+ * bridge's OWN working directory, which the backend had pre-filled — and then
+ * advised "send requests without a cwd", which the caller had already done and
+ * the HTTP API could not express. It blamed the caller for the bridge's
+ * injection and prescribed the impossible. So: no accusation, and no remedy that
+ * lives outside the operator's reach. `<PREFIX>_EXECUTOR=host` is named because
+ * it is the second thing an operator can always actually do.
  */
 export function assertDockerWorkspaceCwd(
   workspaceRoot: string | undefined,
@@ -275,12 +358,14 @@ export function assertDockerWorkspaceCwd(
   if (!cwd) return cwd
   if (!workspaceRoot) {
     const backend = ctx.backend ?? 'this backend'
-    const envKey = `${ctx.envPrefix ?? '<BACKEND>'}_DOCKER_WORKSPACE_ROOT`
+    const prefix = ctx.envPrefix ?? '<BACKEND>'
+    const envKey = `${prefix}_DOCKER_WORKSPACE_ROOT`
     throw new ExecutorConfigurationError(
-      `${backend} runs on a Docker executor with no workspace mounted, but this request asks to run in ${cwd}. ` +
-        `That directory does not exist inside the container, so the CLI would never start. ` +
-        `Set ${envKey} to an absolute host directory containing ${cwd} — the pool bind-mounts it into every ` +
-        `container at the identical path — or send requests without a cwd to run against the container filesystem.`,
+      `${backend} runs on a Docker executor with NO workspace bind, and the run resolved to ${cwd}. ` +
+        `That directory does not exist inside the container, so the CLI would never start. It is the executor's ` +
+        `resolved working directory, not necessarily one the caller named, so there is nothing for a caller to ` +
+        `change. Set ${envKey} to an absolute host directory containing ${cwd} — the pool bind-mounts it into ` +
+        `every container at the identical path — or set ${prefix}_EXECUTOR=host to run the CLI directly on this host.`,
     )
   }
   if (!isAbsolute(cwd)) {
@@ -297,11 +382,13 @@ export function assertDockerWorkspaceCwd(
   }
   const rel = relative(workspaceRoot, canonicalCwd)
   if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    const envKey = `${ctx.envPrefix ?? '<BACKEND>'}_DOCKER_WORKSPACE_ROOT`
+    const prefix = ctx.envPrefix ?? '<BACKEND>'
+    const envKey = `${prefix}_DOCKER_WORKSPACE_ROOT`
     throw new ExecutorConfigurationError(
       `Docker executor cwd ${cwd} is outside configured workspace root ${workspaceRoot}, so it is not inside the ` +
         `bind mount the container can see. Set ${envKey} to a host directory containing ${cwd} — it is bind-mounted ` +
-        `at the identical path in every pool container — or send the request without a cwd to run in ${workspaceRoot}.`,
+        `at the identical path in every pool container — or set ${prefix}_EXECUTOR=host to run the CLI directly on ` +
+        `this host. A request that names no cwd runs in ${workspaceRoot} and is unaffected.`,
     )
   }
   return canonicalCwd
