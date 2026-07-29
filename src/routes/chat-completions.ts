@@ -299,13 +299,12 @@ export function mountChatCompletions(
     const runIdResult = resolveRunId(bodyRunId, c.req.header('x-run-id'))
     if (!runIdResult.ok) return invalidRequest(c, runIdResult.message)
     const runId = runIdResult.value
-    const cursorResult = resolveLastEventId(
-      c.req.header('last-event-id'),
-      c.req.header('x-last-event-id'),
-    )
+    const standardCursor = c.req.header('last-event-id')
+    const aliasCursor = c.req.header('x-last-event-id')
+    const cursorResult = resolveLastEventId(standardCursor, aliasCursor)
     if (!cursorResult.ok) return invalidRequest(c, cursorResult.message)
     const afterSeq = cursorResult.value
-    if (afterSeq > 0 && req.stream !== true) {
+    if ((standardCursor !== undefined || aliasCursor !== undefined) && req.stream !== true) {
       return invalidRequest(c, 'Last-Event-ID is only valid for stream:true replay')
     }
 

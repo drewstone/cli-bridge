@@ -451,6 +451,13 @@ describe('durable run contract', () => {
         'X-Last-Event-Id': '2',
       })
       expect(cursor.status).toBe(400)
+
+      const nonStreamingZero = await postChat(
+        ctx.app,
+        { ...chatBody('nonstream-cursor'), stream: false },
+        { 'Last-Event-ID': '0' },
+      )
+      expect(nonStreamingZero.status).toBe(400)
       expect(backend.calls).toBe(0)
     } finally {
       ctx.cleanup()
