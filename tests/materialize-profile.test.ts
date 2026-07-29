@@ -18,6 +18,8 @@ import {
 import { provisionProfileWorkspace } from '../src/backends/profile-support.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
 import type { ChatRequest } from '../src/backends/types.js'
+import { buildDockerExecArgs } from '../src/executors/docker.js'
+import { sanitizeHostEnv } from '../src/executors/host.js'
 
 const SKILL_BODY = '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.'
 const FULL: AgentProfile = {
@@ -205,8 +207,17 @@ describe('materializeProfile — verified per-harness routing', () => {
         .buildPrompt(req, null)
       const nativeSystemPrompt = readFileSync(join(root, '.gemini/system.md'), 'utf8')
       const workspaceInstructions = readFileSync(join(root, 'GEMINI.md'), 'utf8')
+      const hostEnv = sanitizeHostEnv(provisioned.env)
+      const dockerArgs = buildDockerExecArgs(
+        'gemini-slot',
+        'gemini',
+        [],
+        { env: provisioned.env },
+      )
 
       expect(provisioned.env.GEMINI_SYSTEM_MD).toBe('1')
+      expect(hostEnv?.GEMINI_SYSTEM_MD).toBe('1')
+      expect(dockerArgs).toContain('GEMINI_SYSTEM_MD=1')
       expect(prompt).toContain('[system] Keep this request-specific system message.')
       expect(prompt).toContain('[user] work')
       expect(nativeSystemPrompt).toBe(marker)

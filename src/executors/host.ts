@@ -233,6 +233,7 @@ const PROXIED_ENV_PREFIXES = [
   'CLAUDE_',
   'CODEX_',
   'CURSOR_',
+  'GEMINI_',
   'KIMI_',
   'MOONSHOT_',
   'OPENAI_',

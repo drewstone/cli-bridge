@@ -82,6 +82,7 @@ describe('hostSpawner', () => {
       DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
       ANTHROPIC_API_KEY: 'sk-test',
       OPENCODE_CONFIG: '/tmp/opencode.json',
+      GEMINI_SYSTEM_MD: '1',
       GH_TOKEN: 'ghp_test',
       HUGE_SESSION_BLOB: 'x'.repeat(1024 * 1024),
       npm_config_user_agent: 'pnpm/test',
@@ -93,6 +94,7 @@ describe('hostSpawner', () => {
       DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
       ANTHROPIC_API_KEY: 'sk-test',
       OPENCODE_CONFIG: '/tmp/opencode.json',
+      GEMINI_SYSTEM_MD: '1',
       GH_TOKEN: 'ghp_test',
     })
   })
@@ -311,11 +313,12 @@ describe('buildDockerExecArgs', () => {
     expect(args).toContain('/work')
   })
 
-  it('forwards allowlisted env (CLAUDE_*, ANTHROPIC_*) and skips host-only env', () => {
+  it('forwards harness env and skips host-only env', () => {
     const args = buildDockerExecArgs('cid', 'claude', [], {
       env: {
         ANTHROPIC_API_KEY: 'sk-test',
         CLAUDE_DEBUG: '1',
+        GEMINI_SYSTEM_MD: '1',
         PATH: '/usr/bin', // host-only, must NOT propagate
         HOME: '/Users/drew', // host-only, must NOT propagate
       },
@@ -323,6 +326,7 @@ describe('buildDockerExecArgs', () => {
     const flat = args.join(' ')
     expect(flat).toContain('-e ANTHROPIC_API_KEY=sk-test')
     expect(flat).toContain('-e CLAUDE_DEBUG=1')
+    expect(flat).toContain('-e GEMINI_SYSTEM_MD=1')
     expect(flat).not.toContain('-e PATH=')
     expect(flat).not.toContain('-e HOME=')
   })
