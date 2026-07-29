@@ -81,6 +81,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
           child,
           slot.containerId,
           opts.restartContainer ?? restartDockerContainer,
+          cli,
         ).then(() => {
           terminationFinished = true
         }).catch((error) => {
@@ -176,6 +177,7 @@ export async function terminateDockerExecution(
   child: ChildProcess,
   containerId: string,
   restartContainer: (containerId: string) => Promise<void> = restartDockerContainer,
+  cli: DockerCli = dockerCli,
 ): Promise<void> {
   const cleanExit = child.exitCode === 0 && child.signalCode === null
   if (!cleanExit) {
@@ -186,7 +188,14 @@ export async function terminateDockerExecution(
       // treat it as terminated. Reporting failure here made the caller hold the
       // slot: `docker restart` cannot succeed against a removed container, and
       // the removal is precisely the case the pool must recover from.
-      if (!isMissingContainerError(error)) throw error
+      //
+      // The wording is checked first because it is free, then CONFIRMED with the
+      // daemon, because the wording set was incomplete: a removal in flight says
+      // "container is marked for removal and cannot be started", which matched
+      // nothing, so a swept container was reported to the caller as a failure to
+      // terminate. Asking whether the container is still there does not depend on
+      // Docker's phrasing staying the same.
+      if (!isMissingContainerError(error) && await containerStillExists(containerId, cli)) throw error
     }
   }
   // Reap the local attach client too. After restart it normally exits on its
@@ -194,10 +203,33 @@ export async function terminateDockerExecution(
   await killTree(child)
 }
 
-/** Docker's wording for "that container is not here", across `restart`/`exec`/`inspect`. */
+/**
+ * Docker's wording for "that container is not here or is on its way out",
+ * across `restart`/`exec`/`inspect`. A fast path only — `terminateDockerExecution`
+ * confirms with the daemon when the wording is unfamiliar, because this set was
+ * missing the in-flight-removal phrasing and a swept container was therefore
+ * reported to the caller as a failure to terminate.
+ */
 function isMissingContainerError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
-  return /No such container|no such object|is not running/i.test(message)
+  return /No such container|no such object|is not running|marked for removal|is being removed|removal of container/i.test(message)
+}
+
+/**
+ * Ask the daemon whether the container is still present.
+ *
+ * Fail CLOSED: only a daemon that positively answers "no such object" proves the
+ * container is gone. `docker inspect` also fails when the daemon is unreachable
+ * or the call times out, and reading that as "gone" would swallow a genuine
+ * termination failure — a container that may still be running the caller's work
+ * would be silently reused. Unknown therefore means "still exists", so the real
+ * error is reported and the slot is recycled.
+ */
+async function containerStillExists(containerId: string, cli: DockerCli): Promise<boolean> {
+  const state = await cli(['inspect', '-f', '{{.State.Status}}', containerId])
+  if (state.code === 0) return !/^(removing|dead)$/u.test(state.stdout.trim())
+  if (state.spawnError) return true
+  return !/No such object|No such container/i.test(state.stderr)
 }
 
 async function restartDockerContainer(containerId: string): Promise<void> {

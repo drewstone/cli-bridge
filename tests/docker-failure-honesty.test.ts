@@ -42,6 +42,7 @@ import { assertDockerWorkspaceCwd, createDockerSpawner, terminateDockerExecution
 import { mountHealth } from '../src/routes/health.js'
 import { BackendRegistry } from '../src/backends/registry.js'
 import type { Backend, BackendHealth, ChatDelta } from '../src/backends/types.js'
+import type { DockerCli } from '../src/executors/docker-cli.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { CodexBackend } from '../src/backends/codex.js'
@@ -466,9 +467,15 @@ describe('defect 2 — a holder that cannot terminate its container hands the sl
   it('still reports a genuine termination failure rather than pretending it worked', async () => {
     const child = childExiting(1, '', 'boom')
     await new Promise<void>((resolve) => child.once('close', () => resolve()))
+    // The container is STILL THERE, so the restart failure is real and must be
+    // reported. The liveness answer is injected rather than taken from the host's
+    // daemon: with a made-up id a real `docker inspect` legitimately answers "no
+    // such object", which would make this test assert the opposite of its name.
+    const stillRunning: DockerCli = async (args) =>
+      args[0] === 'inspect' ? { code: 0, stdout: 'running\n', stderr: '' } : { code: 0, stdout: '', stderr: '' }
     await expect(terminateDockerExecution(child, 'abc123', async () => {
       throw new Error('docker executor could not terminate container abc123: daemon is unreachable')
-    })).rejects.toThrow(/daemon is unreachable/)
+    }, stillRunning)).rejects.toThrow(/daemon is unreachable/)
   })
 
   it('recycles the held slot when termination fails, so the slot is never stranded', async () => {
@@ -486,6 +493,11 @@ describe('defect 2 — a holder that cannot terminate its container hands the sl
       envPrefix: 'OPENCODE',
       spawnProcess: (() => child) as never,
       restartContainer: async () => { throw new Error('daemon is unreachable') },
+      // The container is still there, so termination genuinely failed and the
+      // slot must be recycled rather than reused.
+      cli: async (args) => (args[0] === 'inspect'
+        ? { code: 0, stdout: 'running\n', stderr: '' }
+        : { code: 0, stdout: '', stderr: '' }),
     })
 
     const spawned = await spawner('opencode', ['run'], { stdio: ['pipe', 'pipe', 'pipe'] })

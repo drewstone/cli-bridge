@@ -104,6 +104,26 @@ describe('a removed container is not reported as a failure to terminate', () => 
     )).resolves.toBeUndefined()
   })
 
+  it('does NOT read an unreachable daemon as a gone container', async () => {
+    // `docker inspect` fails for both "no such object" and "cannot reach the
+    // daemon". Treating the second as proof of termination would silently reuse a
+    // container that may still be running the caller's work, so unknown must mean
+    // "still there" and the real error must survive.
+    const unreachable: DockerCli = async () => ({
+      code: -1,
+      stdout: '',
+      stderr: '',
+      spawnError: 'connect ENOENT /var/run/docker.sock',
+    })
+
+    await expect(terminateDockerExecution(
+      child(137, ''),
+      'c60496099aaa',
+      async () => { throw new Error('docker executor could not terminate container c60496099aaa: daemon is unreachable') },
+      unreachable,
+    )).rejects.toThrow(/daemon is unreachable/)
+  })
+
   it('still reports a genuine termination failure on a container that IS running', async () => {
     const running: DockerCli = async (args) =>
       args[0] === 'inspect'
