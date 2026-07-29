@@ -144,7 +144,7 @@ export class ClaudeBackend implements Backend {
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
     const mode: BridgeMode = req.mode ?? 'byob'
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
     // hosted-sandboxed requires the sandbox launcher which is a separate
     // code path (src/sandbox.ts, not yet landed). Fail loud until that's

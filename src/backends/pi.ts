@@ -196,7 +196,7 @@ export class PiBackend implements Backend {
     // (no stdin payload required for `--print` mode).
     args.push(prompt)
 
-    const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
     // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) mount as `<cwd>/.pi/mcp.json` for the

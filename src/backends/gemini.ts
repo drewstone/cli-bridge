@@ -61,7 +61,7 @@ export class GeminiBackend implements Backend {
     const model = this.extractModel(req.model)
     const args = this.buildArgs(req.model)
     if (model) args.push('--model', model)
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
     // Validate the profile before touching project-scoped Gemini settings,
     // which can contain MCP headers and other credentials.

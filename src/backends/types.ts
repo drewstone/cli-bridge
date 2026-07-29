@@ -185,6 +185,16 @@ export interface ChatDelta {
   /** Terminal reason. Emitted once on the final chunk. */
   finish_reason?: 'stop' | 'length' | 'tool_calls' | 'error' | 'timeout'
   /**
+   * Why a terminal `error`/`timeout` happened, carried ON the delta so it
+   * survives buffering and replay. Without it a failure that happened after the
+   * first delta reached the caller as `finish_reason: 'error'` with an empty
+   * completion and no reason at all, while the only copy of the message went to
+   * the bridge's stdout — an infrastructure failure that reads as a model
+   * problem. Set by the run pump; backends may set it directly when they
+   * terminate a stream without throwing.
+   */
+  error?: { message: string; type: string }
+  /**
    * Token usage. Optional; present on the final chunk when known. `estimated`
    * is set when the bridge derived it from text (~4 chars/token) because the
    * backend CLI reported none — consumers price it as approximate, not measured.

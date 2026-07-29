@@ -71,7 +71,7 @@ export class CodexBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     // Codex has `--sandbox` flags but we haven't verified end-to-end that
     // every FS/shell tool is gated under read-only. Reject hosted-safe
     // until that audit lands — never fake safety.

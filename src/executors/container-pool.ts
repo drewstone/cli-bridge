@@ -72,8 +72,15 @@ export interface ContainerPoolOptions {
   oauthMode: 'share' | 'per-slot'
   /** Bind paths for the `share` mode. Each entry is `host:container`. */
   shareMounts?: string[]
-  perSlotVolumePrefix?: string
-  perSlotMountTarget?: string
+  /**
+   * Per-slot credential volumes. Each entry becomes
+   * `<volumePrefix>-<slotIndex>:<target>`, so slot N's credentials are its own.
+   * A LIST, not one pair: a CLI can read credentials from more than one
+   * directory (opencode keeps config in ~/.config/opencode and auth.json in
+   * ~/.local/share/opencode), and mounting only the first gives every slot a
+   * volume with nothing to authenticate with.
+   */
+  perSlotVolumes?: Array<{ volumePrefix: string; target: string }>
   /**
    * Optional canonical host workspace root. It is bind-mounted read-write
    * at the identical absolute path in every slot, independently of OAuth.
@@ -408,15 +415,57 @@ export class ContainerPool {
 
   private releaseSlot(slot: SlotState): void {
     slot.busy = false
-    if (this.waiters.length === 0) return
-    const stickyIdx = this.waiters.findIndex((w) => w.sessionId && w.sessionId === slot.lastSession)
-    const waiterIdx = stickyIdx >= 0 ? stickyIdx : 0
-    const waiter = this.waiters.splice(waiterIdx, 1)[0]
+    this.serveWaiterWith(slot)
+  }
+
+  /**
+   * Hand a freed slot to the next waiter — through the SAME liveness gate as the
+   * free-slot path in `acquire()`.
+   *
+   * This is the saturated-pool half of self-healing. Liveness used to be checked
+   * only in `handOut`, which `acquire()` reaches when a slot is already free; a
+   * QUEUED waiter went straight to `markAcquired` and was handed the container id
+   * as-is, at any TTL including 0. So a swept container healed on an idle pool
+   * and never on a busy one — the condition the pool exists for. Every waiter in
+   * the queue received the same removed id in turn.
+   *
+   * The slot stays reserved (`busy`) across the probe so no concurrent acquire
+   * can take it while it is being verified or rebuilt.
+   */
+  private serveWaiterWith(slot: SlotState): void {
+    if (this.destroyed || slot.dead || slot.busy) return
+    const waiter = this.takeWaiterFor(slot)
     if (!waiter) return
     slot.busy = true
-    slot.generation += 1
-    if (waiter.sessionId) slot.lastSession = waiter.sessionId
-    waiter.resolve(slot)
+    void this.ensureContainerAlive(slot).then(
+      () => {
+        slot.busy = false
+        if (waiter.sessionId) slot.lastSession = waiter.sessionId
+        // `waiter.resolve` runs markAcquired, which reserves the slot and bumps
+        // the generation the waiter's own release() is bound to.
+        waiter.resolve(slot)
+      },
+      (err: Error) => {
+        slot.busy = false
+        // This slot could not be made usable. Another alive slot may still
+        // serve the waiter; only when none exists does the waiter learn why.
+        const alternative = this.slots.find((s) => s !== slot && !s.busy && !s.dead)
+        if (alternative) {
+          this.waiters.unshift(waiter)
+          this.serveWaiterWith(alternative)
+          return
+        }
+        clearTimeout(waiter.timer)
+        waiter.reject(err)
+      },
+    )
+  }
+
+  /** Next waiter for this slot, preferring one whose session it last served. */
+  private takeWaiterFor(slot: SlotState): Waiter | undefined {
+    if (this.waiters.length === 0) return undefined
+    const stickyIdx = this.waiters.findIndex((w) => w.sessionId && w.sessionId === slot.lastSession)
+    return this.waiters.splice(stickyIdx >= 0 ? stickyIdx : 0, 1)[0]
   }
 
   /**
@@ -436,17 +485,21 @@ export class ContainerPool {
       if (this.waiters.length > 0) this.releaseSlot(slot)
       return null
     }
-    // Wake any waiter that still has work to do; they'll be routed to
-    // another alive slot. `waiter.resolve` runs markAcquired itself (see
-    // acquire), so this must NOT pre-acquire the slot — doing so bumped the
-    // generation twice and made the waiter's own release() a no-op, leaking
-    // the slot as busy until the hold watchdog fired.
+    // Wake any waiter that still has work to do; they'll be routed to another
+    // alive slot, through the same liveness gate as every other handoff. The
+    // handoff must NOT pre-acquire the slot — `waiter.resolve` runs markAcquired
+    // itself (see acquire), so doing so bumped the generation twice and made the
+    // waiter's own release() a no-op, leaking the slot as busy until the hold
+    // watchdog fired.
     if (this.waiters.length > 0) {
-      const w = this.waiters.shift()!
-      clearTimeout(w.timer)
       const free = this.slots.find((s) => !s.busy && !s.dead)
-      if (free) w.resolve(free)
-      else w.reject(new Error(`container-pool: no alive slots after recycle (${error.message})`))
+      if (free) {
+        this.serveWaiterWith(free)
+      } else {
+        const w = this.waiters.shift()!
+        clearTimeout(w.timer)
+        w.reject(new Error(`container-pool: no alive slots after recycle (${error.message})`))
+      }
     }
     return error
   }
@@ -586,8 +639,8 @@ function collectMountTargets(opts: ContainerPoolOptions): string[] {
       const target = m.slice(m.indexOf(':') + 1)
       if (target.startsWith('/')) targets.push(target)
     }
-  } else if (opts.perSlotMountTarget) {
-    targets.push(opts.perSlotMountTarget)
+  } else {
+    for (const v of opts.perSlotVolumes ?? []) targets.push(v.target)
   }
   if (opts.workspaceRoot) targets.push(opts.workspaceRoot)
   return targets
@@ -658,10 +711,10 @@ export function buildContainerRunArgs(
   if (opts.oauthMode === 'share') {
     for (const m of opts.shareMounts ?? []) args.push('-v', m)
   } else {
-    if (!opts.perSlotVolumePrefix || !opts.perSlotMountTarget) {
-      throw new Error('per-slot oauthMode requires perSlotVolumePrefix + perSlotMountTarget')
+    if (!opts.perSlotVolumes || opts.perSlotVolumes.length === 0) {
+      throw new Error('per-slot oauthMode requires at least one perSlotVolumes entry')
     }
-    args.push('-v', `${opts.perSlotVolumePrefix}-${index}:${opts.perSlotMountTarget}`)
+    for (const v of opts.perSlotVolumes) args.push('-v', `${v.volumePrefix}-${index}:${v.target}`)
   }
   args.push(opts.image, 'tail', '-f', '/dev/null')
   return args

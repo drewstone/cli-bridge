@@ -42,6 +42,15 @@ export interface DockerPreflightMount {
   /** Absolute path inside the container. */
   target: string
   kind: 'bind' | 'volume'
+  /**
+   * Path, relative to `target`, of the file whose presence proves the CLI can
+   * authenticate from this mount. Checked instead of mere non-emptiness:
+   * measured on this host, ~/.config/opencode holds 6 files and NO auth.json
+   * (opencode keeps it in ~/.local/share/opencode), so "the directory is not
+   * empty" passes on a mount that cannot authenticate — and the resulting empty
+   * completions read as a model problem.
+   */
+  credentialFile?: string
 }
 
 export interface DockerPreflightTarget {
@@ -134,7 +143,47 @@ export async function preflightDockerImage(
     findings.push(...checkBindSource(target, mount))
   }
 
+  // The workspace bind is a host directory too. Docker would create it as
+  // root:root at `docker run` time, after which a non-root CLI cannot write in
+  // the directory the caller's files are supposed to land in.
+  if (target.workspaceRoot) findings.push(...checkWorkspaceRootSource(target))
+
   return findings
+}
+
+function checkWorkspaceRootSource(target: DockerPreflightTarget): PreflightFinding[] {
+  const root = target.workspaceRoot!
+  const envKey = `${target.envPrefix}_DOCKER_WORKSPACE_ROOT`
+  if (!isAbsolute(root)) {
+    return [{
+      check: 'workspace-root',
+      detail: `${envKey}=${root} is not an absolute path, so it cannot be bind-mounted at the identical path`,
+      remedy: `set ${envKey} to an absolute host directory`,
+    }]
+  }
+  try {
+    if (!statSync(root).isDirectory()) {
+      return [{
+        check: 'workspace-root',
+        detail: `${envKey}=${root} exists but is not a directory`,
+        remedy: `point ${envKey} at a directory`,
+      }]
+    }
+    return []
+  } catch {
+    try {
+      mkdirSync(root, { recursive: true })
+      return []
+    } catch (err) {
+      return [{
+        check: 'workspace-root',
+        detail:
+          `${envKey}=${root} does not exist and cannot be created ` +
+          `(${err instanceof Error ? err.message : String(err)})`,
+        remedy: `create it, or point ${envKey} at a directory this process can write`,
+      }]
+    }
+  }
 }
 
 function checkBindSource(target: DockerPreflightTarget, mount: DockerPreflightMount): PreflightFinding[] {
@@ -189,8 +238,19 @@ export async function preflightDockerSlot(
   cli: DockerCli = dockerCli,
   /** Sink for conditions worth saying but not worth refusing to start over. */
   warnings: string[] = [],
+  /**
+   * `credentials` probes only what is per-slot: the credential mounts. Every
+   * other check (image identity, HOME, PATH, the trivial exec) is a property of
+   * the image and the configured user, identical in every slot. Per-slot OAUTH
+   * volumes are NOT identical — each slot has its own — so probing slot 0 alone
+   * was evidence about one slot while traffic was routed to all of them.
+   */
+  opts: { scope?: 'full' | 'credentials' } = {},
 ): Promise<PreflightFinding[]> {
   const findings: PreflightFinding[] = []
+  if ((opts.scope ?? 'full') === 'credentials') {
+    return await checkCredentialMounts(target, containerId, cli, warnings)
+  }
 
   // --- identity + HOME agreement -----------------------------------------
   const identity = await cli(containerShell(containerId, 'printf "%s\\n%s\\n%s" "$(id -u)" "$(id -g)" "$HOME"'))
@@ -246,36 +306,8 @@ export async function preflightDockerSlot(
     })
   }
 
-  // --- credential mounts land inside HOME and are readable ---------------
-  for (const mount of target.mounts) {
-    if (target.containerUser && !isInside(target.containerHome, mount.target)) {
-      findings.push({
-        check: 'auth-mount-home',
-        detail:
-          `credentials are mounted at ${mount.target} but the CLI runs as ${target.containerUser} with ` +
-          `HOME=${target.containerHome}, so it never looks there`,
-        remedy:
-          `set ${target.envPrefix}_DOCKER_CONTAINER_CONFIG_DIR to a path under ${target.containerHome}, or unset ` +
-          `${target.envPrefix}_DOCKER_USER/${target.envPrefix}_DOCKER_HOME to run as the image's root identity`,
-      })
-      continue
-    }
-    const readable = await cli(containerShell(containerId, `test -r ${shellQuote(mount.target)} && test -x ${shellQuote(mount.target)}`))
-    if (readable.code !== 0) {
-      const owner = await cli(containerShell(containerId, `ls -ld ${shellQuote(mount.target)} 2>&1; id`))
-      findings.push({
-        check: 'auth-mount-readable',
-        detail:
-          `credential mount ${mount.target} is not readable by the user the CLI runs as ` +
-          `(${compact(owner.stdout)})`,
-        remedy:
-          target.containerUser
-            ? `chown the host directory ${mount.source} to uid ${target.containerUser.split(':')[0]}, or unset ` +
-              `${target.envPrefix}_DOCKER_USER so the CLI runs as the image's root identity`
-            : `check permissions on the host directory ${mount.source}`,
-      })
-    }
-  }
+  // --- credential mounts land inside HOME, are usable, and hold credentials
+  findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings)))
 
   // --- the workspace bind is proven LIVE at the exec path ----------------
   if (target.workspaceRoot) {
@@ -283,24 +315,6 @@ export async function preflightDockerSlot(
   }
 
   // --- the CLI resolves for that user ------------------------------------
-  // Note deliberately NOT a finding: an empty credential mount is legitimate on
-  // a first run (the operator logs in inside the container). It is still worth
-  // saying out loud, because the resulting failure is a model-shaped one — the
-  // CLI starts, authenticates against nothing, and the caller sees an empty
-  // completion rather than "there are no credentials in <dir>".
-  for (const mount of target.mounts) {
-    if (mount.kind !== 'bind') continue
-    const listing = await cli(containerShell(containerId, `ls -A ${shellQuote(mount.target)} 2>/dev/null | head -1`))
-    if (listing.code === 0 && listing.stdout.trim() === '') {
-      warnings.push(
-        `${target.backend}: credential mount ${mount.source} -> ${mount.target} is EMPTY. ` +
-        `${target.bin} will start but have nothing to authenticate with, which surfaces as an empty completion ` +
-        `rather than an auth error. Log in on the host (state lands in ${mount.source}), or run ` +
-        `\`docker exec -it <slot> ${target.bin} auth login\`.`,
-      )
-    }
-  }
-
   const which = await cli(containerShell(containerId, `command -v ${shellQuote(target.bin)} || exit 1`))
   const resolved = which.stdout.trim()
   if (which.code !== 0 || !resolved) {
@@ -334,6 +348,140 @@ export async function preflightDockerSlot(
   }
 
   return findings
+}
+
+/**
+ * Everything about a credential mount that is per-SLOT, probed inside the
+ * container so a per-slot docker volume is checked the same way as a host bind.
+ *
+ * Three things, in dependency order:
+ *
+ *   1. The mount lands inside the HOME the CLI will have; otherwise it never
+ *      looks there.
+ *   2. It is readable AND writable by the user the CLI runs as. The write check
+ *      exists because a CLI writes into its own config dir (session state,
+ *      refreshed tokens): without it, a read-only mount could only be caught by
+ *      the catch-all `<bin> --version` probe, whose remedy is "rebuild the
+ *      image" — a neighbouring cause, and the operator goes and rebuilds a
+ *      perfectly good image.
+ *   3. It actually holds credentials. Checking the named credential FILE rather
+ *      than non-emptiness matters: measured on this host, ~/.config/opencode has
+ *      6 entries and no auth.json (opencode keeps it in ~/.local/share/opencode),
+ *      so the old check passed on a mount that cannot authenticate. Missing
+ *      credentials are a WARNING, not a finding — a first run legitimately has
+ *      none and the operator logs in — but they must be said out loud, because
+ *      the failure they produce is a model-shaped one: the CLI starts,
+ *      authenticates against nothing, and the caller gets an empty completion.
+ */
+async function checkCredentialMounts(
+  target: DockerPreflightTarget,
+  containerId: string,
+  cli: DockerCli,
+  warnings: string[],
+): Promise<PreflightFinding[]> {
+  const findings: PreflightFinding[] = []
+  for (const mount of target.mounts) {
+    if (target.containerUser && !isInside(target.containerHome, mount.target)) {
+      findings.push({
+        check: 'auth-mount-home',
+        detail:
+          `credentials are mounted at ${mount.target} but the CLI runs as ${target.containerUser} with ` +
+          `HOME=${target.containerHome}, so it never looks there`,
+        remedy:
+          `set ${target.envPrefix}_DOCKER_CONTAINER_CONFIG_DIR to a path under ${target.containerHome}, or unset ` +
+          `${target.envPrefix}_DOCKER_USER/${target.envPrefix}_DOCKER_HOME to run as the image's root identity`,
+      })
+      continue
+    }
+    const readable = await cli(containerShell(
+      containerId,
+      `test -r ${shellQuote(mount.target)} && test -x ${shellQuote(mount.target)}`,
+    ))
+    if (readable.code !== 0) {
+      const owner = await cli(containerShell(containerId, `ls -ld ${shellQuote(mount.target)} 2>&1; id`))
+      findings.push({
+        check: 'auth-mount-readable',
+        detail:
+          `credential mount ${mount.target} is not readable by the user the CLI runs as ` +
+          `(${compact(owner.stdout)})`,
+        remedy: mountPermissionRemedy(target, mount, 'readable'),
+      })
+      // A mount that cannot be read cannot be probed further; the reason for
+      // every later failure on it would be this one.
+      continue
+    }
+    const probe = `${mount.target}/.cli-bridge-preflight-write`
+    const writable = await cli(containerShell(
+      containerId,
+      `: > ${shellQuote(probe)} && rm -f ${shellQuote(probe)}`,
+    ))
+    if (writable.code !== 0) {
+      findings.push({
+        check: 'auth-mount-writable',
+        detail:
+          `credential mount ${mount.target} is not writable by ${target.containerUser ?? 'the image default user'}, ` +
+          `so ${target.bin} cannot persist session state or a refreshed token ` +
+          `(${compact(writable.stderr) || `exit ${writable.code}`})`,
+        remedy: mountPermissionRemedy(target, mount, 'writable'),
+      })
+    }
+    findings.push(...(await checkCredentialPresence(target, mount, containerId, cli, warnings)))
+  }
+  return findings
+}
+
+function mountPermissionRemedy(
+  target: DockerPreflightTarget,
+  mount: DockerPreflightMount,
+  need: 'readable' | 'writable',
+): string {
+  const uid = target.containerUser?.split(':')[0]
+  if (mount.kind === 'volume') {
+    return (
+      `fix ownership inside the volume: ` +
+      `\`docker run --rm -u 0:0 -v ${mount.source}:${mount.target} ${target.image} chown -R ` +
+      `${target.containerUser ?? '0:0'} ${mount.target}\``
+    )
+  }
+  const chmod = need === 'writable' ? `chmod u+w ${mount.source}, ` : ''
+  return (
+    `${chmod}or make ${target.envPrefix}_DOCKER_HOST_CONFIG_DIR=${mount.source} ${need} by ` +
+    `${uid ? `uid ${uid}` : 'the image default user'} on the host` +
+    (uid ? ` (\`chown -R ${target.containerUser} ${mount.source}\`), or unset ${target.envPrefix}_DOCKER_USER` : '')
+  )
+}
+
+async function checkCredentialPresence(
+  target: DockerPreflightTarget,
+  mount: DockerPreflightMount,
+  containerId: string,
+  cli: DockerCli,
+  warnings: string[],
+): Promise<PreflightFinding[]> {
+  const loginHint =
+    `log in on the host so the credentials land in ${mount.source}, or run ` +
+    `\`docker exec -it <slot> ${target.bin} auth login\` inside the pool container`
+  if (mount.credentialFile) {
+    const path = `${mount.target}/${mount.credentialFile}`
+    const present = await cli(containerShell(containerId, `test -e ${shellQuote(path)}`))
+    if (present.code !== 0) {
+      warnings.push(
+        `${target.backend}: ${path} does not exist, so ${target.bin} has NO credentials in ` +
+        `${mount.source} -> ${mount.target}. It will start and authenticate against nothing, which surfaces as an ` +
+        `empty completion rather than an auth error — ${loginHint}.`,
+      )
+    }
+    return []
+  }
+  const listing = await cli(containerShell(containerId, `ls -A ${shellQuote(mount.target)} 2>/dev/null | head -1`))
+  if (listing.code === 0 && listing.stdout.trim() === '') {
+    warnings.push(
+      `${target.backend}: credential mount ${mount.source} -> ${mount.target} is EMPTY. ` +
+      `${target.bin} will start but have nothing to authenticate with, which surfaces as an empty completion ` +
+      `rather than an auth error — ${loginHint}.`,
+    )
+  }
+  return []
 }
 
 /**

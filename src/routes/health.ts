@@ -112,8 +112,22 @@ export function mountHealth(
       }),
     )
     const any = probes.some((p) => p.state === 'ready')
+    // `status` and the HTTP code are what a watchdog reads, and they are derived
+    // from verdicts that may be remembered rather than measured — a bridge whose
+    // last container was removed 5 s ago still answers ok/200 until the TTL
+    // expires. Per-backend `cached`/`probed_at` made that visible to a reader who
+    // inspects `backends[]`; these two fields make it visible to one who does
+    // not. `?force=1` re-measures.
+    const cachedVerdicts = probes.some((p) => p.cached)
+    const oldestProbedAt = probes
+      .map((p) => p.probed_at)
+      .sort()[0]
     return c.json({
       status: any ? 'ok' : 'degraded',
+      /** True when at least one verdict behind `status` was not measured on this request. */
+      cached_verdicts: cachedVerdicts,
+      /** When the OLDEST verdict behind `status` was measured. Not the same as `ts`. */
+      ...(oldestProbedAt ? { oldest_probed_at: oldestProbedAt } : {}),
       backends: probes,
       ...(deps.admission ? { admission: deps.admission.snapshot() } : {}),
       ts: new Date(ts).toISOString(),

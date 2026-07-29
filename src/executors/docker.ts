@@ -149,7 +149,16 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       throw err
     }
   }
-  spawner.resolveCwd = (cwd) => assertDockerWorkspaceCwd(opts.workspaceRoot, cwd, naming)
+  // A caller that named no directory gets the container-visible workspace, not
+  // the bridge's own working directory. Measured before this existed: the
+  // backend pre-filled `process.cwd()`, so a cwd-less request was refused with
+  // "this request asks to run in /home/drew/code/cli-bridge-preflight" — the
+  // bridge's directory — and the remedy it offered ("send it without a cwd")
+  // was already what the caller had done. With no workspace mounted the answer
+  // is `undefined`: no `--workdir`, so the CLI runs in the image's own WORKDIR.
+  spawner.resolveCwd = (cwd) => cwd === undefined
+    ? opts.workspaceRoot
+    : assertDockerWorkspaceCwd(opts.workspaceRoot, cwd, naming)
   return spawner
 }
 
@@ -256,9 +265,11 @@ export function assertDockerWorkspaceCwd(
   }
   const rel = relative(workspaceRoot, canonicalCwd)
   if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    const envKey = `${ctx.envPrefix ?? '<BACKEND>'}_DOCKER_WORKSPACE_ROOT`
     throw new ExecutorConfigurationError(
       `Docker executor cwd ${cwd} is outside configured workspace root ${workspaceRoot}, so it is not inside the ` +
-        `bind mount the container can see`,
+        `bind mount the container can see. Set ${envKey} to a host directory containing ${cwd} — it is bind-mounted ` +
+        `at the identical path in every pool container — or send the request without a cwd to run in ${workspaceRoot}.`,
     )
   }
   return canonicalCwd

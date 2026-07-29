@@ -8,7 +8,7 @@
  */
 
 import { realpathSync, statSync } from 'node:fs'
-import { isAbsolute, parse, relative, resolve, sep } from 'node:path'
+import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { assertDockerNetworkName } from './executors/docker-network.js'
 
 export interface Config {
@@ -119,8 +119,26 @@ export interface BackendExecutorConfig {
   /** Writable HOME exposed to the configured container identity. */
   containerHome?: string
   /**
+   * Additional credential/state directories this CLI reads, mounted at the same
+   * HOME-relative path. opencode is the measured case: config lives in
+   * ~/.config/opencode but auth.json lives in ~/.local/share/opencode, so
+   * mounting only the config dir gives the container a pool with NO credentials
+   * in it — the CLI starts, authenticates against nothing, and the caller reads
+   * the empty completion as a model problem.
+   */
+  extraMounts?: Array<{ host: string; container: string }>
+  /**
+   * Path, relative to the container HOME, of the file whose presence proves the
+   * CLI can authenticate. Checked by the startup preflight against the mount it
+   * belongs to.
+   */
+  credentialFile?: string
+  /**
    * Canonical host directory exposed read-write to Docker workers at the
    * identical absolute path. Requests with a cwd outside this root fail.
+   * Always set for a docker executor: without a mounted directory a request
+   * that names no cwd has nowhere to run, and the bridge used to answer it by
+   * refusing the request for the bridge's OWN working directory.
    */
   workspaceRoot?: string
   /** Existing Docker network joined by every pool container. */
@@ -223,7 +241,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
-    executors: parseAllExecutors(env),
+    executors: parseAllExecutors(env, dataDir),
     jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
   }
@@ -278,13 +296,44 @@ const DEFAULT_CONTAINER_HOME = '/root'
  * Resolving the same relative path against the CONFIGURED home makes that
  * mismatch impossible to express instead of something to detect later.
  */
-const BACKEND_EXECUTOR_DEFAULTS: Record<string, { image: string; configRel: string }> = {
-  claude: { image: SHARED_RUNTIME_IMAGE, configRel: '.claude' },
-  kimi: { image: SHARED_RUNTIME_IMAGE, configRel: '.kimi' },
+interface BackendExecutorDefaults {
+  image: string
+  /** Primary config dir, HOME-relative. The one <NAME>_DOCKER_*_CONFIG_DIR overrides. */
+  configRel: string
+  /**
+   * Further HOME-relative directories the CLI needs mounted. Measured on this
+   * host: `opencode auth login` writes ~/.local/share/opencode/auth.json, and
+   * ~/.config/opencode holds no credentials at all — so a pool that mounts only
+   * the config dir has nothing to authenticate with.
+   */
+  extraRels?: string[]
+  /**
+   * HOME-relative path of the file that proves authentication, measured on this
+   * host rather than assumed:
+   *   ~/.local/share/opencode/auth.json   (opencode)
+   *   ~/.claude/.credentials.json         (claude)
+   *   ~/.codex/auth.json                  (codex)
+   *   ~/.kimi/credentials                 (kimi, a directory)
+   *   ~/.pi/agent/auth.json               (pi)
+   * gemini is omitted: it authenticates by API key or a browser flow whose
+   * artifact is not a stable file on this host, so claiming one would invent a
+   * check. An omitted entry falls back to "the mount is empty".
+   */
+  credentialFile?: string
+}
+
+const BACKEND_EXECUTOR_DEFAULTS: Record<string, BackendExecutorDefaults> = {
+  claude: { image: SHARED_RUNTIME_IMAGE, configRel: '.claude', credentialFile: '.claude/.credentials.json' },
+  kimi: { image: SHARED_RUNTIME_IMAGE, configRel: '.kimi', credentialFile: '.kimi/credentials' },
   gemini: { image: SHARED_RUNTIME_IMAGE, configRel: '.gemini' },
-  codex: { image: SHARED_RUNTIME_IMAGE, configRel: '.codex' },
-  opencode: { image: SHARED_RUNTIME_IMAGE, configRel: '.config/opencode' },
-  pi: { image: SHARED_RUNTIME_IMAGE, configRel: '.pi/agent' },
+  codex: { image: SHARED_RUNTIME_IMAGE, configRel: '.codex', credentialFile: '.codex/auth.json' },
+  opencode: {
+    image: SHARED_RUNTIME_IMAGE,
+    configRel: '.config/opencode',
+    extraRels: ['.local/share/opencode'],
+    credentialFile: '.local/share/opencode/auth.json',
+  },
+  pi: { image: SHARED_RUNTIME_IMAGE, configRel: '.pi/agent', credentialFile: '.pi/agent/auth.json' },
 }
 
 const SUPPORTED_EXECUTOR_BACKENDS = Object.keys(BACKEND_EXECUTOR_DEFAULTS)
@@ -310,7 +359,7 @@ const KNOWN_DOCKER_SUFFIXES = [
   'HOME',
 ] as const
 
-function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecutorConfig> {
+function parseAllExecutors(env: NodeJS.ProcessEnv, dataDir: string): Record<string, BackendExecutorConfig> {
   const defaultKind = parseExecutor('BRIDGE_DEFAULT_EXECUTOR', env.BRIDGE_DEFAULT_EXECUTOR, 'host')
   const out: Record<string, BackendExecutorConfig> = {}
   for (const name of SUPPORTED_EXECUTOR_BACKENDS) {
@@ -375,15 +424,28 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
           )
         }
       }
-      if (rawWorkspaceRoot) {
-        cfg.workspaceRoot = parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
-        assertDockerMountsDoNotOverlap(
-          workspaceRootKey,
-          cfg.workspaceRoot,
-          cfg.hostConfigDir,
-          cfg.containerConfigDir,
-        )
-      }
+      // Every further credential directory the CLI reads, at the same
+      // HOME-relative path on both sides so `<cli> auth login` inside a
+      // container writes where the host mount can see it.
+      const extraMounts = (defaults.extraRels ?? []).map((rel) => ({
+        host: resolve(`${hostBase}/${rel}`),
+        container: `${containerHome}/${rel}`,
+      }))
+      if (extraMounts.length > 0) cfg.extraMounts = extraMounts
+      if (defaults.credentialFile) cfg.credentialFile = defaults.credentialFile
+      // A docker executor ALWAYS has a workspace. Without one, a request that
+      // names no cwd has no container-visible directory to run in, and the
+      // bridge answered it by refusing the caller's request for the bridge's
+      // own working directory — a remedy the HTTP API cannot express.
+      cfg.workspaceRoot = rawWorkspaceRoot
+        ? parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
+        : join(dataDir, 'workspace', name)
+      assertDockerMountsDoNotOverlap(
+        workspaceRootKey,
+        cfg.workspaceRoot,
+        cfg.hostConfigDir,
+        cfg.containerConfigDir,
+      )
     }
     out[name] = cfg
   }

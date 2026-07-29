@@ -60,7 +60,7 @@ export class OpencodeBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 

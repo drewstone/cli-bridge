@@ -142,11 +142,27 @@ export interface Spawner {
   /**
    * Resolve and validate a requested cwd before any backend writes profile or
    * MCP files into it. Docker spawners use this to enforce their bind root.
+   *
+   * `undefined` in means the CALLER named no directory, and the answer is this
+   * executor's own default — not the bridge's working directory. That
+   * distinction is the whole point: a backend that pre-filled `process.cwd()`
+   * made a request with no cwd indistinguishable from one asking for the
+   * bridge's own directory, and the docker executor then refused the request
+   * for a path the caller never sent, offering a remedy ("send it without a
+   * cwd") the caller had already followed.
    */
   resolveCwd?(cwd: string | undefined): string | undefined
 }
 
-/** Apply an executor's cwd policy before any workspace materialization. */
+/**
+ * Apply an executor's cwd policy before any workspace materialization.
+ *
+ * An executor that declares `resolveCwd` OWNS the answer, including the
+ * no-cwd default and including `undefined` (docker: run in the image's own
+ * WORKDIR). Only an executor with no policy — the host spawner — falls back to
+ * the directory this process runs in.
+ */
 export function resolveSpawnerCwd(spawner: Spawner, cwd: string | undefined): string | undefined {
-  return spawner.resolveCwd?.(cwd) ?? cwd
+  if (spawner.resolveCwd) return spawner.resolveCwd(cwd)
+  return cwd ?? process.cwd()
 }

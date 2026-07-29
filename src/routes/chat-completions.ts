@@ -486,6 +486,18 @@ export function mountChatCompletions(
   })
 }
 
+/** The subset of the non-streaming completion body this route reasons about. */
+interface CollectedCompletion {
+  error?: { message: string; type: string }
+  choices?: Array<{ message?: { content?: string; tool_calls?: unknown[] } }>
+}
+
+/** True when the run produced something a caller can use. */
+function completionHasOutput(body: CollectedCompletion): boolean {
+  const message = body.choices?.[0]?.message
+  return Boolean(message?.content) || (message?.tool_calls?.length ?? 0) > 0
+}
+
 /**
  * Render a (possibly already-running) durable run to this request. The
  * client attaches as a reader from `afterSeq`; a disconnect ends the
@@ -524,7 +536,21 @@ async function respondFromRun(
     if (dispatchErr !== undefined) return errorResponse(c, dispatchErr)
     try {
       const deltas = mapSeq(run.attach(afterSeq))
-      const body = await collectNonStreaming(deltas, req.model)
+      const body = await collectNonStreaming(deltas, req.model) as CollectedCompletion
+      if (body.error) {
+        // A failure AFTER output began is still a failure. With nothing to show
+        // for the run, answer with the same status the identical pre-output
+        // failure would have produced — a caller cannot tell where in the
+        // stream a fault happened and must not have to. With partial output,
+        // keep the real work and carry the reason in the body: measured, this
+        // was a 200 whose whole explanation was `finish_reason: "error"`.
+        const failure = run.failure()
+        if (!completionHasOutput(body)) {
+          return failure !== undefined
+            ? errorResponse(c, failure)
+            : c.json({ error: body.error }, 500)
+        }
+      }
       return c.json(body)
     } catch (err) {
       return errorResponse(c, err)
@@ -573,20 +599,12 @@ async function respondFromRun(
       if (!await writeRaw(': connected\n\n')) return
       for await (const { seq, delta } of run.attach(afterSeq, readerController.signal)) {
         if (clientGone) break
-        // pump() records a typed pre-output failure and one buffered terminal
-        // marker. Replace that marker with one OpenAI error frame so provider
-        // detail survives without duplicating terminal chunks.
-        const dispatchErr = delta.finish_reason === 'error' ? run.dispatchError() : undefined
-        if (dispatchErr !== undefined) {
-          const message = dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr)
-          const type = dispatchErr instanceof BackendError
-            ? dispatchErr.code
-            : dispatchErr instanceof SandboxBackendUnavailableError
-              ? dispatchErr.code
-            : dispatchErr instanceof ModeNotSupportedError
-              ? 'mode_not_supported'
-              : 'server_error'
-          await writeSse(JSON.stringify({ error: { message, type } }), seq)
+        // The run pump attaches the reason to the terminal delta itself, so a
+        // failure at ANY point in the stream — not only before the first delta —
+        // becomes one OpenAI error frame here, and a reconnecting reader replays
+        // the same reason instead of a bare terminal marker.
+        if (delta.finish_reason === 'error' && delta.error) {
+          await writeSse(JSON.stringify({ error: delta.error }), seq)
           break
         }
         // Backend-level liveness ping (e.g. kimi/opencode stdout idle):

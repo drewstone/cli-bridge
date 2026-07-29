@@ -44,8 +44,19 @@ import {
   preflightDockerSlot,
   type DockerPreflightMount,
   type DockerPreflightTarget,
+  type PreflightFinding,
 } from './executors/docker-preflight.js'
 import type { Spawner } from './executors/types.js'
+
+/**
+ * Volume-name prefix for per-slot credential mount `mountIndex`. Index 0 keeps
+ * the historical `<namePrefix>-oauth` name so an existing per-slot login is not
+ * orphaned by adding the second mount.
+ */
+function perSlotVolumePrefix(cfg: BackendExecutorConfig, mountIndex: number): string {
+  const base = `${cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`}-oauth`
+  return mountIndex === 0 ? base : `${base}${mountIndex}`
+}
 import type { BackendExecutorConfig } from './config.js'
 import { AdmissionGate } from './admission.js'
 import { RunRegistry } from './runs/registry.js'
@@ -70,17 +81,38 @@ export interface BuildAppExtras {
  * receives — a preflight that reconstructs the config independently can pass
  * while the real pool is misconfigured.
  */
-function preflightTargetFor(cfg: BackendExecutorConfig, bin: string): DockerPreflightTarget {
-  const namePrefix = cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`
-  const mounts: DockerPreflightMount[] = cfg.oauthMode === 'per-slot'
-    ? [{ source: `${namePrefix}-oauth-0`, target: cfg.containerConfigDir!, kind: 'volume' }]
-    : [{ source: cfg.hostConfigDir!, target: cfg.containerConfigDir!, kind: 'bind' }]
+function preflightTargetFor(cfg: BackendExecutorConfig, bin: string, slotIndex: number): DockerPreflightTarget {
+  const containerHome = cfg.containerHome ?? '/root'
+  // The mount the credential file belongs to, so the check runs against the
+  // directory that actually holds auth rather than the first one configured.
+  const credentialTargetFor = (containerTarget: string): string | undefined => {
+    if (!cfg.credentialFile) return undefined
+    const full = `${containerHome}/${cfg.credentialFile}`
+    if (!full.startsWith(`${containerTarget}/`)) return undefined
+    return full.slice(containerTarget.length + 1)
+  }
+  const pairs: Array<{ host: string; container: string }> = [
+    { host: cfg.hostConfigDir!, container: cfg.containerConfigDir! },
+    ...(cfg.extraMounts ?? []),
+  ]
+  const mounts: DockerPreflightMount[] = pairs.map((pair, i) => {
+    const credentialFile = credentialTargetFor(pair.container)
+    return {
+      // Per-slot mode gives THIS slot its own volumes, so the probe must name
+      // this slot's volumes — probing slot 0's for every slot was evidence
+      // about one slot while traffic went to all of them.
+      source: cfg.oauthMode === 'per-slot' ? `${perSlotVolumePrefix(cfg, i)}-${slotIndex}` : pair.host,
+      target: pair.container,
+      kind: cfg.oauthMode === 'per-slot' ? 'volume' : 'bind',
+      ...(credentialFile ? { credentialFile } : {}),
+    }
+  })
   return {
     backend: cfg.name,
     envPrefix: cfg.name.toUpperCase(),
     image: cfg.image!,
     bin,
-    containerHome: cfg.containerHome ?? '/root',
+    containerHome,
     ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
     mounts,
@@ -114,7 +146,7 @@ async function buildExecutorForBackend(
   // Deliberately not switchable off. An operator who needs the bridge up
   // without a working container runtime wants <NAME>_EXECUTOR=host, not a
   // bridge that reports ready and fails every request.
-  const target = preflightTargetFor(cfg, bin)
+  const target = preflightTargetFor(cfg, bin, 0)
   const imageFindings = await preflightDockerImage(target)
   if (imageFindings.length > 0) throw new DockerPreflightError(cfg.name, imageFindings)
   const memory = process.env.BRIDGE_POOL_MEMORY || '4g'
@@ -136,11 +168,24 @@ async function buildExecutorForBackend(
     ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
     ...(cfg.network ? { network: cfg.network } : {}),
+    // Every credential directory the CLI reads, not only the primary one: a pool
+    // that mounts ~/.config/opencode alone has no auth.json in it, and the CLI
+    // then authenticates against nothing and returns an empty completion.
     ...(cfg.oauthMode === 'share' || !cfg.oauthMode
-      ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }
+      ? {
+          shareMounts: [
+            `${cfg.hostConfigDir}:${cfg.containerConfigDir}`,
+            ...(cfg.extraMounts ?? []).map((m) => `${m.host}:${m.container}`),
+          ],
+        }
       : {
-          perSlotVolumePrefix: `${cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`}-oauth`,
-          perSlotMountTarget: cfg.containerConfigDir,
+          perSlotVolumes: [
+            { volumePrefix: perSlotVolumePrefix(cfg, 0), target: cfg.containerConfigDir },
+            ...(cfg.extraMounts ?? []).map((m, i) => ({
+              volumePrefix: perSlotVolumePrefix(cfg, i + 1),
+              target: m.container,
+            })),
+          ],
         }),
     onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
   })
@@ -154,25 +199,34 @@ async function buildExecutorForBackend(
   // Probe a real slot: same image, same mounts, same user, same workdir the
   // executor will use. If this passes, `ok` on /health means the bridge has
   // demonstrated it can execute a command, not merely that it started.
-  const probeContainer = pool.liveContainerIds()[0]
-  if (!probeContainer) {
+  const liveContainers = pool.liveContainerIds()
+  if (liveContainers.length === 0) {
     await pool.destroy()
     throw new Error(`backend ${cfg.name}: container pool provisioned no usable slots`)
   }
   const preflightWarnings: string[] = []
-  const slotFindings = await preflightDockerSlot(target, probeContainer, undefined, preflightWarnings)
+  const slotFindings: PreflightFinding[] = []
+  for (const [slotIndex, containerId] of liveContainers.entries()) {
+    // Slot 0 pays for the whole probe; every other slot is checked for the one
+    // thing that is genuinely per-slot — its own credential mounts. Skipping
+    // them entirely is how a pool with zero credentials reported preflight ok.
+    slotFindings.push(...(await preflightDockerSlot(
+      slotIndex === 0 ? target : preflightTargetFor(cfg, bin, slotIndex),
+      containerId,
+      undefined,
+      preflightWarnings,
+      slotIndex === 0 ? {} : { scope: 'credentials' },
+    )))
+  }
   if (slotFindings.length > 0) {
     await pool.destroy()
     throw new DockerPreflightError(cfg.name, slotFindings)
   }
-  if (!cfg.workspaceRoot) {
-    console.log(
-      `[${cfg.name}-pool] no workspace mounted — requests carrying a cwd will be refused with the ` +
-        `${cfg.name.toUpperCase()}_DOCKER_WORKSPACE_ROOT remedy; cwd-less requests run against the container filesystem`,
-    )
-  }
   for (const warning of preflightWarnings) console.warn(`[${cfg.name}-pool] WARNING: ${warning}`)
-  console.log(`[${cfg.name}-pool] preflight ok — image, mounts, HOME, workspace, and \`${bin} --version\` all verified in-slot`)
+  console.log(
+    `[${cfg.name}-pool] preflight ok on ${liveContainers.length} slot(s) — image, credential mounts, HOME, ` +
+      `workspace ${cfg.workspaceRoot}, and \`${bin} --version\` all verified in-slot`,
+  )
 
   return createDockerSpawner({
     pool,

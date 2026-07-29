@@ -466,12 +466,16 @@ describe('Docker container run configuration', () => {
       ...poolOpts,
       oauthMode: 'per-slot',
       shareMounts: undefined,
-      perSlotVolumePrefix: 'test-oauth',
-      perSlotMountTarget: '/root/.claude',
+      perSlotVolumes: [
+        { volumePrefix: 'test-oauth', target: '/root/.claude' },
+        { volumePrefix: 'test-oauth1', target: '/root/.local/share/claude' },
+      ],
       workspaceRoot: '/tmp/research-workspaces',
     }, 2)
     expect(args).toContain('type=bind,source=/tmp/research-workspaces,target=/tmp/research-workspaces')
     expect(args).toContain('test-oauth-2:/root/.claude')
+    // Every credential directory the CLI reads gets its own per-slot volume.
+    expect(args).toContain('test-oauth1-2:/root/.local/share/claude')
   })
 
   it('rejects unsafe bind roots at the pool boundary', () => {
