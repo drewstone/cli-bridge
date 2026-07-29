@@ -223,9 +223,18 @@ async function buildExecutorForBackend(
     throw new DockerPreflightError(cfg.name, slotFindings)
   }
   for (const warning of preflightWarnings) console.warn(`[${cfg.name}-pool] WARNING: ${warning}`)
+  // The summary may not claim more than the probes established. Measured on this
+  // host: two WARNING lines saying the credential volumes hold no auth.json,
+  // followed immediately by "credential mounts ... all verified in-slot" — a
+  // success message contradicting the warnings above it, in the same log, which
+  // is the same defect as a 200 on a failed request.
   console.log(
-    `[${cfg.name}-pool] preflight ok on ${liveContainers.length} slot(s) — image, credential mounts, HOME, ` +
-      `workspace ${cfg.workspaceRoot}, and \`${bin} --version\` all verified in-slot`,
+    preflightWarnings.length === 0
+      ? `[${cfg.name}-pool] preflight ok on ${liveContainers.length} slot(s) — image, credential mounts, HOME, ` +
+        `workspace ${cfg.workspaceRoot}, and \`${bin} --version\` all verified in-slot`
+      : `[${cfg.name}-pool] preflight passed with ${preflightWarnings.length} warning(s) on ` +
+        `${liveContainers.length} slot(s) — image, HOME, workspace ${cfg.workspaceRoot} and ` +
+        `\`${bin} --version\` verified in-slot; the warnings above are NOT verified and /health reports them`,
   )
 
   return createDockerSpawner({
@@ -233,6 +242,10 @@ async function buildExecutorForBackend(
     backend: cfg.name,
     envPrefix: cfg.name.toUpperCase(),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
+    // The readiness probe must judge the SAME configuration the pool received,
+    // for the slot it actually acquires — so it is derived here, from these
+    // values, rather than reconstructed inside the executor.
+    preflightTarget: (slotIndex) => preflightTargetFor(cfg, bin, slotIndex),
   })
 }
 

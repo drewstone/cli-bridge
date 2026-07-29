@@ -10,7 +10,7 @@
  */
 
 import type { ChatDelta } from '../backends/types.js'
-import { describeRunFailure } from './error-shape.js'
+import { BackendReportedFailureError, describeRunFailure, reasonForTerminalDelta } from './error-shape.js'
 
 /** A buffered delta plus its per-run monotonic sequence number. */
 export interface SeqDelta {
@@ -206,14 +206,29 @@ export class Run {
     return this.snapshot()
   }
 
-  /** Consume the backend exactly once, independently from attached readers. */
+  /**
+   * Consume the backend exactly once, independently from attached readers.
+   *
+   * A failure reaches here two ways and BOTH have to end up with a reason on the
+   * terminal delta and a recorded `failure()`:
+   *
+   *   - it is THROWN, and the catch block below handles it;
+   *   - it is YIELDED as `{ finish_reason: 'error' }`, which is what every
+   *     subprocess backend does after an upstream error event and on abort.
+   *
+   * Only the first was covered, and the second is the one that reached callers:
+   * the loop appended the bare delta, `finish()` recorded status `error`, and
+   * `failureError` stayed undefined — so the reader had nothing to report and
+   * answered HTTP 200 with `content: ""`. Normalizing inside this loop is what
+   * makes the invariant hold for backends that do not exist yet.
+   */
   pump(source: AsyncIterable<ChatDelta>): Promise<void> {
     if (this.settled) return this.settled
     this.settled = (async () => {
       try {
         let outcome: 'done' | 'error' = 'done'
         for await (const delta of source) {
-          this.append(delta)
+          this.append(this.withTerminalReason(delta))
           if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') {
             outcome = 'error'
           }
@@ -333,6 +348,34 @@ export class Run {
     this.replayExpired = true
     this.buffer.length = 0
     this.wakeAll()
+  }
+
+  /**
+   * Give a yielded terminal failure the reason it must carry, and record it as
+   * the run's failure so the reader can turn it into a real HTTP status.
+   *
+   * Cancellation is deliberately excluded: the caller asked for it, `finish()`
+   * already records status `cancelled`, and calling it a failure would make a
+   * granted request read as a fault. The delta still gets a reason, so a reader
+   * can tell a cancelled run from an empty answer.
+   */
+  private withTerminalReason(delta: ChatDelta): ChatDelta {
+    const finishReason = delta.finish_reason
+    if (finishReason !== 'error' && finishReason !== 'timeout') return delta
+    if (this.ac.signal.aborted) {
+      return {
+        ...delta,
+        error: delta.error ?? {
+          message: `run ${this.id} was cancelled by the caller before it produced a terminal answer`,
+          type: 'run_cancelled',
+        },
+      }
+    }
+    const reason = reasonForTerminalDelta(finishReason, delta.error, 'the backend')
+    if (this.failureError === undefined) {
+      this.failureError = new BackendReportedFailureError(reason.message, reason.type)
+    }
+    return { ...delta, error: reason }
   }
 
   private append(delta: ChatDelta): void {

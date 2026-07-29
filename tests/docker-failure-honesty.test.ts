@@ -147,8 +147,27 @@ describe('defect 4 — a cwd with no mount behind it is refused, not turned into
     expect(attempt).toThrow(/does not exist inside the container/)
   })
 
-  it('still allows cwd-less calls, which is how /health probes run', () => {
+  // The assertion is unchanged; the CLAIM in the old name — "which is how
+  // /health probes run" — was the shape defect written down. A probe that
+  // reaches this function with no cwd has skipped the one assertion every real
+  // request crosses, and therefore cannot detect the failure requests hit. The
+  // health path now resolves its cwd through the executor's own policy first,
+  // which is asserted in probe-request-path.test.ts.
+  it('returns the cwd unchanged when there is none to validate', () => {
     expect(assertDockerWorkspaceCwd(undefined, undefined)).toBeUndefined()
+  })
+
+  it('the health path does NOT reach this function cwd-less', () => {
+    const pool = {
+      acquire: async () => ({ containerId: 'c1', slotIndex: 0, release: () => {} }),
+      reportContainerUnusable: async () => {},
+    } as unknown as ContainerPool
+    const spawner = createDockerSpawner({
+      pool, backend: 'opencode', envPrefix: 'OPENCODE', workspaceRoot: '/workspace/opencode',
+    })
+    // What a cwd-less request resolves to, and therefore what the probe spawns in.
+    expect(spawner.resolveCwd?.(undefined)).toBe('/workspace/opencode')
+    expect(typeof spawner.probeRequestPath).toBe('function')
   })
 
   it('refuses before acquiring a slot, so no container is touched', async () => {

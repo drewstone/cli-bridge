@@ -19,7 +19,7 @@
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
-import { BackendError } from './types.js'
+import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
@@ -228,7 +228,7 @@ export class OpencodeBackend implements Backend {
           || type === 'run.completed'
         ) {
           yield {
-            finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop'),
+            ...terminalOutcome('opencode', sawError, emittedToolCall),
             usage: stepUsage ?? fallbackUsage,
             internal_session_id: internalSessionId,
           }

@@ -13,7 +13,7 @@
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
-import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
+import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers } from './profile-support.js'
@@ -158,7 +158,7 @@ export class GeminiBackend implements Backend {
             emittedToolCall = true
           }
           if (type === 'completed' || type === 'turn.completed' || type === 'result') {
-            yield { finish_reason: sawError ? 'error' : (emittedToolCall ? 'tool_calls' : 'stop') }
+            yield terminalOutcome('gemini', sawError, emittedToolCall)
             return
           }
         } else {

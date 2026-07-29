@@ -81,6 +81,19 @@ function childExiting(code: number, stdoutText: string, stderrText = ''): ChildP
   return child
 }
 
+/**
+ * A child whose `exitCode` starts null. `readProcessLines` treats a non-null
+ * exitCode as "already closed" and stops before reading a line, so a fake with
+ * `exitCode: undefined` silently delivers no events.
+ */
+class FakeChild extends EventEmitter {
+  stdout = new PassThrough()
+  stderr = new PassThrough()
+  stdin = new PassThrough()
+  exitCode: number | null = null
+  kill(): boolean { return true }
+}
+
 /** A spawner that records every SpawnOpts it was handed. */
 function recordingSpawner(over: Partial<Spawner> = {}): Spawner & { calls: SpawnOpts[] } {
   const calls: SpawnOpts[] = []
@@ -297,16 +310,15 @@ describe('the readiness probe traverses the request path', () => {
     }
   })
 
-  it('the docker executor probes a REAL slot, at that slot own mounts', async () => {
+  it('the docker executor probes EVERY live slot, at that slot own mounts', async () => {
     // Probing slot 0's volumes for every slot is evidence about one slot while
-    // traffic goes to all of them, so the probe must name the slot it acquired.
+    // traffic goes to all of them, so every slot's own volumes must be named.
     let acquires = 0
-    let releases = 0
     const pool = {
-      acquire: async () => {
-        acquires += 1
-        return { containerId: 'container-slot-1', slotIndex: 1, release: () => { releases += 1 } }
-      },
+      liveContainerIds: () => ['container-slot-0', 'container-slot-1'],
+      // Acquiring would make /health queue behind real traffic, so a busy pool
+      // would read as unhealthy. The `--version` spawn exercises acquire.
+      acquire: async () => { acquires += 1; throw new Error('must not acquire for a readiness probe') },
       reportContainerUnusable: async () => {},
       recycleHeldSlot: async () => {},
     } as unknown as ContainerPool
@@ -334,14 +346,16 @@ describe('the readiness probe traverses the request path', () => {
       probeRequestPath: () => Promise<{ cwd?: string; findings: Array<{ detail: string; remedy: string }> }>
     }).probeRequestPath()
 
-    expect(acquires).toBe(1)
-    expect(releases).toBe(1)
+    expect(acquires).toBe(0)
     // A cwd-less request runs in the workspace root, so the probe must too.
     expect(readiness.cwd).toBe(workspaceRoot)
-    expect(readiness.findings.length).toBeGreaterThan(0)
+    expect(readiness.findings.length).toBe(2)
     const detail = readiness.findings.map((f) => `${f.detail} ${f.remedy}`).join(' ')
     expect(detail).toMatch(/auth\.json/)
-    expect(detail).toMatch(/cli-bridge-pool-oauth1-1/)
+    // Each slot's OWN volume, not slot 0's twice.
+    expect(detail).toContain('cli-bridge-pool-oauth1-0')
+    expect(detail).toContain('cli-bridge-pool-oauth1-1')
+    expect(seen.join(' ')).toContain('container-slot-0')
     expect(seen.join(' ')).toContain('container-slot-1')
   })
 })
@@ -455,16 +469,21 @@ describe('a terminal error delta carries its reason, however the backend produce
 
 describe('a backend that KNOWS the reason attaches it', () => {
   it('opencode carries the error event text on the terminal delta', async () => {
-    const events = [
-      '{"type":"session.created","session":{"id":"ses_1"}}',
-      '{"type":"error","message":"provider rejected the model"}',
-      '{"type":"session.completed"}',
-      '',
-    ].join('\n')
-    const spawner = (async () => ({
-      child: childExiting(0, events),
-      release: () => {},
-    })) as unknown as Spawner
+    const events: Array<Record<string, unknown>> = [
+      { type: 'session.created', session: { id: 'ses_1' } },
+      { type: 'error', message: 'provider rejected the model' },
+      { type: 'session.completed' },
+    ]
+    const spawner = (async () => {
+      const child = new FakeChild()
+      queueMicrotask(() => {
+        for (const line of events) child.stdout.write(`${JSON.stringify(line)}\n`)
+        child.stdout.end()
+        child.stderr.end()
+        setTimeout(() => { child.exitCode = 0; child.emit('close', 0) }, 10)
+      })
+      return { child: child as never, release: () => {}, spawnError: () => null }
+    }) as unknown as Spawner
     const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5_000, spawner })
     const deltas: ChatDelta[] = []
     for await (const delta of backend.chat(
