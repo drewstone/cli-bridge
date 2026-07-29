@@ -119,7 +119,11 @@ export async function buildApp(config: Config): Promise<{
 }> {
   const sessions = new SessionStore(config.dataDir)
   const registry = new BackendRegistry()
-  const runs = new RunRegistry()
+  const runs = new RunRegistry({
+    replayRetentionMs: parseEnvPositiveInt('BRIDGE_RUN_REPLAY_RETENTION_MS', 60_000),
+    identityRetentionMs: parseEnvPositiveInt('BRIDGE_RUN_IDENTITY_RETENTION_MS', 86_400_000),
+    maxReplayDeltas: parseEnvPositiveInt('BRIDGE_RUN_MAX_REPLAY_DELTAS', 10_000),
+  })
   const extras: BuildAppExtras = { shutdownHooks: [] }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)

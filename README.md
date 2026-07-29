@@ -123,13 +123,17 @@ Subsequent calls with the same `X-Session-Id` resume the conversation. Claude Co
 
 ### `POST /v1/chat/completions`
 
-OpenAI Chat Completions. Model id routes via harness prefix. Supports streaming (default) or `stream: false`. Session resume via `session_id` body field or `X-Session-Id` header.
+OpenAI Chat Completions.
+Model id routes via harness prefix.
+The OpenAI-compatible default is non-streaming; pass `stream: true` for SSE.
+Session resume uses the `session_id` body field or `X-Session-Id` header.
 
 Extra fields this bridge accepts beyond vanilla OpenAI:
 
 - `cwd`: persist a working directory for the session and run future resumed turns there
 - `agent_profile`: full `AgentProfile` object
 - `mcp`: standardised MCP server passthrough (see [MCP passthrough](#mcp-passthrough))
+- `run_id`: caller-owned durable job id (also accepted as `X-Run-Id`)
 
 Behavior:
 
@@ -155,6 +159,48 @@ curl http://127.0.0.1:3344/v1/chat/completions \
     "stream": false
   }'
 ```
+
+### Durable run lifecycle
+
+Once accepted, a chat job belongs to the bridge process rather than to the HTTP connection that dispatched it.
+Closing an SSE response detaches that reader and does not cancel the backend CLI process.
+Only `POST /v1/runs/:id/cancel` sends the backend abort signal.
+
+Supply `run_id` in the body or `X-Run-Id` in the header to make dispatch idempotent.
+If both are present they must match.
+Ids are 1–128 characters, begin with an ASCII letter or digit, and may then contain letters, digits, `.`, `_`, `:`, or `-`.
+The bridge binds the id atomically to the normalized execution request before admission or backend setup:
+
+- An identical retry attaches to the existing job and never acquires a second process slot.
+- A different request under the same id returns `409 run_identity_conflict` with both request digests.
+- The response carries `X-Run-Id` and `X-Run-Request-Digest`; retain both with the trace.
+
+For `stream: true`, every output delta has a monotonically increasing SSE `id`.
+Reconnect with the same request and `Last-Event-ID: N` to receive only events after `N`.
+An ahead cursor returns `409 invalid_replay_cursor`.
+A cursor older than the retained window returns `410 expired_replay_cursor`; the bridge never silently restarts at event zero.
+`Last-Event-ID` is rejected for non-streaming responses because a single JSON response cannot express partial replay.
+
+Replay storage is explicitly bounded per process:
+
+- At most `BRIDGE_RUN_MAX_REPLAY_DELTAS` deltas are retained per run (default `10000`).
+- Terminal output expires after `BRIDGE_RUN_REPLAY_RETENTION_MS` (default `60000` ms).
+- The run-id/request binding remains after output expiry for `BRIDGE_RUN_IDENTITY_RETENTION_MS` (default `86400000` ms) so a late retry cannot accidentally execute the job again.
+
+Do not recycle run ids after the identity window.
+A bridge restart loses the in-memory registry; `404` after a restart means the old process is unknown, not proven stopped.
+
+`GET /v1/runs/:id?wait_ms=N` returns the current snapshot and can wait up to 30 seconds for terminal state.
+The `state` field is `running` while a reader is attached, `detached` while the job continues without readers, `cancelling` after explicit cancellation but before process exit, and `terminal` only after the backend iterator exits.
+The separate `status` field records the outcome as `running`, `done`, `error`, or `cancelled`.
+
+`POST /v1/runs/:id/cancel?wait_ms=N` returns:
+
+- `202` while cancellation was requested but process exit is not yet proven.
+- `200` only with `terminal: true` and the terminal run snapshot.
+- `404` when this bridge process has no record of the run; this is not termination proof.
+
+The `wait_ms` query is an integer from `0` through `30000` on both endpoints.
 
 ### `GET /v1/models`
 

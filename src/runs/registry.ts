@@ -1,28 +1,12 @@
 /**
- * Durable run registry — decouples a CLI job from any one client
- * connection, mirroring the @tangle-network/sandbox SessionGateway
- * primitive (per-session monotonic `seq`, replay by `lastEventId`,
- * idempotent dispatch by run id).
+ * Durable run registry — one server-owned job can outlive any individual
+ * HTTP reader. A run id is bound to one normalized request, output is
+ * sequence-numbered for replay, and only explicit cancellation aborts the
+ * backend job.
  *
- * The flaw this fixes: today a mere client disconnect aborts the route's
- * AbortController, which the backend contract interprets as "kill the
- * subprocess" — 30 min of work destroyed by a transport blip or the
- * client's own retry. Here, a `Run` owns the subprocess lifecycle
- * INDEPENDENTLY of any HTTP request:
- *
- *   - The backend stream is consumed by the registry ONCE, into a
- *     server-side buffer where every delta gets a monotonic `seq`.
- *   - Any number of clients attach/detach freely. A drop costs nothing.
- *   - On reconnect with `Last-Event-ID: <seq>`, the client replays the
- *     missed deltas from the buffer, then tails live — no cold restart.
- *   - A retry that reuses the same run id RE-ATTACHES to the same live
- *     run (idempotent dispatch) instead of spawning a second subprocess.
- *   - The job is killed ONLY on an explicit cancel — never on socket
- *     close (Pillar 1 + Pillar 4 of the resilience plan).
- *
- * Buffering is in-memory and per-run. A run is reaped a bounded time
- * after it finishes (so a reconnecting client can still drain the tail),
- * or immediately on explicit cancel.
+ * This is deliberately process-local. A bridge restart loses active jobs
+ * and their identity records, so a caller that sees 404 after reconnect
+ * must treat the old job as unknown rather than proven stopped.
  */
 
 import type { ChatDelta } from '../backends/types.js'
@@ -33,66 +17,123 @@ export interface SeqDelta {
   delta: ChatDelta
 }
 
+/** Existing completion outcome. `running` means no outcome exists yet. */
 export type RunStatus = 'running' | 'done' | 'error' | 'cancelled'
+
+/** Connection/process lifecycle, separate from the terminal outcome. */
+export type RunState = 'detached' | 'running' | 'cancelling' | 'terminal'
+
+export interface RunReplayWindow {
+  /** Lowest event still replayable. A cursor of `firstAvailableSeq - 1` is valid. */
+  firstAvailableSeq: number
+  lastSeq: number
+  retainedDeltas: number
+  maxRetainedDeltas: number
+  /** Set once terminal; the buffer is cleared at this Unix-millisecond time. */
+  expiresAt: number | null
+  expired: boolean
+}
 
 export interface RunSnapshot {
   id: string
+  /** Digest of the normalized execution request bound to this id. */
+  requestDigest: string
+  /** Completion outcome; remains `running` while detached or cancelling. */
   status: RunStatus
-  /** Highest seq emitted so far. 0 = nothing buffered yet. */
+  /** Distinguishes an attached reader, no reader, cancellation, and process exit. */
+  state: RunState
+  /** True only after the owned backend job has reached a terminal state. */
+  terminal: boolean
+  attachedReaders: number
+  cancelRequestedAt: number | null
+  /** Highest seq emitted so far. 0 = no delta emitted yet. */
   lastSeq: number
+  replay: RunReplayWindow
   startedAt: number
   endedAt: number | null
+  /** Run-id binding survives replay expiry until this time. */
+  identityExpiresAt: number | null
+}
+
+/** A caller attempted to reuse a durable run id for different execution bytes. */
+export class RunIdentityConflictError extends Error {
+  readonly code = 'run_identity_conflict' as const
+
+  constructor(
+    readonly runId: string,
+    readonly expectedRequestDigest: string,
+    readonly receivedRequestDigest: string,
+  ) {
+    super(`run ${JSON.stringify(runId)} is already bound to a different request`)
+    this.name = 'RunIdentityConflictError'
+  }
+}
+
+export type RunReplayCursorErrorReason = 'ahead' | 'expired'
+
+/** A replay cursor cannot be served exactly from the retained output window. */
+export class RunReplayCursorError extends Error {
+  readonly code: 'invalid_replay_cursor' | 'expired_replay_cursor'
+
+  constructor(
+    readonly runId: string,
+    readonly cursor: number,
+    readonly firstAvailableSeq: number,
+    readonly lastSeq: number,
+    readonly reason: RunReplayCursorErrorReason,
+  ) {
+    super(
+      reason === 'ahead'
+        ? `Last-Event-ID ${cursor} is ahead of run ${JSON.stringify(runId)} at ${lastSeq}`
+        : `Last-Event-ID ${cursor} has expired for run ${JSON.stringify(runId)}; first available event is ${firstAvailableSeq}`,
+    )
+    this.name = 'RunReplayCursorError'
+    this.code = reason === 'ahead' ? 'invalid_replay_cursor' : 'expired_replay_cursor'
+  }
 }
 
 interface Waiter {
   resolve: () => void
 }
 
-/**
- * A single durable run. Owns the subprocess (via `abort`), buffers every
- * delta with a monotonic seq, and fans out to any number of attached
- * readers via a seq cursor.
- */
+interface RunRetention {
+  replayRetentionMs: number
+  identityRetentionMs: number
+  maxReplayDeltas: number
+}
+
+/** One durable server-owned backend job and its bounded replay log. */
 export class Run {
-  readonly id: string
   readonly startedAt = Date.now()
   private readonly buffer: SeqDelta[] = []
   private seq = 0
   private status: RunStatus = 'running'
   private endedAt: number | null = null
+  private attachedReaders = 0
+  private cancelRequestedAt: number | null = null
+  private replayExpiresAt: number | null = null
+  private identityExpiresAt: number | null = null
+  private replayExpired = false
   private readonly waiters = new Set<Waiter>()
-  private reapTimer: ReturnType<typeof setTimeout> | null = null
-  /**
-   * Set when the registry reaps this run and clears the buffer. A reader
-   * that is still attached at reap time must terminate rather than wait
-   * forever for deltas that no longer exist.
-   */
+  private replayTimer: ReturnType<typeof setTimeout> | null = null
+  private identityTimer: ReturnType<typeof setTimeout> | null = null
   private disposed = false
 
-  /** Aborts the OWNED job (subprocess). Distinct from any socket signal. */
+  /** Aborts the owned backend job. A socket signal never reaches this controller. */
   private readonly ac = new AbortController()
-  /** Fires when the job is finished (any terminal status). */
+  /** The one pump promise; its presence prevents duplicate backend consumption. */
   private settled?: Promise<void>
-
-  /**
-   * A typed error thrown at DISPATCH time — before the backend emitted a
-   * single delta (seq 0). E.g. `ModeNotSupportedError`, or a `BackendError`
-   * from spawn/config. These are request rejections, not mid-stream
-   * failures: the fresh dispatcher surfaces them as a real HTTP status
-   * (501/502/…) instead of a 200 with a buffered error delta. A re-attaching
-   * client (run already known) reads the buffered terminal error instead.
-   */
+  /** Typed failure raised before the backend produced any output. */
   private setupError: unknown
 
   constructor(
-    id: string,
-    private readonly onReap: (id: string) => void,
-    private readonly reapDelayMs: number,
-  ) {
-    this.id = id
-  }
+    readonly id: string,
+    readonly requestDigest: string,
+    private readonly onForget: (id: string, run: Run) => void,
+    private readonly retention: RunRetention,
+  ) {}
 
-  /** The signal a backend's `chat()` consumes — aborted only on cancel. */
+  /** The backend consumes this signal; only `cancel()` aborts it. */
   get signal(): AbortSignal {
     return this.ac.signal
   }
@@ -100,186 +141,268 @@ export class Run {
   snapshot(): RunSnapshot {
     return {
       id: this.id,
+      requestDigest: this.requestDigest,
       status: this.status,
+      state: this.state(),
+      terminal: this.isTerminal(),
+      attachedReaders: this.attachedReaders,
+      cancelRequestedAt: this.cancelRequestedAt,
       lastSeq: this.seq,
+      replay: {
+        firstAvailableSeq: this.firstAvailableSeq(),
+        lastSeq: this.seq,
+        retainedDeltas: this.buffer.length,
+        maxRetainedDeltas: this.retention.maxReplayDeltas,
+        expiresAt: this.replayExpiresAt,
+        expired: this.replayExpired,
+      },
       startedAt: this.startedAt,
       endedAt: this.endedAt,
+      identityExpiresAt: this.identityExpiresAt,
     }
+  }
+
+  state(): RunState {
+    if (this.isTerminal()) return 'terminal'
+    if (this.cancelRequestedAt !== null) return 'cancelling'
+    return this.attachedReaders > 0 ? 'running' : 'detached'
   }
 
   isTerminal(): boolean {
     return this.status !== 'running'
   }
 
-  /**
-   * The dispatch-time typed error (see `setupError`), or undefined. Only
-   * ever set when the backend failed before emitting any delta. A fresh
-   * dispatcher awaits the run settling, then consults this to choose
-   * between a proper HTTP error and a normal streamed response.
-   */
   dispatchError(): unknown {
     return this.setupError
   }
 
-  /**
-   * Resolves once the run has either emitted its first delta or reached a
-   * terminal status. Lets the fresh dispatcher decide whether dispatch
-   * failed (setup error, seq still 0 + terminal) WITHOUT waiting for a
-   * healthy long-running job to complete — it returns the moment real
-   * output starts flowing.
-   */
+  /** Resolve once output begins or dispatch reaches a terminal failure. */
   async whenStarted(): Promise<void> {
     while (this.seq === 0 && !this.isTerminal() && !this.disposed) {
       await this.waitForChange()
     }
   }
 
-  /**
-   * Drive the backend stream into the buffer, exactly once. The run keeps
-   * pulling deltas even with zero attached clients — that IS the
-   * decoupling. Marks terminal status when the source completes, errors,
-   * or is cancelled, then schedules reaping.
-   */
+  /** Resolve only after the owned backend job reaches a terminal state. */
+  async whenTerminal(): Promise<RunSnapshot> {
+    while (!this.isTerminal() && !this.disposed) {
+      await this.waitForChange()
+    }
+    return this.snapshot()
+  }
+
+  /** Consume the backend exactly once, independently from attached readers. */
   pump(source: AsyncIterable<ChatDelta>): Promise<void> {
     if (this.settled) return this.settled
     this.settled = (async () => {
       try {
+        let outcome: 'done' | 'error' = 'done'
         for await (const delta of source) {
           this.append(delta)
+          if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') {
+            outcome = 'error'
+          }
         }
-        // A backend that yields no terminal finish_reason still ended the
-        // stream — record completion so readers stop tailing.
-        this.finish('done')
-      } catch (err) {
-        // Cancel surfaces here as an aborted stream; classify it as such.
+        this.finish(this.ac.signal.aborted ? 'cancelled' : outcome)
+      } catch (error) {
         if (this.ac.signal.aborted) {
           this.finish('cancelled')
         } else {
-          // A typed error before any delta (seq 0) is a dispatch-time
-          // rejection — record it so the fresh dispatcher can return the
-          // right HTTP status. The error delta still lands in the buffer so
-          // re-attaching readers see a terminal frame.
-          if (this.seq === 0) this.setupError = err
+          if (this.seq === 0) this.setupError = error
           this.append({ finish_reason: 'error' })
           this.finish('error')
-          console.error(`[cli-bridge] run ${this.id} failed:`, err)
+          console.error(`[cli-bridge] run ${this.id} failed:`, error)
         }
       }
     })()
     return this.settled
   }
 
-  private append(delta: ChatDelta): void {
-    this.seq += 1
-    this.buffer.push({ seq: this.seq, delta })
-    this.wakeAll()
+  /** Commit a claimed run whose admission/backend setup failed before `pump()`. */
+  failSetup(error: unknown): void {
+    if (this.settled || this.isTerminal()) return
+    this.setupError = error
+    this.append({ finish_reason: 'error' })
+    this.finish(this.ac.signal.aborted ? 'cancelled' : 'error')
+    this.settled = Promise.resolve()
   }
 
-  private finish(status: RunStatus): void {
-    if (this.status !== 'running') return
-    this.status = status
-    this.endedAt = Date.now()
-    this.wakeAll()
-    // Keep the buffer around briefly so a reconnecting client can still
-    // drain the tail (and the final finish_reason). Cancelled runs are
-    // reaped on the same delay — the client asked for them gone, but a
-    // racing reader may still want the cancellation notice.
-    this.scheduleReap()
-  }
-
-  private scheduleReap(): void {
-    if (this.reapTimer) return
-    this.reapTimer = setTimeout(() => this.onReap(this.id), this.reapDelayMs)
-    this.reapTimer.unref?.()
+  /** Fail closed unless every event after this cursor remains available. */
+  assertReplayCursor(afterSeq: number): void {
+    const firstAvailableSeq = this.firstAvailableSeq()
+    if (afterSeq > this.seq) {
+      throw new RunReplayCursorError(
+        this.id,
+        afterSeq,
+        firstAvailableSeq,
+        this.seq,
+        'ahead',
+      )
+    }
+    if (this.replayExpired || afterSeq < firstAvailableSeq - 1) {
+      throw new RunReplayCursorError(
+        this.id,
+        afterSeq,
+        firstAvailableSeq,
+        this.seq,
+        'expired',
+      )
+    }
   }
 
   /**
-   * Explicit cancel — the ONLY path that kills the subprocess. Aborts the
-   * owned controller, which the backend's `chat()` honors via its
-   * `signal.addEventListener('abort', killTree)` wiring.
+   * Attach one transport reader. The optional signal detaches only this
+   * reader; it never propagates to the backend's owned abort controller.
    */
-  cancel(): void {
-    if (this.status !== 'running') return
-    this.ac.abort()
-    // pump() observes the aborted signal and records 'cancelled'.
+  async *attach(afterSeq = 0, readerSignal?: AbortSignal): AsyncGenerator<SeqDelta> {
+    this.attachedReaders += 1
+    this.wakeAll()
+    let cursor = afterSeq
+    try {
+      while (!readerSignal?.aborted) {
+        this.assertReplayCursor(cursor)
+
+        // Copy the currently available tail before yielding. The bounded
+        // ring may rotate while the consumer processes a delta; this copy
+        // prevents an array shift from silently skipping an event.
+        const available = this.buffer.filter(item => item.seq > cursor)
+        for (const item of available) {
+          if (readerSignal?.aborted) return
+          cursor = item.seq
+          yield item
+        }
+
+        // Output may have arrived after `available` was copied but before
+        // the waiter is registered. Loop immediately when the sequence moved
+        // so that wake-up cannot be lost in that check/subscribe gap.
+        if (cursor < this.seq) continue
+        if (this.isTerminal()) return
+        if (this.disposed) return
+        await this.waitForChange(readerSignal)
+      }
+    } finally {
+      this.attachedReaders = Math.max(0, this.attachedReaders - 1)
+      this.wakeAll()
+    }
   }
 
-  /** Drop all buffered deltas + timers. Called by the registry on reap. */
+  /** Signal cancellation once. Terminal proof comes later from `pump()`. */
+  cancel(): boolean {
+    if (this.isTerminal() || this.cancelRequestedAt !== null) return false
+    this.cancelRequestedAt = Date.now()
+    this.ac.abort()
+    this.wakeAll()
+    return true
+  }
+
+  /** Cancel and forget immediately during bridge shutdown/tests. */
   dispose(): void {
-    if (this.reapTimer) {
-      clearTimeout(this.reapTimer)
-      this.reapTimer = null
+    if (this.disposed) return
+    if (!this.isTerminal()) {
+      if (this.cancelRequestedAt === null) this.cancelRequestedAt = Date.now()
+      this.ac.abort()
+      this.status = 'cancelled'
+      this.endedAt = Date.now()
     }
+    if (this.replayTimer) clearTimeout(this.replayTimer)
+    if (this.identityTimer) clearTimeout(this.identityTimer)
+    this.replayTimer = null
+    this.identityTimer = null
     this.disposed = true
+    this.replayExpired = true
     this.buffer.length = 0
     this.wakeAll()
   }
 
+  private append(delta: ChatDelta): void {
+    this.seq += 1
+    this.buffer.push({ seq: this.seq, delta })
+    while (this.buffer.length > this.retention.maxReplayDeltas) this.buffer.shift()
+    this.wakeAll()
+  }
+
+  private firstAvailableSeq(): number {
+    return this.buffer[0]?.seq ?? this.seq + 1
+  }
+
+  private finish(status: Exclude<RunStatus, 'running'>): void {
+    if (this.isTerminal() || this.disposed) return
+    this.status = status
+    this.endedAt = Date.now()
+    this.replayExpiresAt = this.endedAt + this.retention.replayRetentionMs
+    this.identityExpiresAt = this.endedAt + this.retention.identityRetentionMs
+    this.wakeAll()
+    this.scheduleRetentionTimers()
+  }
+
+  private scheduleRetentionTimers(): void {
+    if (this.replayTimer || this.identityTimer) return
+    this.replayTimer = setTimeout(() => {
+      this.replayExpired = true
+      this.buffer.length = 0
+      this.wakeAll()
+    }, this.retention.replayRetentionMs)
+    this.replayTimer.unref?.()
+
+    this.identityTimer = setTimeout(() => {
+      this.onForget(this.id, this)
+    }, this.retention.identityRetentionMs)
+    this.identityTimer.unref?.()
+  }
+
   private wakeAll(): void {
-    for (const w of this.waiters) w.resolve()
-    this.waiters.clear()
+    for (const waiter of [...this.waiters]) waiter.resolve()
   }
 
-  private waitForChange(): Promise<void> {
+  private waitForChange(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.resolve()
     return new Promise<void>((resolve) => {
-      const waiter: Waiter = { resolve }
-      this.waiters.add(waiter)
-    })
-  }
-
-  /**
-   * Attach a reader. Replays every buffered delta with `seq > afterSeq`
-   * (0 = from the start), then tails live deltas until the run reaches a
-   * terminal status and the buffer is drained.
-   *
-   * `afterSeq` is the client's `Last-Event-ID`: a reconnecting client
-   * passes the last seq it saw and gets EXACTLY the deltas it missed —
-   * no gap, no duplicate, no cold restart.
-   */
-  async *attach(afterSeq = 0): AsyncGenerator<SeqDelta> {
-    let cursor = afterSeq
-    while (true) {
-      // The buffer is append-only with contiguous seqs starting at 1, so
-      // the first un-yielded delta lives at index `cursor` (seq N is at
-      // index N-1). Slicing from there keeps tailing linear in deltas
-      // produced rather than re-scanning the whole buffer on every wake —
-      // a 30-min run emits thousands of deltas, and O(n²) there would
-      // dominate the run.
-      for (let i = cursor; i < this.buffer.length; i++) {
-        const item = this.buffer[i]
-        if (!item) break
-        cursor = item.seq
-        yield item
+      let resolved = false
+      let waiter: Waiter
+      const onAbort = (): void => finish()
+      const finish = (): void => {
+        if (resolved) return
+        resolved = true
+        this.waiters.delete(waiter)
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
       }
-      if (this.isTerminal() && cursor >= this.seq) return
-      // The run was reaped while we were still attached: the buffer is
-      // gone and no further deltas will ever arrive. Stop rather than
-      // wait on a wake that will never come.
-      if (this.disposed) return
-      await this.waitForChange()
-    }
+      waiter = { resolve: finish }
+      this.waiters.add(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 }
 
 export interface RunRegistryOptions {
-  /**
-   * How long a finished run's buffer survives so a reconnecting client
-   * can drain the tail. Default 60s.
-   */
+  /** Terminal output replay lifetime. Default 60 seconds. */
+  replayRetentionMs?: number
+  /** Backward-compatible alias for `replayRetentionMs`. */
   reapDelayMs?: number
+  /** Run-id/request binding lifetime after terminal. Default 24 hours. */
+  identityRetentionMs?: number
+  /** Maximum deltas retained per live or terminal run. Default 10,000. */
+  maxReplayDeltas?: number
 }
 
-/**
- * Process-wide registry of durable runs, keyed by run id. Idempotent:
- * `getOrCreate` returns the live run for a known id (retry re-attaches)
- * and only invokes the factory for a genuinely new id.
- */
+/** Process-wide, bounded durable-run registry keyed by caller-owned run id. */
 export class RunRegistry {
   private readonly runs = new Map<string, Run>()
-  private readonly reapDelayMs: number
+  private readonly retention: RunRetention
 
   constructor(opts: RunRegistryOptions = {}) {
-    this.reapDelayMs = opts.reapDelayMs ?? 60_000
+    const replayRetentionMs = opts.replayRetentionMs ?? opts.reapDelayMs ?? 60_000
+    const identityRetentionMs = opts.identityRetentionMs ?? 86_400_000
+    const maxReplayDeltas = opts.maxReplayDeltas ?? 10_000
+    assertNonNegativeInt('replayRetentionMs', replayRetentionMs)
+    assertNonNegativeInt('identityRetentionMs', identityRetentionMs)
+    if (identityRetentionMs < replayRetentionMs) {
+      throw new Error('identityRetentionMs must be greater than or equal to replayRetentionMs')
+    }
+    if (!Number.isSafeInteger(maxReplayDeltas) || maxReplayDeltas < 1) {
+      throw new Error('maxReplayDeltas must be a positive safe integer')
+    }
+    this.retention = { replayRetentionMs, identityRetentionMs, maxReplayDeltas }
   }
 
   get(id: string): Run | undefined {
@@ -287,44 +410,47 @@ export class RunRegistry {
   }
 
   /**
-   * Idempotent dispatch. If `id` names a known run, return it WITHOUT
-   * calling `start` — a retry re-attaches to the same subprocess. For a
-   * new id, create the run, hand it to `start` (which wires the backend
-   * source and begins pumping), and register it.
-   *
-   * `start` receives the run so it can read `run.signal` for the backend
-   * call and call `run.pump(source)`.
+   * Atomically bind one run id to one normalized execution request. The
+   * creator alone performs admission/setup; racing identical requests attach.
    */
-  getOrCreate(id: string, start: (run: Run) => void): Run {
+  claim(id: string, requestDigest: string): { readonly run: Run; readonly created: boolean } {
     const existing = this.runs.get(id)
-    if (existing) return existing
-    const run = new Run(id, (rid) => this.reap(rid), this.reapDelayMs)
-    this.runs.set(id, run)
-    start(run)
-    return run
-  }
-
-  /** Explicit cancel by id. Returns true if a live run was cancelled. */
-  cancel(id: string): boolean {
-    const run = this.runs.get(id)
-    if (!run || run.isTerminal()) return false
-    run.cancel()
-    return true
-  }
-
-  private reap(id: string): void {
-    const run = this.runs.get(id)
-    if (!run) return
-    this.runs.delete(id)
-    run.dispose()
-  }
-
-  /** Test/shutdown aid — cancel + drop every run. */
-  clear(): void {
-    for (const run of this.runs.values()) {
-      run.cancel()
-      run.dispose()
+    if (existing) {
+      if (existing.requestDigest !== requestDigest) {
+        throw new RunIdentityConflictError(id, existing.requestDigest, requestDigest)
+      }
+      return { run: existing, created: false }
     }
+    const run = new Run(
+      id,
+      requestDigest,
+      (runId, expected) => this.forget(runId, expected),
+      this.retention,
+    )
+    this.runs.set(id, run)
+    return { run, created: true }
+  }
+
+  /** Request cancellation once. False means unknown, terminal, or already cancelling. */
+  cancel(id: string): boolean {
+    return this.runs.get(id)?.cancel() ?? false
+  }
+
+  private forget(id: string, expected: Run): void {
+    if (this.runs.get(id) !== expected) return
+    this.runs.delete(id)
+    expected.dispose()
+  }
+
+  /** Test/shutdown aid — cancel and forget every run. */
+  clear(): void {
+    for (const run of this.runs.values()) run.dispose()
     this.runs.clear()
+  }
+}
+
+function assertNonNegativeInt(name: string, value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative safe integer`)
   }
 }
