@@ -201,6 +201,7 @@ export function buildDockerExecArgs(
 const PROXIED_ENV_KEYS = new Set([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
+  'GEMINI_SYSTEM_MD',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
   'MOONSHOT_API_KEY',

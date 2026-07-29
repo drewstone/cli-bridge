@@ -16,7 +16,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
@@ -189,8 +189,12 @@ export class GeminiBackend implements Backend {
     }
   }
 
-  buildPrompt(req: ChatRequest, session: SessionRecord | null): string {
-    const flat = this.flattenPrompt(resolvePromptMessages(req, session))
+  buildPrompt(req: ChatRequest, _session: SessionRecord | null): string {
+    // AgentProfile.prompt.systemPrompt is already installed as Gemini's native
+    // `.gemini/system.md` by provisionProfileWorkspace. Adding it to the
+    // request text as well applies the same instruction twice and demotes one
+    // copy to user content. Request messages remain independent input.
+    const flat = this.flattenPrompt(req.messages)
     return wantsJsonObject(req) ? `${JSON_MODE_DIRECTIVE}\n\n${flat}` : flat
   }
 
