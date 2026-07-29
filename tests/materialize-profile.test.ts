@@ -16,6 +16,7 @@ import {
   normalizeSkillMd,
 } from '@tangle-network/agent-profile-materialize'
 import { provisionProfileWorkspace } from '../src/backends/profile-support.js'
+import { GeminiBackend } from '../src/backends/gemini.js'
 import type { ChatRequest } from '../src/backends/types.js'
 
 const SKILL_BODY = '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.'
@@ -177,6 +178,41 @@ describe('materializeProfile — verified per-harness routing', () => {
       expect(result.receipt?.workspacePlanDigest).toMatch(/^(?:sha256:)?[a-f0-9]{64}$/u)
       expect(req.profile_materialization_receipt).toEqual(result.receipt)
       expect(existsSync(join(root, '.claude/skills/receipt-skill/SKILL.md'))).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('applies Gemini profile systemPrompt exactly once through its native system file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'profile-gemini-prompt-'))
+    const marker = 'SYSTEM_PROMPT_MUST_APPEAR_ONCE'
+    try {
+      const req: ChatRequest = {
+        model: 'gemini/gemini-2.5-pro',
+        messages: [
+          { role: 'system', content: 'Keep this request-specific system message.' },
+          { role: 'user', content: 'work' },
+        ],
+        agent_profile: {
+          prompt: {
+            systemPrompt: marker,
+            instructions: ['Keep the workspace instruction.'],
+          },
+        },
+      }
+      const provisioned = provisionProfileWorkspace(req, null, 'gemini', root)
+      const prompt = new GeminiBackend({ bin: '/nonexistent', timeoutMs: 1_000 })
+        .buildPrompt(req, null)
+      const nativeSystemPrompt = readFileSync(join(root, '.gemini/system.md'), 'utf8')
+      const workspaceInstructions = readFileSync(join(root, 'GEMINI.md'), 'utf8')
+
+      expect(provisioned.env.GEMINI_SYSTEM_MD).toBe('1')
+      expect(prompt).toContain('[system] Keep this request-specific system message.')
+      expect(prompt).toContain('[user] work')
+      expect(nativeSystemPrompt).toBe(marker)
+      expect(workspaceInstructions).toContain('Keep the workspace instruction.')
+      expect(workspaceInstructions).not.toContain(marker)
+      expect(`${prompt}\n${nativeSystemPrompt}\n${workspaceInstructions}`.split(marker)).toHaveLength(2)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
