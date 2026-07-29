@@ -83,6 +83,7 @@ describe('hostSpawner', () => {
       ANTHROPIC_API_KEY: 'sk-test',
       OPENCODE_CONFIG: '/tmp/opencode.json',
       GEMINI_SYSTEM_MD: '1',
+      GEMINI_TIMEOUT_MS: '999999',
       GH_TOKEN: 'ghp_test',
       HUGE_SESSION_BLOB: 'x'.repeat(1024 * 1024),
       npm_config_user_agent: 'pnpm/test',
@@ -97,6 +98,29 @@ describe('hostSpawner', () => {
       GEMINI_SYSTEM_MD: '1',
       GH_TOKEN: 'ghp_test',
     })
+  })
+
+  it('passes only the materializer-owned Gemini activation into a real host child', async () => {
+    const result = await hostSpawner(process.execPath, [
+      '-e',
+      'process.stdout.write(JSON.stringify({ system: process.env.GEMINI_SYSTEM_MD, timeout: process.env.GEMINI_TIMEOUT_MS ?? null }))',
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        GEMINI_SYSTEM_MD: '1',
+        GEMINI_TIMEOUT_MS: '999999',
+      },
+    })
+    let stdout = ''
+    result.child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8') })
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      result.child.once('error', reject)
+      result.child.once('close', resolve)
+    })
+
+    expect(exitCode).toBe(0)
+    expect(JSON.parse(stdout)).toEqual({ system: '1', timeout: null })
+    result.release()
   })
 })
 
@@ -319,6 +343,7 @@ describe('buildDockerExecArgs', () => {
         ANTHROPIC_API_KEY: 'sk-test',
         CLAUDE_DEBUG: '1',
         GEMINI_SYSTEM_MD: '1',
+        GEMINI_TIMEOUT_MS: '999999',
         PATH: '/usr/bin', // host-only, must NOT propagate
         HOME: '/Users/drew', // host-only, must NOT propagate
       },
@@ -327,6 +352,7 @@ describe('buildDockerExecArgs', () => {
     expect(flat).toContain('-e ANTHROPIC_API_KEY=sk-test')
     expect(flat).toContain('-e CLAUDE_DEBUG=1')
     expect(flat).toContain('-e GEMINI_SYSTEM_MD=1')
+    expect(flat).not.toContain('GEMINI_TIMEOUT_MS')
     expect(flat).not.toContain('-e PATH=')
     expect(flat).not.toContain('-e HOME=')
   })

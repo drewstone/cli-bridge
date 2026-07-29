@@ -189,7 +189,7 @@ export function buildDockerExecArgs(
       // Filter out obviously-host-only keys that would break things in
       // the container (PATH, HOME, NODE_*). Preserve domain env we
       // actually need passed through.
-      if (PROXIED_ENV_KEYS.has(k) || k.startsWith('ANTHROPIC_') || k.startsWith('CLAUDE_') || k.startsWith('CODEX_') || k.startsWith('GEMINI_') || k.startsWith('KIMI_') || k.startsWith('OPENCODE_')) {
+      if (PROXIED_ENV_KEYS.has(k) || k.startsWith('ANTHROPIC_') || k.startsWith('CLAUDE_') || k.startsWith('CODEX_') || k.startsWith('KIMI_') || k.startsWith('OPENCODE_')) {
         out.push('-e', `${k}=${v}`)
       }
     }
@@ -201,6 +201,7 @@ export function buildDockerExecArgs(
 const PROXIED_ENV_KEYS = new Set([
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
+  'GEMINI_SYSTEM_MD',
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
   'MOONSHOT_API_KEY',
