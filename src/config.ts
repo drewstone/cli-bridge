@@ -8,7 +8,7 @@
  */
 
 import { realpathSync, statSync } from 'node:fs'
-import { isAbsolute, parse, relative, resolve, sep } from 'node:path'
+import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { assertDockerNetworkName } from './executors/docker-network.js'
 
 export interface Config {
@@ -119,8 +119,26 @@ export interface BackendExecutorConfig {
   /** Writable HOME exposed to the configured container identity. */
   containerHome?: string
   /**
+   * Additional credential/state directories this CLI reads, mounted at the same
+   * HOME-relative path. opencode is the measured case: config lives in
+   * ~/.config/opencode but auth.json lives in ~/.local/share/opencode, so
+   * mounting only the config dir gives the container a pool with NO credentials
+   * in it — the CLI starts, authenticates against nothing, and the caller reads
+   * the empty completion as a model problem.
+   */
+  extraMounts?: Array<{ host: string; container: string }>
+  /**
+   * Path, relative to the container HOME, of the file whose presence proves the
+   * CLI can authenticate. Checked by the startup preflight against the mount it
+   * belongs to.
+   */
+  credentialFile?: string
+  /**
    * Canonical host directory exposed read-write to Docker workers at the
    * identical absolute path. Requests with a cwd outside this root fail.
+   * Always set for a docker executor: without a mounted directory a request
+   * that names no cwd has nowhere to run, and the bridge used to answer it by
+   * refusing the request for the bridge's OWN working directory.
    */
   workspaceRoot?: string
   /** Existing Docker network joined by every pool container. */
@@ -223,7 +241,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
-    executors: parseAllExecutors(env),
+    executors: parseAllExecutors(env, dataDir),
     jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
   }
@@ -263,48 +281,86 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
  */
 const SHARED_RUNTIME_IMAGE = 'cli-bridge-cli-runtime:latest'
 
-const BACKEND_EXECUTOR_DEFAULTS: Record<string, { image: string; containerConfigDir: string; hostConfigEnvKey: string; defaultHostConfigDir: string }> = {
-  claude: {
-    image: SHARED_RUNTIME_IMAGE,
-    containerConfigDir: '/root/.claude',
-    hostConfigEnvKey: 'HOME',
-    defaultHostConfigDir: '.claude',
-  },
-  kimi: {
-    image: SHARED_RUNTIME_IMAGE,
-    containerConfigDir: '/root/.kimi',
-    hostConfigEnvKey: 'HOME',
-    defaultHostConfigDir: '.kimi',
-  },
-  gemini: {
-    image: SHARED_RUNTIME_IMAGE,
-    containerConfigDir: '/root/.gemini',
-    hostConfigEnvKey: 'HOME',
-    defaultHostConfigDir: '.gemini',
-  },
-  codex: {
-    image: SHARED_RUNTIME_IMAGE,
-    containerConfigDir: '/root/.codex',
-    hostConfigEnvKey: 'HOME',
-    defaultHostConfigDir: '.codex',
-  },
+/** HOME the container runs with when no non-root identity is configured. */
+const DEFAULT_CONTAINER_HOME = '/root'
+
+/**
+ * Per-backend defaults. `configRel` is HOME-relative and serves BOTH sides:
+ * the host default (`$HOME/.config/opencode`) and the container mount target
+ * (`<container HOME>/.config/opencode`).
+ *
+ * It is deliberately relative. A hardcoded absolute `/root/.config/opencode`
+ * kept pointing at root's home after the operator asked for a uid-1000
+ * container with HOME=/home/node, so the credential volumes landed somewhere
+ * the CLI never reads and the CLI failed with EACCES on an unrelated path.
+ * Resolving the same relative path against the CONFIGURED home makes that
+ * mismatch impossible to express instead of something to detect later.
+ */
+interface BackendExecutorDefaults {
+  image: string
+  /** Primary config dir, HOME-relative. The one <NAME>_DOCKER_*_CONFIG_DIR overrides. */
+  configRel: string
+  /**
+   * Further HOME-relative directories the CLI needs mounted. Measured on this
+   * host: `opencode auth login` writes ~/.local/share/opencode/auth.json, and
+   * ~/.config/opencode holds no credentials at all — so a pool that mounts only
+   * the config dir has nothing to authenticate with.
+   */
+  extraRels?: string[]
+  /**
+   * HOME-relative path of the file that proves authentication, measured on this
+   * host rather than assumed:
+   *   ~/.local/share/opencode/auth.json   (opencode)
+   *   ~/.claude/.credentials.json         (claude)
+   *   ~/.codex/auth.json                  (codex)
+   *   ~/.kimi/credentials                 (kimi, a directory)
+   *   ~/.pi/agent/auth.json               (pi)
+   * gemini is omitted: it authenticates by API key or a browser flow whose
+   * artifact is not a stable file on this host, so claiming one would invent a
+   * check. An omitted entry falls back to "the mount is empty".
+   */
+  credentialFile?: string
+}
+
+const BACKEND_EXECUTOR_DEFAULTS: Record<string, BackendExecutorDefaults> = {
+  claude: { image: SHARED_RUNTIME_IMAGE, configRel: '.claude', credentialFile: '.claude/.credentials.json' },
+  kimi: { image: SHARED_RUNTIME_IMAGE, configRel: '.kimi', credentialFile: '.kimi/credentials' },
+  gemini: { image: SHARED_RUNTIME_IMAGE, configRel: '.gemini' },
+  codex: { image: SHARED_RUNTIME_IMAGE, configRel: '.codex', credentialFile: '.codex/auth.json' },
   opencode: {
     image: SHARED_RUNTIME_IMAGE,
-    containerConfigDir: '/root/.config/opencode',
-    hostConfigEnvKey: 'HOME',
-    defaultHostConfigDir: '.config/opencode',
+    configRel: '.config/opencode',
+    extraRels: ['.local/share/opencode'],
+    credentialFile: '.local/share/opencode/auth.json',
   },
-  pi: {
-    image: SHARED_RUNTIME_IMAGE,
-    containerConfigDir: '/root/.pi/agent',
-    hostConfigEnvKey: 'HOME',
-    defaultHostConfigDir: '.pi/agent',
-  },
+  pi: { image: SHARED_RUNTIME_IMAGE, configRel: '.pi/agent', credentialFile: '.pi/agent/auth.json' },
 }
 
 const SUPPORTED_EXECUTOR_BACKENDS = Object.keys(BACKEND_EXECUTOR_DEFAULTS)
 
-function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecutorConfig> {
+/**
+ * Every `<NAME>_DOCKER_*` setting the parser understands. Anything else with
+ * that shape is REJECTED rather than ignored: `OPENCODE_DOCKER_WORKSPACE_ROOT`
+ * was set on a build that did not yet read it, so the bridge accepted the
+ * setting, mounted nothing, exec'd into a path that did not exist, and reported
+ * exit 127 — "command not found". A setting the bridge silently drops is
+ * indistinguishable to the operator from one it honours.
+ */
+const KNOWN_DOCKER_SUFFIXES = [
+  'IMAGE',
+  'POOL_SIZE',
+  'OAUTH_MOUNT',
+  'NAME_PREFIX',
+  'HOST_HOME',
+  'HOST_CONFIG_DIR',
+  'CONTAINER_CONFIG_DIR',
+  'WORKSPACE_ROOT',
+  'NETWORK',
+  'USER',
+  'HOME',
+] as const
+
+function parseAllExecutors(env: NodeJS.ProcessEnv, dataDir: string): Record<string, BackendExecutorConfig> {
   const defaultKind = parseExecutor('BRIDGE_DEFAULT_EXECUTOR', env.BRIDGE_DEFAULT_EXECUTOR, 'host')
   const out: Record<string, BackendExecutorConfig> = {}
   for (const name of SUPPORTED_EXECUTOR_BACKENDS) {
@@ -312,6 +368,7 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
     if (!defaults) continue
     const upper = name.toUpperCase()
     const kind = parseExecutor(`${upper}_EXECUTOR`, env[`${upper}_EXECUTOR`], defaultKind)
+    assertNoUnknownDockerKeys(env, upper)
     const workspaceRootKey = `${upper}_DOCKER_WORKSPACE_ROOT`
     const rawWorkspaceRoot = env[workspaceRootKey]?.trim()
     const networkKey = `${upper}_DOCKER_NETWORK`
@@ -320,24 +377,41 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
     const containerHomeKey = `${upper}_DOCKER_HOME`
     const rawContainerUser = env[containerUserKey]?.trim()
     const rawContainerHome = env[containerHomeKey]?.trim()
-    const configuredDockerOnlyKey = [
-      rawWorkspaceRoot && workspaceRootKey,
-      rawNetwork && networkKey,
-      rawContainerUser && containerUserKey,
-      rawContainerHome && containerHomeKey,
-    ].find((key): key is string => Boolean(key))
+    // Every docker-only key, not just the four that used to be checked: a
+    // `<NAME>_DOCKER_IMAGE` alongside `<NAME>_EXECUTOR=host` was accepted and
+    // dropped, which is the same "accepted but not honoured" failure.
+    const configuredDockerOnlyKey = KNOWN_DOCKER_SUFFIXES
+      .map((suffix) => `${upper}_DOCKER_${suffix}`)
+      .find((key) => (env[key]?.trim() ?? '') !== '')
     if (configuredDockerOnlyKey && kind !== 'docker') {
-      throw new Error(`${configuredDockerOnlyKey} requires ${upper}_EXECUTOR=docker`)
+      throw new Error(
+        `${configuredDockerOnlyKey} is set but ${upper}_EXECUTOR is ${kind} — the setting would be ignored. ` +
+          `Set ${upper}_EXECUTOR=docker, or remove ${configuredDockerOnlyKey}.`,
+      )
     }
     const cfg: BackendExecutorConfig = { name, kind }
     if (kind === 'docker') {
       cfg.image = env[`${upper}_DOCKER_IMAGE`] ?? defaults.image
-      cfg.poolSize = Number.parseInt(env[`${upper}_DOCKER_POOL_SIZE`] ?? '4', 10)
+      cfg.poolSize = parsePositiveInt(env[`${upper}_DOCKER_POOL_SIZE`], 4)
       cfg.oauthMode = parseOauthMode(`${upper}_DOCKER_OAUTH_MOUNT`, env[`${upper}_DOCKER_OAUTH_MOUNT`], 'share')
       cfg.namePrefix = env[`${upper}_DOCKER_NAME_PREFIX`] ?? `cli-bridge-${name}-pool`
-      const hostBase = env[defaults.hostConfigEnvKey] ?? '/root'
-      cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.defaultHostConfigDir}`)
-      cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? defaults.containerConfigDir
+      // The host directory treated as this CLI's home for credential purposes.
+      // One knob for the whole mount set, because the set only makes sense
+      // together: it is one CLI's home seen from the host and from the container.
+      // Needed because the credential/state directory is also where the CLI keeps
+      // its database — measured, ~/.local/share/opencode/opencode.db is 36 GB on
+      // this host — so an operator has to be able to point the pool at a prepared
+      // directory instead of the personal one.
+      const hostHomeKey = `${upper}_DOCKER_HOST_HOME`
+      const rawHostHome = env[hostHomeKey]?.trim()
+      if (rawHostHome !== undefined && rawHostHome !== '' && !isAbsolute(rawHostHome)) {
+        throw new Error(
+          `${hostHomeKey}=${rawHostHome} must be an absolute host path: it is bind-mounted into every pool ` +
+            `container, and a relative path would resolve against whatever directory the bridge was started in.`,
+        )
+      }
+      const hostBase = rawHostHome || env.HOME || DEFAULT_CONTAINER_HOME
+      cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.configRel}`)
       if (rawNetwork !== undefined && rawNetwork !== '') {
         cfg.network = assertDockerNetworkName(rawNetwork, networkKey)
       }
@@ -347,27 +421,71 @@ function parseAllExecutors(env: NodeJS.ProcessEnv): Record<string, BackendExecut
       if (rawContainerUser && rawContainerHome) {
         cfg.containerUser = parseDockerUser(containerUserKey, rawContainerUser)
         cfg.containerHome = parseDockerHome(containerHomeKey, rawContainerHome)
-        const configRelativeToHome = relative(cfg.containerHome, resolve(cfg.containerConfigDir))
+      }
+      // Resolve the mount target against the home the CLI will actually have,
+      // so the default cannot point at another user's home.
+      const containerHome = cfg.containerHome ?? DEFAULT_CONTAINER_HOME
+      cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? `${containerHome}/${defaults.configRel}`
+      if (cfg.containerUser) {
+        const configRelativeToHome = relative(containerHome, resolve(cfg.containerConfigDir))
         if (configRelativeToHome === ''
           || configRelativeToHome === '..'
           || configRelativeToHome.startsWith(`..${sep}`)
           || isAbsolute(configRelativeToHome)) {
-          throw new Error(`${upper}_DOCKER_CONTAINER_CONFIG_DIR must be a child of ${containerHomeKey}`)
+          throw new Error(
+            `${upper}_DOCKER_CONTAINER_CONFIG_DIR=${cfg.containerConfigDir} is outside ` +
+              `${containerHomeKey}=${containerHome}, so a CLI running as ${cfg.containerUser} would never read it. ` +
+              `Use a path under ${containerHome}, or unset ${containerUserKey}/${containerHomeKey} to run as the ` +
+              `image's root identity.`,
+          )
         }
       }
-      if (rawWorkspaceRoot) {
-        cfg.workspaceRoot = parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
-        assertDockerMountsDoNotOverlap(
-          workspaceRootKey,
-          cfg.workspaceRoot,
-          cfg.hostConfigDir,
-          cfg.containerConfigDir,
-        )
-      }
+      // Every further credential directory the CLI reads, at the same
+      // HOME-relative path on both sides so `<cli> auth login` inside a
+      // container writes where the host mount can see it.
+      const extraMounts = (defaults.extraRels ?? []).map((rel) => ({
+        host: resolve(`${hostBase}/${rel}`),
+        container: `${containerHome}/${rel}`,
+      }))
+      if (extraMounts.length > 0) cfg.extraMounts = extraMounts
+      if (defaults.credentialFile) cfg.credentialFile = defaults.credentialFile
+      // A docker executor ALWAYS has a workspace. Without one, a request that
+      // names no cwd has no container-visible directory to run in, and the
+      // bridge answered it by refusing the caller's request for the bridge's
+      // own working directory — a remedy the HTTP API cannot express.
+      cfg.workspaceRoot = rawWorkspaceRoot
+        ? parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
+        : join(dataDir, 'workspace', name)
+      assertDockerMountsDoNotOverlap(
+        workspaceRootKey,
+        cfg.workspaceRoot,
+        cfg.hostConfigDir,
+        cfg.containerConfigDir,
+      )
     }
     out[name] = cfg
   }
   return out
+}
+
+/**
+ * Reject a `<NAME>_DOCKER_*` variable the parser does not read. A typo or a
+ * variable from a newer/older build is otherwise indistinguishable from a
+ * setting that took effect, which is how a configured workspace root ended up
+ * never mounted while the bridge reported healthy.
+ */
+function assertNoUnknownDockerKeys(env: NodeJS.ProcessEnv, upper: string): void {
+  const prefix = `${upper}_DOCKER_`
+  const known = new Set<string>(KNOWN_DOCKER_SUFFIXES)
+  for (const key of Object.keys(env)) {
+    if (!key.startsWith(prefix)) continue
+    const suffix = key.slice(prefix.length)
+    if (known.has(suffix)) continue
+    throw new Error(
+      `unknown setting ${key} — cli-bridge does not read it, so it would have no effect. ` +
+        `Supported ${prefix}* settings: ${KNOWN_DOCKER_SUFFIXES.join(', ')}.`,
+    )
+  }
 }
 
 function parseDockerUser(key: string, value: string): string {

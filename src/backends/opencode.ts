@@ -18,13 +18,14 @@
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -51,33 +52,7 @@ export class OpencodeBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    let release = (): void => {}
-    try {
-      const spawned = await this.spawner(this.opts.bin, ['--version'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      release = spawned.release
-      const child = spawned.child
-      return await new Promise<BackendHealth>((resolve) => {
-        let stdout = ''; let stderr = ''
-        child.stdout?.on('data', (b) => { stdout += b.toString() })
-        child.stderr?.on('data', (b) => { stderr += b.toString() })
-        child.on('error', (err) => {
-          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-        })
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-          } else {
-            resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
-          }
-        })
-      })
-    } catch (err) {
-      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
-    } finally {
-      release()
-    }
+    return versionHealth(this.name, this.opts.bin, this.spawner)
   }
 
   async *chat(
@@ -85,7 +60,7 @@ export class OpencodeBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
@@ -269,7 +244,7 @@ export class OpencodeBackend implements Backend {
       }
       if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
       if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(`opencode exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'opencode', exitCode, stderr), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')

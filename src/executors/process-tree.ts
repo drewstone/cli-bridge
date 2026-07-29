@@ -92,9 +92,16 @@ export function terminateSpawned(spawned: SpawnResult): Promise<void> {
   const active = terminationBySpawn.get(spawned)
   if (active) return active
 
+  // Never rejects. Backends await this in their `finally`, so a rejection here
+  // REPLACED the outcome the CLI had already produced: measured live, a request
+  // whose container was swept answered HTTP 500 with "docker executor could not
+  // terminate container …", a sentence containing nothing the caller sent.
+  // Cleanup is the executor's business — the docker spawner's own release path
+  // sees the same failure and recycles the slot — while the caller's answer stays
+  // the CLI's answer.
   const termination = (spawned.terminate?.() ?? killTree(spawned.child)).catch((error) => {
     terminationBySpawn.delete(spawned)
-    throw error
+    console.error('[cli-bridge] termination failed after the run completed:', error)
   })
   terminationBySpawn.set(spawned, termination)
   return termination

@@ -37,7 +37,26 @@ import { mountImagesGenerate } from './routes/images-generate.js'
 import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
 import { ContainerPool } from './executors/container-pool.js'
 import { createDockerSpawner } from './executors/docker.js'
+import {
+  buildCommandFor,
+  DockerPreflightError,
+  preflightDockerImage,
+  preflightDockerSlot,
+  type DockerPreflightMount,
+  type DockerPreflightTarget,
+  type PreflightFinding,
+} from './executors/docker-preflight.js'
 import type { Spawner } from './executors/types.js'
+
+/**
+ * Volume-name prefix for per-slot credential mount `mountIndex`. Index 0 keeps
+ * the historical `<namePrefix>-oauth` name so an existing per-slot login is not
+ * orphaned by adding the second mount.
+ */
+function perSlotVolumePrefix(cfg: BackendExecutorConfig, mountIndex: number): string {
+  const base = `${cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`}-oauth`
+  return mountIndex === 0 ? base : `${base}${mountIndex}`
+}
 import type { BackendExecutorConfig } from './config.js'
 import { AdmissionGate } from './admission.js'
 import { RunRegistry } from './runs/registry.js'
@@ -57,19 +76,79 @@ export interface BuildAppExtras {
 }
 
 /**
+ * Describe a docker executor for the startup preflight. Kept next to the pool
+ * wiring so the probed configuration is derived from the SAME values the pool
+ * receives — a preflight that reconstructs the config independently can pass
+ * while the real pool is misconfigured.
+ */
+function preflightTargetFor(cfg: BackendExecutorConfig, bin: string, slotIndex: number): DockerPreflightTarget {
+  const containerHome = cfg.containerHome ?? '/root'
+  // The mount the credential file belongs to, so the check runs against the
+  // directory that actually holds auth rather than the first one configured.
+  const credentialTargetFor = (containerTarget: string): string | undefined => {
+    if (!cfg.credentialFile) return undefined
+    const full = `${containerHome}/${cfg.credentialFile}`
+    if (!full.startsWith(`${containerTarget}/`)) return undefined
+    return full.slice(containerTarget.length + 1)
+  }
+  const pairs: Array<{ host: string; container: string }> = [
+    { host: cfg.hostConfigDir!, container: cfg.containerConfigDir! },
+    ...(cfg.extraMounts ?? []),
+  ]
+  const mounts: DockerPreflightMount[] = pairs.map((pair, i) => {
+    const credentialFile = credentialTargetFor(pair.container)
+    return {
+      // Per-slot mode gives THIS slot its own volumes, so the probe must name
+      // this slot's volumes — probing slot 0's for every slot was evidence
+      // about one slot while traffic went to all of them.
+      source: cfg.oauthMode === 'per-slot' ? `${perSlotVolumePrefix(cfg, i)}-${slotIndex}` : pair.host,
+      target: pair.container,
+      kind: cfg.oauthMode === 'per-slot' ? 'volume' : 'bind',
+      ...(credentialFile ? { credentialFile } : {}),
+    }
+  })
+  return {
+    backend: cfg.name,
+    envPrefix: cfg.name.toUpperCase(),
+    image: cfg.image!,
+    bin,
+    containerHome,
+    ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
+    ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
+    mounts,
+    buildCommand: buildCommandFor(cfg.image!),
+  }
+}
+
+/**
  * Build a Spawner for a backend, plus the shutdown hook that tears down
  * the underlying container pool when the bridge exits. Returns null when
  * the backend's executor is `host` — backends fall back to their default
  * hostSpawner in that case.
+ *
+ * Order matters. The image/daemon/mount checks run BEFORE provisioning,
+ * because `docker run` against an absent image fails with a message about
+ * pulling from a registry — not the build command the operator needs. The
+ * slot checks run AFTER, against a real pool container, and end by executing
+ * `<bin> --version` in the workdir the executor will cd into. Both throw, so
+ * `startServer` never reaches `serve()` with a configuration that would fail
+ * at first request.
  */
 async function buildExecutorForBackend(
   cfg: BackendExecutorConfig | undefined,
   extras: BuildAppExtras,
+  bin: string,
 ): Promise<Spawner | null> {
   if (!cfg || cfg.kind !== 'docker') return null
   if (!cfg.image || !cfg.poolSize || !cfg.containerConfigDir) {
     throw new Error(`backend ${cfg.name} executor=docker but missing image/poolSize/containerConfigDir`)
   }
+  // Deliberately not switchable off. An operator who needs the bridge up
+  // without a working container runtime wants <NAME>_EXECUTOR=host, not a
+  // bridge that reports ready and fails every request.
+  const target = preflightTargetFor(cfg, bin, 0)
+  const imageFindings = await preflightDockerImage(target)
+  if (imageFindings.length > 0) throw new DockerPreflightError(cfg.name, imageFindings)
   const memory = process.env.BRIDGE_POOL_MEMORY || '4g'
   const cpus = process.env.BRIDGE_POOL_CPUS || '2'
   const maxQueueDepth = parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4)
@@ -89,11 +168,24 @@ async function buildExecutorForBackend(
     ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
     ...(cfg.network ? { network: cfg.network } : {}),
+    // Every credential directory the CLI reads, not only the primary one: a pool
+    // that mounts ~/.config/opencode alone has no auth.json in it, and the CLI
+    // then authenticates against nothing and returns an empty completion.
     ...(cfg.oauthMode === 'share' || !cfg.oauthMode
-      ? { shareMounts: [`${cfg.hostConfigDir}:${cfg.containerConfigDir}`] }
+      ? {
+          shareMounts: [
+            `${cfg.hostConfigDir}:${cfg.containerConfigDir}`,
+            ...(cfg.extraMounts ?? []).map((m) => `${m.host}:${m.container}`),
+          ],
+        }
       : {
-          perSlotVolumePrefix: `${cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`}-oauth`,
-          perSlotMountTarget: cfg.containerConfigDir,
+          perSlotVolumes: [
+            { volumePrefix: perSlotVolumePrefix(cfg, 0), target: cfg.containerConfigDir },
+            ...(cfg.extraMounts ?? []).map((m, i) => ({
+              volumePrefix: perSlotVolumePrefix(cfg, i + 1),
+              target: m.container,
+            })),
+          ],
         }),
     onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
   })
@@ -103,8 +195,43 @@ async function buildExecutorForBackend(
   )
   registerPoolForMetrics(cfg.name, pool)
   extras.shutdownHooks.push(() => pool.destroy())
+
+  // Probe a real slot: same image, same mounts, same user, same workdir the
+  // executor will use. If this passes, `ok` on /health means the bridge has
+  // demonstrated it can execute a command, not merely that it started.
+  const liveContainers = pool.liveContainerIds()
+  if (liveContainers.length === 0) {
+    await pool.destroy()
+    throw new Error(`backend ${cfg.name}: container pool provisioned no usable slots`)
+  }
+  const preflightWarnings: string[] = []
+  const slotFindings: PreflightFinding[] = []
+  for (const [slotIndex, containerId] of liveContainers.entries()) {
+    // Slot 0 pays for the whole probe; every other slot is checked for the one
+    // thing that is genuinely per-slot — its own credential mounts. Skipping
+    // them entirely is how a pool with zero credentials reported preflight ok.
+    slotFindings.push(...(await preflightDockerSlot(
+      slotIndex === 0 ? target : preflightTargetFor(cfg, bin, slotIndex),
+      containerId,
+      undefined,
+      preflightWarnings,
+      slotIndex === 0 ? {} : { scope: 'credentials' },
+    )))
+  }
+  if (slotFindings.length > 0) {
+    await pool.destroy()
+    throw new DockerPreflightError(cfg.name, slotFindings)
+  }
+  for (const warning of preflightWarnings) console.warn(`[${cfg.name}-pool] WARNING: ${warning}`)
+  console.log(
+    `[${cfg.name}-pool] preflight ok on ${liveContainers.length} slot(s) — image, credential mounts, HOME, ` +
+      `workspace ${cfg.workspaceRoot}, and \`${bin} --version\` all verified in-slot`,
+  )
+
   return createDockerSpawner({
     pool,
+    backend: cfg.name,
+    envPrefix: cfg.name.toUpperCase(),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
   })
 }
@@ -132,7 +259,7 @@ export async function buildApp(config: Config): Promise<{
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
   if (config.backends.has('claude')) {
-    const spawner = await buildExecutorForBackend(config.executors.claude, extras)
+    const spawner = await buildExecutorForBackend(config.executors.claude, extras, config.claudeBin)
     registry.register(new ClaudeBackend({
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
@@ -151,7 +278,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('codex')) {
-    const spawner = await buildExecutorForBackend(config.executors.codex, extras)
+    const spawner = await buildExecutorForBackend(config.executors.codex, extras, config.codexBin)
     registry.register(new CodexBackend({
       bin: config.codexBin,
       timeoutMs: config.codexTimeoutMs,
@@ -159,7 +286,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('opencode')) {
-    const spawner = await buildExecutorForBackend(config.executors.opencode, extras)
+    const spawner = await buildExecutorForBackend(config.executors.opencode, extras, config.opencodeBin)
     registry.register(new OpencodeBackend({
       bin: config.opencodeBin,
       timeoutMs: config.opencodeTimeoutMs,
@@ -167,7 +294,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('kimi')) {
-    const spawner = await buildExecutorForBackend(config.executors.kimi, extras)
+    const spawner = await buildExecutorForBackend(config.executors.kimi, extras, config.kimiBin)
     registry.register(new KimiBackend({
       bin: config.kimiBin,
       timeoutMs: config.kimiTimeoutMs,
@@ -176,7 +303,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('gemini')) {
-    const spawner = await buildExecutorForBackend(config.executors.gemini, extras)
+    const spawner = await buildExecutorForBackend(config.executors.gemini, extras, config.geminiBin)
     registry.register(new GeminiBackend({
       bin: config.geminiBin,
       timeoutMs: config.geminiTimeoutMs,
@@ -205,7 +332,7 @@ export async function buildApp(config: Config): Promise<{
     registry.register(new NanoclawBackend({ socketPath: config.nanoclawSocket, timeoutMs: config.cliTimeoutMsDefault }))
   }
   if (config.backends.has('pi')) {
-    const spawner = await buildExecutorForBackend(config.executors.pi, extras)
+    const spawner = await buildExecutorForBackend(config.executors.pi, extras, config.piBin)
     registry.register(new PiBackend({
       bin: config.piBin,
       timeoutMs: config.piTimeoutMs,
@@ -303,7 +430,21 @@ export async function startServer(): Promise<void> {
     throw err
   }
 
-  const { app, sessions, extras } = await buildApp(config)
+  let built
+  try {
+    built = await buildApp(config)
+  } catch (err) {
+    // A preflight failure is an operator message, not a stack trace: it already
+    // contains the observation and the command that fixes it.
+    if (err instanceof DockerPreflightError) {
+      console.error(`[cli-bridge] FATAL: ${err.message}`)
+      instanceLock.release()
+      process.exit(1)
+    }
+    instanceLock.release()
+    throw err
+  }
+  const { app, sessions, extras } = built
   // Drop the lock on hard exit too — graceful shutdown also releases, but
   // a process.exit() path (fatal error) must not strand the pidfile.
   process.once('exit', () => instanceLock.release())

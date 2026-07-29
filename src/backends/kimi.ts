@@ -34,6 +34,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -46,7 +47,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -77,33 +78,7 @@ export class KimiBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    let release = (): void => {}
-    try {
-      const spawned = await this.spawner(this.opts.bin, ['--version'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      release = spawned.release
-      const child = spawned.child
-      return await new Promise<BackendHealth>((resolve) => {
-        let stdout = ''; let stderr = ''
-        child.stdout?.on('data', (b) => { stdout += b.toString() })
-        child.stderr?.on('data', (b) => { stderr += b.toString() })
-        child.on('error', (err) => {
-          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-        })
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-          } else {
-            resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
-          }
-        })
-      })
-    } catch (err) {
-      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
-    } finally {
-      release()
-    }
+    return versionHealth(this.name, this.opts.bin, this.spawner)
   }
 
   async *chat(
@@ -111,7 +86,7 @@ export class KimiBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
@@ -360,7 +335,7 @@ export class KimiBackend implements Backend {
       // message is printed as a successful trailer, not an error). If
       // we observed real assistant content, treat exit non-zero as OK.
       if (exitCode !== 0 && exitCode !== null && !emittedContent) {
-        throw new BackendError(`kimi exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'kimi', exitCode, stderr), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`kimi produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')

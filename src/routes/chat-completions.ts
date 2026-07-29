@@ -21,6 +21,7 @@ import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { SessionStore } from '../sessions/store.js'
 import type { ChatDelta, ChatRequest } from '../backends/types.js'
+import { ExecutorConfigurationError } from '../executors/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
@@ -454,13 +455,16 @@ export function mountChatCompletions(
                 },
               } satisfies ChatDelta
             }
-          } catch (err) {
-            if (err instanceof ModeNotSupportedError || err instanceof BackendError) {
-              throw err
-            }
-            yield { finish_reason: 'error' } satisfies ChatDelta
-            console.error(`[cli-bridge] backend ${backend.name} failed:`, err)
           } finally {
+            // Errors are NOT caught here. `Run.pump` records a throw that
+            // happened before any output as the run's dispatch error, which the
+            // reader turns into a real HTTP status carrying the message; a throw
+            // mid-stream still becomes a terminal error delta there. Swallowing
+            // untyped errors into a bare `finish_reason: 'error'` at this point
+            // meant a caller received 200 with an empty error while the only
+            // copy of the reason went to the bridge's stdout — measured with a
+            // configuration error whose message named the exact env var to set.
+            //
             // Admission is released when the job ends. Reader disconnects
             // cannot release a slot that still owns a subprocess.
             admissionLease?.release()
@@ -480,6 +484,18 @@ export function mountChatCompletions(
 
     return respondFromRun(c, run, req, runId, afterSeq)
   })
+}
+
+/** The subset of the non-streaming completion body this route reasons about. */
+interface CollectedCompletion {
+  error?: { message: string; type: string }
+  choices?: Array<{ message?: { content?: string; tool_calls?: unknown[] } }>
+}
+
+/** True when the run produced something a caller can use. */
+function completionHasOutput(body: CollectedCompletion): boolean {
+  const message = body.choices?.[0]?.message
+  return Boolean(message?.content) || (message?.tool_calls?.length ?? 0) > 0
 }
 
 /**
@@ -520,7 +536,21 @@ async function respondFromRun(
     if (dispatchErr !== undefined) return errorResponse(c, dispatchErr)
     try {
       const deltas = mapSeq(run.attach(afterSeq))
-      const body = await collectNonStreaming(deltas, req.model)
+      const body = await collectNonStreaming(deltas, req.model) as CollectedCompletion
+      if (body.error) {
+        // A failure AFTER output began is still a failure. With nothing to show
+        // for the run, answer with the same status the identical pre-output
+        // failure would have produced — a caller cannot tell where in the
+        // stream a fault happened and must not have to. With partial output,
+        // keep the real work and carry the reason in the body: measured, this
+        // was a 200 whose whole explanation was `finish_reason: "error"`.
+        const failure = run.failure()
+        if (!completionHasOutput(body)) {
+          return failure !== undefined
+            ? errorResponse(c, failure)
+            : c.json({ error: body.error }, 500)
+        }
+      }
       return c.json(body)
     } catch (err) {
       return errorResponse(c, err)
@@ -569,20 +599,12 @@ async function respondFromRun(
       if (!await writeRaw(': connected\n\n')) return
       for await (const { seq, delta } of run.attach(afterSeq, readerController.signal)) {
         if (clientGone) break
-        // pump() records a typed pre-output failure and one buffered terminal
-        // marker. Replace that marker with one OpenAI error frame so provider
-        // detail survives without duplicating terminal chunks.
-        const dispatchErr = delta.finish_reason === 'error' ? run.dispatchError() : undefined
-        if (dispatchErr !== undefined) {
-          const message = dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr)
-          const type = dispatchErr instanceof BackendError
-            ? dispatchErr.code
-            : dispatchErr instanceof SandboxBackendUnavailableError
-              ? dispatchErr.code
-            : dispatchErr instanceof ModeNotSupportedError
-              ? 'mode_not_supported'
-              : 'server_error'
-          await writeSse(JSON.stringify({ error: { message, type } }), seq)
+        // The run pump attaches the reason to the terminal delta itself, so a
+        // failure at ANY point in the stream — not only before the first delta —
+        // becomes one OpenAI error frame here, and a reconnecting reader replays
+        // the same reason instead of a bare terminal marker.
+        if (delta.finish_reason === 'error' && delta.error) {
+          await writeSse(JSON.stringify({ error: delta.error }), seq)
           break
         }
         // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
@@ -788,6 +810,12 @@ function errorResponse(c: Context, err: unknown): Response {
   }
   if (err instanceof ModeNotSupportedError) {
     return c.json({ error: { message: err.message, type: 'mode_not_supported' } }, 501)
+  }
+  // An executor that cannot serve the request as configured: 501 (this bridge is
+  // not set up for that) rather than 500 (this bridge broke). The message names
+  // the setting to change, so it must reach the caller and not only the log.
+  if (err instanceof ExecutorConfigurationError) {
+    return c.json({ error: { message: err.message, type: err.code } }, 501)
   }
   if (err instanceof BackendError) {
     // Hono's typed status gate treats 499 as an unofficial code; collapse

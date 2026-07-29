@@ -20,6 +20,7 @@
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -34,7 +35,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -134,43 +135,7 @@ export class ClaudeBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    let release = (): void => {}
-    try {
-      const spawned = await this.spawner(this.bin, ['--version'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      release = spawned.release
-      const child = spawned.child
-      return await new Promise<BackendHealth>((resolve) => {
-        let stdout = ''
-        let stderr = ''
-        child.stdout?.on('data', (b) => { stdout += b.toString() })
-        child.stderr?.on('data', (b) => { stderr += b.toString() })
-        child.on('error', (err) => {
-          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-        })
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({
-              name: this.name,
-              state: 'ready',
-              version: stdout.trim() || undefined,
-              detail: this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined,
-            })
-          } else {
-            resolve({
-              name: this.name,
-              state: 'error',
-              detail: `exit ${code}: ${stderr.slice(0, 200) || stdout.slice(0, 200)}`,
-            })
-          }
-        })
-      })
-    } catch (err) {
-      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
-    } finally {
-      release()
-    }
+    return versionHealth(this.name, this.bin, this.spawner, this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined)
   }
 
   async *chat(
@@ -179,7 +144,7 @@ export class ClaudeBackend implements Backend {
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
     const mode: BridgeMode = req.mode ?? 'byob'
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
     // hosted-sandboxed requires the sandbox launcher which is a separate
     // code path (src/sandbox.ts, not yet landed). Fail loud until that's
@@ -378,7 +343,7 @@ export class ClaudeBackend implements Backend {
 
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(
-          `claude exited ${exitCode}: ${stderr.slice(0, 300)}`,
+          await describeCliExit(spawned, 'claude', exitCode, stderr),
           'upstream',
         )
       }

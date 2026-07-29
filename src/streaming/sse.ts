@@ -128,6 +128,7 @@ export async function collectNonStreaming(
   let finishReason: string | null = null
   let usage: ChatDelta['usage']
   let profileMaterialization: ChatDelta['profile_materialization']
+  let error: ChatDelta['error']
 
   for await (const d of iter) {
     // Backend-liveness signals are transport-layer and have no place in
@@ -138,6 +139,7 @@ export async function collectNonStreaming(
     if (d.finish_reason) finishReason = d.finish_reason
     if (d.usage) usage = d.usage
     if (d.profile_materialization) profileMaterialization = d.profile_materialization
+    if (d.error) error = d.error
   }
 
   // Usage (estimated or measured) is produced upstream in the run source, so
@@ -177,5 +179,9 @@ export async function collectNonStreaming(
     ],
     ...(usageOut ? { usage: usageOut } : {}),
     ...(profileMaterialization ? { profile_materialization: profileMaterialization } : {}),
+    // A run that failed says so IN the body. Dropping the reason here is what
+    // made `finish_reason: 'error'` with an empty message the caller's whole
+    // explanation for a bridge-side failure.
+    ...(error ? { error } : {}),
   }
 }

@@ -10,6 +10,7 @@
  */
 
 import type { ChatDelta } from '../backends/types.js'
+import { describeRunFailure } from './error-shape.js'
 
 /** A buffered delta plus its per-run monotonic sequence number. */
 export interface SeqDelta {
@@ -125,6 +126,14 @@ export class Run {
   private settled?: Promise<void>
   /** Typed failure raised before the backend produced any output. */
   private setupError: unknown
+  /**
+   * The failure that ended this run, whenever it happened. Separate from
+   * `setupError` because only a PRE-OUTPUT failure can replace the whole
+   * response with an HTTP error; a failure after output still has to reach the
+   * caller, and recording it only when `seq === 0` is what turned a mid-stream
+   * auth failure into a 200 with an empty completion and no reason.
+   */
+  private failureError: unknown
 
   constructor(
     readonly id: string,
@@ -172,8 +181,14 @@ export class Run {
     return this.status !== 'running'
   }
 
+  /** Failure raised before any output — the only kind that can replace the body. */
   dispatchError(): unknown {
     return this.setupError
+  }
+
+  /** The failure that ended this run, before or after output. */
+  failure(): unknown {
+    return this.failureError
   }
 
   /** Resolve once output begins or dispatch reaches a terminal failure. */
@@ -208,8 +223,13 @@ export class Run {
         if (this.ac.signal.aborted) {
           this.finish('cancelled')
         } else {
+          this.failureError = error
           if (this.seq === 0) this.setupError = error
-          this.append({ finish_reason: 'error' })
+          // The reason rides ON the terminal delta, so it survives buffering,
+          // replay and reconnect. A bare `{ finish_reason: 'error' }` left the
+          // caller with an empty completion whose only explanation was in this
+          // process's stdout.
+          this.append({ finish_reason: 'error', error: describeRunFailure(error) })
           this.finish('error')
           console.error(`[cli-bridge] run ${this.id} failed:`, error)
         }
@@ -222,7 +242,8 @@ export class Run {
   failSetup(error: unknown): void {
     if (this.settled || this.isTerminal()) return
     this.setupError = error
-    this.append({ finish_reason: 'error' })
+    this.failureError = error
+    this.append({ finish_reason: 'error', error: describeRunFailure(error) })
     this.finish(this.ac.signal.aborted ? 'cancelled' : 'error')
     this.settled = Promise.resolve()
   }

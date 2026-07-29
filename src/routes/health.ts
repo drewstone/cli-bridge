@@ -23,13 +23,30 @@
  *      cached results in <1 ms — the only spawn cost is once per
  *      cache-eviction. `?force=1` bypasses the cache for debugging.
  *
- * Tradeoff: a backend that DIES between probes (CLI crashes or
- * uninstalls) will be reported `ready` for up to the cache TTL.
- * We accept that — the watchdog's job is server liveness, not CLI
- * supervision, and the cost of falsely killing live bridges has
- * proven much worse than the cost of briefly reporting a dead CLI
- * as ready. Set `BRIDGE_HEALTH_CACHE_MS=0` to disable the cache
- * entirely if you need real-time CLI status.
+ * Only `ready` verdicts are cached. A failing backend is RE-PROBED on
+ * every request, because a cached failure is the worse of the two
+ * errors in both directions:
+ *
+ *   - It cannot recover. Once a fault was cached, fixing the underlying
+ *     cause changed nothing until the process restarted. Measured on
+ *     this host: a bridge up for ten days served the identical
+ *     `No such container` detail after the image was rebuilt and the
+ *     directories restored, with `active=0 queued=0` — idle, not busy.
+ *   - It looked live while doing it. The response stamps a fresh
+ *     top-level `ts` on a verdict from an older probe, which reads as
+ *     "just checked, still broken". That is worse than reporting
+ *     nothing, so each backend now carries its OWN `probed_at` and a
+ *     `cached` flag: no verdict can borrow the response's freshness.
+ *
+ * The original reason for caching survives untouched — a healthy pool
+ * still answers watchdog probes from memory in <1 ms, so the fork+exec
+ * storm that got live bridges SIGKILLed cannot come back. Re-probing
+ * only the already-failing backends costs one spawn per failing backend
+ * per request, bounded by `PROBE_TIMEOUT_MS`.
+ *
+ * Tradeoff kept: a backend that DIES between probes is reported `ready`
+ * for up to the cache TTL. `?force=1` bypasses the cache;
+ * `BRIDGE_HEALTH_CACHE_MS=0` disables it.
  */
 
 import { Hono } from 'hono'
@@ -76,25 +93,57 @@ export function mountHealth(
     // shared resource that benefits from serial execution. `boundedProbe`
     // already enforces a per-backend ceiling, so the whole request
     // returns within ~probeTimeoutMs even in the worst case.
-    const probes: BackendHealth[] = await Promise.all(
+    const probes: ReportedHealth[] = await Promise.all(
       deps.registry.all().map(async (b) => {
         const cached = cache.get(b.name)
-        if (!force && cached && cacheMs > 0 && ts - cached.probedAt < cacheMs) {
-          return cached.health
+        // Reusable only while it says `ready`: a fault must be retried so a
+        // fixed fault recovers without restarting the process.
+        if (!force
+          && cached
+          && cached.health.state === 'ready'
+          && cacheMs > 0
+          && ts - cached.probedAt < cacheMs) {
+          return { ...cached.health, probed_at: new Date(cached.probedAt).toISOString(), cached: true }
         }
+        const probedAt = now()
         const fresh = await probe(b)
-        cache.set(b.name, { probedAt: ts, health: fresh })
-        return fresh
+        cache.set(b.name, { probedAt, health: fresh })
+        return { ...fresh, probed_at: new Date(probedAt).toISOString(), cached: false }
       }),
     )
     const any = probes.some((p) => p.state === 'ready')
+    // `status` and the HTTP code are what a watchdog reads, and they are derived
+    // from verdicts that may be remembered rather than measured — a bridge whose
+    // last container was removed 5 s ago still answers ok/200 until the TTL
+    // expires. Per-backend `cached`/`probed_at` made that visible to a reader who
+    // inspects `backends[]`; these two fields make it visible to one who does
+    // not. `?force=1` re-measures.
+    const cachedVerdicts = probes.some((p) => p.cached)
+    const oldestProbedAt = probes
+      .map((p) => p.probed_at)
+      .sort()[0]
     return c.json({
       status: any ? 'ok' : 'degraded',
+      /** True when at least one verdict behind `status` was not measured on this request. */
+      cached_verdicts: cachedVerdicts,
+      /** When the OLDEST verdict behind `status` was measured. Not the same as `ts`. */
+      ...(oldestProbedAt ? { oldest_probed_at: oldestProbedAt } : {}),
       backends: probes,
       ...(deps.admission ? { admission: deps.admission.snapshot() } : {}),
       ts: new Date(ts).toISOString(),
     }, any ? 200 : 503)
   })
+}
+
+/**
+ * A backend verdict plus its own provenance. `probed_at` is when the verdict
+ * was MEASURED, which is not the response's `ts`; `cached` says outright whether
+ * this request re-measured. Without both, a caller cannot tell a live failure
+ * from a remembered one.
+ */
+export interface ReportedHealth extends BackendHealth {
+  probed_at: string
+  cached: boolean
 }
 
 /**

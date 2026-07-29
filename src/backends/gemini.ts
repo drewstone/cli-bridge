@@ -19,7 +19,7 @@ import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
-import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
@@ -61,7 +61,7 @@ export class GeminiBackend implements Backend {
     const model = this.extractModel(req.model)
     const args = this.buildArgs(req.model)
     if (model) args.push('--model', model)
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
     // Validate the profile before touching project-scoped Gemini settings,
     // which can contain MCP headers and other credentials.
@@ -174,7 +174,7 @@ export class GeminiBackend implements Backend {
       }
       if (sawError) throw new BackendError(`gemini: ${sawError}`, 'upstream')
       if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(`gemini exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'gemini', exitCode, stderr), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`gemini produced no output: ${stderr.slice(0, 300)}`, 'upstream')

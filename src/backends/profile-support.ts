@@ -5,12 +5,31 @@ import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-
 import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { ExecutorConfigurationError } from '../executors/types.js'
 import {
   applyWorkspacePlan,
   assertWorkspacePlanSupported,
   type HarnessId,
   materializeProfile,
 } from '@tangle-network/agent-profile-materialize'
+
+/**
+ * The host directory request-scoped files are written into.
+ *
+ * `undefined` means the executor mounts NO host directory into the container, so
+ * a profile or MCP file written here would land where the CLI cannot read it.
+ * Refusing with the setting that fixes it is the only honest answer: writing it
+ * anyway is the silent-corruption path where the caller's files are discarded
+ * with no error at all.
+ */
+function requireMaterializationCwd(cwd: string | undefined, what: string): string {
+  if (cwd !== undefined) return cwd
+  throw new ExecutorConfigurationError(
+    `${what} needs a host directory mounted into the container, and this executor mounts none. Set the backend's ` +
+      `<NAME>_DOCKER_WORKSPACE_ROOT to an absolute host directory — the pool bind-mounts it into every container at ` +
+      `the identical path — or send the request without an agent_profile/mcp block.`,
+  )
+}
 
 /**
  * Provision an AgentProfile's CWD-NATIVE dimensions (skills, context, hooks, subagents,
@@ -24,7 +43,7 @@ export function provisionProfileWorkspace(
   req: ChatRequest,
   session: SessionRecord | null,
   harness: HarnessId,
-  cwd: string,
+  cwd: string | undefined,
 ): {
   env: Record<string, string>
   flags: string[]
@@ -36,10 +55,11 @@ export function provisionProfileWorkspace(
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
   if (!profile) return { env: {}, flags: [], written: [] }
+  const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   try {
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
     assertWorkspacePlanSupported(plan)
-    const applied = applyWorkspacePlan(plan, cwd)
+    const applied = applyWorkspacePlan(plan, workspaceCwd)
     const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
     const receipt: ProfileMaterializationReceipt = {
       schema: 'cli-bridge.profile-materialization.v1',
@@ -360,7 +380,7 @@ function writeFileNoFollow(path: string, bytes: string): void {
 
 export function materializeMcpServersForPi(
   specs: Record<string, McpServerSpec> | null,
-  cwd: string,
+  cwd: string | undefined,
 ): MaterializedMcpConfig | null {
   if (!specs) return null
   const mcpServers = buildCanonicalMcpServers(specs)
@@ -370,7 +390,7 @@ export function materializeMcpServersForPi(
   }
   if (serverNames.length === 0) return null
 
-  const piDir = join(cwd, '.pi')
+  const piDir = join(requireMaterializationCwd(cwd, 'pi MCP passthrough'), '.pi')
   const configPath = join(piDir, 'mcp.json')
   const lockPath = `${configPath}.lock`
 
@@ -890,14 +910,15 @@ function buildGeminiMcpServers(specs: Record<string, McpServerSpec>): Record<str
  */
 export function materializeMcpServersForGemini(
   specs: Record<string, McpServerSpec> | null,
-  cwd: string,
+  cwd: string | undefined,
 ): MaterializedMcpConfig | null {
   if (!specs) return null
+  const target = requireMaterializationCwd(cwd, 'gemini MCP passthrough')
   const mcpServers = buildGeminiMcpServers(specs)
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {
     console.error(`[cli-bridge mcp gemini] materialized servers: ${Object.keys(mcpServers).join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
   }
-  return mountCwdNativeMcp(cwd, { subdir: '.gemini', filename: 'settings.json', backendName: 'gemini', mcpServers })
+  return mountCwdNativeMcp(target, { subdir: '.gemini', filename: 'settings.json', backendName: 'gemini', mcpServers })
 }
 
 /**
