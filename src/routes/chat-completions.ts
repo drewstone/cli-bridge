@@ -17,6 +17,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
+import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { SessionStore } from '../sessions/store.js'
 import type { ChatDelta, ChatRequest } from '../backends/types.js'
@@ -27,9 +28,31 @@ import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
-import type { Run, RunRegistry } from '../runs/registry.js'
+import {
+  type Run,
+  RunIdentityConflictError,
+  RunReplayCursorError,
+  type RunRegistry,
+} from '../runs/registry.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
+
+class SandboxBackendUnavailableError extends Error {
+  readonly code = 'not_found_error' as const
+  constructor(message: string) {
+    super(message)
+    this.name = 'SandboxBackendUnavailableError'
+  }
+}
+
+const durableRunIdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(
+    /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u,
+    'run id must be URL-safe: letters, digits, dot, underscore, colon, or hyphen',
+  )
 
 const chatRequestSchema = z.object({
   model: z.string().min(1),
@@ -90,7 +113,7 @@ const chatRequestSchema = z.object({
    * Reconnect replay: send `Last-Event-ID: <seq>` (or `X-Last-Event-Id`)
    * with the same run_id to replay only the deltas missed since `seq`.
    */
-  run_id: z.string().optional(),
+  run_id: durableRunIdSchema.optional(),
   mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
   // OpenAI-compatible shape — wire is snake_case, TS is camelCase. We
   // translate to responseFormat when we build the ChatRequest below.
@@ -227,7 +250,17 @@ export function mountChatCompletions(
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
-    const { response_format, agent_profile, cwd, execution, mcp: bodyMcp, run_id: bodyRunId, ...rest } = parsed.data
+    const {
+      response_format,
+      agent_profile,
+      cwd,
+      execution,
+      mcp: bodyMcp,
+      run_id: bodyRunId,
+      session_id: _bodySessionId,
+      resume_id: _bodyResumeId,
+      ...rest
+    } = parsed.data
     // MCP can arrive in the body OR the `X-Mcp-Config` header. Body
     // wins on conflict — header is for callers that can't extend the
     // request body (e.g. forwarding through a third-party gateway that
@@ -261,6 +294,46 @@ export function mountChatCompletions(
       }, 404)
     }
 
+    // Durable-run identity and replay cursor are exact claims. Conflicting aliases, malformed ids,
+    // and invalid cursors fail closed instead of silently selecting one value or replaying from 0.
+    const runIdResult = resolveRunId(bodyRunId, c.req.header('x-run-id'))
+    if (!runIdResult.ok) return invalidRequest(c, runIdResult.message)
+    const runId = runIdResult.value
+    const cursorResult = resolveLastEventId(
+      c.req.header('last-event-id'),
+      c.req.header('x-last-event-id'),
+    )
+    if (!cursorResult.ok) return invalidRequest(c, cursorResult.message)
+    const afterSeq = cursorResult.value
+    if (afterSeq > 0 && req.stream !== true) {
+      return invalidRequest(c, 'Last-Event-ID is only valid for stream:true replay')
+    }
+
+    let requestDigest: string
+    try {
+      requestDigest = durableRunRequestDigest(req, backend.name)
+    } catch {
+      return invalidRequest(c, 'chat request cannot be canonicalized as durable-run identity')
+    }
+    let claim: ReturnType<RunRegistry['claim']>
+    try {
+      claim = deps.runs.claim(runId, requestDigest)
+    } catch (error) {
+      if (error instanceof RunIdentityConflictError) return runIdentityConflict(c, error)
+      throw error
+    }
+    const run = claim.run
+
+    // Atomic claim happens BEFORE admission or backend setup. An identical racing request attaches
+    // to this run and cannot acquire a second slot; a different request under the same id was
+    // refused above. The creator alone owns setup and pump.
+    if (!claim.created) {
+      return respondFromRun(c, run, req, runId, afterSeq)
+    }
+
+    // Bind identity to the normalized caller request above, before reading
+    // mutable session defaults. An exact retry must attach even if the live
+    // run has already persisted newer session metadata.
     const session = req.session_id
       ? deps.sessions.get(req.session_id, backend.name)
       : null
@@ -269,23 +342,6 @@ export function mountChatCompletions(
     }
     if (!req.cwd && session?.cwd) {
       req.cwd = session.cwd
-    }
-
-    // Durable-run id: connection-independent job identity. A reconnect or
-    // retry reusing this id RE-ATTACHES to the same in-flight subprocess.
-    const runId = bodyRunId ?? c.req.header('x-run-id') ?? crypto.randomUUID()
-    // Last-Event-ID (standard SSE reconnect header) or the X-Last-Event-Id
-    // alias: the highest seq the client already saw. Replay starts after it.
-    const afterSeq = parseLastEventId(
-      c.req.header('last-event-id') ?? c.req.header('x-last-event-id'),
-    )
-
-    // Idempotent dispatch. A known run id re-attaches with zero new work —
-    // no second subprocess, no second admission slot. Only a genuinely new
-    // id reaches the setup-and-pump path below.
-    const existing = deps.runs.get(runId)
-    if (existing) {
-      return respondFromRun(c, existing, req, runId, afterSeq)
     }
 
     // Execution router: when the caller asks for `execution: 'sandbox'`
@@ -299,135 +355,129 @@ export function mountChatCompletions(
     // contract. A client disconnect leaves this signal untouched, so the
     // subprocess keeps running; only an explicit cancel aborts it.
     let admissionLease: AdmissionLease | null = null
-    let makeSource: ((run: Run) => AsyncIterable<ChatDelta>) | null = null
-    if (req.execution?.kind === 'sandbox' && backend.name !== 'sandbox') {
-      const sandboxBackend = deps.registry.byName('sandbox')
-      if (!sandboxBackend) {
-        return c.json({
-          error: {
-            message: 'execution=sandbox requested but the sandbox backend is not registered. Set TANGLE_API_KEY/SANDBOX_API_KEY + SANDBOX_BASE_URL.',
-            type: 'not_found_error',
+    try {
+      let makeSource: ((run: Run) => AsyncIterable<ChatDelta>) | null = null
+      if (req.execution?.kind === 'sandbox' && backend.name !== 'sandbox') {
+        const sandboxBackend = deps.registry.byName('sandbox')
+        if (!sandboxBackend) {
+          throw new SandboxBackendUnavailableError(
+            'execution=sandbox requested but the sandbox backend is not registered. Set TANGLE_API_KEY/SANDBOX_API_KEY + SANDBOX_BASE_URL.',
+          )
+        }
+        const sandboxBackendType = harnessToSandboxBackendType(backend.name)
+        // Stash the desired in-container backend type on metadata so
+        // SandboxBackend.chat() picks it up. Same path as
+        // forwardedAuthorization — opaque metadata field that backends
+        // honour by convention.
+        const delegatedReq: ChatRequest = {
+          ...req,
+          metadata: {
+            ...(req.metadata ?? {}),
+            sandboxBackendType,
           },
-        }, 503)
-      }
-      const sandboxBackendType = harnessToSandboxBackendType(backend.name)
-      // Stash the desired in-container backend type on metadata so
-      // SandboxBackend.chat() picks it up. Same path as
-      // forwardedAuthorization — opaque metadata field that backends
-      // honour by convention.
-      const delegatedReq: ChatRequest = {
-        ...req,
-        metadata: {
-          ...(req.metadata ?? {}),
-          sandboxBackendType,
-        },
-      }
-      makeSource = (run) => sandboxBackend.chat(delegatedReq, session, run.signal)
-    } else {
-      // Host execution: resolve the write-jail spec from execution.jail
-      // (host variant) layered over the BRIDGE_JAIL_* env defaults, using
-      // the same cwd the backend will spawn in (req.cwd already folds in
-      // session.cwd above; backends fall back to process.cwd()). The
-      // resolved spec rides on req.jailSpec down to the spawn seam; null
-      // means no jail and the spawn is unchanged.
-      req.jailSpec = resolveJailSpec({
-        execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
-        execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
-        cwd: req.cwd ?? process.cwd(),
-        env: process.env,
-      })
-      // Preserve this backend's host credentials inside the jail so the
-      // confined CLI still authenticates as the operator.
-      if (req.jailSpec) req.jailSpec.authSources = authSourcesFor(backend.name)
-      if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
-        try {
-          // Admission is held by the JOB, not the connection — release it
-          // when the run finishes, not when the client drops. Acquire is
-          // cancellable only by an explicit shutdown, so pass no signal.
-          admissionLease = await deps.admission.acquire()
-        } catch (err) {
-          return admissionErrorResponse(c, err)
         }
+        makeSource = (run) => sandboxBackend.chat(delegatedReq, session, run.signal)
+      } else {
+        // Host execution: resolve the write-jail spec from execution.jail
+        // (host variant) layered over the BRIDGE_JAIL_* env defaults, using
+        // the same cwd the backend will spawn in (req.cwd already folds in
+        // session.cwd above; backends fall back to process.cwd()). The
+        // resolved spec rides on req.jailSpec down to the spawn seam; null
+        // means no jail and the spawn is unchanged.
+        req.jailSpec = resolveJailSpec({
+          execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
+          execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
+          cwd: req.cwd ?? process.cwd(),
+          env: process.env,
+        })
+        // Preserve this backend's host credentials inside the jail so the
+        // confined CLI still authenticates as the operator.
+        if (req.jailSpec) req.jailSpec.authSources = authSourcesFor(backend.name)
+        if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
+          // Admission is owned by the job. Explicit cancellation can remove
+          // a queued job before it ever acquires a process slot.
+          admissionLease = await deps.admission.acquire(run.signal)
+        }
+        makeSource = (run) => backend.chat(req, session, run.signal)
       }
-      makeSource = (run) => backend.chat(req, session, run.signal)
-    }
 
-    // Approximate input size once (content + tool-call structures), for backends that
-    // report no usage. Estimated in wrap; tool calls are included so tool-heavy turns
-    // are not systematically undercounted.
-    const promptChars = estimateMessagesChars(req.messages)
+      // Approximate input size once (content + tool-call structures), for backends that
+      // report no usage. Estimated in wrap; tool calls are included so tool-heavy turns
+      // are not systematically undercounted.
+      const promptChars = estimateMessagesChars(req.messages)
 
-    // Persist internal session id as it flows in. Returns a new
-    // AsyncIterable<ChatDelta> so the typed boundary stays clean.
-    // Typed backend/mode errors are converted to a terminal error delta
-    // INSIDE the run buffer (the run owns the stream now — there is no
-    // outer iterator to re-throw to). The route reader surfaces the right
-    // HTTP/SSE shape from the buffered finish_reason.
-    const wrap = (source: AsyncIterable<ChatDelta>): AsyncIterable<ChatDelta> => ({
-      [Symbol.asyncIterator]: async function* () {
-        let sawUsage = false
-        let failed = false
-        let completionChars = 0
-        try {
-          for await (const delta of source) {
-            if (delta.usage) sawUsage = true
-            if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') failed = true
-            completionChars += (delta.content?.length ?? 0)
-              + (delta.tool_calls?.reduce(
-                (s, tc) => s + (tc.id?.length ?? 0) + (tc.name?.length ?? 0) + (tc.arguments?.length ?? 0),
-                0,
-              ) ?? 0)
-            if (delta.internal_session_id && req.session_id) {
-              deps.sessions.upsert({
-                externalId: req.session_id,
-                backend: backend.name,
-                internalId: delta.internal_session_id,
-                cwd: req.cwd ?? session?.cwd ?? null,
-                metadata: {
-                  model: req.model,
-                  ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
-                  ...(req.metadata ?? {}),
-                },
-              })
+      // Persist internal session id as it flows in. Returns a new
+      // AsyncIterable<ChatDelta> so the typed boundary stays clean.
+      // Typed backend/mode errors are converted to a terminal error delta
+      // INSIDE the run buffer (the run owns the stream now — there is no
+      // outer iterator to re-throw to). The route reader surfaces the right
+      // HTTP/SSE shape from the buffered finish_reason.
+      const wrap = (source: AsyncIterable<ChatDelta>): AsyncIterable<ChatDelta> => ({
+        [Symbol.asyncIterator]: async function* () {
+          let sawUsage = false
+          let failed = false
+          let completionChars = 0
+          try {
+            for await (const delta of source) {
+              if (delta.usage) sawUsage = true
+              if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') failed = true
+              completionChars += (delta.content?.length ?? 0)
+                + (delta.tool_calls?.reduce(
+                  (s, tc) => s + (tc.id?.length ?? 0) + (tc.name?.length ?? 0) + (tc.arguments?.length ?? 0),
+                  0,
+                ) ?? 0)
+              if (delta.internal_session_id && req.session_id) {
+                deps.sessions.upsert({
+                  externalId: req.session_id,
+                  backend: backend.name,
+                  internalId: delta.internal_session_id,
+                  cwd: req.cwd ?? session?.cwd ?? null,
+                  metadata: {
+                    model: req.model,
+                    ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
+                    ...(req.metadata ?? {}),
+                  },
+                })
+              }
+              yield delta.finish_reason && req.profile_materialization_receipt
+                ? { ...delta, profile_materialization: req.profile_materialization_receipt }
+                : delta
             }
-            yield delta.finish_reason && req.profile_materialization_receipt
-              ? { ...delta, profile_materialization: req.profile_materialization_receipt }
-              : delta
+            // Successful backends whose CLI reports no usage (kimi-code, opencode)
+            // get a bounded estimate. A failure without measured usage stays unknown:
+            // inventing tokens after error/timeout masks the real terminal condition.
+            if (!sawUsage && !failed) {
+              yield {
+                usage: {
+                  input_tokens: tokensFromChars(promptChars),
+                  output_tokens: tokensFromChars(completionChars),
+                  estimated: true,
+                },
+              } satisfies ChatDelta
+            }
+          } catch (err) {
+            if (err instanceof ModeNotSupportedError || err instanceof BackendError) {
+              throw err
+            }
+            yield { finish_reason: 'error' } satisfies ChatDelta
+            console.error(`[cli-bridge] backend ${backend.name} failed:`, err)
+          } finally {
+            // Admission is released when the job ends. Reader disconnects
+            // cannot release a slot that still owns a subprocess.
+            admissionLease?.release()
           }
-          // Successful backends whose CLI reports no usage (kimi-code, opencode)
-          // get a bounded estimate. A failure without measured usage stays unknown:
-          // inventing tokens after error/timeout masks the real terminal condition.
-          if (!sawUsage && !failed) {
-            yield {
-              usage: {
-                input_tokens: tokensFromChars(promptChars),
-                output_tokens: tokensFromChars(completionChars),
-                estimated: true,
-              },
-            } satisfies ChatDelta
-          }
-        } catch (err) {
-          if (err instanceof ModeNotSupportedError || err instanceof BackendError) {
-            throw err
-          }
-          yield { finish_reason: 'error' } satisfies ChatDelta
-          console.error(`[cli-bridge] backend ${backend.name} failed:`, err)
-        } finally {
-          // Admission is released when the JOB ends — pump() consumes this
-          // source to completion regardless of client connection state.
-          admissionLease?.release()
-        }
-      },
-    })
+        },
+      })
 
-    // Register + start the durable run. getOrCreate is idempotent: a
-    // racing duplicate (same run_id arriving twice) re-attaches to the
-    // first run and never invokes the factory twice. The run pumps the
-    // source to completion on its own — the client connection below is
-    // just one of possibly many readers.
-    const run = deps.runs.getOrCreate(runId, (r) => {
-      void r.pump(wrap(makeSource!(r)))
-    })
+      // The run pumps the source to completion on its own. This connection is only one reader;
+      // dropping it never touches `run.signal` or releases job-owned admission.
+      void run.pump(wrap(makeSource(run)))
+    } catch (error) {
+      admissionLease?.release()
+      admissionLease = null
+      run.failSetup(error)
+      return errorResponse(c, error)
+    }
 
     return respondFromRun(c, run, req, runId, afterSeq)
   })
@@ -446,9 +496,16 @@ async function respondFromRun(
   runId: string,
   afterSeq: number,
 ): Promise<Response> {
+  try {
+    run.assertReplayCursor(afterSeq)
+  } catch (error) {
+    if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
+    throw error
+  }
   // Surface mode + run id so clients can reconnect/cancel by run id.
   c.header('X-Bridge-Mode', req.mode ?? 'byob')
   c.header('X-Run-Id', runId)
+  c.header('X-Run-Request-Digest', run.requestDigest)
 
   // OpenAI's /v1/chat/completions defaults `stream: false` when the field
   // is omitted. Only stream when the caller asked for it (`stream: true`);
@@ -477,25 +534,32 @@ async function respondFromRun(
     // `clientGone` ends THIS reader on a write failure (socket closed). It
     // does NOT cancel the run — that is the whole point of the decoupling.
     let clientGone = false
+    const readerController = new AbortController()
+    stream.onAbort(() => {
+      clientGone = true
+      readerController.abort()
+    })
     const writeRaw = async (chunk: string): Promise<boolean> => {
-      if (clientGone) return false
+      if (clientGone || stream.aborted) return false
       try {
         await stream.write(chunk)
-        return true
+        return !stream.aborted
       } catch {
         clientGone = true
+        readerController.abort()
         return false
       }
     }
     // SSE `id:` carries the per-run seq so the client's next reconnect can
     // send it back as Last-Event-ID and replay exactly what it missed.
     const writeSse = async (data: string, id?: number): Promise<boolean> => {
-      if (clientGone) return false
+      if (clientGone || stream.aborted) return false
       try {
         await stream.writeSSE(id !== undefined ? { data, id: String(id) } : { data })
-        return true
+        return !stream.aborted
       } catch {
         clientGone = true
+        readerController.abort()
         return false
       }
     }
@@ -504,7 +568,7 @@ async function respondFromRun(
     }, heartbeatMs)
     try {
       if (!await writeRaw(': connected\n\n')) return
-      for await (const { seq, delta } of run.attach(afterSeq)) {
+      for await (const { seq, delta } of run.attach(afterSeq, readerController.signal)) {
         if (clientGone) break
         // pump() records a typed pre-output failure and one buffered terminal
         // marker. Replace that marker with one OpenAI error frame so provider
@@ -514,6 +578,8 @@ async function respondFromRun(
           const message = dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr)
           const type = dispatchErr instanceof BackendError
             ? dispatchErr.code
+            : dispatchErr instanceof SandboxBackendUnavailableError
+              ? dispatchErr.code
             : dispatchErr instanceof ModeNotSupportedError
               ? 'mode_not_supported'
               : 'server_error'
@@ -526,13 +592,21 @@ async function respondFromRun(
         // call. SSE comments also count as transport heartbeats.
         const comment = deltaToSseComment(delta)
         if (comment) {
-          if (!await writeRaw(comment)) break
+          // Every buffered delta advances the durable replay cursor, including
+          // liveness and bridge-internal metadata that OpenAI clients should
+          // otherwise ignore. Carry the id on an SSE comment frame so an exact
+          // client can reject a missing sequence instead of silently skipping it.
+          if (!await writeRaw(`id: ${seq}\n${comment}`)) break
           continue
         }
         const chunk = deltaToOpenAIChunk(delta, meta)
         // Metadata-only deltas (e.g. internal_session_id) yield null —
-        // consumed by the run/session store; nothing to write here.
-        if (!chunk) continue
+        // consumed by the run/session store. Emit an id-only comment frame so
+        // the replay sequence remains gap-free without exposing a fake chunk.
+        if (!chunk) {
+          if (!await writeRaw(`id: ${seq}\n: bridge-metadata\n\n`)) break
+          continue
+        }
         // deltaToOpenAIChunk returns a complete "data: …\n\n" line. Strip
         // the framing so streamSSE can re-add it (with the seq as id).
         const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')
@@ -541,7 +615,8 @@ async function respondFromRun(
     } catch (err) {
       if (clientGone) return
       const message = err instanceof Error ? err.message : String(err)
-      await writeSse(JSON.stringify({ error: { message, type: 'server_error' } }))
+      const type = err instanceof RunReplayCursorError ? err.code : 'server_error'
+      await writeSse(JSON.stringify({ error: { message, type } }))
     } finally {
       clearInterval(heartbeat)
     }
@@ -554,14 +629,110 @@ async function* mapSeq(iter: AsyncIterable<{ delta: ChatDelta }>): AsyncIterable
   for await (const { delta } of iter) yield delta
 }
 
-/**
- * Parse a `Last-Event-ID` / `X-Last-Event-Id` reconnect header into a
- * seq. Non-numeric / absent → 0 (replay from the start of the buffer).
- */
-function parseLastEventId(value: string | undefined): number {
-  if (!value) return 0
-  const n = Number.parseInt(value, 10)
-  return Number.isInteger(n) && n >= 0 ? n : 0
+type ParsedHeader<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly message: string }
+
+function resolveRunId(
+  bodyValue: string | undefined,
+  headerValue: string | undefined,
+): ParsedHeader<string> {
+  if (bodyValue !== undefined && headerValue !== undefined && bodyValue !== headerValue) {
+    return { ok: false, message: 'run_id and X-Run-Id must match when both are provided' }
+  }
+  const candidate = bodyValue ?? headerValue ?? crypto.randomUUID()
+  const parsed = durableRunIdSchema.safeParse(candidate)
+  if (!parsed.success) {
+    return { ok: false, message: parsed.error.issues[0]?.message ?? 'invalid run id' }
+  }
+  return { ok: true, value: parsed.data }
+}
+
+function resolveLastEventId(
+  standardValue: string | undefined,
+  aliasValue: string | undefined,
+): ParsedHeader<number> {
+  const parse = (value: string | undefined): ParsedHeader<number | undefined> => {
+    if (value === undefined) return { ok: true, value: undefined }
+    if (!/^(0|[1-9][0-9]*)$/u.test(value)) {
+      return { ok: false, message: 'Last-Event-ID must be a non-negative base-10 integer' }
+    }
+    const parsed = Number(value)
+    if (!Number.isSafeInteger(parsed)) {
+      return { ok: false, message: 'Last-Event-ID exceeds the safe integer range' }
+    }
+    return { ok: true, value: parsed }
+  }
+  const standard = parse(standardValue)
+  if (!standard.ok) return standard
+  const alias = parse(aliasValue)
+  if (!alias.ok) return alias
+  if (
+    standard.value !== undefined &&
+    alias.value !== undefined &&
+    standard.value !== alias.value
+  ) {
+    return {
+      ok: false,
+      message: 'Last-Event-ID and X-Last-Event-Id must match when both are provided',
+    }
+  }
+  return { ok: true, value: standard.value ?? alias.value ?? 0 }
+}
+
+/** Bind a run id to execution semantics, not response representation. `stream` and runtime-owned
+ * materialization fields do not change the backend job and are deliberately excluded. */
+function durableRunRequestDigest(req: ChatRequest, backend: string): string {
+  const {
+    stream: _stream,
+    jailSpec: _jailSpec,
+    profile_materialization_receipt: _materialization,
+    ...executionRequest
+  } = req
+  // The request originated as JSON, but object spreads can reintroduce
+  // optional `undefined` properties. A JSON round trip restores exact wire
+  // semantics before RFC 8785 canonicalization (undefined object fields are
+  // absent; array values retain their JSON form).
+  const normalized = JSON.parse(JSON.stringify({
+    schema: 'cli-bridge.durable-run-request.v1',
+    backend,
+    request: executionRequest,
+  })) as Parameters<typeof canonicalCandidateDigest>[0]
+  return canonicalCandidateDigest(normalized)
+}
+
+function invalidRequest(c: Context, message: string): Response {
+  return c.json({ error: { message, type: 'invalid_request_error' } }, 400)
+}
+
+function runIdentityConflict(c: Context, error: RunIdentityConflictError): Response {
+  return c.json(
+    {
+      error: {
+        message: error.message,
+        type: error.code,
+        run_id: error.runId,
+        expected_request_digest: error.expectedRequestDigest,
+        received_request_digest: error.receivedRequestDigest,
+      },
+    },
+    409,
+  )
+}
+
+function replayCursorError(c: Context, error: RunReplayCursorError): Response {
+  return c.json(
+    {
+      error: {
+        message: error.message,
+        type: error.code,
+        run_id: error.runId,
+        last_event_id: error.lastSeq,
+        first_available_event_id: error.firstAvailableSeq,
+      },
+    },
+    error.reason === 'expired' ? 410 : 409,
+  )
 }
 
 function resolveSseHeartbeatMs(): number {
@@ -609,6 +780,10 @@ function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_
 }
 
 function errorResponse(c: Context, err: unknown): Response {
+  if (err instanceof RunReplayCursorError) return replayCursorError(c, err)
+  if (err instanceof SandboxBackendUnavailableError) {
+    return c.json({ error: { message: err.message, type: err.code } }, 503)
+  }
   if (err instanceof AdmissionRejectedError) {
     return admissionErrorResponse(c, err)
   }
