@@ -37,6 +37,14 @@ import { mountImagesGenerate } from './routes/images-generate.js'
 import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
 import { ContainerPool } from './executors/container-pool.js'
 import { createDockerSpawner } from './executors/docker.js'
+import {
+  buildCommandFor,
+  DockerPreflightError,
+  preflightDockerImage,
+  preflightDockerSlot,
+  type DockerPreflightMount,
+  type DockerPreflightTarget,
+} from './executors/docker-preflight.js'
 import type { Spawner } from './executors/types.js'
 import type { BackendExecutorConfig } from './config.js'
 import { AdmissionGate } from './admission.js'
@@ -57,19 +65,58 @@ export interface BuildAppExtras {
 }
 
 /**
+ * Describe a docker executor for the startup preflight. Kept next to the pool
+ * wiring so the probed configuration is derived from the SAME values the pool
+ * receives — a preflight that reconstructs the config independently can pass
+ * while the real pool is misconfigured.
+ */
+function preflightTargetFor(cfg: BackendExecutorConfig, bin: string): DockerPreflightTarget {
+  const namePrefix = cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`
+  const mounts: DockerPreflightMount[] = cfg.oauthMode === 'per-slot'
+    ? [{ source: `${namePrefix}-oauth-0`, target: cfg.containerConfigDir!, kind: 'volume' }]
+    : [{ source: cfg.hostConfigDir!, target: cfg.containerConfigDir!, kind: 'bind' }]
+  return {
+    backend: cfg.name,
+    envPrefix: cfg.name.toUpperCase(),
+    image: cfg.image!,
+    bin,
+    containerHome: cfg.containerHome ?? '/root',
+    ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
+    ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
+    mounts,
+    buildCommand: buildCommandFor(cfg.image!),
+  }
+}
+
+/**
  * Build a Spawner for a backend, plus the shutdown hook that tears down
  * the underlying container pool when the bridge exits. Returns null when
  * the backend's executor is `host` — backends fall back to their default
  * hostSpawner in that case.
+ *
+ * Order matters. The image/daemon/mount checks run BEFORE provisioning,
+ * because `docker run` against an absent image fails with a message about
+ * pulling from a registry — not the build command the operator needs. The
+ * slot checks run AFTER, against a real pool container, and end by executing
+ * `<bin> --version` in the workdir the executor will cd into. Both throw, so
+ * `startServer` never reaches `serve()` with a configuration that would fail
+ * at first request.
  */
 async function buildExecutorForBackend(
   cfg: BackendExecutorConfig | undefined,
   extras: BuildAppExtras,
+  bin: string,
 ): Promise<Spawner | null> {
   if (!cfg || cfg.kind !== 'docker') return null
   if (!cfg.image || !cfg.poolSize || !cfg.containerConfigDir) {
     throw new Error(`backend ${cfg.name} executor=docker but missing image/poolSize/containerConfigDir`)
   }
+  // Deliberately not switchable off. An operator who needs the bridge up
+  // without a working container runtime wants <NAME>_EXECUTOR=host, not a
+  // bridge that reports ready and fails every request.
+  const target = preflightTargetFor(cfg, bin)
+  const imageFindings = await preflightDockerImage(target)
+  if (imageFindings.length > 0) throw new DockerPreflightError(cfg.name, imageFindings)
   const memory = process.env.BRIDGE_POOL_MEMORY || '4g'
   const cpus = process.env.BRIDGE_POOL_CPUS || '2'
   const maxQueueDepth = parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4)
@@ -103,8 +150,34 @@ async function buildExecutorForBackend(
   )
   registerPoolForMetrics(cfg.name, pool)
   extras.shutdownHooks.push(() => pool.destroy())
+
+  // Probe a real slot: same image, same mounts, same user, same workdir the
+  // executor will use. If this passes, `ok` on /health means the bridge has
+  // demonstrated it can execute a command, not merely that it started.
+  const probeContainer = pool.liveContainerIds()[0]
+  if (!probeContainer) {
+    await pool.destroy()
+    throw new Error(`backend ${cfg.name}: container pool provisioned no usable slots`)
+  }
+  const preflightWarnings: string[] = []
+  const slotFindings = await preflightDockerSlot(target, probeContainer, undefined, preflightWarnings)
+  if (slotFindings.length > 0) {
+    await pool.destroy()
+    throw new DockerPreflightError(cfg.name, slotFindings)
+  }
+  if (!cfg.workspaceRoot) {
+    console.log(
+      `[${cfg.name}-pool] no workspace mounted — requests carrying a cwd will be refused with the ` +
+        `${cfg.name.toUpperCase()}_DOCKER_WORKSPACE_ROOT remedy; cwd-less requests run against the container filesystem`,
+    )
+  }
+  for (const warning of preflightWarnings) console.warn(`[${cfg.name}-pool] WARNING: ${warning}`)
+  console.log(`[${cfg.name}-pool] preflight ok — image, mounts, HOME, workspace, and \`${bin} --version\` all verified in-slot`)
+
   return createDockerSpawner({
     pool,
+    backend: cfg.name,
+    envPrefix: cfg.name.toUpperCase(),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
   })
 }
@@ -132,7 +205,7 @@ export async function buildApp(config: Config): Promise<{
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
   if (config.backends.has('claude')) {
-    const spawner = await buildExecutorForBackend(config.executors.claude, extras)
+    const spawner = await buildExecutorForBackend(config.executors.claude, extras, config.claudeBin)
     registry.register(new ClaudeBackend({
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
@@ -151,7 +224,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('codex')) {
-    const spawner = await buildExecutorForBackend(config.executors.codex, extras)
+    const spawner = await buildExecutorForBackend(config.executors.codex, extras, config.codexBin)
     registry.register(new CodexBackend({
       bin: config.codexBin,
       timeoutMs: config.codexTimeoutMs,
@@ -159,7 +232,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('opencode')) {
-    const spawner = await buildExecutorForBackend(config.executors.opencode, extras)
+    const spawner = await buildExecutorForBackend(config.executors.opencode, extras, config.opencodeBin)
     registry.register(new OpencodeBackend({
       bin: config.opencodeBin,
       timeoutMs: config.opencodeTimeoutMs,
@@ -167,7 +240,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('kimi')) {
-    const spawner = await buildExecutorForBackend(config.executors.kimi, extras)
+    const spawner = await buildExecutorForBackend(config.executors.kimi, extras, config.kimiBin)
     registry.register(new KimiBackend({
       bin: config.kimiBin,
       timeoutMs: config.kimiTimeoutMs,
@@ -176,7 +249,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('gemini')) {
-    const spawner = await buildExecutorForBackend(config.executors.gemini, extras)
+    const spawner = await buildExecutorForBackend(config.executors.gemini, extras, config.geminiBin)
     registry.register(new GeminiBackend({
       bin: config.geminiBin,
       timeoutMs: config.geminiTimeoutMs,
@@ -205,7 +278,7 @@ export async function buildApp(config: Config): Promise<{
     registry.register(new NanoclawBackend({ socketPath: config.nanoclawSocket, timeoutMs: config.cliTimeoutMsDefault }))
   }
   if (config.backends.has('pi')) {
-    const spawner = await buildExecutorForBackend(config.executors.pi, extras)
+    const spawner = await buildExecutorForBackend(config.executors.pi, extras, config.piBin)
     registry.register(new PiBackend({
       bin: config.piBin,
       timeoutMs: config.piTimeoutMs,
@@ -303,7 +376,21 @@ export async function startServer(): Promise<void> {
     throw err
   }
 
-  const { app, sessions, extras } = await buildApp(config)
+  let built
+  try {
+    built = await buildApp(config)
+  } catch (err) {
+    // A preflight failure is an operator message, not a stack trace: it already
+    // contains the observation and the command that fixes it.
+    if (err instanceof DockerPreflightError) {
+      console.error(`[cli-bridge] FATAL: ${err.message}`)
+      instanceLock.release()
+      process.exit(1)
+    }
+    instanceLock.release()
+    throw err
+  }
+  const { app, sessions, extras } = built
   // Drop the lock on hard exit too — graceful shutdown also releases, but
   // a process.exit() path (fatal error) must not strand the pidfile.
   process.once('exit', () => instanceLock.release())

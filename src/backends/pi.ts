@@ -54,6 +54,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -164,34 +165,7 @@ export class PiBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    let release = (): void => {}
-    try {
-      const spawned = await this.spawner(this.opts.bin, ['--version'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      release = spawned.release
-      const child = spawned.child
-      return await new Promise<BackendHealth>((resolve) => {
-        let stdout = ''
-        let stderr = ''
-        child.stdout?.on('data', (b) => { stdout += b.toString() })
-        child.stderr?.on('data', (b) => { stderr += b.toString() })
-        child.on('error', (err) => {
-          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-        })
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-          } else {
-            resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
-          }
-        })
-      })
-    } catch (err) {
-      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
-    } finally {
-      release()
-    }
+    return versionHealth(this.name, this.opts.bin, this.spawner)
   }
 
   async *chat(

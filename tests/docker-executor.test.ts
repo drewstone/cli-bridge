@@ -891,7 +891,7 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     expect(() => loadConfig({
       HOME: '/home/test',
       OPENCODE_DOCKER_NETWORK: 'r391-task-net',
-    })).toThrow(/OPENCODE_DOCKER_NETWORK requires OPENCODE_EXECUTOR=docker/)
+    })).toThrow(/OPENCODE_DOCKER_NETWORK is set but OPENCODE_EXECUTOR is host/)
   })
 
   it('rejects unsafe backend Docker network names', () => {
@@ -912,7 +912,7 @@ describe('per-backend executor config (parseAllExecutors)', () => {
       CLAUDE_DOCKER_USER: '1000:1000',
       CLAUDE_DOCKER_HOME: '/tmp/home',
       CLAUDE_DOCKER_CONTAINER_CONFIG_DIR: '/root/.claude',
-    })).toThrow(/must be a child/)
+    })).toThrow(/CLAUDE_DOCKER_CONTAINER_CONFIG_DIR=\/root\/\.claude is outside CLAUDE_DOCKER_HOME=\/tmp\/home/)
   })
 
   it('loads and canonicalizes an existing Docker workspace directory', () => {
@@ -937,7 +937,7 @@ describe('per-backend executor config (parseAllExecutors)', () => {
       expect(() => loadConfig({
         HOME: '/home/test',
         CLAUDE_DOCKER_WORKSPACE_ROOT: root,
-      })).toThrow(/requires CLAUDE_EXECUTOR=docker/)
+      })).toThrow(/CLAUDE_DOCKER_WORKSPACE_ROOT is set but CLAUDE_EXECUTOR is host/)
       expect(() => loadConfig({
         HOME: '/home/test',
         CLAUDE_EXECUTOR: 'docker',

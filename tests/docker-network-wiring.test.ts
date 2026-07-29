@@ -17,6 +17,16 @@ vi.mock('../src/executors/docker.js', () => ({
   createDockerSpawner: mocks.createSpawner,
 }))
 
+// This test asserts network wiring, not host coherence. The startup preflight
+// probes a real Docker daemon by design, so stub it here — `docker-preflight.test.ts`
+// covers the checks themselves.
+vi.mock('../src/executors/docker-preflight.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/executors/docker-preflight.js')>(
+    '../src/executors/docker-preflight.js',
+  )
+  return { ...actual, preflightDockerImage: async () => [], preflightDockerSlot: async () => [] }
+})
+
 import { loadConfig } from '../src/config.js'
 import { buildApp } from '../src/server.js'
 
@@ -33,7 +43,7 @@ describe('Docker network server wiring', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-network-wiring-'))
     dataDirs.push(dataDir)
     const destroy = vi.fn(async () => {})
-    const pool = { destroy }
+    const pool = { destroy, liveContainerIds: () => ['fake-slot-0'] }
     mocks.createPool.mockResolvedValue(pool)
     mocks.createSpawner.mockReturnValue(async () => {
       throw new Error('not called while building the server')

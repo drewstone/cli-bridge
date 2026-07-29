@@ -26,6 +26,23 @@ import type { JailSpec } from '../jail/index.js'
 /** What the spawner produces. Compatible with node's ChildProcess. */
 export type SpawnedChild = ChildProcess
 
+/**
+ * This executor cannot serve this request as configured — and no retry, backend
+ * or model will change that; an operator has to change a setting.
+ *
+ * Typed rather than a plain Error so the route answers 501 with the message
+ * instead of a generic 500: the distinction the caller needs is "the bridge is
+ * not set up for this" versus "the bridge broke". The message always names the
+ * setting to change.
+ */
+export class ExecutorConfigurationError extends Error {
+  readonly code = 'executor_misconfigured' as const
+  constructor(message: string) {
+    super(message)
+    this.name = 'ExecutorConfigurationError'
+  }
+}
+
 export interface SpawnOpts {
   /** Working directory inside the executor's filesystem. */
   cwd?: string
@@ -75,6 +92,49 @@ export interface SpawnResult {
    * error here to surface it as a BackendError.
    */
   spawnError?(): Error | null
+  /**
+   * Explain a non-zero exit that the EXECUTOR caused rather than the CLI.
+   *
+   * The Docker executor runs the CLI through `docker exec`, which returns 127
+   * both for "the workdir does not exist inside the container" and for "the
+   * binary is not on PATH", and 126 both for "not executable" and "permission
+   * denied". Reporting that status as a CLI exit ("opencode exited 127") states
+   * a CLI failure for a CLI that never started, and points every reader at the
+   * wrong half of the system.
+   *
+   * Implementations probe the container and return a one-line cause + remedy,
+   * or null when the status genuinely came from the CLI — callers then keep
+   * their own wording. Host executors do not implement this; `describeCliExit`
+   * handles its absence.
+   */
+  diagnoseExit?(exitCode: number | null, stderr: string): Promise<string | null>
+}
+
+/**
+ * Build the message for a non-zero CLI exit, giving the executor a chance to
+ * replace an ambiguous status with a named cause first.
+ *
+ * Every subprocess backend ends with the same shape — `<cli> exited <code>:
+ * <stderr>` — and that shape is exactly what turns an executor-level failure
+ * into a CLI-level accusation. Routing all of them through one helper means a
+ * new executor's diagnosis reaches every backend at once, and the fallback is
+ * byte-identical to what each backend printed before.
+ */
+export async function describeCliExit(
+  spawned: Pick<SpawnResult, 'diagnoseExit'>,
+  label: string,
+  exitCode: number | null,
+  stderr: string,
+): Promise<string> {
+  let diagnosis: string | null = null
+  try {
+    diagnosis = (await spawned.diagnoseExit?.(exitCode, stderr)) ?? null
+  } catch {
+    // A diagnosis probe that fails must never replace the real failure with its
+    // own; fall through to the raw exit message.
+  }
+  if (diagnosis) return `${label} could not run: ${diagnosis}`
+  return `${label} exited ${exitCode}: ${stderr.slice(0, 300)}`
 }
 
 export interface Spawner {

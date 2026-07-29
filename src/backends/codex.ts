@@ -27,6 +27,7 @@
 
 import { join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -38,7 +39,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
@@ -62,33 +63,7 @@ export class CodexBackend implements Backend {
   }
 
   async health(): Promise<BackendHealth> {
-    let release = (): void => {}
-    try {
-      const spawned = await this.spawner(this.opts.bin, ['--version'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-      release = spawned.release
-      const child = spawned.child
-      return await new Promise<BackendHealth>((resolve) => {
-        let stdout = ''; let stderr = ''
-        child.stdout?.on('data', (b) => { stdout += b.toString() })
-        child.stderr?.on('data', (b) => { stderr += b.toString() })
-        child.on('error', (err) => {
-          resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-        })
-        child.on('close', (code) => {
-          if (code === 0) {
-            resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
-          } else {
-            resolve({ name: this.name, state: 'error', detail: `exit ${code}: ${stderr.slice(0, 200)}` })
-          }
-        })
-      })
-    } catch (err) {
-      return { name: this.name, state: 'unavailable', detail: (err as Error).message }
-    } finally {
-      release()
-    }
+    return versionHealth(this.name, this.opts.bin, this.spawner)
   }
 
   async *chat(
@@ -254,7 +229,7 @@ export class CodexBackend implements Backend {
         throw new BackendError(`codex: ${sawError}`, 'upstream')
       }
       if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(`codex exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'codex', exitCode, stderr), 'upstream')
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {

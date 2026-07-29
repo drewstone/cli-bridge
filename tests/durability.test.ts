@@ -127,31 +127,14 @@ describe('host executor semaphore', () => {
 })
 
 describe('container pool — snapshot + counters', async () => {
-  // Drive a fake pool by monkey-patching execFile via vi.mock. We're
-  // testing the counter + state-machine code, not docker integration.
+  // Drive the pool through its injected docker runner. This exercises the
+  // counter + state-machine code without faking node's child_process, whose
+  // callback shape the pool is not supposed to depend on.
   beforeEach(() => {
     vi.resetModules()
   })
 
   it('snapshot returns the documented shape', async () => {
-    // Construct via the real module but bypass docker by mocking execFile.
-    vi.doMock('node:child_process', async () => {
-      const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
-      return {
-        ...actual,
-        execFile: (
-          _cmd: string,
-          args: readonly string[],
-          cb: (e: Error | null, out: { stdout: string; stderr: string }) => void,
-        ) => {
-          // `docker run -d ...` returns a fake container id; `docker rm -f`
-          // returns empty. Either path resolves successfully.
-          const isRun = (args as string[]).includes('run')
-          cb(null, { stdout: isRun ? 'fakeid-' + Math.random().toString(36).slice(2) : '', stderr: '' })
-          return undefined as unknown as ReturnType<typeof actual.execFile>
-        },
-      }
-    })
     const { ContainerPool } = await import('../src/executors/container-pool.js')
     const pool = await ContainerPool.create({
       size: 2,
@@ -162,6 +145,11 @@ describe('container pool — snapshot + counters', async () => {
       maxQueueDepth: 4,
       acquireDeadlineMs: 1000,
       slotMaxHoldMs: 60_000,
+      cli: async (args) => ({
+        code: 0,
+        stdout: args.includes('run') ? `fakeid-${Math.random().toString(36).slice(2)}` : '',
+        stderr: '',
+      }),
     })
     const snap = pool.snapshot()
     expect(snap.size).toBe(2)
@@ -173,8 +161,10 @@ describe('container pool — snapshot + counters', async () => {
     expect(typeof snap.queue_full_rejects).toBe('number')
     expect(typeof snap.acquire_timeouts).toBe('number')
     expect(typeof snap.slot_force_releases).toBe('number')
+    expect(typeof snap.slot_reprovisions).toBe('number')
+    expect(typeof snap.slots_marked_dead).toBe('number')
+    expect(typeof snap.slot_liveness_recoveries).toBe('number')
     await pool.destroy()
-    vi.doUnmock('node:child_process')
   })
 })
 

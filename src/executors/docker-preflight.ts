@@ -1,0 +1,416 @@
+/**
+ * Prove a docker-executor configuration COHERENT before the port opens.
+ *
+ * The failure this exists to prevent: the bridge boots, reports backends,
+ * answers /health, accepts requests, and only discovers at first traffic that
+ * the runtime image was never built on this host — then reports it as a missing
+ * *container*. Same shape for a workspace root that is configured but not
+ * mounted, and for a container user whose HOME has neither the credentials nor
+ * a writable state directory.
+ *
+ * Two properties make these checks worth their startup cost:
+ *
+ *   1. They probe the LIVE configuration, not the declared one. Measured on
+ *      this host: `cli-bridge-cli-runtime:latest` lacked
+ *      /home/node/.local/{share,state} even though docker/Dockerfile.cli-runtime
+ *      creates them — the installed image had drifted from its Dockerfile. No
+ *      amount of parse-time validation can see that; only a probe can.
+ *
+ *   2. Every finding carries the command or env var that fixes it. A startup
+ *      failure whose message does not contain its own remedy just moves the
+ *      guessing earlier.
+ *
+ * Split in two phases because they need different preconditions:
+ *   - `preflightDockerImage` runs BEFORE the pool is provisioned (a `docker run`
+ *     against a missing image fails with a message about pulling, which is not
+ *     what the operator needs to read).
+ *   - `preflightDockerSlot` runs AFTER, against a REAL pool slot — the same
+ *     container that will serve traffic, with the same mounts and the same user.
+ *     Its last check runs `<bin> --version` in the workdir the executor will
+ *     actually cd into, so a bridge that reaches "ok" has proven it can execute
+ *     a trivial command.
+ */
+
+import { mkdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { isAbsolute, join, relative, sep } from 'node:path'
+import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
+
+export interface DockerPreflightMount {
+  /** Host path for a bind, or docker volume name for a per-slot volume. */
+  source: string
+  /** Absolute path inside the container. */
+  target: string
+  kind: 'bind' | 'volume'
+}
+
+export interface DockerPreflightTarget {
+  /** Backend name, lowercase: 'opencode', 'claude', … */
+  backend: string
+  /** Env-var prefix used in remedies: 'OPENCODE', 'CLAUDE', … */
+  envPrefix: string
+  image: string
+  /** CLI argv[0] the executor will run inside the container. */
+  bin: string
+  /** Configured numeric identity, or undefined when containers run as the image default. */
+  containerUser?: string | undefined
+  /** HOME the CLI will see inside the container. '/root' when no user is configured. */
+  containerHome: string
+  mounts: DockerPreflightMount[]
+  /** Host directory bind-mounted at the identical path, when configured. */
+  workspaceRoot?: string | undefined
+  /** Command that builds `image`, quoted into remedies. */
+  buildCommand: string
+}
+
+export interface PreflightFinding {
+  /** Stable identifier for the check, e.g. 'runtime-image'. */
+  check: string
+  /** What was observed. */
+  detail: string
+  /** The concrete action that fixes it. */
+  remedy: string
+}
+
+export class DockerPreflightError extends Error {
+  constructor(readonly backend: string, readonly findings: PreflightFinding[]) {
+    super(formatPreflightFailure(backend, findings))
+    this.name = 'DockerPreflightError'
+  }
+}
+
+export function formatPreflightFailure(backend: string, findings: PreflightFinding[]): string {
+  const lines = findings.map((f, i) => `  ${i + 1}. [${f.check}] ${f.detail}\n     fix: ${f.remedy}`)
+  return (
+    `${backend} docker executor is not usable on this host — refusing to open the port ` +
+    `with a configuration that would fail at first request:\n${lines.join('\n')}`
+  )
+}
+
+/** The default runtime-image build command, so callers do not restate it. */
+export const RUNTIME_IMAGE_BUILD_COMMAND = 'pnpm run docker:build:runtime'
+
+export function buildCommandFor(image: string): string {
+  const DEFAULT_IMAGE = 'cli-bridge-cli-runtime:latest'
+  if (image === DEFAULT_IMAGE) return RUNTIME_IMAGE_BUILD_COMMAND
+  return `docker build -f docker/Dockerfile.cli-runtime -t ${image} .`
+}
+
+/**
+ * Phase 1 — daemon reachable, image present, bind sources usable. Returns the
+ * findings rather than throwing so a caller can report every problem at once
+ * instead of making the operator fix them one restart at a time.
+ */
+export async function preflightDockerImage(
+  target: DockerPreflightTarget,
+  cli: DockerCli = dockerCli,
+): Promise<PreflightFinding[]> {
+  const findings: PreflightFinding[] = []
+
+  const version = await cli(['version', '--format', '{{.Server.Version}}'])
+  if (version.code !== 0) {
+    findings.push({
+      check: 'docker-daemon',
+      detail:
+        `${target.envPrefix}_EXECUTOR=docker but the Docker daemon is not reachable ` +
+        `(${firstLine(version.stderr) || version.spawnError || `docker exited ${version.code}`})`,
+      remedy: `start Docker, or set ${target.envPrefix}_EXECUTOR=host to run the CLI on this host instead`,
+    })
+    // Nothing below can be probed without a daemon; report the one real cause.
+    return findings
+  }
+
+  const image = await cli(['image', 'inspect', '--format', '{{.Id}}', target.image])
+  if (image.code !== 0) {
+    findings.push({
+      check: 'runtime-image',
+      detail: `image ${target.image} does not exist on this host, so no pool container can be created`,
+      remedy: `build it: ${target.buildCommand}`,
+    })
+  }
+
+  for (const mount of target.mounts) {
+    if (mount.kind !== 'bind') continue
+    findings.push(...checkBindSource(target, mount))
+  }
+
+  return findings
+}
+
+function checkBindSource(target: DockerPreflightTarget, mount: DockerPreflightMount): PreflightFinding[] {
+  if (!isAbsolute(mount.source)) {
+    return [{
+      check: 'mount-source',
+      detail: `bind source ${mount.source} (mounted at ${mount.target}) is not an absolute path`,
+      remedy: `set ${target.envPrefix}_DOCKER_HOST_CONFIG_DIR to an absolute host path`,
+    }]
+  }
+  try {
+    const st = statSync(mount.source)
+    if (!st.isDirectory()) {
+      return [{
+        check: 'mount-source',
+        detail: `bind source ${mount.source} (mounted at ${mount.target}) exists but is not a directory`,
+        remedy:
+          `Docker would mount it as a file and the CLI would not find its credentials — point ` +
+          `${target.envPrefix}_DOCKER_HOST_CONFIG_DIR at a directory`,
+      }]
+    }
+    return []
+  } catch {
+    // Absent is recoverable: Docker would create it as an empty root-owned
+    // directory, which loses the operator's credentials silently. Create it
+    // here so ownership is the invoking user's and the loss is visible.
+    try {
+      mkdirSync(mount.source, { recursive: true })
+      return []
+    } catch (err) {
+      return [{
+        check: 'mount-source',
+        detail:
+          `bind source ${mount.source} (mounted at ${mount.target}) does not exist and cannot be created ` +
+          `(${err instanceof Error ? err.message : String(err)})`,
+        remedy: `create it, or point ${target.envPrefix}_DOCKER_HOST_CONFIG_DIR at an existing directory`,
+      }]
+    }
+  }
+}
+
+/**
+ * Phase 2 — probe a real, provisioned slot. Checks, in dependency order:
+ * identity/HOME agreement, HOME writability for the CLI's state directory,
+ * credential mounts landing inside that HOME and being readable, the workspace
+ * bind proven live by a marker round-trip, the CLI resolving on PATH, and
+ * finally a trivial execution in the real workdir.
+ */
+export async function preflightDockerSlot(
+  target: DockerPreflightTarget,
+  containerId: string,
+  cli: DockerCli = dockerCli,
+  /** Sink for conditions worth saying but not worth refusing to start over. */
+  warnings: string[] = [],
+): Promise<PreflightFinding[]> {
+  const findings: PreflightFinding[] = []
+
+  // --- identity + HOME agreement -----------------------------------------
+  const identity = await cli(containerShell(containerId, 'printf "%s\\n%s\\n%s" "$(id -u)" "$(id -g)" "$HOME"'))
+  if (identity.code !== 0) {
+    return [{
+      check: 'container-exec',
+      detail: `cannot exec into freshly provisioned container ${containerId.slice(0, 12)} (${firstLine(identity.stderr)})`,
+      remedy: 'check the Docker daemon and whether something outside the bridge is removing containers',
+    }]
+  }
+  const [uid = '', gid = '', home = ''] = identity.stdout.split('\n')
+  if (target.containerUser && `${uid}:${gid}` !== target.containerUser) {
+    findings.push({
+      check: 'container-user',
+      detail:
+        `${target.envPrefix}_DOCKER_USER=${target.containerUser} but processes inside the container run as ` +
+        `${uid}:${gid}`,
+      remedy: `set ${target.envPrefix}_DOCKER_USER=${uid}:${gid}, or use an image whose default user is ${target.containerUser}`,
+    })
+  }
+  if (home.trim() !== target.containerHome) {
+    findings.push({
+      check: 'container-home',
+      detail:
+        `the CLI inside the container sees HOME=${home.trim() || '(unset)'} but the bridge mounts credentials ` +
+        `against ${target.containerHome}`,
+      remedy:
+        `set ${target.envPrefix}_DOCKER_HOME=${home.trim() || '/root'} so credential mounts land where the CLI reads them`,
+    })
+  }
+
+  // --- HOME is writable for CLI state ------------------------------------
+  // The measured failure: a bind target under $HOME whose parents did not exist
+  // in the image makes Docker create them root-owned, after which a non-root CLI
+  // cannot mkdir beside them and reports EACCES on an unrelated path
+  // ($HOME/.local/state). Probe the exact directories a CLI initializes.
+  const stateProbe = await cli(containerShell(
+    containerId,
+    'set -e; for d in "$HOME" "$HOME/.local/state" "$HOME/.local/share" "$HOME/.config" "$HOME/.cache"; do ' +
+    'mkdir -p "$d" 2>&1 || { echo "MKDIR_FAILED $d"; ls -ld "$d" "$(dirname "$d")" 2>&1; exit 3; }; done; ' +
+    'probe="$HOME/.local/state/.cli-bridge-preflight"; : > "$probe" || { echo "WRITE_FAILED $probe"; exit 4; }; ' +
+    'rm -f "$probe"; echo HOME_WRITABLE',
+  ))
+  if (stateProbe.code !== 0 || !stateProbe.stdout.includes('HOME_WRITABLE')) {
+    findings.push({
+      check: 'home-writable',
+      detail:
+        `HOME=${target.containerHome} is not writable inside the container for ` +
+        `${target.containerUser ?? 'the image default user'}: ${compact(stateProbe.stdout + ' ' + stateProbe.stderr)}`,
+      remedy:
+        `rebuild the runtime image so ${target.containerHome} and its XDG subdirectories exist and are owned by ` +
+        `that user (${target.buildCommand}), or set ${target.envPrefix}_DOCKER_HOME to a directory that user owns`,
+    })
+  }
+
+  // --- credential mounts land inside HOME and are readable ---------------
+  for (const mount of target.mounts) {
+    if (target.containerUser && !isInside(target.containerHome, mount.target)) {
+      findings.push({
+        check: 'auth-mount-home',
+        detail:
+          `credentials are mounted at ${mount.target} but the CLI runs as ${target.containerUser} with ` +
+          `HOME=${target.containerHome}, so it never looks there`,
+        remedy:
+          `set ${target.envPrefix}_DOCKER_CONTAINER_CONFIG_DIR to a path under ${target.containerHome}, or unset ` +
+          `${target.envPrefix}_DOCKER_USER/${target.envPrefix}_DOCKER_HOME to run as the image's root identity`,
+      })
+      continue
+    }
+    const readable = await cli(containerShell(containerId, `test -r ${shellQuote(mount.target)} && test -x ${shellQuote(mount.target)}`))
+    if (readable.code !== 0) {
+      const owner = await cli(containerShell(containerId, `ls -ld ${shellQuote(mount.target)} 2>&1; id`))
+      findings.push({
+        check: 'auth-mount-readable',
+        detail:
+          `credential mount ${mount.target} is not readable by the user the CLI runs as ` +
+          `(${compact(owner.stdout)})`,
+        remedy:
+          target.containerUser
+            ? `chown the host directory ${mount.source} to uid ${target.containerUser.split(':')[0]}, or unset ` +
+              `${target.envPrefix}_DOCKER_USER so the CLI runs as the image's root identity`
+            : `check permissions on the host directory ${mount.source}`,
+      })
+    }
+  }
+
+  // --- the workspace bind is proven LIVE at the exec path ----------------
+  if (target.workspaceRoot) {
+    findings.push(...(await checkWorkspaceMount(target, containerId, cli)))
+  }
+
+  // --- the CLI resolves for that user ------------------------------------
+  // Note deliberately NOT a finding: an empty credential mount is legitimate on
+  // a first run (the operator logs in inside the container). It is still worth
+  // saying out loud, because the resulting failure is a model-shaped one — the
+  // CLI starts, authenticates against nothing, and the caller sees an empty
+  // completion rather than "there are no credentials in <dir>".
+  for (const mount of target.mounts) {
+    if (mount.kind !== 'bind') continue
+    const listing = await cli(containerShell(containerId, `ls -A ${shellQuote(mount.target)} 2>/dev/null | head -1`))
+    if (listing.code === 0 && listing.stdout.trim() === '') {
+      warnings.push(
+        `${target.backend}: credential mount ${mount.source} -> ${mount.target} is EMPTY. ` +
+        `${target.bin} will start but have nothing to authenticate with, which surfaces as an empty completion ` +
+        `rather than an auth error. Log in on the host (state lands in ${mount.source}), or run ` +
+        `\`docker exec -it <slot> ${target.bin} auth login\`.`,
+      )
+    }
+  }
+
+  const which = await cli(containerShell(containerId, `command -v ${shellQuote(target.bin)} || exit 1`))
+  const resolved = which.stdout.trim()
+  if (which.code !== 0 || !resolved) {
+    findings.push({
+      check: 'cli-binary',
+      detail: `${target.bin} is not on PATH inside ${target.image} for ${target.containerUser ?? 'the image default user'}`,
+      remedy: `rebuild the image with that CLI installed (${target.buildCommand}), or set ${target.envPrefix}_DOCKER_IMAGE to an image that has it`,
+    })
+  }
+
+  // --- a trivial command actually executes, in the real workdir ----------
+  // Skipped only when an earlier finding already explains why it cannot work,
+  // so the operator reads the cause rather than a second symptom of it.
+  if (findings.length === 0) {
+    const execArgs = ['exec']
+    if (target.workspaceRoot) execArgs.push('--workdir', target.workspaceRoot)
+    execArgs.push(containerId, target.bin, '--version')
+    const trivial = await cli(execArgs, { timeoutMs: 60_000 })
+    if (trivial.code !== 0) {
+      findings.push({
+        check: 'trivial-exec',
+        detail:
+          `\`${target.bin} --version\` failed inside the pool container ` +
+          `(exit ${trivial.code}${target.workspaceRoot ? ` with --workdir ${target.workspaceRoot}` : ''}): ` +
+          `${compact(trivial.stderr + ' ' + trivial.stdout).slice(0, 400)}`,
+        remedy:
+          `run \`docker exec ${target.workspaceRoot ? `-w ${target.workspaceRoot} ` : ''}<slot> ${target.bin} --version\` ` +
+          `against a pool container to reproduce, then rebuild the image (${target.buildCommand}) if the CLI is broken inside it`,
+      })
+    }
+  }
+
+  return findings
+}
+
+/**
+ * Prove the bind by round-tripping a marker: write it on the host inside the
+ * workspace root, read it back at the SAME absolute path inside the container.
+ * `test -d` alone would pass on a path that merely exists in the image — which
+ * is exactly how an unmounted workspace stays invisible until traffic arrives.
+ */
+async function checkWorkspaceMount(
+  target: DockerPreflightTarget,
+  containerId: string,
+  cli: DockerCli,
+): Promise<PreflightFinding[]> {
+  const workspaceRoot = target.workspaceRoot!
+  const markerName = `.cli-bridge-preflight-${randomBytes(6).toString('hex')}`
+  const hostMarker = join(workspaceRoot, markerName)
+  const containerMarker = `${workspaceRoot}/${markerName}`
+  const token = randomBytes(8).toString('hex')
+  try {
+    writeFileSync(hostMarker, token)
+  } catch (err) {
+    return [{
+      check: 'workspace-writable',
+      detail: `${target.envPrefix}_DOCKER_WORKSPACE_ROOT=${workspaceRoot} is not writable on the host (${err instanceof Error ? err.message : String(err)})`,
+      remedy: `point ${target.envPrefix}_DOCKER_WORKSPACE_ROOT at a directory this process can write`,
+    }]
+  }
+  try {
+    const readback = await cli(['exec', '--workdir', workspaceRoot, containerId, 'cat', containerMarker])
+    if (readback.code !== 0 || readback.stdout.trim() !== token) {
+      return [{
+        check: 'workspace-mounted',
+        detail:
+          `${target.envPrefix}_DOCKER_WORKSPACE_ROOT=${workspaceRoot} is configured but is NOT mounted into the pool ` +
+          `container at that path — the executor would cd into a directory that does not exist and docker would ` +
+          `report exit 127, the same status as "command not found" ` +
+          `(${firstLine(readback.stderr) || `read back ${JSON.stringify(readback.stdout.slice(0, 60))}`})`,
+        remedy:
+          `this indicates the pool did not receive the workspace bind; verify with ` +
+          `\`docker inspect --format '{{json .Mounts}}' ${containerId.slice(0, 12)}\` and report it as a bridge bug`,
+      }]
+    }
+    // The writability check the CLI actually depends on: it writes INTO the
+    // workspace, and a read-only bind would fail only once a tool call runs.
+    const writeBack = await cli(containerShell(containerId, `: > ${shellQuote(`${containerMarker}.rw`)} && rm -f ${shellQuote(`${containerMarker}.rw`)}`))
+    if (writeBack.code !== 0) {
+      return [{
+        check: 'workspace-writable-in-container',
+        detail:
+          `${workspaceRoot} is mounted into the container but not writable by ` +
+          `${target.containerUser ?? 'the image default user'} (${compact(writeBack.stderr)})`,
+        remedy:
+          target.containerUser
+            ? `chown ${workspaceRoot} on the host to uid ${target.containerUser.split(':')[0]}, or unset ${target.envPrefix}_DOCKER_USER`
+            : `check host permissions on ${workspaceRoot}`,
+      }]
+    }
+    return []
+  } finally {
+    try { rmSync(hostMarker, { force: true }) } catch { /* best-effort */ }
+  }
+}
+
+/** True when `child` is `parent` or lives beneath it. */
+export function isInside(parent: string, child: string): boolean {
+  const rel = relative(parent, child)
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
+}
+
+function firstLine(text: string): string {
+  return text.split('\n').map((l) => l.trim()).find(Boolean) ?? ''
+}
+
+function compact(text: string): string {
+  return text.split('\n').map((l) => l.trim()).filter(Boolean).join(' ')
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/gu, `'\\''`)}'`
+}
