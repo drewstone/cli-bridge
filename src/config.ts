@@ -351,6 +351,7 @@ const KNOWN_DOCKER_SUFFIXES = [
   'POOL_SIZE',
   'OAUTH_MOUNT',
   'NAME_PREFIX',
+  'HOST_HOME',
   'HOST_CONFIG_DIR',
   'CONTAINER_CONFIG_DIR',
   'WORKSPACE_ROOT',
@@ -394,7 +395,22 @@ function parseAllExecutors(env: NodeJS.ProcessEnv, dataDir: string): Record<stri
       cfg.poolSize = parsePositiveInt(env[`${upper}_DOCKER_POOL_SIZE`], 4)
       cfg.oauthMode = parseOauthMode(`${upper}_DOCKER_OAUTH_MOUNT`, env[`${upper}_DOCKER_OAUTH_MOUNT`], 'share')
       cfg.namePrefix = env[`${upper}_DOCKER_NAME_PREFIX`] ?? `cli-bridge-${name}-pool`
-      const hostBase = env.HOME ?? DEFAULT_CONTAINER_HOME
+      // The host directory treated as this CLI's home for credential purposes.
+      // One knob for the whole mount set, because the set only makes sense
+      // together: it is one CLI's home seen from the host and from the container.
+      // Needed because the credential/state directory is also where the CLI keeps
+      // its database — measured, ~/.local/share/opencode/opencode.db is 36 GB on
+      // this host — so an operator has to be able to point the pool at a prepared
+      // directory instead of the personal one.
+      const hostHomeKey = `${upper}_DOCKER_HOST_HOME`
+      const rawHostHome = env[hostHomeKey]?.trim()
+      if (rawHostHome !== undefined && rawHostHome !== '' && !isAbsolute(rawHostHome)) {
+        throw new Error(
+          `${hostHomeKey}=${rawHostHome} must be an absolute host path: it is bind-mounted into every pool ` +
+            `container, and a relative path would resolve against whatever directory the bridge was started in.`,
+        )
+      }
+      const hostBase = rawHostHome || env.HOME || DEFAULT_CONTAINER_HOME
       cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.configRel}`)
       if (rawNetwork !== undefined && rawNetwork !== '') {
         cfg.network = assertDockerNetworkName(rawNetwork, networkKey)
