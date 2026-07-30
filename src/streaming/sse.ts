@@ -126,7 +126,12 @@ export async function collectNonStreaming(
   let content = ''
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = []
   let finishReason: string | null = null
-  let usage: ChatDelta['usage']
+  let inputTokens = 0
+  let outputTokens = 0
+  let cost = 0
+  let sawUsage = false
+  let costKnown = true
+  let estimated = false
   let profileMaterialization: ChatDelta['profile_materialization']
   let error: ChatDelta['error']
 
@@ -137,20 +142,27 @@ export async function collectNonStreaming(
     if (d.content) content += d.content
     if (d.tool_calls) toolCalls.push(...d.tool_calls)
     if (d.finish_reason) finishReason = d.finish_reason
-    if (d.usage) usage = d.usage
+    if (d.usage) {
+      sawUsage = true
+      inputTokens += d.usage.input_tokens ?? 0
+      outputTokens += d.usage.output_tokens ?? 0
+      if (d.usage.cost === undefined) costKnown = false
+      else cost += d.usage.cost
+      estimated ||= d.usage.estimated === true
+    }
     if (d.profile_materialization) profileMaterialization = d.profile_materialization
     if (d.error) error = d.error
   }
 
-  // Usage (estimated or measured) is produced upstream in the run source, so
-  // here we only normalise to the OpenAI shape, preserving the `estimated` flag.
-  const usageOut = usage
+  // Usage receipts are incremental. Summing here gives non-streaming callers
+  // the same total a streaming consumer obtains by folding each usage chunk.
+  const usageOut = sawUsage
     ? {
-        prompt_tokens: usage.input_tokens ?? 0,
-        completion_tokens: usage.output_tokens ?? 0,
-        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
-        ...(usage.cost !== undefined ? { cost: usage.cost } : {}),
-        ...(usage.estimated ? { estimated: true } : {}),
+        prompt_tokens: inputTokens,
+        completion_tokens: outputTokens,
+        total_tokens: inputTokens + outputTokens,
+        ...(costKnown ? { cost } : {}),
+        ...(estimated ? { estimated: true } : {}),
       }
     : undefined
 

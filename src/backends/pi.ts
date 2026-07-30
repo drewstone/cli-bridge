@@ -42,7 +42,7 @@
  *      "toolCall":{...} }}
  *   {"type":"tool_execution_start","toolCallId":"...","toolName":"...","args":{...}}
  *   {"type":"turn_end","message":{"usage":{...}}}
- *   {"type":"agent_end"}
+ *   {"type":"agent_end","messages":[...]}
  *
  * We surface text_delta as ChatDelta.content and pi tool-call lifecycle events
  * as OpenAI-shaped tool_calls so downstream trace consumers can observe native
@@ -260,7 +260,7 @@ export class PiBackend implements Backend {
       let emittedContent = false
       let emittedToolCall = false
       let sawError: string | null = null
-      let usage: { input?: number; output?: number } | undefined
+      let emittedTurnUsage = false
       const piToolCalls = new PiToolCallTracker()
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
@@ -307,18 +307,26 @@ export class PiBackend implements Backend {
           continue
         }
 
-        // Final turn_end / agent_end carries usage when pi reports it.
-        // Different pi versions have emitted usage on the event itself,
-        // on `message.usage`, or on `partial.usage`; accept all three
-        // shapes so backend-integrity guards see real token activity.
-        if (type === 'turn_end' || type === 'agent_end') {
-          const message = ev.message as Record<string, unknown> | undefined
-          const partial = ev.partial as Record<string, unknown> | undefined
-          const u = (ev.usage ?? message?.usage ?? partial?.usage) as
-            | Record<string, number>
-            | undefined
-          if (u) {
-            usage = { input: Number(u.input ?? u.prompt_tokens ?? 0), output: Number(u.output ?? u.completion_tokens ?? 0) }
+        // Pi 0.75.5 emits one turn_end.message.usage receipt for every
+        // model call. Emit it immediately: retaining only the last receipt
+        // undercounts tool loops, while waiting for agent_end loses every
+        // completed call when the outer run is cancelled.
+        if (type === 'turn_end') {
+          const receipt = piUsageReceipt(ev)
+          if (receipt) {
+            emittedTurnUsage = true
+            yield { usage: receipt }
+          }
+          continue
+        }
+
+        // Older Pi versions have put an aggregate on agent_end. It is a
+        // fallback only: once any per-turn receipt was emitted, replaying an
+        // agent aggregate would bill the same calls twice.
+        if (type === 'agent_end') {
+          if (!emittedTurnUsage) {
+            const fallback = piUsageReceipt(ev)
+            if (fallback) yield { usage: fallback }
           }
           continue
         }
@@ -394,7 +402,6 @@ export class PiBackend implements Backend {
 
       yield {
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
-        ...(usage ? { usage: { input_tokens: usage.input, output_tokens: usage.output } } : {}),
       }
     } finally {
       clearTimeout(timeoutHandle)
@@ -423,6 +430,29 @@ export class PiBackend implements Backend {
     }
     return parts.join('\n\n')
   }
+}
+
+function piUsageReceipt(ev: Record<string, unknown>): NonNullable<ChatDelta['usage']> | undefined {
+  const message = ev.message as Record<string, unknown> | undefined
+  const partial = ev.partial as Record<string, unknown> | undefined
+  const usage = (ev.usage ?? message?.usage ?? partial?.usage) as
+    | Record<string, unknown>
+    | undefined
+  if (!usage) return undefined
+
+  const input = piTokenCount(usage.input ?? usage.prompt_tokens)
+  const output = piTokenCount(usage.output ?? usage.completion_tokens)
+  if (input === undefined && output === undefined) return undefined
+  return {
+    input_tokens: input ?? 0,
+    output_tokens: output ?? 0,
+  }
+}
+
+function piTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined
 }
 
 /**
