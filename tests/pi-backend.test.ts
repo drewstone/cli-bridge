@@ -260,6 +260,11 @@ describe('PiBackend', () => {
       })).status).toBe(200)
       expect(argv[1]).not.toContain('--no-session')
       expect(argv[1]).not.toContain('--session')
+      const createdSessionFlag = argv[1]?.indexOf('--session-id') ?? -1
+      expect(createdSessionFlag).toBeGreaterThanOrEqual(0)
+      expect(argv[1]?.[createdSessionFlag + 1]).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+      )
       expect(sessions.get('discovery-run', 'pi')).toMatchObject({
         internalId: 'created-pi-session',
         turns: 1,

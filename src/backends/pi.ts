@@ -51,6 +51,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -274,9 +275,14 @@ export class PiBackend implements Backend {
     if (spec.model) args.push('--model', spec.model)
     if (session?.internalId) {
       args.push('--session', session.internalId)
+    } else if (req.session_id) {
+      // Pi's implicit persistent-session path drops request-scoped system
+      // prompt overrides while creating the first session. Give Pi an explicit
+      // internal id so the first turn uses the profile and report that id back
+      // through the normal session event for subsequent `--session` resumes.
+      args.push('--session-id', randomUUID())
     } else if (!req.session_id) {
-      // A caller-owned id without a mapping needs Pi's default persistent
-      // session creation; only a truly anonymous call is stateless.
+      // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
     const thinking = thinkingFlagForEffort(req.effort ?? profile?.model?.reasoningEffort)
