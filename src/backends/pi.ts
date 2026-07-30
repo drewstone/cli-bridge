@@ -105,6 +105,20 @@ function thinkingFlagForEffort(effort?: string): string | null {
   return allowed.has(e) ? e : null
 }
 
+function resolveReasoningEffort(
+  req: ChatRequest,
+  profile: ReturnType<typeof resolveAgentProfile>,
+): ChatRequest['effort'] {
+  const profileEffort = profile?.model?.reasoningEffort
+  if (profileEffort && req.effort && profileEffort !== req.effort) {
+    throw new BackendError(
+      `request effort ${JSON.stringify(req.effort)} conflicts with agent_profile.model.reasoningEffort ${JSON.stringify(profileEffort)}`,
+      'parse_error',
+    )
+  }
+  return profileEffort ?? req.effort
+}
+
 /**
  * Translate the handled `extensions.pi.load` control into an exact extension
  * set. This is the provider-specific half that the shared profile materializer
@@ -285,7 +299,7 @@ export class PiBackend implements Backend {
       // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
-    const thinking = thinkingFlagForEffort(req.effort ?? profile?.model?.reasoningEffort)
+    const thinking = thinkingFlagForEffort(resolveReasoningEffort(req, profile))
     if (thinking) args.push('--thinking', thinking)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
@@ -502,12 +516,18 @@ export class PiBackend implements Backend {
     }
   }
 
-  /** Compose a single prompt string from the request's messages. */
+  /** Preserve a single task exactly; serialize only genuine multi-message input. */
   private buildPrompt(req: ChatRequest): string {
+    const messages = req.messages.flatMap((message) => {
+      const text = contentToText(message.content)
+      return text ? [{ message, text }] : []
+    })
+    if (messages.length === 1 && messages[0]?.message.role === 'user') {
+      return messages[0].text
+    }
+
     const parts: string[] = []
-    for (const msg of req.messages) {
-      const text = contentToText(msg.content)
-      if (!text) continue
+    for (const { message: msg, text } of messages) {
       const prefix = msg.role === 'system' ? 'System: '
         : msg.role === 'user' ? 'User: '
         : msg.role === 'assistant' ? 'Assistant: '
