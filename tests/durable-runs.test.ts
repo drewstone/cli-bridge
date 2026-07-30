@@ -114,6 +114,59 @@ class ControlledCancelBackend extends TestBackend {
   }
 }
 
+class SerializedSessionBackend extends TestBackend {
+  calls = 0
+  active = 0
+  maxActive = 0
+  readonly observedInternalIds: Array<string | null> = []
+  private readonly releases = new Map<number, () => void>()
+
+  async *chat(
+    _req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    const call = ++this.calls
+    this.observedInternalIds.push(session?.internalId ?? null)
+    this.active += 1
+    this.maxActive = Math.max(this.maxActive, this.active)
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = (): void => {
+          this.releases.delete(call)
+          signal.removeEventListener('abort', onAbort)
+        }
+        const onAbort = (): void => {
+          cleanup()
+          reject(new BackendError('cancelled by test', 'aborted'))
+        }
+        this.releases.set(call, () => {
+          cleanup()
+          resolve()
+        })
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) onAbort()
+      })
+      yield { internal_session_id: `internal-${call}` }
+      yield { content: `call-${call}` }
+      yield {
+        finish_reason: 'stop',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }
+    } finally {
+      this.active -= 1
+    }
+  }
+
+  release(call: number): boolean {
+    const release = this.releases.get(call)
+    if (!release) return false
+    release()
+    return true
+  }
+}
+
 class ChildProcessBackend extends TestBackend {
   child: ChildProcess | null = null
   abortObserved = false
@@ -243,6 +296,169 @@ describe('durable run contract', () => {
       expect(admission.snapshot()).toMatchObject({ active: 0, queued: 0 })
     } finally {
       backend.finish()
+      ctx.cleanup()
+    }
+  })
+
+  it('serializes distinct creators across the complete session state transition', async () => {
+    const backend = new SerializedSessionBackend()
+    const ctx = fixture(backend)
+    const sessionId = 'shared-session'
+    ctx.sessions.upsert({
+      externalId: sessionId,
+      backend: backend.name,
+      internalId: 'base',
+    })
+
+    try {
+      const first = await postChat(ctx.app, {
+        ...chatBody('serialized-first'),
+        session_id: sessionId,
+      })
+      const firstText = first.text()
+      await waitFor(() => backend.calls === 1)
+
+      const secondResponse = postChat(ctx.app, {
+        ...chatBody('serialized-second'),
+        session_id: sessionId,
+      })
+      await waitFor(() => ctx.runs.get('serialized-second') !== undefined)
+      await delay(25)
+
+      expect(backend.calls).toBe(1)
+      expect(backend.active).toBe(1)
+      expect(backend.maxActive).toBe(1)
+      expect(backend.observedInternalIds).toEqual(['base'])
+
+      expect(backend.release(1)).toBe(true)
+      await firstText
+      const second = await secondResponse
+      const secondText = second.text()
+      await waitFor(() => backend.calls === 2)
+
+      expect(backend.maxActive).toBe(1)
+      expect(backend.observedInternalIds).toEqual(['base', 'internal-1'])
+
+      expect(backend.release(2)).toBe(true)
+      await secondText
+      expect(ctx.sessions.get(sessionId, backend.name)).toMatchObject({
+        internalId: 'internal-2',
+        turns: 3,
+      })
+    } finally {
+      backend.release(1)
+      backend.release(2)
+      ctx.cleanup()
+    }
+  })
+
+  it('attaches an identical retry before the session queue and removes a cancelled waiter', async () => {
+    const backend = new SerializedSessionBackend()
+    const ctx = fixture(backend)
+    const sessionId = 'cancelled-waiter-session'
+    ctx.sessions.upsert({
+      externalId: sessionId,
+      backend: backend.name,
+      internalId: 'base',
+    })
+
+    try {
+      const holder = await postChat(ctx.app, {
+        ...chatBody('session-holder'),
+        session_id: sessionId,
+      })
+      const holderText = holder.text()
+      await waitFor(() => backend.calls === 1)
+
+      const queuedBody = {
+        ...chatBody('session-queued'),
+        session_id: sessionId,
+      }
+      const queuedCreator = postChat(ctx.app, queuedBody)
+      await waitFor(() => ctx.runs.get('session-queued') !== undefined)
+
+      // If retries entered session serialization before RunRegistry attachment,
+      // this response would remain blocked behind the holder as another creator.
+      const retry = await Promise.race([
+        postChat(ctx.app, queuedBody),
+        delay(500).then(() => {
+          throw new Error('identical retry waited on session serialization')
+        }),
+      ])
+      const retryText = retry.text()
+      await delay(25)
+      expect(backend.calls).toBe(1)
+
+      const cancelled = await ctx.app.request(
+        '/v1/runs/session-queued/cancel?wait_ms=2000',
+        { method: 'POST' },
+      )
+      expect(cancelled.status).toBe(200)
+      await expect(cancelled.json()).resolves.toMatchObject({
+        cancelled: true,
+        terminal: true,
+        run: { status: 'cancelled' },
+      })
+
+      const creatorResponse = await queuedCreator
+      expect(creatorResponse.status).toBe(504)
+      await retryText
+      expect(backend.calls).toBe(1)
+
+      expect(backend.release(1)).toBe(true)
+      await holderText
+
+      const successor = await postChat(ctx.app, {
+        ...chatBody('session-successor'),
+        session_id: sessionId,
+      })
+      const successorText = successor.text()
+      await waitFor(() => backend.calls === 2)
+      expect(backend.observedInternalIds).toEqual(['base', 'internal-1'])
+      expect(backend.maxActive).toBe(1)
+
+      expect(backend.release(2)).toBe(true)
+      await successorText
+      expect(ctx.sessions.get(sessionId, backend.name)).toMatchObject({
+        internalId: 'internal-2',
+        turns: 3,
+      })
+    } finally {
+      backend.release(1)
+      backend.release(2)
+      ctx.cleanup()
+    }
+  })
+
+  it('releases session ownership when setup fails before dispatch', async () => {
+    const backend = new SerializedSessionBackend()
+    const ctx = fixture(backend)
+    const sessionId = 'setup-failure-session'
+
+    try {
+      const failed = await postChat(ctx.app, {
+        ...chatBody('session-setup-failure'),
+        session_id: sessionId,
+        execution: { kind: 'sandbox' },
+      })
+      expect(failed.status).toBe(503)
+      expect(backend.calls).toBe(0)
+
+      const successor = await postChat(ctx.app, {
+        ...chatBody('session-after-setup-failure'),
+        session_id: sessionId,
+      })
+      const successorText = successor.text()
+      await waitFor(() => backend.calls === 1)
+
+      expect(backend.release(1)).toBe(true)
+      await successorText
+      expect(ctx.sessions.get(sessionId, backend.name)).toMatchObject({
+        internalId: 'internal-1',
+        turns: 1,
+      })
+    } finally {
+      backend.release(1)
       ctx.cleanup()
     }
   })

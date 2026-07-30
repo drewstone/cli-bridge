@@ -26,8 +26,31 @@ export interface SessionRecord {
   metadata: Record<string, unknown>
 }
 
+export interface SessionExecutionLease {
+  release(): void
+}
+
+export class SessionExecutionAbortedError extends Error {
+  constructor() {
+    super('session execution was cancelled while waiting for the previous turn')
+    this.name = 'SessionExecutionAbortedError'
+  }
+}
+
+interface SessionExecutionWaiter {
+  readonly signal?: AbortSignal
+  readonly resolve: (lease: SessionExecutionLease) => void
+  readonly reject: (error: SessionExecutionAbortedError) => void
+  onAbort?: () => void
+}
+
+interface SessionExecutionLane {
+  readonly waiters: SessionExecutionWaiter[]
+}
+
 export class SessionStore {
   private db: Database.Database
+  private readonly executionLanes = new Map<string, SessionExecutionLane>()
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true })
@@ -56,6 +79,46 @@ export class SessionStore {
     ).get(externalId, backend) as Record<string, unknown> | undefined
     if (!row) return null
     return this.hydrate(row)
+  }
+
+  /**
+   * Own one session's read → execute → update interval.
+   *
+   * The durable run registry handles duplicate run ids before this method is
+   * called. This queue only orders distinct creators that would otherwise read
+   * the same resume id and overwrite each other's next state.
+   */
+  acquireExecution(
+    externalId: string,
+    backend: string,
+    signal?: AbortSignal,
+  ): Promise<SessionExecutionLease> {
+    if (signal?.aborted) {
+      return Promise.reject(new SessionExecutionAbortedError())
+    }
+
+    const key = JSON.stringify([backend, externalId])
+    const lane = this.executionLanes.get(key)
+    if (!lane) {
+      const created: SessionExecutionLane = { waiters: [] }
+      this.executionLanes.set(key, created)
+      return Promise.resolve(this.executionLease(key, created))
+    }
+
+    return new Promise<SessionExecutionLease>((resolve, reject) => {
+      const waiter: SessionExecutionWaiter = { signal, resolve, reject }
+      const onAbort = (): void => {
+        const index = lane.waiters.indexOf(waiter)
+        if (index === -1) return
+        lane.waiters.splice(index, 1)
+        signal?.removeEventListener('abort', onAbort)
+        reject(new SessionExecutionAbortedError())
+      }
+      waiter.onAbort = onAbort
+      lane.waiters.push(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
+    })
   }
 
   upsert(args: {
@@ -120,7 +183,39 @@ export class SessionStore {
   }
 
   close(): void {
+    for (const lane of this.executionLanes.values()) {
+      for (const waiter of lane.waiters.splice(0)) {
+        if (waiter.onAbort) waiter.signal?.removeEventListener('abort', waiter.onAbort)
+        waiter.reject(new SessionExecutionAbortedError())
+      }
+    }
+    this.executionLanes.clear()
     this.db.close()
+  }
+
+  private executionLease(key: string, lane: SessionExecutionLane): SessionExecutionLease {
+    let released = false
+    return {
+      release: (): void => {
+        if (released) return
+        released = true
+
+        while (lane.waiters.length > 0) {
+          const waiter = lane.waiters.shift()!
+          if (waiter.onAbort) waiter.signal?.removeEventListener('abort', waiter.onAbort)
+          if (waiter.signal?.aborted) {
+            waiter.reject(new SessionExecutionAbortedError())
+            continue
+          }
+          waiter.resolve(this.executionLease(key, lane))
+          return
+        }
+
+        if (this.executionLanes.get(key) === lane) {
+          this.executionLanes.delete(key)
+        }
+      },
+    }
   }
 
   private hydrate(row: Record<string, unknown>): SessionRecord {
