@@ -120,6 +120,34 @@ function resolveReasoningEffort(
 }
 
 /**
+ * Pi's MCP adapter keeps its compact proxy by default. A request profile,
+ * however, declares actual tools rather than a second protocol the model must
+ * learn before it can reach those tools. Select every request-supplied server
+ * for direct exposure, preserving any ambient selectors without naming a
+ * particular server or tool in bridge source.
+ */
+function piDirectToolSelection(
+  requestedServerNames: readonly string[],
+  ambientSelection: string | undefined,
+): string | undefined {
+  if (requestedServerNames.length === 0) return ambientSelection
+
+  const unsupported = requestedServerNames.filter((name) => name.includes(',') || name.includes('/'))
+  if (unsupported.length > 0) {
+    throw new BackendError(
+      `backend pi cannot expose MCP server name(s) through pi-mcp-adapter: ${unsupported.join(', ')}; `
+      + 'server names used by this backend cannot contain "," or "/"',
+      'not_configured',
+    )
+  }
+
+  const ambient = ambientSelection && ambientSelection !== '__none__'
+    ? ambientSelection.split(',').map((entry) => entry.trim()).filter(Boolean)
+    : []
+  return [...new Set([...ambient, ...requestedServerNames])].join(',')
+}
+
+/**
  * Translate the handled `extensions.pi.load` control into an exact extension
  * set. This is the provider-specific half that the shared profile materializer
  * deliberately leaves to Pi.
@@ -339,7 +367,18 @@ export class PiBackend implements Backend {
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
-        env: { ...process.env, ...(provisioned?.env ?? {}) },
+        env: {
+          ...process.env,
+          ...(provisioned?.env ?? {}),
+          ...(requestedMcpNames.length > 0
+            ? {
+                MCP_DIRECT_TOOLS: piDirectToolSelection(
+                  requestedMcpNames,
+                  process.env.MCP_DIRECT_TOOLS,
+                ),
+              }
+            : {}),
+        },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })

@@ -20,4 +20,15 @@ describe('sanitizeHostEnv PWD/cwd agreement', () => {
     const out = sanitizeHostEnv({ HOME: '/home/x', PATH: '/bin', PWD: '/srv/bridge' })
     expect(out?.PWD).toBe('/srv/bridge')
   })
+
+  it('forwards dynamically selected MCP tools while dropping unrelated environment', () => {
+    const out = sanitizeHostEnv({
+      HOME: '/home/x',
+      PATH: '/bin',
+      MCP_DIRECT_TOOLS: 'coordination,records',
+      UNRELATED_SECRET: 'must-not-cross',
+    })
+    expect(out?.MCP_DIRECT_TOOLS).toBe('coordination,records')
+    expect(out?.UNRELATED_SECRET).toBeUndefined()
+  })
 })
