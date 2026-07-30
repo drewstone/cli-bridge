@@ -221,9 +221,12 @@ export interface ChatDelta {
    */
   error?: { message: string; type: string }
   /**
-   * Token usage. Optional; present on the final chunk when known. `estimated`
+   * Incremental token usage. Optional; emitted once per provider receipt.
+   * Most backends report one final receipt; multi-turn CLIs may report one
+   * after each model call so completed work survives cancellation. `estimated`
    * is set when the bridge derived it from text (~4 chars/token) because the
-   * backend CLI reported none — consumers price it as approximate, not measured.
+   * backend CLI reported none — consumers sum receipts and price estimates as
+   * approximate, not measured.
    */
   usage?: {
     input_tokens?: number

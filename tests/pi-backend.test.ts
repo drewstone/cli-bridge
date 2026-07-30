@@ -44,6 +44,27 @@ function piSpawner(
   }
 }
 
+function pausingPiSpawner(lines: Array<Record<string, unknown>>): Spawner {
+  return async (): Promise<SpawnResult> => {
+    const child = new FakeChild()
+    queueMicrotask(() => {
+      for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`)
+    })
+    return {
+      child: child as never,
+      async terminate() {
+        if (child.exitCode !== null) return
+        child.stdout.end()
+        child.stderr.end()
+        child.exitCode = 143
+        child.emit('close', 143)
+      },
+      release() {},
+      spawnError: () => null,
+    }
+  }
+}
+
 async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
   const out: ChatDelta[] = []
   for await (const delta of deltas) out.push(delta)
@@ -109,7 +130,7 @@ describe('PiBackend', () => {
     }
   })
 
-  it('emits only text deltas and preserves final usage from turn_end.message.usage', async () => {
+  it('emits only text deltas and preserves usage from turn_end.message.usage', async () => {
     const backend = new PiBackend({
       bin: 'pi',
       timeoutMs: 1000,
@@ -152,7 +173,110 @@ describe('PiBackend', () => {
       { internal_session_id: 'pi-session-1' },
       { content: 'pi' },
       { content: '-ok' },
-      { finish_reason: 'stop', usage: { input_tokens: 8417, output_tokens: 30 } },
+      { usage: { input_tokens: 8417, output_tokens: 30 } },
+      { finish_reason: 'stop' },
+    ])
+  })
+
+  it('emits every turn receipt once and does not double-count the agent_end aggregate', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'turn_end',
+          message: { usage: { input: 100, output: 20 } },
+        },
+        {
+          type: 'turn_end',
+          message: { usage: { input: 240, output: 35 } },
+        },
+        {
+          type: 'agent_end',
+          usage: { input: 340, output: 55 },
+          messages: [
+            { role: 'assistant', usage: { input: 100, output: 20 } },
+            { role: 'assistant', usage: { input: 240, output: 35 } },
+          ],
+        },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/zai-coding-paas/glm-5.2',
+      messages: [{ role: 'user', content: 'use tools twice' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { usage: { input_tokens: 100, output_tokens: 20 } },
+      { usage: { input_tokens: 240, output_tokens: 35 } },
+      { finish_reason: 'stop' },
+    ])
+  })
+
+  it('accepts an agent_end aggregate only when no turn receipt was available', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'agent_end',
+          partial: { usage: { prompt_tokens: 19, completion_tokens: 7 } },
+        },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/legacy-model',
+      messages: [{ role: 'user', content: 'legacy event shape' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      { usage: { input_tokens: 19, output_tokens: 7 } },
+      { finish_reason: 'stop' },
+    ])
+  })
+
+  it('preserves completed-turn usage when the outer run is aborted before agent_end', async () => {
+    const controller = new AbortController()
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: pausingPiSpawner([
+        {
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'partial' },
+        },
+        {
+          type: 'turn_end',
+          message: { usage: { input: 80, output: 12 } },
+        },
+      ]),
+    })
+    const iterator = backend.chat({
+      model: 'pi/zai-coding-paas/glm-5.2',
+      messages: [{ role: 'user', content: 'keep working' }],
+    }, null, controller.signal)[Symbol.asyncIterator]()
+
+    const first = await iterator.next()
+    expect(first.value).toEqual({ content: 'partial' })
+    const pending = iterator.next()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    controller.abort()
+
+    const deltas: ChatDelta[] = [first.value as ChatDelta]
+    const second = await pending
+    if (!second.done) deltas.push(second.value)
+    for (;;) {
+      const next = await iterator.next()
+      if (next.done) break
+      deltas.push(next.value)
+    }
+
+    expect(deltas).toEqual([
+      { content: 'partial' },
+      { usage: { input_tokens: 80, output_tokens: 12 } },
+      { finish_reason: 'error' },
     ])
   })
 
@@ -194,7 +318,8 @@ describe('PiBackend', () => {
     expect(deltas).toEqual([
       { internal_session_id: 'pi-tools-1' },
       { tool_calls: [{ id: 'call_read_1', name: 'read', arguments: '{"path":"src/lib.rs"}' }] },
-      { finish_reason: 'tool_calls', usage: { input_tokens: 20, output_tokens: 8 } },
+      { usage: { input_tokens: 20, output_tokens: 8 } },
+      { finish_reason: 'tool_calls' },
     ])
   })
 
@@ -270,7 +395,8 @@ describe('PiBackend', () => {
     expect(deltas).toEqual([
       { internal_session_id: 'pi-real-tools-1' },
       { tool_calls: [{ id: 'call_read_1', name: 'read', arguments: '{"path":"/tmp/secret.txt"}' }] },
-      { finish_reason: 'tool_calls', usage: { input_tokens: 31, output_tokens: 12 } },
+      { usage: { input_tokens: 31, output_tokens: 12 } },
+      { finish_reason: 'tool_calls' },
     ])
   })
 
@@ -303,7 +429,8 @@ describe('PiBackend', () => {
 
     expect(deltas).toEqual([
       { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
-      { finish_reason: 'tool_calls', usage: { input_tokens: 10, output_tokens: 5 } },
+      { usage: { input_tokens: 10, output_tokens: 5 } },
+      { finish_reason: 'tool_calls' },
     ])
   })
 
@@ -338,7 +465,8 @@ describe('PiBackend', () => {
 
     expect(deltas).toEqual([
       { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
-      { finish_reason: 'tool_calls', usage: { input_tokens: 10, output_tokens: 5 } },
+      { usage: { input_tokens: 10, output_tokens: 5 } },
+      { finish_reason: 'tool_calls' },
     ])
   })
 
@@ -368,10 +496,10 @@ describe('PiBackend', () => {
       messages: [{ role: 'user', content: 'x' }],
     }, null, new AbortController().signal))
 
-    expect(deltas.at(-1)).toEqual({
-      finish_reason: 'stop',
-      usage: { input_tokens: 11, output_tokens: 7 },
-    })
+    expect(deltas.slice(-2)).toEqual([
+      { usage: { input_tokens: 11, output_tokens: 7 } },
+      { finish_reason: 'stop' },
+    ])
   })
 
   it('mounts request MCP servers as <cwd>/.pi/mcp.json for the run and cleans up after', async () => {
@@ -414,10 +542,10 @@ describe('PiBackend', () => {
           'legal-tools': { command: 'tsx', args: ['proposal-server.ts'], env: { CASE_ID: 'c-1' } },
         },
       })
-      expect(deltas.at(-1)).toEqual({
-        finish_reason: 'stop',
-        usage: { input_tokens: 5, output_tokens: 2 },
-      })
+      expect(deltas.slice(-2)).toEqual([
+        { usage: { input_tokens: 5, output_tokens: 2 } },
+        { finish_reason: 'stop' },
+      ])
       // Run-scoped mount: the workspace is restored after the subprocess exits.
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
     } finally {
@@ -532,10 +660,10 @@ describe('PiBackend', () => {
       }, null, new AbortController().signal))
 
       expect(piConfigExistedAtSpawn).toBe(false)
-      expect(deltas.at(-1)).toEqual({
-        finish_reason: 'stop',
-        usage: { input_tokens: 3, output_tokens: 1 },
-      })
+      expect(deltas.slice(-2)).toEqual([
+        { usage: { input_tokens: 3, output_tokens: 1 } },
+        { finish_reason: 'stop' },
+      ])
     } finally {
       if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
       else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride

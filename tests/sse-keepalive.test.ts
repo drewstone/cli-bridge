@@ -98,4 +98,25 @@ describe('collectNonStreaming', () => {
     expect(body.usage?.prompt_tokens).toBe(3)
     expect(body.usage?.completion_tokens).toBe(2)
   })
+
+  it('sums incremental usage receipts and omits partially-known cost', async () => {
+    async function* deltas(): AsyncIterable<ChatDelta> {
+      yield { usage: { input_tokens: 100, output_tokens: 20, cost: 0.01 } }
+      yield { usage: { input_tokens: 240, output_tokens: 35 } }
+      yield { finish_reason: 'stop' }
+    }
+    const body = (await collectNonStreaming(deltas(), 'test')) as {
+      usage?: {
+        prompt_tokens: number
+        completion_tokens: number
+        total_tokens: number
+        cost?: number
+      }
+    }
+    expect(body.usage).toEqual({
+      prompt_tokens: 340,
+      completion_tokens: 55,
+      total_tokens: 395,
+    })
+  })
 })
