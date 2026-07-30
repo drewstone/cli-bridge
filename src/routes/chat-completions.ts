@@ -19,7 +19,11 @@ import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
 import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
-import type { SessionStore } from '../sessions/store.js'
+import {
+  SessionExecutionAbortedError,
+  type SessionExecutionLease,
+  type SessionStore,
+} from '../sessions/store.js'
 import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
 import { BackendError } from '../backends/types.js'
@@ -332,19 +336,6 @@ export function mountChatCompletions(
       return respondFromRun(c, run, req, runId, afterSeq)
     }
 
-    // Bind identity to the normalized caller request above, before reading
-    // mutable session defaults. An exact retry must attach even if the live
-    // run has already persisted newer session metadata.
-    const session = req.session_id
-      ? deps.sessions.get(req.session_id, backend.name)
-      : null
-    if (!req.agent_profile && session?.metadata?.agent_profile && typeof session.metadata.agent_profile === 'object') {
-      req.agent_profile = session.metadata.agent_profile as ChatRequest['agent_profile']
-    }
-    if (!req.cwd && session?.cwd) {
-      req.cwd = session.cwd
-    }
-
     // Execution router: when the caller asks for `execution: 'sandbox'`
     // on a host harness (claude/kimi/gemini/codex/...), delegate to the
     // SandboxBackend instead of spawning the local CLI. The agent_profile
@@ -356,7 +347,36 @@ export function mountChatCompletions(
     // contract. A client disconnect leaves this signal untouched, so the
     // subprocess keeps running; only an explicit cancel aborts it.
     let admissionLease: AdmissionLease | null = null
+    let sessionLease: SessionExecutionLease | null = null
     try {
+      // Distinct runs that continue one backend session must own its full
+      // read → execute → update interval. The duplicate-run attachment path
+      // above intentionally happens first and never enters this queue.
+      if (req.session_id) {
+        try {
+          sessionLease = await deps.sessions.acquireExecution(
+            req.session_id,
+            backend.name,
+            run.signal,
+          )
+        } catch (error) {
+          if (error instanceof SessionExecutionAbortedError) {
+            throw new BackendError(error.message, 'aborted', error)
+          }
+          throw error
+        }
+      }
+
+      const session = req.session_id
+        ? deps.sessions.get(req.session_id, backend.name)
+        : null
+      if (!req.agent_profile && session?.metadata?.agent_profile && typeof session.metadata.agent_profile === 'object') {
+        req.agent_profile = session.metadata.agent_profile as ChatRequest['agent_profile']
+      }
+      if (!req.cwd && session?.cwd) {
+        req.cwd = session.cwd
+      }
+
       let makeSource: ((run: Run) => AsyncIterable<ChatDelta>) | null = null
       if (req.execution?.kind === 'sandbox' && backend.name !== 'sandbox') {
         const sandboxBackend = deps.registry.byName('sandbox')
@@ -469,6 +489,7 @@ export function mountChatCompletions(
             // Admission is released when the job ends. Reader disconnects
             // cannot release a slot that still owns a subprocess.
             admissionLease?.release()
+            sessionLease?.release()
           }
         },
       })
@@ -479,6 +500,8 @@ export function mountChatCompletions(
     } catch (error) {
       admissionLease?.release()
       admissionLease = null
+      sessionLease?.release()
+      sessionLease = null
       run.failSetup(error)
       return errorResponse(c, error)
     }
