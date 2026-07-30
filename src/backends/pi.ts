@@ -218,7 +218,9 @@ export class PiBackend implements Backend {
 
     // Reject unsupported profile plans before mounting MCP credentials
     // into the caller's project-scoped .pi directory.
-    const provisioned = provisionProfileWorkspace(req, session, 'pi', runCwd)
+    const provisioned = provisionProfileWorkspace(req, session, 'pi', runCwd, {
+      requestScopedInstructions: true,
+    })
     args.push(...provisioned.flags)
 
     const mcpMounted = requestedMcpNames.length > 0
@@ -406,7 +408,9 @@ export class PiBackend implements Backend {
 
   /** Compose a single prompt string from the request's messages. */
   private buildPrompt(req: ChatRequest): string {
-    const messages = resolvePromptMessages(req, null)
+    const messages = resolvePromptMessages(req, null, {
+      includeRequestScopedInstructions: true,
+    })
     const parts: string[] = []
     for (const msg of messages) {
       const text = contentToText(msg.content)

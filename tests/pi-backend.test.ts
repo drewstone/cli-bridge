@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
 import { BackendError } from '../src/backends/types.js'
-import type { ChatDelta } from '../src/backends/types.js'
+import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { RunRegistry } from '../src/runs/registry.js'
@@ -51,6 +51,144 @@ async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
 }
 
 describe('PiBackend', () => {
+  it('keeps different Pi profile instructions request-local in one shared workspace', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-isolation-'))
+    const operatorInstructions = 'Persistent operator-authored workspace instructions.\n'
+    const prompts: string[] = []
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'ok' },
+        },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ], (_bin, args) => {
+        prompts.push(args.at(-1) ?? '')
+      }),
+    })
+    const sharedResources = {
+      skills: [{ kind: 'inline' as const, name: 'shared-proof', content: 'Use the shared proof skill.' }],
+      commands: [{ kind: 'inline' as const, name: 'shared-command', content: 'Run the shared command.' }],
+    }
+    const alphaRequest: ChatRequest = {
+      model: 'pi/zai-coding-paas/glm-5.2',
+      messages: [{ role: 'user' as const, content: 'alpha task' }],
+      cwd,
+      agent_profile: {
+        prompt: {
+          systemPrompt: 'ALPHA_SYSTEM',
+          instructions: ['ALPHA_PROMPT_INSTRUCTION'],
+        },
+        resources: {
+          ...sharedResources,
+          instructions: 'ALPHA_RESOURCE_INSTRUCTION',
+        },
+      },
+    }
+    const betaRequest: ChatRequest = {
+      model: 'pi/zai-coding-paas/glm-5.2',
+      messages: [{ role: 'user' as const, content: 'beta task' }],
+      cwd,
+      agent_profile: {
+        prompt: {
+          systemPrompt: 'BETA_SYSTEM',
+          instructions: ['BETA_PROMPT_INSTRUCTION'],
+        },
+        resources: {
+          ...sharedResources,
+          instructions: {
+            kind: 'inline' as const,
+            name: 'beta-instructions',
+            content: 'BETA_RESOURCE_INSTRUCTION',
+          },
+        },
+      },
+    }
+
+    try {
+      writeFileSync(join(cwd, 'AGENTS.md'), operatorInstructions)
+
+      await Promise.all([
+        collect(backend.chat(alphaRequest, null, new AbortController().signal)),
+        collect(backend.chat(betaRequest, null, new AbortController().signal)),
+      ])
+
+      const alphaPrompt = prompts.find((prompt) => prompt.includes('ALPHA_SYSTEM'))
+      const betaPrompt = prompts.find((prompt) => prompt.includes('BETA_SYSTEM'))
+      expect(alphaPrompt).toContain('ALPHA_PROMPT_INSTRUCTION')
+      expect(alphaPrompt).toContain('ALPHA_RESOURCE_INSTRUCTION')
+      expect(alphaPrompt).not.toContain('BETA_PROMPT_INSTRUCTION')
+      expect(alphaPrompt).not.toContain('BETA_RESOURCE_INSTRUCTION')
+      expect(betaPrompt).toContain('BETA_PROMPT_INSTRUCTION')
+      expect(betaPrompt).toContain('BETA_RESOURCE_INSTRUCTION')
+      expect(betaPrompt).not.toContain('ALPHA_PROMPT_INSTRUCTION')
+      expect(betaPrompt).not.toContain('ALPHA_RESOURCE_INSTRUCTION')
+
+      expect(readFileSync(join(cwd, 'AGENTS.md'), 'utf8')).toBe(operatorInstructions)
+      expect(readFileSync(join(cwd, '.pi', 'skills', 'shared-proof', 'SKILL.md'), 'utf8'))
+        .toContain('Use the shared proof skill.')
+      expect(readFileSync(join(cwd, '.pi', 'prompts', 'shared-command.md'), 'utf8'))
+        .toBe('Run the shared command.\n')
+      expect(alphaRequest.profile_materialization_receipt?.files.map((file) => file.path))
+        .toEqual(['.pi/prompts/shared-command.md', '.pi/skills/shared-proof/SKILL.md'])
+      expect(betaRequest.profile_materialization_receipt?.files.map((file) => file.path))
+        .toEqual(['.pi/prompts/shared-command.md', '.pi/skills/shared-proof/SKILL.md'])
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('still materializes an explicit caller resource targeting AGENTS.md', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-explicit-agents-resource-'))
+    const prompts: string[] = []
+    const request: ChatRequest = {
+      model: 'pi/zai-coding-paas/glm-5.2',
+      messages: [{ role: 'user', content: 'work' }],
+      cwd,
+      agent_profile: {
+        prompt: { instructions: ['REQUEST_SCOPED_INSTRUCTION'] },
+        resources: {
+          files: [{
+            path: 'AGENTS.md',
+            resource: {
+              kind: 'inline',
+              name: 'caller-agents',
+              content: 'CALLER_OWNED_AGENTS_RESOURCE\n',
+            },
+          }],
+        },
+      },
+    }
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'ok' },
+        },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ], (_bin, args) => {
+        prompts.push(args.at(-1) ?? '')
+      }),
+    })
+
+    try {
+      await collect(backend.chat(request, null, new AbortController().signal))
+
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]).toContain('REQUEST_SCOPED_INSTRUCTION')
+      expect(readFileSync(join(cwd, 'AGENTS.md'), 'utf8')).toBe('CALLER_OWNED_AGENTS_RESOURCE\n')
+      expect(request.profile_materialization_receipt?.files).toEqual([
+        { path: 'AGENTS.md', mode: 0o644 },
+      ])
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   it('keeps anonymous calls stateless, creates caller sessions, then resumes the mapped Pi session', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-session-'))
     const sessions = new SessionStore(dataDir)

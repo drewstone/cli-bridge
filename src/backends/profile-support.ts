@@ -1,7 +1,7 @@
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
+import { agentProfileSchema, type AgentProfile, type AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -44,6 +44,7 @@ export function provisionProfileWorkspace(
   session: SessionRecord | null,
   harness: HarnessId,
   cwd: string | undefined,
+  options: { requestScopedInstructions?: boolean } = {},
 ): {
   env: Record<string, string>
   flags: string[]
@@ -57,7 +58,13 @@ export function provisionProfileWorkspace(
   if (!profile) return { env: {}, flags: [], written: [] }
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   try {
-    const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
+    // Pi receives these two fields in its per-request prompt. Remove them before
+    // native file planning so only their generated context file disappears;
+    // every caller-declared file, skill, command, and other dimension remains.
+    const workspaceProfile = options.requestScopedInstructions
+      ? withoutRequestScopedInstructions(profile)
+      : profile
+    const plan = materializeProfile(workspaceProfile, harness, { skip: ['mcp'] })
     assertWorkspacePlanSupported(plan)
     const applied = applyWorkspacePlan(plan, workspaceCwd)
     const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
@@ -81,6 +88,27 @@ export function provisionProfileWorkspace(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
+  }
+}
+
+function withoutRequestScopedInstructions(profile: AgentProfile): AgentProfile {
+  const parsed = agentProfileSchema.parse(profile)
+  const resourceInstructions = parsed.resources?.instructions
+  if (
+    resourceInstructions
+    && typeof resourceInstructions !== 'string'
+    && resourceInstructions.kind !== 'inline'
+  ) {
+    throw new Error('request-scoped instruction ref is not inline (github refs need async pre-resolution)')
+  }
+  return {
+    ...parsed,
+    ...(parsed.prompt
+      ? { prompt: { ...parsed.prompt, instructions: undefined } }
+      : {}),
+    ...(parsed.resources
+      ? { resources: { ...parsed.resources, instructions: undefined } }
+      : {}),
   }
 }
 
@@ -1315,13 +1343,20 @@ export function buildMcpAllowList(serverNames: string[]): string {
   return serverNames.map((n) => `mcp__${n}`).join(',')
 }
 
-export function resolvePromptMessages(req: ChatRequest, session: SessionRecord | null): ChatMessage[] {
-  const preamble = renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session))
+export function resolvePromptMessages(
+  req: ChatRequest,
+  session: SessionRecord | null,
+  options: { includeRequestScopedInstructions?: boolean } = {},
+): ChatMessage[] {
+  const preamble = renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session), options)
   if (!preamble) return req.messages
   return [{ role: 'system', content: preamble }, ...req.messages]
 }
 
-export function renderLocalHarnessProfilePreamble(profile: AgentProfile | null): string | null {
+export function renderLocalHarnessProfilePreamble(
+  profile: AgentProfile | null,
+  options: { includeRequestScopedInstructions?: boolean } = {},
+): string | null {
   if (!profile || typeof profile !== 'object') return null
   const sections: string[] = []
 
@@ -1330,6 +1365,20 @@ export function renderLocalHarnessProfilePreamble(profile: AgentProfile | null):
     ((profile as Record<string, unknown>).prompt as Record<string, unknown> | undefined)?.systemPrompt,
   )
   if (systemPrompt) sections.push(systemPrompt)
+
+  if (options.includeRequestScopedInstructions) {
+    const rawProfile = profile as Record<string, unknown>
+    const prompt = rawProfile.prompt && typeof rawProfile.prompt === 'object'
+      ? rawProfile.prompt as Record<string, unknown>
+      : undefined
+    sections.push(...pickStringArray(prompt?.instructions))
+
+    const resources = rawProfile.resources && typeof rawProfile.resources === 'object'
+      ? rawProfile.resources as Record<string, unknown>
+      : undefined
+    const resourceInstructions = pickInlineInstruction(resources?.instructions)
+    if (resourceInstructions) sections.push(resourceInstructions)
+  }
 
   const skills = pickStringArray((profile as Record<string, unknown>).skills)
   if (skills.length) {
@@ -1364,6 +1413,17 @@ function pickString(...values: unknown[]): string | null {
 function pickStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
+function pickInlineInstruction(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) return value
+  if (!value || typeof value !== 'object') return null
+  const resource = value as Record<string, unknown>
+  return resource.kind === 'inline'
+    && typeof resource.content === 'string'
+    && resource.content.trim()
+    ? resource.content
+    : null
 }
 
 function pickNamedEntries(value: unknown): string[] {
