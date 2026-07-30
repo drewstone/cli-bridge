@@ -187,7 +187,9 @@ export class PiBackend implements Backend {
     if (spec.model) args.push('--model', spec.model)
     if (session?.internalId) {
       args.push('--session', session.internalId)
-    } else {
+    } else if (!req.session_id) {
+      // A caller-owned id without a mapping needs Pi's default persistent
+      // session creation; only a truly anonymous call is stateless.
       args.push('--no-session')
     }
     const thinking = thinkingFlagForEffort(req.effort)
