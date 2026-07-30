@@ -256,7 +256,8 @@ export class PiBackend implements Backend {
       let emittedContent = false
       let emittedToolCall = false
       let sawError: string | null = null
-      let usage: { input?: number; output?: number } | undefined
+      let usage: PiUsageTotal | undefined
+      let sawTurnUsage = false
       const piToolCalls = new PiToolCallTracker()
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
@@ -303,18 +304,25 @@ export class PiBackend implements Backend {
           continue
         }
 
-        // Final turn_end / agent_end carries usage when pi reports it.
-        // Different pi versions have emitted usage on the event itself,
-        // on `message.usage`, or on `partial.usage`; accept all three
-        // shapes so backend-integrity guards see real token activity.
-        if (type === 'turn_end' || type === 'agent_end') {
-          const message = ev.message as Record<string, unknown> | undefined
-          const partial = ev.partial as Record<string, unknown> | undefined
-          const u = (ev.usage ?? message?.usage ?? partial?.usage) as
-            | Record<string, number>
-            | undefined
-          if (u) {
-            usage = { input: Number(u.input ?? u.prompt_tokens ?? 0), output: Number(u.output ?? u.completion_tokens ?? 0) }
+        // Pi emits one `turn_end.message.usage` receipt per model call. A
+        // tool-using turn therefore has several receipts; retain all of them
+        // and publish one cumulative OpenAI usage record when the run ends.
+        if (type === 'turn_end') {
+          const receipt = piUsageFromEvent(ev)
+          if (receipt) {
+            usage = addPiUsage(usage, receipt)
+            sawTurnUsage = true
+          }
+          continue
+        }
+
+        // Older Pi versions may expose usage only at `agent_end`. Treat that
+        // as a fallback: current Pi repeats the same assistant messages already
+        // seen at `turn_end`, so reading both would count every call twice.
+        if (type === 'agent_end') {
+          if (!sawTurnUsage) {
+            const receipt = piUsageFromEvent(ev)
+            if (receipt) usage = addPiUsage(usage, receipt)
           }
           continue
         }
@@ -369,7 +377,10 @@ export class PiBackend implements Backend {
       releaseSpawner()
 
       if (signal.aborted) {
-        yield { finish_reason: 'error' }
+        yield {
+          finish_reason: 'error',
+          ...(usage ? { usage: { input_tokens: usage.input, output_tokens: usage.output } } : {}),
+        }
         return
       }
 
@@ -417,6 +428,80 @@ export class PiBackend implements Backend {
     }
     return parts.join('\n\n')
   }
+}
+
+interface PiUsageTotal {
+  input: number
+  output: number
+}
+
+function piUsageFromEvent(ev: Record<string, unknown>): PiUsageTotal | undefined {
+  const message = record(ev.message)
+  const partial = record(ev.partial)
+  const direct = record(ev.usage) ?? record(message?.usage) ?? record(partial?.usage)
+  if (direct) return piUsageFromRecord(direct)
+
+  const messages = ev.messages
+  if (!Array.isArray(messages)) return undefined
+  let total: PiUsageTotal | undefined
+  for (const item of messages) {
+    const usage = record(record(item)?.usage)
+    if (!usage) continue
+    const receipt = piUsageFromRecord(usage)
+    if (receipt) total = addPiUsage(total, receipt)
+  }
+  return total
+}
+
+function piUsageFromRecord(usage: Record<string, unknown>): PiUsageTotal | undefined {
+  // Pi's native shape separates fresh input, cache reads, and cache writes.
+  // OpenAI's prompt_tokens includes all prompt traffic, so fold the three
+  // components together. An older OpenAI-shaped prompt_tokens value already
+  // includes cache traffic and must not have the cache fields added again.
+  const nativeInput = piTokenCount(usage.input ?? usage.inputTokens)
+  const openAiInput = piTokenCount(usage.prompt_tokens)
+  const cacheRead = piTokenCount(
+    usage.cacheRead ?? usage.cache_read_input_tokens ?? usage.cacheReadInputTokens,
+  )
+  const cacheWrite = piTokenCount(
+    usage.cacheWrite ?? usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens,
+  )
+  const output = piTokenCount(usage.output ?? usage.outputTokens ?? usage.completion_tokens)
+  if (
+    nativeInput === undefined
+    && openAiInput === undefined
+    && cacheRead === undefined
+    && cacheWrite === undefined
+    && output === undefined
+  ) {
+    return undefined
+  }
+  return {
+    input: openAiInput ?? (nativeInput ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0),
+    output: output ?? 0,
+  }
+}
+
+function addPiUsage(
+  total: PiUsageTotal | undefined,
+  receipt: PiUsageTotal,
+): PiUsageTotal {
+  return {
+    input: (total?.input ?? 0) + receipt.input,
+    output: (total?.output ?? 0) + receipt.output,
+  }
+}
+
+function piTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 /**

@@ -39,6 +39,27 @@ function piSpawner(
   }
 }
 
+function pausingPiSpawner(lines: Array<Record<string, unknown>>): Spawner {
+  return async (): Promise<SpawnResult> => {
+    const child = new FakeChild()
+    queueMicrotask(() => {
+      for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`)
+    })
+    return {
+      child: child as never,
+      async terminate() {
+        if (child.exitCode !== null) return
+        child.stdout.end()
+        child.stderr.end()
+        child.exitCode = 143
+        child.emit('close', 143)
+      },
+      release() {},
+      spawnError: () => null,
+    }
+  }
+}
+
 async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
   const out: ChatDelta[] = []
   for await (const delta of deltas) out.push(delta)
@@ -90,6 +111,150 @@ describe('PiBackend', () => {
       { content: 'pi' },
       { content: '-ok' },
       { finish_reason: 'stop', usage: { input_tokens: 8417, output_tokens: 30 } },
+    ])
+  })
+
+  it('publishes one cumulative receipt for every model call including cache traffic', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'turn_end',
+          message: {
+            usage: {
+              input: 100,
+              output: 20,
+              cacheRead: 900,
+              cacheWrite: 30,
+              totalTokens: 1050,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          },
+        },
+        {
+          type: 'turn_end',
+          message: {
+            usage: {
+              input: 240,
+              output: 35,
+              cacheRead: 1_700,
+              cacheWrite: 50,
+              totalTokens: 2025,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          },
+        },
+        {
+          type: 'agent_end',
+          messages: [
+            { role: 'assistant', usage: { input: 100, output: 20, cacheRead: 900, cacheWrite: 30 } },
+            { role: 'assistant', usage: { input: 240, output: 35, cacheRead: 1_700, cacheWrite: 50 } },
+          ],
+        },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/zai-coding-paas/glm-5.2',
+      messages: [{ role: 'user', content: 'use tools twice' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      {
+        finish_reason: 'stop',
+        usage: {
+          input_tokens: 3_020,
+          output_tokens: 55,
+        },
+      },
+    ])
+  })
+
+  it('uses agent_end messages only as a fallback when turn receipts are absent', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'agent_end',
+          messages: [
+            { role: 'assistant', usage: { input: 19, output: 7, cacheRead: 80, cacheWrite: 4 } },
+            { role: 'toolResult', content: [] },
+            { role: 'assistant', usage: { input: 23, output: 9, cacheRead: 100, cacheWrite: 5 } },
+          ],
+        },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/legacy-model',
+      messages: [{ role: 'user', content: 'legacy event shape' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toEqual([
+      {
+        finish_reason: 'stop',
+        usage: {
+          input_tokens: 231,
+          output_tokens: 16,
+        },
+      },
+    ])
+  })
+
+  it('preserves completed model-call usage when the outer run is aborted', async () => {
+    const controller = new AbortController()
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: pausingPiSpawner([
+        {
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'partial' },
+        },
+        {
+          type: 'turn_end',
+          message: {
+            usage: {
+              input: 80,
+              output: 12,
+              cacheRead: 320,
+              cacheWrite: 8,
+            },
+          },
+        },
+      ]),
+    })
+    const iterator = backend.chat({
+      model: 'pi/zai-coding-paas/glm-5.2',
+      messages: [{ role: 'user', content: 'keep working' }],
+    }, null, controller.signal)[Symbol.asyncIterator]()
+
+    const first = await iterator.next()
+    expect(first.value).toEqual({ content: 'partial' })
+    const pending = iterator.next()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    controller.abort()
+
+    const deltas: ChatDelta[] = [first.value as ChatDelta]
+    const second = await pending
+    if (!second.done) deltas.push(second.value)
+    for (;;) {
+      const next = await iterator.next()
+      if (next.done) break
+      deltas.push(next.value)
+    }
+
+    expect(deltas).toEqual([
+      { content: 'partial' },
+      {
+        finish_reason: 'error',
+        usage: {
+          input_tokens: 408,
+          output_tokens: 12,
+        },
+      },
     ])
   })
 
