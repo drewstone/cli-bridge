@@ -137,7 +137,7 @@ export function provisionPiProfile(
     }
     const plan = materializeProfile(profile, 'pi', { skip: ['mcp', 'extensions'] })
     assertWorkspacePlanSupported(plan)
-    assertPiPlanHasNativeLoaders(plan)
+    const nativeLoaders = assertPiPlanHasNativeLoaders(plan)
 
     profileRoot = mkdtempSync(join(workspaceCwd, '.cli-bridge-pi-profile-'))
     // Docker executors may run Pi under a uid different from the bridge. The
@@ -145,7 +145,7 @@ export function provisionPiProfile(
     // traversable and the files read-only to non-owners.
     chmodSync(profileRoot, 0o755)
     const applied = applyWorkspacePlan(plan, profileRoot, { existingFiles: 'reject' })
-    const flags = piProfileFlags(plan, applied, profileRoot)
+    const flags = piProfileFlags(plan, applied, profileRoot, nativeLoaders)
     const receipt = retainProfileMaterializationReceipt(req, 'pi', plan, applied)
 
     let cleaned = false
@@ -168,24 +168,52 @@ export function provisionPiProfile(
   }
 }
 
-function assertPiPlanHasNativeLoaders(plan: WorkspacePlan): void {
-  if (plan.flags.length > 0) {
-    throw new Error(`Pi materializer emitted unsupported relative launch flags: ${plan.flags.join(', ')}`)
+interface PiPlanNativeLoaders {
+  extensionPaths: ReadonlySet<string>
+}
+
+function assertPiPlanHasNativeLoaders(plan: WorkspacePlan): PiPlanNativeLoaders {
+  const extensionPaths = new Set<string>()
+  for (let index = 0; index < plan.flags.length; index += 1) {
+    const flag = plan.flags[index]
+    const value = plan.flags[index + 1]
+    if (typeof flag !== 'string' || typeof value !== 'string') {
+      throw new Error('Pi materializer emitted a non-public or incomplete launch flag')
+    }
+    if (flag === '--extension') {
+      const extension = plan.files.find((file) => file.relPath === value)
+      if (extension?.source !== 'generated') {
+        throw new Error(`Pi materializer extension flag does not reference a generated plan file: ${value}`)
+      }
+      extensionPaths.add(value)
+      index += 1
+      continue
+    }
+    if (flag === '--exclude-tools') {
+      if (!value || value.startsWith('--')) {
+        throw new Error('Pi materializer emitted an invalid --exclude-tools value')
+      }
+      index += 1
+      continue
+    }
+    throw new Error(`Pi materializer emitted unsupported launch flag: ${flag}`)
   }
   const unsupportedPaths = plan.files
     .map((file) => file.relPath)
-    .filter((path) => piProfileFileFlag(path) === null)
+    .filter((path) => piProfileFileFlag(path) === null && !extensionPaths.has(path))
   if (unsupportedPaths.length > 0) {
     throw new Error(
       `no request-scoped Pi loader exists for workspace file(s): ${unsupportedPaths.join(', ')}`,
     )
   }
+  return { extensionPaths }
 }
 
 function piProfileFlags(
   plan: WorkspacePlan,
   applied: WorkspacePlanReceipt,
   profileRoot: string,
+  nativeLoaders: PiPlanNativeLoaders,
 ): string[] {
   const flags = ['--no-context-files', '--no-skills', '--no-prompt-templates']
 
@@ -197,7 +225,18 @@ function piProfileFlags(
     flags.push('--system-prompt', systemPromptPath)
   }
 
+  for (let index = 0; index < applied.flags.length; index += 1) {
+    const flag = applied.flags[index]
+    const value = applied.flags[index + 1]
+    if (typeof flag !== 'string' || typeof value !== 'string') {
+      throw new Error('Pi materializer emitted a non-public or incomplete launch flag')
+    }
+    flags.push(flag, flag === '--extension' ? join(profileRoot, value) : value)
+    index += 1
+  }
+
   for (const path of applied.written) {
+    if (nativeLoaders.extensionPaths.has(path)) continue
     const flag = piProfileFileFlag(path)
     if (flag) flags.push(flag, join(profileRoot, path))
   }
