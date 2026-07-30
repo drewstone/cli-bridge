@@ -85,6 +85,7 @@ pnpm install:harness -- codex
 pnpm install:harness -- opencode
 pnpm install:harness -- kimi
 pnpm install:harness -- gemini
+pnpm install:harness -- pi
 pnpm install:harnesses      # all harnesses
 ```
 
@@ -95,6 +96,7 @@ pnpm install:harnesses      # all harnesses
 | `codex` | `brew install openai/homebrew-tap/codex` | `codex login` |
 | `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
 | `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
+| `pi` | `npm install -g @earendil-works/pi-coding-agent` | Provider credentials in `~/.pi/agent` |
 | `passthrough` | (none) | provider API keys in `.env` |
 
 For a Nix-provisioned host shell with the shared prerequisites:
@@ -430,7 +432,7 @@ The Docker executor solves all three: each chat() runs inside a
 pre-warmed container slot, and session_id sticks the same caller to
 the same slot so `--resume` reads the same on-disk transcript
 turn-to-turn. Works for **every subprocess backend** — claude, kimi,
-gemini, codex, opencode — through the same `Spawner` abstraction.
+gemini, codex, opencode, pi — through the same `Spawner` abstraction.
 
 ```bash
 # 1. build the unified runtime image once (has all coding CLIs installed)

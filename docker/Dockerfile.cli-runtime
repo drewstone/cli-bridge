@@ -2,7 +2,7 @@
 #
 # Each container in the pool runs `tail -f /dev/null` as its idle entrypoint;
 # cli-bridge dispatches real CLI invocations via `docker exec <slot> claude
-# -p …` (or kimi / gemini / codex / opencode equivalents). One image serves any
+# -p …` (or kimi / gemini / codex / opencode / pi equivalents). One image serves any
 # backend, so a single pool can be reused or per-backend pools all share
 # the same image — your call via the per-backend image env knobs.
 #
@@ -26,6 +26,7 @@
 #   /root/.codex             — OpenAI Codex
 #   /root/.config/opencode   — opencode
 #   /root/.opencode          — opencode binary install dir
+#   /root/.pi/agent          — Pi auth/config/packages
 #
 # The bridge's container-pool config bind-mounts only the dirs the
 # active backend needs.
@@ -68,6 +69,7 @@ VOLUME /root/.config/kimi
 VOLUME /root/.gemini
 VOLUME /root/.config/opencode
 VOLUME /root/.opencode
+VOLUME /root/.pi/agent
 
 # Workspace dir for cwd-scoped tool calls.
 WORKDIR /workspace
