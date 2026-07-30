@@ -63,6 +63,97 @@ function argValue(args: readonly string[], flag: string): string | undefined {
 }
 
 describe('PiBackend', () => {
+  it('applies one exact profile while leaving the task unchanged', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-exact-profile-'))
+    const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    const profile: NonNullable<ChatRequest['agent_profile']> = {
+      prompt: { systemPrompt: 'SYSTEM_ONCE' },
+      model: { reasoningEffort: 'xhigh' },
+      mcp: {
+        coordination: {
+          transport: 'stdio',
+          command: 'node',
+          args: ['coordinator.mjs'],
+          env: { RUN_ID: 'exact-profile' },
+        },
+      },
+    }
+    let args: string[] = []
+    let systemPrompt = ''
+    let mcp: unknown
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ], (_bin, rawArgs) => {
+        args = [...rawArgs]
+        const systemPromptPath = argValue(args, '--system-prompt')
+        if (!systemPromptPath) throw new Error('missing native system prompt')
+        systemPrompt = readFileSync(systemPromptPath, 'utf8')
+        mcp = JSON.parse(readFileSync(join(cwd, '.pi', 'mcp.json'), 'utf8'))
+      }),
+    })
+
+    try {
+      await collect(backend.chat({
+        model: 'pi/tangle-router/glm-5.2',
+        messages: [{ role: 'user', content: 'TASK_UNCHANGED' }],
+        cwd,
+        agent_profile: profile,
+      }, null, new AbortController().signal))
+
+      expect(args.filter((arg) => arg === '--system-prompt')).toHaveLength(1)
+      expect(systemPrompt).toBe('SYSTEM_ONCE')
+      expect(argValue(args, '--thinking')).toBe('xhigh')
+      expect(args.at(-1)).toBe('TASK_UNCHANGED')
+      expect(args.at(-1)).not.toContain('SYSTEM_ONCE')
+      expect(mcp).toEqual({
+        mcpServers: {
+          coordination: {
+            command: 'node',
+            args: ['coordinator.mjs'],
+            env: { RUN_ID: 'exact-profile' },
+          },
+        },
+      })
+      expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
+    } finally {
+      if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a turn-level effort that conflicts with the exact profile', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-effort-conflict-'))
+    let spawns = 0
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([], () => {
+        spawns += 1
+      }),
+    })
+
+    try {
+      const run = collect(backend.chat({
+        model: 'pi/tangle-router/glm-5.2',
+        messages: [{ role: 'user', content: 'task' }],
+        effort: 'low',
+        cwd,
+        agent_profile: { model: { reasoningEffort: 'high' } },
+      }, null, new AbortController().signal))
+
+      await expect(run).rejects.toThrow(/effort .* conflicts with agent_profile/u)
+      expect(spawns).toBe(0)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   it('isolates concurrent same-name profile resources and keeps their authority channels distinct', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-isolation-'))
     const operatorContext = 'OPERATOR_CONTEXT_MUST_NOT_BE_REPLACED\n'
@@ -154,7 +245,7 @@ describe('PiBackend', () => {
         expect(entry.args).toContain('--no-context-files')
         expect(entry.args).toContain('--no-skills')
         expect(entry.args).toContain('--no-prompt-templates')
-        expect(entry.args.at(-1)).toMatch(/^User: (?:ALPHA|BETA) task$/u)
+        expect(entry.args.at(-1)).toMatch(/^(?:ALPHA|BETA) task$/u)
         expect(entry.args.at(-1)).not.toContain('_SYSTEM')
         expect(existsSync(entry.root)).toBe(false)
       }
