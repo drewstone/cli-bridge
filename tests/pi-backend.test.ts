@@ -79,23 +79,25 @@ describe('PiBackend', () => {
         },
       },
     }
-    let args: string[] = []
-    let systemPrompt = ''
-    let mcp: unknown
-    const backend = new PiBackend({
-      bin: 'pi',
-      timeoutMs: 1000,
-      spawner: piSpawner([
-        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
-        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
-      ], (_bin, rawArgs) => {
-        args = [...rawArgs]
-        const systemPromptPath = argValue(args, '--system-prompt')
-        if (!systemPromptPath) throw new Error('missing native system prompt')
-        systemPrompt = readFileSync(systemPromptPath, 'utf8')
-        mcp = JSON.parse(readFileSync(join(cwd, '.pi', 'mcp.json'), 'utf8'))
-      }),
-    })
+      let args: string[] = []
+      let systemPrompt = ''
+      let mcp: unknown
+      let directTools: string | undefined
+      const backend = new PiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        spawner: piSpawner([
+          { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+          { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+        ], (_bin, rawArgs, opts) => {
+          args = [...rawArgs]
+          const systemPromptPath = argValue(args, '--system-prompt')
+          if (!systemPromptPath) throw new Error('missing native system prompt')
+          systemPrompt = readFileSync(systemPromptPath, 'utf8')
+          mcp = JSON.parse(readFileSync(join(cwd, '.pi', 'mcp.json'), 'utf8'))
+          directTools = opts.env?.MCP_DIRECT_TOOLS
+        }),
+      })
 
     try {
       await collect(backend.chat({
@@ -110,6 +112,7 @@ describe('PiBackend', () => {
       expect(argValue(args, '--thinking')).toBe('xhigh')
       expect(args.at(-1)).toBe('TASK_UNCHANGED')
       expect(args.at(-1)).not.toContain('SYSTEM_ONCE')
+      expect(directTools).toBe('coordination')
       expect(mcp).toEqual({
         mcpServers: {
           coordination: {
@@ -650,6 +653,7 @@ describe('PiBackend', () => {
     try {
       let configAtSpawn: unknown = null
       let cwdAtSpawn: string | undefined
+      let directToolsAtSpawn: string | undefined
       const backend = new PiBackend({
         bin: 'pi',
         timeoutMs: 1000,
@@ -661,6 +665,7 @@ describe('PiBackend', () => {
           (_bin, _args, opts) => {
             cwdAtSpawn = opts.cwd
             configAtSpawn = JSON.parse(readFileSync(join(cwd, '.pi', 'mcp.json'), 'utf-8'))
+            directToolsAtSpawn = opts.env?.MCP_DIRECT_TOOLS
           },
         ),
       })
@@ -678,6 +683,7 @@ describe('PiBackend', () => {
 
       // The pi subprocess must see the config in ITS cwd before it starts.
       expect(cwdAtSpawn).toBe(cwd)
+      expect(directToolsAtSpawn).toBe('legal-tools')
       expect(configAtSpawn).toEqual({
         mcpServers: {
           'legal-tools': { command: 'tsx', args: ['proposal-server.ts'], env: { CASE_ID: 'c-1' } },
