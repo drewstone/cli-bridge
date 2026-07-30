@@ -3,11 +3,16 @@ import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
+import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
 import { BackendError } from '../src/backends/types.js'
 import type { ChatDelta } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
+import { mountChatCompletions } from '../src/routes/chat-completions.js'
+import { RunRegistry } from '../src/runs/registry.js'
+import { SessionStore } from '../src/sessions/store.js'
 
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
@@ -46,6 +51,64 @@ async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
 }
 
 describe('PiBackend', () => {
+  it('keeps anonymous calls stateless, creates caller sessions, then resumes the mapped Pi session', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-session-'))
+    const sessions = new SessionStore(dataDir)
+    const argv: string[][] = []
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'created-pi-session' },
+        {
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'ok' },
+        },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ], (_bin, args) => argv.push([...args])),
+    })
+    const app = new Hono()
+    mountChatCompletions(app, {
+      registry: new BackendRegistry().register(backend),
+      sessions,
+      runs: new RunRegistry(),
+    })
+    const post = async (sessionId?: string): Promise<Response> => {
+      return await app.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'pi/zai-coding-paas/glm-5.2',
+          messages: [{ role: 'user', content: 'inspect the project' }],
+          stream: false,
+          ...(sessionId ? { session_id: sessionId } : {}),
+        }),
+      })
+    }
+
+    try {
+      expect((await post()).status).toBe(200)
+      expect(argv[0]).toContain('--no-session')
+      expect(sessions.list()).toEqual([])
+
+      expect((await post('discovery-run')).status).toBe(200)
+      expect(argv[1]).not.toContain('--no-session')
+      expect(argv[1]).not.toContain('--session')
+      expect(sessions.get('discovery-run', 'pi')).toMatchObject({
+        internalId: 'created-pi-session',
+        turns: 1,
+      })
+
+      expect((await post('discovery-run')).status).toBe(200)
+      const sessionFlag = argv[2]?.indexOf('--session') ?? -1
+      expect(argv[2]?.[sessionFlag + 1]).toBe('created-pi-session')
+      expect(argv[2]).not.toContain('--no-session')
+    } finally {
+      sessions.close()
+      rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
+
   it('emits only text deltas and preserves final usage from turn_end.message.usage', async () => {
     const backend = new PiBackend({
       bin: 'pi',
