@@ -265,6 +265,16 @@ describe('preflightDockerSlot — defect 4 at startup: a configured workspace mu
 })
 
 describe('the runtime image the Dockerfile promises', () => {
+  it('installs Pi in explicit and all-harness images', () => {
+    const installer = readFileSync(join(__dirname, '..', 'scripts', 'install-harness.sh'), 'utf8')
+    const dockerfile = readFileSync(join(__dirname, '..', 'docker', 'Dockerfile.cli-runtime'), 'utf8')
+
+    expect(installer).toContain('npm install -g @earendil-works/pi-coding-agent@latest')
+    expect(installer).toMatch(/pi\) install_pi/)
+    expect(installer).toMatch(/for name in claude codex opencode kimi gemini pi/)
+    expect(dockerfile).toContain('VOLUME /root/.pi/agent')
+  })
+
   it('pre-creates the non-root XDG tree, so a uid-1000 CLI has somewhere to put state', () => {
     const dockerfile = readFileSync(join(__dirname, '..', 'docker', 'Dockerfile.cli-runtime'), 'utf8')
     for (const dir of [

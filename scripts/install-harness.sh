@@ -3,7 +3,7 @@ set -eu
 
 harness="${1:-}"
 if [ -z "$harness" ]; then
-  echo "usage: scripts/install-harness.sh <claude|codex|opencode|kimi|gemini|all>" >&2
+  echo "usage: scripts/install-harness.sh <claude|codex|opencode|kimi|gemini|pi|all>" >&2
   exit 2
 fi
 
@@ -49,6 +49,10 @@ install_gemini() {
   npm install -g @google/gemini-cli@latest
 }
 
+install_pi() {
+  npm install -g @earendil-works/pi-coding-agent@latest
+}
+
 install_one() {
   case "$1" in
     claude) install_claude ;;
@@ -56,12 +60,13 @@ install_one() {
     opencode) install_opencode ;;
     kimi) install_kimi ;;
     gemini) install_gemini ;;
+    pi) install_pi ;;
     *) echo "unknown harness: $1" >&2; exit 2 ;;
   esac
 }
 
 if [ "$harness" = "all" ]; then
-  for name in claude codex opencode kimi gemini; do
+  for name in claude codex opencode kimi gemini pi; do
     echo "==> installing $name"
     install_one "$name"
   done
