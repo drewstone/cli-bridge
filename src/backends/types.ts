@@ -221,15 +221,20 @@ export interface ChatDelta {
    */
   error?: { message: string; type: string }
   /**
-   * Token usage. Optional; present on the final chunk when known. `estimated`
-   * is set when the bridge derived it from text (~4 chars/token) because the
-   * backend CLI reported none — consumers price it as approximate, not measured.
+   * Token usage. Optional; a backend may emit one metadata-only record per
+   * model call. `estimated` is set when the bridge derived it from text
+   * (~4 chars/token) because the backend CLI reported none.
    */
   usage?: {
     input_tokens?: number
     output_tokens?: number
     /** Backend-reported USD cost. Omitted when the backend did not report one. */
     cost?: number
+    /**
+     * Incremental by default. `total` proves the cost covers all usage emitted
+     * through this record and replaces any incomplete incremental sum.
+     */
+    cost_scope?: 'incremental' | 'total'
     estimated?: boolean
   }
   /** Safe proof of the AgentProfile files applied before this run. */

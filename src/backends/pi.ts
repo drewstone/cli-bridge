@@ -42,7 +42,7 @@
  *      "toolCall":{...} }}
  *   {"type":"tool_execution_start","toolCallId":"...","toolName":"...","args":{...}}
  *   {"type":"turn_end","message":{"usage":{...}}}
- *   {"type":"agent_end"}
+ *   {"type":"agent_end","messages":[...]}
  *
  * We surface text_delta as ChatDelta.content and pi tool-call lifecycle events
  * as OpenAI-shaped tool_calls so downstream trace consumers can observe native
@@ -408,7 +408,12 @@ export class PiBackend implements Backend {
       let emittedContent = false
       let emittedToolCall = false
       let sawError: string | null = null
-      let usage: { input?: number; output?: number } | undefined
+      let sawTurnUsage = false
+      const usageCost: PiUsageCost = {
+        receipts: 0,
+        total: 0,
+        complete: true,
+      }
       const piToolCalls = new PiToolCallTracker()
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
@@ -455,18 +460,29 @@ export class PiBackend implements Backend {
           continue
         }
 
-        // Final turn_end / agent_end carries usage when pi reports it.
-        // Different pi versions have emitted usage on the event itself,
-        // on `message.usage`, or on `partial.usage`; accept all three
-        // shapes so backend-integrity guards see real token activity.
-        if (type === 'turn_end' || type === 'agent_end') {
-          const message = ev.message as Record<string, unknown> | undefined
-          const partial = ev.partial as Record<string, unknown> | undefined
-          const u = (ev.usage ?? message?.usage ?? partial?.usage) as
-            | Record<string, number>
-            | undefined
-          if (u) {
-            usage = { input: Number(u.input ?? u.prompt_tokens ?? 0), output: Number(u.output ?? u.completion_tokens ?? 0) }
+        // Pi emits one turn_end.message.usage receipt for every model call.
+        // Emit each receipt immediately: retaining only the last call
+        // undercounts tool loops, and waiting for agent_end loses completed
+        // calls when the outer run is cancelled.
+        if (type === 'turn_end') {
+          const receipts = piUsageReceiptsFromEvent(ev)
+          if (receipts.length > 0) sawTurnUsage = true
+          for (const receipt of receipts) {
+            recordPiUsageCost(usageCost, receipt)
+            yield { usage: piTokenUsage(receipt) }
+          }
+          continue
+        }
+
+        // Older Pi versions may report usage only at agent_end, either as one
+        // aggregate or as messages[].usage. This is fallback-only because
+        // current Pi repeats calls already observed at turn_end.
+        if (type === 'agent_end') {
+          if (!sawTurnUsage) {
+            for (const receipt of piUsageReceiptsFromEvent(ev)) {
+              recordPiUsageCost(usageCost, receipt)
+              yield { usage: piTokenUsage(receipt) }
+            }
           }
           continue
         }
@@ -520,6 +536,20 @@ export class PiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
 
+      // Per-turn token receipts stay observable. Cost is emitted once, only
+      // after every contributing call proved its amount; a partial sum must
+      // never be presented as the run's complete cost.
+      if (usageCost.receipts > 0 && usageCost.complete) {
+        yield {
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: usageCost.total,
+            cost_scope: 'total',
+          },
+        }
+      }
+
       if (signal.aborted) {
         yield { finish_reason: 'error' }
         return
@@ -542,7 +572,6 @@ export class PiBackend implements Backend {
 
       yield {
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
-        ...(usage ? { usage: { input_tokens: usage.input, output_tokens: usage.output } } : {}),
       }
     } finally {
       clearTimeout(timeoutHandle)
@@ -575,6 +604,114 @@ export class PiBackend implements Backend {
     }
     return parts.join('\n\n')
   }
+}
+
+interface PiUsageReceipt {
+  input: number
+  output: number
+  cost?: number
+}
+
+interface PiUsageCost {
+  receipts: number
+  total: number
+  complete: boolean
+}
+
+function piUsageReceiptsFromEvent(ev: Record<string, unknown>): PiUsageReceipt[] {
+  const message = record(ev.message)
+  const partial = record(ev.partial)
+  const direct = record(ev.usage) ?? record(message?.usage) ?? record(partial?.usage)
+  if (direct) {
+    const receipt = piUsageFromRecord(direct)
+    return receipt ? [receipt] : []
+  }
+
+  if (!Array.isArray(ev.messages)) return []
+  const receipts: PiUsageReceipt[] = []
+  for (const item of ev.messages) {
+    const usage = record(record(item)?.usage)
+    if (!usage) continue
+    const receipt = piUsageFromRecord(usage)
+    if (receipt) receipts.push(receipt)
+  }
+  return receipts
+}
+
+function piUsageFromRecord(usage: Record<string, unknown>): PiUsageReceipt | undefined {
+  // Native Pi usage separates fresh input, cache reads, and cache writes.
+  // OpenAI prompt_tokens already includes all three, so never add cache fields
+  // to that older aggregate shape.
+  const nativeInput = piTokenCount(usage.input ?? usage.inputTokens, 'input')
+  const openAiInput = piTokenCount(usage.prompt_tokens, 'prompt_tokens')
+  const cacheRead = piTokenCount(
+    usage.cacheRead ?? usage.cache_read_input_tokens ?? usage.cacheReadInputTokens,
+    'cacheRead',
+  )
+  const cacheWrite = piTokenCount(
+    usage.cacheWrite ?? usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens,
+    'cacheWrite',
+  )
+  const output = piTokenCount(
+    usage.output ?? usage.outputTokens ?? usage.completion_tokens,
+    'output',
+  )
+  if (
+    nativeInput === undefined
+    && openAiInput === undefined
+    && cacheRead === undefined
+    && cacheWrite === undefined
+    && output === undefined
+  ) {
+    return undefined
+  }
+
+  const rawCost = usage.cost
+  const nestedCost = record(rawCost)
+  const cost = piCost(nestedCost ? nestedCost.total : rawCost)
+  return {
+    input: openAiInput ?? (nativeInput ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0),
+    output: output ?? 0,
+    ...(cost !== undefined ? { cost } : {}),
+  }
+}
+
+function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['usage']> {
+  return {
+    input_tokens: receipt.input,
+    output_tokens: receipt.output,
+  }
+}
+
+function recordPiUsageCost(total: PiUsageCost, receipt: PiUsageReceipt): void {
+  total.receipts += 1
+  if (receipt.cost === undefined) {
+    total.complete = false
+    return
+  }
+  total.total += receipt.cost
+}
+
+function piTokenCount(value: unknown, field: string): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new BackendError(`pi reported invalid ${field} token count`, 'upstream')
+  }
+  return value
+}
+
+function piCost(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new BackendError('pi reported invalid usage cost', 'upstream')
+  }
+  return value
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 /**

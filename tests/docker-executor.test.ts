@@ -1494,6 +1494,53 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(stub.releaseCalls).toBe(1)
   })
 
+  it('OpencodeBackend omits cost when any step receipt has unknown cost', async () => {
+    const stub = createStubSpawner([
+      JSON.stringify({
+        type: 'step_finish',
+        sessionID: 'oc-partial-cost',
+        part: {
+          type: 'step-finish',
+          tokens: {
+            input: 100,
+            output: 20,
+            cache: { read: 30, write: 10 },
+          },
+          cost: 0.01,
+        },
+      }),
+      JSON.stringify({
+        type: 'step_finish',
+        sessionID: 'oc-partial-cost',
+        part: {
+          type: 'step-finish',
+          tokens: {
+            input: 40,
+            output: 5,
+            cache: { read: 8, write: 2 },
+          },
+        },
+      }),
+      JSON.stringify({ type: 'text', part: { type: 'text', text: 'finished' } }),
+    ])
+    const backend = new OpencodeBackend({
+      bin: 'opencode',
+      timeoutMs: 5000,
+      spawner: stub.spawner,
+    })
+    const deltas: ChatDelta[] = []
+    for await (const delta of backend.chat(
+      { model: 'opencode/zai-coding-plan/glm-5.1', messages: [{ role: 'user', content: 'hi' }] },
+      null,
+      new AbortController().signal,
+    )) deltas.push(delta)
+
+    expect(deltas.at(-1)?.usage).toEqual({
+      input_tokens: 190,
+      output_tokens: 25,
+    })
+  })
+
   it('OpencodeBackend surfaces buffered-stdout silence as keepalive deltas (not synthetic tool_calls)', async () => {
     // Mirror of the KimiBackend keepalive test — see the comment there
     // for the rationale on why we deliberately do NOT synthesize a

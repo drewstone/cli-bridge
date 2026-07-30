@@ -32,6 +32,11 @@ import { terminateSpawned } from '../executors/process-tree.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
 
+interface UsageTotal {
+  receipt: UsageReceipt
+  costComplete: boolean
+}
+
 export interface OpencodeBackendOptions {
   bin: string
   timeoutMs: number
@@ -171,7 +176,7 @@ export class OpencodeBackend implements Backend {
       let sawError: string | null = null
       let emittedContent = false
       let emittedToolCall = false
-      let stepUsage: UsageReceipt | undefined
+      let stepUsage: UsageTotal | undefined
       let fallbackUsage: UsageReceipt | undefined
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
 
@@ -229,7 +234,7 @@ export class OpencodeBackend implements Backend {
         ) {
           yield {
             ...terminalOutcome('opencode', sawError, emittedToolCall),
-            usage: stepUsage ?? fallbackUsage,
+            usage: stepUsage ? completeUsage(stepUsage) : fallbackUsage,
             internal_session_id: internalSessionId,
           }
           return
@@ -251,7 +256,7 @@ export class OpencodeBackend implements Backend {
       }
       yield {
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
-        usage: stepUsage ?? fallbackUsage,
+        usage: stepUsage ? completeUsage(stepUsage) : fallbackUsage,
         internal_session_id: internalSessionId,
       }
     } finally {
@@ -368,13 +373,30 @@ function isStepReceipt(ev: Record<string, unknown>): boolean {
     || partType === 'step-finish'
 }
 
-function addUsage(total: UsageReceipt | undefined, next: UsageReceipt): UsageReceipt {
+function addUsage(total: UsageTotal | undefined, next: UsageReceipt): UsageTotal {
   const sum = (left: number | undefined, right: number | undefined): number | undefined =>
     left === undefined ? right : right === undefined ? left : left + right
   return {
-    input_tokens: sum(total?.input_tokens, next.input_tokens),
-    output_tokens: sum(total?.output_tokens, next.output_tokens),
-    cost: sum(total?.cost, next.cost),
+    receipt: {
+      input_tokens: sum(total?.receipt.input_tokens, next.input_tokens),
+      output_tokens: sum(total?.receipt.output_tokens, next.output_tokens),
+      cost: sum(total?.receipt.cost, next.cost),
+    },
+    costComplete: (total?.costComplete ?? true) && next.cost !== undefined,
+  }
+}
+
+function completeUsage(total: UsageTotal): UsageReceipt {
+  return {
+    ...(total.receipt.input_tokens !== undefined
+      ? { input_tokens: total.receipt.input_tokens }
+      : {}),
+    ...(total.receipt.output_tokens !== undefined
+      ? { output_tokens: total.receipt.output_tokens }
+      : {}),
+    ...(total.costComplete && total.receipt.cost !== undefined
+      ? { cost: total.receipt.cost }
+      : {}),
   }
 }
 

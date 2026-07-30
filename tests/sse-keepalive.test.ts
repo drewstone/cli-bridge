@@ -98,4 +98,53 @@ describe('collectNonStreaming', () => {
     expect(body.usage?.prompt_tokens).toBe(3)
     expect(body.usage?.completion_tokens).toBe(2)
   })
+
+  it('sums incremental usage records and a complete aggregate cost', async () => {
+    async function* deltas(): AsyncIterable<ChatDelta> {
+      yield { usage: { input_tokens: 100, output_tokens: 20 } }
+      yield { usage: { input_tokens: 240, output_tokens: 35 } }
+      yield {
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cost: 0.005,
+          cost_scope: 'total',
+        },
+      }
+      yield { finish_reason: 'stop' }
+    }
+    const body = (await collectNonStreaming(deltas(), 'test')) as {
+      usage?: {
+        prompt_tokens: number
+        completion_tokens: number
+        total_tokens: number
+        cost?: number
+      }
+    }
+
+    expect(body.usage).toEqual({
+      prompt_tokens: 340,
+      completion_tokens: 55,
+      total_tokens: 395,
+      cost: 0.005,
+    })
+  })
+
+  it('omits a partial cost when any incremental usage record lacks cost', async () => {
+    async function* deltas(): AsyncIterable<ChatDelta> {
+      yield { usage: { input_tokens: 100, output_tokens: 20, cost: 0.003 } }
+      yield { usage: { input_tokens: 240, output_tokens: 35 } }
+      yield { finish_reason: 'stop' }
+    }
+
+    const body = (await collectNonStreaming(deltas(), 'test')) as {
+      usage?: Record<string, unknown>
+    }
+
+    expect(body.usage).toEqual({
+      prompt_tokens: 340,
+      completion_tokens: 55,
+      total_tokens: 395,
+    })
+  })
 })
