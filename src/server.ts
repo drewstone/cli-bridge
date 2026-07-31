@@ -237,7 +237,7 @@ export async function buildApp(config: Config): Promise<{
   }
 
   mountHealth(app, { registry, admission })
-  mountModels(app, { registry, catalog })
+  mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin })
   mountSessions(app, { sessions })
   mountRuns(app, { runs })
   mountProfiles(app, { catalog })

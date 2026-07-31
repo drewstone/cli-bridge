@@ -20,19 +20,54 @@ export function provisionProfileWorkspace(
   session: SessionRecord | null,
   harness: HarnessId,
   cwd: string,
-): { env: Record<string, string>; flags: string[]; written: string[] } {
+): { env: Record<string, string>; flags: string[]; written: string[]; unsupported: ProfileUnsupported[] } {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return { env: {}, flags: [], written: [], unsupported: [] }
+
+  // A caller that sent `agent_profile` is asking for THAT agent. Provisioning
+  // it is not optional decoration: the profile's prompt cites the paths these
+  // files land at, so a run that proceeds un-provisioned answers as an agent
+  // with no skills, no context, and no subagents while reporting success. That
+  // is indistinguishable from a working run at the wire and it silently
+  // invalidates anything measured from it, so it fails the request instead.
+  let plan: ReturnType<typeof materializeProfile>
   try {
-    const profile = resolveAgentProfile(req, session)
-    if (!profile) return { env: {}, flags: [], written: [] }
-    const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
-    if (!plan.files.length && !plan.flags.length) return { env: {}, flags: [], written: [] }
-    const applied = applyWorkspacePlan(plan, cwd)
-    return { env: applied.env, flags: applied.flags, written: applied.written }
-  } catch {
-    // FAIL-SAFE: a profile-materialization error must never break a live request.
-    // Worst case the run is un-provisioned (same as today), never crashed.
-    return { env: {}, flags: [], written: [] }
+    plan = materializeProfile(profile, harness, { skip: ['mcp'] })
+  } catch (cause) {
+    throw new BackendError(
+      `agent_profile could not be materialized for harness "${harness}": ${cause instanceof Error ? cause.message : String(cause)}`,
+      'not_configured',
+      cause,
+    )
   }
+
+  // `unsupported` is data, not an exception: the harness genuinely cannot take
+  // that dimension (hermes has no cwd skill dir; Hub connections need a runtime
+  // to authorize them). Dropping it is correct — dropping it SILENTLY is not,
+  // so it is returned for the caller to log or assert on.
+  const unsupported: ProfileUnsupported[] = (plan.unsupported ?? []).map((entry) => ({
+    dimension: entry.dimension,
+    reason: entry.reason,
+  }))
+
+  if (!plan.files.length && !plan.flags.length) return { env: {}, flags: [], written: [], unsupported }
+
+  let applied: ReturnType<typeof applyWorkspacePlan>
+  try {
+    applied = applyWorkspacePlan(plan, cwd)
+  } catch (cause) {
+    throw new BackendError(
+      `agent_profile workspace could not be written under ${cwd}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      'not_configured',
+      cause,
+    )
+  }
+  return { env: applied.env, flags: applied.flags, written: applied.written, unsupported }
+}
+
+export interface ProfileUnsupported {
+  dimension: string
+  reason: string
 }
 
 export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | null): AgentProfile | null {
@@ -334,7 +369,18 @@ export function materializeMcpServersForPi(
   cwd: string,
 ): MaterializedMcpConfig | null {
   if (!specs) return null
-  const mcpServers = buildCanonicalMcpServers(specs)
+  // `directTools` is pi-adapter-specific, so it is added HERE rather than in the shared canonical
+  // builder that Claude and Kimi also read. It registers each server's tools as NATIVE pi tools
+  // instead of leaving them behind the generic `mcp` tool, where an agent must connect to the
+  // server and describe each verb before it can call one. A measured supervisor run spent 58 turns
+  // and 639,632 input tokens on that discovery before it could delegate once; naming the tools up
+  // front is the difference between a usable server and a directory to browse.
+  const mcpServers = Object.fromEntries(
+    Object.entries(buildCanonicalMcpServers(specs)).map(([name, server]) => [
+      name,
+      { ...server, directTools: true },
+    ]),
+  )
   const serverNames = Object.keys(mcpServers)
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {
     console.error(`[cli-bridge mcp pi] materialized servers: ${serverNames.join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)

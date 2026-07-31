@@ -61,6 +61,7 @@ import {
   buildCanonicalMcpServers,
   materializeMcpServersForPi,
   provisionProfileWorkspace,
+  resolveAgentProfile,
   resolveMcpServers,
   resolvePromptMessages,
 } from './profile-support.js'
@@ -101,6 +102,78 @@ function thinkingFlagForEffort(effort?: string): string | null {
   // Canonical ladder → pi's: none → off, ultracode → xhigh (pi's ceiling); the rest pass through.
   const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'xhigh' : effort
   return allowed.has(e) ? e : null
+}
+
+/** Pi's agent home whose `npm/node_modules/<pkg>` holds installed extensions. */
+function piNpmRoot(): string {
+  return join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent'), 'npm')
+}
+
+/**
+ * Resolve one `extensions.pi.load` entry to an absolute extension entry file.
+ * An absolute path is used verbatim; a bare package name resolves to
+ * `<npmRoot>/node_modules/<pkg>/<package.json main>` (main defaults to
+ * `index.ts`, matching pi's own packages). A bare specifier is required to be
+ * absolute because pi's per-file loader does NOT resolve names against
+ * `~/.pi/agent/npm/node_modules` (verified: bare `import 'pi-memory'` from a
+ * loaded extension fails). Fail-closed with `not_configured`: a missing package
+ * or entry file rejects the request rather than letting an ablation arm run
+ * silently without the extension it declared (a structural false-null).
+ */
+function resolvePiExtensionEntry(spec: string, npmRoot: string): string {
+  let entry: string
+  if (isAbsolute(spec)) {
+    entry = spec
+  } else {
+    const packageDir = join(npmRoot, 'node_modules', spec)
+    let main = 'index.ts'
+    try {
+      const manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf-8')) as { main?: unknown }
+      if (typeof manifest.main === 'string' && manifest.main) main = manifest.main
+    } catch (err) {
+      throw new BackendError(
+        `backend pi cannot load extension "${spec}": ${join(packageDir, 'package.json')} is not readable `
+        + `(install it with \`pi install npm:${spec}\`): ${err instanceof Error ? err.message : String(err)}`,
+        'not_configured',
+      )
+    }
+    entry = join(packageDir, main)
+  }
+  if (!existsSync(entry)) {
+    throw new BackendError(
+      `backend pi cannot load extension "${spec}": resolved entry ${entry} does not exist`,
+      'not_configured',
+    )
+  }
+  return entry
+}
+
+/**
+ * Hermetic extension control from `AgentProfile.extensions.pi.load` (the `pi`
+ * backend namespace — extension keys are backend namespaces, and pi reads its
+ * own). When `load` is an array, pi runs with `--no-extensions` (which
+ * suppresses ALL auto-discovery: cwd `.pi/extensions`, global
+ * `~/.pi/agent/extensions`, and the `settings.json` `packages` list) and loads
+ * ONLY the listed extensions via explicit `--extension <abspath>` (explicit
+ * `-e` paths still load under `--no-extensions`). This makes ablation arms
+ * reproducible and leak-free: `load: []` is a clean control (no extensions at
+ * all, even globally-installed ones), `load: ['pi-memory']` is exactly that one
+ * extension with no double-registration conflict against a global copy. Absent
+ * `extensions.pi.load` → pi's default discovery (today's behavior), so
+ * non-ablation callers are unaffected. Flags must precede the positional prompt.
+ */
+function piExtensionArgs(req: ChatRequest, session: SessionRecord | null): string[] {
+  const profile = resolveAgentProfile(req, session)
+  const piExt = (profile?.extensions as { pi?: { load?: unknown } } | undefined)?.pi
+  const load = piExt?.load
+  if (!Array.isArray(load)) return []
+  const npmRoot = piNpmRoot()
+  const args = ['--no-extensions']
+  for (const entry of load) {
+    if (typeof entry !== 'string' || !entry.trim()) continue
+    args.push('--extension', resolvePiExtensionEntry(entry.trim(), npmRoot))
+  }
+  return args
 }
 
 /**
@@ -218,6 +291,10 @@ export class PiBackend implements Backend {
     }
     const thinking = thinkingFlagForEffort(req.effort)
     if (thinking) args.push('--thinking', thinking)
+    // Hermetic pi extension control from agent_profile.extensions.pi.load —
+    // reproducible, leak-free ablation arms (see piExtensionArgs). Throws
+    // `not_configured` on an unresolvable extension, before any spawn/mount.
+    args.push(...piExtensionArgs(req, session))
     // The prompt goes as a positional argument. Pi reads it directly
     // (no stdin payload required for `--print` mode).
     args.push(prompt)
