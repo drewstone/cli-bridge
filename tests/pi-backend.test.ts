@@ -479,4 +479,78 @@ describe('PiBackend', () => {
       rmSync(cwd, { recursive: true, force: true })
     }
   })
+
+  describe('extensions.pi.load → hermetic --extension flags', () => {
+    const drive = async (load: unknown): Promise<string[]> => {
+      const cwd = mkdtempSync(join(tmpdir(), 'pi-ext-test-'))
+      let captured: string[] = []
+      try {
+        const backend = new PiBackend({
+          bin: 'pi',
+          timeoutMs: 1000,
+          spawner: piSpawner(
+            [{ type: 'session', id: 's' }, { type: 'agent_end' }],
+            (_bin, args) => { captured = args as string[] },
+          ),
+        })
+        await collect(
+          backend.chat(
+            {
+              model: 'pi/tangle-router/gpt-4o-mini',
+              messages: [{ role: 'user', content: 'hi' }],
+              agent_profile: { extensions: { pi: { load } } },
+              cwd,
+            } as never,
+            null,
+            new AbortController().signal,
+          ),
+        )
+        return captured
+      } finally {
+        rmSync(cwd, { recursive: true, force: true })
+      }
+    }
+
+    it('loads a declared package as --no-extensions + an absolute --extension (hermetic arm)', async () => {
+      const args = await drive(['pi-memory'])
+      expect(args).toContain('--no-extensions')
+      const i = args.indexOf('--extension')
+      expect(i).toBeGreaterThan(-1)
+      // resolved to the installed package's entry, absolute (pi's per-file
+      // loader cannot resolve a bare specifier against ~/.pi/agent/npm).
+      expect(args[i + 1]).toMatch(/\/pi-memory\/index\.ts$/)
+      expect(args[i + 1]!.startsWith('/')).toBe(true)
+    })
+
+    it('empty load is a clean control: --no-extensions and NO --extension', async () => {
+      const args = await drive([])
+      expect(args).toContain('--no-extensions')
+      expect(args).not.toContain('--extension')
+    })
+
+    it('absent extensions.pi.load leaves pi default discovery untouched', async () => {
+      let captured: string[] = []
+      const backend = new PiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        spawner: piSpawner(
+          [{ type: 'session', id: 's' }, { type: 'agent_end' }],
+          (_bin, args) => { captured = args as string[] },
+        ),
+      })
+      await collect(
+        backend.chat(
+          { model: 'pi', messages: [{ role: 'user', content: 'hi' }] } as never,
+          null,
+          new AbortController().signal,
+        ),
+      )
+      expect(captured).not.toContain('--no-extensions')
+      expect(captured).not.toContain('--extension')
+    })
+
+    it('fails loud (BackendError not_configured) when a declared extension is not installed', async () => {
+      await expect(drive(['pi-does-not-exist-xyz'])).rejects.toBeInstanceOf(BackendError)
+    })
+  })
 })
