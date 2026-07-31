@@ -140,7 +140,10 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
-- local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`) persist the full profile, honor the executable subset directly where possible, and compile the remaining context into a deterministic system-prompt preamble
+- local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`) persist the full profile and reject profile dimensions they cannot execute
+- Pi passes the replacement system prompt, additive instructions, skills, and prompt templates through Pi's native per-process flags using unique files that are removed after the run; a profile also disables ambient context, skill, and prompt-template discovery
+- `agent_profile.extensions.pi.load` selects an exact Pi extension set from installed package names or absolute paths; when present, the bridge passes `--no-extensions` plus one `--extension` flag per resolved entry
+- Pi rejects generic profile file mounts because Pi has no request-scoped loader that can preserve their declared task-relative paths
 
 Example:
 

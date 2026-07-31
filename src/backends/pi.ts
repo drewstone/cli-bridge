@@ -51,6 +51,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -61,9 +62,9 @@ import type { SessionRecord } from '../sessions/store.js'
 import {
   buildCanonicalMcpServers,
   materializeMcpServersForPi,
-  provisionProfileWorkspace,
+  provisionPiProfile,
+  resolveAgentProfile,
   resolveMcpServers,
-  resolvePromptMessages,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -102,6 +103,92 @@ function thinkingFlagForEffort(effort?: string): string | null {
   // Canonical ladder → pi's: none → off, ultracode → xhigh (pi's ceiling); the rest pass through.
   const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'xhigh' : effort
   return allowed.has(e) ? e : null
+}
+
+/**
+ * Translate the handled `extensions.pi.load` control into an exact extension
+ * set. This is the provider-specific half that the shared profile materializer
+ * deliberately leaves to Pi.
+ *
+ * An explicit list disables every ambient extension before loading only its
+ * entries. Absent `load` preserves Pi's normal global extension discovery,
+ * which remains necessary for existing provider packages such as pi-zai-glm.
+ */
+function piExtensionArgs(
+  req: ChatRequest,
+  session: SessionRecord | null,
+  needsMcpAdapter: boolean,
+): string[] {
+  const pi = resolveAgentProfile(req, session)?.extensions?.pi
+  if (pi === undefined) return []
+  if (!pi || typeof pi !== 'object' || Array.isArray(pi)) {
+    throw new BackendError('extensions.pi must be an object', 'parse_error')
+  }
+
+  const unknown = Object.keys(pi).filter((key) => key !== 'load')
+  if (unknown.length > 0) {
+    throw new BackendError(
+      `unsupported extensions.pi controls: ${unknown.sort().join(', ')}`,
+      'parse_error',
+    )
+  }
+  if (!Object.hasOwn(pi, 'load')) return []
+
+  const load = pi.load
+  if (!Array.isArray(load) || load.some((entry) => typeof entry !== 'string' || !entry.trim())) {
+    throw new BackendError('extensions.pi.load must be an array of non-empty strings', 'parse_error')
+  }
+  if (
+    needsMcpAdapter
+    && !load.some((entry) => entry === 'pi-mcp-adapter' || entry === 'npm:pi-mcp-adapter')
+  ) {
+    throw new BackendError(
+      'extensions.pi.load must include the installed pi-mcp-adapter package when the profile requests MCP servers',
+      'parse_error',
+    )
+  }
+
+  const configuredAgentDir = process.env.PI_CODING_AGENT_DIR
+  const hostNpmRoot = join(configuredAgentDir ?? join(homedir(), '.pi', 'agent'), 'npm', 'node_modules')
+  // Pi expands `~` itself. Keeping the default path HOME-relative makes the
+  // same argv work for host execution and for a container whose mounted Pi
+  // agent directory lives under a different HOME.
+  const runtimeNpmRoot = join(configuredAgentDir ?? '~/.pi/agent', 'npm', 'node_modules')
+  const entries = new Set((load as string[]).map((spec) =>
+    resolvePiExtensionPath(spec.trim(), hostNpmRoot, runtimeNpmRoot),
+  ))
+  return [
+    '--no-extensions',
+    ...[...entries].flatMap((entry) => ['--extension', entry]),
+  ]
+}
+
+function resolvePiExtensionPath(spec: string, hostNpmRoot: string, runtimeNpmRoot: string): string {
+  const normalized = spec.startsWith('npm:') ? spec.slice(4) : spec
+  if (isAbsolute(normalized)) {
+    if (existsSync(normalized)) return normalized
+    throw new BackendError(
+      `backend pi cannot load extension "${spec}": ${normalized} does not exist`,
+      'not_configured',
+    )
+  }
+  if (!/^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/u.test(normalized)) {
+    throw new BackendError(
+      `backend pi cannot load extension "${spec}": expected an installed package name or absolute path`,
+      'not_configured',
+    )
+  }
+  const hostPath = join(hostNpmRoot, normalized)
+  if (!existsSync(hostPath)) {
+    throw new BackendError(
+      `backend pi cannot load extension "${spec}": ${hostPath} does not exist`,
+      'not_configured',
+    )
+  }
+  // Pi accepts package directories directly and applies its own package.json
+  // manifest, glob, and conventional-directory rules. Keeping that logic in Pi
+  // avoids a second, inevitably incomplete package loader in the bridge.
+  return join(runtimeNpmRoot, normalized)
 }
 
 /**
@@ -178,6 +265,7 @@ export class PiBackend implements Backend {
 
     const spec = parsePiModelId(req.model)
     const prompt = this.buildPrompt(req)
+    const profile = resolveAgentProfile(req, session)
 
     const args: string[] = [
       '--print',
@@ -187,16 +275,18 @@ export class PiBackend implements Backend {
     if (spec.model) args.push('--model', spec.model)
     if (session?.internalId) {
       args.push('--session', session.internalId)
+    } else if (req.session_id) {
+      // Pi's implicit persistent-session path drops request-scoped system
+      // prompt overrides while creating the first session. Give Pi an explicit
+      // internal id so the first turn uses the profile and report that id back
+      // through the normal session event for subsequent `--session` resumes.
+      args.push('--session-id', randomUUID())
     } else if (!req.session_id) {
-      // A caller-owned id without a mapping needs Pi's default persistent
-      // session creation; only a truly anonymous call is stateless.
+      // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
-    const thinking = thinkingFlagForEffort(req.effort)
+    const thinking = thinkingFlagForEffort(req.effort ?? profile?.model?.reasoningEffort)
     if (thinking) args.push('--thinking', thinking)
-    // The prompt goes as a positional argument. Pi reads it directly
-    // (no stdin payload required for `--print` mode).
-    args.push(prompt)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
@@ -216,20 +306,26 @@ export class PiBackend implements Backend {
       )
     }
 
-    // Reject unsupported profile plans before mounting MCP credentials
-    // into the caller's project-scoped .pi directory.
-    const provisioned = provisionProfileWorkspace(req, session, 'pi', runCwd)
-    args.push(...provisioned.flags)
+    // The provider-specific extension namespace and the canonical profile
+    // files both use Pi's per-process loaders. All flags precede the positional
+    // prompt, and large prompt material rides file paths rather than argv.
+    args.push(...piExtensionArgs(req, session, requestedMcpNames.length > 0))
+    const provisioned = provisionPiProfile(req, session, runCwd)
+    if (provisioned) args.push(...provisioned.flags)
+    // The task prompt remains the sole positional message. Profile system and
+    // additive instructions retain their native, separate authority channels.
+    args.push(prompt)
 
-    const mcpMounted = requestedMcpNames.length > 0
-      ? materializeMcpServersForPi(mcpSpecs, runCwd)
-      : null
+    let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
     let spawned: Awaited<ReturnType<Spawner>>
     try {
+      mcpMounted = requestedMcpNames.length > 0
+        ? materializeMcpServersForPi(mcpSpecs, runCwd)
+        : null
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
-        env: { ...process.env, ...provisioned.env },
+        env: { ...process.env, ...(provisioned?.env ?? {}) },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })
@@ -237,6 +333,7 @@ export class PiBackend implements Backend {
       // `.pi/mcp.json` lives in the caller's workspace, not a temp dir —
       // never leave it behind when the subprocess failed to spawn.
       mcpMounted?.cleanup()
+      provisioned?.cleanup()
       throw err
     }
     const child = spawned.child
@@ -401,14 +498,14 @@ export class PiBackend implements Backend {
       await terminateSpawned(spawned)
       try { releaseSpawner() } catch { /* best effort */ }
       mcpMounted?.cleanup()
+      provisioned?.cleanup()
     }
   }
 
   /** Compose a single prompt string from the request's messages. */
   private buildPrompt(req: ChatRequest): string {
-    const messages = resolvePromptMessages(req, null)
     const parts: string[] = []
-    for (const msg of messages) {
+    for (const msg of req.messages) {
       const text = contentToText(msg.content)
       if (!text) continue
       const prefix = msg.role === 'system' ? 'System: '

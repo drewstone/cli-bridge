@@ -1,4 +1,19 @@
-import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
@@ -11,6 +26,8 @@ import {
   assertWorkspacePlanSupported,
   type HarnessId,
   materializeProfile,
+  type WorkspacePlan,
+  type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
 
 /**
@@ -60,16 +77,7 @@ export function provisionProfileWorkspace(
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
     assertWorkspacePlanSupported(plan)
     const applied = applyWorkspacePlan(plan, workspaceCwd)
-    const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
-    const receipt: ProfileMaterializationReceipt = {
-      schema: 'cli-bridge.profile-materialization.v1',
-      harness,
-      workspacePlanDigest: applied.workspacePlanDigest,
-      files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
-      unsupported: applied.unsupported,
-    }
-    req.profile_materialization_receipt = receipt
-    console.info(`[cli-bridge] profile materialization receipt ${JSON.stringify(receipt)}`)
+    const receipt = retainProfileMaterializationReceipt(req, harness, plan, applied)
     return {
       env: applied.env,
       flags: applied.flags,
@@ -82,6 +90,144 @@ export function provisionProfileWorkspace(
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
   }
+}
+
+export interface ProvisionedPiProfile {
+  env: Record<string, string>
+  flags: string[]
+  written: string[]
+  workspacePlanDigest: string
+  receipt: ProfileMaterializationReceipt
+  cleanup(): void
+}
+
+/**
+ * Apply the canonical Pi profile plan without writing profile resources to the
+ * task's conventional context, skill, or prompt-template paths.
+ *
+ * Pi has explicit per-process loaders for every native file this function
+ * accepts. The files live in a unique directory under the resolved workspace
+ * root so host and Docker executors see the same absolute path. Ambient context,
+ * skills, and prompt templates are disabled whenever a profile is present; only
+ * the exact plan files are opted back in. Generic workspace files fail closed:
+ * moving one into the private directory would make its declared path invisible
+ * to the agent, while writing it into the shared task directory reintroduces the
+ * cross-run collision this path exists to remove.
+ *
+ * MCP and `extensions.pi` are handled by PiBackend's native controls, so they
+ * are skipped here only after that caller has validated and prepared them.
+ */
+export function provisionPiProfile(
+  req: ChatRequest,
+  session: SessionRecord | null,
+  cwd: string | undefined,
+): ProvisionedPiProfile | null {
+  delete req.profile_materialization_receipt
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return null
+  const workspaceCwd = requireMaterializationCwd(cwd, 'pi AgentProfile materialization')
+
+  let profileRoot: string | null = null
+  try {
+    const genericFiles = profile.resources?.files?.map((file) => file.path) ?? []
+    if (genericFiles.length > 0) {
+      throw new Error(
+        `no request-scoped Pi loader exists for generic workspace file(s): ${genericFiles.join(', ')}`,
+      )
+    }
+    const plan = materializeProfile(profile, 'pi', { skip: ['mcp', 'extensions'] })
+    assertWorkspacePlanSupported(plan)
+    assertPiPlanHasNativeLoaders(plan)
+
+    profileRoot = mkdtempSync(join(workspaceCwd, '.cli-bridge-pi-profile-'))
+    // Docker executors may run Pi under a uid different from the bridge. The
+    // workspace bind is already the trust boundary; keep the directory
+    // traversable and the files read-only to non-owners.
+    chmodSync(profileRoot, 0o755)
+    const applied = applyWorkspacePlan(plan, profileRoot, { existingFiles: 'reject' })
+    const flags = piProfileFlags(plan, applied, profileRoot)
+    const receipt = retainProfileMaterializationReceipt(req, 'pi', plan, applied)
+
+    let cleaned = false
+    return {
+      env: applied.env,
+      flags,
+      written: applied.written,
+      workspacePlanDigest: applied.workspacePlanDigest,
+      receipt,
+      cleanup: () => {
+        if (cleaned) return
+        cleaned = true
+        rmSync(profileRoot!, { recursive: true, force: true })
+      },
+    }
+  } catch (error) {
+    if (profileRoot) rmSync(profileRoot, { recursive: true, force: true })
+    const message = error instanceof Error ? error.message : String(error)
+    throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
+  }
+}
+
+function assertPiPlanHasNativeLoaders(plan: WorkspacePlan): void {
+  if (plan.flags.length > 0) {
+    throw new Error(`Pi materializer emitted unsupported relative launch flags: ${plan.flags.join(', ')}`)
+  }
+  const unsupportedPaths = plan.files
+    .map((file) => file.relPath)
+    .filter((path) => piProfileFileFlag(path) === null)
+  if (unsupportedPaths.length > 0) {
+    throw new Error(
+      `no request-scoped Pi loader exists for workspace file(s): ${unsupportedPaths.join(', ')}`,
+    )
+  }
+}
+
+function piProfileFlags(
+  plan: WorkspacePlan,
+  applied: WorkspacePlanReceipt,
+  profileRoot: string,
+): string[] {
+  const flags = ['--no-context-files', '--no-skills', '--no-prompt-templates']
+
+  if (plan.systemPrompt !== undefined) {
+    const systemPromptDir = join(profileRoot, '.cli-bridge')
+    const systemPromptPath = join(systemPromptDir, 'system-prompt.md')
+    mkdirSync(systemPromptDir, { recursive: true })
+    writeFileSync(systemPromptPath, plan.systemPrompt, { encoding: 'utf8', mode: 0o644, flag: 'wx' })
+    flags.push('--system-prompt', systemPromptPath)
+  }
+
+  for (const path of applied.written) {
+    const flag = piProfileFileFlag(path)
+    if (flag) flags.push(flag, join(profileRoot, path))
+  }
+  return flags
+}
+
+function piProfileFileFlag(path: string): '--append-system-prompt' | '--skill' | '--prompt-template' | null {
+  if (path === 'AGENTS.md') return '--append-system-prompt'
+  if (/^\.pi\/skills\/.+\/SKILL\.md$/u.test(path)) return '--skill'
+  if (/^\.pi\/prompts\/.+\.md$/u.test(path)) return '--prompt-template'
+  return null
+}
+
+function retainProfileMaterializationReceipt(
+  req: ChatRequest,
+  harness: HarnessId,
+  plan: WorkspacePlan,
+  applied: WorkspacePlanReceipt,
+): ProfileMaterializationReceipt {
+  const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
+  const receipt: ProfileMaterializationReceipt = {
+    schema: 'cli-bridge.profile-materialization.v1',
+    harness,
+    workspacePlanDigest: applied.workspacePlanDigest,
+    files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
+    unsupported: applied.unsupported,
+  }
+  req.profile_materialization_receipt = receipt
+  console.info(`[cli-bridge] profile materialization receipt ${JSON.stringify(receipt)}`)
+  return receipt
 }
 
 export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | null): AgentProfile | null {
