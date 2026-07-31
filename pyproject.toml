@@ -1,0 +1,16 @@
+[project]
+name = "novu-subscribers-client"
+version = "1.0.0"
+description = "Novu Subscribers API client — stdlib only"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+include = ["solution", "solution.*"]
+
+[tool.mypy]
+disallow_any_generics = false
+warn_unused_configs = false
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
