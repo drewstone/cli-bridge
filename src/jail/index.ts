@@ -42,6 +42,25 @@ export class NoopJail implements JailBackend {
 
 export const noopJail = new NoopJail()
 
+/**
+ * Expose extra host paths read-only inside an fs-jail. An fs-jail mounts a
+ * FRESH tmpfs over `/tmp`, which hides a backend's runtime config (MCP config,
+ * OPENCODE_CONFIG, kimi config.toml) that was materialized under the host
+ * `/tmp` before spawn. Backends call this with those config paths so the
+ * confined CLI can still read them; the linux backend binds them read-only
+ * AFTER the tmpfs, so they reappear.
+ *
+ * No-op unless `spec` is a read-confined (fs-jail) spec: a write-jail keeps the
+ * whole host readable, so nothing needs re-binding, and an absent spec means no
+ * jail at all. Safe to call unconditionally from a backend.
+ */
+export function registerJailReadable(spec: JailSpec | null | undefined, ...paths: string[]): void {
+  if (!spec?.readConfine) return
+  const merged = new Set(spec.extraReadablePaths ?? [])
+  for (const p of paths) if (p) merged.add(p)
+  spec.extraReadablePaths = [...merged]
+}
+
 export function selectJailBackend(platform: NodeJS.Platform = process.platform): JailBackend {
   if (platform === 'linux') return new LinuxBwrapJail()
   if (platform === 'darwin') return new MacosSeatbeltJail()

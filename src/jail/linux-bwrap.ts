@@ -26,12 +26,40 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync } from 'node:fs'
-import { delimiter, join } from 'node:path'
+import { accessSync, constants, existsSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
 const BWRAP_BIN = 'bwrap'
+
+/**
+ * Minimal read-only system paths bound into an fs-jail (readConfine) so the
+ * CLI, a shell, and the C/Python runtimes resolve. Each is bound with
+ * `--ro-bind-try` so a path absent on this host is skipped, not fatal.
+ *
+ *   - /usr holds the bulk of binaries + shared libs + the Python stdlib.
+ *   - /bin /sbin /lib* are real dirs on split-usr systems and symlinks into
+ *     /usr on merged-usr systems; `--ro-bind-try` binds either shape (it
+ *     follows the symlink to the target dir), so `#!/bin/sh` shebangs and
+ *     PATH lookups work without assuming a layout.
+ *   - /etc supplies resolv.conf, TLS trust (ssl/ca-certificates), passwd/nss.
+ *   - /run/systemd/resolve is the stub-resolv.conf target on systemd-resolved
+ *     hosts (where /etc/resolv.conf is a symlink into it), needed for DNS.
+ *
+ * Deliberately absent: /home, /root, /tmp, /var, /mnt, /media — the host repo
+ * (task defs / grader keys) and sibling run scratch dirs live under those and
+ * must stay invisible. The workspace and the language toolchain are added
+ * explicitly (see wrap() / {@link toolchainReadPaths}).
+ */
+const SYSTEM_RO_PATHS: readonly string[] = [
+  '/usr',
+  '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32',
+  '/etc',
+  '/opt',
+  '/run/systemd/resolve',
+]
 
 export class LinuxBwrapJail implements JailBackend {
   readonly name = 'bwrap'
@@ -52,18 +80,42 @@ export class LinuxBwrapJail implements JailBackend {
       '--unshare-ipc',
       '--unshare-uts',
       '--share-net',
-      // Host root is read-only. Note we do NOT tmpfs /tmp: the bridge
+    ]
+
+    if (spec.readConfine) {
+      // fs-jail: ALLOWLIST reads. Bind only the minimal system + toolchain
+      // paths the CLI and its runtimes need; the host repo, sibling run
+      // scratch dirs, and the host /tmp are simply never mounted, so a jailed
+      // shell cannot read benchmark task definitions or grader answer keys.
+      // /tmp is a FRESH empty tmpfs (writable, ephemeral) — the host /tmp
+      // (twins, other runs' materialized config) is invisible. The workspace
+      // is re-exposed READ-WRITE below (it commonly lives under /tmp), after
+      // the tmpfs, so a coding agent can still build its solution.
+      for (const path of SYSTEM_RO_PATHS) bwrapArgs.push('--ro-bind-try', path, path)
+      bwrapArgs.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp')
+      for (const path of toolchainReadPaths(bin, spec.projectDir)) {
+        bwrapArgs.push('--ro-bind-try', path, path)
+      }
+      bwrapArgs.push('--bind', spec.projectDir, spec.projectDir)
+    } else {
+      // write-jail: reads stay OPEN (whole host read-only), only writes are
+      // confined to the jail root. Note we do NOT tmpfs /tmp: the bridge
       // materializes runtime config (MCP config, kimi config.toml,
       // OPENCODE_CONFIG) under the host tmpdir before spawn, and the CLI must
       // still read those paths. /tmp stays readable (read-only) via this bind;
       // the CLI's own temp WRITES are redirected to TMPDIR=<root>/.tmp (jailEnv).
-      '--ro-bind', '/', '/',
-      '--dev', '/dev',
-      '--ro-bind', spec.projectDir, spec.projectDir,
-    ]
+      bwrapArgs.push(
+        '--ro-bind', '/', '/',
+        '--dev', '/dev',
+        '--ro-bind', spec.projectDir, spec.projectDir,
+      )
+    }
 
     for (const path of spec.extraReadablePaths ?? []) {
-      bwrapArgs.push('--ro-bind', path, path)
+      // In an fs-jail these carry the materialized runtime config the backend
+      // wrote under the host /tmp (now hidden by the tmpfs above); `-try` keeps
+      // a since-removed path non-fatal. Bound after the tmpfs so they win.
+      bwrapArgs.push('--ro-bind-try', path, path)
     }
     for (const path of spec.extraWritablePaths ?? []) {
       bwrapArgs.push('--bind', path, path)
@@ -95,6 +147,103 @@ export class LinuxBwrapJail implements JailBackend {
     )
 
     return { bin: BWRAP_BIN, args: bwrapArgs }
+  }
+}
+
+/**
+ * Read-only paths for the language + CLI toolchain that must be visible inside
+ * an fs-jail, derived at wrap time so no host layout is hard-coded:
+ *
+ *   - the Node install prefix (from the bridge's own interpreter), covering
+ *     node/npm/pnpm and any globally-installed CLI under its lib/node_modules;
+ *   - the wrapped CLI's own location — both its on-PATH entry dir (so a bare
+ *     `bin` name resolves) and its realpath install root (so a bundled runtime
+ *     a level up, e.g. `~/.opencode`, is readable);
+ *   - the operator's `~/.cache` (tokenizer / model caches some CLIs read);
+ *   - any extra dirs an operator lists in `BRIDGE_JAIL_RO_PATHS` (a PATH-style
+ *     list) for a runtime whose location auto-derivation misses.
+ *
+ * Every candidate passes through {@link isSafeReadPath}: `/`, `/home`, the
+ * operator HOME itself, and any ANCESTOR of the workspace are refused, so a
+ * mis-derivation can never re-open the whole home tree or the sibling run
+ * scratch dirs the jail exists to hide.
+ */
+export function toolchainReadPaths(bin: string, projectDir: string): string[] {
+  const home = homedir()
+  const candidates: string[] = []
+
+  // Node install prefix: <prefix>/bin/node → <prefix>. Also covers npm/pnpm and
+  // globally npm-installed CLIs (which live under <prefix>/lib/node_modules).
+  const nodeReal = tryRealpath(process.execPath)
+  if (nodeReal) candidates.push(dirname(dirname(nodeReal)))
+
+  // The wrapped CLI itself: its on-PATH entry dir (resolves a bare name and a
+  // symlink such as ~/.local/bin/opencode) plus its realpath install root.
+  const onPathEntry = whichPath(bin)
+  if (onPathEntry) {
+    candidates.push(dirname(onPathEntry))
+    const real = tryRealpath(onPathEntry)
+    if (real) {
+      const realDir = dirname(real)
+      candidates.push(basename(realDir) === 'bin' ? dirname(realDir) : realDir)
+    }
+  }
+
+  candidates.push(join(home, '.cache'))
+
+  for (const p of (process.env.BRIDGE_JAIL_RO_PATHS ?? '').split(delimiter)) {
+    if (p.trim()) candidates.push(resolve(p.trim()))
+  }
+
+  const base = resolve(projectDir)
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const c of candidates) {
+    const p = resolve(c)
+    if (seen.has(p)) continue
+    seen.add(p)
+    if (isSafeReadPath(p, home, base)) out.push(p)
+  }
+  return out
+}
+
+/**
+ * Reject a toolchain read-bind that would defeat the jail: the filesystem root,
+ * the shared `/home`, the operator HOME itself, or any path that is the
+ * workspace or an ANCESTOR of it. The ancestor check is the load-bearing one —
+ * binding an ancestor read-only (e.g. `/tmp` when the workspace is a
+ * `/tmp/vb-live-<id>/ws` scratch dir) would re-expose the workspace's siblings,
+ * which is exactly the leak the fs-jail closes.
+ */
+function isSafeReadPath(p: string, home: string, base: string): boolean {
+  if (!isAbsolute(p) || p === '/' || p === '/home' || p === home) return false
+  const relToBase = relative(p, base)
+  const isBaseOrAncestor = relToBase === '' || (!relToBase.startsWith(`..${sep}`) && relToBase !== '..' && !isAbsolute(relToBase))
+  return !isBaseOrAncestor
+}
+
+/** Absolute on-PATH location of `bin` (or `bin` itself if absolute), else null. */
+function whichPath(bin: string): string | null {
+  if (isAbsolute(bin)) return existsSync(bin) ? bin : null
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue
+    const full = join(dir, bin)
+    try {
+      accessSync(full, constants.X_OK)
+      return full
+    } catch {
+      // not in this dir; keep scanning
+    }
+  }
+  return null
+}
+
+/** realpathSync that returns null instead of throwing on a missing path. */
+function tryRealpath(p: string): string | null {
+  try {
+    return realpathSync(p)
+  } catch {
+    return null
   }
 }
 

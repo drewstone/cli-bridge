@@ -18,14 +18,16 @@
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   LinuxBwrapJail,
   MacosSeatbeltJail,
   NoopJail,
+  registerJailReadable,
   resolveJailRoot,
 } from '../src/jail/index.js'
+import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
 import { authSourcesFor } from '../src/jail/auth-preserve.js'
@@ -97,6 +99,101 @@ describe('LinuxBwrapJail.wrap', () => {
 
     // The project dir is exposed read-only.
     expect(seqIndex(argv, '--ro-bind', projectDir, projectDir)).toBeGreaterThanOrEqual(0)
+  })
+})
+
+describe('LinuxBwrapJail.wrap read-confine (fs-jail)', () => {
+  it('drops the whole-host read bind, uses a system allowlist + fresh /tmp, and binds the workspace READ-WRITE', async () => {
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'echo hi'], { root, projectDir, readConfine: true })
+    const argv = [wrap.bin, ...wrap.args]
+    const expectedRoot = resolveJailRoot(root, projectDir)
+
+    // The read hole is CLOSED: the whole host root is no longer mounted readable.
+    expect(seqIndex(argv, '--ro-bind', '/', '/'), 'must NOT ro-bind the whole host root').toBe(-1)
+    // A minimal system allowlist is bound read-only instead.
+    expect(seqIndex(argv, '--ro-bind-try', '/usr', '/usr'), '/usr allowlisted read-only').toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--ro-bind-try', '/etc', '/etc'), '/etc allowlisted read-only').toBeGreaterThanOrEqual(0)
+    // Fresh empty /tmp so the host /tmp (twins, other runs) is invisible.
+    expect(seqIndex(argv, '--tmpfs', '/tmp'), 'fresh tmpfs over /tmp').toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--proc', '/proc')).toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--dev', '/dev')).toBeGreaterThanOrEqual(0)
+    // The workspace is READ-WRITE (a coding agent builds here), not read-only.
+    expect(seqIndex(argv, '--bind', projectDir, projectDir), 'workspace bound read-write').toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--ro-bind', projectDir, projectDir), 'workspace must not be read-only in fs-jail').toBe(-1)
+    // HOME + chdir still wired; original command still the tail.
+    expect(seqIndex(argv, '--setenv', 'HOME', expectedRoot)).toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--chdir', projectDir)).toBeGreaterThanOrEqual(0)
+    expect(argv.slice(-3)).toEqual(['/bin/sh', '-c', 'echo hi'])
+  })
+
+  it('re-binds extraReadablePaths AFTER the fresh /tmp so a materialized config under /tmp survives', async () => {
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const cfgDir = await mkdtemp(join(tmpdir(), 'cli-bridge-cfg-'))
+    cleanups.push(() => rm(cfgDir, { recursive: true, force: true }))
+
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root, projectDir, readConfine: true, extraReadablePaths: [cfgDir],
+    })
+    const argv = [wrap.bin, ...wrap.args]
+    const tmpfsAt = seqIndex(argv, '--tmpfs', '/tmp')
+    const cfgAt = seqIndex(argv, '--ro-bind-try', cfgDir, cfgDir)
+    expect(tmpfsAt).toBeGreaterThanOrEqual(0)
+    expect(cfgAt, 'config dir re-bound').toBeGreaterThanOrEqual(0)
+    expect(cfgAt, 'config re-bind comes AFTER the tmpfs so it wins').toBeGreaterThan(tmpfsAt)
+  })
+})
+
+describe('toolchainReadPaths', () => {
+  it('includes the node install prefix and never a jail-defeating path', () => {
+    const projectDir = '/tmp/some-run/workspace'
+    const paths = toolchainReadPaths('/bin/sh', projectDir)
+    // The Node prefix (two levels up from the running node) is present.
+    const nodePrefix = dirname(dirname(process.execPath))
+    expect(paths).toContain(nodePrefix)
+    // Never the root, /home, the operator HOME, or an ancestor of the workspace.
+    for (const p of paths) {
+      expect(p).not.toBe('/')
+      expect(p).not.toBe('/home')
+      expect(p).not.toBe(homedir())
+      // p must not be an ancestor of (or equal to) the workspace.
+      expect(projectDir === p || projectDir.startsWith(`${p}/`), `${p} must not contain the workspace`).toBe(false)
+    }
+  })
+
+  it('honors BRIDGE_JAIL_RO_PATHS but still rejects an ancestor of the workspace', () => {
+    const projectDir = '/tmp/run42/ws'
+    const prev = process.env.BRIDGE_JAIL_RO_PATHS
+    // One safe extra dir + one that is an ancestor of the workspace (must be dropped).
+    process.env.BRIDGE_JAIL_RO_PATHS = `/opt/custom-runtime:/tmp/run42`
+    try {
+      const paths = toolchainReadPaths('/bin/sh', projectDir)
+      expect(paths).toContain('/opt/custom-runtime')
+      expect(paths, 'an ancestor of the workspace must be refused').not.toContain('/tmp/run42')
+    } finally {
+      if (prev === undefined) delete process.env.BRIDGE_JAIL_RO_PATHS
+      else process.env.BRIDGE_JAIL_RO_PATHS = prev
+    }
+  })
+})
+
+describe('registerJailReadable', () => {
+  it('adds paths to a read-confined spec, deduped', () => {
+    const spec = { root: '/p/.agent-home', projectDir: '/p', readConfine: true } as const
+    const mut = { ...spec, extraReadablePaths: undefined as string[] | undefined }
+    registerJailReadable(mut, '/tmp/cfg-a', '/tmp/cfg-a', '/tmp/cfg-b')
+    expect(mut.extraReadablePaths?.sort()).toEqual(['/tmp/cfg-a', '/tmp/cfg-b'])
+  })
+
+  it('is a no-op on a write-jail spec (whole host already readable) and on null', () => {
+    const writeJail = { root: '/p/.agent-home', projectDir: '/p', extraReadablePaths: undefined as string[] | undefined }
+    registerJailReadable(writeJail, '/tmp/cfg')
+    expect(writeJail.extraReadablePaths).toBeUndefined()
+    expect(() => registerJailReadable(null, '/tmp/cfg')).not.toThrow()
+    expect(() => registerJailReadable(undefined, '/tmp/cfg')).not.toThrow()
   })
 })
 
@@ -371,6 +468,42 @@ describe('resolveJailSpec', () => {
     const cwd = '/home/user/project'
     const spec = resolveJailSpec({ cwd, execMode: 'off', env: { BRIDGE_JAIL_MODE: 'write-jail' } })
     expect(spec, 'a per-request off must not disable an operator-enforced write-jail').not.toBeNull()
+  })
+
+  it('sets readConfine only for fs-jail: write-jail leaves reads open, fs-jail confines them', () => {
+    const cwd = '/home/user/project'
+    expect(resolveJailSpec({ cwd, execMode: 'write-jail', env: {} })?.readConfine).toBeUndefined()
+    expect(resolveJailSpec({ cwd, execMode: 'fs-jail', env: {} })?.readConfine).toBe(true)
+    expect(resolveJailSpec({ cwd, env: { BRIDGE_JAIL_MODE: 'fs-jail' } })?.readConfine).toBe(true)
+  })
+
+  it('WORKER_FS_JAIL=1 is a shorthand that turns on fs-jail (readConfine)', () => {
+    const cwd = '/home/user/project'
+    for (const v of ['1', 'true', 'yes', 'ON']) {
+      const spec = resolveJailSpec({ cwd, env: { WORKER_FS_JAIL: v } })
+      expect(spec?.readConfine, `WORKER_FS_JAIL=${v}`).toBe(true)
+    }
+    // Anything falsey is off.
+    expect(resolveJailSpec({ cwd, env: { WORKER_FS_JAIL: '0' } })).toBeNull()
+    expect(resolveJailSpec({ cwd, env: { WORKER_FS_JAIL: '' } })).toBeNull()
+  })
+
+  it('the jail floor is a MAX: a request can raise write-jail→fs-jail but not lower an fs-jail floor', () => {
+    const cwd = '/home/user/project'
+    // Request raises the floor.
+    expect(
+      resolveJailSpec({ cwd, execMode: 'fs-jail', env: { BRIDGE_JAIL_MODE: 'write-jail' } })?.readConfine,
+      'fs-jail request raises a write-jail floor',
+    ).toBe(true)
+    // Request cannot lower the fs-jail floor.
+    expect(
+      resolveJailSpec({ cwd, execMode: 'write-jail', env: { WORKER_FS_JAIL: '1' } })?.readConfine,
+      'a write-jail request must not weaken an fs-jail floor',
+    ).toBe(true)
+    expect(
+      resolveJailSpec({ cwd, execMode: 'off', env: { BRIDGE_JAIL_MODE: 'fs-jail' } })?.readConfine,
+      'a per-request off must not disable an fs-jail floor',
+    ).toBe(true)
   })
 
   it('defaults the writable root to .agent-home inside cwd', () => {

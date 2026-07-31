@@ -33,6 +33,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { AgentProfile } from '@tangle-network/agent-interface'
+import { registerJailReadable } from '../jail/index.js'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
@@ -126,6 +127,13 @@ export class KimiBackend implements Backend {
         writeMcpConfigFile(resolveMcpServers(req, session)) ?? materializeEmptyMcpConfig()
       if (configFile) args.push('--config-file', configFile)
       if (mcpMaterialized) args.push('--mcp-config-file', mcpMaterialized.configPath)
+      // Under an fs-jail the fresh tmpfs over /tmp hides these host-/tmp configs;
+      // expose their dirs read-only so the confined kimi can still read them.
+      registerJailReadable(
+        req.jailSpec,
+        ...(configFile ? [dirname(configFile)] : []),
+        ...(mcpMaterialized ? [dirname(mcpMaterialized.configPath)] : []),
+      )
 
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],

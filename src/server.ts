@@ -478,25 +478,30 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
     console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue} queueTimeoutMs=${config.admission.queueTimeoutMs}`)
-    console.log(`[cli-bridge] write-jail default: ${config.jailMode}${config.jailMode === 'write-jail' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
-    // Fail fast (don't go ready) if write-jail is the operator floor but no jail
+    // WORKER_FS_JAIL=1 is a shorthand that raises the operator jail floor to
+    // fs-jail even when BRIDGE_JAIL_MODE is unset, so fold it into the effective
+    // floor the startup gate + log report.
+    const fsJailFlag = ['1', 'true', 'yes', 'on'].includes((process.env.WORKER_FS_JAIL ?? '').trim().toLowerCase())
+    const jailFloor: 'off' | 'write-jail' | 'fs-jail' = fsJailFlag ? 'fs-jail' : config.jailMode
+    console.log(`[cli-bridge] jail default: ${jailFloor}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
+    // Fail fast (don't go ready) if a jail is the operator floor but no jail
     // backend can run here — every host request would otherwise fail closed while
     // /health reports ready. Only relevant when some backend actually spawns on the
     // host: docker/remote-only deployments never hit the host jail. Honor
     // BRIDGE_JAIL_FALLBACK=warn, which runs unconfined-with-warning instead.
     const hasHostSpawn = anyBackendSpawnsOnHost(config.backends, config.executors)
-    if (config.jailMode === 'write-jail' && hasHostSpawn && !selectJailBackend().isAvailable()) {
+    if (jailFloor !== 'off' && hasHostSpawn && !selectJailBackend().isAvailable()) {
       if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
         console.warn(
-          '[cli-bridge] WARNING: BRIDGE_JAIL_MODE=write-jail but no jail backend can run here; ' +
+          `[cli-bridge] WARNING: jail floor '${jailFloor}' set but no jail backend can run here; ` +
           'requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).',
         )
       } else {
         console.error(
-          '[cli-bridge] FATAL: BRIDGE_JAIL_MODE=write-jail but no write-jail backend can run on this ' +
+          `[cli-bridge] FATAL: jail floor '${jailFloor}' set but no jail backend can run on this ` +
           'host — every host request would fail closed. Enable unprivileged user namespaces (Linux: ' +
           '`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s /usr/bin/bwrap`), ' +
-          'ensure sandbox-exec exists (macOS), set BRIDGE_JAIL_FALLBACK=warn, or unset BRIDGE_JAIL_MODE.',
+          'ensure sandbox-exec exists (macOS), set BRIDGE_JAIL_FALLBACK=warn, or unset the jail floor.',
         )
         process.exit(1)
       }
