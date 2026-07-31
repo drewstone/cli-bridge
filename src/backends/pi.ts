@@ -42,7 +42,7 @@
  *      "toolCall":{...} }}
  *   {"type":"tool_execution_start","toolCallId":"...","toolName":"...","args":{...}}
  *   {"type":"turn_end","message":{"usage":{...}}}
- *   {"type":"agent_end"}
+ *   {"type":"agent_end","messages":[...]}
  *
  * We surface text_delta as ChatDelta.content and pi tool-call lifecycle events
  * as OpenAI-shaped tool_calls so downstream trace consumers can observe native
@@ -103,6 +103,48 @@ function thinkingFlagForEffort(effort?: string): string | null {
   // Canonical ladder → pi's: none → off, ultracode → xhigh (pi's ceiling); the rest pass through.
   const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'xhigh' : effort
   return allowed.has(e) ? e : null
+}
+
+function resolveReasoningEffort(
+  req: ChatRequest,
+  profile: ReturnType<typeof resolveAgentProfile>,
+): ChatRequest['effort'] {
+  const profileEffort = profile?.model?.reasoningEffort
+  if (profileEffort && req.effort && profileEffort !== req.effort) {
+    throw new BackendError(
+      `request effort ${JSON.stringify(req.effort)} conflicts with agent_profile.model.reasoningEffort ${JSON.stringify(profileEffort)}`,
+      'parse_error',
+    )
+  }
+  return profileEffort ?? req.effort
+}
+
+/**
+ * Pi's MCP adapter keeps its compact proxy by default. A request profile,
+ * however, declares actual tools rather than a second protocol the model must
+ * learn before it can reach those tools. Select every request-supplied server
+ * for direct exposure, preserving any ambient selectors without naming a
+ * particular server or tool in bridge source.
+ */
+function piDirectToolSelection(
+  requestedServerNames: readonly string[],
+  ambientSelection: string | undefined,
+): string | undefined {
+  if (requestedServerNames.length === 0) return ambientSelection
+
+  const unsupported = requestedServerNames.filter((name) => name.includes(',') || name.includes('/'))
+  if (unsupported.length > 0) {
+    throw new BackendError(
+      `backend pi cannot expose MCP server name(s) through pi-mcp-adapter: ${unsupported.join(', ')}; `
+      + 'server names used by this backend cannot contain "," or "/"',
+      'not_configured',
+    )
+  }
+
+  const ambient = ambientSelection && ambientSelection !== '__none__'
+    ? ambientSelection.split(',').map((entry) => entry.trim()).filter(Boolean)
+    : []
+  return [...new Set([...ambient, ...requestedServerNames])].join(',')
 }
 
 /**
@@ -285,7 +327,7 @@ export class PiBackend implements Backend {
       // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
-    const thinking = thinkingFlagForEffort(req.effort ?? profile?.model?.reasoningEffort)
+    const thinking = thinkingFlagForEffort(resolveReasoningEffort(req, profile))
     if (thinking) args.push('--thinking', thinking)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
@@ -325,7 +367,18 @@ export class PiBackend implements Backend {
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
-        env: { ...process.env, ...(provisioned?.env ?? {}) },
+        env: {
+          ...process.env,
+          ...(provisioned?.env ?? {}),
+          ...(requestedMcpNames.length > 0
+            ? {
+                MCP_DIRECT_TOOLS: piDirectToolSelection(
+                  requestedMcpNames,
+                  process.env.MCP_DIRECT_TOOLS,
+                ),
+              }
+            : {}),
+        },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })
@@ -355,7 +408,12 @@ export class PiBackend implements Backend {
       let emittedContent = false
       let emittedToolCall = false
       let sawError: string | null = null
-      let usage: { input?: number; output?: number } | undefined
+      let sawTurnUsage = false
+      const usageCost: PiUsageCost = {
+        receipts: 0,
+        total: 0,
+        complete: true,
+      }
       const piToolCalls = new PiToolCallTracker()
 
       child.stderr?.on('data', (b) => { stderr += b.toString() })
@@ -402,18 +460,29 @@ export class PiBackend implements Backend {
           continue
         }
 
-        // Final turn_end / agent_end carries usage when pi reports it.
-        // Different pi versions have emitted usage on the event itself,
-        // on `message.usage`, or on `partial.usage`; accept all three
-        // shapes so backend-integrity guards see real token activity.
-        if (type === 'turn_end' || type === 'agent_end') {
-          const message = ev.message as Record<string, unknown> | undefined
-          const partial = ev.partial as Record<string, unknown> | undefined
-          const u = (ev.usage ?? message?.usage ?? partial?.usage) as
-            | Record<string, number>
-            | undefined
-          if (u) {
-            usage = { input: Number(u.input ?? u.prompt_tokens ?? 0), output: Number(u.output ?? u.completion_tokens ?? 0) }
+        // Pi emits one turn_end.message.usage receipt for every model call.
+        // Emit each receipt immediately: retaining only the last call
+        // undercounts tool loops, and waiting for agent_end loses completed
+        // calls when the outer run is cancelled.
+        if (type === 'turn_end') {
+          const receipts = piUsageReceiptsFromEvent(ev)
+          if (receipts.length > 0) sawTurnUsage = true
+          for (const receipt of receipts) {
+            recordPiUsageCost(usageCost, receipt)
+            yield { usage: piTokenUsage(receipt) }
+          }
+          continue
+        }
+
+        // Older Pi versions may report usage only at agent_end, either as one
+        // aggregate or as messages[].usage. This is fallback-only because
+        // current Pi repeats calls already observed at turn_end.
+        if (type === 'agent_end') {
+          if (!sawTurnUsage) {
+            for (const receipt of piUsageReceiptsFromEvent(ev)) {
+              recordPiUsageCost(usageCost, receipt)
+              yield { usage: piTokenUsage(receipt) }
+            }
           }
           continue
         }
@@ -467,6 +536,20 @@ export class PiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
 
+      // Per-turn token receipts stay observable. Cost is emitted once, only
+      // after every contributing call proved its amount; a partial sum must
+      // never be presented as the run's complete cost.
+      if (usageCost.receipts > 0 && usageCost.complete) {
+        yield {
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cost: usageCost.total,
+            cost_scope: 'total',
+          },
+        }
+      }
+
       if (signal.aborted) {
         yield { finish_reason: 'error' }
         return
@@ -489,7 +572,6 @@ export class PiBackend implements Backend {
 
       yield {
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
-        ...(usage ? { usage: { input_tokens: usage.input, output_tokens: usage.output } } : {}),
       }
     } finally {
       clearTimeout(timeoutHandle)
@@ -502,12 +584,18 @@ export class PiBackend implements Backend {
     }
   }
 
-  /** Compose a single prompt string from the request's messages. */
+  /** Preserve a single task exactly; serialize only genuine multi-message input. */
   private buildPrompt(req: ChatRequest): string {
+    const messages = req.messages.flatMap((message) => {
+      const text = contentToText(message.content)
+      return text ? [{ message, text }] : []
+    })
+    if (messages.length === 1 && messages[0]?.message.role === 'user') {
+      return messages[0].text
+    }
+
     const parts: string[] = []
-    for (const msg of req.messages) {
-      const text = contentToText(msg.content)
-      if (!text) continue
+    for (const { message: msg, text } of messages) {
       const prefix = msg.role === 'system' ? 'System: '
         : msg.role === 'user' ? 'User: '
         : msg.role === 'assistant' ? 'Assistant: '
@@ -516,6 +604,114 @@ export class PiBackend implements Backend {
     }
     return parts.join('\n\n')
   }
+}
+
+interface PiUsageReceipt {
+  input: number
+  output: number
+  cost?: number
+}
+
+interface PiUsageCost {
+  receipts: number
+  total: number
+  complete: boolean
+}
+
+function piUsageReceiptsFromEvent(ev: Record<string, unknown>): PiUsageReceipt[] {
+  const message = record(ev.message)
+  const partial = record(ev.partial)
+  const direct = record(ev.usage) ?? record(message?.usage) ?? record(partial?.usage)
+  if (direct) {
+    const receipt = piUsageFromRecord(direct)
+    return receipt ? [receipt] : []
+  }
+
+  if (!Array.isArray(ev.messages)) return []
+  const receipts: PiUsageReceipt[] = []
+  for (const item of ev.messages) {
+    const usage = record(record(item)?.usage)
+    if (!usage) continue
+    const receipt = piUsageFromRecord(usage)
+    if (receipt) receipts.push(receipt)
+  }
+  return receipts
+}
+
+function piUsageFromRecord(usage: Record<string, unknown>): PiUsageReceipt | undefined {
+  // Native Pi usage separates fresh input, cache reads, and cache writes.
+  // OpenAI prompt_tokens already includes all three, so never add cache fields
+  // to that older aggregate shape.
+  const nativeInput = piTokenCount(usage.input ?? usage.inputTokens, 'input')
+  const openAiInput = piTokenCount(usage.prompt_tokens, 'prompt_tokens')
+  const cacheRead = piTokenCount(
+    usage.cacheRead ?? usage.cache_read_input_tokens ?? usage.cacheReadInputTokens,
+    'cacheRead',
+  )
+  const cacheWrite = piTokenCount(
+    usage.cacheWrite ?? usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens,
+    'cacheWrite',
+  )
+  const output = piTokenCount(
+    usage.output ?? usage.outputTokens ?? usage.completion_tokens,
+    'output',
+  )
+  if (
+    nativeInput === undefined
+    && openAiInput === undefined
+    && cacheRead === undefined
+    && cacheWrite === undefined
+    && output === undefined
+  ) {
+    return undefined
+  }
+
+  const rawCost = usage.cost
+  const nestedCost = record(rawCost)
+  const cost = piCost(nestedCost ? nestedCost.total : rawCost)
+  return {
+    input: openAiInput ?? (nativeInput ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0),
+    output: output ?? 0,
+    ...(cost !== undefined ? { cost } : {}),
+  }
+}
+
+function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['usage']> {
+  return {
+    input_tokens: receipt.input,
+    output_tokens: receipt.output,
+  }
+}
+
+function recordPiUsageCost(total: PiUsageCost, receipt: PiUsageReceipt): void {
+  total.receipts += 1
+  if (receipt.cost === undefined) {
+    total.complete = false
+    return
+  }
+  total.total += receipt.cost
+}
+
+function piTokenCount(value: unknown, field: string): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new BackendError(`pi reported invalid ${field} token count`, 'upstream')
+  }
+  return value
+}
+
+function piCost(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new BackendError('pi reported invalid usage cost', 'upstream')
+  }
+  return value
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 /**

@@ -126,7 +126,7 @@ export async function collectNonStreaming(
   let content = ''
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = []
   let finishReason: string | null = null
-  let usage: ChatDelta['usage']
+  let usage: CollectedUsage | undefined
   let profileMaterialization: ChatDelta['profile_materialization']
   let error: ChatDelta['error']
 
@@ -137,7 +137,7 @@ export async function collectNonStreaming(
     if (d.content) content += d.content
     if (d.tool_calls) toolCalls.push(...d.tool_calls)
     if (d.finish_reason) finishReason = d.finish_reason
-    if (d.usage) usage = d.usage
+    if (d.usage) usage = addUsage(usage, d.usage)
     if (d.profile_materialization) profileMaterialization = d.profile_materialization
     if (d.error) error = d.error
   }
@@ -146,10 +146,10 @@ export async function collectNonStreaming(
   // here we only normalise to the OpenAI shape, preserving the `estimated` flag.
   const usageOut = usage
     ? {
-        prompt_tokens: usage.input_tokens ?? 0,
-        completion_tokens: usage.output_tokens ?? 0,
-        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
-        ...(usage.cost !== undefined ? { cost: usage.cost } : {}),
+        prompt_tokens: usage.inputTokens,
+        completion_tokens: usage.outputTokens,
+        total_tokens: usage.inputTokens + usage.outputTokens,
+        ...(usage.costComplete ? { cost: usage.cost } : {}),
         ...(usage.estimated ? { estimated: true } : {}),
       }
     : undefined
@@ -183,5 +183,29 @@ export async function collectNonStreaming(
     // made `finish_reason: 'error'` with an empty message the caller's whole
     // explanation for a bridge-side failure.
     ...(error ? { error } : {}),
+  }
+}
+
+interface CollectedUsage {
+  inputTokens: number
+  outputTokens: number
+  cost: number
+  costComplete: boolean
+  estimated: boolean
+}
+
+function addUsage(
+  current: CollectedUsage | undefined,
+  next: NonNullable<ChatDelta['usage']>,
+): CollectedUsage {
+  const totalCost = next.cost_scope === 'total'
+  return {
+    inputTokens: (current?.inputTokens ?? 0) + (next.input_tokens ?? 0),
+    outputTokens: (current?.outputTokens ?? 0) + (next.output_tokens ?? 0),
+    cost: totalCost ? (next.cost ?? 0) : (current?.cost ?? 0) + (next.cost ?? 0),
+    costComplete: totalCost
+      ? next.cost !== undefined
+      : (current?.costComplete ?? true) && next.cost !== undefined,
+    estimated: (current?.estimated ?? false) || next.estimated === true,
   }
 }
