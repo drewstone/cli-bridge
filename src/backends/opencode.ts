@@ -130,6 +130,17 @@ export class OpencodeBackend implements Backend {
           // one nobody configured decided the outcome. Propagate ours so a single
           // setting governs, and leave an explicit operator override ahead of it.
           OPENCODE_RUN_TIMEOUT_SECONDS: String(Math.ceil(this.opts.timeoutMs / 1000)),
+          // Name the SERIES for the isolating wrapper. It keeps non-interactive runs
+          // out of the user's shared opencode store by redirecting XDG_DATA_HOME into a
+          // temp dir it deletes on exit — but disposability is a property of the series,
+          // not of one call. The first shot of a resumable loop carries no `-s` (the
+          // session does not exist yet), so it was isolated and wiped, and the next shot
+          // resumed a session that was gone: `opencode exited 1: Session not found`,
+          // which ended every multi-round run at round 2. The caller's session id is
+          // stable across shots, so it names the series and the store persists for it.
+          ...(req.session_id
+            ? { OPENCODE_RUNTIME_ID: req.session_id.replace(/[^A-Za-z0-9_.-]/g, '-') }
+            : {}),
           ...provisioned.env,
           ...(process.env.OPENCODE_RUN_TIMEOUT_SECONDS
             ? { OPENCODE_RUN_TIMEOUT_SECONDS: process.env.OPENCODE_RUN_TIMEOUT_SECONDS }
