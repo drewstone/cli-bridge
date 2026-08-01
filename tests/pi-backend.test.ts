@@ -694,6 +694,155 @@ describe('PiBackend', () => {
     )
   })
 
+  // Captured from pi 0.83.0 against a provider that answers 401: pi exits 0, emits no
+  // `error` event and no `error` field, and reports the failure only on the assistant
+  // message. Read off the wire with:
+  //   PI_CODING_AGENT_DIR=<dir> pi --print --mode json --provider probe --model probe-model \
+  //     --no-session "say hi"
+  const piProviderFailureTurnEnd = {
+    type: 'turn_end',
+    message: {
+      role: 'assistant',
+      content: [],
+      api: 'openai-completions',
+      provider: 'probe',
+      model: 'probe-model',
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+      stopReason: 'error',
+      timestamp: 1785566141560,
+      errorMessage: '401: {"message":"probe: invalid api key","type":"invalid_request_error"}',
+    },
+    toolResults: [],
+  }
+
+  it('fails the request when pi reports a provider failure on the assistant turn', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-session-err' },
+        { type: 'agent_start' },
+        { type: 'turn_start' },
+        piProviderFailureTurnEnd,
+        { type: 'agent_end' },
+        { type: 'agent_settled' },
+      ]),
+    })
+
+    const run = collect(backend.chat({
+      model: 'pi/tangle-router/gpt-5-mini',
+      messages: [{ role: 'user', content: 'say hi' }],
+    }, null, new AbortController().signal))
+
+    await expect(run).rejects.toThrowError(BackendError)
+    await expect(run).rejects.toThrow(/pi assistant turn failed/u)
+    await expect(run).rejects.toThrow(/invalid api key/u)
+    // A 401 from the provider is a credential problem, not a transient upstream blip.
+    await run.catch((err: BackendError) => {
+      expect(err.code).toBe('not_configured')
+    })
+  })
+
+  it('fails a truncated turn: partial text streamed before the provider failure is not success', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-session-trunc' },
+        {
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'partial ' },
+        },
+        {
+          type: 'turn_end',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'partial ' }],
+            usage: { input: 12, output: 3 },
+            stopReason: 'error',
+            errorMessage: '529 overloaded_error: Overloaded',
+          },
+        },
+        { type: 'agent_end' },
+      ]),
+    })
+
+    const run = collect(backend.chat({
+      model: 'pi/tangle-router/gpt-5-mini',
+      messages: [{ role: 'user', content: 'write an essay' }],
+    }, null, new AbortController().signal))
+
+    await expect(run).rejects.toThrow(/pi assistant turn failed.*Overloaded/su)
+    await run.catch((err: BackendError) => {
+      expect(err.code).toBe('upstream')
+    })
+  })
+
+  it('fails on a bare errorMessage even when stopReason is absent', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'turn_end',
+          message: {
+            role: 'assistant',
+            content: [],
+            usage: { input: 1, output: 0 },
+            errorMessage: 'context_length_exceeded: request too large',
+          },
+        },
+        { type: 'agent_end' },
+      ]),
+    })
+
+    await expect(collect(backend.chat({
+      model: 'pi/tangle-router/gpt-5-mini',
+      messages: [{ role: 'user', content: 'answer' }],
+    }, null, new AbortController().signal))).rejects.toThrow(/context_length_exceeded/u)
+  })
+
+  it('does not fail a run whose failed turn pi retried successfully', async () => {
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-session-retry' },
+        piProviderFailureTurnEnd,
+        {
+          type: 'auto_retry_start',
+          attempt: 1,
+          maxAttempts: 3,
+          delayMs: 100,
+          errorMessage: '401: transient',
+        },
+        {
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'hi' },
+        },
+        {
+          type: 'turn_end',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'hi' }],
+            usage: { input: 10, output: 2 },
+            stopReason: 'stop',
+          },
+        },
+        { type: 'auto_retry_end', success: true, attempt: 1 },
+        { type: 'agent_end' },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/tangle-router/gpt-5-mini',
+      messages: [{ role: 'user', content: 'say hi' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas).toContainEqual({ content: 'hi' })
+    expect(deltas.at(-1)).toEqual({ finish_reason: 'stop' })
+  })
+
   it('surfaces pi assistantMessageEvent tool_call_start as OpenAI tool_calls', async () => {
     const backend = new PiBackend({
       bin: 'pi',

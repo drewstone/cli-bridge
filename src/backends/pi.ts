@@ -409,6 +409,11 @@ export class PiBackend implements Backend {
       let emittedToolCall = false
       let sawError: string | null = null
       let sawTurnUsage = false
+      // Pi reports provider failures on the assistant message, not as an `error` event:
+      // it exits 0 with `turn_end.message.stopReason === 'error'` and an `errorMessage`.
+      // Only the LAST turn decides, because pi auto-retries a transient failure and the
+      // retry's turn_end supersedes it (`auto_retry_start`/`auto_retry_end`).
+      let turnFailure: string | null = null
       const usageCost: PiUsageCost = {
         receipts: 0,
         total: 0,
@@ -465,6 +470,7 @@ export class PiBackend implements Backend {
         // undercounts tool loops, and waiting for agent_end loses completed
         // calls when the outer run is cancelled.
         if (type === 'turn_end') {
+          turnFailure = piAssistantFailure(ev.message)
           const receipts = piUsageReceiptsFromEvent(ev)
           if (receipts.length > 0) sawTurnUsage = true
           for (const receipt of receipts) {
@@ -561,9 +567,18 @@ export class PiBackend implements Backend {
 
       if (exitCode !== 0) {
         const detail = sawError ?? stderr.slice(0, 300) ?? `exit ${exitCode ?? 'unknown'}`
-        // Auth/scope failures surface as a 401/403 in pi stderr.
-        const isAuth = /401|403|token expired|forbidden|unauthorized/i.test(detail)
-        throw new BackendError(`pi exit ${exitCode ?? 'unknown'}: ${detail}`, isAuth ? 'not_configured' : 'upstream')
+        throw new BackendError(
+          `pi exit ${exitCode ?? 'unknown'}: ${detail}`,
+          piFailureKind(detail),
+        )
+      }
+
+      // A failed provider call must never complete as success. Pi exits 0 and the text it
+      // did stream is a truncated answer, so this throws even when content was emitted —
+      // an empty or partial body reported as `stop` is silent data loss for any caller
+      // scoring outcomes, which is exactly what agent-runtime's piExecutor refuses.
+      if (turnFailure) {
+        throw new BackendError(`pi assistant turn failed: ${turnFailure}`, piFailureKind(turnFailure))
       }
 
       if (sawError && !emittedContent && !emittedToolCall) {
@@ -616,6 +631,30 @@ interface PiUsageCost {
   receipts: number
   total: number
   complete: boolean
+}
+
+/** Read a provider failure off a `turn_end` assistant message, or null when the turn succeeded.
+ *
+ *  Pi's `AssistantMessage` carries `stopReason: 'stop' | 'length' | 'toolUse' | 'error' |
+ *  'aborted'` plus an optional `errorMessage` (pi 0.83.0 `docs/session-format.md`). A provider
+ *  failure produces neither a `type: 'error'` event nor a non-zero exit, so this message is the
+ *  only failure signal on the wire.
+ *
+ *  `aborted` is deliberately NOT a failure here: the caller's `AbortSignal` already owns that
+ *  path and reports `finish_reason: 'error'` before this is consulted. */
+function piAssistantFailure(message: unknown): string | null {
+  const value = record(message)
+  if (!value) return null
+  const stopReason = typeof value.stopReason === 'string' ? value.stopReason : undefined
+  const errorMessage = typeof value.errorMessage === 'string' ? value.errorMessage.trim() : ''
+  if (stopReason !== 'error' && errorMessage === '') return null
+  return errorMessage !== '' ? errorMessage : `stopReason=${stopReason ?? 'error'}`
+}
+
+/** Auth/scope failures are a local credential problem, not a transient upstream one, whether they
+ *  arrive on pi's stderr or in the provider's error body. */
+function piFailureKind(detail: string): 'not_configured' | 'upstream' {
+  return /401|403|token expired|forbidden|unauthorized/i.test(detail) ? 'not_configured' : 'upstream'
 }
 
 function piUsageReceiptsFromEvent(ev: Record<string, unknown>): PiUsageReceipt[] {
