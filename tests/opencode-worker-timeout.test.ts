@@ -70,3 +70,49 @@ describe('opencode worker timeout propagation', () => {
     expect(out?.OPENCODE_RUN_TIMEOUT_SECONDS).toBe('86400')
   })
 })
+
+/**
+ * The isolating wrapper decides disposability from ONE call's argv. Shot 1 of a
+ * resumable loop has no `-s` yet — the session does not exist — so it was isolated
+ * into a temp store and deleted on exit; shot 2 then resumed a session that was gone
+ * and opencode exited 1 with "Session not found". Every multi-round run died at
+ * round 2. The caller's session id is stable across shots, so it names the series.
+ */
+describe('opencode resumable-series isolation', () => {
+  const spawnEnvFor = async (req: Record<string, unknown>): Promise<NodeJS.ProcessEnv> => {
+    let captured: NodeJS.ProcessEnv = {}
+    const backend = new OpencodeBackend({
+      bin: 'opencode',
+      timeoutMs: 86_400_000,
+      spawner: async (_bin, _args, opts: { env?: NodeJS.ProcessEnv }) => {
+        captured = opts.env ?? {}
+        throw new Error('spawn intercepted — env captured')
+      },
+    } as ConstructorParameters<typeof OpencodeBackend>[0])
+    try {
+      const stream = backend.chat({
+        model: 'opencode/zai-coding-plan/glm-5.2',
+        messages: [{ role: 'user', content: 'hi' }],
+        ...req,
+      } as Parameters<typeof backend.chat>[0])
+      for await (const _ of stream) { /* drain */ }
+    } catch { /* expected */ }
+    return captured
+  }
+
+  it('names the series from the caller session id, so shot 1 and shot 2 share one store', async () => {
+    const env = await spawnEnvFor({ session_id: 'task-2f92cd28-a0c4-4a3d-8332-71f057cd04ee' })
+    expect(env.OPENCODE_RUNTIME_ID).toBe('task-2f92cd28-a0c4-4a3d-8332-71f057cd04ee')
+  })
+
+  it('sanitises a session id that would escape the runtime root', async () => {
+    const env = await spawnEnvFor({ session_id: '../../etc/passwd' })
+    expect(env.OPENCODE_RUNTIME_ID).toBe('..-..-etc-passwd')
+    expect(env.OPENCODE_RUNTIME_ID).not.toContain('/')
+  })
+
+  it('leaves one-shot calls disposable — no series id when the caller supplies no session', async () => {
+    const env = await spawnEnvFor({})
+    expect(env.OPENCODE_RUNTIME_ID).toBeUndefined()
+  })
+})
