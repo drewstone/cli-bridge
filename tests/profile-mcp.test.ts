@@ -16,6 +16,7 @@ import { describe, expect, it } from 'vitest'
 import { execSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
   buildMcpAllowList,
@@ -51,8 +52,8 @@ describe('materializeMcpConfig', () => {
       mcp: {
         coordinator: {
           command: 'tsx',
-          args: ['/absolute/path/coordinator-mcp.ts'],
-          env: { OUTDIR: '/tmp/x', SCENARIO: 'foo' },
+          args: [pub('/absolute/path/coordinator-mcp.ts')],
+          env: { OUTDIR: pub('/tmp/x'), SCENARIO: pub('foo') },
         },
         // Mixed in a disabled entry to confirm it doesn't leak.
         ignored: { enabled: false },
@@ -78,7 +79,7 @@ describe('materializeMcpConfig', () => {
 
   it('cleanup() is idempotent — second call must not throw even if the dir is gone', () => {
     const profile: AgentProfile = {
-      mcp: { foo: { command: 'tsx', args: ['x.ts'] } },
+      mcp: { foo: { command: 'tsx', args: [pub('x.ts')] } },
     }
     const m = materializeMcpConfig(profile)
     expect(m).not.toBeNull()
@@ -182,7 +183,7 @@ describe('resolveMcpServers', () => {
     const r = req({
       agent_profile: {
         mcp: {
-          coord: { transport: 'stdio', command: 'tsx', args: ['c.ts'] },
+          coord: { transport: 'stdio', command: 'tsx', args: [pub('c.ts')] },
         },
       } as AgentProfile,
     })
@@ -310,8 +311,14 @@ describe('materializeMcpServersForPi', () => {
       expect(m.configPath).toBe(join(cwd, '.pi', 'mcp.json'))
       expect(m.serverNames).toEqual(['echo'])
       const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+      // `directTools: true` promotes this server's tools to first-class pi tools instead of
+      // leaving them behind the proxy, where the agent must connect and search before calling.
+      // Per-server, because pi-mcp-adapter reads `mcpServers[name].directTools` and lets it
+      // override the global `settings.directTools` (pi-mcp-adapter 2.17.0 direct-tools.ts:135).
       expect(written).toEqual({
-        mcpServers: { echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } } },
+        mcpServers: {
+          echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' }, directTools: true },
+        },
       })
       m.cleanup()
       expect(existsSync(m.configPath)).toBe(false)
@@ -341,8 +348,10 @@ describe('materializeMcpServersForPi', () => {
       const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
       expect(written).toEqual({
         mcpServers: {
+          // A server the request did not contribute keeps the user's own bytes exactly, including
+          // staying opted OUT of direct registration — we stamp only what we materialize.
           existing: { command: 'existing-cmd' },
-          echo: { command: 'node' },
+          echo: { command: 'node', directTools: true },
         },
         // Non-mcpServers adapter settings in the original file survive the merge.
         directTools: ['existing_tool'],

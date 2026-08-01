@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest'
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
   applyWorkspacePlan,
@@ -29,7 +30,7 @@ const FULL: AgentProfile = {
     skills: [{ kind: 'inline', name: 'fhenix-core', content: SKILL_BODY }],
     commands: [{ kind: 'inline', name: 'ship', content: 'Ship the build.' }],
   },
-  mcp: { echo: { command: 'echo-mcp', args: ['--stdio'], env: { K: 'v' } }, web: { url: 'https://mcp.example/sse' } },
+  mcp: { echo: { command: 'echo-mcp', args: [pub('--stdio')], env: { K: pub('v') } }, web: { url: 'https://mcp.example/sse' } },
   hooks: { PreToolUse: [{ command: 'touch .sentinel', matcher: '*' }] },
   subagents: { reviewer: { description: 'reviews diffs', model: 'deepseek', prompt: 'Review.' } },
 }

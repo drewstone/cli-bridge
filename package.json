@@ -23,8 +23,8 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
-    "@tangle-network/agent-interface": "0.36.0",
-    "@tangle-network/agent-profile-materialize": "0.9.3",
+    "@tangle-network/agent-interface": "0.40.0",
+    "@tangle-network/agent-profile-materialize": "0.9.4",
     "better-sqlite3": "^12.0.0",
     "hono": "^4.9.0",
     "zod": "^3.24.0"

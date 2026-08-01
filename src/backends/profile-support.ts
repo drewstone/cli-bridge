@@ -16,7 +16,11 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
+import type {
+  AgentProfile,
+  AgentProfileConfigValue,
+  AgentProfileMcpServer,
+} from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -27,6 +31,8 @@ import {
   type HarnessId,
   materializeProfile,
   type WorkspacePlan,
+  type WorkspacePlanArgument,
+  type WorkspacePlanConfigValue,
   type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
 
@@ -45,6 +51,49 @@ function requireMaterializationCwd(cwd: string | undefined, what: string): strin
     `${what} needs a host directory mounted into the container, and this executor mounts none. Set the backend's ` +
       `<NAME>_DOCKER_WORKSPACE_ROOT to an absolute host directory — the pool bind-mounts it into every container at ` +
       `the identical path — or send the request without an agent_profile/mcp block.`,
+  )
+}
+
+/**
+ * Read one applied-plan launch value as the public string a spawn needs.
+ *
+ * Interface 0.40 made a plan's env values and launch arguments either public bytes or an opaque
+ * `AgentProfileSecretRef` that only a private executor's `AgentProfileSecretProvider` may resolve.
+ * cli-bridge holds no such provider: it spawns the harness itself and applies plans through
+ * `applyWorkspacePlan`, the public-only entry point, which already rejects a plan carrying any
+ * reference before its first write. So a non-string reaching here means the value arrived by a
+ * route that skipped that check, and the only safe answer is refusal.
+ *
+ * Refusal, not rendering. `JSON.stringify`-ing a reference into argv or an env value would hand the
+ * harness a nonsense token — and argv is world-readable through `/proc/<pid>/cmdline` and sits
+ * outside every redaction channel, so a value that later DID carry a secret would leak with no
+ * recall path. This mirrors agent-runtime's `publicConfigString`
+ * (`src/runtime/supervise/pi-mcp.ts`), which refuses for the same reason on the same no-provider
+ * path.
+ */
+function requirePublicPlanValue(
+  value: WorkspacePlanConfigValue | WorkspacePlanArgument,
+  where: string,
+  harness: HarnessId,
+): string {
+  if (typeof value === 'string') return value
+  throw new BackendError(
+    `AgentProfile ${harness} materialization produced ${where} requiring a secret provider, ` +
+      'which this path does not have — declare a public value or resolve it before the request',
+    'parse_error',
+  )
+}
+
+/** Every env entry of an applied plan as public strings, refusing any secret reference. */
+function requirePublicPlanEnv(
+  env: Record<string, WorkspacePlanConfigValue>,
+  harness: HarnessId,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).map(([name, value]) => [
+      name,
+      requirePublicPlanValue(value, `env ${name}`, harness),
+    ]),
   )
 }
 
@@ -79,8 +128,10 @@ export function provisionProfileWorkspace(
     const applied = applyWorkspacePlan(plan, workspaceCwd)
     const receipt = retainProfileMaterializationReceipt(req, harness, plan, applied)
     return {
-      env: applied.env,
-      flags: applied.flags,
+      env: requirePublicPlanEnv(applied.env, harness),
+      flags: applied.flags.map((flag, index) =>
+        requirePublicPlanValue(flag, `launch flag ${index}`, harness),
+      ),
       written: applied.written,
       unsupported: applied.unsupported,
       workspacePlanDigest: applied.workspacePlanDigest,
@@ -150,7 +201,7 @@ export function provisionPiProfile(
 
     let cleaned = false
     return {
-      env: applied.env,
+      env: requirePublicPlanEnv(applied.env, 'pi'),
       flags,
       written: applied.written,
       workspacePlanDigest: applied.workspacePlanDigest,
@@ -300,7 +351,7 @@ export function resolveMcpServers(
     if (profileMcp && typeof profileMcp === 'object') {
       for (const [name, raw] of Object.entries(profileMcp)) {
         if (!name || !raw || typeof raw !== 'object') continue
-        merged[name] = profileMcpToSpec(raw)
+        merged[name] = profileMcpToSpec(raw, name)
       }
     }
   }
@@ -316,23 +367,79 @@ export function resolveMcpServers(
   return Object.keys(merged).length > 0 ? merged : null
 }
 
-function profileMcpToSpec(raw: AgentProfileMcpServer): McpServerSpec {
+/**
+ * Read one `AgentProfileMcpServer` configuration value as the plain string an MCP config file or a
+ * server spawn needs.
+ *
+ * Interface 0.40 retyped `args`/`env`/`headers` from `string` to `AgentProfileConfigValue` — public
+ * bytes (`{kind:'public', value}`) or an opaque `{kind:'secret-ref', key}` a private executor
+ * resolves. cli-bridge is not that executor: every one of these values ends up in an on-disk MCP
+ * config the harness reads (`writeMcpConfigFile`, `materializeMcpServersForPi`,
+ * `materializeMcpServersForOpencode`, …), and cli-bridge has no `AgentProfileSecretProvider` to
+ * resolve a reference with. So a reference is REFUSED here rather than resolved or rendered:
+ * writing the reference object is nonsense to the harness, and writing a placeholder turns an auth
+ * failure into what looks like a broken tool. The refusal names the reference KEY, never a value.
+ *
+ * `args` is refused for a second, stronger reason: those strings become the MCP server's argv,
+ * which is readable by every process on the host (`/proc/<pid>/cmdline`) and lies outside every
+ * redaction channel. agent-runtime's `resolveMcpServerLaunch` refuses a secret-ref in argv even
+ * when it DOES hold a provider; a secret belongs in `env`, never in a command line.
+ *
+ * Plain `string`/`number`/`boolean` are accepted, matching agent-runtime's `publicConfigString`
+ * (`src/runtime/supervise/pi-mcp.ts`): hand-written JSON profiles authored before 0.40 commonly
+ * carry those where the type now says `{kind:'public'}`, and rejecting them would break every
+ * caller mid-migration for no safety gain.
+ */
+function publicMcpConfigString(value: unknown, where: string): string {
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (value && typeof value === 'object') {
+    const config = value as AgentProfileConfigValue
+    if (config.kind === 'public' && typeof config.value === 'string') return config.value
+    if (config.kind === 'secret-ref') {
+      throw new BackendError(
+        `AgentProfile ${where} is a secret-ref (${JSON.stringify(config.key)}) and cli-bridge has ` +
+          'no secret provider — resolve it before the request, or declare a public value',
+        'parse_error',
+      )
+    }
+  }
+  throw new BackendError(
+    `AgentProfile ${where} is not a public configuration value`,
+    'parse_error',
+  )
+}
+
+/** Every entry of an MCP `env`/`headers` map as public strings. */
+function publicMcpConfigRecord(
+  record: Record<string, AgentProfileConfigValue> | undefined,
+  where: string,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!record || typeof record !== 'object') return out
+  for (const [key, value] of Object.entries(record)) {
+    if (value === undefined) continue
+    out[key] = publicMcpConfigString(value, `${where}[${JSON.stringify(key)}]`)
+  }
+  return out
+}
+
+function profileMcpToSpec(raw: AgentProfileMcpServer, name: string): McpServerSpec {
   // AgentProfileMcpServer uses `transport`; McpServerSpec uses `type`.
   // Rename and forward only the fields we model.
+  const where = `mcp[${JSON.stringify(name)}]`
   const out: McpServerSpec = {}
   if (raw.transport) out.type = raw.transport
   if (typeof raw.command === 'string') out.command = raw.command
-  if (Array.isArray(raw.args)) out.args = raw.args.filter((a): a is string => typeof a === 'string')
+  if (Array.isArray(raw.args)) {
+    out.args = raw.args.map((arg, index) => publicMcpConfigString(arg, `${where}.args[${index}]`))
+  }
   if (raw.env && typeof raw.env === 'object') {
-    out.env = Object.fromEntries(
-      Object.entries(raw.env).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
+    out.env = publicMcpConfigRecord(raw.env, `${where}.env`)
   }
   if (typeof raw.url === 'string') out.url = raw.url
   if (raw.headers && typeof raw.headers === 'object') {
-    out.headers = Object.fromEntries(
-      Object.entries(raw.headers).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
+    out.headers = publicMcpConfigRecord(raw.headers, `${where}.headers`)
   }
   if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled
   const timeoutRaw = (raw as { timeout?: unknown }).timeout
@@ -413,7 +520,7 @@ export function materializeMcpConfig(profile: AgentProfile | null): Materialized
   const specs: Record<string, McpServerSpec> = {}
   for (const [name, raw] of Object.entries(mcp)) {
     if (!name || !raw || typeof raw !== 'object') continue
-    specs[name] = profileMcpToSpec(raw)
+    specs[name] = profileMcpToSpec(raw, name)
   }
   return writeMcpConfigFile(specs)
 }
@@ -568,7 +675,17 @@ export function materializeMcpServersForPi(
   cwd: string | undefined,
 ): MaterializedMcpConfig | null {
   if (!specs) return null
-  const mcpServers = buildCanonicalMcpServers(specs)
+  // `directTools` is pi-adapter-specific, so it is added HERE rather than in the shared canonical
+  // builder that Claude and Kimi also read. It registers each server's tools as NATIVE pi tools
+  // instead of leaving them behind the generic `mcp` tool, where an agent must connect to the
+  // server and describe each verb before it can call one. A measured supervisor run spent turns
+  // and hundreds of thousands of input tokens on that discovery before it could delegate once.
+  const mcpServers = Object.fromEntries(
+    Object.entries(buildCanonicalMcpServers(specs)).map(([name, server]) => [
+      name,
+      { ...server, directTools: true },
+    ]),
+  )
   const serverNames = Object.keys(mcpServers)
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {
     console.error(`[cli-bridge mcp pi] materialized servers: ${serverNames.join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
@@ -1202,7 +1319,7 @@ export function materializeOpencodeMcpConfig(profile: AgentProfile | null): Mate
     if (mcp && typeof mcp === 'object') {
       for (const [name, raw] of Object.entries(mcp)) {
         if (!name || !raw || typeof raw !== 'object') continue
-        specs[name] = profileMcpToSpec(raw)
+        specs[name] = profileMcpToSpec(raw, name)
       }
     }
   }
