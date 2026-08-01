@@ -174,7 +174,8 @@ async function buildExecutorForBackend(
   if (netJail) {
     extras.shutdownHooks.push(() => netJail.destroy())
     console.log(
-      `[${cfg.name}-pool] net-jail verified on ${netJail.network} — egress denied except ` +
+      `[${cfg.name}-pool] net-jail verified on ${netJail.network} — sole next hop ${netJail.relayIp} ` +
+        '(Docker host, peer containers, link-local and IPv6 proven unreachable); egress denied except ' +
         netJail.entries.map((e) => `${e.host}:${e.port} (${e.source})`).join(', '),
     )
   }
@@ -205,6 +206,10 @@ async function buildExecutorForBackend(
     // The net-jail network supersedes any operator network; loadConfig refuses
     // a configuration where both are set, so this can never silently override.
     ...(netJail ? { network: netJail.network } : cfg.network ? { network: cfg.network } : {}),
+    // Joining the internal network is not the jail. The deny lives in each
+    // container's own network namespace, and it is written here — a slot whose
+    // filter cannot be installed is destroyed instead of served.
+    ...(netJail ? { afterCreate: (id: string, i: number) => netJail.applyFilter(id, `slot ${i}`) } : {}),
     // Every credential directory the CLI reads, not only the primary one: a pool
     // that mounts ~/.config/opencode alone has no auth.json in it, and the CLI
     // then authenticates against nothing and returns an empty completion.

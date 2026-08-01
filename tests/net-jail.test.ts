@@ -22,6 +22,12 @@ import { canonicalAllowList, modelEndpointsFor, parseAllowEntry, parseAllowList 
 import { resolveNetJailSpec } from '../src/jail/resolve-net-spec.js'
 import { assertNetJailEnforced, type NetJailRegistry } from '../src/jail/enforce-net-jail.js'
 import { provisionNetJail, NetJailProvisionError } from '../src/executors/net-jail-network.js'
+import {
+  applyNetJailEgressFilter,
+  relayAddressFor,
+  withJailedContainer,
+  NetJailEgressError,
+} from '../src/executors/net-jail-egress.js'
 import { dockerCli, type DockerCli } from '../src/executors/docker-cli.js'
 import { parseAllowlist, readHttpHost, readSni, startRelay } from '../src/jail/net-relay.mjs'
 
@@ -61,6 +67,49 @@ describe('net-jail allowlist derivation', () => {
   it('defaults a bare host to 443 rather than 80', () => {
     expect(canonicalAllowList(parseAllowList('a.example, b.example:8443', 'test')))
       .toEqual(['a.example:443', 'b.example:8443'])
+  })
+})
+
+describe('net-jail egress filter', () => {
+  it('pins the relay to the address after the gateway, inside the usable range', () => {
+    expect(relayAddressFor('172.20.0.0/16', '172.20.0.1')).toBe('172.20.0.2')
+    expect(relayAddressFor('10.64.0.0/20', '10.64.0.1')).toBe('10.64.0.2')
+    expect(relayAddressFor('192.168.64.0/24', '192.168.64.1')).toBe('192.168.64.2')
+  })
+
+  it('refuses a subnet it cannot pin an address in, rather than emitting a rule for a bogus address', () => {
+    // A rule aimed at the wrong address is a jail that denies its own model
+    // endpoint, so every one of these is fatal at provisioning time.
+    expect(() => relayAddressFor('172.20.0.0/31', '172.20.0.1')).toThrow(NetJailEgressError)
+    expect(() => relayAddressFor('192.168.1.0/24', '192.168.1.254')).toThrow(/outside usable range/)
+    expect(() => relayAddressFor('not-a-subnet', '10.0.0.1')).toThrow(NetJailEgressError)
+    expect(() => relayAddressFor('10.0.0.0/24', 'gateway')).toThrow(NetJailEgressError)
+  })
+
+  it('refuses to build a filter around anything but an IP literal', async () => {
+    const never: DockerCli = async () => { throw new Error('docker must not be reached') }
+    await expect(applyNetJailEgressFilter({
+      containerId: 'c', relayIp: 'relay.example', image: 'img', cli: never, label: 'test',
+    })).rejects.toThrow(/not an IPv4 literal/)
+    await expect(applyNetJailEgressFilter({
+      containerId: 'c', relayIp: '10.0.0.2', relayIp6: 'nonsense', image: 'img', cli: never, label: 'test',
+    })).rejects.toThrow(/not an IPv6 literal/)
+  })
+
+  it('treats an image without iptables as an unenforceable jail, naming the rebuild', async () => {
+    const noTooling: DockerCli = async () => ({ code: 90, stdout: 'netjail-egress-missing-iptables\n', stderr: '' })
+    await expect(applyNetJailEgressFilter({
+      containerId: 'c', relayIp: '10.0.0.2', image: 'stale:image', cli: noTooling, label: 'slot 0',
+    })).rejects.toThrow(/has no 'iptables'.*Dockerfile\.cli-runtime/s)
+  })
+
+  it('treats a silent success without the applied marker as a failure', async () => {
+    // A `docker run` that exits 0 having done nothing is indistinguishable from
+    // a working one by exit status alone; the marker is what makes it evidence.
+    const silent: DockerCli = async () => ({ code: 0, stdout: '', stderr: '' })
+    await expect(applyNetJailEgressFilter({
+      containerId: 'c', relayIp: '10.0.0.2', image: 'img', cli: silent, label: 'slot 1',
+    })).rejects.toThrow(/could not install egress rules/)
   })
 })
 
@@ -249,21 +298,34 @@ describe('net-jail relay authorization', () => {
  * controls that enforced nothing.
  */
 describe('net-jail enforcement on real Docker', () => {
-  const image = 'cli-bridge-cli-runtime:latest'
+  const image = process.env.CLI_BRIDGE_TEST_IMAGE ?? 'cli-bridge-cli-runtime:latest'
   const namePrefix = `cli-bridge-test-netjail-${process.pid}`
   const allow = [parseAllowEntry('router.tangle.tools:443', 'test')]
   let available = false
   let provision: Awaited<ReturnType<typeof provisionNetJail>> | null = null
+  let gateway = ''
 
   beforeAll(async () => {
     const daemon = await dockerCli(['image', 'inspect', image])
-    available = daemon.code === 0
-    if (!available) {
+    if (daemon.code !== 0) {
       console.warn(`[net-jail tests] SKIPPED: ${image} is not available on this host — enforcement is unproven here`)
       return
     }
+    // The egress filter is written by a sidecar running this image. An image
+    // without iptables cannot enforce the jail at all, so the honest outcome is
+    // a loud skip rather than a suite that reports green on an unenforced jail.
+    const tooling = await dockerCli(['run', '--rm', '--entrypoint', 'sh', image, '-c', 'command -v iptables'])
+    if (tooling.code !== 0) {
+      console.warn(
+        `[net-jail tests] SKIPPED: ${image} has no iptables, so no egress filter can be installed — ` +
+          'rebuild it (docker build -f docker/Dockerfile.cli-runtime -t <image> .) to run these tests',
+      )
+      return
+    }
+    available = true
     provision = await provisionNetJail({ backend: 'test', namePrefix, image, allow })
-  }, 180_000)
+    gateway = await networkGateway(provision.network)
+  }, 300_000)
 
   afterAll(async () => {
     await provision?.destroy()
@@ -271,28 +333,78 @@ describe('net-jail enforcement on real Docker', () => {
 
   it('denies `git clone` of a public repository', async () => {
     if (!available) return
-    const out = await inJail(provision!.network, image, 'git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw 2>&1; echo rc=$?')
+    const out = await inJail(provision!, image, 'git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw 2>&1; echo rc=$?')
     expect(out).not.toContain('rc=0')
     expect(out).toMatch(/Could not resolve host|unable to access|Could not connect/i)
   }, 120_000)
 
   it('denies `curl https://github.com`', async () => {
     if (!available) return
-    const out = await inJail(provision!.network, image, 'curl -sS -o /dev/null https://github.com 2>&1; echo rc=$?')
+    const out = await inJail(provision!, image, 'curl -sS -o /dev/null https://github.com 2>&1; echo rc=$?')
     expect(out).not.toContain('rc=0')
   }, 120_000)
 
   it('denies a raw-IP connection, so removing DNS from the picture changes nothing', async () => {
     if (!available) return
-    const out = await inJail(provision!.network, image, 'curl -sS -k -m 10 -o /dev/null https://140.82.121.4/ 2>&1; echo rc=$?')
+    const out = await inJail(provision!, image, 'curl -sS -k -m 10 -o /dev/null https://140.82.121.4/ 2>&1; echo rc=$?')
     expect(out).not.toContain('rc=0')
+  }, 120_000)
+
+  it('denies the Docker host, which the internal network leaves on-link in the worker\'s own subnet', async () => {
+    if (!available) return
+    // The escape this suite exists to keep closed: `--internal` denies routing
+    // OFF the bridge and leaves the host's gateway address ON it. A worker used
+    // it to pull 339,594 bytes of github.com through a service on the host.
+    const results = await Promise.all([22, 80, 443, 2375, 8080].map((port) => dialFromJail(provision!, image, gateway, port)))
+    for (const result of results) expect(result).toMatch(BLOCKED)
+    // ECONNREFUSED would mean a RST came back, which is proof the host is
+    // REACHABLE and merely silent on that port. It is not a pass.
+    expect(results.join(' ')).not.toContain('ECONNREFUSED')
+  }, 120_000)
+
+  it('denies another container on the same bridge, while that container is listening', async () => {
+    if (!available) return
+    const peer = `cli-bridge-test-netjail-peer-${process.pid}`
+    await dockerCli(['rm', '-f', peer])
+    const started = await dockerCli([
+      'run', '-d', '--name', peer, '--network', provision!.network, '--entrypoint', 'node', image,
+      '-e', "require('node:net').createServer((s) => s.end('peer')).listen(9)",
+    ], { timeoutMs: 60_000 })
+    expect(started.code).toBe(0)
+    try {
+      const { stdout } = await execFileAsync('docker', [
+        'inspect', '-f', `{{(index .NetworkSettings.Networks "${provision!.network}").IPAddress}}`, peer,
+      ])
+      expect(await dialFromJail(provision!, image, stdout.trim(), 9)).toMatch(BLOCKED)
+    } finally {
+      await dockerCli(['rm', '-f', peer])
+    }
+  }, 180_000)
+
+  it('denies link-local, so cloud instance metadata is not a credential source', async () => {
+    if (!available) return
+    for (const address of ['169.254.169.254', '169.254.170.2']) {
+      expect(await dialFromJail(provision!, image, address, 80)).toMatch(BLOCKED)
+    }
+  }, 120_000)
+
+  it('gives the worker no capability to undo its own filter, even as uid 0', async () => {
+    if (!available) return
+    const out = await inJail(provision!, image, 'iptables -w 2 -F OUTPUT 2>&1; echo rc=$?')
+    expect(out).not.toContain('rc=0')
+    expect(out).toMatch(/Permission denied|iptables: not found|do you need to be root/i)
+  }, 120_000)
+
+  it('still reaches the relay, so the four denials above are a filter and not a dead network', async () => {
+    if (!available) return
+    expect(await dialFromJail(provision!, image, provision!.relayIp, 443)).toBe('open')
   }, 120_000)
 
   it('denies a host pinned to the relay by the worker itself, so DNS aliasing is not the only control', async () => {
     if (!available) return
-    const relayIp = await jailAddress(provision!.network, namePrefix)
+    const relayIp = provision!.relayIp
     const out = await inJail(
-      provision!.network,
+      provision!,
       image,
       `curl -sS -m 15 -o /dev/null --resolve github.com:443:${relayIp} https://github.com 2>&1; echo rc=$?`,
     )
@@ -301,14 +413,14 @@ describe('net-jail enforcement on real Docker', () => {
 
   it('gives the worker no proxy variable to unset, because there is no proxy to bypass', async () => {
     if (!available) return
-    const out = await inJail(provision!.network, image, 'env | grep -ci proxy')
+    const out = await inJail(provision!, image, 'env | grep -ci proxy')
     expect(out.trim()).toBe('0')
   }, 120_000)
 
   it('allows the derived model endpoint, so a jailed agent still works', async () => {
     if (!available) return
     const out = await inJail(
-      provision!.network,
+      provision!,
       image,
       'curl -sS -m 25 -o /dev/null -w "http=%{http_code}\\n" https://router.tangle.tools/v1/models 2>&1',
     )
@@ -330,25 +442,79 @@ describe('net-jail enforcement on real Docker', () => {
     })).rejects.toThrow(NetJailProvisionError)
   }, 180_000)
 
+  it('fails provisioning when the egress filter is absent — the NEW guard is calibrated', async () => {
+    if (!available) return
+    // Same code path, the per-container filter removed. This is the exact
+    // configuration that shipped and leaked: an `--internal` network whose
+    // members still have the Docker host on-link. If provisioning succeeds
+    // here, verifyNetJail is decoration and every green test above is noise.
+    await expect(provisionNetJail({
+      backend: 'test-unfiltered',
+      namePrefix: `${namePrefix}-unfiltered`,
+      image,
+      allow,
+      skipEgressFilterForVerification: true,
+    })).rejects.toThrow(/Docker host is reachable from inside the jail/)
+  }, 300_000)
+
   it('refuses to provision a jail with nothing on its allowlist', async () => {
     await expect(provisionNetJail({ backend: 'test-empty', namePrefix: `${namePrefix}-empty`, image, allow: [] }))
       .rejects.toThrow(/no model endpoint could be derived/)
   }, 60_000)
 })
 
-/** Run a shell line inside a throwaway container on the jailed network. */
-async function inJail(network: string, image: string, script: string): Promise<string> {
-  const result = await dockerCli(
-    ['run', '--rm', '--network', network, '--entrypoint', 'sh', image, '-c', script],
-    { timeoutMs: 90_000 },
-  )
+/**
+ * Run a shell line inside a throwaway container on the jailed network, under
+ * the SAME egress filter a pool slot gets.
+ *
+ * Joining the network is not the jail — a container on the internal network
+ * with no filter still has the Docker host on-link. A helper that skipped the
+ * filter would be testing a configuration no worker ever runs in, and every
+ * assertion below would be about the wrong container.
+ */
+let jailedProbeSeq = 0
+async function inJail(
+  provision: Awaited<ReturnType<typeof provisionNetJail>>,
+  image: string,
+  script: string,
+): Promise<string> {
+  const result = await withJailedContainer({
+    network: provision.network,
+    image,
+    relayIp: provision.relayIp,
+    ...(provision.relayIp6 ? { relayIp6: provision.relayIp6 } : {}),
+    cli: dockerCli,
+    label: 'test probe',
+    name: `cli-bridge-test-netjail-probe-${process.pid}-${jailedProbeSeq++}`,
+  }, (containerId) => dockerCli(['exec', containerId, 'sh', '-c', script], { timeoutMs: 90_000 }))
   return `${result.stdout}${result.stderr}`
 }
 
-/** The relay's address on the jailed network, as a worker would see it. */
-async function jailAddress(network: string, namePrefix: string): Promise<string> {
+/**
+ * Statuses that mean the destination was NOT reached. `ECONNREFUSED` is
+ * deliberately absent: a refusal is a packet that came back, which proves the
+ * address is reachable and only happens to have nothing listening.
+ */
+const BLOCKED = /^(EHOSTUNREACH|ENETUNREACH|EACCES|EPERM|ETIMEDOUT|timeout)$/u
+
+/** Dial one address from inside the jail and report what the kernel said. */
+async function dialFromJail(
+  provision: Awaited<ReturnType<typeof provisionNetJail>>,
+  image: string,
+  host: string,
+  port: number,
+): Promise<string> {
+  const program = `const n=require('node:net');const s=n.connect({host:'${host}',port:${port}});`
+    + `const d=(r)=>{s.destroy();console.log(r)};s.setTimeout(5000,()=>d('timeout'));`
+    + `s.on('connect',()=>d('open'));s.on('error',(e)=>d(e.code||'error'))`
+  const out = await inJail(provision, image, `node -e ${JSON.stringify(program)}`)
+  return out.trim().split('\n').pop() ?? ''
+}
+
+/** The gateway address Docker put on the jail's bridge — the host, on-link. */
+async function networkGateway(network: string): Promise<string> {
   const { stdout } = await execFileAsync('docker', [
-    'inspect', '-f', `{{(index .NetworkSettings.Networks "${network}").IPAddress}}`, `${namePrefix}-netjail-relay`,
+    'network', 'inspect', '-f', '{{range .IPAM.Config}}{{.Gateway}}{{end}}', network,
   ])
   return stdout.trim()
 }

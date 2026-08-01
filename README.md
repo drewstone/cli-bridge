@@ -508,15 +508,35 @@ and no network policy has the whole internet regardless of its permission map.
 A benchmark rig was one run from a large fake result because the worker could
 clone the public upstream of the repository it was being graded on.
 
-**How it is enforced.** For each jailed backend the bridge creates an
-`--internal` Docker network — Docker gives it no gateway, so a container on it
-has no default route and no external DNS — plus a relay container attached to
-both that network and an ordinary one. The relay is registered on the internal
-network under a network-scoped alias for every allowlisted hostname, and it
-checks the name each connection claims (TLS SNI, or the `Host` header for
-cleartext) before forwarding a byte. TLS is never terminated: the relay splices
-raw bytes, so certificate validation still happens end-to-end against the real
-origin.
+**How it is enforced.** Two layers, and both are load-bearing.
+
+*The network.* For each jailed backend the bridge creates an `--internal` Docker
+network — no default route off it, no external DNS — plus a relay container
+attached to both that network and an ordinary one, pinned to a fixed address.
+The relay is registered on the internal network under a network-scoped alias for
+every allowlisted hostname, and it checks the name each connection claims (TLS
+SNI, or the `Host` header for cleartext) before forwarding a byte. TLS is never
+terminated: the relay splices raw bytes, so certificate validation still happens
+end-to-end against the real origin.
+
+*The filter.* `--internal` denies routing OFF the bridge; it does not deny the
+bridge. Docker still configures the host's gateway address on that subnet, and
+it is on-link in the worker's own network — as is every other container there.
+A jailed worker used exactly that to pull 339,594 bytes of github.com with a
+valid certificate chain, through a service listening on the Docker host. So each
+jailed container also gets a packet filter in its OWN network namespace: default
+policy DROP in both directions, and exactly two exceptions — loopback (Docker's
+embedded resolver lives there) and the relay's pinned address. The host gateway,
+peer containers, the host's other interfaces, link-local metadata addresses
+(`169.254.0.0/16`) and all IPv6 are rejected by the kernel.
+
+The rules are written by a throwaway sidecar that joins the worker's network
+namespace with `CAP_NET_ADMIN` and exits. The worker itself never holds that
+capability, so `iptables` inside it fails with `Permission denied` even as uid
+0, and the filter outlives the sidecar because it is state of the namespace. A
+slot whose filter cannot be installed is destroyed rather than served. This
+needs `iptables` in the runtime image; `docker/Dockerfile.cli-runtime` installs
+it, and a net-jailed backend refuses to start without it.
 
 There is deliberately no proxy environment variable. `HTTPS_PROXY` is a request
 an agent can decline with `unset`; here the worker never learns a relay exists,
@@ -540,9 +560,25 @@ a control that can be turned off by the thing it constrains is not isolation,
 and shipping it under the same name is how the leak above survived.
 
 Startup provisioning ends by PROVING the jail on a throwaway container drawn
-from the same image and network a worker gets — a name that must not resolve, a
-name that must, and a real TLS handshake through the relay. Failing any of the
-three is fatal.
+from the same image, the same network AND the same filter a worker gets, with a
+listening peer container beside it on the bridge:
+
+| Proven at provisioning | Why it is checked |
+| --- | --- |
+| no default route | the network denies routing off the bridge |
+| the Docker host's gateway is unreachable | an address that answers on the worker's own subnet is a next hop that never passes the relay |
+| a peer container is unreachable while listening | the relay must be the only next hop, not merely the only *external* one |
+| link-local is unreachable | cloud instance metadata, and the credentials it hands out, live at `169.254.169.254` |
+| the worker cannot run `iptables` | a worker that can flush the rules is not confined by them |
+| the relay IS reachable | the control: a container with a dead network stack denies everything and proves nothing |
+| a non-allowlisted name does not resolve | DNS is scoped to the allowlist |
+| an allowlisted name resolves and completes a real TLS handshake | the jail does not deny its own model |
+
+Failing any one of these is fatal. Reachability is judged by the ERROR, not by
+whether something answered: `ECONNREFUSED` means a packet came back, which
+proves the address is reachable and merely silent on that port, so it counts as
+a leak. The previous verifier checked only the route table, the two DNS facts
+and the handshake — and passed the jail the escape above was performed on.
 
 Per request, `execution.netJail` mirrors `execution.jail`:
 

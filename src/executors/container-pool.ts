@@ -112,6 +112,18 @@ export interface ContainerPoolOptions {
   livenessTtlMs?: number
   /** Injectable docker command runner. Tests replace this; production uses the real CLI. */
   cli?: DockerCli
+  /**
+   * Run against a slot's container after it exists and BEFORE the slot is
+   * usable. The net-jail installs its egress filter here: a filter belongs to a
+   * network namespace, so it cannot be set by `docker run` arguments and has to
+   * be written into the namespace once the container is up.
+   *
+   * A rejection is fatal for that slot — the container is destroyed and the
+   * slot fails to provision. That is deliberate: the alternative is a pool slot
+   * serving requests with an egress policy nobody applied, which is the exact
+   * shape of the leak the net-jail exists to close.
+   */
+  afterCreate?: (containerId: string, index: number) => Promise<void>
   /** Optional progress hook. */
   onProgress?: (msg: string) => void
 }
@@ -562,6 +574,20 @@ async function provisionSlot(
           `Build it: ${buildCommandFor(opts.image)}. (docker: ${firstLine(stderr)})`
         : `container-pool: cannot create slot ${index} — ${firstLine(stderr)}`,
     )
+  }
+  // Before anything else touches the container, including this bridge's own
+  // `docker exec`: the window between `run` and the filter being in place is
+  // the only moment a slot has unrestricted egress, and the only thing running
+  // in it is the idle `tail -f /dev/null` entrypoint.
+  if (opts.afterCreate) {
+    try {
+      await opts.afterCreate(containerId, index)
+    } catch (error) {
+      await cli(['rm', '-f', containerId], { timeoutMs: 30_000 })
+      throw error instanceof Error
+        ? new Error(`container-pool: slot ${index} was destroyed unused — ${error.message}`, { cause: error })
+        : error
+    }
   }
   await normalizeContainerHome(opts, containerId, cli)
   onProgress(`[slot ${index}] ready @ ${containerId.slice(0, 12)}`)

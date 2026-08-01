@@ -23,6 +23,7 @@ import { OpencodeBackend } from '../src/backends/opencode.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
 import { PiBackend } from '../src/backends/pi.js'
 import { buildContainerRunArgs, ContainerPool } from '../src/executors/container-pool.js'
+import type { DockerCli } from '../src/executors/docker-cli.js'
 import { assertDockerWorkspaceCwd, buildDockerExecArgs, createDockerSpawner } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
 import { killTree } from '../src/executors/process-tree.js'
@@ -610,6 +611,48 @@ describe('ContainerPool sticky routing semantics', () => {
     other.release()
     // sticky-A served first → stickyP resolved first
     expect(sticky.id).toBe('c-0')
+  })
+})
+
+describe('ContainerPool afterCreate hook', () => {
+  /** Records docker argv so the test can prove the container was destroyed. */
+  const recordingCli = (calls: string[][]): DockerCli => async (args) => {
+    calls.push(args)
+    if (args[0] === 'run') return { code: 0, stdout: 'container-abc\n', stderr: '' }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+
+  it('destroys the slot and fails provisioning when the hook rejects', async () => {
+    // The net-jail writes its egress filter here. A slot that kept running
+    // after the filter failed would serve requests with unrestricted egress —
+    // the exact silent non-enforcement the jail exists to eliminate.
+    const calls: string[][] = []
+    await expect(ContainerPool.create({
+      size: 1,
+      image: 'x:latest',
+      namePrefix: 'p',
+      oauthMode: 'share',
+      shareMounts: [],
+      cli: recordingCli(calls),
+      afterCreate: async () => { throw new Error('egress rules could not be installed') },
+    })).rejects.toThrow(/slot 0 was destroyed unused.*egress rules could not be installed/s)
+    expect(calls.some((args) => args[0] === 'rm' && args.includes('container-abc'))).toBe(true)
+  })
+
+  it('runs the hook before anything execs in the container', async () => {
+    const calls: string[][] = []
+    const seen: string[] = []
+    const pool = await ContainerPool.create({
+      size: 1,
+      image: 'x:latest',
+      namePrefix: 'p',
+      oauthMode: 'share',
+      shareMounts: [],
+      cli: async (args) => { seen.push(args[0]!); return recordingCli(calls)(args) },
+      afterCreate: async () => { seen.push('afterCreate') },
+    })
+    expect(seen.indexOf('afterCreate')).toBe(seen.indexOf('run') + 1)
+    await pool.destroy()
   })
 })
 
