@@ -15,6 +15,7 @@
     "test:scoped-host-real": "CLI_BRIDGE_REAL_CGROUP_TESTS=1 vitest run tests/scoped-host.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "review": "~/code/dotfiles/bin/ai-agent-hooks.mjs run review",
     "verify": "tsx scripts/verify.ts",
     "verify:fs-jail": "tsx scripts/verify-fs-jail.ts",
     "install:harness": "sh scripts/install-harness.sh",
