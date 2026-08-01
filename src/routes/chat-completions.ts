@@ -31,6 +31,8 @@ import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
+import { resolveNetJailSpec } from '../jail/resolve-net-spec.js'
+import { assertNetJailEnforced, type NetJailRegistry } from '../jail/enforce-net-jail.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
 import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
 import {
@@ -190,12 +192,37 @@ const chatRequestSchema = z.object({
       mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
       root: z.string().optional(),
     }).optional(),
+    /**
+     * Deny-by-default EGRESS for the worker process tree — the network sibling
+     * of `jail` above.
+     *   mode: 'net-jail' requires that the worker run with no route off its
+     *         network except an allowlist that always contains the backend's
+     *         own model endpoint. The operator floor (`BRIDGE_NET_JAIL_MODE`,
+     *         or `WORKER_NET_JAIL=1`) can only be RAISED by a request. A
+     *         request the bridge cannot enforce FAILS with 501 naming the
+     *         execution mode; it is never accepted and quietly not applied.
+     *   allow: asserts the exact `host:port` allowlist in force. It does not
+     *         change the allowlist — a pooled worker joined its network when
+     *         the bridge started — so a list that differs from the enforced one
+     *         is a failure, not a silent widening.
+     */
+    netJail: z.object({
+      mode: z.enum(['off', 'net-jail']).optional(),
+      allow: z.array(z.string()).optional(),
+    }).optional(),
   }).optional(),
 })
 
 export function mountChatCompletions(
   app: Hono,
-  deps: { registry: BackendRegistry; sessions: SessionStore; runs: RunRegistry; admission?: AdmissionGate },
+  deps: {
+    registry: BackendRegistry
+    sessions: SessionStore
+    runs: RunRegistry
+    admission?: AdmissionGate
+    /** Backends with a provisioned, verified net-jail. Absent map = none. */
+    netJail?: NetJailRegistry
+  },
 ): void {
   app.post('/v1/chat/completions', async (c) => {
     let raw: unknown
@@ -377,6 +404,22 @@ export function mountChatCompletions(
       }
       if (!req.cwd && session?.cwd) {
         req.cwd = session.cwd
+      }
+
+      // Deny-by-default egress, gated before any execution path is chosen so a
+      // net-jail cannot be requested of a mode that would not apply it.
+      const netJailSpec = resolveNetJailSpec({
+        execMode: req.execution?.netJail?.mode,
+        ...(req.execution?.netJail?.allow ? { execAllow: req.execution.netJail.allow } : {}),
+        env: process.env,
+      })
+      if (netJailSpec) {
+        assertNetJailEnforced({
+          backend: backend.name,
+          executionKind: req.execution?.kind ?? 'host',
+          spec: netJailSpec,
+          registry: deps.netJail ?? new Map(),
+        })
       }
 
       let makeSource: ((run: Run) => AsyncIterable<ChatDelta>) | null = null

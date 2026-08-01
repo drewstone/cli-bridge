@@ -36,6 +36,9 @@ import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
 import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
 import { ContainerPool } from './executors/container-pool.js'
+import { provisionNetJail } from './executors/net-jail-network.js'
+import { modelEndpointsFor, parseAllowList } from './jail/net-allowlist.js'
+import type { EnforcedNetJail } from './jail/enforce-net-jail.js'
 import { createDockerSpawner } from './executors/docker.js'
 import {
   buildCommandFor,
@@ -73,6 +76,14 @@ function parseEnvPositiveInt(name: string, fallback: number): number {
 export interface BuildAppExtras {
   /** Disposers to await on graceful shutdown — pool teardown lives here. */
   shutdownHooks: Array<() => Promise<void>>
+  /**
+   * Backends whose worker containers were provisioned onto a verified net-jail
+   * network. Written only after {@link provisionNetJail} has PROVEN the jail on
+   * a throwaway container, so a membership test here is evidence rather than
+   * intent — which is what lets the chat route refuse a net-jail request it
+   * cannot honour instead of recording a policy it never applied.
+   */
+  netJail: Map<string, EnforcedNetJail>
 }
 
 /**
@@ -138,10 +149,34 @@ async function buildExecutorForBackend(
   cfg: BackendExecutorConfig | undefined,
   extras: BuildAppExtras,
   bin: string,
+  config: Config,
 ): Promise<Spawner | null> {
   if (!cfg || cfg.kind !== 'docker') return null
   if (!cfg.image || !cfg.poolSize || !cfg.containerConfigDir) {
     throw new Error(`backend ${cfg.name} executor=docker but missing image/poolSize/containerConfigDir`)
+  }
+  // The net-jail is provisioned BEFORE the pool because the pool's containers
+  // join its internal network at creation; a container cannot be re-jailed
+  // afterwards. loadConfig has already refused any configuration this cannot
+  // enforce, so reaching here with the mode on means it must succeed.
+  const netJail = config.netJailMode === 'net-jail'
+    ? await provisionNetJail({
+      backend: cfg.name,
+      namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
+      image: cfg.image,
+      allow: [
+        ...modelEndpointsFor(cfg.name, process.env),
+        ...parseAllowList(config.netJailAllow.join(','), 'BRIDGE_NET_JAIL_ALLOW'),
+      ],
+      onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
+    })
+    : null
+  if (netJail) {
+    extras.shutdownHooks.push(() => netJail.destroy())
+    console.log(
+      `[${cfg.name}-pool] net-jail verified on ${netJail.network} — egress denied except ` +
+        netJail.entries.map((e) => `${e.host}:${e.port} (${e.source})`).join(', '),
+    )
   }
   // Deliberately not switchable off. An operator who needs the bridge up
   // without a working container runtime wants <NAME>_EXECUTOR=host, not a
@@ -167,7 +202,9 @@ async function buildExecutorForBackend(
     ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
     ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
-    ...(cfg.network ? { network: cfg.network } : {}),
+    // The net-jail network supersedes any operator network; loadConfig refuses
+    // a configuration where both are set, so this can never silently override.
+    ...(netJail ? { network: netJail.network } : cfg.network ? { network: cfg.network } : {}),
     // Every credential directory the CLI reads, not only the primary one: a pool
     // that mounts ~/.config/opencode alone has no auth.json in it, and the CLI
     // then authenticates against nothing and returns an empty completion.
@@ -237,6 +274,11 @@ async function buildExecutorForBackend(
         `\`${bin} --version\` verified in-slot; the warnings above are NOT verified and /health reports them`,
   )
 
+  // Recorded only here: after the network was verified AND a pool of live slots
+  // was actually created on it. Anything earlier would let the chat route
+  // report a jail for containers that do not exist.
+  if (netJail) extras.netJail.set(cfg.name, { network: netJail.network, allow: netJail.allow })
+
   return createDockerSpawner({
     pool,
     backend: cfg.name,
@@ -264,7 +306,7 @@ export async function buildApp(config: Config): Promise<{
     identityRetentionMs: parseEnvPositiveInt('BRIDGE_RUN_IDENTITY_RETENTION_MS', 86_400_000),
     maxReplayDeltas: parseEnvPositiveInt('BRIDGE_RUN_MAX_REPLAY_DELTAS', 10_000),
   })
-  const extras: BuildAppExtras = { shutdownHooks: [] }
+  const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)
 
@@ -272,7 +314,7 @@ export async function buildApp(config: Config): Promise<{
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
   if (config.backends.has('claude')) {
-    const spawner = await buildExecutorForBackend(config.executors.claude, extras, config.claudeBin)
+    const spawner = await buildExecutorForBackend(config.executors.claude, extras, config.claudeBin, config)
     registry.register(new ClaudeBackend({
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
@@ -291,7 +333,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('codex')) {
-    const spawner = await buildExecutorForBackend(config.executors.codex, extras, config.codexBin)
+    const spawner = await buildExecutorForBackend(config.executors.codex, extras, config.codexBin, config)
     registry.register(new CodexBackend({
       bin: config.codexBin,
       timeoutMs: config.codexTimeoutMs,
@@ -299,7 +341,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('opencode')) {
-    const spawner = await buildExecutorForBackend(config.executors.opencode, extras, config.opencodeBin)
+    const spawner = await buildExecutorForBackend(config.executors.opencode, extras, config.opencodeBin, config)
     registry.register(new OpencodeBackend({
       bin: config.opencodeBin,
       timeoutMs: config.opencodeTimeoutMs,
@@ -307,7 +349,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('kimi')) {
-    const spawner = await buildExecutorForBackend(config.executors.kimi, extras, config.kimiBin)
+    const spawner = await buildExecutorForBackend(config.executors.kimi, extras, config.kimiBin, config)
     registry.register(new KimiBackend({
       bin: config.kimiBin,
       timeoutMs: config.kimiTimeoutMs,
@@ -316,7 +358,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('gemini')) {
-    const spawner = await buildExecutorForBackend(config.executors.gemini, extras, config.geminiBin)
+    const spawner = await buildExecutorForBackend(config.executors.gemini, extras, config.geminiBin, config)
     registry.register(new GeminiBackend({
       bin: config.geminiBin,
       timeoutMs: config.geminiTimeoutMs,
@@ -345,7 +387,7 @@ export async function buildApp(config: Config): Promise<{
     registry.register(new NanoclawBackend({ socketPath: config.nanoclawSocket, timeoutMs: config.cliTimeoutMsDefault }))
   }
   if (config.backends.has('pi')) {
-    const spawner = await buildExecutorForBackend(config.executors.pi, extras, config.piBin)
+    const spawner = await buildExecutorForBackend(config.executors.pi, extras, config.piBin, config)
     registry.register(new PiBackend({
       bin: config.piBin,
       timeoutMs: config.piTimeoutMs,
@@ -392,7 +434,7 @@ export async function buildApp(config: Config): Promise<{
   mountSessions(app, { sessions })
   mountRuns(app, { runs })
   mountProfiles(app, { catalog })
-  mountChatCompletions(app, { registry, sessions, runs, admission })
+  mountChatCompletions(app, { registry, sessions, runs, admission, netJail: extras.netJail })
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)

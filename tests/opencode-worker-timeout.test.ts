@@ -28,10 +28,14 @@ describe('opencode worker timeout propagation', () => {
     const saved = { ...process.env }
     Object.assign(process.env, parentEnv)
     try {
-      const stream = backend.chat({
-        model: 'opencode/zai-coding-plan/glm-5.2',
-        messages: [{ role: 'user', content: 'hi' }],
-      } as Parameters<typeof backend.chat>[0])
+      const stream = backend.chat(
+        {
+          model: 'opencode/zai-coding-plan/glm-5.2',
+          messages: [{ role: 'user', content: 'hi' }],
+        } as Parameters<typeof backend.chat>[0],
+        null,
+        new AbortController().signal,
+      )
       for await (const _ of stream) { /* drain until the spawner throws */ }
     } catch {
       // expected: the spawner throws once it has captured the env

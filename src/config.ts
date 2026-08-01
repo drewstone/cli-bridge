@@ -10,6 +10,7 @@
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { assertDockerNetworkName } from './executors/docker-network.js'
+import { formatAllowEntry, parseAllowList } from './jail/net-allowlist.js'
 
 export interface Config {
   host: string
@@ -102,6 +103,27 @@ export interface Config {
    * `execution.jail.root` overrides this.
    */
   jailRoot: string | null
+  /**
+   * Default net-jail mode, from `BRIDGE_NET_JAIL_MODE` (off|net-jail, default
+   * off; `WORKER_NET_JAIL=1` is a shorthand for net-jail). Sibling of
+   * {@link Config.jailMode}: fs-jail confines what a worker can READ, net-jail
+   * confines where it can CONNECT. In `net-jail` every worker container runs on
+   * an internal Docker network with no route off it, and reaches only an
+   * allowlist that always contains its own model endpoint.
+   *
+   * Docker-only, by construction. A CLI spawned on the host shares the host's
+   * network namespace and there is no unprivileged way to give it a partial
+   * egress policy, so this setting REFUSES to load alongside a host-executed
+   * backend rather than reporting a policy it cannot apply.
+   */
+  netJailMode: 'off' | 'net-jail'
+  /**
+   * Extra `host` or `host:port` tokens added to every net-jail allowlist, from
+   * `BRIDGE_NET_JAIL_ALLOW`. The model endpoint is derived automatically and
+   * does not belong here; this is for the rest (a package registry, an internal
+   * service) that a specific workload legitimately needs.
+   */
+  netJailAllow: string[]
 }
 
 export interface BackendExecutorConfig {
@@ -204,6 +226,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
 
   const defaultTimeout = Number.parseInt(env.CLI_TIMEOUT_MS ?? '300000', 10)
+  const executors = parseAllExecutors(env, dataDir)
+  const netJailMode = parseNetJailMode(env)
+  if (netJailMode !== 'off') assertNetJailEnforceable(backends, executors)
 
   return {
     host,
@@ -244,9 +269,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
-    executors: parseAllExecutors(env, dataDir),
+    executors,
     jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
+    netJailMode,
+    // Parsed (not merely split) so an unusable token is rejected at startup
+    // rather than at provisioning time, when it would read as a Docker failure.
+    netJailAllow: parseAllowList(env.BRIDGE_NET_JAIL_ALLOW, 'BRIDGE_NET_JAIL_ALLOW').map(formatAllowEntry),
   }
 }
 
@@ -254,6 +283,57 @@ function parseJailMode(value: string | undefined): 'off' | 'write-jail' | 'fs-ja
   if (value === undefined || value === '') return 'off'
   if (value === 'off' || value === 'write-jail' || value === 'fs-jail') return value
   throw new Error(`invalid BRIDGE_JAIL_MODE: ${value} — expected off|write-jail|fs-jail`)
+}
+
+function parseNetJailMode(env: NodeJS.ProcessEnv): 'off' | 'net-jail' {
+  const value = env.BRIDGE_NET_JAIL_MODE
+  if (value !== undefined && value !== '' && value !== 'off' && value !== 'net-jail') {
+    throw new Error(`invalid BRIDGE_NET_JAIL_MODE: ${value} — expected off|net-jail`)
+  }
+  const shorthand = ['1', 'true', 'yes', 'on'].includes((env.WORKER_NET_JAIL ?? '').trim().toLowerCase())
+  return value === 'net-jail' || shorthand ? 'net-jail' : 'off'
+}
+
+/**
+ * Refuse to load a net-jail the bridge cannot enforce.
+ *
+ * Two contradictions, both fatal rather than warned:
+ *
+ *   - A backend that spawns its CLI on the host. That process shares the host's
+ *     network namespace; there is no unprivileged mechanism that gives it an
+ *     egress allowlist, and a proxy variable it can `unset` is not one. Booting
+ *     with the setting accepted would report a network policy to every caller
+ *     while enforcing nothing — the failure this feature exists to remove.
+ *   - A backend pinned to an operator's own `<NAME>_DOCKER_NETWORK`. A worker
+ *     joins exactly one network at creation, and joining a routable one is
+ *     indistinguishable from having no jail at all.
+ */
+function assertNetJailEnforceable(
+  backends: Set<string>,
+  executors: Record<string, BackendExecutorConfig>,
+): void {
+  const hostSpawned = [...backends].filter(
+    (name) => !NON_HOST_SPAWN_BACKENDS.has(name) && executors[name]?.kind !== 'docker',
+  )
+  if (hostSpawned.length > 0) {
+    throw new Error(
+      `net-jail is enabled (BRIDGE_NET_JAIL_MODE / WORKER_NET_JAIL) but ${hostSpawned.join(', ')} ` +
+        `${hostSpawned.length === 1 ? 'runs' : 'run'} on the host execution mode, which cannot enforce it: a ` +
+        'host-spawned CLI shares this machine\'s network namespace and any proxy variable it is given can be ' +
+        'unset. Set ' + hostSpawned.map((n) => `${n.toUpperCase()}_EXECUTOR=docker`).join(' / ') +
+        ', drop those backends from BRIDGE_BACKENDS, or unset the net-jail. Refusing to start with a network ' +
+        'policy that would not be applied.',
+    )
+  }
+  for (const cfg of Object.values(executors)) {
+    if (cfg.kind === 'docker' && cfg.network && backends.has(cfg.name)) {
+      throw new Error(
+        `net-jail is enabled but ${cfg.name.toUpperCase()}_DOCKER_NETWORK=${cfg.network} pins its workers to a ` +
+          'routable network. A container joins one network at creation, so the two settings cannot both hold. ' +
+          `Unset ${cfg.name.toUpperCase()}_DOCKER_NETWORK, or unset the net-jail.`,
+      )
+    }
+  }
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {

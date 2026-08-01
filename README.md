@@ -489,6 +489,80 @@ Pool workers can join one existing Docker network with
 `docker run --network`; it does not create or remove the network. Leave this
 unset to retain Docker's default networking behavior.
 
+### net-jail — deny-by-default egress (`WORKER_NET_JAIL`)
+
+`WORKER_FS_JAIL` confines what a worker can READ. `WORKER_NET_JAIL=1` confines
+where it can CONNECT: the worker's process tree gets no egress at all except to
+an allowlist that always contains the backend's own model endpoint.
+
+```bash
+OPENCODE_EXECUTOR=docker
+WORKER_NET_JAIL=1
+# optional extras beyond the model endpoint, which is derived automatically
+BRIDGE_NET_JAIL_ALLOW=registry.npmjs.org,internal-svc.example:8443
+```
+
+The gap it closes: denying the harness's `webfetch` tool removes a *tool*. It
+does not stop `bash` from running `curl` or `git clone`, so a worker with bash
+and no network policy has the whole internet regardless of its permission map.
+A benchmark rig was one run from a large fake result because the worker could
+clone the public upstream of the repository it was being graded on.
+
+**How it is enforced.** For each jailed backend the bridge creates an
+`--internal` Docker network — Docker gives it no gateway, so a container on it
+has no default route and no external DNS — plus a relay container attached to
+both that network and an ordinary one. The relay is registered on the internal
+network under a network-scoped alias for every allowlisted hostname, and it
+checks the name each connection claims (TLS SNI, or the `Host` header for
+cleartext) before forwarding a byte. TLS is never terminated: the relay splices
+raw bytes, so certificate validation still happens end-to-end against the real
+origin.
+
+There is deliberately no proxy environment variable. `HTTPS_PROXY` is a request
+an agent can decline with `unset`; here the worker never learns a relay exists,
+its clients dial what they believe is the origin, and clearing every variable in
+its environment changes nothing about what it can reach.
+
+**The model endpoint is derived, not typed.** The host and port come from the
+configured base URL (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`,
+`TANGLE_ROUTER_URL`, …), falling back to the CLI's own default endpoint when
+none is set. A caller asking for a net-jail names no hosts and still gets a
+working agent. Multi-provider CLIs (opencode, pi) have no single default; set a
+base URL or name the endpoint in `BRIDGE_NET_JAIL_ALLOW`, and the bridge refuses
+to start rather than hand back a jail that denies its own model.
+
+**Docker only, and it says so.** A CLI spawned on the host shares this machine's
+network namespace, and there is no unprivileged mechanism that gives it a
+partial egress policy. So the bridge REFUSES to start when `WORKER_NET_JAIL` is
+set alongside a host-executed backend, naming each backend and the
+`<NAME>_EXECUTOR=docker` that fixes it. No weaker env-proxy fallback is offered:
+a control that can be turned off by the thing it constrains is not isolation,
+and shipping it under the same name is how the leak above survived.
+
+Startup provisioning ends by PROVING the jail on a throwaway container drawn
+from the same image and network a worker gets — a name that must not resolve, a
+name that must, and a real TLS handshake through the relay. Failing any of the
+three is fatal.
+
+Per request, `execution.netJail` mirrors `execution.jail`:
+
+```jsonc
+{
+  "execution": {
+    "kind": "host",
+    "netJail": { "mode": "net-jail", "allow": ["router.tangle.tools:443"] }
+  }
+}
+```
+
+`mode` follows the same floor rule as the fs-jail: the env setting can be raised
+by a request, never lowered. `allow` ASSERTS the enforced allowlist rather than
+changing it — a pooled worker joined its network when the bridge started and
+cannot be re-jailed per request, so a list that differs from what is in force
+fails with 501 instead of silently widening. A net-jail requested of a backend
+with none provisioned, or of `execution.kind=sandbox`, fails the same way and
+names the mode. Nothing is ever accepted and then not applied.
+
 ### Topology guide
 
 cli-bridge spawns pool containers by talking to the **host docker
