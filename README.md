@@ -489,6 +489,147 @@ Pool workers can join one existing Docker network with
 `docker run --network`; it does not create or remove the network. Leave this
 unset to retain Docker's default networking behavior.
 
+### net-jail — deny-by-default egress (`WORKER_NET_JAIL`)
+
+`WORKER_FS_JAIL` confines what a worker can READ. `WORKER_NET_JAIL=1` confines
+where it can CONNECT: the worker's process tree gets no egress at all except to
+an allowlist that always contains the backend's own model endpoint.
+
+```bash
+OPENCODE_EXECUTOR=docker
+WORKER_NET_JAIL=1
+# optional extras beyond the model endpoint, which is derived automatically
+BRIDGE_NET_JAIL_ALLOW=registry.npmjs.org,internal-svc.example:8443
+```
+
+The gap it closes: denying the harness's `webfetch` tool removes a *tool*. It
+does not stop `bash` from running `curl` or `git clone`, so a worker with bash
+and no network policy has the whole internet regardless of its permission map.
+A benchmark rig was one run from a large fake result because the worker could
+clone the public upstream of the repository it was being graded on.
+
+**How it is enforced.** Three layers, and all three are load-bearing.
+
+*The network.* For each jailed backend the bridge creates an `--internal` Docker
+network — no default route off it, no external DNS — plus a relay container
+attached to both that network and an ordinary one, pinned to a fixed address.
+The relay is registered on the internal network under a network-scoped alias for
+every allowlisted hostname, and it checks the name each connection claims (TLS
+SNI, or the `Host` header for cleartext) before forwarding a byte. TLS is never
+terminated: the relay splices raw bytes, so certificate validation still happens
+end-to-end against the real origin.
+
+*The filter.* `--internal` denies routing OFF the bridge; it does not deny the
+bridge. Docker still configures the host's gateway address on that subnet, and
+it is on-link in the worker's own network — as is every other container there.
+A jailed worker used exactly that to pull 339,594 bytes of github.com with a
+valid certificate chain, through a service listening on the Docker host. So each
+jailed container also gets a packet filter in its OWN network namespace: default
+policy DROP in both directions, and exactly two exceptions — loopback (Docker's
+embedded resolver lives there) and the relay's pinned address. The host gateway,
+peer containers, the host's other interfaces, link-local metadata addresses
+(`169.254.0.0/16`) and all IPv6 are rejected by the kernel.
+
+The rules are written by a throwaway sidecar that joins the worker's network
+namespace with `CAP_NET_ADMIN` and exits. The worker itself never holds that
+capability, so `iptables` inside it fails with `Permission denied` even as uid
+0, and the filter outlives the sidecar because it is state of the namespace. A
+slot whose filter cannot be installed is destroyed rather than served. This
+needs `iptables` in the runtime image; `docker/Dockerfile.cli-runtime` installs
+it, and a net-jailed backend refuses to start without it.
+
+*Surviving a restart.* A filter is state of a network namespace, and Docker
+destroys and recreates that namespace every time a container restarts — same
+container id, same mounts, same filesystem, empty rules. A worker can cause the
+restart: when a worker's command exits non-cleanly the executor runs `docker
+restart` on its slot, because killing the local `docker exec` client does not
+stop the process tree inside the container. Before this was closed, exiting
+non-zero and then asking for one more turn pulled 339,598 bytes of github.com
+out of a real pool slot through the Docker host. So the filter is treated as
+belonging to a container START rather than to a container: a jailed slot carries
+**no Docker restart policy** (a dead one is replaced, which reinstalls the
+filter, instead of being revived in place), and every handout compares the
+container's `StartedAt` against the start the filter was installed for and
+reinstalls it before the slot can be used. The window in between contains
+nothing but the idle `tail -f /dev/null` entrypoint, and the slot stays reserved
+across it, so no request is ever dispatched into an unfiltered namespace. A
+container whose filter cannot be reinstalled is replaced, not served.
+
+There is deliberately no proxy environment variable. `HTTPS_PROXY` is a request
+an agent can decline with `unset`; here the worker never learns a relay exists,
+its clients dial what they believe is the origin, and clearing every variable in
+its environment changes nothing about what it can reach.
+
+**The model endpoint is derived, not typed.** The host and port come from the
+configured base URL (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`,
+`TANGLE_ROUTER_URL`, …), falling back to the CLI's own default endpoint when
+none is set. A caller asking for a net-jail names no hosts and still gets a
+working agent. Multi-provider CLIs (opencode, pi) have no single default; set a
+base URL or name the endpoint in `BRIDGE_NET_JAIL_ALLOW`, and the bridge refuses
+to start rather than hand back a jail that denies its own model.
+
+**Docker only, and it says so.** A CLI spawned on the host shares this machine's
+network namespace, and there is no unprivileged mechanism that gives it a
+partial egress policy. So the bridge REFUSES to start when `WORKER_NET_JAIL` is
+set alongside a host-executed backend, naming each backend and the
+`<NAME>_EXECUTOR=docker` that fixes it. No weaker env-proxy fallback is offered:
+a control that can be turned off by the thing it constrains is not isolation,
+and shipping it under the same name is how the leak above survived.
+
+Startup provisioning ends by PROVING the jail on a throwaway container drawn
+from the same image, the same network AND the same filter a worker gets, with a
+listening peer container beside it on the bridge:
+
+| Proven at provisioning | Why it is checked |
+| --- | --- |
+| no default route | the network denies routing off the bridge |
+| the Docker host's gateway is unreachable | an address that answers on the worker's own subnet is a next hop that never passes the relay |
+| a peer container is unreachable while listening | the relay must be the only next hop, not merely the only *external* one |
+| link-local is unreachable | cloud instance metadata, and the credentials it hands out, live at `169.254.169.254` |
+| the worker cannot run `iptables` | a worker that can flush the rules is not confined by them |
+| the relay IS reachable | the control: a container with a dead network stack denies everything and proves nothing |
+| a non-allowlisted name does not resolve | DNS is scoped to the allowlist |
+| an allowlisted name resolves and completes a real TLS handshake | the jail does not deny its own model |
+| **every line above, again, after restarting the probe** | a restart empties the namespace, and a worker can cause one by exiting non-zero |
+
+Failing any one of these is fatal. Reachability is judged by the ERROR, not by
+whether something answered: `ECONNREFUSED` means a packet came back, which
+proves the address is reachable and merely silent on that port, so it counts as
+a leak.
+
+The restart round is run with the same `docker restart --time 0` the executor
+uses to kill a worker's process tree, and the filter is put back by the same
+function the pool's slot provisioning calls — verifying through a second
+implementation would prove a jail no worker runs in. Provisioning also fails if
+the probe's start time does not move, because a restart that did not happen
+makes the second round a re-run of the first.
+
+Each of the two escapes found so far was found because the verifier checked
+something adjacent to it. The first version checked only the route table, the
+two DNS facts and the handshake, and passed the jail the host-gateway escape was
+performed on. The second checked the filter's presence at one instant, and
+passed a jail that a worker could empty by exiting non-zero. Each round's fix is
+therefore added here as a direct probe of the escape itself.
+
+Per request, `execution.netJail` mirrors `execution.jail`:
+
+```jsonc
+{
+  "execution": {
+    "kind": "host",
+    "netJail": { "mode": "net-jail", "allow": ["router.tangle.tools:443"] }
+  }
+}
+```
+
+`mode` follows the same floor rule as the fs-jail: the env setting can be raised
+by a request, never lowered. `allow` ASSERTS the enforced allowlist rather than
+changing it — a pooled worker joined its network when the bridge started and
+cannot be re-jailed per request, so a list that differs from what is in force
+fails with 501 instead of silently widening. A net-jail requested of a backend
+with none provisioned, or of `execution.kind=sandbox`, fails the same way and
+names the mode. Nothing is ever accepted and then not applied.
+
 ### Topology guide
 
 cli-bridge spawns pool containers by talking to the **host docker

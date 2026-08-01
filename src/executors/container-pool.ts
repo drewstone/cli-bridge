@@ -43,6 +43,18 @@
  *      container` on /health that only a restart cleared — observed on a
  *      bridge that had been up ten days. Env: BRIDGE_SLOT_LIVENESS_TTL_MS.
  *
+ *   7. Start-scoped setup, re-armed across restarts — see {@link
+ *      ContainerPoolOptions.afterCreate}. `afterCreate` writes state into the
+ *      container's KERNEL NAMESPACES, which Docker destroys and recreates on
+ *      every restart, so that state belongs to a container START, not to a
+ *      container. A slot is therefore never handed out until `afterCreate` has
+ *      been run against the incarnation the request will actually execute in,
+ *      and a pool that uses it never carries a Docker restart policy — a
+ *      container revived behind the pool's back is one the pool never re-armed.
+ *      Measured before this existed: a worker exited non-zero, the executor
+ *      restarted its slot to kill the process tree, and the next request pulled
+ *      339,598 bytes of github.com from that slot through the Docker host.
+ *
  * Sticky session routing is unchanged: when sessionId is passed, prefer
  * the slot that last served that session.
  */
@@ -108,10 +120,41 @@ export interface ContainerPoolOptions {
    * How long a slot's container liveness is trusted before the next acquire
    * re-checks it with `docker inspect`. Default 30_000. Set 0 to check every
    * acquire (correct but adds a docker round-trip per request).
+   *
+   * IGNORED when {@link ContainerPoolOptions.afterCreate} is set: start-scoped
+   * state cannot be cached across a window in which the container may have
+   * started again. See the constructor.
    */
   livenessTtlMs?: number
   /** Injectable docker command runner. Tests replace this; production uses the real CLI. */
   cli?: DockerCli
+  /**
+   * Run against a slot's container after it exists and BEFORE the slot is
+   * usable. The net-jail installs its egress filter here: a filter belongs to a
+   * network namespace, so it cannot be set by `docker run` arguments and has to
+   * be written into the namespace once the container is up.
+   *
+   * A rejection is fatal for that slot — the container is destroyed and the
+   * slot fails to provision. That is deliberate: the alternative is a pool slot
+   * serving requests with an egress policy nobody applied, which is the exact
+   * shape of the leak the net-jail exists to close.
+   *
+   * THIS HOOK IS SCOPED TO A CONTAINER START, NOT TO A CONTAINER. Docker
+   * destroys and recreates a container's network namespace on every restart, so
+   * anything written into that namespace is gone the moment the container comes
+   * back — and the container id, the mounts and the filesystem are all
+   * unchanged, so nothing about the slot looks different afterwards. Setting
+   * this therefore changes three things about the pool:
+   *
+   *   - the container carries NO Docker restart policy, so a dead container is
+   *     replaced by `provisionSlot` (which re-runs this hook) instead of being
+   *     revived in place with a fresh, empty namespace;
+   *   - `livenessTtlMs` is forced to 0, because a cached "alive" answer cannot
+   *     tell one incarnation from the next;
+   *   - every handout compares the container's `StartedAt` against the start
+   *     this hook was last run for, and re-runs it before the slot is usable.
+   */
+  afterCreate?: (containerId: string, index: number) => Promise<void>
   /** Optional progress hook. */
   onProgress?: (msg: string) => void
 }
@@ -138,6 +181,13 @@ interface SlotState {
   consecutiveFailures: number
   /** Epoch ms of the last positive liveness observation for `containerId`. */
   lastVerifiedAt: number
+  /**
+   * `.State.StartedAt` of the container incarnation `afterCreate` was last run
+   * against. Empty when the pool has no `afterCreate`. A slot whose container
+   * reports a different value has been restarted, which means its namespaces —
+   * and everything `afterCreate` wrote into them — were recreated empty.
+   */
+  armedStart: string
 }
 
 const DEFAULTS = {
@@ -176,6 +226,10 @@ export class ContainerPool {
     slots_marked_dead: 0,
     /** Slots recreated because their container had vanished or stopped. */
     slot_liveness_recoveries: 0,
+    /** Handouts that found a restarted container and re-ran `afterCreate` first. */
+    slot_rearms: 0,
+    /** Re-arms that failed, so the container was replaced instead of served. */
+    slot_rearm_failures: 0,
   }
 
   private constructor(slots: SlotState[], opts: ContainerPoolOptions) {
@@ -185,7 +239,12 @@ export class ContainerPool {
     this.acquireDeadlineMs = opts.acquireDeadlineMs ?? DEFAULTS.ACQUIRE_DEADLINE_MS
     this.slotMaxHoldMs = opts.slotMaxHoldMs ?? DEFAULTS.SLOT_MAX_HOLD_MS
     this.maxConsecutiveFailures = opts.maxConsecutiveFailures ?? DEFAULTS.MAX_CONSECUTIVE_FAILURES
-    this.livenessTtlMs = opts.livenessTtlMs ?? DEFAULTS.LIVENESS_TTL_MS
+    // A pool whose slots carry start-scoped state cannot cache liveness. The TTL
+    // exists to skip a `docker inspect` on a warm path, and the very thing the
+    // inspect now reads — which START this container is on — is what changes
+    // inside that window. A 30-second cache is 30 seconds in which a restarted
+    // container is handed out with the setup its previous incarnation had.
+    this.livenessTtlMs = opts.afterCreate ? 0 : (opts.livenessTtlMs ?? DEFAULTS.LIVENESS_TTL_MS)
     this.cli = opts.cli ?? dockerCli
   }
 
@@ -226,6 +285,8 @@ export class ContainerPool {
     slot_reprovisions: number
     slots_marked_dead: number
     slot_liveness_recoveries: number
+    slot_rearms: number
+    slot_rearm_failures: number
   } {
     return {
       size: this.slots.length,
@@ -349,7 +410,7 @@ export class ContainerPool {
   private async handOut(slot: SlotState, sessionId: string | undefined): Promise<AcquiredSlot> {
     slot.busy = true
     try {
-      await this.ensureContainerAlive(slot)
+      await this.ensureSlotUsable(slot)
     } catch (err) {
       slot.busy = false
       throw err
@@ -359,15 +420,37 @@ export class ContainerPool {
   }
 
   /**
-   * Re-provision the slot if its container no longer exists or is not running.
-   * Bounded by `livenessTtlMs` so a warm pool serving back-to-back requests
-   * does not pay a `docker inspect` per request; a reported exec failure resets
-   * the clock so the very next acquire re-checks.
+   * The gate every handout passes: the slot's container exists, is running, and
+   * — when the pool has an `afterCreate` — is on the very START that hook was
+   * run for.
+   *
+   * Both halves recover rather than refuse. A container that is gone or stopped
+   * is rebuilt. A container that RESTARTED still has the caller's filesystem and
+   * mounts, so it is re-armed in place: `afterCreate` runs again against the new
+   * incarnation, and only if that fails is the container replaced.
+   *
+   * There is no window. The restart is over by the time this runs, the only
+   * thing alive in the container is its idle entrypoint, and the slot is
+   * reserved (`busy`) across the whole check — so no request can be dispatched
+   * into an incarnation that has not been armed. That is the property a Docker
+   * event watcher could not have given: a watcher races the next `docker exec`,
+   * and the loser of that race is a request running unconfined.
+   *
+   * Bounded by `livenessTtlMs` so a warm pool serving back-to-back requests does
+   * not pay a `docker inspect` per request; a reported exec failure resets the
+   * clock so the very next acquire re-checks. The TTL is forced to 0 whenever
+   * `afterCreate` is set (see the constructor), because a cached answer cannot
+   * tell one incarnation from the next.
    */
-  private async ensureContainerAlive(slot: SlotState): Promise<void> {
+  private async ensureSlotUsable(slot: SlotState): Promise<void> {
     if (this.livenessTtlMs > 0 && Date.now() - slot.lastVerifiedAt < this.livenessTtlMs) return
-    const state = await this.cli(['inspect', '-f', '{{.State.Running}}', slot.containerId])
-    if (state.code === 0 && state.stdout.trim() === 'true') {
+    const state = await this.cli(['inspect', '-f', START_FORMAT, slot.containerId])
+    const [running = '', startedAt = ''] = state.stdout.trim().split(/\s+/u)
+    if (state.code === 0 && running === 'true') {
+      if (this.opts.afterCreate && startedAt !== slot.armedStart) {
+        await this.rearmSlot(slot, startedAt)
+        return
+      }
       slot.lastVerifiedAt = Date.now()
       return
     }
@@ -386,6 +469,40 @@ export class ContainerPool {
           `Verify the Docker daemon is up and image ${this.opts.image} still exists ` +
           `(build: ${buildCommandFor(this.opts.image)}).`,
       )
+    }
+  }
+
+  /**
+   * The container restarted, so run `afterCreate` against the incarnation that
+   * is up now. On failure the container is REPLACED rather than handed over: a
+   * slot whose setup could not be re-applied is precisely a slot running without
+   * it, and serving that is the defect. The replacement path is the pool's
+   * ordinary one, so it re-runs `afterCreate` too.
+   */
+  private async rearmSlot(slot: SlotState, observedStart: string): Promise<void> {
+    this.counters.slot_rearms += 1
+    ;(this.opts.onProgress ?? (() => {}))(
+      `[slot ${slot.index}] container restarted (${slot.containerId.slice(0, 12)}, ` +
+        `start ${slot.armedStart || 'unknown'} -> ${observedStart}) — re-running afterCreate before use`,
+    )
+    try {
+      slot.armedStart = await armContainerStart(this.opts, slot.containerId, slot.index, this.cli)
+      slot.lastVerifiedAt = Date.now()
+      return
+    } catch (err) {
+      const cause = err instanceof Error ? err.message : String(err)
+      this.counters.slot_rearm_failures += 1
+      ;(this.opts.onProgress ?? (() => {}))(
+        `[slot ${slot.index}] could not re-arm the restarted container — ${cause}; replacing it`,
+      )
+      const error = await this.reprovisionSlot(slot)
+      if (error) {
+        throw new Error(
+          `container-pool: slot ${slot.index} restarted, its afterCreate setup could not be re-applied ` +
+            `(${cause}), and the container could not be replaced either — ${error.message}. Refusing to hand ` +
+            'out a container whose per-start setup is absent.',
+        )
+      }
     }
   }
 
@@ -437,7 +554,7 @@ export class ContainerPool {
     const waiter = this.takeWaiterFor(slot)
     if (!waiter) return
     slot.busy = true
-    void this.ensureContainerAlive(slot).then(
+    void this.ensureSlotUsable(slot).then(
       () => {
         slot.busy = false
         if (waiter.sessionId) slot.lastSession = waiter.sessionId
@@ -517,6 +634,11 @@ export class ContainerPool {
     try {
       const reborn = await provisionSlot(this.opts, slot.index, this.opts.onProgress ?? (() => {}))
       slot.containerId = reborn.containerId
+      // The new container has its own start, and `provisionSlot` already armed
+      // it. Keeping the old stamp would not be unsafe — it never matches, so
+      // every handout re-arms — but it would run a sidecar per request forever
+      // on a pool that is working perfectly.
+      slot.armedStart = reborn.armedStart
       slot.lastSession = null
       slot.generation += 1
       slot.consecutiveFailures = 0
@@ -526,6 +648,10 @@ export class ContainerPool {
       const error = err instanceof Error ? err : new Error(String(err))
       slot.consecutiveFailures += 1
       slot.lastVerifiedAt = 0
+      // There is no container this stamp describes. Clearing it means the next
+      // handout can only proceed by arming something, never by trusting a
+      // stamp left over from a container that no longer exists.
+      slot.armedStart = ''
       if (slot.consecutiveFailures >= this.maxConsecutiveFailures) {
         slot.dead = true
         this.counters.slots_marked_dead += 1
@@ -563,6 +689,21 @@ async function provisionSlot(
         : `container-pool: cannot create slot ${index} — ${firstLine(stderr)}`,
     )
   }
+  // Before anything else touches the container, including this bridge's own
+  // `docker exec`: the window between `run` and the filter being in place is
+  // the only moment a slot has unrestricted egress, and the only thing running
+  // in it is the idle `tail -f /dev/null` entrypoint.
+  let armedStart = ''
+  if (opts.afterCreate) {
+    try {
+      armedStart = await armContainerStart(opts, containerId, index, cli)
+    } catch (error) {
+      await cli(['rm', '-f', containerId], { timeoutMs: 30_000 })
+      throw error instanceof Error
+        ? new Error(`container-pool: slot ${index} was destroyed unused — ${error.message}`, { cause: error })
+        : error
+    }
+  }
   await normalizeContainerHome(opts, containerId, cli)
   onProgress(`[slot ${index}] ready @ ${containerId.slice(0, 12)}`)
   return {
@@ -575,7 +716,58 @@ async function provisionSlot(
     generation: 0,
     consecutiveFailures: 0,
     lastVerifiedAt: Date.now(),
+    armedStart,
   }
+}
+
+/** Fields that identify one container INCARNATION, in one `docker inspect`. */
+const START_FORMAT = '{{.State.Running}} {{.State.StartedAt}}'
+
+/** How many times arming may lose a race with a concurrent restart before it fails. */
+const ARM_ATTEMPTS = 3
+
+/**
+ * Run `afterCreate` and return the container start it applies to.
+ *
+ * The start is read BEFORE and AFTER the hook, and the two must match. Reading
+ * it only afterwards would record the wrong thing in the one case that matters:
+ * a container that restarted DURING the hook would be stamped with the new
+ * start while the hook's work went into the namespace that is already gone —
+ * a slot that looks armed and is not. Losing the race repeatedly is reported as
+ * a failure rather than retried forever, because a container restarting that
+ * often is not a container to hand a request.
+ */
+async function armContainerStart(
+  opts: ContainerPoolOptions,
+  containerId: string,
+  index: number,
+  cli: DockerCli,
+): Promise<string> {
+  const afterCreate = opts.afterCreate
+  if (!afterCreate) return ''
+  let lastSeen = ''
+  for (let attempt = 0; attempt < ARM_ATTEMPTS; attempt++) {
+    const before = await readContainerStart(cli, containerId)
+    await afterCreate(containerId, index)
+    const after = await readContainerStart(cli, containerId)
+    if (after === before) return after
+    lastSeen = after
+  }
+  throw new Error(
+    `container-pool: slot ${index} restarted during afterCreate ${ARM_ATTEMPTS} times in a row ` +
+      `(last observed start ${lastSeen}); its per-start setup cannot be established`,
+  )
+}
+
+/** `.State.StartedAt` of a running container; throws if it is not running. */
+async function readContainerStart(cli: DockerCli, containerId: string): Promise<string> {
+  const result = await cli(['inspect', '-f', START_FORMAT, containerId], { timeoutMs: 30_000 })
+  const [running = '', startedAt = ''] = result.stdout.trim().split(/\s+/u)
+  if (result.code !== 0 || running !== 'true' || !startedAt) {
+    const detail = result.stderr.trim() || result.stdout.trim() || `docker exited ${result.code}`
+    throw new Error(`container ${containerId.slice(0, 12)} is not running — ${firstLine(detail)}`)
+  }
+  return startedAt
 }
 
 /**
@@ -673,12 +865,10 @@ export function buildContainerRunArgs(
 ): string[] {
   const memory = opts.memory ?? '4g'
   const cpus = opts.cpus ?? '2'
-  // restart=on-failure:3 instead of unless-stopped — caps the docker-level
-  // restart loop so a poisoned image can't churn the daemon forever.
   const args = [
     'run', '-d',
     '--name', name,
-    '--restart', 'on-failure:3',
+    '--restart', restartPolicyFor(opts),
     '--memory', memory, '--memory-swap', memory,
     '--cpus', cpus,
   ]
@@ -718,6 +908,33 @@ export function buildContainerRunArgs(
   }
   args.push(opts.image, 'tail', '-f', '/dev/null')
   return args
+}
+
+/**
+ * The Docker restart policy a slot runs under.
+ *
+ * Without `afterCreate`, `on-failure:3` instead of `unless-stopped` — it caps
+ * the docker-level restart loop so a poisoned image can't churn the daemon
+ * forever, and reviving the container in place is a strictly cheaper recovery
+ * than rebuilding it.
+ *
+ * WITH `afterCreate`, none at all. A restart policy revives a container with
+ * fresh, empty namespaces — the setup the hook wrote is gone, the container id
+ * and every mount are unchanged, and the revival happens with nothing in this
+ * process observing it. The pool already models a dead slot correctly (`rm -f`
+ * then `provisionSlot`, which re-runs the hook), so the honest configuration is
+ * for a dead jailed container to be REPLACED, never revived. `tail -f /dev/null`
+ * is the entrypoint, so a slot only dies when something killed it, which is a
+ * container to discard rather than to bring back.
+ *
+ * This is one half of the invariant; the other is `ensureSlotUsable`, which
+ * covers the restarts this bridge performs ITSELF — `terminateDockerExecution`
+ * restarts a slot to kill a worker's process tree whenever the worker exits
+ * non-cleanly, which a worker triggers simply by exiting non-zero. Removing the
+ * policy without that gate would have closed the smaller of the two doors.
+ */
+function restartPolicyFor(opts: ContainerPoolOptions): string {
+  return opts.afterCreate ? 'no' : 'on-failure:3'
 }
 
 function isSafeWorkspaceBindPath(path: string): boolean {

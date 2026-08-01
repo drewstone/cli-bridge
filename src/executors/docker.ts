@@ -244,6 +244,16 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
  * awaited zero-timeout restart is the smallest reliable unit that kills every
  * descendant, including children that created their own process group. Docker
  * restart preserves the container filesystem and mounted authentication data.
+ *
+ * It does NOT preserve the container's namespaces: Docker recreates them empty,
+ * so anything the pool installed into them — the net-jail's egress filter — is
+ * gone when the container comes back. A worker reaches this path by exiting
+ * non-zero, so this is a worker-triggerable un-jailing, and it leaked 339,598
+ * bytes of github.com from a real pool slot before it was closed. What makes the
+ * restart safe is the pool, not this function: the slot stays held until
+ * termination completes, and `ContainerPool` re-runs `afterCreate` on any
+ * container whose `StartedAt` has moved before the next request can be
+ * dispatched into it. Do not release a slot before this resolves.
  */
 export async function terminateDockerExecution(
   child: ChildProcess,

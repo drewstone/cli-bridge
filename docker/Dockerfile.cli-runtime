@@ -35,9 +35,15 @@ FROM node:22-slim
 
 ARG CLI_BRIDGE_HARNESSES=all
 
+# iptables is here for WORKER_NET_JAIL. The jail installs a deny-by-default
+# egress filter into each worker's network namespace, written by a throwaway
+# sidecar that runs THIS image with CAP_NET_ADMIN and exits; the workers never
+# hold that capability and cannot undo the rules. Without iptables in the image
+# a net-jailed backend refuses to start rather than run a jail that does not
+# deny, so this package is a hard requirement of that mode, not an extra.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-       git ca-certificates dumb-init curl python3 \
+       git ca-certificates dumb-init curl python3 iptables \
   && rm -rf /var/lib/apt/lists/*
 
 # --- CLI installs (latest at image-build time) ---
