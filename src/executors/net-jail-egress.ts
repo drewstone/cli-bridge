@@ -38,6 +38,15 @@
  *     `enable_icc` and an explicit subnet/gateway all still leave the bridge's
  *     address configured on the host and on-link for members; there is no option
  *     that removes the host from a bridge network's reachable set.
+ *   - Moving the deny OUTSIDE the namespace so a restart cannot clear it. There
+ *     is nowhere to put it that is both outside the namespace and on the path:
+ *     the only such place is the host's own firewall, which is the DOCKER-USER
+ *     option above with its FORWARD-chain blind spot, needs root on the host,
+ *     and would have to name the container by an address Docker is free to
+ *     reassign on the very restart the rule is supposed to survive. The property
+ *     is instead obtained by scoping the filter to a container START and
+ *     re-installing it before the container is used again — see
+ *     `ContainerPoolOptions.afterCreate`.
  *
  * The filter needs `iptables` in the image the sidecar runs. That is the same
  * runtime image the workers use (see `docker/Dockerfile.cli-runtime`), so no

@@ -619,6 +619,7 @@ describe('ContainerPool afterCreate hook', () => {
   const recordingCli = (calls: string[][]): DockerCli => async (args) => {
     calls.push(args)
     if (args[0] === 'run') return { code: 0, stdout: 'container-abc\n', stderr: '' }
+    if (args[0] === 'inspect') return { code: 0, stdout: 'true 2026-08-01T00:00:00Z\n', stderr: '' }
     return { code: 0, stdout: '', stderr: '' }
   }
 
@@ -651,8 +652,220 @@ describe('ContainerPool afterCreate hook', () => {
       cli: async (args) => { seen.push(args[0]!); return recordingCli(calls)(args) },
       afterCreate: async () => { seen.push('afterCreate') },
     })
-    expect(seen.indexOf('afterCreate')).toBe(seen.indexOf('run') + 1)
+    // Nothing may run INSIDE the container before the hook. `inspect` is
+    // allowed to precede it: reading `.State.StartedAt` is how the pool stamps
+    // which container start the hook's work belongs to, and it touches nothing.
+    const armed = seen.indexOf('afterCreate')
+    expect(armed).toBeGreaterThan(seen.indexOf('run'))
+    expect(seen.slice(0, armed).every((op) => op === 'run' || op === 'inspect')).toBe(true)
     await pool.destroy()
+  })
+})
+
+/**
+ * `afterCreate` writes into the container's KERNEL NAMESPACES, and Docker
+ * recreates those empty on every restart. So the hook is scoped to a container
+ * START, and a slot whose container has started again since is a slot whose
+ * setup is gone — with the same container id, the same mounts and the same
+ * filesystem, so nothing about it looks different.
+ *
+ * Measured before these tests existed: a worker exited non-zero, the executor
+ * restarted its slot to kill the process tree, and the next request pulled
+ * 339,598 bytes of github.com out of that slot through the Docker host.
+ */
+describe('ContainerPool re-arms start-scoped setup across a container restart', () => {
+  interface FakeDaemon {
+    /** What `docker inspect` reports for `.State.StartedAt`. Move it to restart. */
+    startedAt: string
+    calls: string[][]
+    /** Container ids handed out by successive `docker run` calls. */
+    runIds: string[]
+  }
+
+  const fakeDocker = (daemon: FakeDaemon): DockerCli => {
+    let runSeq = 0
+    return async (args) => {
+      daemon.calls.push(args)
+      if (args[0] === 'run') return { code: 0, stdout: `${daemon.runIds[runSeq++] ?? 'container-abc'}\n`, stderr: '' }
+      if (args[0] === 'inspect') return { code: 0, stdout: `true ${daemon.startedAt}\n`, stderr: '' }
+      return { code: 0, stdout: '', stderr: '' }
+    }
+  }
+
+  const newDaemon = (runIds = ['c-first', 'c-second']): FakeDaemon =>
+    ({ startedAt: '2026-08-01T00:00:00Z', calls: [], runIds })
+
+  it('carries NO Docker restart policy, so a dead jailed container is replaced and never revived', () => {
+    // A restart policy revives the container in place, with fresh empty
+    // namespaces, and nothing in this process observes it happening. The pool
+    // already models a dead slot correctly — `rm -f` then provision, which
+    // re-runs the hook — so a hook means the slot opts out of revival.
+    const jailed = buildContainerRunArgs({
+      size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
+      afterCreate: async () => {},
+    }, 0)
+    expect(jailed[jailed.indexOf('--restart') + 1]).toBe('no')
+
+    const plain = buildContainerRunArgs({
+      size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
+    }, 0)
+    expect(plain[plain.indexOf('--restart') + 1]).toBe('on-failure:3')
+  })
+
+  it('re-runs the hook before handing out a slot whose container has restarted', async () => {
+    const daemon = newDaemon()
+    const armedFor: string[] = []
+    const pool = await ContainerPool.create({
+      size: 1,
+      image: 'x:latest',
+      namePrefix: 'p',
+      oauthMode: 'share',
+      shareMounts: [],
+      cli: fakeDocker(daemon),
+      afterCreate: async () => { armedFor.push(daemon.startedAt) },
+    })
+    try {
+      expect(armedFor).toEqual(['2026-08-01T00:00:00Z'])
+
+      // No restart: the hook must not be re-run, or every request pays for it.
+      ;(await pool.acquire()).release()
+      expect(armedFor).toEqual(['2026-08-01T00:00:00Z'])
+
+      // The container restarted. Same id, same mounts, empty namespaces.
+      daemon.startedAt = '2026-08-01T00:05:00Z'
+      const slot = await pool.acquire()
+      expect(armedFor).toEqual(['2026-08-01T00:00:00Z', '2026-08-01T00:05:00Z'])
+      expect(slot.containerId).toBe('c-first')
+      expect(pool.snapshot().slot_rearms).toBe(1)
+      slot.release()
+
+      // ...and once, not on every acquire thereafter.
+      ;(await pool.acquire()).release()
+      expect(pool.snapshot().slot_rearms).toBe(1)
+    } finally {
+      await pool.destroy()
+    }
+  })
+
+  it('replaces the container rather than serving it when the re-arm fails', async () => {
+    const daemon = newDaemon()
+    let refuse = false
+    const pool = await ContainerPool.create({
+      size: 1,
+      image: 'x:latest',
+      namePrefix: 'p',
+      oauthMode: 'share',
+      shareMounts: [],
+      cli: fakeDocker(daemon),
+      afterCreate: async (containerId) => {
+        if (refuse && containerId === 'c-first') throw new Error('egress rules could not be installed')
+      },
+    })
+    try {
+      daemon.startedAt = '2026-08-01T00:05:00Z'
+      refuse = true
+      const slot = await pool.acquire()
+      // Handing back `c-first` would be handing back a container with no filter.
+      expect(slot.containerId).toBe('c-second')
+      expect(pool.snapshot().slot_rearm_failures).toBe(1)
+      slot.release()
+    } finally {
+      await pool.destroy()
+    }
+  })
+
+  it('does not re-arm forever after a replacement, because the stamp follows the new container', async () => {
+    // The stamp names a container START. A replacement produces a new one, and
+    // `provisionSlot` has already armed it — carrying the dead container's stamp
+    // forward is not unsafe (it never matches, so every handout re-arms) but it
+    // runs an enforcer sidecar per request on a pool that is working perfectly.
+    const daemon = newDaemon(['c-first', 'c-second'])
+    let armCount = 0
+    let vanished = false
+    const pool = await ContainerPool.create({
+      size: 1,
+      image: 'x:latest',
+      namePrefix: 'p',
+      oauthMode: 'share',
+      shareMounts: [],
+      cli: async (args) => {
+        daemon.calls.push(args)
+        if (args[0] === 'run') return { code: 0, stdout: `${daemon.runIds.shift() ?? 'c-extra'}\n`, stderr: '' }
+        if (args[0] === 'inspect') {
+          // Once the first container has been swept, only the replacement
+          // answers — and it reports a DIFFERENT start, which is exactly what a
+          // stale stamp would misread as "this container restarted".
+          return vanished && args.includes('c-first')
+            ? { code: 1, stdout: '', stderr: 'Error: No such object: c-first' }
+            : { code: 0, stdout: `true ${daemon.startedAt}\n`, stderr: '' }
+        }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+      afterCreate: async () => { armCount += 1 },
+    })
+    try {
+      const armsAfterProvision = armCount
+      vanished = true
+      daemon.startedAt = '2026-08-01T00:09:00Z'
+      const slot = await pool.acquire()
+      expect(slot.containerId).toBe('c-second')
+      slot.release()
+      const armsAfterReplacement = armCount
+      for (let i = 0; i < 3; i++) (await pool.acquire()).release()
+      expect(armCount).toBe(armsAfterReplacement)
+      expect(armsAfterReplacement).toBeGreaterThan(armsAfterProvision)
+      expect(pool.snapshot().slot_rearms).toBe(0)
+    } finally {
+      await pool.destroy()
+    }
+  })
+
+  it('checks the container start on EVERY acquire, ignoring the liveness TTL', async () => {
+    // The TTL exists to skip a `docker inspect` on a warm path. The very fact
+    // the inspect now reads — which start this container is on — is what changes
+    // inside the cached window, so a 30-second cache is 30 seconds of serving a
+    // restarted container with its previous incarnation's setup.
+    const jailed = newDaemon()
+    const jailedPool = await ContainerPool.create({
+      size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
+      livenessTtlMs: 600_000, cli: fakeDocker(jailed), afterCreate: async () => {},
+    })
+    const plain = newDaemon()
+    const plainPool = await ContainerPool.create({
+      size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
+      livenessTtlMs: 600_000, cli: fakeDocker(plain),
+    })
+    try {
+      const inspectsSoFar = (d: FakeDaemon): number => d.calls.filter((args) => args[0] === 'inspect').length
+      const jailedBase = inspectsSoFar(jailed)
+      const plainBase = inspectsSoFar(plain)
+      for (let i = 0; i < 3; i++) {
+        ;(await jailedPool.acquire()).release()
+        ;(await plainPool.acquire()).release()
+      }
+      expect(inspectsSoFar(jailed) - jailedBase).toBe(3)
+      expect(inspectsSoFar(plain) - plainBase).toBe(0)
+    } finally {
+      await jailedPool.destroy()
+      await plainPool.destroy()
+    }
+  })
+
+  it('refuses to record a slot as armed when the container restarted DURING the hook', async () => {
+    // The window's only failure mode: the hook writes into a namespace that is
+    // already gone, and the slot is then stamped with the start it never armed.
+    // Reading the start before AND after is what catches it.
+    const daemon = newDaemon()
+    let restarts = 0
+    await expect(ContainerPool.create({
+      size: 1,
+      image: 'x:latest',
+      namePrefix: 'p',
+      oauthMode: 'share',
+      shareMounts: [],
+      cli: fakeDocker(daemon),
+      afterCreate: async () => { daemon.startedAt = `2026-08-01T00:0${++restarts}:00Z` },
+    })).rejects.toThrow(/restarted during afterCreate 3 times in a row/)
   })
 })
 

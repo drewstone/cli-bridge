@@ -508,7 +508,7 @@ and no network policy has the whole internet regardless of its permission map.
 A benchmark rig was one run from a large fake result because the worker could
 clone the public upstream of the repository it was being graded on.
 
-**How it is enforced.** Two layers, and both are load-bearing.
+**How it is enforced.** Three layers, and all three are load-bearing.
 
 *The network.* For each jailed backend the bridge creates an `--internal` Docker
 network — no default route off it, no external DNS — plus a relay container
@@ -537,6 +537,23 @@ capability, so `iptables` inside it fails with `Permission denied` even as uid
 slot whose filter cannot be installed is destroyed rather than served. This
 needs `iptables` in the runtime image; `docker/Dockerfile.cli-runtime` installs
 it, and a net-jailed backend refuses to start without it.
+
+*Surviving a restart.* A filter is state of a network namespace, and Docker
+destroys and recreates that namespace every time a container restarts — same
+container id, same mounts, same filesystem, empty rules. A worker can cause the
+restart: when a worker's command exits non-cleanly the executor runs `docker
+restart` on its slot, because killing the local `docker exec` client does not
+stop the process tree inside the container. Before this was closed, exiting
+non-zero and then asking for one more turn pulled 339,598 bytes of github.com
+out of a real pool slot through the Docker host. So the filter is treated as
+belonging to a container START rather than to a container: a jailed slot carries
+**no Docker restart policy** (a dead one is replaced, which reinstalls the
+filter, instead of being revived in place), and every handout compares the
+container's `StartedAt` against the start the filter was installed for and
+reinstalls it before the slot can be used. The window in between contains
+nothing but the idle `tail -f /dev/null` entrypoint, and the slot stays reserved
+across it, so no request is ever dispatched into an unfiltered namespace. A
+container whose filter cannot be reinstalled is replaced, not served.
 
 There is deliberately no proxy environment variable. `HTTPS_PROXY` is a request
 an agent can decline with `unset`; here the worker never learns a relay exists,
@@ -573,12 +590,26 @@ listening peer container beside it on the bridge:
 | the relay IS reachable | the control: a container with a dead network stack denies everything and proves nothing |
 | a non-allowlisted name does not resolve | DNS is scoped to the allowlist |
 | an allowlisted name resolves and completes a real TLS handshake | the jail does not deny its own model |
+| **every line above, again, after restarting the probe** | a restart empties the namespace, and a worker can cause one by exiting non-zero |
 
 Failing any one of these is fatal. Reachability is judged by the ERROR, not by
 whether something answered: `ECONNREFUSED` means a packet came back, which
 proves the address is reachable and merely silent on that port, so it counts as
-a leak. The previous verifier checked only the route table, the two DNS facts
-and the handshake — and passed the jail the escape above was performed on.
+a leak.
+
+The restart round is run with the same `docker restart --time 0` the executor
+uses to kill a worker's process tree, and the filter is put back by the same
+function the pool's slot provisioning calls — verifying through a second
+implementation would prove a jail no worker runs in. Provisioning also fails if
+the probe's start time does not move, because a restart that did not happen
+makes the second round a re-run of the first.
+
+Each of the two escapes found so far was found because the verifier checked
+something adjacent to it. The first version checked only the route table, the
+two DNS facts and the handshake, and passed the jail the host-gateway escape was
+performed on. The second checked the filter's presence at one instant, and
+passed a jail that a worker could empty by exiting non-zero. Each round's fix is
+therefore added here as a direct probe of the escape itself.
 
 Per request, `execution.netJail` mirrors `execution.jail`:
 

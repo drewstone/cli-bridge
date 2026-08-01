@@ -29,6 +29,7 @@ import {
   NetJailEgressError,
 } from '../src/executors/net-jail-egress.js'
 import { dockerCli, type DockerCli } from '../src/executors/docker-cli.js'
+import { ContainerPool } from '../src/executors/container-pool.js'
 import { parseAllowlist, readHttpHost, readSni, startRelay } from '../src/jail/net-relay.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -428,6 +429,67 @@ describe('net-jail enforcement on real Docker', () => {
     expect(out).toMatch(/http=(200|401|403)/)
   }, 120_000)
 
+  /**
+   * The round-three escape: the filter is state of a network namespace, and
+   * Docker recreates that namespace empty on every restart. A worker gets its
+   * own slot restarted by exiting non-zero — `terminateDockerExecution` restarts
+   * the slot to kill the process tree — and before this was closed, the next
+   * request pulled 339,598 bytes of github.com out of that slot through a
+   * service on the Docker host.
+   */
+  it('re-arms a restarted slot before the next request can use it, so a worker cannot un-jail itself', async () => {
+    if (!available) return
+    const pool = await ContainerPool.create({
+      size: 1,
+      image,
+      namePrefix: `${namePrefix}-slot`,
+      oauthMode: 'share',
+      shareMounts: [],
+      network: provision!.network,
+      afterCreate: (id, i) => provision!.applyFilter(id, `slot ${i}`),
+    })
+    try {
+      const containerId = pool.liveContainerIds()[0]!
+      // Half one: Docker must not be able to revive this container behind the
+      // pool's back, because a revival is a restart nobody re-armed.
+      expect(await inspectField(containerId, '{{.HostConfig.RestartPolicy.Name}}')).toBe('no')
+
+      // Half two: the restart this bridge performs ITSELF, which is the one a
+      // worker triggers. Exactly the argv `terminateDockerExecution` uses.
+      await execFileAsync('docker', ['restart', '--time', '0', containerId])
+
+      // Right now the container is unjailed — that is what a restart does, and
+      // it is why the gate has to exist. ECONNREFUSED counts as reachable: a
+      // packet came back.
+      expect(await dialInContainer(containerId, gateway, 443)).not.toMatch(BLOCKED)
+
+      // The next request. Same slot, same container id, no rebuild.
+      const slot = await pool.acquire()
+      expect(slot.containerId).toBe(containerId)
+      expect(await dialInContainer(containerId, gateway, 443)).toMatch(BLOCKED)
+      expect(await dialInContainer(containerId, provision!.relayIp, 443)).toBe('open')
+      expect(pool.snapshot().slot_rearms).toBe(1)
+      slot.release()
+    } finally {
+      await pool.destroy()
+    }
+  }, 300_000)
+
+  it('fails provisioning when a restart leaves the filter off — the restart guard is calibrated', async () => {
+    if (!available) return
+    // Same code path, the re-arm after the verification restart removed. This
+    // is the configuration that leaked: an airtight jail, one worker-triggerable
+    // restart, and nothing that puts the filter back. If provisioning succeeds
+    // here, the restart check is decoration and the round-three fix is unproven.
+    await expect(provisionNetJail({
+      backend: 'test-restart-unarmed',
+      namePrefix: `${namePrefix}-restart`,
+      image,
+      allow,
+      skipRestartRearmForVerification: true,
+    })).rejects.toThrow(/did not verify after the container restarted.*Docker host is reachable/s)
+  }, 300_000)
+
   it('fails provisioning when the network is not actually isolating — the guard is calibrated', async () => {
     if (!available) return
     // Same code path, one primitive removed. If this passes provisioning, the
@@ -509,6 +571,27 @@ async function dialFromJail(
     + `s.on('connect',()=>d('open'));s.on('error',(e)=>d(e.code||'error'))`
   const out = await inJail(provision, image, `node -e ${JSON.stringify(program)}`)
   return out.trim().split('\n').pop() ?? ''
+}
+
+/**
+ * Dial from a container that already exists, rather than from a fresh one.
+ *
+ * `dialFromJail` builds a new container per call, which cannot express "the same
+ * container, before and after a restart" — the only question the restart tests
+ * ask.
+ */
+async function dialInContainer(containerId: string, host: string, port: number): Promise<string> {
+  const program = `const n=require('node:net');const s=n.connect({host:'${host}',port:${port}});`
+    + `const d=(r)=>{s.destroy();console.log(r)};s.setTimeout(5000,()=>d('timeout'));`
+    + `s.on('connect',()=>d('open'));s.on('error',(e)=>d(e.code||'error'))`
+  const result = await dockerCli(['exec', containerId, 'node', '-e', program], { timeoutMs: 60_000 })
+  return `${result.stdout}${result.stderr}`.trim().split('\n').pop() ?? ''
+}
+
+/** One `docker inspect` field of a container, as a trimmed string. */
+async function inspectField(containerId: string, format: string): Promise<string> {
+  const { stdout } = await execFileAsync('docker', ['inspect', '-f', format, containerId])
+  return stdout.trim()
 }
 
 /** The gateway address Docker put on the jail's bridge — the host, on-link. */

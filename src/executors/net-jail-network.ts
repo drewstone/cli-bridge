@@ -30,12 +30,23 @@
  * origin, and removing every variable in its environment changes nothing about
  * what it can reach.
  *
+ * The filter is state of a NETWORK NAMESPACE, and Docker gives a container a
+ * brand-new, empty one every time it restarts. So the filter is scoped to a
+ * container START, not to a container, and the pool treats it that way (see
+ * `ContainerPoolOptions.afterCreate`): a jailed slot carries no Docker restart
+ * policy, and every handout re-runs the install if the container's `StartedAt`
+ * has moved. Both halves are needed — the policy covers revivals Docker performs
+ * on its own, the handout gate covers the restart this bridge performs itself to
+ * kill a worker's process tree when the worker's command exits non-cleanly,
+ * which is a restart any worker can cause by exiting non-zero.
+ *
  * Provisioning ends by PROVING the jail on a throwaway container drawn from the
  * same image, the same network and the same filter a worker gets: the host
  * gateway unreachable, a peer container unreachable, link-local unreachable,
  * the relay reachable, a name that must not resolve, a name that must, and a
- * real TLS handshake through the relay. A provisioner that returned success
- * without taking that path would be the control this feature exists to replace.
+ * real TLS handshake through the relay — and then all of it again after
+ * restarting that container. A provisioner that returned success without taking
+ * that path would be the control this feature exists to replace.
  */
 
 import { fileURLToPath } from 'node:url'
@@ -110,6 +121,14 @@ export interface ProvisionNetJailOptions {
    * fires.
    */
   skipEgressFilterForVerification?: boolean
+  /**
+   * Calibration seam: restart the verification probe and DO NOT re-arm it, so
+   * the second probe runs in exactly the namespace Docker hands back — which is
+   * the configuration that leaked 339,598 bytes of github.com from a real pool
+   * slot. Provisioning must fail; if it does not, the restart check is
+   * decoration.
+   */
+  skipRestartRearmForVerification?: boolean
 }
 
 export async function provisionNetJail(opts: ProvisionNetJailOptions): Promise<NetJailProvision> {
@@ -224,6 +243,8 @@ export async function provisionNetJail(opts: ProvisionNetJailOptions): Promise<N
       probeName,
       peerName,
       skipEgressFilter: opts.skipEgressFilterForVerification === true,
+      skipRestartRearm: opts.skipRestartRearmForVerification === true,
+      onProgress,
     })
     return {
       backend: opts.backend,
@@ -278,12 +299,22 @@ async function readNetworkIpam(
  *   - an allowlisted host resolves and completes a TLS handshake through the
  *     relay to the true origin
  *
+ * AND THEN ALL OF IT AGAIN, ACROSS A RESTART. The filter is state of a network
+ * namespace, and Docker destroys and recreates that namespace every time a
+ * container restarts — so a jail that is airtight while it exists is not a jail
+ * if a worker can get its container restarted, and it can: the executor restarts
+ * a slot to kill the process tree whenever a worker's command exits non-cleanly.
+ * So the probe is restarted with the same `docker restart --time 0` that path
+ * uses, re-armed by the same `applyNetJailEgressFilter` the pool's `afterCreate`
+ * calls, and every assertion above is re-run against the new incarnation.
+ * Measured before that existed: 339,598 bytes of github.com pulled from a real
+ * pool slot, through the Docker host, after the worker exited non-zero.
+ *
  * Anything less is a configuration that reports a policy it has not
- * demonstrated. The previous version of this function checked only the route
- * table, the two DNS facts and the handshake — and passed on a jail from which
- * a worker pulled 339,594 bytes of github.com through the host gateway. A
- * verifier that cannot prove the gateway is unreachable is the defect, so this
- * one FAILS provisioning rather than warning.
+ * demonstrated. This function has now missed two escapes by checking the wrong
+ * thing — first the route table alone, then the filter's presence at one instant
+ * — so each round's fix is added as a DIRECT probe of the escape rather than of
+ * something adjacent to it, and every one of them FAILS provisioning.
  */
 async function verifyNetJail(opts: {
   backend: string
@@ -296,6 +327,8 @@ async function verifyNetJail(opts: {
   probeName: string
   peerName: string
   skipEgressFilter: boolean
+  skipRestartRearm: boolean
+  onProgress: (message: string) => void
 }): Promise<void> {
   const first = opts.allow[0]!
   const [allowHost, allowPortText] = splitHostPort(first)
@@ -327,7 +360,73 @@ async function verifyNetJail(opts: {
       canary: canary ?? null,
     }
 
-    const probe = await withJailedContainer({
+    /** Run the probe program inside the jailed container and read its answers. */
+    const probeOnce = async (containerId: string, phase: string): Promise<void> => {
+      const probe = await opts.cli(
+        ['exec', '-e', `NETJAIL_PROBE=${JSON.stringify(spec)}`, containerId, 'node', '-e', PROBE_PROGRAM],
+        { timeoutMs: 120_000 },
+      )
+      const observed = Object.fromEntries(
+        probe.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
+          .filter((line) => line.includes('='))
+          .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
+      )
+      const fail = (detail: string): never => {
+        throw new NetJailProvisionError(
+          `backend ${opts.backend}: net-jail on ${opts.network} did not verify ${phase} — ${detail}. ` +
+            `Probe output: ${probe.stdout.trim().replace(/\n/gu, '; ') || firstLine(probe)}`,
+        )
+      }
+
+      // The control comes first. If the probe cannot reach the relay, every
+      // "blocked" line below is worthless — a container with a broken network
+      // stack denies everything and proves nothing.
+      if (observed['relay-reachable'] !== 'yes') {
+        fail(
+          `the probe could not reach the relay at ${spec.relay} (${observed['relay-reachable'] ?? 'no result'}), ` +
+            'so the jail denies its own model endpoint and no other denial in this probe is evidence of anything',
+        )
+      }
+      if (observed['default-routes'] !== '0') {
+        fail(
+          `a jailed container still has ${observed['default-routes'] ?? 'an unknown number of'} default route(s), ` +
+            'so it can route off the network',
+        )
+      }
+      if (observed['gateway-reachable'] !== 'no') {
+        fail(
+          `the Docker host is reachable from inside the jail at ${opts.gateway} ` +
+            `(${observed['gateway-detail'] ?? observed['gateway-reachable'] ?? 'unknown'}). An address that ` +
+            'answers on the worker\'s own subnet is a next hop that never passes the relay and is on no ' +
+            'allowlist — every service on the host, and the internet behind them, is one connect() away',
+        )
+      }
+      if (observed['peer-reachable'] !== 'no') {
+        fail(
+          `another container on ${opts.network} is reachable from inside the jail at ${spec.peer} ` +
+            `(${observed['peer-detail'] ?? 'unknown'}), so the relay is not the only next hop`,
+        )
+      }
+      if (observed['linklocal-reachable'] !== 'no') {
+        fail(
+          `link-local is reachable from inside the jail (${observed['linklocal-detail'] ?? 'unknown'}); ` +
+            'cloud instance metadata, and the credentials it hands out, live there',
+        )
+      }
+      if (observed['net-admin'] !== 'denied') {
+        fail(
+          `a jailed container can run iptables itself (${observed['net-admin'] ?? 'unknown'}), so the worker ` +
+            'can flush the very rules that confine it',
+        )
+      }
+      if (observed['canary-resolves'] === 'yes') fail(`${canary} still resolves inside the jail`)
+      if (observed['allow-resolves'] !== 'yes') fail(`the allowlisted host ${allowHost} does not resolve inside the jail`)
+      if (observed['allow-tls'] !== undefined && !['yes', 'skipped-non-443'].includes(observed['allow-tls'])) {
+        fail(`the allowlisted endpoint ${first} did not complete a TLS handshake through the relay (${observed['allow-tls']})`)
+      }
+    }
+
+    await withJailedContainer({
       network: opts.network,
       image: opts.image,
       relayIp: opts.relayAddress.ip,
@@ -336,72 +435,75 @@ async function verifyNetJail(opts: {
       label: 'verification probe',
       name: opts.probeName,
       skipFilter: opts.skipEgressFilter,
-    }, (containerId) => opts.cli(
-      ['exec', '-e', `NETJAIL_PROBE=${JSON.stringify(spec)}`, containerId, 'node', '-e', PROBE_PROGRAM],
-      { timeoutMs: 120_000 },
-    ))
-
-    const observed = Object.fromEntries(
-      probe.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
-        .filter((line) => line.includes('='))
-        .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
-    )
-    const fail = (detail: string): never => {
-      throw new NetJailProvisionError(
-        `backend ${opts.backend}: net-jail on ${opts.network} did not verify — ${detail}. ` +
-          `Probe output: ${probe.stdout.trim().replace(/\n/gu, '; ') || firstLine(probe)}`,
+    }, async (containerId) => {
+      await probeOnce(containerId, 'as provisioned')
+      await restartAndRearm(containerId, opts)
+      await probeOnce(containerId, 'after the container restarted')
+      opts.onProgress(
+        `net-jail ${opts.network} verified twice — once as provisioned and once after a ` +
+          '`docker restart`, the restart a worker triggers by exiting non-cleanly',
       )
-    }
-
-    // The control comes first. If the probe cannot reach the relay, every
-    // "blocked" line below is worthless — a container with a broken network
-    // stack denies everything and proves nothing.
-    if (observed['relay-reachable'] !== 'yes') {
-      fail(
-        `the probe could not reach the relay at ${spec.relay} (${observed['relay-reachable'] ?? 'no result'}), ` +
-          'so the jail denies its own model endpoint and no other denial in this probe is evidence of anything',
-      )
-    }
-    if (observed['default-routes'] !== '0') {
-      fail(
-        `a jailed container still has ${observed['default-routes'] ?? 'an unknown number of'} default route(s), ` +
-          'so it can route off the network',
-      )
-    }
-    if (observed['gateway-reachable'] !== 'no') {
-      fail(
-        `the Docker host is reachable from inside the jail at ${opts.gateway} ` +
-          `(${observed['gateway-detail'] ?? observed['gateway-reachable'] ?? 'unknown'}). An address that ` +
-          'answers on the worker\'s own subnet is a next hop that never passes the relay and is on no ' +
-          'allowlist — every service on the host, and the internet behind them, is one connect() away',
-      )
-    }
-    if (observed['peer-reachable'] !== 'no') {
-      fail(
-        `another container on ${opts.network} is reachable from inside the jail at ${spec.peer} ` +
-          `(${observed['peer-detail'] ?? 'unknown'}), so the relay is not the only next hop`,
-      )
-    }
-    if (observed['linklocal-reachable'] !== 'no') {
-      fail(
-        `link-local is reachable from inside the jail (${observed['linklocal-detail'] ?? 'unknown'}); ` +
-          'cloud instance metadata, and the credentials it hands out, live there',
-      )
-    }
-    if (observed['net-admin'] !== 'denied') {
-      fail(
-        `a jailed container can run iptables itself (${observed['net-admin'] ?? 'unknown'}), so the worker ` +
-          'can flush the very rules that confine it',
-      )
-    }
-    if (observed['canary-resolves'] === 'yes') fail(`${canary} still resolves inside the jail`)
-    if (observed['allow-resolves'] !== 'yes') fail(`the allowlisted host ${allowHost} does not resolve inside the jail`)
-    if (observed['allow-tls'] !== undefined && !['yes', 'skipped-non-443'].includes(observed['allow-tls'])) {
-      fail(`the allowlisted endpoint ${first} did not complete a TLS handshake through the relay (${observed['allow-tls']})`)
-    }
+    })
   } finally {
     await opts.cli(['rm', '-f', opts.peerName], { timeoutMs: 30_000 })
   }
+}
+
+/**
+ * Restart the probe the way a worker gets its own slot restarted, then put the
+ * filter back the way the pool does.
+ *
+ * `terminateDockerExecution` runs `docker restart --time 0` against a slot
+ * whenever the command inside it exits non-cleanly, because killing the local
+ * `docker exec` client does not stop the process tree in the container. A worker
+ * reaches that path by exiting non-zero, and Docker gives the container back
+ * with brand-new, empty namespaces. So this is the escape, reproduced exactly.
+ *
+ * The re-arm calls the SAME function the pool's `afterCreate` calls. Verifying
+ * through a second implementation would prove a jail no worker ever runs in,
+ * which is the failure this whole file is written against.
+ *
+ * The restart must be observable — `StartedAt` has to move. A "restart" that
+ * changed nothing would make the second probe a re-run of the first and the
+ * whole check theatre, so provisioning fails rather than reporting a property it
+ * did not test.
+ */
+async function restartAndRearm(containerId: string, opts: {
+  backend: string
+  image: string
+  cli: DockerCli
+  relayAddress: ContainerNetworkAddress
+  skipRestartRearm: boolean
+}): Promise<void> {
+  const startedAt = async (): Promise<string> => {
+    const result = await opts.cli(['inspect', '-f', '{{.State.StartedAt}}', containerId], { timeoutMs: 30_000 })
+    return result.stdout.trim()
+  }
+  const before = await startedAt()
+  const restarted = await opts.cli(['restart', '--time', '0', containerId], { timeoutMs: 60_000 })
+  if (restarted.code !== 0) {
+    throw new NetJailProvisionError(
+      `backend ${opts.backend}: could not restart the verification probe, so the jail's survival of a ` +
+        `container restart is untested — ${firstLine(restarted)}`,
+    )
+  }
+  const after = await startedAt()
+  if (!after || after === before) {
+    throw new NetJailProvisionError(
+      `backend ${opts.backend}: the verification probe reported the same start time (${before || 'unknown'}) ` +
+        'after `docker restart`, so no restart was actually observed and the jail\'s survival of one cannot be ' +
+        'claimed',
+    )
+  }
+  if (opts.skipRestartRearm) return
+  await applyNetJailEgressFilter({
+    containerId,
+    relayIp: opts.relayAddress.ip,
+    ...(opts.relayAddress.ip6 ? { relayIp6: opts.relayAddress.ip6 } : {}),
+    image: opts.image,
+    cli: opts.cli,
+    label: 'verification probe after restart',
+  })
 }
 
 /** Port the verification peer listens on, purely so the probe has a live target. */
