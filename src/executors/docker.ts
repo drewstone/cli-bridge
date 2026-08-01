@@ -426,6 +426,11 @@ export function buildDockerExecArgs(
 
 const PROXIED_ENV_KEYS = new Set([
   'ANTHROPIC_API_KEY',
+  // pi-mcp-adapter reads MCP_DIRECT_TOOLS to register MCP verbs as native pi tools. Without it the
+  // container falls back to the config-file route, which does NOT await adapter init (adapter
+  // 2.17.0 index.ts:360-370), so a one-shot worker can start its only turn before the tools are
+  // registered. Host already proxies this key; docker omitting it made the two diverge silently.
+  'MCP_DIRECT_TOOLS',
   'ANTHROPIC_BASE_URL',
   'GEMINI_SYSTEM_MD',
   'OPENAI_API_KEY',

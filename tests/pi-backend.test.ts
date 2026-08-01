@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
+import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
 import { BackendError } from '../src/backends/types.js'
@@ -95,8 +96,8 @@ describe('PiBackend', () => {
         coordination: {
           transport: 'stdio',
           command: 'node',
-          args: ['coordinator.mjs'],
-          env: { RUN_ID: 'exact-profile' },
+          args: [pub('coordinator.mjs')],
+          env: { RUN_ID: pub('exact-profile') },
         },
       },
     }
@@ -136,10 +137,13 @@ describe('PiBackend', () => {
       expect(directTools).toBe('coordination')
       expect(mcp).toEqual({
         mcpServers: {
+          // Materialized servers carry `directTools: true` so pi registers their verbs as native
+          // tools rather than hiding them behind the proxy's connect/describe discovery.
           coordination: {
             command: 'node',
             args: ['coordinator.mjs'],
             env: { RUN_ID: 'exact-profile' },
+            directTools: true,
           },
         },
       })
@@ -952,7 +956,12 @@ describe('PiBackend', () => {
       expect(directToolsAtSpawn).toBe('legal-tools')
       expect(configAtSpawn).toEqual({
         mcpServers: {
-          'legal-tools': { command: 'tsx', args: ['proposal-server.ts'], env: { CASE_ID: 'c-1' } },
+          'legal-tools': {
+            command: 'tsx',
+            args: ['proposal-server.ts'],
+            env: { CASE_ID: 'c-1' },
+            directTools: true,
+          },
         },
       })
       expect(deltas.slice(-2)).toEqual([

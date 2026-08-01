@@ -12,11 +12,11 @@ importers:
         specifier: ^1.13.0
         version: 1.19.14(hono@4.12.14)
       '@tangle-network/agent-interface':
-        specifier: 0.36.0
-        version: 0.36.0
+        specifier: 0.40.0
+        version: 0.40.0
       '@tangle-network/agent-profile-materialize':
-        specifier: 0.9.3
-        version: 0.9.3(@tangle-network/agent-interface@0.36.0)
+        specifier: 0.9.4
+        version: 0.9.4(@tangle-network/agent-interface@0.40.0)
       better-sqlite3:
         specifier: ^12.0.0
         version: 12.9.0
@@ -490,13 +490,13 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@tangle-network/agent-interface@0.36.0':
-    resolution: {integrity: sha512-l48SiAY5Atx6ZTL86/XP2wSUPfJJ1sga82/F6V0KqwVkE5MHWiFql6wsLoqk0lc7s4EJe6+cKky+2zzxFuxDpg==}
+  '@tangle-network/agent-interface@0.40.0':
+    resolution: {integrity: sha512-4A6+bb5Ub22WJsVQRNuNIr6BSsfQG4ZZT436GZ2qUcZocjJ7186MEbN7kOmYq9TQ9qeMSUh/HbyYw2nsok5b+w==}
 
-  '@tangle-network/agent-profile-materialize@0.9.3':
-    resolution: {integrity: sha512-/WuiAOeP86HpnCXzL7E3xX4hWpuw5dK7MlZyvKLRf7xCGp3w7iTrUXH5mxcaYWpxGHbSC3V8tNpAUGGsMgGSEg==}
+  '@tangle-network/agent-profile-materialize@0.9.4':
+    resolution: {integrity: sha512-LCKfohFcjzeDz+WrPx6lXyZvn0CYyw0Y3/sBCaJ6fqj2Sgg7KwG178eg/LhlqNPz6xJzBh0g4iHxPge1kNn4nw==}
     peerDependencies:
-      '@tangle-network/agent-interface': '>=0.36.0 <0.38.0'
+      '@tangle-network/agent-interface': '>=0.38.0 <0.41.0'
 
   '@types/better-sqlite3@7.6.13':
     resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
@@ -746,6 +746,15 @@ packages:
   source-map-js@1.2.1:
     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
     engines: {node: '>=0.10.0'}
+
+  spdx-exceptions@2.5.0:
+    resolution: {integrity: sha512-PiU42r+xO4UbUS1buo3LPJkjlO7430Xn5SVAhdpzzsPHsjbYVflnnFdATgabnLude+Cqu25p6N+g2lw/PFsa4w==}
+
+  spdx-expression-parse@5.0.0:
+    resolution: {integrity: sha512-vngmw3Rgn+o2arXNbnZaj5UtOEBuWBfvaI+Wc8GFfykIhA5/vdK9/Sp/XkLv63dykz2rxKDvKEHupF5P0FORcQ==}
+
+  spdx-license-ids@3.0.23:
+    resolution: {integrity: sha512-CWLcCCH7VLu13TgOH+r8p1O/Znwhqv/dbb6lqWy67G+pT1kHmeD/+V36AVb/vq8QMIQwVShJ6Ssl5FPh0fuSdw==}
 
   stackback@0.0.2:
     resolution: {integrity: sha512-1XMJE5fQo1jGH6Y/7ebnwPOBEkIEnT4QF32d5R1+VXdXveM0IBMJt8zfaxX1P3QhVwrYe+576+jkANtSS2mBbw==}
@@ -1111,14 +1120,15 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.60.2':
     optional: true
 
-  '@tangle-network/agent-interface@0.36.0':
+  '@tangle-network/agent-interface@0.40.0':
     dependencies:
       '@noble/hashes': 1.8.0
+      spdx-expression-parse: 5.0.0
       zod: 4.4.3
 
-  '@tangle-network/agent-profile-materialize@0.9.3(@tangle-network/agent-interface@0.36.0)':
+  '@tangle-network/agent-profile-materialize@0.9.4(@tangle-network/agent-interface@0.40.0)':
     dependencies:
-      '@tangle-network/agent-interface': 0.36.0
+      '@tangle-network/agent-interface': 0.40.0
 
   '@types/better-sqlite3@7.6.13':
     dependencies:
@@ -1431,6 +1441,15 @@ snapshots:
       simple-concat: 1.0.1
 
   source-map-js@1.2.1: {}
+
+  spdx-exceptions@2.5.0: {}
+
+  spdx-expression-parse@5.0.0:
+    dependencies:
+      spdx-exceptions: 2.5.0
+      spdx-license-ids: 3.0.23
+
+  spdx-license-ids@3.0.23: {}
 
   stackback@0.0.2: {}
 
