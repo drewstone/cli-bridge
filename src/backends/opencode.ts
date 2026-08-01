@@ -122,7 +122,18 @@ export class OpencodeBackend implements Backend {
         cwd,
         env: {
           ...process.env,
+          // The `opencode` on PATH is a wrapper that hard-caps every non-interactive
+          // `run` at `OPENCODE_RUN_TIMEOUT_SECONDS`, default 1800. That cap is invisible
+          // from here and SMALLER than this backend's own timeout, so it silently won:
+          // a long agent run died at exactly 30 minutes with exit 124 while
+          // OPENCODE_TIMEOUT_MS said 24 hours. Two timeouts governed one process and the
+          // one nobody configured decided the outcome. Propagate ours so a single
+          // setting governs, and leave an explicit operator override ahead of it.
+          OPENCODE_RUN_TIMEOUT_SECONDS: String(Math.ceil(this.opts.timeoutMs / 1000)),
           ...provisioned.env,
+          ...(process.env.OPENCODE_RUN_TIMEOUT_SECONDS
+            ? { OPENCODE_RUN_TIMEOUT_SECONDS: process.env.OPENCODE_RUN_TIMEOUT_SECONDS }
+            : {}),
           ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
         },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
