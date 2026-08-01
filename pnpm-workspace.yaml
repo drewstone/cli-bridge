@@ -1,2 +1,6 @@
+# pnpm applies a minimum release age before it will install a package. This exempts one exact
+# version so a same-day publish can be consumed. Scoped to a single version on purpose: it must
+# NOT become a standing bypass of that supply-chain control.
+# Remove once 0.9.4 is older than the minimum release age (safe any time after 2026-08-08).
 minimumReleaseAgeExclude:
   - '@tangle-network/agent-profile-materialize@0.9.4'

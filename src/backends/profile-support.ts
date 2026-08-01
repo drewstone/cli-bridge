@@ -349,8 +349,15 @@ export function resolveMcpServers(
   if (profile && typeof profile === 'object') {
     const profileMcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
     if (profileMcp && typeof profileMcp === 'object') {
+      const overriddenByRequest = new Set(Object.keys(req.mcp?.mcpServers ?? {}))
       for (const [name, raw] of Object.entries(profileMcp)) {
         if (!name || !raw || typeof raw !== 'object') continue
+        // An entry the request replaces below, and an entry explicitly disabled, are both dropped
+        // before anything reads them. Converting them anyway would let a value nobody uses turn a
+        // working request into a hard 400 — the validation must follow the value into use, not
+        // stand in front of entries that never get there.
+        if (overriddenByRequest.has(name)) continue
+        if ((raw as { enabled?: unknown }).enabled === false) continue
         merged[name] = profileMcpToSpec(raw, name)
       }
     }
@@ -360,7 +367,7 @@ export function resolveMcpServers(
   if (requestMcp && typeof requestMcp === 'object') {
     for (const [name, raw] of Object.entries(requestMcp)) {
       if (!name || !raw || typeof raw !== 'object') continue
-      merged[name] = normalizeMcpServerSpec(raw)
+      merged[name] = normalizeMcpServerSpec(raw, name)
     }
   }
 
@@ -449,23 +456,32 @@ function profileMcpToSpec(raw: AgentProfileMcpServer, name: string): McpServerSp
   return out
 }
 
-function normalizeMcpServerSpec(raw: McpServerSpec | Record<string, unknown>): McpServerSpec {
+function normalizeMcpServerSpec(
+  raw: McpServerSpec | Record<string, unknown>,
+  name: string,
+): McpServerSpec {
   // Defensive copy — drop any unknown fields, coerce types loosely.
   const r = raw as Record<string, unknown>
   const out: McpServerSpec = {}
   if (r.type === 'stdio' || r.type === 'http' || r.type === 'sse') out.type = r.type
   if (typeof r.command === 'string') out.command = r.command
-  if (Array.isArray(r.args)) out.args = (r.args as unknown[]).filter((a): a is string => typeof a === 'string')
+  // A request-body server WINS over a profile server of the same name, so this path decides the
+  // bytes that reach argv and the on-disk MCP config. It used to drop every non-string silently,
+  // which turned a secret-ref in `args` into a SHORTER command line and a server that spawned
+  // wrong for a reason nothing reported. Same refusal as the profile path, same reason.
+  const where = `mcp.mcpServers[${JSON.stringify(name)}]`
+  if (Array.isArray(r.args)) {
+    out.args = (r.args as unknown[]).map((a, i) => publicMcpConfigString(a, `${where}.args[${i}]`))
+  }
   if (r.env && typeof r.env === 'object') {
-    out.env = Object.fromEntries(
-      Object.entries(r.env as Record<string, unknown>).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
+    out.env = publicMcpConfigRecord(r.env as Record<string, AgentProfileConfigValue>, `${where}.env`)
   }
   if (typeof r.url === 'string') out.url = r.url
   if (r.headers && typeof r.headers === 'object') {
-    out.headers = Object.fromEntries(
-      Object.entries(r.headers as Record<string, unknown>).filter(([, v]) => typeof v === 'string'),
-    ) as Record<string, string>
+    out.headers = publicMcpConfigRecord(
+      r.headers as Record<string, AgentProfileConfigValue>,
+      `${where}.headers`,
+    )
   }
   if (typeof r.enabled === 'boolean') out.enabled = r.enabled
   if (typeof r.timeout === 'number' && Number.isFinite(r.timeout) && r.timeout > 0) {

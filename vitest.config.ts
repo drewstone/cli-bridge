@@ -10,7 +10,6 @@ export default defineConfig({
       // a suite whose tests spawn real CLI backends and containers, which is enough to exhaust it.
       '**/.claude/worktrees/**',
       '**/.worktrees/**',
-      '**/worktrees/**',
     ],
   },
 })

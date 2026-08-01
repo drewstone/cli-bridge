@@ -17,3 +17,6 @@ data/
 .env.*.local
 .claude/
 entities/
+
+# Agent worktrees are separate checkouts of this repo; never commit them as embedded repos.
+.worktrees/

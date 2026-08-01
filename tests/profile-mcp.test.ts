@@ -16,7 +16,10 @@ import { describe, expect, it } from 'vitest'
 import { execSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
+import {
+  defineAgentProfilePublicConfig as pub,
+  defineAgentProfileSecretRef as secretRef,
+} from '@tangle-network/agent-interface'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
   buildMcpAllowList,
@@ -162,6 +165,71 @@ describe('resolveMcpServers', () => {
       ...overrides,
     }
   }
+
+  // These are the canary for the whole reason secret-refs are refused rather than rendered: an MCP
+  // server's `args` become argv, which every process on the host can read through
+  // /proc/<pid>/cmdline, outside every redaction channel. cli-bridge holds no secret provider, so
+  // there is no correct way to resolve one here — only a loud refusal. Before this, a non-string
+  // was silently dropped, which truncated the command line and spawned a broken server quietly.
+  describe('secret-ref refusal', () => {
+    it('refuses a secret-ref in profile mcp args, naming the key and never a value', () => {
+      const r = req({
+        agent_profile: {
+          mcp: { coord: { command: 'tsx', args: [secretRef('COORD_TOKEN')] } },
+        } as AgentProfile,
+      })
+      expect(() => resolveMcpServers(r, null)).toThrow(/secret-ref/)
+      expect(() => resolveMcpServers(r, null)).toThrow(/COORD_TOKEN/)
+    })
+
+    it('refuses a secret-ref in profile mcp env', () => {
+      const r = req({
+        agent_profile: {
+          mcp: { coord: { command: 'tsx', env: { TOKEN: secretRef('ENV_TOKEN') } } },
+        } as AgentProfile,
+      })
+      expect(() => resolveMcpServers(r, null)).toThrow(/ENV_TOKEN/)
+    })
+
+    it('refuses a secret-ref in profile mcp headers', () => {
+      const r = req({
+        agent_profile: {
+          mcp: { remote: { url: 'https://x/sse', headers: { Auth: secretRef('HDR_TOKEN') } } },
+        } as AgentProfile,
+      })
+      expect(() => resolveMcpServers(r, null)).toThrow(/HDR_TOKEN/)
+    })
+
+    // The request body WINS over the profile on a name collision, so it decides the bytes that
+    // reach argv. It must refuse for the same reason — this path used to drop silently.
+    it('refuses a secret-ref in request-body mcpServers args', () => {
+      const r = req({
+        mcp: {
+          mcpServers: {
+            coord: { command: 'tsx', args: [secretRef('BODY_TOKEN') as unknown as string] },
+          },
+        },
+      } as Partial<ChatRequest>)
+      expect(() => resolveMcpServers(r, null)).toThrow(/BODY_TOKEN/)
+    })
+
+    it('refuses before materializeMcpConfig writes anything', () => {
+      expect(() =>
+        materializeMcpConfig({
+          mcp: { coord: { command: 'tsx', args: [secretRef('NO_WRITE')] } },
+        } as AgentProfile),
+      ).toThrow(/NO_WRITE/)
+    })
+
+    it('still accepts plain pre-0.40 strings, so mid-migration profiles keep working', () => {
+      const r = req({
+        agent_profile: {
+          mcp: { coord: { command: 'tsx', args: ['plain.ts'] } },
+        } as unknown as AgentProfile,
+      })
+      expect(resolveMcpServers(r, null)?.coord?.args).toEqual(['plain.ts'])
+    })
+  })
 
   it('returns null when neither source supplies entries', () => {
     expect(resolveMcpServers(req({}), null)).toBeNull()
