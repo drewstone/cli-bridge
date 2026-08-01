@@ -651,6 +651,86 @@ Either way, an orchestrator running in its own container hits the bridge
 at `host.docker.internal:3344` (Docker Desktop) or the bridge gateway
 IP (Linux). No DinD anywhere.
 
+## Traces
+
+Every chat request emits one OTLP span, in the shape defined by
+`@tangle-network/agent-trace-contract`.
+Because every harness routes through this one service, instrumenting here traces
+claude, kimi, codex, opencode and pi identically — there is no per-harness adapter.
+
+The contract is an ordinary registry dependency (`@tangle-network/agent-trace-contract`,
+`^1.0.1` on npmjs) — the same package the trace analyzer and VerticalBench depend on, so
+all three agree on the span shape without sharing code.
+
+```
+chat <backend>   (LLM)    gen_ai.request.model, gen_ai.system,
+  │                       gen_ai.usage.input_tokens / output_tokens / cost_usd
+  └─ <tool name> (TOOL)   gen_ai.tool.name, gen_ai.tool.call.id
+```
+
+Spans land as JSON lines in `<BRIDGE_DATA_DIR>/traces/spans.jsonl`.
+`BRIDGE_TRACE=off` disables emission. A sink failure is logged and swallowed —
+tracing never fails a request.
+
+**Rotation.** The active file rotates to `spans.jsonl.1`, `.2`, … once the next
+write would exceed `BRIDGE_TRACE_MAX_BYTES`, and the oldest generation is deleted,
+so retained trace bytes are bounded by `BRIDGE_TRACE_MAX_BYTES × BRIDGE_TRACE_MAX_FILES`.
+Because tracing is on by default, that ceiling defaults to a deliberately small
+**32 MiB** (16 MiB × 2) — an operator who never configured it does not pay for a
+retention target they never asked for. A span is a few hundred bytes, so 32 MiB
+still holds tens of thousands of requests; raise both values for longer history.
+
+### Correlation
+
+Send your own trace context and the bridge's span nests under yours, so a caller's
+round and the harness invocation it caused are one tree:
+
+```bash
+curl http://127.0.0.1:3344/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+  -d '{"model":"opencode/deepseek/deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+```
+
+W3C `traceparent` is preferred; `X-Trace-Id` + `X-Parent-Span-Id` are the fallback
+for callers without a tracing SDK (a dashed UUID is accepted as a trace id). Without
+either, the request becomes its own root trace. `cli_bridge.trace.correlation` on the
+span records which path was taken — `invalid` means a header was sent and could not
+be used.
+
+Both forms require the OTLP encoding: 32 lowercase hex characters for a trace id, 16
+for a span id. A caller whose own ids are human — VerticalBench names a round
+`oc-glm52@generic-…-r0` — derives the wire ids with the contract's `deriveHexId` and
+keeps the readable name as an attribute on its own span. That derivation is pure and
+dependency-free, so the caller and the bridge mint the same ids without talking to
+each other. Sending the human id raw is the failure this prevents: the request still
+succeeds, but the span roots itself and `cli_bridge.trace.correlation` reads `invalid`.
+
+A correlated span names a parent that lives in the CALLER's export, so validating
+this file alone reports `orphan-parent`. That is the fragment saying where it
+attaches; concatenate both exports and the tree validates clean.
+
+### Bridge-specific attributes
+
+Everything a semantic convention already names uses the standard key. These are
+the bridge's own execution context:
+
+| Attribute | Meaning |
+|---|---|
+| `cli_bridge.run.id` | Durable run id — joins to `GET /v1/runs/:id` |
+| `cli_bridge.session.id` | Caller-owned session id, when resuming |
+| `cli_bridge.backend.session_id` | The harness's own session id — joins to that CLI's transcript |
+| `cli_bridge.mode` / `cli_bridge.execution` | `byob`/`hosted-safe` and `host`/`sandbox` |
+| `cli_bridge.trace.correlation` | `traceparent` / `headers` / `none` / `invalid` |
+| `cli_bridge.finish_reason` | Terminal reason — separates `length` from `stop` |
+| `cli_bridge.usage.estimated` | Present and `true` when tokens were derived from text, not measured |
+| `cli_bridge.tool_calls.observed` / `.dropped` | Tool calls seen, and any beyond the per-request span cap |
+
+Tool ARGUMENTS are never written: they carry prompts, paths and file contents, and
+a trace file must not become a second copy of everything the agent read. Cost is
+written only when every usage record reported one, so a floor is never read as a
+total.
+
 ## Deploy
 
 See `deploy/README.md` for Hetzner box (Docker or systemd). Remote deploy requires `BRIDGE_BEARER` — cli-bridge refuses to bind non-loopback without one.

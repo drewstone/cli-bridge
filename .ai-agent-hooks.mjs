@@ -18,7 +18,18 @@ export default {
       checks: [
         { id: "merge-conflict-markers", builtin: "merge-conflict-markers", required: true },
         { id: "mergeable-with-base", builtin: "mergeable-with-base", required: true },
-        { id: "suspicious-secrets", builtin: "suspicious-secrets", required: true }
+        { id: "suspicious-secrets", builtin: "suspicious-secrets", required: true },
+        // The trace-contract conformance tests are the gate that the bridge's OTLP
+        // output stays readable by @tangle-network/agent-trace-contract consumers.
+        // They are cheap (~3 s), deterministic, and pass with no coding CLIs
+        // installed, so they meet this file's bar for a push-path check — and they
+        // gate pushes that bypass GitHub CI.
+        {
+          id: "trace-contract-tests",
+          required: true,
+          timeoutSec: 300,
+          run: "pnpm vitest run tests/trace-emitter.test.ts"
+        }
       ]
     },
     // No git event fires this name; it runs only via `npm run review`. It diffs the branch against

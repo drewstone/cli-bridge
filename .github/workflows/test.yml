@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # No packageManager field in package.json, so the pnpm major must be
+      # pinned here. pnpm-workspace.yaml carries both allowBuilds (pnpm 11)
+      # and onlyBuiltDependencies (pnpm 9/10) so either major installs the
+      # native better-sqlite3 binding.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      # engines.node declares >=22; test on the declared floor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # Real-docker and real-cgroup suites are opt-in via
+      # CLI_BRIDGE_REAL_DOCKER_TESTS / CLI_BRIDGE_REAL_CGROUP_TESTS and
+      # self-skip here; everything else runs.
+      - name: Test
+        run: pnpm test

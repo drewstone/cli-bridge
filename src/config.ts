@@ -124,6 +124,29 @@ export interface Config {
    * service) that a specific workload legitimately needs.
    */
   netJailAllow: string[]
+  /** OTLP span emission for chat requests. See {@link TraceConfig}. */
+  trace: TraceConfig
+}
+
+/**
+ * Trace emission settings.
+ *
+ * On by default: the bridge is the only place every harness passes through, so a
+ * bridge that has to be switched on to be observable is a bridge nobody has
+ * traces for when they need them. The cost is bounded by `maxBytes * maxFiles`
+ * on disk — 32 MiB unless configured — and one append per request.
+ */
+export interface TraceConfig {
+  /** `BRIDGE_TRACE=off` disables emission entirely (the sink becomes a no-op). */
+  enabled: boolean
+  /** Active JSONL file. Rotated generations get `.1`, `.2`, … */
+  file: string
+  /** Rotate once the active file would exceed this. */
+  maxBytes: number
+  /** Generations retained, including the active file. */
+  maxFiles: number
+  /** Cap on TOOL spans per request; the observed count is still reported in full. */
+  maxToolSpans: number
 }
 
 export interface BackendExecutorConfig {
@@ -276,7 +299,44 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // Parsed (not merely split) so an unusable token is rejected at startup
     // rather than at provisioning time, when it would read as a Docker failure.
     netJailAllow: parseAllowList(env.BRIDGE_NET_JAIL_ALLOW, 'BRIDGE_NET_JAIL_ALLOW').map(formatAllowEntry),
+    trace: parseTraceConfig(env, dataDir),
   }
+}
+
+/**
+ * Retained trace bytes default to `DEFAULT_TRACE_MAX_BYTES * DEFAULT_TRACE_MAX_FILES`
+ * = 32 MiB. Tracing stays on by default, so this ceiling is what an operator who
+ * never configured it silently pays; it is sized to be unnoticeable on any disk
+ * that can host a coding CLI rather than to a retention target. A span is a few
+ * hundred bytes, so 32 MiB still holds tens of thousands of requests — long past
+ * the point where an operator debugging a live bridge would have read them.
+ * Raise `BRIDGE_TRACE_MAX_BYTES` / `BRIDGE_TRACE_MAX_FILES` for longer history.
+ */
+const DEFAULT_TRACE_MAX_BYTES = 16 * 1024 * 1024
+const DEFAULT_TRACE_MAX_FILES = 2
+const DEFAULT_TRACE_MAX_TOOL_SPANS = 512
+
+function parseTraceConfig(env: NodeJS.ProcessEnv, dataDir: string): TraceConfig {
+  return {
+    enabled: parseOnOff('BRIDGE_TRACE', env.BRIDGE_TRACE, true),
+    file: resolve(env.BRIDGE_TRACE_FILE?.trim() || join(dataDir, 'traces', 'spans.jsonl')),
+    maxBytes: parsePositiveInt(env.BRIDGE_TRACE_MAX_BYTES, DEFAULT_TRACE_MAX_BYTES),
+    maxFiles: parsePositiveInt(env.BRIDGE_TRACE_MAX_FILES, DEFAULT_TRACE_MAX_FILES),
+    maxToolSpans: parseNonNegativeInt(env.BRIDGE_TRACE_MAX_TOOL_SPANS, DEFAULT_TRACE_MAX_TOOL_SPANS),
+  }
+}
+
+/**
+ * Boolean switch. Unrecognised values throw rather than defaulting, because a
+ * typo silently leaving tracing on is exactly the surprise config validation
+ * exists to prevent.
+ */
+function parseOnOff(name: string, value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === '') return fallback
+  const normalized = value.trim().toLowerCase()
+  if (['on', '1', 'true', 'yes'].includes(normalized)) return true
+  if (['off', '0', 'false', 'no'].includes(normalized)) return false
+  throw new Error(`invalid ${name}: ${value} — expected on|off`)
 }
 
 function parseJailMode(value: string | undefined): 'off' | 'write-jail' | 'fs-jail' {
