@@ -31,4 +31,19 @@ describe('sanitizeHostEnv PWD/cwd agreement', () => {
     expect(out?.MCP_DIRECT_TOOLS).toBe('coordination,records')
     expect(out?.UNRELATED_SECRET).toBeUndefined()
   })
+
+  it('forwards Pi native configuration controls', () => {
+    const out = sanitizeHostEnv({
+      HOME: '/home/x',
+      PATH: '/bin',
+      PI_CODING_AGENT_DIR: '/work/cell-1/.pi-agent',
+      PI_CODING_AGENT_SESSION_DIR: '/work/cell-1/.pi-sessions',
+      PI_PACKAGE_DIR: '/opt/pi',
+      UNRELATED_SECRET: 'must-not-cross',
+    })
+    expect(out?.PI_CODING_AGENT_DIR).toBe('/work/cell-1/.pi-agent')
+    expect(out?.PI_CODING_AGENT_SESSION_DIR).toBe('/work/cell-1/.pi-sessions')
+    expect(out?.PI_PACKAGE_DIR).toBe('/opt/pi')
+    expect(out?.UNRELATED_SECRET).toBeUndefined()
+  })
 })

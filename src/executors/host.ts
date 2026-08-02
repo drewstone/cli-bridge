@@ -239,6 +239,7 @@ const PROXIED_ENV_PREFIXES = [
   'MOONSHOT_',
   'OPENAI_',
   'OPENCODE_',
+  'PI_',
   'TANGLE_',
   'ZAI_',
   'ZHIPU_',
