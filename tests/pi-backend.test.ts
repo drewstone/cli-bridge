@@ -1242,6 +1242,50 @@ describe('PiBackend', () => {
     }
   })
 
+  it('an EMPTY extension list means load nothing — the complete-isolation request', async () => {
+    // This is the shape a paired experiment depends on, and the reason it has to be pinned:
+    // an installed extension that persists memory across runs (pi-memory) carries arm A's state
+    // into arm B, and nothing anywhere reports that it happened. `extensions.pi.load: []` is the
+    // caller's declarative way to say "no ambient extensions", and it must keep meaning that.
+    //
+    // The regression it guards is silent by construction. Treating an empty list as "absent"
+    // is the natural-looking simplification — `load?.length ? [...] : []` reads fine — and it
+    // restores ambient extension discovery without failing a single request. Pinned alongside
+    // the three isolation flags that materializing ANY profile already applies, because a caller
+    // reasoning about run isolation needs all four to hold together.
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-extension-none-'))
+    let args: string[] = []
+    try {
+      const backend = new PiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        spawner: piSpawner([
+          { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+          { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+        ], (_bin, rawArgs) => {
+          args = [...rawArgs]
+        }),
+      })
+      await collect(backend.chat({
+        model: 'pi/zai-coding-paas/glm-5.2',
+        messages: [{ role: 'user', content: 'work' }],
+        cwd,
+        agent_profile: {
+          name: 'isolated-worker',
+          extensions: { pi: { load: [] } },
+        },
+      }, null, new AbortController().signal))
+
+      expect(args).toContain('--no-extensions')
+      expect(args).not.toContain('--extension')
+      expect(args).toContain('--no-context-files')
+      expect(args).toContain('--no-skills')
+      expect(args).toContain('--no-prompt-templates')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   it('loads an explicit Pi extension set without ambient extension discovery', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-extension-'))
     const agentDir = mkdtempSync(join(tmpdir(), 'pi-profile-agent-dir-'))
