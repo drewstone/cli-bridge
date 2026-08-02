@@ -133,6 +133,7 @@ describe('PiBackend', () => {
       }, null, new AbortController().signal))
 
       expect(args.filter((arg) => arg === '--system-prompt')).toHaveLength(1)
+      expect(args).toContain('--approve')
       expect(systemPrompt).toBe('SYSTEM_ONCE')
       expect(argValue(args, '--thinking')).toBe('xhigh')
       expect(args.at(-1)).toBe('TASK_UNCHANGED')
@@ -274,6 +275,7 @@ describe('PiBackend', () => {
       expect(beta?.promptTemplate).toBe('BETA_PROMPT_TEMPLATE\n')
 
       for (const entry of captured) {
+        expect(entry.args).toContain('--approve')
         expect(entry.args).toContain('--no-context-files')
         expect(entry.args).toContain('--no-skills')
         expect(entry.args).toContain('--no-prompt-templates')
@@ -406,6 +408,32 @@ describe('PiBackend', () => {
     } finally {
       sessions.close()
       rmSync(dataDir, { recursive: true, force: true })
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('does not change project-approval behavior for a call without an exact profile', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-no-profile-approval-'))
+    let args: string[] = []
+    try {
+      const backend = new PiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        spawner: piSpawner([
+          { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+          { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+        ], (_bin, rawArgs) => {
+          args = [...rawArgs]
+        }),
+      })
+      await collect(backend.chat({
+        model: 'pi/zai-coding-paas/glm-5.2',
+        messages: [{ role: 'user', content: 'work' }],
+        cwd,
+      }, null, new AbortController().signal))
+
+      expect(args).not.toContain('--approve')
+    } finally {
       rmSync(cwd, { recursive: true, force: true })
     }
   })
@@ -1361,6 +1389,7 @@ describe('PiBackend', () => {
 
       expect(args).toContain('--no-extensions')
       expect(args).not.toContain('--extension')
+      expect(args).toContain('--approve')
       expect(args).toContain('--no-context-files')
       expect(args).toContain('--no-skills')
       expect(args).toContain('--no-prompt-templates')
@@ -1412,6 +1441,57 @@ describe('PiBackend', () => {
       expect(args).toContain('--no-extensions')
       expect(argValue(args, '--extension')).toBe(packageDir)
       expect(args.indexOf('--extension')).toBeLessThan(args.length - 1)
+    } finally {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('loads a custom AgentDir extension through its stable in-jail path', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-jailed-extension-'))
+    const jailRoot = join(cwd, '.agent-home')
+    const agentDir = mkdtempSync(join(tmpdir(), 'pi-profile-custom-agent-dir-'))
+    const packageDir = join(agentDir, 'npm', 'node_modules', 'pi-zai-glm')
+    const extensionDir = join(packageDir, 'extensions')
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    let args: string[] = []
+    let jail: ChatRequest['jailSpec']
+    try {
+      mkdirSync(extensionDir, { recursive: true })
+      writeFileSync(
+        join(packageDir, 'package.json'),
+        JSON.stringify({ name: 'pi-zai-glm', pi: { extensions: ['./extensions'] } }),
+      )
+      writeFileSync(join(extensionDir, 'provider.ts'), 'export default () => undefined\n')
+      process.env.PI_CODING_AGENT_DIR = agentDir
+
+      const backend = new PiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        spawner: piSpawner([
+          { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+          { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+        ], (_bin, rawArgs, opts) => {
+          args = [...rawArgs]
+          jail = opts.jail
+        }),
+      })
+      await collect(backend.chat({
+        model: 'pi/zai-coding-paas/glm-5.2',
+        messages: [{ role: 'user', content: 'work' }],
+        cwd,
+        jailSpec: { root: jailRoot, projectDir: cwd, readConfine: true },
+        agent_profile: { extensions: { pi: { load: ['pi-zai-glm'] } } },
+      }, null, new AbortController().signal))
+
+      expect(argValue(args, '--extension')).toBe(packageDir)
+      expect(jail?.argumentRewrites).toEqual([{
+        from: packageDir,
+        to: join(jailRoot, '.pi', 'agent', 'npm', 'node_modules', 'pi-zai-glm'),
+        precededBy: '--extension',
+      }])
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir

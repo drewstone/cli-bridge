@@ -266,7 +266,12 @@ function piProfileFlags(
   profileRoot: string,
   nativeLoaders: PiPlanNativeLoaders,
 ): string[] {
-  const flags = ['--no-context-files', '--no-skills', '--no-prompt-templates']
+  // Exact profiles load request-scoped resources from unique paths under the
+  // workspace. Grant project-file trust for this process so Pi neither prompts
+  // nor persists approval into its read-only global settings. Ambient context,
+  // skills, and prompt templates remain disabled by the flags below; callers
+  // control ambient extensions separately through extensions.pi.load.
+  const flags = ['--approve', '--no-context-files', '--no-skills', '--no-prompt-templates']
 
   if (plan.systemPrompt !== undefined) {
     const systemPromptDir = join(profileRoot, '.cli-bridge')

@@ -61,6 +61,33 @@ export function registerJailReadable(spec: JailSpec | null | undefined, ...paths
   spec.extraReadablePaths = [...merged]
 }
 
+/**
+ * Register one exact argv translation that applies only when a jail really
+ * wraps the command. This keeps the ordinary host/Docker argv valid when a
+ * requested jail is unavailable and the operator explicitly permits fallback.
+ */
+export function registerJailArgumentRewrite(
+  spec: JailSpec | null | undefined,
+  from: string,
+  to: string,
+  precededBy?: string,
+): void {
+  if (!spec || from === to) return
+  const existing = spec.argumentRewrites?.find(
+    (entry) => entry.from === from && entry.precededBy === precededBy,
+  )
+  if (existing) {
+    if (existing.to !== to) {
+      throw new Error(`conflicting jail argument rewrite for ${from}`)
+    }
+    return
+  }
+  spec.argumentRewrites = [
+    ...(spec.argumentRewrites ?? []),
+    { from, to, ...(precededBy ? { precededBy } : {}) },
+  ]
+}
+
 export function selectJailBackend(platform: NodeJS.Platform = process.platform): JailBackend {
   if (platform === 'linux') return new LinuxBwrapJail()
   if (platform === 'darwin') return new MacosSeatbeltJail()

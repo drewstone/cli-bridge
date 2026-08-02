@@ -64,10 +64,28 @@ export async function applyJail(
     )
   }
 
-  const wrap = await backend.wrap(bin, args, opts.jail)
+  // Only the executor knows that the jail will actually run. Apply backend-
+  // declared path translations here, after availability is proven; the
+  // explicit warn fallback above must preserve the normal host/Docker argv.
+  const rewrittenArgs = rewriteJailArguments(args, opts.jail.argumentRewrites)
+  const wrap = await backend.wrap(bin, rewrittenArgs, opts.jail)
   // Merge any jail-supplied env onto the child env. The merged result
   // still flows through sanitizeHostEnv at the spawn site, so the host
   // env allowlist continues to apply.
   const env = wrap.env ? { ...(opts.env ?? {}), ...wrap.env } : opts.env
   return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup }
+}
+
+export function rewriteJailArguments(
+  args: string[],
+  rewrites: ReadonlyArray<{ from: string; to: string; precededBy?: string }> | undefined,
+): string[] {
+  if (!rewrites?.length) return args
+  return args.map((arg, index) => {
+    const rewrite = rewrites.find(
+      (entry) => entry.from === arg
+        && (entry.precededBy === undefined || args[index - 1] === entry.precededBy),
+    )
+    return rewrite?.to ?? arg
+  })
 }
