@@ -15,12 +15,11 @@
  * MOONSHOT_API_KEY etc. must be set in the bridge's environment (sourced
  * via the kick-script's `.env` chain).
  *
- * MCP: pi's CLI has no `--mcp-config` flag — MCP support comes from the
- * `pi-mcp-adapter` extension, which discovers the canonical `{mcpServers}`
- * JSON from `<cwd>/.mcp.json` / `<cwd>/.pi/mcp.json`. When a request
+ * MCP: MCP support comes from the `pi-mcp-adapter` extension. When a request
  * carries MCP servers (X-Mcp-Config header, body `mcp.mcpServers`, or
- * `agent_profile.mcp`), the bridge writes `<cwd>/.pi/mcp.json` for the
- * run and removes/restores it afterwards. If the adapter is NOT
+ * `agent_profile.mcp`), the bridge writes a unique request-scoped config and
+ * passes it through the adapter's `--mcp-config` flag. Concurrent Pi agents may
+ * therefore share a task cwd without sharing control config. If the adapter is NOT
  * installed the request is REJECTED (`not_configured`) instead of
  * silently dropping the servers — a run whose tools never existed must
  * fail loudly, not score zero structurally. Detection: `pi-mcp-adapter`
@@ -236,7 +235,7 @@ function resolvePiExtensionPath(spec: string, hostNpmRoot: string, runtimeNpmRoo
 /**
  * True when pi can actually consume MCP config — i.e. the
  * `pi-mcp-adapter` extension is installed. Pi itself ships no MCP
- * support, so mounting `.pi/mcp.json` without the adapter is a silent
+ * support, so passing MCP config without the adapter is a silent
  * no-op; callers use this to fail loudly instead.
  *
  * `CLI_BRIDGE_PI_MCP_ADAPTER=1|0` overrides detection for nonstandard
@@ -333,8 +332,8 @@ export class PiBackend implements Backend {
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
     // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
-    // `agent_profile.mcp`) mount as `<cwd>/.pi/mcp.json` for the
-    // pi-mcp-adapter extension. FAIL-LOUD, not fail-safe: if the caller
+    // `agent_profile.mcp`) reach pi-mcp-adapter through its per-process
+    // config flag. FAIL-LOUD, not fail-safe: if the caller
     // requested MCP tools pi can't provide, reject the request — a
     // silently tool-less run scores zero for the wrong reason.
     const mcpSpecs = resolveMcpServers(req, session)
@@ -348,22 +347,23 @@ export class PiBackend implements Backend {
       )
     }
 
-    // The provider-specific extension namespace and the canonical profile
-    // files both use Pi's per-process loaders. All flags precede the positional
+    // The provider-specific extension namespace, MCP config, and canonical profile
+    // files all use Pi's per-process loaders. Every flag precedes the positional
     // prompt, and large prompt material rides file paths rather than argv.
     args.push(...piExtensionArgs(req, session, requestedMcpNames.length > 0))
-    const provisioned = provisionPiProfile(req, session, runCwd)
-    if (provisioned) args.push(...provisioned.flags)
-    // The task prompt remains the sole positional message. Profile system and
-    // additive instructions retain their native, separate authority channels.
-    args.push(prompt)
-
     let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
+    let provisioned: ReturnType<typeof provisionPiProfile> = null
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       mcpMounted = requestedMcpNames.length > 0
         ? materializeMcpServersForPi(mcpSpecs, runCwd)
         : null
+      if (mcpMounted) args.push('--mcp-config', mcpMounted.configPath)
+      provisioned = provisionPiProfile(req, session, runCwd)
+      if (provisioned) args.push(...provisioned.flags)
+      // The task prompt remains the sole positional message. Profile system and
+      // additive instructions retain their native, separate authority channels.
+      args.push(prompt)
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
@@ -383,8 +383,6 @@ export class PiBackend implements Backend {
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })
     } catch (err) {
-      // `.pi/mcp.json` lives in the caller's workspace, not a temp dir —
-      // never leave it behind when the subprocess failed to spawn.
       mcpMounted?.cleanup()
       provisioned?.cleanup()
       throw err

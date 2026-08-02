@@ -101,25 +101,28 @@ describe('PiBackend', () => {
         },
       },
     }
-      let args: string[] = []
-      let systemPrompt = ''
-      let mcp: unknown
-      let directTools: string | undefined
-      const backend = new PiBackend({
-        bin: 'pi',
-        timeoutMs: 1000,
-        spawner: piSpawner([
-          { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
-          { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
-        ], (_bin, rawArgs, opts) => {
-          args = [...rawArgs]
-          const systemPromptPath = argValue(args, '--system-prompt')
-          if (!systemPromptPath) throw new Error('missing native system prompt')
-          systemPrompt = readFileSync(systemPromptPath, 'utf8')
-          mcp = JSON.parse(readFileSync(join(cwd, '.pi', 'mcp.json'), 'utf8'))
-          directTools = opts.env?.MCP_DIRECT_TOOLS
-        }),
-      })
+    let args: string[] = []
+    let systemPrompt = ''
+    let mcp: unknown
+    let mcpConfigPath: string | undefined
+    let directTools: string | undefined
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ], (_bin, rawArgs, opts) => {
+        args = [...rawArgs]
+        const systemPromptPath = argValue(args, '--system-prompt')
+        if (!systemPromptPath) throw new Error('missing native system prompt')
+        systemPrompt = readFileSync(systemPromptPath, 'utf8')
+        mcpConfigPath = argValue(args, '--mcp-config')
+        if (!mcpConfigPath) throw new Error('missing request-scoped MCP config')
+        mcp = JSON.parse(readFileSync(mcpConfigPath, 'utf8'))
+        directTools = opts.env?.MCP_DIRECT_TOOLS
+      }),
+    })
 
     try {
       await collect(backend.chat({
@@ -148,6 +151,7 @@ describe('PiBackend', () => {
         },
       })
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
+      expect(mcpConfigPath && existsSync(mcpConfigPath)).toBe(false)
     } finally {
       if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
       else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
@@ -1065,12 +1069,13 @@ describe('PiBackend', () => {
     ])
   })
 
-  it('mounts request MCP servers as <cwd>/.pi/mcp.json for the run and cleans up after', async () => {
+  it('passes request MCP servers through a request-scoped --mcp-config file', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-mcp-test-'))
     const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
     process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
     try {
       let configAtSpawn: unknown = null
+      let configPathAtSpawn: string | undefined
       let cwdAtSpawn: string | undefined
       let directToolsAtSpawn: string | undefined
       const backend = new PiBackend({
@@ -1081,9 +1086,13 @@ describe('PiBackend', () => {
             { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
             { type: 'turn_end', message: { usage: { input: 5, output: 2 } } },
           ],
-          (_bin, _args, opts) => {
+          (_bin, args, opts) => {
             cwdAtSpawn = opts.cwd
-            configAtSpawn = JSON.parse(readFileSync(join(cwd, '.pi', 'mcp.json'), 'utf-8'))
+            const flagIndex = args.indexOf('--mcp-config')
+            expect(flagIndex).toBeGreaterThanOrEqual(0)
+            configPathAtSpawn = args[flagIndex + 1]
+            expect(configPathAtSpawn).toBeTruthy()
+            configAtSpawn = JSON.parse(readFileSync(configPathAtSpawn!, 'utf-8'))
             directToolsAtSpawn = opts.env?.MCP_DIRECT_TOOLS
           },
         ),
@@ -1100,8 +1109,9 @@ describe('PiBackend', () => {
         },
       }, null, new AbortController().signal))
 
-      // The pi subprocess must see the config in ITS cwd before it starts.
+      // Pi keeps the shared task cwd while receiving private control config.
       expect(cwdAtSpawn).toBe(cwd)
+      expect(configPathAtSpawn?.startsWith(join(cwd, '.cli-bridge-pi-mcp-'))).toBe(true)
       expect(directToolsAtSpawn).toBe('legal-tools')
       expect(configAtSpawn).toEqual({
         mcpServers: {
@@ -1117,7 +1127,79 @@ describe('PiBackend', () => {
         { usage: { input_tokens: 5, output_tokens: 2 } },
         { finish_reason: 'stop' },
       ])
-      // Run-scoped mount: the workspace is restored after the subprocess exits.
+      expect(configPathAtSpawn && existsSync(configPathAtSpawn)).toBe(false)
+      expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
+    } finally {
+      if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('runs two MCP-enabled Pi requests concurrently in one cwd', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-mcp-overlap-'))
+    const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    const configPaths: string[] = []
+    const configs: unknown[] = []
+    const children: FakeChild[] = []
+    let bothConfigsExistedTogether = false
+    const spawner: Spawner = async (_bin, args): Promise<SpawnResult> => {
+      const configPath = argValue(args, '--mcp-config')
+      if (!configPath) throw new Error('missing request-scoped MCP config')
+      configPaths.push(configPath)
+      configs.push(JSON.parse(readFileSync(configPath, 'utf8')))
+      const child = new FakeChild()
+      children.push(child)
+      if (children.length === 2) {
+        bothConfigsExistedTogether = configPaths.every((path) => existsSync(path))
+        setTimeout(() => {
+          for (const running of children) {
+            running.stdout.write(`${JSON.stringify({
+              type: 'message_update',
+              assistantMessageEvent: { type: 'text_delta', delta: 'ok' },
+            })}\n`)
+            running.stdout.write(`${JSON.stringify({
+              type: 'turn_end',
+              message: { usage: { input: 2, output: 1 } },
+            })}\n`)
+            running.stdout.end()
+            running.stderr.end()
+            running.exitCode = 0
+            running.emit('close', 0)
+          }
+        }, 0)
+      }
+      return {
+        child: child as never,
+        release() {},
+        spawnError: () => null,
+      }
+    }
+    const backend = new PiBackend({ bin: 'pi', timeoutMs: 1000, spawner })
+
+    try {
+      const request = (name: string): ChatRequest => ({
+        model: 'pi/tangle-router/deepseek-v4-flash',
+        messages: [{ role: 'user', content: `run ${name}` }],
+        cwd,
+        mcp: { mcpServers: { [name]: { command: `${name}-server` } } },
+      })
+      const [alpha, beta] = await Promise.all([
+        collect(backend.chat(request('alpha'), null, new AbortController().signal)),
+        collect(backend.chat(request('beta'), null, new AbortController().signal)),
+      ])
+
+      expect(alpha.at(-1)).toEqual({ finish_reason: 'stop' })
+      expect(beta.at(-1)).toEqual({ finish_reason: 'stop' })
+      expect(configPaths).toHaveLength(2)
+      expect(new Set(configPaths).size).toBe(2)
+      expect(bothConfigsExistedTogether).toBe(true)
+      expect(configs).toEqual(expect.arrayContaining([
+        { mcpServers: { alpha: { command: 'alpha-server', directTools: true } } },
+        { mcpServers: { beta: { command: 'beta-server', directTools: true } } },
+      ]))
+      expect(configPaths.every((path) => !existsSync(path))).toBe(true)
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
     } finally {
       if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
@@ -1211,7 +1293,7 @@ describe('PiBackend', () => {
     // Adapter absent — must NOT matter when no MCP was requested.
     process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '0'
     try {
-      let piConfigExistedAtSpawn: boolean | null = null
+      let mcpConfigFlagAtSpawn: string | undefined
       const backend = new PiBackend({
         bin: 'pi',
         timeoutMs: 1000,
@@ -1220,7 +1302,7 @@ describe('PiBackend', () => {
             { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
             { type: 'turn_end', message: { usage: { input: 3, output: 1 } } },
           ],
-          () => { piConfigExistedAtSpawn = existsSync(join(cwd, '.pi', 'mcp.json')) },
+          (_bin, args) => { mcpConfigFlagAtSpawn = argValue(args, '--mcp-config') },
         ),
       })
 
@@ -1230,7 +1312,8 @@ describe('PiBackend', () => {
         cwd,
       }, null, new AbortController().signal))
 
-      expect(piConfigExistedAtSpawn).toBe(false)
+      expect(mcpConfigFlagAtSpawn).toBeUndefined()
+      expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
       expect(deltas.slice(-2)).toEqual([
         { usage: { input_tokens: 3, output_tokens: 1 } },
         { finish_reason: 'stop' },
