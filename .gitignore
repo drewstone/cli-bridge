@@ -18,5 +18,9 @@ data/
 .claude/
 entities/
 
+# Request-private Pi materialization; cleanup is best-effort after hard process exits.
+.cli-bridge-pi-profile-*/
+.cli-bridge-pi-mcp-*/
+
 # Agent worktrees are separate checkouts of this repo; never commit them as embedded repos.
 .worktrees/

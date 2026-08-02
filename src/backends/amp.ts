@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 
 export interface AmpBackendOptions {
   bin: string
@@ -26,15 +27,15 @@ export class AmpBackend implements Backend {
   async health(): Promise<BackendHealth> {
     return new Promise((resolve) => {
       const child = spawn(this.opts.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let stdout = ''; let stderr = ''
-      child.stdout.on('data', (b) => { stdout += b.toString() })
-      child.stderr.on('data', (b) => { stderr += b.toString() })
+      const stdout = new BoundedDiagnosticBuffer()
+      child.stdout.on('data', (b) => { stdout.append(b) })
+      child.stderr.resume()
       child.on('error', (err) => {
         resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
       })
       child.on('close', (code) => {
         if (code === 0) {
-          resolve({ name: this.name, state: 'ready', version: stdout.trim() || undefined })
+          resolve({ name: this.name, state: 'ready', version: stdout.render().trim() || undefined })
         } else {
           resolve({ name: this.name, state: 'error', detail: `exit ${code}` })
         }

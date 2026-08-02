@@ -5,6 +5,7 @@ import {
   type Spawner,
 } from '../executors/types.js'
 import type { BackendHealth } from './types.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 
 /**
  * Probe a CLI-backed agent's readiness by TAKING THE REQUEST PATH: the
@@ -73,12 +74,14 @@ export async function versionHealth(
     release = spawned.release
     const child = spawned.child
     const closed = await new Promise<{ code: number | null; stdout: string; stderr: string } | { spawnFailure: string }>((resolve) => {
-      let stdout = ''
-      let stderr = ''
-      child.stdout?.on('data', (b) => { stdout += b.toString() })
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      const stdout = new BoundedDiagnosticBuffer()
+      const stderr = new BoundedDiagnosticBuffer()
+      child.stdout?.on('data', (b) => { stdout.append(b) })
+      child.stderr?.on('data', (b) => { stderr.append(b) })
       child.on('error', (err) => { resolve({ spawnFailure: err.message }) })
-      child.on('close', (code) => { resolve({ code, stdout, stderr }) })
+      child.on('close', (code) => {
+        resolve({ code, stdout: stdout.render(), stderr: stderr.render() })
+      })
     })
     if ('spawnFailure' in closed) {
       return { name, state: 'unavailable', detail: `spawn failed: ${closed.spawnFailure}` }

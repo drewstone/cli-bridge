@@ -50,6 +50,7 @@ import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
@@ -167,7 +168,7 @@ export class KimiBackend implements Backend {
 
     try {
       let internalSessionId: string | undefined
-      let stderr = ''
+      const stderr = new BoundedDiagnosticBuffer()
       let emittedContent = false
       let emittedToolCall = false
       if (spawnErrorMessage) {
@@ -197,7 +198,7 @@ export class KimiBackend implements Backend {
       }
       child.stderr?.on('data', (b) => {
         const chunk = b.toString()
-        stderr += chunk
+        stderr.append(chunk)
         // Kimi prints "To resume this session: kimi -r <uuid>" to
         // stderr after --print. That's our session id when no init
         // event carries one.
@@ -343,10 +344,10 @@ export class KimiBackend implements Backend {
       // message is printed as a successful trailer, not an error). If
       // we observed real assistant content, treat exit non-zero as OK.
       if (exitCode !== 0 && exitCode !== null && !emittedContent) {
-        throw new BackendError(await describeCliExit(spawned, 'kimi', exitCode, stderr), 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'kimi', exitCode, stderr.render()), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
-        throw new BackendError(`kimi produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(`kimi produced no stream output: ${stderr.render(300)}`, 'upstream')
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
