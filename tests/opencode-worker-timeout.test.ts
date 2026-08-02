@@ -90,11 +90,15 @@ describe('opencode resumable-series isolation', () => {
       },
     } as ConstructorParameters<typeof OpencodeBackend>[0])
     try {
-      const stream = backend.chat({
-        model: 'opencode/zai-coding-plan/glm-5.2',
-        messages: [{ role: 'user', content: 'hi' }],
-        ...req,
-      } as Parameters<typeof backend.chat>[0])
+      const stream = backend.chat(
+        {
+          model: 'opencode/zai-coding-plan/glm-5.2',
+          messages: [{ role: 'user', content: 'hi' }],
+          ...req,
+        } as Parameters<typeof backend.chat>[0],
+        null,
+        new AbortController().signal,
+      )
       for await (const _ of stream) { /* drain */ }
     } catch { /* expected */ }
     return captured
