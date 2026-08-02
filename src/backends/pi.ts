@@ -69,6 +69,7 @@ import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
 export interface PiBackendOptions {
@@ -402,7 +403,7 @@ export class PiBackend implements Backend {
 
     try {
       let internalSessionId: string | undefined
-      let stderr = ''
+      const stderr = new BoundedDiagnosticBuffer()
       let emittedContent = false
       let emittedToolCall = false
       let sawError: string | null = null
@@ -419,7 +420,7 @@ export class PiBackend implements Backend {
       }
       const piToolCalls = new PiToolCallTracker()
 
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      child.stderr?.on('data', (b) => { stderr.append(b) })
 
       if (!child.stdout) {
         throw new BackendError('pi subprocess has no stdout pipe', 'upstream')
@@ -564,7 +565,7 @@ export class PiBackend implements Backend {
       }
 
       if (exitCode !== 0) {
-        const detail = sawError ?? stderr.slice(0, 300) ?? `exit ${exitCode ?? 'unknown'}`
+        const detail = sawError ?? (stderr.render(300) || `exit ${exitCode ?? 'unknown'}`)
         throw new BackendError(
           `pi exit ${exitCode ?? 'unknown'}: ${detail}`,
           piFailureKind(detail),

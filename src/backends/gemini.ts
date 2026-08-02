@@ -22,6 +22,7 @@ import { hostSpawner } from '../executors/host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
@@ -102,10 +103,10 @@ export class GeminiBackend implements Backend {
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
-      let stderr = ''
+      const stderr = new BoundedDiagnosticBuffer()
       let emittedContent = false
       let emittedToolCall = false
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      child.stderr?.on('data', (b) => { stderr.append(b) })
       if (spawnErrorMessage) {
         throw new BackendError(`gemini spawn failed: ${spawnErrorMessage}`, 'upstream')
       }
@@ -174,10 +175,10 @@ export class GeminiBackend implements Backend {
       }
       if (sawError) throw new BackendError(`gemini: ${sawError}`, 'upstream')
       if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(await describeCliExit(spawned, 'gemini', exitCode, stderr), 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'gemini', exitCode, stderr.render()), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
-        throw new BackendError(`gemini produced no output: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(`gemini produced no output: ${stderr.render(300)}`, 'upstream')
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }
     } finally {

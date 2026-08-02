@@ -41,6 +41,7 @@ import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
 export interface CodexBackendOptions {
@@ -165,8 +166,8 @@ export class CodexBackend implements Backend {
     let emittedToolCall = false
     try {
       let internalSessionId: string | undefined
-      let stderr = ''
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      const stderr = new BoundedDiagnosticBuffer()
+      child.stderr?.on('data', (b) => { stderr.append(b) })
       if (spawnErrorMessage) {
         throw new BackendError(`codex spawn failed: ${spawnErrorMessage}`, 'upstream')
       }
@@ -229,7 +230,7 @@ export class CodexBackend implements Backend {
         throw new BackendError(`codex: ${sawError}`, 'upstream')
       }
       if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(await describeCliExit(spawned, 'codex', exitCode, stderr), 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'codex', exitCode, stderr.render()), 'upstream')
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {

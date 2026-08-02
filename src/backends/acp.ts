@@ -24,6 +24,7 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { contentToText } from './content.js'
 import { buildAcpMcpServers, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 
 export interface AcpBackendOptions {
   /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
@@ -92,16 +93,17 @@ export class AcpBackend implements Backend {
       const child = spawned.child
       const early = spawned.spawnError?.()
       if (early) return { name: this.name, state: 'unavailable', detail: `spawn failed: ${early.message}` }
-      let out = ''
-      child.stdout?.on('data', (b) => { out += b.toString() })
-      child.stderr?.on('data', (b) => { out += b.toString() })
+      const out = new BoundedDiagnosticBuffer()
+      child.stdout?.on('data', (b) => { out.append(b) })
+      child.stderr?.on('data', (b) => { out.append(b) })
       const code = await new Promise<number>((resolve) => {
         const t = setTimeout(() => { void terminateSpawned(spawned); resolve(124) }, 5000)
         child.on('exit', (c) => { clearTimeout(t); resolve(c ?? 0) })
         child.on('error', () => { clearTimeout(t); resolve(1) })
       })
-      if (code !== 0 && !out.trim()) return { name: this.name, state: 'error', detail: `${this.bin} --version exit ${code}` }
-      return { name: this.name, state: 'ready', version: out.split('\n')[0]?.trim() || this.bin }
+      const output = out.render()
+      if (code !== 0 && !output.trim()) return { name: this.name, state: 'error', detail: `${this.bin} --version exit ${code}` }
+      return { name: this.name, state: 'ready', version: output.split('\n')[0]?.trim() || this.bin }
     } catch (err) {
       return { name: this.name, state: 'error', detail: `health probe failed: ${(err as Error).message}` }
     } finally {
@@ -128,6 +130,8 @@ export class AcpBackend implements Backend {
     })
     const child = spawned.child
     const release = spawned.release
+    const stderr = new BoundedDiagnosticBuffer()
+    child.stderr?.on('data', (chunk) => { stderr.append(chunk) })
     let spawnErrorMessage = spawned.spawnError?.()?.message ?? ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
 
@@ -212,7 +216,11 @@ export class AcpBackend implements Backend {
         if (driverError) throw driverError
         if (streamEnded) {
           yield { finish_reason: 'error' }
-          throw new BackendError(`${this.name} acp stream ended before session/prompt completed`, 'upstream')
+          const detail = stderr.render(300)
+          throw new BackendError(
+            `${this.name} acp stream ended before session/prompt completed${detail ? `: ${detail}` : ''}`,
+            'upstream',
+          )
         }
         await new Promise<void>((resolve) => { wake = () => { wake = null; resolve() } })
       }

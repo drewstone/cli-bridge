@@ -29,6 +29,7 @@ import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
@@ -176,8 +177,8 @@ export class OpencodeBackend implements Backend {
 
     try {
       let internalSessionId: string | undefined
-      let stderr = ''
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      const stderr = new BoundedDiagnosticBuffer()
+      child.stderr?.on('data', (b) => { stderr.append(b) })
       if (spawnErrorMessage) {
         throw new BackendError(`opencode spawn failed: ${spawnErrorMessage}`, 'upstream')
       }
@@ -276,10 +277,10 @@ export class OpencodeBackend implements Backend {
       }
       if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
       if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(await describeCliExit(spawned, 'opencode', exitCode, stderr), 'upstream')
+        throw new BackendError(await describeCliExit(spawned, 'opencode', exitCode, stderr.render()), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
-        throw new BackendError(`opencode produced no stream output: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(`opencode produced no stream output: ${stderr.render(300)}`, 'upstream')
       }
       yield {
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',

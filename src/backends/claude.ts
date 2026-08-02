@@ -37,6 +37,7 @@ import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
@@ -240,8 +241,8 @@ export class ClaudeBackend implements Backend {
     let emittedAnyToolCall = false
     try {
       let internalSessionId: string | undefined
-      let stderr = ''
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      const stderr = new BoundedDiagnosticBuffer()
+      child.stderr?.on('data', (b) => { stderr.append(b) })
 
       if (spawnErrorMessage) {
         throw new BackendError(`claude spawn failed: ${spawnErrorMessage}`, 'upstream')
@@ -343,7 +344,7 @@ export class ClaudeBackend implements Backend {
 
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(
-          await describeCliExit(spawned, 'claude', exitCode, stderr),
+          await describeCliExit(spawned, 'claude', exitCode, stderr.render()),
           'upstream',
         )
       }

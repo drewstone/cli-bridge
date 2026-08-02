@@ -193,6 +193,10 @@ Replay storage is explicitly bounded per process:
 - Terminal output expires after `BRIDGE_RUN_REPLAY_RETENTION_MS` (default `60000` ms).
 - The run-id/request binding remains after output expiry for `BRIDGE_RUN_IDENTITY_RETENTION_MS` (default `86400000` ms) so a late retry cannot accidentally execute the job again.
 
+Model output is not clipped by the bridge's process-diagnostic protection.
+The bridge retains at most 64 KiB of each subprocess's stderr/stdout diagnostics, preserving both the beginning and end for failures, while successful streamed content continues through the normal response and replay path.
+Progress heartbeats use one live timer per subprocess wait rather than one timer per streamed event.
+
 Do not recycle run ids after the identity window.
 A bridge restart loses the in-memory registry; `404` after a restart means the old process is unknown, not proven stopped.
 

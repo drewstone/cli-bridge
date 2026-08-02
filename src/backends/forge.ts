@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 
 export interface ForgeBackendOptions {
   bin: string
@@ -27,8 +28,8 @@ export class ForgeBackend implements Backend {
   async health(): Promise<BackendHealth> {
     return new Promise((resolve) => {
       const child = spawn(this.opts.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      let stderr = ''
-      child.stderr.on('data', (b) => { stderr += b.toString() })
+      const stderr = new BoundedDiagnosticBuffer()
+      child.stderr.on('data', (b) => { stderr.append(b) })
       child.on('error', (err) => {
         resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
       })
@@ -36,7 +37,7 @@ export class ForgeBackend implements Backend {
         resolve({
           name: this.name,
           state: code === 0 ? 'ready' : 'error',
-          detail: code === 0 ? undefined : `exit ${code}: ${stderr.slice(0, 200)}`,
+          detail: code === 0 ? undefined : `exit ${code}: ${stderr.render(200)}`,
         })
       })
     })

@@ -30,6 +30,7 @@ import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
 export interface FactoryBackendOptions {
@@ -104,11 +105,11 @@ export class FactoryBackend implements Backend {
 
     try {
       let internalSessionId: string | undefined
-      let stderr = ''
+      const stderr = new BoundedDiagnosticBuffer()
       let emittedContent = false
       let emittedToolCall = false
       let sawError: string | null = null
-      child.stderr?.on('data', (b) => { stderr += b.toString() })
+      child.stderr?.on('data', (b) => { stderr.append(b) })
       if (spawnErrorMessage) {
         throw new BackendError(`factory spawn failed: ${spawnErrorMessage}`, 'upstream')
       }
@@ -165,10 +166,10 @@ export class FactoryBackend implements Backend {
       }
       if (sawError) throw new BackendError(`factory: ${sawError}`, 'upstream')
       if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(`factory (droid exec) exited ${exitCode}: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(`factory (droid exec) exited ${exitCode}: ${stderr.render(300)}`, 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
-        throw new BackendError(`factory produced no output: ${stderr.slice(0, 300)}`, 'upstream')
+        throw new BackendError(`factory produced no output: ${stderr.render(300)}`, 'upstream')
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
