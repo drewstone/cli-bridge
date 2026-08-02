@@ -42,6 +42,8 @@ import {
   type RunRegistry,
 } from '../runs/registry.js'
 import { BackendReportedFailureError } from '../runs/error-shape.js'
+import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
+import { resolveCallerTrace } from '../trace/ids.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -222,6 +224,8 @@ export function mountChatCompletions(
     admission?: AdmissionGate
     /** Backends with a provisioned, verified net-jail. Absent map = none. */
     netJail?: NetJailRegistry
+    /** Emits one conforming span per request. Absent = no tracing. */
+    trace?: TraceEmitter
   },
 ): void {
   app.post('/v1/chat/completions', async (c) => {
@@ -375,6 +379,23 @@ export function mountChatCompletions(
     // `run.signal` (NOT the HTTP socket) drives the backend's abort
     // contract. A client disconnect leaves this signal untouched, so the
     // subprocess keeps running; only an explicit cancel aborts it.
+    // One span per RUN, opened by its creator. A reconnecting reader attaches to
+    // the run above and never reaches here, so replay cannot double-count a
+    // request that only ran once.
+    const recorder: RequestSpanRecorder | null = deps.trace?.beginRequest({
+      runId,
+      model: req.model,
+      backend: backend.name,
+      sessionId: req.session_id ?? null,
+      mode: req.mode ?? 'byob',
+      execution: req.execution?.kind ?? 'host',
+      caller: resolveCallerTrace({
+        traceparent: c.req.header('traceparent'),
+        traceId: c.req.header('x-trace-id'),
+        parentSpanId: c.req.header('x-parent-span-id'),
+      }),
+    }) ?? null
+
     let admissionLease: AdmissionLease | null = null
     let sessionLease: SessionExecutionLease | null = null
     try {
@@ -485,6 +506,7 @@ export function mountChatCompletions(
           let completionChars = 0
           try {
             for await (const delta of source) {
+              recorder?.observe(delta)
               if (delta.usage) sawUsage = true
               if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') failed = true
               completionChars += (delta.content?.length ?? 0)
@@ -513,28 +535,37 @@ export function mountChatCompletions(
             // get a bounded estimate. A failure without measured usage stays unknown:
             // inventing tokens after error/timeout masks the real terminal condition.
             if (!sawUsage && !failed) {
-              yield {
+              const estimated = {
                 usage: {
                   input_tokens: tokensFromChars(promptChars),
                   output_tokens: tokensFromChars(completionChars),
                   estimated: true,
                 },
               } satisfies ChatDelta
+              recorder?.observe(estimated)
+              yield estimated
             }
+          } catch (error) {
+            // Recorded, then RETHROWN unchanged. Errors are still NOT handled
+            // here: `Run.pump` records a throw that happened before any output as
+            // the run's dispatch error, which the reader turns into a real HTTP
+            // status carrying the message; a throw mid-stream still becomes a
+            // terminal error delta there. Swallowing untyped errors into a bare
+            // `finish_reason: 'error'` at this point meant a caller received 200
+            // with an empty error while the only copy of the reason went to the
+            // bridge's stdout — measured with a configuration error whose message
+            // named the exact env var to set. This catch exists solely to close
+            // the span with that reason; adding anything else to it re-opens the
+            // defect above.
+            recorder?.fail(error)
+            throw error
           } finally {
-            // Errors are NOT caught here. `Run.pump` records a throw that
-            // happened before any output as the run's dispatch error, which the
-            // reader turns into a real HTTP status carrying the message; a throw
-            // mid-stream still becomes a terminal error delta there. Swallowing
-            // untyped errors into a bare `finish_reason: 'error'` at this point
-            // meant a caller received 200 with an empty error while the only
-            // copy of the reason went to the bridge's stdout — measured with a
-            // configuration error whose message named the exact env var to set.
-            //
             // Admission is released when the job ends. Reader disconnects
             // cannot release a slot that still owns a subprocess.
             admissionLease?.release()
             sessionLease?.release()
+            // No-op when the catch above already closed the span.
+            recorder?.end()
           }
         },
       })
@@ -548,6 +579,10 @@ export function mountChatCompletions(
       sessionLease?.release()
       sessionLease = null
       run.failSetup(error)
+      // A request rejected at admission or misconfigured before spawn never
+      // reaches the wrapped stream, and it is exactly the request an operator
+      // goes looking for. The span records why it never ran.
+      recorder?.fail(error)
       return errorResponse(c, error)
     }
 

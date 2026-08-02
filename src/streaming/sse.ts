@@ -8,6 +8,7 @@
  */
 
 import type { ChatDelta } from '../backends/types.js'
+import { addUsage, type CollectedUsage } from '../usage.js'
 
 export interface ChunkMeta {
   id: string
@@ -186,26 +187,3 @@ export async function collectNonStreaming(
   }
 }
 
-interface CollectedUsage {
-  inputTokens: number
-  outputTokens: number
-  cost: number
-  costComplete: boolean
-  estimated: boolean
-}
-
-function addUsage(
-  current: CollectedUsage | undefined,
-  next: NonNullable<ChatDelta['usage']>,
-): CollectedUsage {
-  const totalCost = next.cost_scope === 'total'
-  return {
-    inputTokens: (current?.inputTokens ?? 0) + (next.input_tokens ?? 0),
-    outputTokens: (current?.outputTokens ?? 0) + (next.output_tokens ?? 0),
-    cost: totalCost ? (next.cost ?? 0) : (current?.cost ?? 0) + (next.cost ?? 0),
-    costComplete: totalCost
-      ? next.cost !== undefined
-      : (current?.costComplete ?? true) && next.cost !== undefined,
-    estimated: (current?.estimated ?? false) || next.estimated === true,
-  }
-}

@@ -63,6 +63,8 @@ function perSlotVolumePrefix(cfg: BackendExecutorConfig, mountIndex: number): st
 import type { BackendExecutorConfig } from './config.js'
 import { AdmissionGate } from './admission.js'
 import { RunRegistry } from './runs/registry.js'
+import { TraceEmitter } from './trace/emitter.js'
+import { JsonlSpanSink, nullSpanSink } from './trace/sink.js'
 import { selectJailBackend } from './jail/index.js'
 import { acquireInstanceLock, PortAlreadyBoundError } from './runtime/single-instance.js'
 
@@ -314,6 +316,16 @@ export async function buildApp(config: Config): Promise<{
   const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)
+  const trace = new TraceEmitter({
+    sink: config.trace.enabled
+      ? new JsonlSpanSink({
+          file: config.trace.file,
+          maxBytes: config.trace.maxBytes,
+          maxFiles: config.trace.maxFiles,
+        })
+      : nullSpanSink,
+    maxToolSpans: config.trace.maxToolSpans,
+  })
 
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
@@ -439,7 +451,7 @@ export async function buildApp(config: Config): Promise<{
   mountSessions(app, { sessions })
   mountRuns(app, { runs })
   mountProfiles(app, { catalog })
-  mountChatCompletions(app, { registry, sessions, runs, admission, netJail: extras.netJail })
+  mountChatCompletions(app, { registry, sessions, runs, admission, netJail: extras.netJail, trace })
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)
@@ -525,6 +537,11 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
     console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue} queueTimeoutMs=${config.admission.queueTimeoutMs}`)
+    console.log(
+      config.trace.enabled
+        ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)`
+        : '[cli-bridge] traces: off (BRIDGE_TRACE=off)',
+    )
     // WORKER_FS_JAIL=1 is a shorthand that raises the operator jail floor to
     // fs-jail even when BRIDGE_JAIL_MODE is unset, so fold it into the effective
     // floor the startup gate + log report.

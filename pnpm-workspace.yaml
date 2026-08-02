@@ -1,6 +1,19 @@
-# pnpm applies a minimum release age before it will install a package. This exempts one exact
-# version so a same-day publish can be consumed. Scoped to a single version on purpose: it must
-# NOT become a standing bypass of that supply-chain control.
-# Remove once 0.9.4 is older than the minimum release age (safe any time after 2026-08-08).
+# pnpm applies a minimum release age before it will install a package. These exempt exact
+# versions so a same-day publish can be consumed. Scoped to single versions on purpose: this
+# must NOT become a standing bypass of that supply-chain control. Each entry is dead weight
+# once its version is older than the minimum release age.
 minimumReleaseAgeExclude:
   - '@tangle-network/agent-profile-materialize@0.9.4'
+  - '@tangle-network/agent-trace-contract@1.0.2'
+
+# Dependencies allowed to run install scripts. better-sqlite3 needs its install script to
+# obtain the native binding the session store loads; esbuild needs its platform binary.
+# pnpm 11 reads `allowBuilds`; pnpm 9/10 read `onlyBuiltDependencies`. Both are listed so a
+# fresh clone installs the same way whichever major the developer or runner has.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
