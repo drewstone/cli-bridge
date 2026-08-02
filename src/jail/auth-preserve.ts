@@ -77,6 +77,19 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     // when it actually wraps — docker/fallback runs keep the host CODEX_HOME.
     for (const e of out) if (e.jailRel === '.codex') e.envVar = 'CODEX_HOME'
   }
+  if (backendName === 'pi') {
+    // Mirror CODEX_HOME: a custom Pi directory is the real provider catalog,
+    // not an alias for ~/.pi/agent. Surface that exact source at Pi's stable
+    // in-jail location, then redirect the child-only env var to it.
+    const piAgentDir = process.env.PI_CODING_AGENT_DIR?.trim()
+    if (piAgentDir) {
+      const source = resolve(piAgentDir)
+      const idx = out.findIndex((e) => e.jailRel === '.pi/agent')
+      if (idx >= 0) out.splice(idx, 1)
+      if (existsSync(source)) out.push({ source, jailRel: '.pi/agent' })
+    }
+    for (const e of out) if (e.jailRel === '.pi/agent') e.envVar = 'PI_CODING_AGENT_DIR'
+  }
   return out
 }
 

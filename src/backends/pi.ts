@@ -195,7 +195,13 @@ function piExtensionArgs(
   // Pi expands `~` itself. Keeping the default path HOME-relative makes the
   // same argv work for host execution and for a container whose mounted Pi
   // agent directory lives under a different HOME.
-  const runtimeNpmRoot = join(configuredAgentDir ?? '~/.pi/agent', 'npm', 'node_modules')
+  // A confined run sees the selected host AgentDir at one stable in-jail path.
+  // Use that path for explicit extensions too; retaining the host's absolute
+  // custom path would make the config readable but leave its packages hidden.
+  const runtimeAgentDir = req.jailSpec
+    ? join(req.jailSpec.root, '.pi', 'agent')
+    : configuredAgentDir ?? '~/.pi/agent'
+  const runtimeNpmRoot = join(runtimeAgentDir, 'npm', 'node_modules')
   const entries = new Set((load as string[]).map((spec) =>
     resolvePiExtensionPath(spec.trim(), hostNpmRoot, runtimeNpmRoot),
   ))
