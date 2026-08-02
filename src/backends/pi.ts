@@ -52,7 +52,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
@@ -68,6 +68,7 @@ import {
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { registerJailArgumentRewrite } from '../jail/index.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -190,21 +191,30 @@ function piExtensionArgs(
     )
   }
 
-  const configuredAgentDir = process.env.PI_CODING_AGENT_DIR
-  const hostNpmRoot = join(configuredAgentDir ?? join(homedir(), '.pi', 'agent'), 'npm', 'node_modules')
-  // Pi expands `~` itself. Keeping the default path HOME-relative makes the
-  // same argv work for host execution and for a container whose mounted Pi
-  // agent directory lives under a different HOME.
-  // A confined run sees the selected host AgentDir at one stable in-jail path.
-  // Use that path for explicit extensions too; retaining the host's absolute
-  // custom path would make the config readable but leave its packages hidden.
-  const runtimeAgentDir = req.jailSpec
-    ? join(req.jailSpec.root, '.pi', 'agent')
-    : configuredAgentDir ?? '~/.pi/agent'
-  const runtimeNpmRoot = join(runtimeAgentDir, 'npm', 'node_modules')
-  const entries = new Set((load as string[]).map((spec) =>
-    resolvePiExtensionPath(spec.trim(), hostNpmRoot, runtimeNpmRoot),
-  ))
+  const configuredAgentDir = process.env.PI_CODING_AGENT_DIR?.trim()
+  const hostAgentDir = configuredAgentDir
+    ? resolve(configuredAgentDir)
+    : join(homedir(), '.pi', 'agent')
+  const hostNpmRoot = join(hostAgentDir, 'npm', 'node_modules')
+  // Pi expands `~` itself. Keep the ordinary argv portable across a direct
+  // host run, the explicit unconfined fallback, and a container whose mounted
+  // Pi directory lives under a different HOME. The executor rewrites exact
+  // package arguments only after it proves the OS jail will actually apply.
+  const runtimeNpmRoot = join(
+    configuredAgentDir ? hostAgentDir : '~/.pi/agent',
+    'npm',
+    'node_modules',
+  )
+  const jailedNpmRoot = req.jailSpec
+    ? join(req.jailSpec.root, '.pi', 'agent', 'npm', 'node_modules')
+    : runtimeNpmRoot
+  const entries = new Set((load as string[]).map((spec) => {
+    const normalizedSpec = spec.trim()
+    const runtimePath = resolvePiExtensionPath(normalizedSpec, hostNpmRoot, runtimeNpmRoot)
+    const jailedPath = resolvePiExtensionPath(normalizedSpec, hostNpmRoot, jailedNpmRoot)
+    registerJailArgumentRewrite(req.jailSpec, runtimePath, jailedPath, '--extension')
+    return runtimePath
+  }))
   return [
     '--no-extensions',
     ...[...entries].flatMap((entry) => ['--extension', entry]),

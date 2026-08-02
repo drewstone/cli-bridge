@@ -500,6 +500,64 @@ describe('applyJail fail-closed', () => {
     }
   })
 
+  it('rewrites exact path arguments only when an available jail wraps the command', async () => {
+    const available: JailBackend = {
+      name: 'available-stub',
+      isAvailable: () => true,
+      wrap: (bin, args) => ({ bin, args }),
+    }
+    const opts = {
+      jail: {
+        root: '/proj/.agent-home',
+        projectDir: '/proj',
+        argumentRewrites: [{
+          from: '/host/pi-extension',
+          to: '/proj/.agent-home/pi-extension',
+          precededBy: '--extension',
+        }],
+      },
+    } as never
+
+    const result = await applyJail(
+      'pi',
+      ['--extension', '/host/pi-extension', '/host/pi-extension'],
+      opts,
+      available,
+    )
+
+    expect(result.args).toEqual([
+      '--extension',
+      '/proj/.agent-home/pi-extension',
+      '/host/pi-extension',
+    ])
+  })
+
+  it('keeps ordinary path arguments when explicit warn fallback runs unconfined', async () => {
+    process.env.BRIDGE_JAIL_FALLBACK = 'warn'
+    try {
+      const opts = {
+        jail: {
+          root: '/proj/.agent-home',
+          projectDir: '/proj',
+          argumentRewrites: [{
+            from: '/host/pi-extension',
+            to: '/proj/.agent-home/pi-extension',
+            precededBy: '--extension',
+          }],
+        },
+      } as never
+      const result = await applyJail(
+        'pi',
+        ['--extension', '/host/pi-extension'],
+        opts,
+        unavailable,
+      )
+      expect(result.args).toEqual(['--extension', '/host/pi-extension'])
+    } finally {
+      delete process.env.BRIDGE_JAIL_FALLBACK
+    }
+  })
+
   it('is a pure pass-through when no jail is requested (never throws)', async () => {
     const r = await applyJail('mybin', ['--x'], {} as never, unavailable)
     expect(r.bin).toBe('mybin')

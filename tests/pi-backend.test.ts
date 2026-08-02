@@ -1457,6 +1457,7 @@ describe('PiBackend', () => {
     const extensionDir = join(packageDir, 'extensions')
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR
     let args: string[] = []
+    let jail: ChatRequest['jailSpec']
     try {
       mkdirSync(extensionDir, { recursive: true })
       writeFileSync(
@@ -1472,8 +1473,9 @@ describe('PiBackend', () => {
         spawner: piSpawner([
           { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
           { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
-        ], (_bin, rawArgs) => {
+        ], (_bin, rawArgs, opts) => {
           args = [...rawArgs]
+          jail = opts.jail
         }),
       })
       await collect(backend.chat({
@@ -1484,9 +1486,12 @@ describe('PiBackend', () => {
         agent_profile: { extensions: { pi: { load: ['pi-zai-glm'] } } },
       }, null, new AbortController().signal))
 
-      expect(argValue(args, '--extension')).toBe(
-        join(jailRoot, '.pi', 'agent', 'npm', 'node_modules', 'pi-zai-glm'),
-      )
+      expect(argValue(args, '--extension')).toBe(packageDir)
+      expect(jail?.argumentRewrites).toEqual([{
+        from: packageDir,
+        to: join(jailRoot, '.pi', 'agent', 'npm', 'node_modules', 'pi-zai-glm'),
+        precededBy: '--extension',
+      }])
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir
