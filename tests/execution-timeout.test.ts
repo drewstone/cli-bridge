@@ -36,6 +36,70 @@ class CapturingBackend implements Backend {
   }
 }
 
+class ProfileReceiptBackend extends CapturingBackend {
+  override async *chat(
+    request: ChatRequest,
+    _session: SessionRecord | null,
+    _signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    this.request = request
+    request.profile_materialization_receipt = testProfileReceipt(request.model, this.name)
+    yield { content: 'done' }
+    yield { finish_reason: 'stop', usage: { input_tokens: 1, output_tokens: 1 } }
+  }
+}
+
+class SilentProfileReceiptBackend extends CapturingBackend {
+  override async *chat(
+    request: ChatRequest,
+    _session: SessionRecord | null,
+    _signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    this.request = request
+    request.profile_materialization_receipt = testProfileReceipt(request.model, this.name)
+  }
+}
+
+class DelegatedProfileReceiptBackend implements Backend {
+  readonly name = 'sandbox'
+  readonly defaultExecutionTimeoutMs = 0
+  request: ChatRequest | undefined
+
+  matches(model: string): boolean {
+    return model === this.name || model.startsWith(`${this.name}/`)
+  }
+
+  async health(): Promise<BackendHealth> {
+    return { name: this.name, state: 'ready' }
+  }
+
+  async *chat(
+    request: ChatRequest,
+    _session: SessionRecord | null,
+    _signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    this.request = request
+    request.profile_materialization_receipt = testProfileReceipt(request.model, this.name)
+  }
+}
+
+function testProfileReceipt(
+  model: string,
+  harness: string,
+): NonNullable<ChatRequest['profile_materialization_receipt']> {
+  return {
+    schema: 'cli-bridge.profile-materialization.v2',
+    effectiveProfileDigest: `sha256:${'1'.repeat(64)}`,
+    harness,
+    provider: 'test-provider',
+    model,
+    reasoningEffort: { requested: null, applied: null },
+    workspacePlanDigest: `sha256:${'2'.repeat(64)}`,
+    files: [],
+    unsupported: [],
+  }
+}
+
 class BlockingBackend implements Backend {
   readonly name = 'blocking'
   signal: AbortSignal | undefined
@@ -68,11 +132,13 @@ class BlockingBackend implements Backend {
   }
 }
 
-function fixture(backend: Backend): { app: Hono; runs: RunRegistry } {
+function fixture(...backends: Backend[]): { app: Hono; runs: RunRegistry } {
   const runs = new RunRegistry()
   const app = new Hono()
+  const registry = new BackendRegistry()
+  for (const backend of backends) registry.register(backend)
   mountChatCompletions(app, {
-    registry: new BackendRegistry().register(backend),
+    registry,
     sessions: {
       acquireExecution: async () => ({ release: () => {} }),
       get: () => null,
@@ -117,6 +183,72 @@ describe('caller-owned execution timeout', () => {
 
     expect(response.status).toBe(200)
     expect(backend.request?.execution).toEqual({ kind: 'host', timeoutMs: 300_000 })
+  })
+
+  it('preserves a profile acknowledgment across the operator-timeout request copy', async () => {
+    const backend = new ProfileReceiptBackend()
+    const response = await fixture(backend).app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'capture/test',
+        messages: [{ role: 'user', content: 'complete the task' }],
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      profile_materialization: {
+        schema: 'cli-bridge.profile-materialization.v2',
+        model: 'capture/test',
+      },
+    })
+  })
+
+  it('preserves a profile acknowledgment when a materialized backend yields no deltas', async () => {
+    const backend = new SilentProfileReceiptBackend()
+    const response = await fixture(backend).app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'capture/test',
+        messages: [{ role: 'user', content: 'complete the task' }],
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      profile_materialization: {
+        schema: 'cli-bridge.profile-materialization.v2',
+        model: 'capture/test',
+      },
+    })
+  })
+
+  it('preserves a profile acknowledgment across sandbox delegation and a silent backend', async () => {
+    const requested = new CapturingBackend()
+    const sandbox = new DelegatedProfileReceiptBackend()
+    const response = await fixture(requested, sandbox).app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'capture/test',
+        messages: [{ role: 'user', content: 'complete the task' }],
+        agent_profile: { prompt: { systemPrompt: 'Use the exact profile.' } },
+        execution: { kind: 'sandbox' },
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(requested.request).toBeUndefined()
+    expect(sandbox.request?.metadata).toMatchObject({ sandboxBackendType: 'capture' })
+    await expect(response.json()).resolves.toMatchObject({
+      profile_materialization: {
+        schema: 'cli-bridge.profile-materialization.v2',
+        harness: 'sandbox',
+        model: 'capture/test',
+      },
+    })
   })
 
   it('aborts at the requested deadline and reports a typed timeout without wall time', async () => {
