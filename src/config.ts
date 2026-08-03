@@ -12,6 +12,8 @@ import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { assertDockerNetworkName } from './executors/docker-network.js'
 import { formatAllowEntry, parseAllowList } from './jail/net-allowlist.js'
 
+const maxExecutionTimeoutMs = 2_147_483_647
+
 export interface Config {
   host: string
   port: number
@@ -59,7 +61,7 @@ export interface Config {
   sandboxApiKey: string | null
   /** Filesystem dir holding cataloged AgentProfile JSON files (one per profile, filename is the id). */
   sandboxProfilesDir: string
-  /** Per-task timeout sent to sandbox-api `/batch/run`. Default 5min. */
+  /** Operator timeout fallback sent to sandbox-api when the caller omits one. Zero means none. */
   sandboxTimeoutMs: number
   /**
    * Per-backend executor configuration. Every subprocess backend
@@ -248,7 +250,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     )
   }
 
-  const defaultTimeout = Number.parseInt(env.CLI_TIMEOUT_MS ?? '300000', 10)
+  // A caller may own the process deadline through `execution.timeoutMs`.
+  // Operator values are fallbacks only when the request omits that field; no
+  // implicit wall-clock deadline is safer than silently killing valid long work.
+  const defaultTimeout = parseExecutionTimeoutMs('CLI_TIMEOUT_MS', env.CLI_TIMEOUT_MS, 0)
   const executors = parseAllExecutors(env, dataDir)
   const netJailMode = parseNetJailMode(env)
   if (netJailMode !== 'off') assertNetJailEnforceable(backends, executors)
@@ -260,15 +265,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir,
     backends,
     claudeBin: env.CLAUDE_BIN ?? 'claude',
-    claudeTimeoutMs: Number.parseInt(env.CLAUDE_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    claudeTimeoutMs: parseExecutionTimeoutMs('CLAUDE_TIMEOUT_MS', env.CLAUDE_TIMEOUT_MS, defaultTimeout),
     codexBin: env.CODEX_BIN ?? 'codex',
-    codexTimeoutMs: Number.parseInt(env.CODEX_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    codexTimeoutMs: parseExecutionTimeoutMs('CODEX_TIMEOUT_MS', env.CODEX_TIMEOUT_MS, defaultTimeout),
     opencodeBin: env.OPENCODE_BIN ?? 'opencode',
-    opencodeTimeoutMs: Number.parseInt(env.OPENCODE_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    opencodeTimeoutMs: parseExecutionTimeoutMs('OPENCODE_TIMEOUT_MS', env.OPENCODE_TIMEOUT_MS, defaultTimeout),
     kimiBin: env.KIMI_BIN ?? 'kimi',
-    kimiTimeoutMs: Number.parseInt(env.KIMI_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    kimiTimeoutMs: parseExecutionTimeoutMs('KIMI_TIMEOUT_MS', env.KIMI_TIMEOUT_MS, defaultTimeout),
     geminiBin: env.GEMINI_BIN ?? 'gemini',
-    geminiTimeoutMs: Number.parseInt(env.GEMINI_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    geminiTimeoutMs: parseExecutionTimeoutMs('GEMINI_TIMEOUT_MS', env.GEMINI_TIMEOUT_MS, defaultTimeout),
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
     forgeBin: env.FORGE_BIN ?? 'forge',
@@ -276,7 +281,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     nanoclawSocket: env.NANOCLAW_SOCKET ?? '',
     piBin: env.PI_BIN ?? 'pi',
-    piTimeoutMs: Number.parseInt(env.PI_TIMEOUT_MS ?? String(defaultTimeout), 10),
+    piTimeoutMs: parseExecutionTimeoutMs('PI_TIMEOUT_MS', env.PI_TIMEOUT_MS, defaultTimeout),
     cliTimeoutMsDefault: defaultTimeout,
     admission: {
       maxActive: parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8),
@@ -291,7 +296,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxApiUrl: env.SANDBOX_API_URL?.trim() || null,
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
-    sandboxTimeoutMs: Number.parseInt(env.SANDBOX_TIMEOUT_MS ?? '300000', 10),
+    sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
     executors,
     jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
@@ -410,6 +415,22 @@ function parseNonNegativeInt(value: string | undefined, fallback: number): numbe
   const parsed = Number.parseInt(value, 10)
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`invalid non-negative integer: ${value}`)
+  }
+  return parsed
+}
+
+function parseExecutionTimeoutMs(
+  key: string,
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (value === undefined || value === '') return fallback
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`invalid ${key}: expected an integer from 0 to ${maxExecutionTimeoutMs}`)
+  }
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed > maxExecutionTimeoutMs) {
+    throw new Error(`invalid ${key}: expected an integer from 0 to ${maxExecutionTimeoutMs}`)
   }
   return parsed
 }

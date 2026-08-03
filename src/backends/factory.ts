@@ -42,8 +42,10 @@ export interface FactoryBackendOptions {
 
 export class FactoryBackend implements Backend {
   readonly name = 'factory'
+  readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
   constructor(private readonly opts: FactoryBackendOptions) {
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? hostSpawner
   }
 
@@ -99,7 +101,6 @@ export class FactoryBackend implements Backend {
     const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.opts.timeoutMs)
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -173,7 +174,6 @@ export class FactoryBackend implements Backend {
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       await terminateSpawned(spawned)
       releaseSpawner()

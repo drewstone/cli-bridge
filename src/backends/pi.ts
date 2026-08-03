@@ -317,9 +317,11 @@ export function piMcpAdapterAvailable(): boolean {
 
 export class PiBackend implements Backend {
   readonly name = 'pi'
+  readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
 
   constructor(private readonly opts: PiBackendOptions) {
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? scopedHostSpawner
   }
 
@@ -438,8 +440,7 @@ export class PiBackend implements Backend {
     const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-    // Group-kill on timeout/abort — see backends/opencode.ts.
-    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.opts.timeoutMs)
+    // The durable run owns the deadline and delivers it through this signal.
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -579,7 +580,6 @@ export class PiBackend implements Backend {
       }
 
       const exitCode = await waitForProcessClose(child)
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
 
@@ -630,7 +630,6 @@ export class PiBackend implements Backend {
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
       }
     } finally {
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree before releasing the slot.
       await terminateSpawned(spawned)

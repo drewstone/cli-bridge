@@ -17,7 +17,10 @@ export interface AmpBackendOptions {
 
 export class AmpBackend implements Backend {
   readonly name = 'amp'
-  constructor(private readonly opts: AmpBackendOptions) {}
+  readonly defaultExecutionTimeoutMs: number
+  constructor(private readonly opts: AmpBackendOptions) {
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
+  }
 
   matches(model: string): boolean {
     const m = model.toLowerCase()

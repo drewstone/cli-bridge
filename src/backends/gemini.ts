@@ -35,9 +35,11 @@ export interface GeminiBackendOptions {
 
 export class GeminiBackend implements Backend {
   readonly name = 'gemini'
+  readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
 
   constructor(private readonly opts: GeminiBackendOptions) {
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? hostSpawner
   }
 
@@ -98,7 +100,6 @@ export class GeminiBackend implements Backend {
     const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.opts.timeoutMs)
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -182,7 +183,6 @@ export class GeminiBackend implements Backend {
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }
     } finally {
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       await terminateSpawned(spawned)
       releaseSpawner()

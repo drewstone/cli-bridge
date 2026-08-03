@@ -22,9 +22,10 @@ import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
   type SessionExecutionLease,
+  type SessionRecord,
   type SessionStore,
 } from '../sessions/store.js'
-import type { ChatDelta, ChatRequest } from '../backends/types.js'
+import type { Backend, ChatDelta, ChatRequest } from '../backends/types.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
@@ -63,6 +64,11 @@ const durableRunIdSchema = z
     /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u,
     'run id must be URL-safe: letters, digits, dot, underscore, colon, or hyphen',
   )
+
+// Node timers above this value overflow to an almost-immediate callback. This
+// is the implementation limit, not a product policy; omitting the field means
+// no deadline.
+const maxExecutionTimeoutMs = 2_147_483_647
 
 const chatRequestSchema = z.object({
   model: z.string().min(1),
@@ -212,8 +218,70 @@ const chatRequestSchema = z.object({
       mode: z.enum(['off', 'net-jail']).optional(),
       allow: z.array(z.string()).optional(),
     }).optional(),
+    timeoutMs: z.number().int().positive().max(maxExecutionTimeoutMs).optional(),
   }).optional(),
 })
+
+/**
+ * Run one backend against the caller's deadline. Backend configuration is only
+ * a fallback for direct bridge clients that omitted `execution.timeoutMs`;
+ * an explicit caller value always wins. The derived signal belongs to the
+ * durable run, not its current HTTP reader, so disconnect/replay cannot cancel
+ * or restart the process.
+ */
+function backendChatWithDeadline(
+  backend: Backend,
+  request: ChatRequest,
+  session: SessionRecord | null,
+  runSignal: AbortSignal,
+): AsyncIterable<ChatDelta> {
+  const timeoutMs = request.execution?.timeoutMs ?? backend.defaultExecutionTimeoutMs ?? 0
+  if (timeoutMs === 0) return backend.chat(request, session, runSignal)
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maxExecutionTimeoutMs) {
+    throw new BackendError(
+      `${backend.name} execution timeout must be an integer from 1 to ${maxExecutionTimeoutMs}ms`,
+      'not_configured',
+    )
+  }
+
+  const execution = request.execution ?? { kind: 'host' as const }
+  const effectiveRequest: ChatRequest = {
+    ...request,
+    execution: { ...execution, timeoutMs },
+  }
+
+  return {
+    async *[Symbol.asyncIterator](): AsyncIterator<ChatDelta> {
+      const controller = new AbortController()
+      const timeoutError = new BackendError(
+        `${backend.name} execution timed out after ${timeoutMs}ms`,
+        'timeout',
+      )
+      let timedOut = false
+      const onRunAbort = (): void => controller.abort(runSignal.reason)
+      if (runSignal.aborted) onRunAbort()
+      else runSignal.addEventListener('abort', onRunAbort, { once: true })
+      const timer = setTimeout(() => {
+        timedOut = true
+        controller.abort(timeoutError)
+      }, timeoutMs)
+
+      try {
+        for await (const delta of backend.chat(effectiveRequest, session, controller.signal)) {
+          if (timedOut) throw timeoutError
+          yield delta
+        }
+        if (timedOut) throw timeoutError
+      } catch (error) {
+        if (timedOut) throw timeoutError
+        throw error
+      } finally {
+        clearTimeout(timer)
+        runSignal.removeEventListener('abort', onRunAbort)
+      }
+    },
+  }
+}
 
 export function mountChatCompletions(
   app: Hono,
@@ -463,7 +531,7 @@ export function mountChatCompletions(
             sandboxBackendType,
           },
         }
-        makeSource = (run) => sandboxBackend.chat(delegatedReq, session, run.signal)
+        makeSource = (run) => backendChatWithDeadline(sandboxBackend, delegatedReq, session, run.signal)
       } else {
         // Host execution: resolve the write-jail spec from execution.jail
         // (host variant) layered over the BRIDGE_JAIL_* env defaults, using
@@ -485,7 +553,7 @@ export function mountChatCompletions(
           // a queued job before it ever acquires a process slot.
           admissionLease = await deps.admission.acquire(run.signal)
         }
-        makeSource = (run) => backend.chat(req, session, run.signal)
+        makeSource = (run) => backendChatWithDeadline(backend, req, session, run.signal)
       }
 
       // Approximate input size once (content + tool-call structures), for backends that

@@ -75,6 +75,15 @@ function parseEnvPositiveInt(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
+function parseEnvNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  if (!/^\d+$/.test(raw)) throw new Error(`invalid ${name}: expected a non-negative integer`)
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value)) throw new Error(`invalid ${name}: expected a non-negative integer`)
+  return value
+}
+
 export interface BuildAppExtras {
   /** Disposers to await on graceful shutdown — pool teardown lives here. */
   shutdownHooks: Array<() => Promise<void>>
@@ -191,7 +200,7 @@ async function buildExecutorForBackend(
   const cpus = process.env.BRIDGE_POOL_CPUS || '2'
   const maxQueueDepth = parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4)
   const acquireDeadlineMs = parseEnvPositiveInt('BRIDGE_POOL_ACQUIRE_DEADLINE_MS', 60_000)
-  const slotMaxHoldMs = parseEnvPositiveInt('BRIDGE_SLOT_MAX_HOLD_MS', 600_000)
+  const slotMaxHoldMs = parseEnvNonNegativeInt('BRIDGE_SLOT_MAX_HOLD_MS', 0)
   const pool = await ContainerPool.create({
     size: cfg.poolSize,
     image: cfg.image,
@@ -235,7 +244,8 @@ async function buildExecutorForBackend(
   })
   console.log(
     `[${cfg.name}-pool] caps memory=${memory} cpus=${cpus} queue=${maxQueueDepth} ` +
-      `acquire-deadline=${acquireDeadlineMs}ms slot-hold=${slotMaxHoldMs}ms`,
+      `acquire-deadline=${acquireDeadlineMs}ms ` +
+        `slot-hold=${slotMaxHoldMs === 0 ? 'disabled' : `${slotMaxHoldMs}ms`}`,
   )
   registerPoolForMetrics(cfg.name, pool)
   extras.shutdownHooks.push(() => pool.destroy())
@@ -580,8 +590,8 @@ export async function startServer(): Promise<void> {
   // audit runs that stream tool_use deltas for 10–30 min get severed
   // mid-flight by that ceiling; without this bump every long run dies
   // at 300_700ms and the caller sees a truncated SSE stream with no
-  // final stop event. 0 = no per-request ceiling — the per-backend
-  // CLI_TIMEOUT_MS still bounds the underlying subprocess.
+  // final stop event. 0 = no transport ceiling. The durable run's
+  // execution.timeoutMs (or an explicit operator fallback) owns the process deadline.
   ;(server as { requestTimeout?: number }).requestTimeout = 0
   ;(server as { headersTimeout?: number }).headersTimeout = 0
 

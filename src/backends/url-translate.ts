@@ -293,10 +293,12 @@ function reassembleHtml(html: string, translatedSegments: string[], placeholderM
 
 export class UrlTranslateBackend implements Backend {
   readonly name = 'url-translate'
+  readonly defaultExecutionTimeoutMs: number
   private readonly opts: UrlTranslateBackendOptions
 
   constructor(opts: UrlTranslateBackendOptions) {
     this.opts = opts
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
   }
 
   matches(model: string): boolean {

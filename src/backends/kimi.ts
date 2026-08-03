@@ -65,11 +65,13 @@ export interface KimiBackendOptions {
 
 export class KimiBackend implements Backend {
   readonly name: string
+  readonly defaultExecutionTimeoutMs: number
   private readonly prefix: string
   private readonly spawner: Spawner
 
   constructor(private readonly opts: KimiBackendOptions) {
     this.name = opts.harness ?? 'kimi-code'
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.prefix = `${this.name}/`
     this.spawner = opts.spawner ?? scopedHostSpawner
   }
@@ -162,7 +164,6 @@ export class KimiBackend implements Backend {
 
     // Tear down the whole process group (kimi + every tool/MCP subprocess
     // it forks). See backends/opencode.ts for the rationale.
-    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.opts.timeoutMs)
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -351,7 +352,6 @@ export class KimiBackend implements Backend {
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       // Always tear down the whole subtree (kimi + any MCP/tool forks)
       // before releasing the slot. Idempotent; waits for actual exit.

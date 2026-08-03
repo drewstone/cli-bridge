@@ -174,6 +174,8 @@ export interface ChatRequest {
          */
         jail?: { mode?: 'off' | 'write-jail'; root?: string }
         netJail?: NetJailRequest
+        /** Caller-owned process deadline. Omit to allow the operator fallback, if configured. */
+        timeoutMs?: number
       }
     | {
         kind: 'sandbox'
@@ -185,6 +187,8 @@ export interface ChatRequest {
         // reaches the gate and is REFUSED by name. Dropping it from the type
         // would make the request parse and the requirement disappear.
         netJail?: NetJailRequest
+        /** Caller-owned task deadline. Omit to allow the operator fallback, if configured. */
+        timeoutMs?: number
       }
   /**
    * Resolved write-jail spec for this turn, set by the chat route from
@@ -289,6 +293,8 @@ export interface BackendHealth {
 
 export interface Backend {
   readonly name: string
+  /** Operator-selected fallback used only when `execution.timeoutMs` is absent. Zero/absent means no deadline. */
+  readonly defaultExecutionTimeoutMs?: number
 
   /** Does this backend want to handle requests for `model`? */
   matches(model: string): boolean
