@@ -123,19 +123,18 @@ export async function copyAuthIntoJail(
     for (const { source, jailRel } of sources ?? []) {
       if (!existsSync(source)) continue
       const dest = resolveJailRoot(jailRel, root)
-      if (options.replace !== false) {
-        await rm(dest, { recursive: true, force: true })
-      }
-      // Track the destination before copying so an interrupted/failed copy is
-      // removed too; otherwise a partial credential tree could remain in the
-      // project-local jail root even though wrap() never returned a cleanup.
-      copied.push(dest)
+      // Request-unique writable copies cannot be shared, so track them before
+      // copying and remove even a partial tree after failure. Stable macOS auth
+      // paths can be shared by concurrent runs: preserve the established
+      // in-place copy behavior and never delete another run's live directory.
+      if (options.replace === false) copied.push(dest)
       await cp(source, dest, {
         recursive: true,
         force: options.replace !== false,
         errorOnExist: options.replace === false,
       })
       await chmod(dest, 0o700)
+      if (options.replace !== false) copied.push(dest)
     }
     return copied
   } catch (error) {
