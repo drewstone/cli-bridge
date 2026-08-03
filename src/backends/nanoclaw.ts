@@ -60,15 +60,26 @@ export class NanoclawBackend implements Backend {
     return model === this.name || model.startsWith(`${this.name}/`)
   }
 
-  async health(): Promise<BackendHealth> {
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
     if (!this.socketPath) return { name: this.name, state: 'unavailable', detail: 'NANOCLAW_SOCKET not set' }
     return new Promise<BackendHealth>((resolve) => {
       const s = net.connect(this.socketPath)
-      const done = (h: BackendHealth): void => { try { s.destroy() } catch { /* ignore */ } resolve(h) }
-      const t = setTimeout(() => done({ name: this.name, state: 'error', detail: 'connect timed out' }), 3000)
-      s.on('connect', () => { clearTimeout(t); done({ name: this.name, state: 'ready', version: `nanoclaw @ ${this.socketPath}` }) })
+      let settled = false
+      let timer: ReturnType<typeof setTimeout>
+      const onAbort = (): void => done({ name: this.name, state: 'error', detail: 'health probe cancelled' })
+      const done = (h: BackendHealth): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        try { s.destroy() } catch { /* ignore */ }
+        resolve(h)
+      }
+      timer = setTimeout(() => done({ name: this.name, state: 'error', detail: 'connect timed out' }), 3000)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
+      s.on('connect', () => { done({ name: this.name, state: 'ready', version: `nanoclaw @ ${this.socketPath}` }) })
       s.on('error', (e: NodeJS.ErrnoException) => {
-        clearTimeout(t)
         const offline = e.code === 'ENOENT' || e.code === 'ECONNREFUSED'
         done({ name: this.name, state: 'unavailable', detail: offline ? 'nanoclaw daemon not running' : e.message })
       })

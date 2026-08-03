@@ -36,6 +36,8 @@ import { PassThrough, Readable } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
 import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
+
+const TEST_RESOURCE_OWNER = '1'.repeat(64)
 import { loadConfig } from '../src/config.js'
 import { ContainerPool } from '../src/executors/container-pool.js'
 import { assertDockerWorkspaceCwd, createDockerSpawner, terminateDockerExecution } from '../src/executors/docker.js'
@@ -76,6 +78,17 @@ const DIAGNOSIS =
   `pool container 58b95fdb3ab6 no longer exists, so the CLI never started ` +
   `— exit 1 came from docker exec, not from opencode.`
 
+function ownershipInspect(
+  args: string[],
+  exists: (name: string) => boolean,
+): { code: number; stdout: string; stderr: string } | null {
+  if (args[0] !== 'container' || args[1] !== 'inspect') return null
+  const name = args[args.length - 1]!
+  return exists(name)
+    ? { code: 0, stdout: `${TEST_RESOURCE_OWNER}\n`, stderr: '' }
+    : { code: 1, stdout: '', stderr: `Error: No such container: ${name}` }
+}
+
 /**
  * A docker-style executor lease whose container was removed between acquire and
  * exec. The diagnosis text is supplied directly here; the real prober that
@@ -105,6 +118,8 @@ function poolDocker(): {
   const alive = new Set<string>()
   return {
     cli: async (args) => {
+      const ownership = ownershipInspect(args, (id) => alive.has(id))
+      if (ownership) return ownership
       if (args[0] === 'run') {
         state.runs += 1
         const id = `container-${state.runs}`
@@ -256,7 +271,7 @@ describe('defect 3 — the credential mount target follows the configured HOME',
 describe('defect 2 — a slot whose container vanished is recreated, not poisoned', () => {
   it('hands out a NEW container after the old one is removed outside the bridge', async () => {
     const docker = poolDocker()
-    const pool = await ContainerPool.create({ ...basePool, cli: docker.cli, livenessTtlMs: 0 })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli, livenessTtlMs: 0 })
 
     const first = await pool.acquire()
     expect(first.containerId).toBe('container-1')
@@ -279,7 +294,7 @@ describe('defect 2 — a slot whose container vanished is recreated, not poisone
 
   it('reportContainerUnusable heals the slot even when liveness is still trusted', async () => {
     const docker = poolDocker()
-    const pool = await ContainerPool.create({ ...basePool, cli: docker.cli, livenessTtlMs: 10 * 60_000 })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli, livenessTtlMs: 10 * 60_000 })
     const first = await pool.acquire()
     expect(first.containerId).toBe('container-1')
     first.release()
@@ -295,7 +310,7 @@ describe('defect 2 — a slot whose container vanished is recreated, not poisone
 
   it('ignores a report for a container it no longer owns', async () => {
     const docker = poolDocker()
-    const pool = await ContainerPool.create({ ...basePool, cli: docker.cli })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli })
     await expect(pool.reportContainerUnusable('some-other-container')).resolves.toBeUndefined()
     expect(docker.counters().runs).toBe(1)
     await pool.destroy()
@@ -303,7 +318,7 @@ describe('defect 2 — a slot whose container vanished is recreated, not poisone
 
   it('checks liveness once per TTL — free on the warm path, guaranteed once it expires', async () => {
     const docker = poolDocker()
-    const warm = await ContainerPool.create({ ...basePool, cli: docker.cli, livenessTtlMs: 60_000 })
+    const warm = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli, livenessTtlMs: 60_000 })
     const before = docker.counters().inspects
     for (let i = 0; i < 5; i++) {
       const slot = await warm.acquire()
@@ -315,7 +330,7 @@ describe('defect 2 — a slot whose container vanished is recreated, not poisone
 
     // With the TTL expired, liveness MUST be re-established — that check is the
     // only thing between a swept container and a ten-day-stale verdict.
-    const checked = await ContainerPool.create({ ...basePool, cli: docker.cli, livenessTtlMs: 0 })
+    const checked = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli, livenessTtlMs: 0 })
     const inspectsBefore = docker.counters().inspects
     const slot = await checked.acquire()
     expect(docker.counters().inspects).toBeGreaterThan(inspectsBefore)
@@ -328,17 +343,23 @@ describe('defect 2 — a slot whose container vanished is recreated, not poisone
 
 describe('defect 1 — provisioning failures name the IMAGE and its build command', () => {
   it('names the image, not a container, when the first provision fails', async () => {
-    const cli = async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => (args[0] === 'run'
-      ? { code: 125, stdout: '', stderr: 'docker: Error response from daemon: pull access denied for cli-bridge-cli-runtime, repository does not exist' }
-      : { code: 0, stdout: '', stderr: '' })
-    await expect(ContainerPool.create({ ...basePool, cli }))
+    const cli = async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      const ownership = ownershipInspect(args, () => false)
+      if (ownership) return ownership
+      return args[0] === 'run'
+        ? { code: 125, stdout: '', stderr: 'docker: Error response from daemon: pull access denied for cli-bridge-cli-runtime, repository does not exist' }
+        : { code: 0, stdout: '', stderr: '' }
+    }
+    await expect(ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli }))
       .rejects.toThrow(/image cli-bridge-cli-runtime:latest is not available on this host\. Build it: pnpm run docker:build:runtime/)
-    await expect(ContainerPool.create({ ...basePool, cli })).rejects.not.toThrow(/No such container/)
+    await expect(ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli })).rejects.not.toThrow(/No such container/)
   })
 
   it('surfaces the build command when a vanished slot cannot be rebuilt', async () => {
     let runs = 0
     const cli = async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      const ownership = ownershipInspect(args, (name) => name === 'container-1')
+      if (ownership) return ownership
       if (args[0] === 'run') {
         runs += 1
         if (runs === 1) return { code: 0, stdout: 'container-1\n', stderr: '' }
@@ -347,7 +368,7 @@ describe('defect 1 — provisioning failures name the IMAGE and its build comman
       if (args[0] === 'inspect') return { code: 1, stdout: '', stderr: 'Error: No such object' }
       return { code: 0, stdout: '', stderr: '' }
     }
-    const pool = await ContainerPool.create({ ...basePool, cli, livenessTtlMs: 0 })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli, livenessTtlMs: 0 })
     await expect(pool.acquire()).rejects.toThrow(/image cli-bridge-cli-runtime:latest is not available on this host/)
     await expect(pool.acquire()).rejects.toThrow(/pnpm run docker:build:runtime/)
     await pool.destroy()
@@ -360,6 +381,8 @@ describe('defect 1 — provisioning failures name the IMAGE and its build comman
     // slot as busy until the 10-minute hold watchdog fired.
     let runs = 0
     const cli = async (args: string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      const ownership = ownershipInspect(args, (name) => /^container-[12]$/u.test(name))
+      if (ownership) return ownership
       if (args[0] === 'run') {
         runs += 1
         if (runs <= 2) return { code: 0, stdout: `container-${runs}\n`, stderr: '' }
@@ -368,7 +391,7 @@ describe('defect 1 — provisioning failures name the IMAGE and its build comman
       if (args[0] === 'inspect') return { code: 0, stdout: 'true\n', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
-    const pool = await ContainerPool.create({
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       ...basePool, size: 2, cli, livenessTtlMs: 60_000, slotMaxHoldMs: 50, maxConsecutiveFailures: 1,
     })
     const a = await pool.acquire()
@@ -524,12 +547,14 @@ describe('defect 2 — a holder that cannot terminate its container hands the sl
     // Let the termination attempt, the recycle and the release settle.
     for (let i = 0; i < 8; i++) await new Promise<void>((r) => setImmediate(r))
     expect(recycled).toBe('held-container')
-    expect(releases).toBe(1)
+    // recycleHeldSlot owns the BUSY slot and replaces it atomically. Calling
+    // the stale lease's release afterward would make the dead id routable.
+    expect(releases).toBe(0)
   })
 
   it('recycleHeldSlot replaces a BUSY slot and returns it free', async () => {
     const docker = poolDocker()
-    const pool = await ContainerPool.create({ ...basePool, cli: docker.cli, livenessTtlMs: 10 * 60_000 })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli, livenessTtlMs: 10 * 60_000 })
     const held = await pool.acquire()
     expect(pool.snapshot().in_flight).toBe(1)
 
@@ -607,7 +632,11 @@ describe('defect 2 — a failing backend is retried, and a cached verdict says s
         : { name: 'opencode', state: 'ready', version: '1.18.9' }
     }))
     // A generous TTL: pre-fix this is exactly the window that froze the verdict.
-    mountHealth(app, { registry }, { cacheMs: 60_000, probe: (b) => b.health() })
+    mountHealth(app, { registry }, {
+      cacheMs: 60_000,
+      failureRetryBackoffMs: 0,
+      probe: (b) => b.health(),
+    })
 
     const first = await (await app.request('/health')).json() as HealthBody
     expect(first.status).toBe('degraded')

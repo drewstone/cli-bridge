@@ -59,11 +59,12 @@ export class SandboxBackend implements Backend {
     return m === HARNESS || m.startsWith(PREFIX)
   }
 
-  async health(): Promise<BackendHealth> {
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
     try {
       const fetchImpl = this.opts.fetchImpl ?? fetch
       const res = await fetchImpl(`${this.opts.apiUrl.replace(/\/+$/, '')}/health`, {
         headers: { Authorization: `Bearer ${this.opts.apiKey}` },
+        signal,
       })
       if (res.ok) return { name: this.name, state: 'ready' }
       return { name: this.name, state: 'error', detail: `health ${res.status}` }

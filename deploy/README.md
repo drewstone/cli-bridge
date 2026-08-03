@@ -61,7 +61,11 @@ sudo mkdir -p /srv/cli-bridge
 sudo chown $USER:$USER /srv/cli-bridge
 git clone https://github.com/drewstone/cli-bridge.git /srv/cli-bridge
 cd /srv/cli-bridge
-pnpm install --prod
+pnpm install --frozen-lockfile --ignore-scripts=false
+node -e "const Database = require('better-sqlite3'); new Database(':memory:').close()"
+pnpm build
+/usr/bin/node -e "if (Number(process.versions.node.split('.')[0]) < 22) process.exit(1)"
+test -x dist/cli.js
 cp .env.example .env
 # edit .env
 
@@ -94,12 +98,20 @@ curl -sS http://127.0.0.1:3344/v1/chat/completions \
 ```bash
 cd /srv/cli-bridge
 git pull
-pnpm install
+pnpm install --frozen-lockfile --ignore-scripts=false
+node -e "const Database = require('better-sqlite3'); new Database(':memory:').close()"
+pnpm build
+test -x dist/cli.js
 # Docker:
 docker compose -f docker/compose.yml up -d --build
 # systemd:
 sudo systemctl restart cli-bridge@$USER
 ```
+
+The source checkout does not track `dist/`.
+The build must finish before the service starts or restarts; `pnpm source-install:check` reproduces the clean-checkout install and direct `node dist/cli.js` startup in a temporary directory.
+Keep `--ignore-scripts=false` even on hosts whose global pnpm configuration disables scripts; this repository's allowlist limits builds to `better-sqlite3` and `esbuild`, and the next command proves SQLite loaded before the service can restart.
+Do not run `pnpm prune --prod` after the build: pnpm can replace the compiled `better-sqlite3` package without rebuilding its native binary, leaving a service that installs successfully and crashes before binding its port.
 
 ## Gotchas
 

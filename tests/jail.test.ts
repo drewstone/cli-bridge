@@ -15,10 +15,12 @@
  *   - resolveJailSpec: null when off; root clamped inside cwd.
  */
 
-import { existsSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   LinuxBwrapJail,
@@ -210,10 +212,16 @@ describe('MacosSeatbeltJail.wrap', () => {
 
     const profilePath = wrap.args[1]
     expect(profilePath, 'profile path arg present').toBeDefined()
+    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
+    const privateHome = wrap.env?.HOME
+    expect(privateHome).toBeDefined()
+    expect(dirname(privateHome!)).toBe(expectedRoot)
+    expect(privateHome).toContain('/.cli-bridge-jail-home-')
+    expect(statSync(privateHome!).mode & 0o777).toBe(0o700)
 
     // sandbox-exec is invoked with the profile then the original command.
     expect(wrap.args.slice(-3)).toEqual(['/bin/sh', '-c', 'echo hi'])
-    expect(wrap.args).toContain(`HOME=${root}`)
+    expect(wrap.args).toContain(`HOME=${privateHome}`)
 
     const profile = await readFile(profilePath as string, 'utf8')
     expect(profile).toContain('(deny file-write* (subpath "/"))')
@@ -227,14 +235,68 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(profile).toContain('(literal "/dev/null")')
 
     // The root is canonicalized (realpath) before embedding in the profile.
-    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
     expect(profile).toContain(`(subpath "${expectedRoot}")`)
+    expect(profile).toContain(`(subpath "${privateHome}")`)
 
     // sandbox-exec does not rewrite the child env, so the wrapper MUST return
     // HOME + XDG pointing into the jail (else stateful CLIs write to real $HOME).
-    expect(wrap.env?.HOME).toBe(expectedRoot)
-    expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(expectedRoot, '.config'))
-    expect(wrap.env?.XDG_CACHE_HOME).toBe(join(expectedRoot, '.cache'))
+    expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(privateHome!, '.config'))
+    expect(wrap.env?.XDG_CACHE_HOME).toBe(join(privateHome!, '.cache'))
+  })
+
+  it('reaps the private profile and copied-auth home after an uncatchable process death', async () => {
+    const dir = await tempProjectDir()
+    const projectDir = join(dir, 'project')
+    const isolatedTmp = join(dir, 'tmp')
+    const isolatedHome = join(dir, 'host-home')
+    const marker = join(dir, 'roots.json')
+    await mkdir(projectDir, { recursive: true, mode: 0o700 })
+    await mkdir(isolatedTmp, { mode: 0o700 })
+    await mkdir(isolatedHome, { mode: 0o700 })
+    const isolatedEnv = {
+      ...process.env,
+      HOME: isolatedHome,
+      TMPDIR: isolatedTmp,
+      TMP: isolatedTmp,
+      TEMP: isolatedTmp,
+    }
+    const tsx = join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs')
+    const jailUrl = pathToFileURL(join(process.cwd(), 'src', 'jail', 'macos-seatbelt.ts')).href
+    const reaperUrl = pathToFileURL(join(process.cwd(), 'src', 'runtime', 'private-temporary.ts')).href
+    const source = [
+      `import { writeFileSync } from 'node:fs'`,
+      `import { dirname, join } from 'node:path'`,
+      `import { MacosSeatbeltJail } from ${JSON.stringify(jailUrl)}`,
+      `void (async () => {`,
+      `const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], { root: join(${JSON.stringify(projectDir)}, '.agent-home'), projectDir: ${JSON.stringify(projectDir)} })`,
+      `writeFileSync(${JSON.stringify(marker)}, JSON.stringify([dirname(wrap.args[1]), wrap.env?.HOME]))`,
+      `process.kill(process.pid, 'SIGKILL')`,
+      `})().catch(error => { console.error(error); process.exitCode = 1 })`,
+    ].join(';')
+    const child = spawnSync(process.execPath, [tsx, '-e', source], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: isolatedEnv,
+    })
+    expect(child.status).not.toBe(0)
+    const roots = JSON.parse(readFileSync(marker, 'utf8')) as string[]
+    expect(roots).toHaveLength(2)
+    for (const root of roots) {
+      expect(existsSync(root)).toBe(true)
+      expect(statSync(root).mode & 0o777).toBe(0o700)
+    }
+
+    const reaper = spawnSync(process.execPath, [tsx, '-e', [
+      `import { reapStalePrivateTemporaryRoots } from ${JSON.stringify(reaperUrl)}`,
+      `process.stdout.write(String(reapStalePrivateTemporaryRoots()))`,
+    ].join(';')], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: isolatedEnv,
+    })
+    expect(reaper.status, reaper.stderr).toBe(0)
+    expect(Number(reaper.stdout)).toBeGreaterThanOrEqual(2)
+    for (const root of roots) expect(existsSync(root)).toBe(false)
   })
 })
 
@@ -349,7 +411,7 @@ describe('auth preservation', () => {
   })
 
   it('bwrap read-only-binds an auth source into the jail HOME at its relative path', async () => {
-    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-authtest-'))
+    const authDir = await mkdtemp(join(tmpdir(), 'cli-bridge-authtest-'))
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
     const projectDir = await tempProjectDir()
     const root = join(projectDir, '.agent-home')
@@ -366,7 +428,7 @@ describe('auth preservation', () => {
   })
 
   it('bwrap redirects an auth env var (CODEX_HOME) at the in-jail copy — only when it wraps', async () => {
-    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexauth-'))
+    const authDir = await mkdtemp(join(tmpdir(), 'cli-bridge-codexauth-'))
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
     const projectDir = await tempProjectDir()
     const root = join(projectDir, '.agent-home')
@@ -384,7 +446,7 @@ describe('auth preservation', () => {
   })
 
   it('seatbelt returns an auth env var (CODEX_HOME) pointing at the in-jail copy', async () => {
-    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexauth-'))
+    const authDir = await mkdtemp(join(tmpdir(), 'cli-bridge-codexauth-'))
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
     const projectDir = await tempProjectDir()
     const root = join(projectDir, '.agent-home')
@@ -394,8 +456,8 @@ describe('auth preservation', () => {
       authSources: [{ source: authDir, jailRel: '.codex', envVar: 'CODEX_HOME' }],
     })
     if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
-    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
-    expect(wrap.env?.CODEX_HOME).toBe(join(expectedRoot, '.codex'))
+    expect(wrap.env?.HOME).toContain(`${await realpath(resolveJailRoot(root, projectDir))}/.cli-bridge-jail-home-`)
+    expect(wrap.env?.CODEX_HOME).toBe(join(wrap.env!.HOME!, '.codex'))
   })
 })
 

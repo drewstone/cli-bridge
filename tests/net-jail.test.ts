@@ -17,6 +17,8 @@ import { execFile } from 'node:child_process'
 import { connect } from 'node:net'
 import { promisify } from 'node:util'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+const TEST_RESOURCE_OWNER = '4'.repeat(64)
 import { loadConfig } from '../src/config.js'
 import { canonicalAllowList, modelEndpointsFor, parseAllowEntry, parseAllowList } from '../src/jail/net-allowlist.js'
 import { resolveNetJailSpec } from '../src/jail/resolve-net-spec.js'
@@ -324,7 +326,7 @@ describe('net-jail enforcement on real Docker', () => {
       return
     }
     available = true
-    provision = await provisionNetJail({ backend: 'test', namePrefix, image, allow })
+    provision = await provisionNetJail({ resourceOwner: TEST_RESOURCE_OWNER, backend: 'test', namePrefix, image, allow })
     gateway = await networkGateway(provision.network)
   }, 300_000)
 
@@ -439,7 +441,7 @@ describe('net-jail enforcement on real Docker', () => {
    */
   it('re-arms a restarted slot before the next request can use it, so a worker cannot un-jail itself', async () => {
     if (!available) return
-    const pool = await ContainerPool.create({
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1,
       image,
       namePrefix: `${namePrefix}-slot`,
@@ -449,7 +451,7 @@ describe('net-jail enforcement on real Docker', () => {
       afterCreate: (id, i) => provision!.applyFilter(id, `slot ${i}`),
     })
     try {
-      const containerId = pool.liveContainerIds()[0]!
+      const { containerId } = pool.liveContainerIds()[0]!
       // Half one: Docker must not be able to revive this container behind the
       // pool's back, because a revival is a restart nobody re-armed.
       expect(await inspectField(containerId, '{{.HostConfig.RestartPolicy.Name}}')).toBe('no')
@@ -481,7 +483,7 @@ describe('net-jail enforcement on real Docker', () => {
     // is the configuration that leaked: an airtight jail, one worker-triggerable
     // restart, and nothing that puts the filter back. If provisioning succeeds
     // here, the restart check is decoration and the round-three fix is unproven.
-    await expect(provisionNetJail({
+    await expect(provisionNetJail({ resourceOwner: TEST_RESOURCE_OWNER,
       backend: 'test-restart-unarmed',
       namePrefix: `${namePrefix}-restart`,
       image,
@@ -495,7 +497,7 @@ describe('net-jail enforcement on real Docker', () => {
     // Same code path, one primitive removed. If this passes provisioning, the
     // verification step is decoration and every green run above means nothing.
     const leakyCli: DockerCli = (args, opts) => dockerCli(args.filter((a) => a !== '--internal'), opts)
-    await expect(provisionNetJail({
+    await expect(provisionNetJail({ resourceOwner: TEST_RESOURCE_OWNER,
       backend: 'test-leaky',
       namePrefix: `${namePrefix}-leaky`,
       image,
@@ -510,7 +512,7 @@ describe('net-jail enforcement on real Docker', () => {
     // configuration that shipped and leaked: an `--internal` network whose
     // members still have the Docker host on-link. If provisioning succeeds
     // here, verifyNetJail is decoration and every green test above is noise.
-    await expect(provisionNetJail({
+    await expect(provisionNetJail({ resourceOwner: TEST_RESOURCE_OWNER,
       backend: 'test-unfiltered',
       namePrefix: `${namePrefix}-unfiltered`,
       image,
@@ -520,7 +522,7 @@ describe('net-jail enforcement on real Docker', () => {
   }, 300_000)
 
   it('refuses to provision a jail with nothing on its allowlist', async () => {
-    await expect(provisionNetJail({ backend: 'test-empty', namePrefix: `${namePrefix}-empty`, image, allow: [] }))
+    await expect(provisionNetJail({ resourceOwner: TEST_RESOURCE_OWNER, backend: 'test-empty', namePrefix: `${namePrefix}-empty`, image, allow: [] }))
       .rejects.toThrow(/no model endpoint could be derived/)
   }, 60_000)
 })
@@ -540,7 +542,7 @@ async function inJail(
   image: string,
   script: string,
 ): Promise<string> {
-  const result = await withJailedContainer({
+  const result = await withJailedContainer({ resourceOwner: TEST_RESOURCE_OWNER,
     network: provision.network,
     image,
     relayIp: provision.relayIp,

@@ -8,14 +8,15 @@
  */
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
+import Database from 'better-sqlite3'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { RunRegistry } from '../src/runs/registry.js'
-import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
+import type { Backend, BackendHealth, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { BackendError } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { ClaudeBackend, claudeEffort } from '../src/backends/claude.js'
@@ -24,7 +25,7 @@ import { CodexBackend, codexReasoningEffort } from '../src/backends/codex.js'
 import { OpencodeBackend, opencodeVariantForEffort } from '../src/backends/opencode.js'
 import { GeminiBackend, geminiSandboxFlag, geminiYoloFlag } from '../src/backends/gemini.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
-import { mountSessions } from '../src/routes/sessions.js'
+import { mountLegacySessionMappings } from '../src/routes/sessions.js'
 import { mountHealth } from '../src/routes/health.js'
 import { mountModels } from '../src/routes/models.js'
 import { contentToText } from '../src/backends/content.js'
@@ -35,7 +36,7 @@ class FakeBackend implements Backend {
   matches(model: string): boolean {
     return model === this.name || model.startsWith(`${this.name}/`)
   }
-  async health() { return { name: this.name, state: 'ready' as const } }
+  async health(): Promise<BackendHealth> { return { name: this.name, state: 'ready' } }
   async *chat(req: ChatRequest, session: SessionRecord | null): AsyncIterable<ChatDelta> {
     yield { internal_session_id: `${this.name}-int-xyz` }
     yield { content: `[${this.name}] ` }
@@ -153,6 +154,61 @@ describe('SessionStore', () => {
     store.upsert({ externalId: 'e1', backend: 'claudish', internalId: '2' })
     expect(store.get('e1', 'claude')?.internalId).toBe('1')
     expect(store.get('e1', 'claudish')?.internalId).toBe('2')
+  })
+
+  it('uses one namespace for legacy and retained session ids', () => {
+    store.claimSessionIdentity('legacy-first', 'legacy')
+    expect(() => store.claimSessionIdentity('legacy-first', 'retained')).toThrow(/already owned by the legacy session API/)
+    store.claimSessionIdentity('retained-first', 'retained')
+    expect(() => store.claimSessionIdentity('retained-first', 'legacy')).toThrow(/already owned by the retained session API/)
+  })
+
+  it('normalizes the data directory and SQLite files to private modes', () => {
+    store.close()
+    chmodSync(dir, 0o755)
+    store = new SessionStore(dir)
+    expect(statSync(dir).mode & 0o777).toBe(0o700)
+    for (const name of readdirSync(dir).filter(candidate => candidate.startsWith('sessions.sqlite'))) {
+      expect(statSync(join(dir, name)).mode & 0o777, name).toBe(0o600)
+    }
+  })
+
+  it('scrubs secret legacy metadata already present on disk before reloading it', () => {
+    store.upsert({
+      externalId: 'old-secret',
+      backend: 'claude',
+      internalId: 'internal',
+      metadata: { model: 'claude/sonnet' },
+    })
+    store.close()
+    const db = new Database(join(dir, 'sessions.sqlite'))
+    db.prepare('UPDATE sessions SET metadata_json = ? WHERE external_id = ?').run(JSON.stringify({
+      model: 'claude/sonnet',
+      forwardedAuthorization: 'Bearer sk-legacy-secret',
+      agent_profile: {
+        prompt: { systemPrompt: 'private' },
+        mcp: { remote: { headers: { Authorization: 'Bearer hidden' } } },
+      },
+      request: { metadata: { token: 'hidden' } },
+    }), 'old-secret')
+    db.close()
+
+    store = new SessionStore(dir)
+    expect(store.get('old-secret', 'claude')?.metadata).toEqual({ model: 'claude/sonnet' })
+    const inspected = new Database(join(dir, 'sessions.sqlite'), { readonly: true })
+    const row = inspected.prepare('SELECT metadata_json FROM sessions WHERE external_id = ?')
+      .get('old-secret') as { metadata_json: string }
+    inspected.close()
+    expect(JSON.parse(row.metadata_json)).toEqual({ model: 'claude/sonnet' })
+    expect(row.metadata_json).not.toContain('secret')
+    expect(row.metadata_json).not.toContain('agent_profile')
+    store.close()
+    for (const name of readdirSync(dir).filter(candidate => candidate.startsWith('sessions.sqlite'))) {
+      const bytes = readFileSync(join(dir, name)).toString('latin1')
+      expect(bytes, name).not.toContain('sk-legacy-secret')
+      expect(bytes, name).not.toContain('agent_profile')
+    }
+    store = new SessionStore(dir)
   })
 })
 
@@ -355,6 +411,41 @@ describe('POST /v1/chat/completions', () => {
     expect(text).toContain('"finish_reason":"stop"')
     expect(text).toContain('data: [DONE]')
     expect(sessions.get('s1', 'claude')?.internalId).toBe('claude-int-xyz')
+  })
+
+  it('rejects conflicting session aliases instead of choosing one', async () => {
+    const base = {
+      model: 'claude/sonnet',
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    const requests: Array<{ headers: Record<string, string>; body: Record<string, unknown> }> = [
+      {
+        headers: { 'content-type': 'application/json' },
+        body: { ...base, session_id: 'body-a', resume_id: 'body-b' },
+      },
+      {
+        headers: { 'content-type': 'application/json', 'x-session-id': 'header-a' },
+        body: { ...base, session_id: 'body-a' },
+      },
+      {
+        headers: {
+          'content-type': 'application/json',
+          'x-session-id': 'header-a',
+          'x-resume': 'header-b',
+        },
+        body: base,
+      },
+    ]
+    for (const request of requests) {
+      const response = await app.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: request.headers,
+        body: JSON.stringify(request.body),
+      })
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({ error: { type: 'invalid_request_error' } })
+    }
+    expect(sessions.list()).toEqual([])
   })
 
   it('keeps SSE alive while a backend is silent', async () => {
@@ -854,7 +945,7 @@ describe('POST /v1/chat/completions', () => {
     expect(res.status).toBe(200)
   })
 
-  it('persists cwd and agent_profile into resumed sessions', async () => {
+  it('persists cwd and a profile digest without persisting request credentials or profile material', async () => {
     const profile = {
       name: 'local-coder',
       prompt: { systemPrompt: 'Be surgical.' },
@@ -862,19 +953,28 @@ describe('POST /v1/chat/completions', () => {
     }
     await app.request('/v1/chat/completions', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'x-tangle-forwarded-authorization': 'Bearer sk-request-secret',
+      },
       body: JSON.stringify({
         model: 'claude',
         messages: [{ role: 'user', content: 'one' }],
         session_id: 'profile-1',
         cwd: '/tmp/demo',
         agent_profile: profile,
+        metadata: { token: 'request-metadata-secret' },
         stream: false,
       }),
     })
     const stored = sessions.get('profile-1', 'claude')
     expect(stored?.cwd).toBe('/tmp/demo')
-    expect(stored?.metadata.agent_profile).toEqual(profile)
+    expect(stored?.metadata).toEqual({
+      model: 'claude',
+      profile_digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+    })
+    expect(JSON.stringify(stored?.metadata)).not.toContain('secret')
+    expect(JSON.stringify(stored?.metadata)).not.toContain('agent_profile')
 
     const res = await app.request('/v1/chat/completions', {
       method: 'POST',
@@ -883,6 +983,7 @@ describe('POST /v1/chat/completions', () => {
         model: 'claude',
         messages: [{ role: 'user', content: 'two' }],
         session_id: 'profile-1',
+        agent_profile: profile,
         stream: false,
       }),
     })
@@ -964,7 +1065,7 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
       .toEqual(['--effort', 'low'])
   })
 
-  it('uses effort from a resumed session AgentProfile', () => {
+  it('does not treat legacy session metadata as executable AgentProfile input', () => {
     const session = {
       externalId: 'r385-session',
       backend: 'claude-code',
@@ -976,8 +1077,7 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
       metadata: { agent_profile: { model: { reasoningEffort: 'high' } } },
     }
     const args = b.buildArgs(baseReq, session, 'byob')
-    expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2))
-      .toEqual(['--effort', 'high'])
+    expect(args).not.toContain('--effort')
   })
 
   it('falls back to --input-format stream-json when user text is too large for argv', () => {
@@ -1240,6 +1340,48 @@ describe('GET /health', () => {
     expect(opencode?.detail).toContain('timed out')
   })
 
+  it('cancels and shares a timed-out probe instead of accumulating work', async () => {
+    class AbortableBackend extends FakeBackend {
+      starts = 0
+      active = 0
+      maxActive = 0
+      aborts = 0
+
+      override async health(signal?: AbortSignal) {
+        this.starts += 1
+        this.active += 1
+        this.maxActive = Math.max(this.maxActive, this.active)
+        return await new Promise<{ name: string; state: 'error'; detail: string }>((resolve) => {
+          const onAbort = (): void => {
+            this.aborts += 1
+            this.active -= 1
+            resolve({ name: this.name, state: 'error', detail: 'cancelled' })
+          }
+          signal?.addEventListener('abort', onAbort, { once: true })
+          if (signal?.aborted) onAbort()
+        })
+      }
+    }
+    const backend = new AbortableBackend('opencode')
+    const app = new Hono()
+    mountHealth(app, { registry: new BackendRegistry().register(backend) }, {
+      cacheMs: 0,
+      probeTimeoutMs: 25,
+      failureRetryBackoffMs: 1_000,
+    })
+
+    const responses = await Promise.all([
+      app.request('/health'),
+      app.request('/health'),
+      app.request('/health'),
+    ])
+    expect(responses.map(response => response.status)).toEqual([503, 503, 503])
+    expect(backend).toMatchObject({ starts: 1, aborts: 1, active: 0, maxActive: 1 })
+
+    await app.request('/health')
+    expect(backend.starts).toBe(1)
+  })
+
   it('synthesises an error state when a backend rejects (does not crash /health)', async () => {
     class ThrowingBackend extends FakeBackend {
       override async health(): Promise<never> {
@@ -1315,7 +1457,7 @@ describe('GET /v1/sessions', () => {
     dir = mkdtempSync(join(tmpdir(), 'cli-bridge-test-'))
     sessions = new SessionStore(dir)
     app = new Hono()
-    mountSessions(app, { sessions })
+    mountLegacySessionMappings(app, { sessions })
   })
   afterEach(() => {
     sessions.close()

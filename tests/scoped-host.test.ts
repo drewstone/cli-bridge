@@ -12,9 +12,19 @@
  */
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { EventEmitter } from 'node:events'
+import type { ChildProcess } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
-import { isOwnedScopeControlGroup, scopedHostSpawner } from '../src/executors/scoped-host.js'
+import {
+  createScopedHostSpawner,
+  isOwnedScopeControlGroup,
+  scopeControlArgs,
+  scopedHostSpawner,
+  terminateOwnedScope,
+  type ScopeCleanupOperations,
+} from '../src/executors/scoped-host.js'
 import { killTree } from '../src/executors/process-tree.js'
 
 const systemdRunAvailable =
@@ -53,6 +63,364 @@ describe('scopedHostSpawner — cgroup ownership proof', () => {
   it('never authorizes the bridge current cgroup or any ancestor of it', () => {
     expect(isOwnedScopeControlGroup(owned, unit, owned)).toBe(false)
     expect(isOwnedScopeControlGroup(owned, unit, `${owned}/nested-child`)).toBe(false)
+  })
+})
+
+describe('scopedHostSpawner — strict scope termination', () => {
+  const unit = 'cli-bridge-1234-a1b2c3d4e5f6.scope'
+  const controlGroup = `/user.slice/user-1000.slice/user@1000.service/cli.slice/cli-bridge-llm.slice/${unit}`
+  const bridge = '/user.slice/user-1000.slice/user@1000.service/app.slice/cli-bridge.service'
+
+  function operations(overrides: Partial<ScopeCleanupOperations> = {}): ScopeCleanupOperations {
+    return {
+      showUnit: async () => ({ loadState: 'loaded', activeState: 'active', controlGroup }),
+      stopUnit: async () => {},
+      currentControlGroup: () => bridge,
+      cgroupIsPopulated: () => false,
+      writeCgroupKill: async () => {},
+      wait: async () => {},
+      ...overrides,
+    }
+  }
+
+  it('propagates a missing or non-executable systemctl instead of declaring cleanup complete', async () => {
+    const error = Object.assign(new Error('spawn /usr/bin/systemctl ENOENT'), { code: 'ENOENT' })
+    await expect(terminateOwnedScope(unit, operations({
+      showUnit: async () => { throw error },
+    }))).rejects.toBe(error)
+  })
+
+  it('fails through the default systemctl path when the user manager is unreachable', async () => {
+    const previousRuntime = process.env.XDG_RUNTIME_DIR
+    const previousBus = process.env.DBUS_SESSION_BUS_ADDRESS
+    const missingRuntime = `/nonexistent-cli-bridge-systemd-${process.pid}`
+    process.env.XDG_RUNTIME_DIR = missingRuntime
+    process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${missingRuntime}/bus`
+    try {
+      await expect(terminateOwnedScope(unit)).rejects.toThrow(/connect to bus|ENOENT/u)
+    } finally {
+      if (previousRuntime === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = previousRuntime
+      if (previousBus === undefined) delete process.env.DBUS_SESSION_BUS_ADDRESS
+      else process.env.DBUS_SESSION_BUS_ADDRESS = previousBus
+    }
+  })
+
+  it('reports both cgroup.kill and systemctl stop failures', async () => {
+    const killFailure = new Error('cgroup.kill denied')
+    const stopFailure = new Error('systemctl stop failed')
+    await expect(terminateOwnedScope(unit, operations({
+      writeCgroupKill: async () => { throw killFailure },
+      stopUnit: async () => { throw stopFailure },
+    }))).rejects.toMatchObject({
+      name: 'AggregateError',
+      errors: [killFailure, stopFailure],
+    })
+  })
+})
+
+describe('scopedHostSpawner — launch fallback', () => {
+  it('probes the same slice and resource properties used by a real launch', () => {
+    const args = scopeControlArgs('cli-bridge-1234-a1b2c3d4e5f6.scope', {
+      tasksMax: 37,
+      memoryMax: '768M',
+      runtimeMaxSec: 91,
+    })
+    expect(args).toContain('--slice=cli-bridge-llm.slice')
+    expect(args).toContain('--property=TasksMax=37')
+    expect(args).toContain('--property=MemoryMax=768M')
+    expect(args).toContain('--property=RuntimeMaxSec=91')
+    expect(args).toContain('--property=OOMPolicy=stop')
+  })
+
+  it('does not dispatch a duplicate when scope start was not observed', async () => {
+    let acquires = 0
+    let releases = 0
+    let fallbackCalls = 0
+    let markerCleanups = 0
+    let launchedArgs: string[] = []
+    const spawner = createScopedHostSpawner({
+      probe: () => true,
+      invalidateProbe: () => {},
+      semaphore: {
+        acquire: async () => { acquires += 1 },
+        release: () => { releases += 1 },
+      },
+      spawnProcess: ((bin: string, args: readonly string[]) => {
+        launchedArgs = [bin, ...args]
+        return spawn('/bin/true')
+      }) as typeof spawn,
+      fallbackSpawner: async () => {
+        fallbackCalls += 1
+        return { child: spawn('/bin/true'), release: () => {} }
+      },
+      killTreeFn: async () => {},
+      killScopeFn: async () => {},
+      observeStart: async () => ({ started: false, error: new Error('TasksMax property rejected') }),
+      createMarker: () => ({
+        path: `/tmp/cli-bridge-never-created-${process.pid}`,
+        cleanup: () => { markerCleanups += 1 },
+      }),
+    })
+
+    await expect(spawner('/bin/requested-workload', ['--must-not-run-in-failed-scope'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })).rejects.toThrow(/request was not retried/u)
+    expect(acquires).toBe(1)
+    expect(releases).toBe(1)
+    expect(fallbackCalls).toBe(0)
+    expect(markerCleanups).toBe(1)
+    expect(launchedArgs).toContain('/bin/sh')
+    expect(launchedArgs).toContain('/bin/requested-workload')
+  })
+
+  it('holds capacity and never falls back until an uncertain scope is proven stopped', async () => {
+    let releases = 0
+    let fallbackCalls = 0
+    let scopeCleanupCalls = 0
+    const spawner = createScopedHostSpawner({
+      probe: () => true,
+      invalidateProbe: () => {},
+      semaphore: {
+        acquire: async () => {},
+        release: () => { releases += 1 },
+      },
+      spawnProcess: (() => spawn('/bin/true')) as unknown as typeof spawn,
+      fallbackSpawner: async () => {
+        fallbackCalls += 1
+        return { child: spawn('/bin/true'), release: () => {} }
+      },
+      killTreeFn: async () => {},
+      killScopeFn: async () => {
+        scopeCleanupCalls += 1
+        if (scopeCleanupCalls === 1) throw new Error('user manager unavailable')
+      },
+      observeStart: async () => ({ started: false, error: new Error('start observation timed out') }),
+      createMarker: () => ({
+        path: `/tmp/cli-bridge-never-created-${process.pid}`,
+        cleanup: () => {},
+      }),
+    })
+
+    await expect(spawner('/bin/requested-workload', [], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })).rejects.toThrow(/termination could not be proven/u)
+    expect(releases).toBe(0)
+    expect(fallbackCalls).toBe(0)
+
+    const deadline = Date.now() + 1_000
+    while (releases === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+    expect(scopeCleanupCalls).toBe(2)
+    expect(releases).toBe(1)
+    expect(fallbackCalls).toBe(0)
+  })
+
+  it('retries full finalization after a transient scope cleanup failure', async () => {
+    const child = new EventEmitter() as ChildProcess
+    ;(child as unknown as { exitCode: number | null }).exitCode = null
+    ;(child as unknown as { signalCode: NodeJS.Signals | null }).signalCode = null
+    let scopeCleanupCalls = 0
+    let releases = 0
+    const spawner = createScopedHostSpawner({
+      probe: () => true,
+      invalidateProbe: () => {},
+      semaphore: {
+        acquire: async () => {},
+        release: () => { releases += 1 },
+      },
+      spawnProcess: (() => child) as never,
+      fallbackSpawner: async () => { throw new Error('fallback must not run') },
+      applyJailFn: async (bin, args, opts) => ({ bin, args, env: opts.env }),
+      killTreeFn: async () => {},
+      killScopeFn: async () => {
+        scopeCleanupCalls += 1
+        if (scopeCleanupCalls === 1) throw new Error('transient scope cleanup failure')
+      },
+      observeStart: async () => ({ started: true }),
+      createMarker: () => ({ path: '/tmp/unused-scope-marker', cleanup: () => {} }),
+    })
+    const owned = await spawner('ignored', [], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    await expect(owned.terminate?.()).rejects.toThrow(/transient scope cleanup failure/u)
+    expect(releases).toBe(0)
+    const deadline = Date.now() + 1_000
+    while (releases === 0 && Date.now() < deadline) await sleep(10)
+    expect(scopeCleanupCalls).toBe(2)
+    expect(releases).toBe(1)
+  })
+
+  it('terminates the scope before retrying transient start-marker cleanup', async () => {
+    const child = new EventEmitter() as ChildProcess
+    ;(child as unknown as { exitCode: number | null }).exitCode = null
+    ;(child as unknown as { signalCode: NodeJS.Signals | null }).signalCode = null
+    let markerCleanupCalls = 0
+    let scopeCleanupCalls = 0
+    let releases = 0
+    const spawner = createScopedHostSpawner({
+      probe: () => true,
+      invalidateProbe: () => {},
+      semaphore: {
+        acquire: async () => {},
+        release: () => { releases += 1 },
+      },
+      spawnProcess: (() => child) as never,
+      fallbackSpawner: async () => { throw new Error('fallback must not run') },
+      applyJailFn: async (bin, args, opts) => ({ bin, args, env: opts.env }),
+      killTreeFn: async () => {},
+      killScopeFn: async () => { scopeCleanupCalls += 1 },
+      observeStart: async () => ({ started: true }),
+      createMarker: () => ({
+        path: '/tmp/unused-scope-marker',
+        cleanup: () => {
+          markerCleanupCalls += 1
+          if (markerCleanupCalls === 1) throw new Error('transient marker cleanup failure')
+        },
+      }),
+    })
+    const owned = await spawner('ignored', [], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    const failure = await owned.terminate?.().catch(error => error as unknown)
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: 'transient marker cleanup failure' }),
+    ])
+    expect(scopeCleanupCalls).toBe(1)
+    expect(releases).toBe(0)
+    const deadline = Date.now() + 1_000
+    while (releases === 0 && Date.now() < deadline) await sleep(10)
+    expect(markerCleanupCalls).toBe(2)
+    expect(scopeCleanupCalls).toBe(2)
+    expect(releases).toBe(1)
+  })
+
+  it('retries marker cleanup after a synchronous spawn failure without skipping jail cleanup', async () => {
+    let markerCleanupCalls = 0
+    let jailCleanupCalls = 0
+    let releases = 0
+    const spawner = createScopedHostSpawner({
+      probe: () => true,
+      invalidateProbe: () => {},
+      semaphore: {
+        acquire: async () => {},
+        release: () => { releases += 1 },
+      },
+      spawnProcess: (() => { throw new Error('spawn failed') }) as never,
+      fallbackSpawner: async () => { throw new Error('fallback must not run') },
+      applyJailFn: async (bin, args, opts) => ({
+        bin,
+        args,
+        env: opts.env,
+        cleanup: async () => { jailCleanupCalls += 1 },
+      }),
+      killTreeFn: async () => {},
+      killScopeFn: async () => {},
+      observeStart: async () => ({ started: true }),
+      createMarker: () => ({
+        path: '/tmp/unused-scope-marker',
+        cleanup: () => {
+          markerCleanupCalls += 1
+          if (markerCleanupCalls === 1) throw new Error('transient marker cleanup failure')
+        },
+      }),
+    })
+
+    await expect(spawner('ignored', [], { stdio: ['ignore', 'pipe', 'pipe'] }))
+      .rejects.toThrow(/temporary-artifact cleanup failed/u)
+    expect(jailCleanupCalls).toBe(1)
+    expect(releases).toBe(0)
+    const deadline = Date.now() + 1_000
+    while (releases === 0 && Date.now() < deadline) await sleep(10)
+    expect(markerCleanupCalls).toBe(2)
+    expect(jailCleanupCalls).toBe(1)
+    expect(releases).toBe(1)
+  })
+
+  it('rolls back the jail when cancellation arrives immediately after jail setup', async () => {
+    const controller = new AbortController()
+    let jailCleanupCalls = 0
+    let markerCreations = 0
+    let releases = 0
+    const spawner = createScopedHostSpawner({
+      probe: () => true,
+      invalidateProbe: () => {},
+      semaphore: {
+        acquire: async () => {},
+        release: () => { releases += 1 },
+      },
+      spawnProcess: (() => { throw new Error('spawn must not run') }) as never,
+      fallbackSpawner: async () => { throw new Error('fallback must not run') },
+      applyJailFn: async (bin, args, opts) => {
+        controller.abort(new Error('caller disconnected'))
+        return {
+          bin,
+          args,
+          env: opts.env,
+          cleanup: async () => {
+            jailCleanupCalls += 1
+            if (jailCleanupCalls === 1) throw new Error('transient jail cleanup failure')
+          },
+        }
+      },
+      killTreeFn: async () => {},
+      killScopeFn: async () => {},
+      observeStart: async () => ({ started: true }),
+      createMarker: () => {
+        markerCreations += 1
+        return { path: '/tmp/unused-scope-marker', cleanup: () => {} }
+      },
+    })
+
+    await expect(spawner('ignored', [], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      signal: controller.signal,
+    })).rejects.toThrow(/jail cleanup failed/u)
+    expect({ jailCleanupCalls, markerCreations, releases }).toEqual({
+      jailCleanupCalls: 1,
+      markerCreations: 0,
+      releases: 0,
+    })
+    const deadline = Date.now() + 1_000
+    while (releases === 0 && Date.now() < deadline) await sleep(10)
+    expect({ jailCleanupCalls, markerCreations, releases }).toEqual({
+      jailCleanupCalls: 2,
+      markerCreations: 0,
+      releases: 1,
+    })
+  })
+
+  it('rolls back the jail and capacity when start-marker allocation throws', async () => {
+    let jailCleanupCalls = 0
+    let releases = 0
+    const spawner = createScopedHostSpawner({
+      probe: () => true,
+      invalidateProbe: () => {},
+      semaphore: {
+        acquire: async () => {},
+        release: () => { releases += 1 },
+      },
+      spawnProcess: (() => { throw new Error('spawn must not run') }) as never,
+      fallbackSpawner: async () => { throw new Error('fallback must not run') },
+      applyJailFn: async (bin, args, opts) => ({
+        bin,
+        args,
+        env: opts.env,
+        cleanup: async () => {
+          jailCleanupCalls += 1
+          if (jailCleanupCalls === 1) throw new Error('transient jail cleanup failure')
+        },
+      }),
+      killTreeFn: async () => {},
+      killScopeFn: async () => {},
+      observeStart: async () => ({ started: true }),
+      createMarker: () => { throw new Error('marker allocation failed') },
+    })
+
+    await expect(spawner('ignored', [], { stdio: ['ignore', 'pipe', 'pipe'] }))
+      .rejects.toThrow(/marker creation and jail cleanup failed/u)
+    expect({ jailCleanupCalls, releases }).toEqual({ jailCleanupCalls: 1, releases: 0 })
+    const deadline = Date.now() + 1_000
+    while (releases === 0 && Date.now() < deadline) await sleep(10)
+    expect({ jailCleanupCalls, releases }).toEqual({ jailCleanupCalls: 2, releases: 1 })
   })
 })
 

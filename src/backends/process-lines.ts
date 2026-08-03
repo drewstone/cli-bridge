@@ -85,9 +85,33 @@ export async function* readProcessLines(
   }
 }
 
-export async function waitForProcessClose(child: ChildProcess): Promise<number | null> {
-  if (child.exitCode !== null) return child.exitCode
-  return await new Promise((resolve) => {
-    child.once('close', (code) => resolve(typeof code === 'number' ? code : null))
+export async function waitForProcessClose(
+  child: ChildProcess,
+  signal?: AbortSignal,
+): Promise<number | null> {
+  const terminal = (): boolean => child.exitCode != null || child.signalCode != null
+  const code = (): number | null => typeof child.exitCode === 'number' ? child.exitCode : null
+  if (terminal()) return code()
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('process wait aborted')
+  return await new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      child.off('close', onClose)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const onClose = (code: number | null): void => {
+      cleanup()
+      resolve(typeof code === 'number' ? code : null)
+    }
+    const onAbort = (): void => {
+      cleanup()
+      reject(signal?.reason instanceof Error ? signal.reason : new Error('process wait aborted'))
+    }
+    child.once('close', onClose)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    // Close or abort may have happened between the checks above and listener
+    // registration. Re-check so an already-terminal child cannot strand its
+    // executor allocation forever.
+    if (terminal()) onClose(code())
+    else if (signal?.aborted) onAbort()
   })
 }

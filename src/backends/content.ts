@@ -1,6 +1,7 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createPrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import type { ChatMessage, ChatMessageContent, ChatContentPart } from './types.js'
 
 export interface ImageAttachment {
@@ -85,20 +86,23 @@ export async function materializeImages(images: ImageAttachment[]): Promise<Mate
     return { paths: [], cleanup: async () => {} }
   }
 
-  const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-images-'))
+  const root = createPrivateTemporaryRoot(tmpdir(), 'cli-bridge-images-')
   const paths: string[] = []
-  await Promise.all(images.map(async (image, i) => {
-    const ext = extensionForMediaType(image.mediaType)
-    const file = join(dir, `image-${i + 1}.${ext}`)
-    await writeFile(file, image.data)
-    paths.push(file)
-  }))
+  try {
+    await Promise.all(images.map(async (image, i) => {
+      const ext = extensionForMediaType(image.mediaType)
+      const file = join(root.path, `image-${i + 1}.${ext}`)
+      await writeFile(file, image.data, { mode: 0o600, flag: 'wx' })
+      paths.push(file)
+    }))
+  } catch (error) {
+    root.cleanup()
+    throw error
+  }
 
   return {
     paths,
-    cleanup: async () => {
-      await rm(dir, { recursive: true, force: true })
-    },
+    cleanup: async () => { root.cleanup() },
   }
 }
 

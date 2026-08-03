@@ -23,9 +23,11 @@
  *      cached results in <1 ms — the only spawn cost is once per
  *      cache-eviction. `?force=1` bypasses the cache for debugging.
  *
- * Only `ready` verdicts are cached. A failing backend is RE-PROBED on
- * every request, because a cached failure is the worse of the two
- * errors in both directions:
+ * `ready` verdicts use the normal cache TTL. Failed verdicts use a shorter
+ * retry delay (default 5 s), and one backend can have only one live probe.
+ * This preserves fast recovery without allowing watchdog bursts to queue the
+ * same stalled process repeatedly. A long-lived cached failure is the worse of
+ * the two errors in both directions:
  *
  *   - It cannot recover. Once a fault was cached, fixing the underlying
  *     cause changed nothing until the process restarted. Measured on
@@ -40,9 +42,7 @@
  *
  * The original reason for caching survives untouched — a healthy pool
  * still answers watchdog probes from memory in <1 ms, so the fork+exec
- * storm that got live bridges SIGKILLed cannot come back. Re-probing
- * only the already-failing backends costs one spawn per failing backend
- * per request, bounded by `PROBE_TIMEOUT_MS`.
+ * storm that got live bridges SIGKILLed cannot come back.
  *
  * Tradeoff kept: a backend that DIES between probes is reported `ready`
  * for up to the cache TTL. `?force=1` bypasses the cache;
@@ -53,9 +53,12 @@ import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { Backend, BackendHealth } from '../backends/types.js'
 import type { AdmissionGate } from '../admission.js'
+import { boundedProbe, resolveHealthProbeTimeoutMs } from '../backends/health.js'
+
+export { boundedProbe } from '../backends/health.js'
 
 const DEFAULT_HEALTH_CACHE_MS = 30_000
-const DEFAULT_PROBE_TIMEOUT_MS = 3_500
+const DEFAULT_FAILURE_RETRY_BACKOFF_MS = 5_000
 
 interface CacheEntry {
   probedAt: number
@@ -69,6 +72,8 @@ export interface MountHealthOptions {
   cacheMs?: number
   /** Override per-probe timeout for tests; defaults to BRIDGE_HEALTH_PROBE_TIMEOUT_MS env or 3.5 s. */
   probeTimeoutMs?: number
+  /** Minimum delay before retrying a failed probe; defaults to 5 s. */
+  failureRetryBackoffMs?: number
   /** Injectable now() for cache-TTL tests. */
   now?: () => number
   /** Injectable probe runner — tests bypass real `b.health()`. */
@@ -81,34 +86,54 @@ export function mountHealth(
   options: MountHealthOptions = {},
 ): void {
   const cacheMs = options.cacheMs ?? resolveEnvMs('BRIDGE_HEALTH_CACHE_MS', DEFAULT_HEALTH_CACHE_MS)
-  const probeTimeoutMs = options.probeTimeoutMs ?? resolveEnvMs('BRIDGE_HEALTH_PROBE_TIMEOUT_MS', DEFAULT_PROBE_TIMEOUT_MS)
+  const probeTimeoutMs = options.probeTimeoutMs ?? resolveHealthProbeTimeoutMs()
+  const failureRetryBackoffMs = options.failureRetryBackoffMs
+    ?? resolveEnvMs('BRIDGE_HEALTH_FAILURE_RETRY_BACKOFF_MS', DEFAULT_FAILURE_RETRY_BACKOFF_MS)
   const now = options.now ?? Date.now
   const probe = options.probe ?? ((b) => boundedProbe(b, probeTimeoutMs))
   const cache = new Map<string, CacheEntry>()
+  const inFlight = new Map<string, Promise<CacheEntry>>()
+
+  const runProbe = (backend: Backend): Promise<CacheEntry> => {
+    const existing = inFlight.get(backend.name)
+    if (existing) return existing
+    const probedAt = now()
+    const started = probe(backend).then(
+      health => ({ probedAt, health }),
+      error => ({
+        probedAt,
+        health: {
+          name: backend.name,
+          state: 'error' as const,
+          detail: error instanceof Error ? error.message : String(error),
+        },
+      }),
+    )
+    inFlight.set(backend.name, started)
+    void started.then(entry => {
+      cache.set(backend.name, entry)
+      if (inFlight.get(backend.name) === started) inFlight.delete(backend.name)
+    })
+    return started
+  }
 
   app.get('/health', async (c) => {
     const force = c.req.query('force') === '1'
     const ts = now()
-    // Run all backend probes in parallel — independent CLIs have no
-    // shared resource that benefits from serial execution. `boundedProbe`
-    // already enforces a per-backend ceiling, so the whole request
-    // returns within ~probeTimeoutMs even in the worst case.
+    // Different backends probe in parallel. Calls for the same backend share
+    // one in-flight operation, and `boundedProbe` enforces its time limit.
     const probes: ReportedHealth[] = await Promise.all(
       deps.registry.all().map(async (b) => {
         const cached = cache.get(b.name)
-        // Reusable only while it says `ready`: a fault must be retried so a
-        // fixed fault recovers without restarting the process.
+        const reuseFor = cached?.health.state === 'ready' ? cacheMs : failureRetryBackoffMs
         if (!force
           && cached
-          && cached.health.state === 'ready'
-          && cacheMs > 0
-          && ts - cached.probedAt < cacheMs) {
+          && reuseFor > 0
+          && ts - cached.probedAt < reuseFor) {
           return { ...cached.health, probed_at: new Date(cached.probedAt).toISOString(), cached: true }
         }
-        const probedAt = now()
-        const fresh = await probe(b)
-        cache.set(b.name, { probedAt, health: fresh })
-        return { ...fresh, probed_at: new Date(probedAt).toISOString(), cached: false }
+        const fresh = await runProbe(b)
+        return { ...fresh.health, probed_at: new Date(fresh.probedAt).toISOString(), cached: false }
       }),
     )
     const any = probes.some((p) => p.state === 'ready')
@@ -144,55 +169,6 @@ export function mountHealth(
 export interface ReportedHealth extends BackendHealth {
   probed_at: string
   cached: boolean
-}
-
-/**
- * Run `backend.health()` with a hard ceiling. If the underlying probe
- * exceeds `timeoutMs` (which happens when the CLI spawn wedges under
- * heavy load or the binary's I/O stalls), short-circuit to a synthetic
- * `error` result. The actual spawn is left running — caller policy is
- * "report and move on"; an orphan `--version` subprocess is bounded
- * by the OS reaping it after its own `_exit()`. We do NOT use this as
- * a vehicle to forcibly kill the spawn — the cost of killing a
- * legitimately-slow probe is worse than letting it complete in the
- * background.
- *
- * Exported for tests.
- */
-export async function boundedProbe(
-  backend: Backend,
-  timeoutMs: number,
-): Promise<BackendHealth> {
-  if (timeoutMs <= 0) return backend.health()
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout: Promise<BackendHealth> = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      resolve({
-        name: backend.name,
-        state: 'error',
-        detail: `health probe timed out after ${timeoutMs}ms`,
-      })
-    }, timeoutMs)
-    timer.unref?.()
-  })
-  try {
-    return await Promise.race([
-      backend.health().then((result) => {
-        if (timer) clearTimeout(timer)
-        return result
-      }, (err) => {
-        if (timer) clearTimeout(timer)
-        return {
-          name: backend.name,
-          state: 'error' as const,
-          detail: err instanceof Error ? err.message : String(err),
-        }
-      }),
-      timeout,
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
 }
 
 function resolveEnvMs(key: string, fallback: number): number {

@@ -4,8 +4,12 @@ import {
   probeExecutorReadiness,
   type Spawner,
 } from '../executors/types.js'
-import type { BackendHealth } from './types.js'
+import type { Backend, BackendHealth } from './types.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+import { finalizeSpawned } from '../executors/process-tree.js'
+import { waitForProcessClose } from './process-lines.js'
+
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 3_500
 
 /**
  * Probe a CLI-backed agent's readiness by TAKING THE REQUEST PATH: the
@@ -54,13 +58,14 @@ export async function versionHealth(
   spawner: Spawner,
   /** Extra context for the `ready` verdict, e.g. the base URL a proxy is using. */
   readyDetail?: string,
+  signal?: AbortSignal,
 ): Promise<BackendHealth> {
-  let release = (): void => {}
+  let owned: Awaited<ReturnType<Spawner>> | null = null
   try {
     // The request path, taken first: a request that cannot resolve a cwd or
     // whose slot holds no credentials fails no matter what `--version` prints,
     // so reporting `ready` on the strength of `--version` alone is the defect.
-    const readiness = await probeExecutorReadiness(spawner)
+    const readiness = await probeExecutorReadiness(spawner, signal)
     if (readiness.findings.length > 0) {
       return { name, state: 'error', detail: formatExecutorFindings(readiness.findings) }
     }
@@ -70,38 +75,144 @@ export async function versionHealth(
       // probe skip the executor's workspace assertion and run in the image's
       // own WORKDIR instead of the mount a request depends on.
       ...(readiness.cwd !== undefined ? { cwd: readiness.cwd } : {}),
+      signal,
     })
-    release = spawned.release
+    owned = spawned
     const child = spawned.child
-    const closed = await new Promise<{ code: number | null; stdout: string; stderr: string } | { spawnFailure: string }>((resolve) => {
-      const stdout = new BoundedDiagnosticBuffer()
-      const stderr = new BoundedDiagnosticBuffer()
-      child.stdout?.on('data', (b) => { stdout.append(b) })
-      child.stderr?.on('data', (b) => { stderr.append(b) })
-      child.on('error', (err) => { resolve({ spawnFailure: err.message }) })
-      child.on('close', (code) => {
-        resolve({ code, stdout: stdout.render(), stderr: stderr.render() })
-      })
-    })
-    if ('spawnFailure' in closed) {
-      return { name, state: 'unavailable', detail: `spawn failed: ${closed.spawnFailure}` }
+    const stdout = new BoundedDiagnosticBuffer()
+    const stderr = new BoundedDiagnosticBuffer()
+    child.stdout?.on('data', (b) => { stdout.append(b) })
+    child.stderr?.on('data', (b) => { stderr.append(b) })
+    let spawnFailure = spawned.spawnError?.() ?? null
+    const captureSpawnFailure = (error: Error): void => { spawnFailure ??= error }
+    child.on('error', captureSpawnFailure)
+    let code: number | null
+    try {
+      code = spawnFailure ? null : await waitForProcessClose(child, signal)
+      spawnFailure ??= spawned.spawnError?.() ?? null
+    } finally {
+      child.off('error', captureSpawnFailure)
     }
-    if (closed.code === 0) {
+    if (spawnFailure) {
+      return { name, state: 'unavailable', detail: `spawn failed: ${spawnFailure.message}` }
+    }
+    if (code === 0) {
       return {
         name,
         state: 'ready',
-        version: closed.stdout.trim() || undefined,
+        version: stdout.render().trim() || undefined,
         ...(readyDetail ? { detail: readyDetail } : {}),
       }
     }
     return {
       name,
       state: 'error',
-      detail: await describeCliExit(spawned, bin, closed.code, closed.stderr || closed.stdout),
+      detail: await describeCliExit(spawned, bin, code, stderr.render() || stdout.render()),
     }
   } catch (err) {
     return { name, state: 'unavailable', detail: (err as Error).message }
   } finally {
-    release()
+    if (owned) await finalizeSpawned(owned)
   }
 }
+
+/**
+ * Run one shared backend readiness operation with a per-caller timeout.
+ * Cancelling one waiter leaves the shared operation alive for the others. The
+ * underlying operation is aborted only after every waiter has left, so an
+ * abandoned probe cannot retain a process or container allocation.
+ */
+export async function boundedProbe(
+  backend: Backend,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<BackendHealth> {
+  let active = activeBackendProbes.get(backend)
+  if (!active) {
+    const controller = new AbortController()
+    const created: ActiveBackendProbe = {
+      controller,
+      promise: undefined as unknown as Promise<BackendHealth>,
+      waiters: 0,
+      settled: false,
+    }
+    const promise = Promise.resolve()
+      .then(async () => await backend.health(controller.signal))
+      .catch((err): BackendHealth => ({
+        name: backend.name,
+        state: 'error',
+        detail: err instanceof Error ? err.message : String(err),
+      }))
+      .finally(() => {
+        created.settled = true
+        if (activeBackendProbes.get(backend) === created) activeBackendProbes.delete(backend)
+      })
+    created.promise = promise
+    active = created
+    activeBackendProbes.set(backend, created)
+  }
+
+  active.waiters += 1
+  let waiterReleased = false
+  const releaseWaiter = (): void => {
+    if (waiterReleased) return
+    waiterReleased = true
+    active!.waiters -= 1
+    if (active!.waiters === 0 && !active!.settled) {
+      if (activeBackendProbes.get(backend) === active) activeBackendProbes.delete(backend)
+      active!.controller.abort(new Error('health probe has no waiting callers'))
+    }
+  }
+
+  if (timeoutMs <= 0 && !signal) {
+    try {
+      return await active.promise
+    } finally {
+      releaseWaiter()
+    }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  let interruptedAlready = false
+  const interrupted = new Promise<BackendHealth>((resolve) => {
+    const stop = (detail: string): void => {
+      if (interruptedAlready) return
+      interruptedAlready = true
+      resolve({ name: backend.name, state: 'error', detail })
+    }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => stop(
+        `health probe timed out after ${timeoutMs}ms`,
+      ), timeoutMs)
+      timer.unref?.()
+    }
+    if (signal) {
+      onAbort = () => stop('health probe aborted by caller')
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    }
+  })
+  try {
+    return await Promise.race([active.promise, interrupted])
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (onAbort) signal?.removeEventListener('abort', onAbort)
+    releaseWaiter()
+  }
+}
+
+export function resolveHealthProbeTimeoutMs(): number {
+  const raw = process.env.BRIDGE_HEALTH_PROBE_TIMEOUT_MS
+  if (raw === undefined) return DEFAULT_HEALTH_PROBE_TIMEOUT_MS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_HEALTH_PROBE_TIMEOUT_MS
+}
+
+interface ActiveBackendProbe {
+  controller: AbortController
+  promise: Promise<BackendHealth>
+  waiters: number
+  settled: boolean
+}
+
+const activeBackendProbes = new WeakMap<Backend, ActiveBackendProbe>()

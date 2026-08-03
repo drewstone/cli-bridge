@@ -29,9 +29,10 @@
  * common ones (`content`, `text`, `message.content`, `delta.text`).
  */
 
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import { registerJailReadable } from '../jail/index.js'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -48,11 +49,12 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, prepareSpawnerPrivatePath, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
+import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -79,8 +81,8 @@ export class KimiBackend implements Backend {
     return m === this.name || m.startsWith(this.prefix)
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
   async *chat(
@@ -119,24 +121,32 @@ export class KimiBackend implements Backend {
     if (thinkingFlag) args.push(thinkingFlag)
     args.push(...provisioned.flags)
 
-    let configFile: string | null = null
+    let configFile: { file: string; root: PrivateTemporaryRoot } | null = null
     let mcpMaterialized: ReturnType<typeof writeMcpConfigFile> = null
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      configFile = await this.prepareConfigFile(req.model)
+      const materializationParent = this.spawner.preparePrivatePath ? cwd : undefined
+      configFile = await this.prepareConfigFile(req.model, materializationParent)
       mcpMaterialized =
-        writeMcpConfigFile(resolveMcpServers(req, session)) ?? materializeEmptyMcpConfig()
-      if (configFile) args.push('--config-file', configFile)
-      if (mcpMaterialized) args.push('--mcp-config-file', mcpMaterialized.configPath)
+        writeMcpConfigFile(resolveMcpServers(req, session), materializationParent) ?? materializeEmptyMcpConfig(materializationParent)
+      if (configFile) {
+        const runtimeRoot = await prepareSpawnerPrivatePath(this.spawner, configFile.root.path)
+        args.push('--config-file', join(runtimeRoot, basename(configFile.file)))
+      }
+      if (mcpMaterialized) {
+        const runtimeRoot = await prepareSpawnerPrivatePath(this.spawner, dirname(mcpMaterialized.configPath))
+        args.push('--mcp-config-file', join(runtimeRoot, basename(mcpMaterialized.configPath)))
+      }
       // Under an fs-jail the fresh tmpfs over /tmp hides these host-/tmp configs;
       // expose their dirs read-only so the confined kimi can still read them.
       registerJailReadable(
         req.jailSpec,
-        ...(configFile ? [dirname(configFile)] : []),
+        ...(configFile ? [dirname(configFile.file)] : []),
         ...(mcpMaterialized ? [dirname(mcpMaterialized.configPath)] : []),
       )
 
       spawned = await this.spawner(this.opts.bin, args, {
+        signal,
         stdio: ['pipe', 'pipe', 'pipe'],
         cwd,
         env: { ...process.env, ...provisioned.env },
@@ -144,12 +154,11 @@ export class KimiBackend implements Backend {
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })
     } catch (error) {
-      if (configFile) await cleanupConfigFile(configFile)
+      configFile?.root.cleanup()
       mcpMaterialized?.cleanup()
       throw error
     }
     const child = spawned.child
-    const releaseSpawner = spawned.release
 
     // The spawner registers a synchronous 'error' listener so the spawn
     // failure event doesn't crash the process before our own listener
@@ -355,10 +364,10 @@ export class KimiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       // Always tear down the whole subtree (kimi + any MCP/tool forks)
       // before releasing the slot. Idempotent; waits for actual exit.
-      await terminateSpawned(spawned)
-      if (configFile) await cleanupConfigFile(configFile)
-      mcpMaterialized?.cleanup()
-      releaseSpawner()
+      await finalizeSpawned(spawned, [
+        configFile ? () => configFile.root.cleanup() : null,
+        mcpMaterialized ? () => mcpMaterialized.cleanup() : null,
+      ])
     }
   }
 
@@ -397,7 +406,10 @@ export class KimiBackend implements Backend {
     return null
   }
 
-  private async prepareConfigFile(fullModel: string): Promise<string | null> {
+  private async prepareConfigFile(
+    fullModel: string,
+    parent: string = tmpdir(),
+  ): Promise<{ file: string; root: PrivateTemporaryRoot } | null> {
     if (fullModel.toLowerCase() !== `${this.prefix}kimi-k2.6`) return null
 
     const home = process.env.HOME
@@ -412,10 +424,15 @@ export class KimiBackend implements Backend {
     }
 
     const next = ensureK2DefaultConfig(config)
-    const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-kimi-'))
-    const file = join(dir, 'config.toml')
-    await writeFile(file, next, 'utf8')
-    return file
+    const root = createPrivateTemporaryRoot(parent, 'cli-bridge-kimi-')
+    try {
+      const file = join(root.path, 'config.toml')
+      writeFileSync(file, next, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+      return { file, root }
+    } catch (error) {
+      root.cleanup()
+      throw error
+    }
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
@@ -450,11 +467,6 @@ export function thinkingFlagForEffort(effort: ChatRequest['effort']): '--thinkin
   if (!effort || effort === 'medium') return null
   if (effort === 'none' || effort === 'minimal' || effort === 'low') return '--no-thinking'
   return '--thinking' // high | xhigh | ultracode → kimi's "on"
-}
-
-async function cleanupConfigFile(file: string): Promise<void> {
-  await rm(file, { force: true }).catch(() => undefined)
-  await rm(dirname(file), { recursive: true, force: true }).catch(() => undefined)
 }
 
 function pickSessionId(ev: Record<string, unknown>): string | null {

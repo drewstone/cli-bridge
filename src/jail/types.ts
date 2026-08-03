@@ -12,7 +12,7 @@
  * else the NoopJail passes argv through unchanged.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -197,14 +197,18 @@ function findGitDir(start: string): { gitDir: string; repoRoot: string } | null 
 export async function prepareJailHome(root: string): Promise<void> {
   // Mirror the XDG layout produced by jailEnv() so a CLI finds the dirs ready.
   const relDirs = ['.tmp', '.config', '.cache', join('.local', 'share'), join('.local', 'state'), '.runtime']
-  await mkdir(root, { recursive: true })
+  await mkdir(root, { recursive: true, mode: 0o700 })
+  chmodSync(root, 0o700)
   // The jail root sits inside the project (default <cwd>/.agent-home) and holds
   // scratch + (on macOS) copied credentials. Ignore the whole tree so neither
   // work artifacts nor copied secrets can ever be committed. Never clobber an
   // existing .gitignore.
   const gitignore = join(root, '.gitignore')
-  if (!existsSync(gitignore)) await writeFile(gitignore, '*\n')
+  if (!existsSync(gitignore)) await writeFile(gitignore, '*\n', { mode: 0o600 })
+  else chmodSync(gitignore, 0o600)
   for (const rel of relDirs) {
-    await mkdir(join(root, rel), { recursive: true })
+    const path = join(root, rel)
+    await mkdir(path, { recursive: true, mode: 0o700 })
+    chmodSync(path, 0o700)
   }
 }

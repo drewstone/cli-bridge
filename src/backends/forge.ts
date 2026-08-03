@@ -5,11 +5,11 @@
  * is lower priority than claude / codex / opencode.
  */
 
-import { spawn } from 'node:child_process'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+import { hostSpawner } from '../executors/host.js'
+import { versionHealth } from './health.js'
 
 export interface ForgeBackendOptions {
   bin: string
@@ -25,22 +25,8 @@ export class ForgeBackend implements Backend {
     return m === 'forge' || m.startsWith('forge/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return new Promise((resolve) => {
-      const child = spawn(this.opts.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      const stderr = new BoundedDiagnosticBuffer()
-      child.stderr.on('data', (b) => { stderr.append(b) })
-      child.on('error', (err) => {
-        resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-      })
-      child.on('close', (code) => {
-        resolve({
-          name: this.name,
-          state: code === 0 ? 'ready' : 'error',
-          detail: code === 0 ? undefined : `exit ${code}: ${stderr.render(200)}`,
-        })
-      })
-    })
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, hostSpawner, undefined, signal)
   }
 
   // eslint-disable-next-line require-yield

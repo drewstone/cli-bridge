@@ -8,7 +8,7 @@ Type=simple
 User=%i
 WorkingDirectory=/srv/cli-bridge
 EnvironmentFile=/srv/cli-bridge/.env
-ExecStart=/usr/bin/env pnpm start
+ExecStart=/usr/bin/node /srv/cli-bridge/dist/cli.js
 Restart=always
 RestartSec=5
 # Capture stdout/stderr to journal

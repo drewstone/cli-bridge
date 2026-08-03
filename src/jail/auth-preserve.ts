@@ -18,6 +18,7 @@ import { cp } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import type { JailAuthSource } from './types.js'
+import { hardenPrivateTemporaryTree } from '../runtime/private-temporary.js'
 
 /**
  * $HOME-relative auth/config paths per REGISTERED backend name. Aliases that
@@ -95,5 +96,6 @@ export async function copyAuthIntoJail(root: string, sources: JailAuthSource[] |
     await cp(source, dest, { recursive: true, force: true, errorOnExist: false })
     copied.push(dest)
   }
+  hardenPrivateTemporaryTree(root)
   return copied
 }

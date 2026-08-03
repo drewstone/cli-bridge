@@ -33,9 +33,11 @@
 
 import { mkdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
-import { isAbsolute, join, relative, sep } from 'node:path'
+import { basename, isAbsolute, join, relative, sep } from 'node:path'
 import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
-import type { ExecutorFinding } from './types.js'
+import { throwIfExecutorAborted, type ExecutorFinding } from './types.js'
+import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
+import { grantPrivateTreeToUid } from './private-path-access.js'
 
 export interface DockerPreflightMount {
   /** Host path for a bind, or docker volume name for a per-slot volume. */
@@ -268,27 +270,33 @@ export async function preflightDockerSlot(
    *
    * `request-path` is the live readiness verdict; see `PreflightScope`.
    */
-  opts: { scope?: PreflightScope } = {},
+  opts: { scope?: PreflightScope; signal?: AbortSignal } = {},
 ): Promise<PreflightFinding[]> {
   const findings: PreflightFinding[] = []
   const scope = opts.scope ?? 'full'
+  const signal = opts.signal
+  throwIfExecutorAborted(signal)
   if (scope === 'credentials') {
-    return await checkCredentialMounts(target, containerId, cli, warnings, 'warn')
+    return await checkCredentialMounts(target, containerId, cli, warnings, 'warn', signal)
   }
   if (scope === 'request-path') {
     // Exactly what a request depends on and nothing a request does not: this
     // slot's credentials, and the workspace bind still being live. Adding the
     // image-invariant checks here would spend four docker execs per /health on
     // properties that cannot have changed since startup.
-    findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings, 'fail')))
+    findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings, 'fail', signal)))
     if (target.workspaceRoot) {
-      findings.push(...(await checkWorkspaceMount(target, containerId, cli)))
+      findings.push(...(await checkWorkspaceMount(target, containerId, cli, signal)))
     }
     return findings
   }
 
   // --- identity + HOME agreement -----------------------------------------
-  const identity = await cli(containerShell(containerId, 'printf "%s\\n%s\\n%s" "$(id -u)" "$(id -g)" "$HOME"'))
+  const identity = await runDockerCli(
+    cli,
+    containerShell(containerId, 'printf "%s\\n%s\\n%s" "$(id -u)" "$(id -g)" "$HOME"'),
+    signal,
+  )
   if (identity.code !== 0) {
     return [{
       check: 'container-exec',
@@ -322,13 +330,17 @@ export async function preflightDockerSlot(
   // in the image makes Docker create them root-owned, after which a non-root CLI
   // cannot mkdir beside them and reports EACCES on an unrelated path
   // ($HOME/.local/state). Probe the exact directories a CLI initializes.
-  const stateProbe = await cli(containerShell(
-    containerId,
-    'set -e; for d in "$HOME" "$HOME/.local/state" "$HOME/.local/share" "$HOME/.config" "$HOME/.cache"; do ' +
-    'mkdir -p "$d" 2>&1 || { echo "MKDIR_FAILED $d"; ls -ld "$d" "$(dirname "$d")" 2>&1; exit 3; }; done; ' +
-    'probe="$HOME/.local/state/.cli-bridge-preflight"; : > "$probe" || { echo "WRITE_FAILED $probe"; exit 4; }; ' +
-    'rm -f "$probe"; echo HOME_WRITABLE',
-  ))
+  const stateProbe = await runDockerCli(
+    cli,
+    containerShell(
+      containerId,
+      'set -e; for d in "$HOME" "$HOME/.local/state" "$HOME/.local/share" "$HOME/.config" "$HOME/.cache"; do ' +
+      'mkdir -p "$d" 2>&1 || { echo "MKDIR_FAILED $d"; ls -ld "$d" "$(dirname "$d")" 2>&1; exit 3; }; done; ' +
+      'probe="$HOME/.local/state/.cli-bridge-preflight"; : > "$probe" || { echo "WRITE_FAILED $probe"; exit 4; }; ' +
+      'rm -f "$probe"; echo HOME_WRITABLE',
+    ),
+    signal,
+  )
   if (stateProbe.code !== 0 || !stateProbe.stdout.includes('HOME_WRITABLE')) {
     findings.push({
       check: 'home-writable',
@@ -342,15 +354,19 @@ export async function preflightDockerSlot(
   }
 
   // --- credential mounts land inside HOME, are usable, and hold credentials
-  findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings, 'warn')))
+  findings.push(...(await checkCredentialMounts(target, containerId, cli, warnings, 'warn', signal)))
 
   // --- the workspace bind is proven LIVE at the exec path ----------------
   if (target.workspaceRoot) {
-    findings.push(...(await checkWorkspaceMount(target, containerId, cli)))
+    findings.push(...(await checkWorkspaceMount(target, containerId, cli, signal)))
   }
 
   // --- the CLI resolves for that user ------------------------------------
-  const which = await cli(containerShell(containerId, `command -v ${shellQuote(target.bin)} || exit 1`))
+  const which = await runDockerCli(
+    cli,
+    containerShell(containerId, `command -v ${shellQuote(target.bin)} || exit 1`),
+    signal,
+  )
   const resolved = which.stdout.trim()
   if (which.code !== 0 || !resolved) {
     findings.push({
@@ -367,7 +383,7 @@ export async function preflightDockerSlot(
     const execArgs = ['exec']
     if (target.workspaceRoot) execArgs.push('--workdir', target.workspaceRoot)
     execArgs.push(containerId, target.bin, '--version')
-    const trivial = await cli(execArgs, { timeoutMs: 60_000 })
+    const trivial = await runDockerCli(cli, execArgs, signal, 60_000)
     if (trivial.code !== 0) {
       findings.push({
         check: 'trivial-exec',
@@ -421,6 +437,7 @@ async function checkCredentialMounts(
   cli: DockerCli,
   warnings: string[],
   missingCredentials: 'warn' | 'fail',
+  signal?: AbortSignal,
 ): Promise<PreflightFinding[]> {
   const findings: PreflightFinding[] = []
   for (const mount of target.mounts) {
@@ -436,12 +453,20 @@ async function checkCredentialMounts(
       })
       continue
     }
-    const readable = await cli(containerShell(
-      containerId,
-      `test -r ${shellQuote(mount.target)} && test -x ${shellQuote(mount.target)}`,
-    ))
+    const readable = await runDockerCli(
+      cli,
+      containerShell(
+        containerId,
+        `test -r ${shellQuote(mount.target)} && test -x ${shellQuote(mount.target)}`,
+      ),
+      signal,
+    )
     if (readable.code !== 0) {
-      const owner = await cli(containerShell(containerId, `ls -ld ${shellQuote(mount.target)} 2>&1; id`))
+      const owner = await runDockerCli(
+        cli,
+        containerShell(containerId, `ls -ld ${shellQuote(mount.target)} 2>&1; id`),
+        signal,
+      )
       findings.push({
         check: 'auth-mount-readable',
         detail:
@@ -454,10 +479,14 @@ async function checkCredentialMounts(
       continue
     }
     const probe = `${mount.target}/.cli-bridge-preflight-write`
-    const writable = await cli(containerShell(
-      containerId,
-      `: > ${shellQuote(probe)} && rm -f ${shellQuote(probe)}`,
-    ))
+    const writable = await runDockerCli(
+      cli,
+      containerShell(
+        containerId,
+        `: > ${shellQuote(probe)} && rm -f ${shellQuote(probe)}`,
+      ),
+      signal,
+    )
     if (writable.code !== 0) {
       findings.push({
         check: 'auth-mount-writable',
@@ -468,7 +497,15 @@ async function checkCredentialMounts(
         remedy: mountPermissionRemedy(target, mount, 'writable'),
       })
     }
-    findings.push(...(await checkCredentialPresence(target, mount, containerId, cli, warnings, missingCredentials)))
+    findings.push(...(await checkCredentialPresence(
+      target,
+      mount,
+      containerId,
+      cli,
+      warnings,
+      missingCredentials,
+      signal,
+    )))
   }
   return findings
 }
@@ -501,6 +538,7 @@ async function checkCredentialPresence(
   cli: DockerCli,
   warnings: string[],
   missingCredentials: 'warn' | 'fail',
+  signal?: AbortSignal,
 ): Promise<PreflightFinding[]> {
   const loginHint =
     `log in on the host so the credentials land in ${mount.source}, or run ` +
@@ -515,7 +553,11 @@ async function checkCredentialPresence(
   }
   if (mount.credentialFile) {
     const path = `${mount.target}/${mount.credentialFile}`
-    const present = await cli(containerShell(containerId, `test -e ${shellQuote(path)}`))
+    const present = await runDockerCli(
+      cli,
+      containerShell(containerId, `test -e ${shellQuote(path)}`),
+      signal,
+    )
     if (present.code !== 0) {
       return report(
         'auth-mount-credentials',
@@ -526,7 +568,11 @@ async function checkCredentialPresence(
     }
     return []
   }
-  const listing = await cli(containerShell(containerId, `ls -A ${shellQuote(mount.target)} 2>/dev/null | head -1`))
+  const listing = await runDockerCli(
+    cli,
+    containerShell(containerId, `ls -A ${shellQuote(mount.target)} 2>/dev/null | head -1`),
+    signal,
+  )
   if (listing.code === 0 && listing.stdout.trim() === '') {
     return report(
       'auth-mount-empty',
@@ -547,23 +593,37 @@ async function checkWorkspaceMount(
   target: DockerPreflightTarget,
   containerId: string,
   cli: DockerCli,
+  signal?: AbortSignal,
 ): Promise<PreflightFinding[]> {
   const workspaceRoot = target.workspaceRoot!
-  const markerName = `.cli-bridge-preflight-${randomBytes(6).toString('hex')}`
-  const hostMarker = join(workspaceRoot, markerName)
-  const containerMarker = `${workspaceRoot}/${markerName}`
+  let privateRoot: PrivateTemporaryRoot | null = null
   const token = randomBytes(8).toString('hex')
   try {
-    writeFileSync(hostMarker, token)
+    privateRoot = createPrivateTemporaryRoot(workspaceRoot, '.cli-bridge-preflight-')
+    writeFileSync(join(privateRoot.path, 'private-config'), token, { mode: 0o600, flag: 'wx' })
+    if (target.containerUser) {
+      await grantPrivateTreeToUid(privateRoot.path, Number(target.containerUser.split(':')[0]))
+    }
   } catch (err) {
+    privateRoot?.cleanup()
     return [{
-      check: 'workspace-writable',
-      detail: `${target.envPrefix}_DOCKER_WORKSPACE_ROOT=${workspaceRoot} is not writable on the host (${err instanceof Error ? err.message : String(err)})`,
-      remedy: `point ${target.envPrefix}_DOCKER_WORKSPACE_ROOT at a directory this process can write`,
+      check: 'workspace-private-files',
+      detail:
+        `${target.envPrefix}_DOCKER_WORKSPACE_ROOT=${workspaceRoot} cannot host private generated CLI config ` +
+        `for ${target.containerUser ?? 'the image default user'} (${err instanceof Error ? err.message : String(err)})`,
+      remedy:
+        `point ${target.envPrefix}_DOCKER_WORKSPACE_ROOT at a directory this process can write and ensure the ` +
+        `Linux acl package is installed when ${target.envPrefix}_DOCKER_USER differs from the bridge uid`,
     }]
   }
+  const containerRoot = join(workspaceRoot, basename(privateRoot.path))
+  const containerMarker = join(containerRoot, 'private-config')
   try {
-    const readback = await cli(['exec', '--workdir', workspaceRoot, containerId, 'cat', containerMarker])
+    const readback = await runDockerCli(
+      cli,
+      ['exec', '--workdir', workspaceRoot, containerId, 'cat', containerMarker],
+      signal,
+    )
     if (readback.code !== 0 || readback.stdout.trim() !== token) {
       return [{
         check: 'workspace-mounted',
@@ -579,7 +639,12 @@ async function checkWorkspaceMount(
     }
     // The writability check the CLI actually depends on: it writes INTO the
     // workspace, and a read-only bind would fail only once a tool call runs.
-    const writeBack = await cli(containerShell(containerId, `: > ${shellQuote(`${containerMarker}.rw`)} && rm -f ${shellQuote(`${containerMarker}.rw`)}`))
+    const runtimeWrite = join(containerRoot, 'runtime-write')
+    const writeBack = await runDockerCli(
+      cli,
+      containerShell(containerId, `: > ${shellQuote(runtimeWrite)} && rm -f ${shellQuote(runtimeWrite)}`),
+      signal,
+    )
     if (writeBack.code !== 0) {
       return [{
         check: 'workspace-writable-in-container',
@@ -594,7 +659,7 @@ async function checkWorkspaceMount(
     }
     return []
   } finally {
-    try { rmSync(hostMarker, { force: true }) } catch { /* best-effort */ }
+    try { privateRoot.cleanup() } catch { /* best-effort */ }
   }
 }
 
@@ -614,4 +679,19 @@ function compact(text: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/gu, `'\\''`)}'`
+}
+
+async function runDockerCli(
+  cli: DockerCli,
+  args: string[],
+  signal?: AbortSignal,
+  timeoutMs?: number,
+): Promise<Awaited<ReturnType<DockerCli>>> {
+  throwIfExecutorAborted(signal)
+  const result = await cli(args, {
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(signal ? { signal } : {}),
+  })
+  throwIfExecutorAborted(signal)
+  return result
 }

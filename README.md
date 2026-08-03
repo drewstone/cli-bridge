@@ -13,6 +13,7 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 | `codex/` | ✓ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
 | `opencode/` | ✓ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
 | `gemini/` | ✓ | [Gemini CLI](https://github.com/google-gemini/gemini-cli) — Google's official Gemini coding CLI |
+| `pi/` | ✓ | [Pi](https://github.com/badlogic/pi-mono) — retained native RPC sessions plus one-shot JSON mode |
 | `factory/` | ◦ | [Factory Droid](https://docs.factory.ai/) |
 | `amp/` | ◦ | [Sourcegraph Amp](https://ampcode.com/) |
 | `forge/` | ◦ | [Forge Code](https://github.com/antinomyhq/forge) |
@@ -66,10 +67,23 @@ The router's short-circuit strips the leading `bridge/` and forwards the `<harne
 
 ## Install
 
+For a published install without development dependencies:
+
+```bash
+npm install -g @tangle-network/cli-bridge
+cli-bridge
+```
+
+This exposes one `cli-bridge` executable and starts the existing single-server HTTP surface.
+
+The zero-config backend set contains only local CLI adapters plus passthrough: `claude,codex,opencode,kimi,gemini,pi,passthrough`.
+Sandbox execution is opt-in through `BRIDGE_BACKENDS=sandbox` and its required credentials, so a bare install never fails because remote sandbox configuration is absent.
+
 ```bash
 git clone https://github.com/drewstone/cli-bridge.git
 cd cli-bridge
 pnpm install
+pnpm build
 cp .env.example .env
 # edit .env to taste
 pnpm verify   # probes each configured backend, reports ready/unavailable
@@ -136,15 +150,19 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 - `agent_profile`: full `AgentProfile` object
 - `mcp`: standardised MCP server passthrough (see [MCP passthrough](#mcp-passthrough))
 - `run_id`: caller-owned durable job id (also accepted as `X-Run-Id`)
+- `interaction_policy`: `unattended-deny` or `unattended-allow` for one-shot runs; `unattended-allow` requires the named profile policy and emits a receipt
 
 Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
-- local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`) persist the full profile and reject profile dimensions they cannot execute
+- local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`) apply the full profile to that request and reject profile dimensions they cannot execute
+- resumed one-shot calls must send `agent_profile` again; the session database stores only the model and a non-secret profile digest, never the profile, MCP credentials, forwarded authorization, or request metadata
 - Pi passes the replacement system prompt, additive instructions, skills, and prompt templates through Pi's native per-process flags using unique files that are removed after the run; a profile also disables ambient context, skill, and prompt-template discovery
 - `agent_profile.extensions.pi.load` selects an exact Pi extension set from installed package names or absolute paths; when present, the bridge passes `--no-extensions` plus one `--extension` flag per resolved entry
 - an EMPTY `load` list (`"extensions": { "pi": { "load": [] } }`) is the complete-isolation request: `--no-extensions` and nothing else, so no installed extension loads. Use it when a run must not inherit state an extension persists across runs — a paired experiment whose two arms share such an extension is silently unpaired, and nothing in the response reports it
 - Pi rejects generic profile file mounts because Pi has no request-scoped loader that can preserve their declared task-relative paths
+
+Pi one-shot calls pass `--no-tools` by default; only the exact named unattended profile policy enables headless tool approval.
 
 Example:
 
@@ -219,10 +237,96 @@ Lists model ids each ready backend claims, with which harness serves them.
 ### `GET /health`
 
 JSON report per backend — ready / unavailable / error with detail.
+Timed-out CLI probes are cancelled and never overlap for the same backend.
+Ready results use `BRIDGE_HEALTH_CACHE_MS` (default `30000` ms); failures wait `BRIDGE_HEALTH_FAILURE_RETRY_BACKOFF_MS` (default `5000` ms) before retrying; each probe is limited by `BRIDGE_HEALTH_PROBE_TIMEOUT_MS` (default `3500` ms).
 
-### `GET /v1/sessions` · `DELETE /v1/sessions/:id`
+### Retained native sessions
 
-Inspect / clear external-to-internal session mappings.
+The retained surface uses the public Agent Interface 0.43 event, interaction, run-control, capability, and native-context schemas.
+
+Pi 0.83.0 is the only backend currently advertised for retained native sessions.
+
+Other runners remain available through the compatible one-shot chat route and return `501 capability_denied` from `POST /v1/sessions` because their installed protocols do not yet prove bidirectional continuation.
+
+Create a retained session with an explicit id, model, working directory, and optional exact `agent_profile`:
+
+```bash
+curl -s http://127.0.0.1:3344/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"pi-work","model":"pi/deepseek/deepseek-v4-pro","cwd":"/tmp/project"}'
+```
+
+The HTTP surface is:
+
+- `POST /v1/sessions` creates a retained session and returns its capabilities plus `create_request_digest`, which lets a client recover an identical lost response without attaching to changed input.
+- `GET /v1/sessions` lists retained sessions; `GET /v1/sessions/:id` returns one session.
+- `POST /v1/sessions/:id/turns` accepts the next text-only user turn with stable `execution_id` and `run_id`; `/input` queues a next turn behind an active run and returns when that turn is admitted.
+- `GET /v1/sessions/:id/events` streams the durable `RuntimeEventEnvelope` values as SSE.
+- `GET /v1/runs/:runId/events` streams one exact run using its per-run sequence as the SSE replay id while preserving the session cursor inside each envelope.
+- `GET /v1/sessions/:id/transcript` returns canonical message parts, interactions, usage records, and the latest cursor.
+- `GET /v1/sessions/:id/status` returns the same lifecycle view as the session resource.
+- `POST /v1/sessions/:id/steer` is admitted only when the native runner proves active steering.
+- `POST /v1/sessions/:id/cancel?wait_ms=N` accepts one public `AgentRunCancellationRequest` bound to an operation id, request digest, retained run reference with its admitted run digest, and optional reason, then returns the matching `AgentRunCancellationAcknowledgement`.
+- `POST /v1/sessions/:id/detach` releases no process and does not cancel the active run.
+- `POST /v1/sessions/:id/close` closes an idle or unknown session, releases its native child, and refuses while a run is active.
+- `POST /v1/runs/:runId/interactions/:interactionId/respond` accepts one public `InteractionResponseCommand`.
+
+Create requests without `id` or `session_id`, and turn requests without `run_id`, are rejected before dispatch.
+The bridge never invents random retained identities that a retry could duplicate.
+
+Capability discovery and retained-session creation share one cancellable selected-backend probe, enforce `BRIDGE_HEALTH_PROBE_TIMEOUT_MS`, and return `503 backend_not_ready` unless its health state is `ready`.
+
+The `/input` route queues at most `BRIDGE_RETAINED_INPUT_MAX_QUEUE` requests per session, defaulting to `16`, and waits at most `BRIDGE_RETAINED_INPUT_QUEUE_TIMEOUT_MS`, defaulting to `30000` milliseconds.
+
+Queue overflow returns `429 input_queue_full`, while timeout or request cancellation returns `408` before a durable run admission is created.
+
+Steering requires `operationId`, `message`, and an exact `run` reference containing `runId`, `provider`, `environmentId`, `sessionId`, `executionId`, and the admitted `requestDigest`.
+
+The bridge rechecks that durable reference and the current live native run immediately before sending the steer, and retries with the same operation identity never repeat a native effect.
+
+Each event has a stable `runId`, `eventId`, per-run `sequence`, session replay `cursor`, and receive time.
+
+The run admission stores the caller's public `execution_id` separately from the session-scoped wire `run_id`, and both survive a bridge restart.
+
+The current Pi native channel rejects files, images, per-turn model changes, timeouts, context metadata, and provider options instead of converting or dropping them.
+
+Pi 0.83 does not emit a command acknowledgement for `extension_ui_response`.
+
+The injected retained-session extension puts a unique sanitized token in each permission title and emits `cli-bridge.permission-applied.v1:<token>:<selected-value>` only after `await ctx.ui.select` returns.
+
+The bridge reports an interaction response as accepted only after that exact marker for that exact interaction and selected value arrives after the response, so unrelated later Pi traffic never counts.
+
+Uninstrumented Pi dialogs are recorded as unsupported warnings and are not advertised as answerable interactions.
+
+A native event stream that ends without Pi's explicit `agent_settled` status is recorded as failed, never completed.
+
+Run replay uses the SSE id, while the envelope cursor remains the session-wide cursor; clients must not replace one with the other.
+
+Pass the last numeric SSE `id` as `Last-Event-ID` to replay only later committed events.
+
+Usage is carried by the public `raw` event with `event.type="usage"` because Agent Interface 0.43 exposes usage on `AgentEnvironmentEvent`, not as a new `StreamEvent` union member.
+
+Disconnecting an events reader only stops that reader.
+
+It never invents a terminal event and never cancels the run.
+
+An interaction response already in flight finishes and records its accepted acknowledgement before a competing cancellation is admitted.
+
+If the bridge restarts before a native process is recoverable, the stored session becomes `unknown` and a next-turn request returns `unknown_session` rather than creating a fresh context or claiming cancellation.
+
+The native Pi adapter keeps one child open between turns and checks a `get_state` revision before each later turn, storing a boundary such as `pi:<provider-session-id>:<message-count>`.
+
+Pi does not advertise the public `nativeContinuation` capability because its RPC does not provide one atomic boundary-check-plus-admit operation with request-id replay.
+
+The boundary check is a safety refusal, not a claim that the public native-continuation operation is available.
+
+The adapter stores an explicit `unverified` boundary only when Pi does not return a usable revision.
+
+A later native turn is refused until a fresh Pi boundary matches the stored proof.
+
+Startup validates the complete retained-session SQLite shape, including every table, column type, nullability, primary-key position, event-identity uniqueness rule, and named index, and rejects partial older schemas with the existing incompatible-schema error.
+
+See [BACKENDS.md](docs/BACKENDS.md) for capability evidence and [the session design](docs/design/session-runner.md) for the actual W3 implementation.
 
 ### `POST /cad/render`
 

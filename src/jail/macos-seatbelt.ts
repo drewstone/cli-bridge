@@ -17,9 +17,13 @@
  */
 
 import { accessSync, constants, existsSync } from 'node:fs'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, realpath, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
+import {
+  createPrivateTemporaryRoot,
+  type PrivateTemporaryRoot,
+} from '../runtime/private-temporary.js'
 import { copyAuthIntoJail } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
@@ -53,20 +57,16 @@ export class MacosSeatbeltJail implements JailBackend {
     // can write to them; they sit inside `root`, already in the writable set.
     await prepareJailHome(root)
     ignoreJailRoot(spec.projectDir, root)
-    // sandbox-exec cannot bind-mount, so copy the backend's host auth into the
-    // jail HOME (writable, under root) — the CLI authenticates as the operator.
-    // The copies are removed in cleanup() so credentials never linger in the
-    // project-local jail root.
-    const copiedAuth = await copyAuthIntoJail(root, spec.authSources)
-    const removeCopiedAuth = async (): Promise<void> => {
-      for (const copied of copiedAuth) {
-        await rm(copied, { recursive: true, force: true })
-      }
-    }
-    // From here on, any failure must remove the copied credentials — otherwise a
-    // throw before `cleanup` is returned leaves real auth under the repo jail root.
+    // macOS cannot bind-mount auth. Put each run's HOME and copied credentials in
+    // a registered owner-only child, never directly in persistent .agent-home.
+    // A SIGKILL leaves a manifest that the next bridge startup removes.
+    let homeRoot: PrivateTemporaryRoot | null = null
+    let profileRoot: PrivateTemporaryRoot | null = null
     try {
-      const writable = [root]
+      homeRoot = createPrivateTemporaryRoot(root, '.cli-bridge-jail-home-')
+      await prepareJailHome(homeRoot.path)
+      await copyAuthIntoJail(homeRoot.path, spec.authSources)
+      const writable = [root, homeRoot.path]
       for (const path of spec.extraWritablePaths ?? []) {
         writable.push(await canonicalize(path))
       }
@@ -75,30 +75,54 @@ export class MacosSeatbeltJail implements JailBackend {
       // here, where the jail truly applies, so non-jailed paths are untouched.
       const authEnv: Record<string, string> = {}
       for (const { source, jailRel, envVar } of spec.authSources ?? []) {
-        if (envVar && existsSync(source)) authEnv[envVar] = join(root, jailRel)
+        if (envVar && existsSync(source)) authEnv[envVar] = join(homeRoot.path, jailRel)
       }
 
       const profile = buildProfile(writable)
-      const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
-      const profilePath = join(dir, 'profile.sb')
+      profileRoot = createPrivateTemporaryRoot(tmpdir(), 'cli-bridge-jail-')
+      const profilePath = join(profileRoot.path, 'profile.sb')
       await writeFile(profilePath, profile, { mode: 0o600 })
 
       return {
         bin: SANDBOX_EXEC_BIN,
-        args: ['-f', profilePath, '-D', `HOME=${root}`, '-D', `WORK=${spec.projectDir}`, bin, ...args],
+        args: ['-f', profilePath, '-D', `HOME=${homeRoot.path}`, '-D', `WORK=${spec.projectDir}`, bin, ...args],
         // sandbox-exec does NOT rewrite the child env; -D only parameterizes the
         // profile. Return the real env so HOME/XDG actually point into the jail.
-        env: { ...jailEnv(root), ...authEnv },
+        env: { ...jailEnv(homeRoot.path), ...authEnv },
         cleanup: async () => {
-          await rm(dir, { recursive: true, force: true })
-          await removeCopiedAuth()
+          await cleanupSeatbeltArtifacts(profileRoot, homeRoot)
         },
       }
     } catch (err) {
-      await removeCopiedAuth()
+      try {
+        await cleanupSeatbeltArtifacts(profileRoot, homeRoot)
+      } catch (cleanupError) {
+        throw new AggregateError([err, cleanupError], 'failed to prepare and clean up macOS sandbox profile')
+      }
       throw err
     }
   }
+}
+
+async function cleanupSeatbeltArtifacts(
+  profileRoot: PrivateTemporaryRoot | null,
+  homeRoot: PrivateTemporaryRoot | null,
+): Promise<void> {
+  let profileError: unknown
+  try {
+    profileRoot?.cleanup()
+  } catch (error) {
+    profileError = error
+  }
+  try {
+    homeRoot?.cleanup()
+  } catch (authError) {
+    if (profileError !== undefined) {
+      throw new AggregateError([profileError, authError], 'failed to remove macOS sandbox artifacts')
+    }
+    throw authError
+  }
+  if (profileError !== undefined) throw profileError
 }
 
 function buildProfile(writable: string[]): string {

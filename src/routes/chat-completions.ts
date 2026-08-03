@@ -21,6 +21,7 @@ import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
+  SessionIdentityConflictError,
   type SessionExecutionLease,
   type SessionStore,
 } from '../sessions/store.js'
@@ -109,6 +110,7 @@ const chatRequestSchema = z.object({
   max_tokens: z.number().optional(),
   // Mirrors the canonical ReasoningEffort ladder in @tangle-network/agent-interface.
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
+  interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
   /**
@@ -254,12 +256,14 @@ export function mountChatCompletions(
     //   header X-Session-Id            (canonical)
     //   header X-Resume                (alias — ergonomic single-word form)
     //   header X-Conversation-Id       (alias — matches OpenAI Assistants vocab)
-    const headerSession =
-      c.req.header('x-session-id')
-      ?? c.req.header('x-resume')
-      ?? c.req.header('x-conversation-id')
-      ?? undefined
-    const bodySession = parsed.data.session_id ?? parsed.data.resume_id
+    const sessionResult = resolveSessionId([
+      ['session_id', parsed.data.session_id],
+      ['resume_id', parsed.data.resume_id],
+      ['X-Session-Id', c.req.header('x-session-id')],
+      ['X-Resume', c.req.header('x-resume')],
+      ['X-Conversation-Id', c.req.header('x-conversation-id')],
+    ])
+    if (!sessionResult.ok) return invalidRequest(c, sessionResult.message)
 
     let mode
     try {
@@ -308,7 +312,7 @@ export function mountChatCompletions(
     const mergedMcp = mergeMcpInputs(mcpHeader, bodyMcp as ChatRequest['mcp'] | undefined)
     const req: ChatRequest = {
       ...rest,
-      session_id: bodySession ?? headerSession,
+      session_id: sessionResult.value,
       mode,
       ...(response_format ? { responseFormat: normalizeResponseFormat(response_format) } : {}),
       ...(agent_profile ? { agent_profile: agent_profile as ChatRequest['agent_profile'] } : {}),
@@ -323,6 +327,29 @@ export function mountChatCompletions(
       },
     }
 
+    if (req.interaction_policy === 'interactive') {
+      return c.json({
+        error: {
+          message: 'interactive responses require a retained native session; one-shot chat runners advertise interactions=false',
+          type: 'capability_denied',
+        },
+      }, 501)
+    }
+
+    if (req.interaction_policy === 'unattended-allow') {
+      const profile = req.agent_profile as Record<string, unknown> | undefined
+      const profileMetadata = profile?.metadata as Record<string, unknown> | undefined
+      const policy = profileMetadata?.cliBridge as Record<string, unknown> | undefined
+      if (policy?.interactionPolicy !== 'unattended-allow-v1') {
+        return invalidRequest(c, 'interaction_policy=unattended-allow requires agent_profile.metadata.cliBridge.interactionPolicy="unattended-allow-v1"')
+      }
+      req.interaction_policy_receipt = {
+        schema: 'cli-bridge.interaction-policy.v1',
+        name: 'unattended-allow',
+        profileDigest: canonicalCandidateDigest(req.agent_profile),
+      }
+    }
+
     const backend = deps.registry.resolve(req.model)
     if (!backend) {
       return c.json({
@@ -331,6 +358,17 @@ export function mountChatCompletions(
           type: 'not_found_error',
         },
       }, 404)
+    }
+
+    if (req.session_id) {
+      try {
+        deps.sessions.claimSessionIdentity(req.session_id, 'legacy')
+      } catch (error) {
+        if (error instanceof SessionIdentityConflictError) {
+          return c.json({ error: { message: error.message, type: error.code } }, 409)
+        }
+        throw error
+      }
     }
 
     // Durable-run identity and replay cursor are exact claims. Conflicting aliases, malformed ids,
@@ -420,9 +458,6 @@ export function mountChatCompletions(
       const session = req.session_id
         ? deps.sessions.get(req.session_id, backend.name)
         : null
-      if (!req.agent_profile && session?.metadata?.agent_profile && typeof session.metadata.agent_profile === 'object') {
-        req.agent_profile = session.metadata.agent_profile as ChatRequest['agent_profile']
-      }
       if (!req.cwd && session?.cwd) {
         req.cwd = session.cwd
       }
@@ -522,13 +557,18 @@ export function mountChatCompletions(
                   cwd: req.cwd ?? session?.cwd ?? null,
                   metadata: {
                     model: req.model,
-                    ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
-                    ...(req.metadata ?? {}),
+                    ...(req.agent_profile
+                      ? { profile_digest: canonicalCandidateDigest(req.agent_profile) }
+                      : {}),
                   },
                 })
               }
-              yield delta.finish_reason && req.profile_materialization_receipt
-                ? { ...delta, profile_materialization: req.profile_materialization_receipt }
+              yield delta.finish_reason && (req.profile_materialization_receipt || req.interaction_policy_receipt)
+                ? {
+                    ...delta,
+                    ...(req.profile_materialization_receipt ? { profile_materialization: req.profile_materialization_receipt } : {}),
+                    ...(req.interaction_policy_receipt ? { interaction_policy_receipt: req.interaction_policy_receipt } : {}),
+                  }
                 : delta
             }
             // Successful backends whose CLI reports no usage (kimi-code, opencode)
@@ -765,6 +805,25 @@ type ParsedHeader<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly message: string }
 
+function resolveSessionId(
+  aliases: ReadonlyArray<readonly [name: string, value: string | undefined]>,
+): ParsedHeader<string | undefined> {
+  const supplied = aliases.filter((entry): entry is readonly [string, string] => entry[1] !== undefined)
+  for (const [name, value] of supplied) {
+    if (value.length === 0 || value.length > 512 || value.trim() !== value) {
+      return { ok: false, message: `${name} must be a non-empty identifier of at most 512 characters without outer whitespace` }
+    }
+  }
+  const distinct = new Set(supplied.map(([, value]) => value))
+  if (distinct.size > 1) {
+    return {
+      ok: false,
+      message: `session aliases must match when supplied together: ${supplied.map(([name]) => name).join(', ')}`,
+    }
+  }
+  return { ok: true, value: supplied[0]?.[1] }
+}
+
 function resolveRunId(
   bodyValue: string | undefined,
   headerValue: string | undefined,
@@ -940,7 +999,7 @@ function errorResponse(c: Context, err: unknown): Response {
     // Hono's typed status gate treats 499 as an unofficial code; collapse
     // that one to 504 and keep the rest as documented codes.
     const status: 500 | 501 | 502 | 503 | 504 =
-      err.code === 'not_configured' ? 501
+      err.code === 'not_configured' || err.code === 'capability_denied' ? 501
       : err.code === 'cli_missing' ? 503
       : err.code === 'timeout' ? 504
       : err.code === 'aborted' ? 504

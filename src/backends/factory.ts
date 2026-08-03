@@ -17,9 +17,9 @@
  * is untouched.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -27,11 +27,12 @@ import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForFactory, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
-import type { Spawner } from '../executors/types.js'
+import { prepareSpawnerPrivatePath, prepareSpawnerWorkspacePath, resolveSpawnerCwd, type PreparedWorkspacePath, type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
+import { createPrivateTemporaryRoot } from '../runtime/private-temporary.js'
 
 export interface FactoryBackendOptions {
   bin: string
@@ -52,8 +53,8 @@ export class FactoryBackend implements Backend {
     return m === 'factory' || m.startsWith('factory/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
   async *chat(
@@ -66,33 +67,69 @@ export class FactoryBackend implements Backend {
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
     const model = this.extractModel(req.model)
-    const cwd = req.cwd ?? session?.cwd ?? process.cwd()
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined) ?? process.cwd()
 
     // Prompt via `-f <file>` rather than argv: `droid exec` reads the
     // prompt from a file, which sidesteps the Linux MAX_ARG_STRLEN
     // (128 KiB) limit that a long system prompt would blow through on the
     // positional-arg path.
-    const promptDir = mkdtempSync(join(tmpdir(), 'cli-bridge-droid-'))
-    const promptFile = join(promptDir, 'prompt.txt')
-    writeFileSync(promptFile, prompt)
+    const promptRoot = createPrivateTemporaryRoot(
+      this.spawner.preparePrivatePath ? cwd : tmpdir(),
+      'cli-bridge-droid-',
+    )
+    const promptFile = join(promptRoot.path, 'prompt.txt')
+    writeFileSync(promptFile, prompt, { mode: 0o600, flag: 'wx' })
+    let runtimePromptFile: string
+    try {
+      const runtimeRoot = await prepareSpawnerPrivatePath(this.spawner, promptRoot.path)
+      runtimePromptFile = join(runtimeRoot, basename(promptFile))
+    } catch (error) {
+      promptRoot.cleanup()
+      throw error
+    }
 
-    const args = ['exec', '--output-format', 'stream-json', '--auto', droidAutonomy(), '-f', promptFile]
+    const args = ['exec', '--output-format', 'stream-json', '--auto', droidAutonomy(), '-f', runtimePromptFile]
     if (model) args.push('-m', model)
     if (session?.internalId) args.push('-s', session.internalId)
 
     // Materialize MCP into the project-scope `<cwd>/.factory/mcp.json`
     // (merges + restores, never clobbers the user's global config).
-    const mcpMaterialized = materializeMcpServersForFactory(resolveMcpServers(req, session), cwd)
-
-    const spawned = await this.spawner(this.opts.bin, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd,
-      env: process.env,
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-    })
+    let mcpMaterialized: ReturnType<typeof materializeMcpServersForFactory> = null
+    let workspaceAccess: PreparedWorkspacePath | null = null
+    const cleanupMcpWorkspace = async (): Promise<void> => {
+      const failures: unknown[] = []
+      try { mcpMaterialized?.cleanup() } catch (error) { failures.push(error) }
+      try { await workspaceAccess?.cleanup() } catch (error) { failures.push(error) }
+      if (failures.length === 1) throw failures[0]
+      if (failures.length > 1) throw new AggregateError(failures, 'factory MCP workspace cleanup failed')
+    }
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      const mcpSpecs = resolveMcpServers(req, session)
+      if (mcpSpecs && this.spawner.prepareWorkspacePath) {
+        workspaceAccess = await prepareSpawnerWorkspacePath(this.spawner, join(cwd, '.factory'))
+      }
+      mcpMaterialized = materializeMcpServersForFactory(mcpSpecs, cwd)
+      if (!mcpMaterialized && workspaceAccess) {
+        await workspaceAccess.cleanup()
+        workspaceAccess = null
+      }
+      spawned = await this.spawner(this.opts.bin, args, {
+        signal,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: process.env,
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+    } catch (error) {
+      const failures: unknown[] = [error]
+      try { await cleanupMcpWorkspace() } catch (cleanupError) { failures.push(cleanupError) }
+      try { promptRoot.cleanup() } catch (cleanupError) { failures.push(cleanupError) }
+      if (failures.length > 1) throw new AggregateError(failures, 'factory spawn and cleanup failed')
+      throw error
+    }
     const child = spawned.child
-    const releaseSpawner = spawned.release
 
     let spawnErrorMessage = ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
@@ -175,10 +212,10 @@ export class FactoryBackend implements Backend {
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      await terminateSpawned(spawned)
-      releaseSpawner()
-      mcpMaterialized?.cleanup()
-      try { rmSync(promptDir, { recursive: true, force: true }) } catch { /* best-effort */ }
+      await finalizeSpawned(spawned, [
+        cleanupMcpWorkspace,
+        () => promptRoot.cleanup(),
+      ])
     }
   }
 

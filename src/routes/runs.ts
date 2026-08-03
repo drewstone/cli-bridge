@@ -11,16 +11,22 @@
 import type { Context } from 'hono'
 import { Hono } from 'hono'
 import type { Run, RunRegistry, RunSnapshot } from '../runs/registry.js'
+import type { DurableRetainedRunSnapshot } from '../sessions/retained.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
 
-export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
+export function mountRuns(app: Hono, deps: {
+  runs: RunRegistry
+  retainedRuns?: { runSnapshot(runId: string): DurableRetainedRunSnapshot | null }
+}): void {
   app.get('/v1/runs/:id', async (c) => {
     const run = deps.runs.get(c.req.param('id'))
-    if (!run) return runNotFound(c)
     const waitMs = parseWaitMs(c)
     if (!waitMs.ok) return invalidWait(c, waitMs.message)
-    const snapshot = await terminalSnapshot(run, waitMs.value)
+    const snapshot = run
+      ? await terminalSnapshot(run, waitMs.value)
+      : deps.retainedRuns?.runSnapshot(c.req.param('id'))
+    if (!snapshot) return runNotFound(c)
     setRunHeaders(c, snapshot)
     return c.json(snapshot)
   })
@@ -48,6 +54,14 @@ export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
     if (!snapshot.terminal) {
       c.header('Retry-After', '1')
       return c.json(body, 202)
+    }
+    if (snapshot.status === 'unknown') {
+      return c.json({
+        ...body,
+        effect_unknown: true,
+        retryable: false,
+        message: 'the cancellation effect is unknown',
+      }, 502)
     }
     return c.json(body)
   })
@@ -87,14 +101,14 @@ async function terminalSnapshot(run: Run, waitMs: number): Promise<RunSnapshot> 
   }
 }
 
-function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
+function setRunHeaders(c: Context, snapshot: RunSnapshot | DurableRetainedRunSnapshot): void {
   c.header('X-Run-Id', snapshot.id)
   c.header('X-Run-Request-Digest', snapshot.requestDigest)
   c.header('X-Run-Status', snapshot.status)
   c.header('X-Run-State', snapshot.state)
   c.header('X-Run-Terminal', String(snapshot.terminal))
-  c.header('X-Last-Event-Id', String(snapshot.lastSeq))
-  if (snapshot.replay.expiresAt !== null) {
+  c.header('X-Last-Event-Id', String('lastSeq' in snapshot ? snapshot.lastSeq : 0))
+  if ('replay' in snapshot && snapshot.replay.expiresAt !== null) {
     c.header('X-Run-Replay-Expires-At', String(snapshot.replay.expiresAt))
   }
 }

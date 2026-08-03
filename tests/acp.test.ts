@@ -77,7 +77,7 @@ describe('AcpBackend', () => {
     expect(spawner).toHaveBeenCalledWith('hermes', ['acp'], expect.objectContaining({ cwd: '/tmp' }))
   })
 
-  it('auto-allows session/request_permission (first option) mid-prompt', async () => {
+  it('fails closed on session/request_permission in one-shot mode', async () => {
     const { child, stdin } = mockAcpChild({ permission: true })
     const writes: string[] = []
     stdin.on('data', (d: Buffer) => writes.push(d.toString()))
@@ -85,7 +85,8 @@ describe('AcpBackend', () => {
     const be = new AcpBackend({ name: 'hermes', bin: 'hermes', timeoutMs: 5000, spawner })
     const r = await drain(be, baseReq)
     expect(r.text).toBe('Hello world')
-    expect(writes.join('')).toContain('allow-once') // responded to the permission request with the offered option
+    expect(writes.join('')).toContain('"code":-32001')
+    expect(writes.join('')).not.toContain('"outcome":{"outcome":"selected"')
   })
 
   it('surfaces a spawn error as a clean BackendError', async () => {

@@ -1,134 +1,151 @@
 /**
- * Single-instance guard — one cli-bridge per BRIDGE_PORT.
+ * Single-writer ownership for the durable CLI Bridge data directory.
  *
- * Two bridges bound to the same port is the silent-corruption failure
- * mode: the second `serve()` either EADDRINUSE-crashes (loud, fine) or —
- * worse, under a racing restart — both processes spawn subprocesses,
- * both write the SAME `sessions.sqlite`, and runs get killed out from
- * under each other. The job/connection decoupling and the durable run
- * buffer both assume exactly one owner of the run registry; this guard
- * enforces that assumption before we ever listen.
- *
- * Mechanism: an atomic `O_CREAT | O_EXCL` pidfile keyed by port. Node
- * ships no `flock`, so we use the portable, dependency-free pidfile
- * pattern with a liveness reclaim:
- *
- *   - Create the pidfile exclusively. Win → we own the port.
- *   - On EEXIST, read the holder pid and probe it with `kill(pid, 0)`.
- *       - Holder alive  → throw PortAlreadyBoundError (refuse to start).
- *       - Holder dead    → the file is STALE (predecessor SIGKILL'd,
- *                          never ran its release). Reclaim atomically.
- *
- * The liveness reclaim is what makes this safe under systemd
- * `Restart=always`: a SIGKILL'd predecessor leaves the pidfile behind,
- * but its pid is gone, so the restart reclaims instead of wedging. A
- * graceful exit removes the file in `release()`.
+ * A PID file cannot safely own a process lifetime: file creation and PID writes
+ * are separate operations, and stale-file deletion races a new owner. SQLite's
+ * exclusive transaction is an OS-backed lock that the kernel releases on
+ * process death, so there is no stale-claim protocol to race.
  */
 
-import { openSync, writeSync, closeSync, readFileSync, unlinkSync, constants as fsConstants } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { createHash, randomUUID } from 'node:crypto'
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
+import Database from 'better-sqlite3'
 
 export interface InstanceLock {
-  /** Absolute path to the pidfile this lock holds. */
+  /** Absolute path to the SQLite file whose transaction owns the lock. */
   path: string
-  /** Remove the pidfile. Idempotent — safe to call from shutdown + atexit. */
+  /** Canonical durable-data directory protected by this lock. */
+  dataDir: string
+  /** Roll back the ownership transaction and close its file. Idempotent. */
   release(): void
 }
 
-export class PortAlreadyBoundError extends Error {
+export class DataDirectoryInUseError extends Error {
   constructor(
-    public readonly port: number,
+    public readonly dataDir: string,
+    public readonly requestedPort: number,
     public readonly lockPath: string,
     public readonly holderPid: number | null,
   ) {
     super(
-      `cli-bridge is already running on port ${port}` +
-        (holderPid ? ` (pid ${holderPid})` : '') +
-        `. Lockfile ${lockPath} is held by a live process. ` +
-        `Stop the other instance or set BRIDGE_PORT to a free port.`,
+      `cli-bridge data directory ${JSON.stringify(dataDir)} is already owned` +
+        (holderPid ? ` by pid ${holderPid}` : '') +
+        `. Ownership database ${lockPath} is locked by a live process. ` +
+        'Stop the other instance or set BRIDGE_DATA_DIR to a different directory.',
     )
-    this.name = 'PortAlreadyBoundError'
+    this.name = 'DataDirectoryInUseError'
   }
 }
 
-/**
- * Acquire the per-port single-instance lock. Throws
- * `PortAlreadyBoundError` (a fatal startup error — see
- * `isFatalServerStartupError`) when a LIVE process already holds it.
- * Reclaims a stale lockfile left by a crashed predecessor. Returns a
- * handle whose `release()` removes the pidfile.
- *
- * `dir` defaults to the OS temp dir — a writable location even under
- * systemd `ProtectSystem=strict`. PrivateTmp gives each unit its own
- * /tmp namespace, which is correct: the guard is per-host-port within
- * one namespace, and systemd never runs two instances of the same
- * templated unit on the same port.
- */
-export function acquireInstanceLock(port: number, dir: string = tmpdir()): InstanceLock {
-  const path = join(dir, `cli-bridge-${port}.pid`)
-  claim(path, port)
+/** Create or normalize one local-user-only directory and return its real path. */
+export function ensurePrivateDataDirectory(inputPath: string): string {
+  mkdirSync(inputPath, { recursive: true, mode: 0o700 })
+  const path = realpathSync(inputPath)
+  const before = lstatSync(path)
+  if (!before.isDirectory() || before.isSymbolicLink()) {
+    throw new Error(`CLI Bridge data path ${JSON.stringify(path)} is not a real directory`)
+  }
+  if (typeof process.getuid === 'function' && before.uid !== process.getuid()) {
+    throw new Error(`CLI Bridge data directory ${JSON.stringify(path)} is owned by uid ${before.uid}`)
+  }
+  chmodSync(path, 0o700)
+  if ((statSync(path).mode & 0o777) !== 0o700) {
+    throw new Error(`CLI Bridge data directory ${JSON.stringify(path)} could not be restricted to mode 0700`)
+  }
+  return path
+}
 
+export function acquireInstanceLock(
+  input: { port: number; dataDir: string },
+  lockDir?: string,
+): InstanceLock {
+  const dataDir = ensurePrivateDataDirectory(input.dataDir)
+  const ownershipDir = ensurePrivateDataDirectory(lockDir ?? dataDir)
+  const digest = createHash('sha256').update(dataDir).digest('hex')
+  const path = join(ownershipDir, `cli-bridge-owner-${digest}.sqlite`)
+  const ownerPath = `${path}.json`
+  const token = randomUUID()
+  const db = new Database(path, { timeout: 0 })
+  chmodSync(path, 0o600)
+
+  try {
+    db.pragma('journal_mode = DELETE')
+    db.exec('BEGIN EXCLUSIVE')
+  } catch (error) {
+    db.close()
+    const holderPid = readOwnerPid(ownerPath)
+    throw new DataDirectoryInUseError(dataDir, input.port, path, holderPid)
+  }
+
+  try {
+    writeOwner(ownerPath, { pid: process.pid, port: input.port, dataDir, token })
+    restrictOwnershipFiles(path)
+  } catch (error) {
+    try { db.exec('ROLLBACK') } finally { db.close() }
+    throw error
+  }
   let released = false
   return {
     path,
+    dataDir,
     release(): void {
       if (released) return
       released = true
-      // Only remove the file if it still carries OUR pid — never delete
-      // a lock a successor reclaimed after we were declared dead.
       try {
-        if (readHolderPid(path) === process.pid) unlinkSync(path)
-      } catch { /* already gone */ }
+        db.exec('ROLLBACK')
+      } catch {
+        // A fatal SQLite error may already have ended the transaction.
+      }
+      db.close()
+      try {
+        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string }
+        if (owner.token === token) rmSync(ownerPath, { force: true })
+      } catch {
+        // A crash or external cleanup may already have removed the diagnostic.
+      }
     },
   }
 }
 
-/**
- * Try to create the pidfile exclusively; on collision, reclaim iff the
- * recorded holder is dead. Retries once after a reclaim to close the
- * (vanishingly small) race where two reclaimers fight — the second sees
- * the first's fresh pid and correctly refuses.
- */
-function claim(path: string, port: number, attempt = 0): void {
-  let fd: number
+function writeOwner(
+  path: string,
+  owner: { pid: number; port: number; dataDir: string; token: string },
+): void {
+  const temporaryPath = `${path}.${process.pid}.${owner.token}.tmp`
   try {
-    fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o644)
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-    const holderPid = readHolderPid(path)
-    if (holderPid !== null && isAlive(holderPid)) {
-      throw new PortAlreadyBoundError(port, path, holderPid)
-    }
-    // Stale lockfile (holder dead or unreadable). Reclaim atomically.
-    if (attempt >= 2) {
-      // A live successor reclaimed faster than us — treat as bound.
-      throw new PortAlreadyBoundError(port, path, holderPid)
-    }
-    try { unlinkSync(path) } catch { /* someone else reclaimed first */ }
-    claim(path, port, attempt + 1)
-    return
+    writeFileSync(temporaryPath, JSON.stringify(owner), { flag: 'wx', mode: 0o600 })
+    renameSync(temporaryPath, path)
+    chmodSync(path, 0o600)
+  } finally {
+    rmSync(temporaryPath, { force: true })
   }
-  writeSync(fd, `${process.pid}\n`)
-  closeSync(fd)
 }
 
-function readHolderPid(path: string): number | null {
+function readOwnerPid(path: string): number | null {
   try {
-    const pid = Number.parseInt(readFileSync(path, 'utf8').trim(), 10)
-    return Number.isInteger(pid) && pid > 0 ? pid : null
+    const value = JSON.parse(readFileSync(path, 'utf8')) as { pid?: unknown }
+    return typeof value.pid === 'number' && Number.isSafeInteger(value.pid) && value.pid > 0
+      ? value.pid
+      : null
   } catch {
     return null
   }
 }
 
-/** `kill(pid, 0)` probes existence without delivering a signal. */
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (err) {
-    // EPERM = exists but not ours to signal (still alive). ESRCH = gone.
-    return (err as NodeJS.ErrnoException).code === 'EPERM'
+function restrictOwnershipFiles(path: string): void {
+  for (const candidate of [path, `${path}-journal`]) {
+    if (existsSync(candidate)) chmodSync(candidate, 0o600)
   }
 }

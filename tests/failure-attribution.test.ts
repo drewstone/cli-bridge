@@ -50,6 +50,8 @@ import { PassThrough, Readable } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
 import { Hono } from 'hono'
 import { afterEach, describe, expect, it } from 'vitest'
+
+const TEST_RESOURCE_OWNER = '2'.repeat(64)
 import { loadConfig } from '../src/config.js'
 import { ContainerPool } from '../src/executors/container-pool.js'
 import { createDockerSpawner } from '../src/executors/docker.js'
@@ -148,6 +150,12 @@ async function streamChat(app: Hono, body: unknown): Promise<string> {
 const ok = (stdout = ''): DockerCliResult => ({ code: 0, stdout, stderr: '' })
 const fail = (stderr: string, code = 1): DockerCliResult => ({ code, stdout: '', stderr })
 
+function ownershipInspect(args: string[], exists: (name: string) => boolean): DockerCliResult | null {
+  if (args[0] !== 'container' || args[1] !== 'inspect') return null
+  const name = args[args.length - 1]!
+  return exists(name) ? ok(`${TEST_RESOURCE_OWNER}\n`) : fail(`Error: No such container: ${name}`)
+}
+
 function target(over: Partial<DockerPreflightTarget> = {}): DockerPreflightTarget {
   return {
     backend: 'opencode',
@@ -206,6 +214,8 @@ function poolDocker(): {
   const alive = new Set<string>()
   return {
     cli: async (args) => {
+      const ownership = ownershipInspect(args, (id) => alive.has(id))
+      if (ownership) return ownership
       if (args[0] === 'run') {
         state.runs += 1
         const id = `container-${state.runs}`
@@ -493,19 +503,20 @@ describe('a cwd-less request runs where the container can actually run', () => {
     expect(seen[0]![seen[0]!.indexOf('--workdir') + 1]).toBe(ws)
   })
 
-  it('runs against the container filesystem when nothing is mounted and no cwd is sent', async () => {
+  it('refuses an unmounted generated config even when no cwd is sent', async () => {
     const seen: string[][] = []
     const spawner = spawnerWith(undefined, seen)
     expect(resolveSpawnerCwd(spawner, undefined)).toBeUndefined()
 
     const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5_000, spawner })
-    const { status } = await postChat(chatApp(backend), {
+    const { status, json } = await postChat(chatApp(backend), {
       model: 'opencode/zai-coding-plan/glm-5.2',
       messages: [{ role: 'user', content: 'hi' }],
     })
 
-    expect(status).toBe(200)
-    expect(seen[0]).not.toContain('--workdir')
+    expect(status).toBe(501)
+    expect(json.error?.message).toMatch(/cannot expose host-only path/u)
+    expect(seen).toEqual([])
   })
 
   it('still refuses a cwd the container cannot see, and now names the remedy', () => {
@@ -562,7 +573,7 @@ describe('a cwd-less request runs where the container can actually run', () => {
 describe('slot self-healing covers the saturated pool, not only the idle one', () => {
   it('hands a QUEUED waiter a fresh container after the old one was removed', async () => {
     const docker = poolDocker()
-    const pool = await ContainerPool.create({ ...basePool, cli: docker.cli, livenessTtlMs: 0 })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli, livenessTtlMs: 0 })
 
     const first = await pool.acquire()
     const queued = pool.acquire()          // saturated: this one waits
@@ -577,7 +588,7 @@ describe('slot self-healing covers the saturated pool, not only the idle one', (
 
   it('does not poison every waiter in the queue with the same dead id', async () => {
     const docker = poolDocker()
-    const pool = await ContainerPool.create({ ...basePool, cli: docker.cli, livenessTtlMs: 0 })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: docker.cli, livenessTtlMs: 0 })
 
     const first = await pool.acquire()
     const q1 = pool.acquire()
@@ -600,7 +611,7 @@ describe('slot self-healing covers the saturated pool, not only the idle one', (
       if (args[0] === 'inspect') inspects += 1
       return docker.cli(args)
     }
-    const pool = await ContainerPool.create({ ...basePool, cli: counting, livenessTtlMs: 60_000 })
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER, ...basePool, cli: counting, livenessTtlMs: 60_000 })
 
     const first = await pool.acquire()
     const queued = pool.acquire()

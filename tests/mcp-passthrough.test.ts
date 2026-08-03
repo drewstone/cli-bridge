@@ -19,7 +19,7 @@
  *      codex TOML) AND the materialized stdio command actually spawns
  *      a working JSON-RPC MCP server when launched.
  *
- * (3) is the load-bearing test: it stands up a real Node-based stdio
+ * (3) is the load-bearing test: it stands up a real stdio
  * MCP server, exec's the command line our materializer writes, and
  * confirms the server processes a JSON-RPC `initialize` request. If
  * the materializer drops `args` or `env`, the spawn fails or the
@@ -217,42 +217,46 @@ describe('chat-completions route — mcp body field', () => {
  * stdout and exits.
  */
 const TINY_MCP_SERVER_SOURCE = `
-'use strict'
-process.stdin.setEncoding('utf-8')
-let buf = ''
-process.stdin.on('data', (chunk) => {
-  buf += chunk
-  while (true) {
-    const idx = buf.indexOf('\\r\\n\\r\\n')
-    if (idx < 0) return
-    const headers = buf.slice(0, idx)
-    const m = /Content-Length: (\\d+)/i.exec(headers)
-    if (!m) { buf = buf.slice(idx + 4); continue }
-    const len = Number(m[1])
-    if (buf.length < idx + 4 + len) return
-    const body = buf.slice(idx + 4, idx + 4 + len)
-    buf = buf.slice(idx + 4 + len)
-    let req
-    try { req = JSON.parse(body) } catch { continue }
-    const reply = {
-      jsonrpc: '2.0',
-      id: req.id ?? 1,
-      result: {
-        ok: true,
-        gotMethod: req.method ?? null,
-        // Echo the env var the materializer MUST forward, so tests can
-        // assert env survived the spawn boundary.
-        echoEnv: process.env.MCP_ECHO_KEY ?? null,
-        // Echo argv[2] so tests can assert args survived.
-        echoArg: process.argv[2] ?? null,
-      },
-    }
-    const payload = JSON.stringify(reply)
-    process.stdout.write(\`Content-Length: \${Buffer.byteLength(payload, 'utf-8')}\\r\\n\\r\\n\${payload}\`)
-    process.exit(0)
-  }
-})
-process.stdin.on('end', () => process.exit(0))
+import json
+import os
+import re
+import sys
+
+buf = b''
+while True:
+    chunk = sys.stdin.buffer.read1(4096)
+    if not chunk:
+        break
+    buf += chunk
+    while True:
+        marker = buf.find(b'\\r\\n\\r\\n')
+        if marker < 0:
+            break
+        headers = buf[:marker].decode('ascii', errors='ignore')
+        match = re.search(r'Content-Length: (\\d+)', headers, re.I)
+        if not match:
+            buf = buf[marker + 4:]
+            continue
+        length = int(match.group(1))
+        start = marker + 4
+        if len(buf) < start + length:
+            break
+        body = json.loads(buf[start:start + length].decode('utf-8'))
+        buf = buf[start + length:]
+        reply = {
+            'jsonrpc': '2.0',
+            'id': body.get('id', 1),
+            'result': {
+                'ok': True,
+                'gotMethod': body.get('method'),
+                'echoEnv': os.environ.get('MCP_ECHO_KEY'),
+                'echoArg': sys.argv[1] if len(sys.argv) > 1 else None,
+            },
+        }
+        payload = json.dumps(reply, separators=(',', ':')).encode('utf-8')
+        sys.stdout.buffer.write(b'Content-Length: ' + str(len(payload)).encode('ascii') + b'\\r\\n\\r\\n' + payload)
+        sys.stdout.buffer.flush()
+        raise SystemExit(0)
 `
 
 interface SpawnedReply {
@@ -323,7 +327,7 @@ describe('per-backend materializer produces a launchable stdio MCP server', () =
 
   beforeEach(() => {
     workDir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-int-'))
-    serverPath = join(workDir, 'mini-mcp.cjs')
+    serverPath = join(workDir, 'mini-mcp.py')
     writeFileSync(serverPath, TINY_MCP_SERVER_SOURCE)
   })
   afterEach(() => {
@@ -333,7 +337,7 @@ describe('per-backend materializer produces a launchable stdio MCP server', () =
   function specsForServer(): Record<string, { command: string; args: string[]; env: Record<string, string> }> {
     return {
       echo: {
-        command: process.execPath,
+        command: 'python3',
         args: [serverPath, 'expected-arg-value'],
         env: { MCP_ECHO_KEY: 'expected-env-value' },
       },
@@ -418,9 +422,9 @@ describe('per-backend materializer produces a launchable stdio MCP server', () =
       // spawn probe (the TOML file is what codex reads; spec is the
       // truth our materializer wrote it from).
       expect(toml).toContain('[mcp_servers.echo]')
-      expect(toml).toContain(`command = "${process.execPath}"`)
+      expect(toml).toContain('command = "python3"')
       // Args entry must be a TOML array of strings.
-      expect(toml).toMatch(/args = \["[^"]*mini-mcp\.cjs", "expected-arg-value"\]/)
+      expect(toml).toMatch(/args = \["[^"]*mini-mcp\.py", "expected-arg-value"\]/)
       // env inline table — TOML requires quoted strings, unquoted bare keys.
       expect(toml).toContain('env = { MCP_ECHO_KEY = "expected-env-value" }')
       const spec = specs.echo!

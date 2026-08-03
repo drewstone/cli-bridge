@@ -1,9 +1,10 @@
 import {
-  chmodSync,
   closeSync,
   constants as fsConstants,
   existsSync,
+  fchmodSync,
   fstatSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -12,10 +13,12 @@ import {
   renameSync,
   rmdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type {
   AgentProfile,
   AgentProfileConfigValue,
@@ -25,6 +28,14 @@ import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationRec
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
+import {
+  createPrivateTemporaryRoot,
+  hardenPrivateTemporaryTree,
+  processMatchesOwner,
+  processStartIdentity,
+  reapStalePrivateTemporaryRoots,
+  type PrivateTemporaryRoot,
+} from '../runtime/private-temporary.js'
 import {
   applyWorkspacePlan,
   assertWorkspacePlanSupported,
@@ -144,6 +155,7 @@ export function provisionProfileWorkspace(
 }
 
 export interface ProvisionedPiProfile {
+  rootPath: string
   env: Record<string, string>
   flags: string[]
   written: string[]
@@ -178,7 +190,7 @@ export function provisionPiProfile(
   if (!profile) return null
   const workspaceCwd = requireMaterializationCwd(cwd, 'pi AgentProfile materialization')
 
-  let profileRoot: string | null = null
+  let profileRoot: PrivateTemporaryRoot | null = null
   try {
     const genericFiles = profile.resources?.files?.map((file) => file.path) ?? []
     if (genericFiles.length > 0) {
@@ -190,17 +202,15 @@ export function provisionPiProfile(
     assertWorkspacePlanSupported(plan)
     const nativeLoaders = assertPiPlanHasNativeLoaders(plan)
 
-    profileRoot = mkdtempSync(join(workspaceCwd, '.cli-bridge-pi-profile-'))
-    // Docker executors may run Pi under a uid different from the bridge. The
-    // workspace bind is already the trust boundary; keep the directory
-    // traversable and the files read-only to non-owners.
-    chmodSync(profileRoot, 0o755)
-    const applied = applyWorkspacePlan(plan, profileRoot, { existingFiles: 'reject' })
-    const flags = piProfileFlags(plan, applied, profileRoot, nativeLoaders)
-    const receipt = retainProfileMaterializationReceipt(req, 'pi', plan, applied)
+    profileRoot = createPrivateTemporaryRoot(workspaceCwd, '.cli-bridge-pi-profile-')
+    const applied = applyWorkspacePlan(plan, profileRoot.path, { existingFiles: 'reject' })
+    const flags = piProfileFlags(plan, applied, profileRoot.path, nativeLoaders)
+    hardenPrivateTemporaryTree(profileRoot.path)
+    const receipt = retainProfileMaterializationReceipt(req, 'pi', plan, applied, profileRoot.path)
 
     let cleaned = false
     return {
+      rootPath: profileRoot.path,
       env: requirePublicPlanEnv(applied.env, 'pi'),
       flags,
       written: applied.written,
@@ -208,12 +218,12 @@ export function provisionPiProfile(
       receipt,
       cleanup: () => {
         if (cleaned) return
+        profileRoot!.cleanup()
         cleaned = true
-        rmSync(profileRoot!, { recursive: true, force: true })
       },
     }
   } catch (error) {
-    if (profileRoot) rmSync(profileRoot, { recursive: true, force: true })
+    profileRoot?.cleanup()
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
   }
@@ -306,13 +316,17 @@ function retainProfileMaterializationReceipt(
   harness: HarnessId,
   plan: WorkspacePlan,
   applied: WorkspacePlanReceipt,
+  actualRoot?: string,
 ): ProfileMaterializationReceipt {
   const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
   const receipt: ProfileMaterializationReceipt = {
     schema: 'cli-bridge.profile-materialization.v1',
     harness,
     workspacePlanDigest: applied.workspacePlanDigest,
-    files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
+    files: applied.written.map((path) => ({
+      path,
+      mode: actualRoot ? statSync(join(actualRoot, path)).mode & 0o777 : modes.get(path) ?? 0o644,
+    })),
     unsupported: applied.unsupported,
   }
   req.profile_materialization_receipt = receipt
@@ -320,10 +334,9 @@ function retainProfileMaterializationReceipt(
   return receipt
 }
 
-export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | null): AgentProfile | null {
+export function resolveAgentProfile(req: ChatRequest, _session: SessionRecord | null): AgentProfile | null {
   if (req.agent_profile && typeof req.agent_profile === 'object') return req.agent_profile
-  const stored = session?.metadata?.agent_profile
-  return stored && typeof stored === 'object' ? stored as AgentProfile : null
+  return null
 }
 
 /**
@@ -602,6 +615,7 @@ export function buildCanonicalMcpServers(
 
 export function writeMcpConfigFile(
   specs: Record<string, McpServerSpec> | null,
+  parent: string = tmpdir(),
 ): MaterializedMcpConfig | null {
   if (!specs) return null
   const mcpServers = buildCanonicalMcpServers(specs)
@@ -611,40 +625,27 @@ export function writeMcpConfigFile(
   }
   if (serverNames.length === 0) return null
 
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
-  const configPath = join(dir, 'mcp-config.json')
-  writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2))
-  return {
-    configPath,
-    serverNames,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
-  }
-}
-
-/** True when a process id still names a live process. */
-function pidAlive(pid: number): boolean {
+  const root = createPrivateTemporaryRoot(parent, 'cli-bridge-mcp-')
   try {
-    process.kill(pid, 0)
-    return true
-  } catch (err) {
-    // EPERM = alive but owned by another user — still very much alive.
-    return (err as NodeJS.ErrnoException).code === 'EPERM'
+    const configPath = join(root.path, 'mcp-config.json')
+    writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2), { mode: 0o600, flag: 'wx' })
+    return { configPath, serverNames, cleanup: root.cleanup }
+  } catch (error) {
+    root.cleanup()
+    throw error
   }
 }
 
 /** Write a cwd-native config without following a planted final-component symlink. */
-function writeFileNoFollow(path: string, bytes: string): void {
+function writeFileNoFollow(path: string, bytes: string, mode = 0o600): void {
   const fd = openSync(
     path,
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | (fsConstants.O_NOFOLLOW ?? 0),
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0),
+    0o600,
   )
   try {
+    fchmodSync(fd, mode)
+    ftruncateSync(fd, 0)
     writeFileSync(fd, bytes)
   } finally {
     closeSync(fd)
@@ -654,6 +655,7 @@ function writeFileNoFollow(path: string, bytes: string): void {
 export function materializeMcpServersForPi(
   specs: Record<string, McpServerSpec> | null,
   cwd: string | undefined,
+  options: { isolateChildren?: boolean } = {},
 ): MaterializedMcpConfig | null {
   if (!specs) return null
   // `directTools` is pi-adapter-specific, so it is added HERE rather than in the shared canonical
@@ -673,30 +675,94 @@ export function materializeMcpServersForPi(
   }
   if (serverNames.length === 0) return null
   const workspaceCwd = requireMaterializationCwd(cwd, 'pi MCP passthrough')
-  let dir: string | null = null
+  let root: PrivateTemporaryRoot | null = null
   try {
+    reapStalePiMcpConfigs()
     // pi-mcp-adapter has exposed the per-process `--mcp-config` flag since its first public
     // release. Keep the config under the mounted workspace so host and Docker Pi see the same
     // absolute path, but never mutate the project's own `.pi/mcp.json`.
-    dir = mkdtempSync(join(workspaceCwd, '.cli-bridge-pi-mcp-'))
-    chmodSync(dir, 0o755)
-    const configPath = join(dir, 'mcp.json')
-    writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2), { flag: 'wx', mode: 0o644 })
+    root = createPrivateTemporaryRoot(workspaceCwd, '.cli-bridge-pi-mcp-')
+    const configPath = join(root.path, 'mcp.json')
+    const isolatedMcpServers = options.isolateChildren ? isolatePiMcpServers(mcpServers, root.path) : mcpServers
+    writeFileSync(configPath, JSON.stringify({ mcpServers: isolatedMcpServers }, null, 2), { flag: 'wx', mode: 0o600 })
+    hardenPrivateTemporaryTree(root.path)
     let cleaned = false
     return {
       configPath,
       serverNames,
       cleanup: () => {
         if (cleaned) return
+        root!.cleanup()
         cleaned = true
-        rmSync(dir!, { recursive: true, force: true })
       },
     }
   } catch (error) {
-    if (dir) rmSync(dir, { recursive: true, force: true })
+    root?.cleanup()
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`backend pi failed to prepare MCP config: ${message}`, 'not_configured', error)
   }
+}
+
+/** Backward-compatible entry point; all private backend roots share one reaper. */
+export function reapStalePiMcpConfigs(): number {
+  return reapStalePrivateTemporaryRoots()
+}
+
+const PI_MCP_SECRET_KEY = /(?:^|_)(?:API[_-]?KEY|AUTH(?:ORIZATION|ENTICATION)?|BEARER|COOKIE|CREDENTIALS?|PASSWORD|PASSPHRASE|PRIVATE[_-]?KEY|SECRET|TOKEN)(?:_|$)/iu
+const PI_MCP_ISOLATION_KEY = /^(?:HOME|PATH|PWD|TMPDIR|TEMP|TMP|XDG_CONFIG_HOME|XDG_CACHE_HOME|XDG_DATA_HOME|XDG_RUNTIME_DIR|PI_CODING_AGENT_DIR|PI_CODING_AGENT_SESSION_DIR|PI_PACKAGE_DIR)$/u
+
+/**
+ * pi-mcp-adapter currently copies process.env for every stdio child.
+ * Put a trusted `/usr/bin/env -i` boundary in the config so the adapter's
+ * ambient environment never reaches an untrusted server, and give each server
+ * a fresh HOME/XDG tree with no provider auth files.
+ */
+function isolatePiMcpServers(
+  servers: Record<string, Record<string, unknown>>,
+  root: string,
+): Record<string, Record<string, unknown>> {
+  return Object.fromEntries(Object.entries(servers).map(([name, server], index) => {
+    if (typeof server.command !== 'string') return [name, server]
+    const serverEnv = server.env && typeof server.env === 'object' ? server.env as Record<string, unknown> : {}
+    const safeEntries: string[] = []
+    for (const [key, value] of Object.entries(serverEnv)) {
+      if (!/^[A-Z][A-Z0-9_]*$/u.test(key) || PI_MCP_SECRET_KEY.test(key)) {
+        throw new BackendError(`pi MCP server ${JSON.stringify(name)} declares a secret-shaped environment key ${JSON.stringify(key)}; resolve it in a private adapter instead`, 'parse_error')
+      }
+      if (PI_MCP_ISOLATION_KEY.test(key)) {
+        throw new BackendError(`pi MCP server ${JSON.stringify(name)} cannot override isolated environment key ${JSON.stringify(key)}`, 'parse_error')
+      }
+      if (typeof value !== 'string' || value.includes('\u0000')) {
+        throw new BackendError(`pi MCP server ${JSON.stringify(name)} has an invalid environment value for ${JSON.stringify(key)}`, 'parse_error')
+      }
+      safeEntries.push(`${key}=${value}`)
+    }
+    const home = join(root, `home-${index}`)
+    const tmp = join(home, 'tmp')
+    const config = join(home, '.config')
+    const cache = join(home, '.cache')
+    const data = join(home, '.local', 'share')
+    const runtime = join(home, '.runtime')
+    for (const directory of [tmp, config, cache, data, runtime]) mkdirSync(directory, { recursive: true, mode: 0o700 })
+    const args = [
+      '-i',
+      `HOME=${home}`,
+      'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      `TMPDIR=${tmp}`,
+      `TEMP=${tmp}`,
+      `TMP=${tmp}`,
+      `XDG_CONFIG_HOME=${config}`,
+      `XDG_CACHE_HOME=${cache}`,
+      `XDG_DATA_HOME=${data}`,
+      `XDG_RUNTIME_DIR=${runtime}`,
+      ...safeEntries,
+      '--',
+      server.command,
+      ...(Array.isArray(server.args) ? server.args as string[] : []),
+    ]
+    const { env: _discardedEnv, ...withoutEnv } = server
+    return [name, { ...withoutEnv, command: '/usr/bin/env', args }]
+  }))
 }
 
 /**
@@ -741,6 +807,7 @@ function mountCwdNativeMcp(
   const piDir = join(cwd, subdir)
   const configPath = join(piDir, filename)
   const lockPath = `${configPath}.lock`
+  const recoveryPath = `${lockPath}.recovery`
 
   const fail = (detail: string): never => {
     throw new BackendError(
@@ -776,12 +843,21 @@ function mountCwdNativeMcp(
   // one post-acquire correction path goes through temp-file + rename,
   // which readers see atomically. An unreadable lock is FAIL-CLOSED
   // (contention error), never stolen.
-  const writeLockAtomic = (payload: { pid: number; originalBytes: string | null }): void => {
+  interface LockPayload {
+    pid: number
+    processStart: string | null
+    originalBytes: string | null
+    originalMode: number | null
+    mountedDigest: string | null
+    mountedDevice: string | null
+    mountedInode: string | null
+  }
+  const writeLockAtomic = (payload: LockPayload): void => {
     const tmpPath = `${lockPath}.${process.pid}.tmp`
     // `wx` refuses a pre-planted symlink at the tmp path; rename replaces
     // the lock atomically without following links.
     rmSync(tmpPath, { force: true })
-    writeFileSync(tmpPath, JSON.stringify(payload), { flag: 'wx' })
+    writeFileSync(tmpPath, JSON.stringify(payload), { flag: 'wx', mode: 0o600 })
     renameSync(tmpPath, lockPath)
   }
 
@@ -790,7 +866,15 @@ function mountCwdNativeMcp(
   // DoS before any timeout starts). Open no-follow + non-blocking, fstat
   // the fd (no swap race), reject non-regular files and oversized bytes.
   const MAX_WORKSPACE_READ = 1024 * 1024
-  const readWorkspaceFileMaybe = (path: string): string | null => {
+  const readWorkspaceFileState = (
+    path: string,
+    enforcePrivateMode = false,
+  ): {
+    bytes: string | null
+    mode: number | null
+    device: string | null
+    inode: string | null
+  } => {
     let fd: number
     try {
       fd = openSync(
@@ -799,25 +883,64 @@ function mountCwdNativeMcp(
       )
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code
-      if (code === 'ENOENT') return null
+      if (code === 'ENOENT') return { bytes: null, mode: null, device: null, inode: null }
       return fail(`${path} is not readable as a regular file (${code ?? 'unknown error'})`)
     }
     try {
-      const st = fstatSync(fd)
+      const st = fstatSync(fd, { bigint: true })
       if (!st.isFile()) fail(`${path} is not a regular file (workspace planted a special file)`)
-      if (st.size > MAX_WORKSPACE_READ) fail(`${path} exceeds the ${MAX_WORKSPACE_READ}-byte cap`)
-      return readFileSync(fd, 'utf-8')
+      if (st.size > BigInt(MAX_WORKSPACE_READ)) fail(`${path} exceeds the ${MAX_WORKSPACE_READ}-byte cap`)
+      if (enforcePrivateMode) fchmodSync(fd, 0o600)
+      return {
+        bytes: readFileSync(fd, 'utf-8'),
+        mode: Number(st.mode & 0o777n),
+        device: st.dev.toString(),
+        inode: st.ino.toString(),
+      }
     } finally {
       closeSync(fd)
     }
   }
+  const readWorkspaceFileMaybe = (path: string, enforcePrivateMode = false): string | null =>
+    readWorkspaceFileState(path, enforcePrivateMode).bytes
+  const contentDigest = (bytes: string): string => createHash('sha256').update(bytes).digest('hex')
+  const matchesMountedFile = (
+    state: ReturnType<typeof readWorkspaceFileState>,
+    payload: Partial<LockPayload>,
+  ): boolean => Boolean(
+    state.bytes !== null
+    && payload.mountedDigest
+    && payload.mountedDevice
+    && payload.mountedInode
+    && state.device === payload.mountedDevice
+    && state.inode === payload.mountedInode
+    && contentDigest(state.bytes) === payload.mountedDigest,
+  )
+  const matchesOriginalFile = (
+    state: ReturnType<typeof readWorkspaceFileState>,
+    payload: Partial<LockPayload>,
+  ): boolean => {
+    if (payload.originalBytes === null) return state.bytes === null
+    return typeof payload.originalBytes === 'string'
+      && state.bytes === payload.originalBytes
+      && state.mode === payload.originalMode
+  }
 
   const tryAcquire = (): boolean => {
     try {
+      const original = readWorkspaceFileState(configPath)
       writeFileSync(
         lockPath,
-        JSON.stringify({ pid: process.pid, originalBytes: readWorkspaceFileMaybe(configPath) }),
-        { flag: 'wx' },
+        JSON.stringify({
+          pid: process.pid,
+          processStart: processStartIdentity(process.pid),
+          originalBytes: original.bytes,
+          originalMode: original.mode,
+          mountedDigest: null,
+          mountedDevice: null,
+          mountedInode: null,
+        } satisfies LockPayload),
+        { flag: 'wx', mode: 0o600 },
       )
       return true
     } catch (err) {
@@ -829,10 +952,15 @@ function mountCwdNativeMcp(
     }
   }
 
+  if (existsSync(recoveryPath)) {
+    fail(`stale-lock recovery is already in progress at ${recoveryPath}`)
+  }
   if (!tryAcquire()) {
-    let stale: { pid?: number; originalBytes?: string | null } | null = null
+    let stale: Partial<LockPayload> | null = null
+    let staleLockBytes: string | null = null
     try {
-      stale = JSON.parse(readWorkspaceFileMaybe(lockPath) ?? '') as { pid?: number; originalBytes?: string | null }
+      staleLockBytes = readWorkspaceFileMaybe(lockPath, true)
+      stale = JSON.parse(staleLockBytes ?? '') as Partial<LockPayload>
     } catch {
       // Unreadable/corrupt lock: FAIL-CLOSED. Stealing here could kill a
       // live mount mid-run; a human (or a dead-pid check on a later
@@ -844,30 +972,57 @@ function mountCwdNativeMcp(
       )
     }
     const holderPid = stale?.pid ?? null
-    if (holderPid === null || pidAlive(holderPid)) {
+    if (holderPid === null || processMatchesOwner(holderPid, stale?.processStart ?? null)) {
       throw new BackendError(
         `backend ${backendName} cannot mount MCP servers at ${configPath}: another run${holderPid !== null ? ` (pid ${holderPid})` : ''} holds the `
         + `mount for this cwd; ${backendName} supports one MCP-mounted run per workspace — use distinct cwds`,
         'not_configured',
       )
     }
-    // Stale lock from a dead/crashed run: roll the config back to the
-    // dead run's recorded pre-mount state (or remove it when unknown —
-    // leaked request-scoped servers must not persist), then steal.
+    // Stale lock from a dead/crashed run: roll back only the exact inode and
+    // content that the dead run wrote. A user may have replaced or edited the
+    // file after the crash; preserving that file is safer than guessing.
     try {
-      if (stale && typeof stale.originalBytes === 'string') {
-        writeFileNoFollow(configPath, stale.originalBytes)
-      } else {
-        // unlink removes a symlink itself, never its target — safe.
-        rmSync(configPath, { force: true })
+      writeFileSync(recoveryPath, JSON.stringify({ pid: process.pid, processStart: processStartIdentity(process.pid) }), {
+        flag: 'wx',
+        mode: 0o600,
+      })
+    } catch (recoveryError) {
+      fail(`another run is recovering a stale lock (${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)})`)
+    }
+    try {
+      const currentLockBytes = readWorkspaceFileMaybe(lockPath, true)
+      if (currentLockBytes !== staleLockBytes) {
+        fail('lock changed while stale-lock recovery was being claimed')
       }
-      rmSync(lockPath, { force: true })
-      if (!tryAcquire()) {
-        fail('lost race stealing stale lock: another run acquired it first')
+      try {
+        const current = readWorkspaceFileState(configPath)
+        if (matchesMountedFile(current, stale ?? {})) {
+          if (stale && typeof stale.originalBytes === 'string') {
+            writeFileNoFollow(
+              configPath,
+              stale.originalBytes,
+              typeof stale.originalMode === 'number' ? stale.originalMode : 0o600,
+            )
+          } else if (stale?.originalBytes === null) {
+            // unlink removes a symlink itself, never its target — safe.
+            rmSync(configPath, { force: true })
+          } else {
+            fail('stale lock has no valid original config state')
+          }
+        } else if (!matchesOriginalFile(current, stale ?? {})) {
+          fail(`stale mounted config changed after its owner exited; preserving ${configPath} and keeping the lock`)
+        }
+        rmSync(lockPath, { force: true })
+        if (!tryAcquire()) {
+          fail('lost race stealing stale lock: another run acquired it first')
+        }
+      } catch (retryErr) {
+        if (retryErr instanceof BackendError) throw retryErr
+        fail(`lost race stealing stale lock: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`)
       }
-    } catch (retryErr) {
-      if (retryErr instanceof BackendError) throw retryErr
-      fail(`lost race stealing stale lock: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`)
+    } finally {
+      rmSync(recoveryPath, { force: true })
     }
   }
 
@@ -882,16 +1037,30 @@ function mountCwdNativeMcp(
   // We hold the lock; re-read the config in case it changed between the
   // pre-acquire snapshot and acquisition, and correct the recorded
   // pre-mount state atomically if so.
-  const originalBytes = readWorkspaceFileMaybe(configPath)
+  const original = readWorkspaceFileState(configPath)
+  const originalBytes = original.bytes
+  const originalMode = original.mode
   try {
     let recorded: string | null | undefined
+    let recordedMode: number | null | undefined
     try {
-      recorded = (JSON.parse(readWorkspaceFileMaybe(lockPath) ?? '') as { originalBytes?: string | null }).originalBytes
+      const payload = JSON.parse(readWorkspaceFileMaybe(lockPath, true) ?? '') as Partial<LockPayload>
+      recorded = payload.originalBytes
+      recordedMode = payload.originalMode
     } catch {
       recorded = undefined
+      recordedMode = undefined
     }
-    if (recorded !== originalBytes) {
-      writeLockAtomic({ pid: process.pid, originalBytes })
+    if (recorded !== originalBytes || recordedMode !== originalMode) {
+      writeLockAtomic({
+        pid: process.pid,
+        processStart: processStartIdentity(process.pid),
+        originalBytes,
+        originalMode,
+        mountedDigest: null,
+        mountedDevice: null,
+        mountedInode: null,
+      })
     }
   } catch (err) {
     releaseLock()
@@ -908,10 +1077,40 @@ function mountCwdNativeMcp(
       // restores the original bytes verbatim either way.
     }
   }
+  const restoreOriginal = (): void => {
+    if (originalBytes !== null) writeFileNoFollow(configPath, originalBytes, originalMode ?? 0o600)
+    else rmSync(configPath, { force: true })
+  }
+  const mountedBytes = JSON.stringify(merged, null, 2)
+  let mountedState: ReturnType<typeof readWorkspaceFileState> | null = null
   try {
-    writeFileNoFollow(configPath, JSON.stringify(merged, null, 2))
+    writeFileNoFollow(configPath, mountedBytes, 0o600)
+    mountedState = readWorkspaceFileState(configPath)
+    if (mountedState.bytes !== mountedBytes || !mountedState.device || !mountedState.inode) {
+      fail(`could not prove the identity of the mounted config at ${configPath}`)
+    }
+    writeLockAtomic({
+      pid: process.pid,
+      processStart: processStartIdentity(process.pid),
+      originalBytes,
+      originalMode,
+      mountedDigest: contentDigest(mountedBytes),
+      mountedDevice: mountedState.device,
+      mountedInode: mountedState.inode,
+    })
   } catch (err) {
-    releaseLock()
+    try {
+      const current = readWorkspaceFileState(configPath)
+      if (mountedState && !matchesMountedFile(current, {
+        mountedDigest: contentDigest(mountedBytes),
+        mountedDevice: mountedState.device,
+        mountedInode: mountedState.inode,
+      })) throw new Error('mounted config identity changed before setup rollback')
+      restoreOriginal()
+      releaseLock()
+    } catch {
+      // Keep the lock and its original bytes for crash recovery.
+    }
     fail(err instanceof Error ? err.message : String(err))
   }
 
@@ -921,13 +1120,21 @@ function mountCwdNativeMcp(
     serverNames,
     cleanup: () => {
       if (cleaned) return
-      cleaned = true
       try {
-        if (originalBytes !== null) {
+        const current = readWorkspaceFileState(configPath)
+        const mountedStillOwned = matchesMountedFile(current, {
+          mountedDigest: contentDigest(mountedBytes),
+          mountedDevice: mountedState?.device ?? null,
+          mountedInode: mountedState?.inode ?? null,
+        })
+        if (!mountedStillOwned && !matchesOriginalFile(current, { originalBytes, originalMode })) {
+          throw new Error(`mounted config changed during the run; preserving ${configPath}`)
+        }
+        if (mountedStillOwned && originalBytes !== null) {
           // No-follow: the workspace may have swapped the config for a
           // symlink mid-run; never restore THROUGH it from the host.
-          writeFileNoFollow(configPath, originalBytes)
-        } else {
+          writeFileNoFollow(configPath, originalBytes, originalMode ?? 0o600)
+        } else if (mountedStillOwned) {
           rmSync(configPath, { force: true })
         }
       } catch (err) {
@@ -936,12 +1143,22 @@ function mountCwdNativeMcp(
         // stale-lock recovery retry the rollback once this pid exits;
         // releasing it now would let the tampered config masquerade as
         // workspace-original state.
-        if (process.env.CLI_BRIDGE_DEBUG_MCP) {
-          console.error(`[cli-bridge mcp ${backendName}] cleanup restore failed for ${configPath}; keeping lock: ${err instanceof Error ? err.message : String(err)}`)
-        }
-        return
+        throw new BackendError(
+          `backend ${backendName} could not restore MCP config at ${configPath}; keeping lock: ${err instanceof Error ? err.message : String(err)}`,
+          'upstream',
+          err,
+        )
       }
-      releaseLock()
+      try {
+        rmSync(lockPath, { force: true })
+      } catch (err) {
+        throw new BackendError(
+          `backend ${backendName} restored MCP config but could not remove lock ${lockPath}: ${err instanceof Error ? err.message : String(err)}`,
+          'upstream',
+          err,
+        )
+      }
+      cleaned = true
       try {
         // Only remove `<subdir>` when this run created it AND nothing
         // else landed in it meanwhile (rmdirSync refuses non-empty dirs).
@@ -1117,7 +1334,11 @@ export function materializeOpencodeMcpConfig(profile: AgentProfile | null): Mate
   const permissions = profile && typeof profile === 'object'
     ? (profile as { permissions?: Record<string, unknown> }).permissions
     : undefined
-  return materializeMcpServersForOpencode(specs, permissions)
+  const policy = profile?.metadata?.cliBridge as Record<string, unknown> | undefined
+  const interactionPolicy = policy?.interactionPolicy === 'unattended-allow-v1'
+    ? 'unattended-allow'
+    : 'unattended-deny'
+  return materializeMcpServersForOpencode(specs, permissions, interactionPolicy)
 }
 
 /**
@@ -1126,9 +1347,8 @@ export function materializeOpencodeMcpConfig(profile: AgentProfile | null): Mate
  * from a normalized `McpServerSpec` map. Layered on top of the user's
  * global `~/.config/opencode/opencode.json` via `OPENCODE_CONFIG`.
  *
- * Always returns a non-null result — opencode needs a config file
- * even when no MCP servers are declared (so the headless permission
- * map below can disable interactive prompts).
+ * Always returns a non-null result — opencode needs a config file even when
+ * no MCP servers are declared so the permission posture is explicit.
  *
  * Schema source: https://opencode.ai/config.json
  *   (`properties.mcp.additionalProperties`).
@@ -1136,6 +1356,8 @@ export function materializeOpencodeMcpConfig(profile: AgentProfile | null): Mate
 export function materializeMcpServersForOpencode(
   specs: Record<string, McpServerSpec> | null,
   callerPermissions?: Record<string, unknown> | null,
+  interactionPolicy: 'interactive' | 'unattended-deny' | 'unattended-allow' = 'unattended-deny',
+  parent: string = tmpdir(),
 ): MaterializedMcpConfig {
   const opencodeMcp: Record<string,
     | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
@@ -1171,66 +1393,60 @@ export function materializeMcpServersForOpencode(
   }
   const serverNames = Object.keys(opencodeMcp)
 
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-'))
-  const configPath = join(dir, 'opencode.json')
-  // Headless benchmark and automation runs must never block on an
-  // interactive permission prompt, so every tool defaults to `allow`.
-  const headlessPermission: Record<string, 'allow' | 'ask' | 'deny'> = {
-    external_directory: 'allow',
-    bash: 'allow',
-    edit: 'allow',
-    read: 'allow',
-    write: 'allow',
-    webfetch: 'allow',
-    task: 'allow',
-    plan_enter: 'allow',
-    plan_exit: 'allow',
-    question: 'allow',
+  const root = createPrivateTemporaryRoot(parent, 'cli-bridge-opencode-')
+  const configPath = join(root.path, 'opencode.json')
+  // Interactive and unattended-deny paths remain explicit. The only path that
+  // writes `allow` is an explicit named profile policy, which the chat route
+  // has already converted into an interaction-policy receipt.
+  const defaultPermission = interactionPolicy === 'unattended-allow'
+    ? 'allow'
+    : interactionPolicy === 'interactive'
+      ? 'ask'
+      : 'deny'
+  const permission: Record<string, 'allow' | 'ask' | 'deny'> = {
+    external_directory: defaultPermission,
+    bash: defaultPermission,
+    edit: defaultPermission,
+    read: defaultPermission,
+    write: defaultPermission,
+    webfetch: defaultPermission,
+    task: defaultPermission,
+    plan_enter: defaultPermission,
+    plan_exit: defaultPermission,
+    question: defaultPermission,
   }
-  // The caller's agent_profile.permissions override the headless defaults —
-  // an explicit `deny` is load-bearing (the search benchmark's no-web arm
-  // sets webfetch:'deny' to remove native web). Without this, the hardcoded
-  // `allow` above silently kept webfetch on and the "offline" arm still
-  // fetched. Only known permission verbs are honored, per-key.
+  // The profile may narrow the posture. It may not silently widen an
+  // interactive request into unattended execution.
   if (callerPermissions && typeof callerPermissions === 'object') {
     for (const [key, value] of Object.entries(callerPermissions)) {
       if (value === 'allow' || value === 'ask' || value === 'deny') {
-        headlessPermission[key] = value
+        if (interactionPolicy !== 'unattended-allow' && value === 'allow') continue
+        permission[key] = value
       }
     }
   }
-  writeFileSync(configPath, JSON.stringify({
-    $schema: 'https://opencode.ai/config.json',
-    permission: headlessPermission,
-    mcp: opencodeMcp,
-  }, null, 2))
-  return {
-    configPath,
-    serverNames,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
+  try {
+    writeFileSync(configPath, JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      permission,
+      mcp: opencodeMcp,
+    }, null, 2), { mode: 0o600, flag: 'wx' })
+    return { configPath, serverNames, cleanup: root.cleanup }
+  } catch (error) {
+    root.cleanup()
+    throw error
   }
 }
 
-export function materializeEmptyMcpConfig(): MaterializedMcpConfig {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
-  const configPath = join(dir, 'mcp-config.json')
-  writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2))
-  return {
-    configPath,
-    serverNames: [],
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
+export function materializeEmptyMcpConfig(parent: string = tmpdir()): MaterializedMcpConfig {
+  const root = createPrivateTemporaryRoot(parent, 'cli-bridge-mcp-')
+  try {
+    const configPath = join(root.path, 'mcp-config.json')
+    writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2), { mode: 0o600, flag: 'wx' })
+    return { configPath, serverNames: [], cleanup: root.cleanup }
+  } catch (error) {
+    root.cleanup()
+    throw error
   }
 }
 
@@ -1264,6 +1480,7 @@ export interface MaterializedCodexHome {
 export function materializeMcpServersForCodex(
   specs: Record<string, McpServerSpec> | null,
   authSourcePath?: string,
+  parent: string = stableTmpRoot(),
 ): MaterializedCodexHome | null {
   if (!specs) return null
 
@@ -1314,30 +1531,22 @@ export function materializeMcpServersForCodex(
 
   // Codex aborts if CODEX_HOME is under the system tmpdir on some
   // platforms — use the user's HOME/.cache as a stable parent.
-  const baseDir = mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
-  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n')
+  const root = createPrivateTemporaryRoot(parent, 'cli-bridge-codex-')
+  try {
+    writeFileSync(join(root.path, 'config.toml'), lines.join('\n\n') + '\n', { mode: 0o600, flag: 'wx' })
 
-  if (authSourcePath) {
-    try {
-      const auth = readFileMaybe(authSourcePath)
-      if (auth !== null) writeFileSync(join(baseDir, 'auth.json'), auth)
-    } catch {
-      // Best-effort: codex without auth.json will fail to call the
-      // model. Surface that as an upstream error from the backend
-      // rather than silently swallowing it here.
-    }
-  }
-
-  return {
-    homePath: baseDir,
-    serverNames,
-    cleanup: () => {
+    if (authSourcePath) {
       try {
-        rmSync(baseDir, { recursive: true, force: true })
+        const auth = readFileMaybe(authSourcePath)
+        if (auth !== null) writeFileSync(join(root.path, 'auth.json'), auth, { mode: 0o600, flag: 'wx' })
       } catch {
-        // best-effort
+        // Codex will report missing auth through its normal upstream error.
       }
-    },
+    }
+    return { homePath: root.path, serverNames, cleanup: root.cleanup }
+  } catch (error) {
+    root.cleanup()
+    throw error
   }
 }
 
@@ -1350,8 +1559,9 @@ function stableTmpRoot(): string {
   if (home) {
     try {
       const cache = join(home, '.cache')
-      // Don't mkdir — cli-bridge runs on hosts that always have
-      // ~/.cache (we don't ship a polyfill for first-boot Linux).
+      mkdirSync(cache, { recursive: true, mode: 0o700 })
+      const probe = mkdtempSync(join(cache, '.cli-bridge-write-probe-'))
+      rmSync(probe, { recursive: true, force: true })
       return cache
     } catch {
       // fallthrough

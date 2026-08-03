@@ -4,11 +4,11 @@
  * upstream ships it.
  */
 
-import { spawn } from 'node:child_process'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+import { hostSpawner } from '../executors/host.js'
+import { versionHealth } from './health.js'
 
 export interface AmpBackendOptions {
   bin: string
@@ -24,23 +24,8 @@ export class AmpBackend implements Backend {
     return m === 'amp' || m.startsWith('amp/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return new Promise((resolve) => {
-      const child = spawn(this.opts.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      const stdout = new BoundedDiagnosticBuffer()
-      child.stdout.on('data', (b) => { stdout.append(b) })
-      child.stderr.resume()
-      child.on('error', (err) => {
-        resolve({ name: this.name, state: 'unavailable', detail: `spawn failed: ${err.message}` })
-      })
-      child.on('close', (code) => {
-        if (code === 0) {
-          resolve({ name: this.name, state: 'ready', version: stdout.render().trim() || undefined })
-        } else {
-          resolve({ name: this.name, state: 'error', detail: `exit ${code}` })
-        }
-      })
-    })
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, hostSpawner, undefined, signal)
   }
 
   // eslint-disable-next-line require-yield

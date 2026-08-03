@@ -40,6 +40,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process'
+import { readdirSync, readFileSync } from 'node:fs'
 import type { SpawnResult } from './types.js'
 
 /** Time we give a subprocess to exit gracefully before SIGKILL. */
@@ -61,22 +62,17 @@ export async function killTree(
   const gracefulMs = opts.gracefulMs ?? DEFAULT_GRACEFUL_TERMINATION_MS
   const pid = child.pid
   if (pid === undefined) return
-  if (child.exitCode !== null || child.signalCode !== null) return
 
-  // Send SIGTERM to the negative pgid. Node's `process.kill(-pid, sig)`
-  // dispatches the signal to every process in the group. We try the
-  // group first; if it errors (ESRCH = no such group, EPERM = not the
-  // leader) fall back to the direct child.
-  trySignal(-pid, 'SIGTERM') || trySignal(pid, 'SIGTERM')
+  // A direct child can exit before a helper it forked. Its ChildProcess then
+  // looks terminal while the process group still owns live work. Always judge
+  // both, and signal the group even after the leader has exited.
+  signalOwnedTree(child, pid, 'SIGTERM')
 
-  // Wait for exit OR grace period. Whichever comes first.
-  await waitForExitOrTimeout(child, gracefulMs)
+  if (await waitForOwnedTreeGone(child, pid, gracefulMs)) return
 
-  if (child.exitCode === null && child.signalCode === null) {
-    trySignal(-pid, 'SIGKILL') || trySignal(pid, 'SIGKILL')
-    // SIGKILL is uncatchable — process dies on the next scheduler tick.
-    // Wait briefly so child.exitCode is populated before we return.
-    await waitForExitOrTimeout(child, 500)
+  signalOwnedTree(child, pid, 'SIGKILL')
+  if (!await waitForOwnedTreeGone(child, pid, 1_000)) {
+    throw new Error(`process group ${pid} remained alive after SIGKILL`)
   }
 }
 
@@ -92,19 +88,87 @@ export function terminateSpawned(spawned: SpawnResult): Promise<void> {
   const active = terminationBySpawn.get(spawned)
   if (active) return active
 
-  // Never rejects. Backends await this in their `finally`, so a rejection here
-  // REPLACED the outcome the CLI had already produced: measured live, a request
-  // whose container was swept answered HTTP 500 with "docker executor could not
-  // terminate container …", a sentence containing nothing the caller sent.
-  // Cleanup is the executor's business — the docker spawner's own release path
-  // sees the same failure and recycles the slot — while the caller's answer stays
-  // the CLI's answer.
-  const termination = (spawned.terminate?.() ?? killTree(spawned.child)).catch((error) => {
-    terminationBySpawn.delete(spawned)
-    console.error('[cli-bridge] termination failed after the run completed:', error)
-  })
+  // A terminal response is only true after the executor proves its workload is
+  // gone. Returning success after this promise rejects can release a pool slot
+  // while a child still owns credentials or keeps mutating the workspace.
+  const termination = spawned.terminate?.() ?? killTree(spawned.child)
   terminationBySpawn.set(spawned, termination)
+  termination.then(
+    () => terminationBySpawn.delete(spawned),
+    error => {
+      terminationBySpawn.delete(spawned)
+      console.error('[cli-bridge] termination proof failed:', error)
+    },
+  )
   return termination
+}
+
+/**
+ * Finish one executor-owned workload, remove all request-owned files, then
+ * return its capacity. A failed termination preserves both capacity and files.
+ * A failed file rollback keeps that path's own lock, is retried in-process, and
+ * does not strand capacity after the workload is already proven stopped.
+ */
+export async function finalizeSpawned(
+  spawned: SpawnResult,
+  cleanups: ReadonlyArray<(() => Promise<void> | void) | null | undefined> = [],
+): Promise<void> {
+  await terminateSpawned(spawned)
+  const failures: unknown[] = []
+  for (const cleanup of cleanups) {
+    if (!cleanup) continue
+    try {
+      await cleanup()
+    } catch (error) {
+      failures.push(error)
+      retryCleanupUntilSuccessful(cleanup)
+    }
+  }
+  // Capacity belongs to the terminated workload, not to its files. A failed
+  // rollback keeps its own path lock and is retried below, but must not strand
+  // a host permit or an already-stopped Docker slot.
+  try { spawned.release() } catch (error) { failures.push(error) }
+  if (failures.length === 1) throw failures[0]
+  if (failures.length > 1) throw new AggregateError(failures, 'request cleanup failed')
+}
+
+interface CleanupRetry {
+  cleanup: () => Promise<void> | void
+  attempts: number
+  timer: NodeJS.Timeout | null
+}
+
+const cleanupRetries = new Map<() => Promise<void> | void, CleanupRetry>()
+const CLEANUP_RETRY_BASE_MS = 250
+const CLEANUP_RETRY_MAX_MS = 30_000
+
+export function retryCleanupUntilSuccessful(cleanup: () => Promise<void> | void): void {
+  const retry = cleanupRetries.get(cleanup) ?? { cleanup, attempts: 0, timer: null }
+  cleanupRetries.set(cleanup, retry)
+  if (retry.timer) return
+  const delay = Math.min(CLEANUP_RETRY_BASE_MS * (2 ** retry.attempts), CLEANUP_RETRY_MAX_MS)
+  retry.timer = setTimeout(() => {
+    retry.timer = null
+    void retryCleanup(retry)
+  }, delay)
+  retry.timer.unref()
+}
+
+async function retryCleanup(retry: CleanupRetry): Promise<void> {
+  try {
+    await retry.cleanup()
+    cleanupRetries.delete(retry.cleanup)
+  } catch (error) {
+    retry.attempts += 1
+    if (retry.attempts === 1 || retry.attempts % 8 === 0) {
+      console.error('[cli-bridge] request cleanup retry still failing:', error)
+    }
+    retryCleanupUntilSuccessful(retry.cleanup)
+  }
+}
+
+export function pendingCleanupRetries(): number {
+  return cleanupRetries.size
 }
 
 /**
@@ -115,8 +179,7 @@ export function terminateSpawned(spawned: SpawnResult): Promise<void> {
 export function killTreeSync(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
   const pid = child.pid
   if (pid === undefined) return
-  if (child.exitCode !== null || child.signalCode !== null) return
-  trySignal(-pid, signal) || trySignal(pid, signal)
+  signalOwnedTree(child, pid, signal)
 }
 
 function trySignal(target: number, sig: NodeJS.Signals): boolean {
@@ -128,21 +191,46 @@ function trySignal(target: number, sig: NodeJS.Signals): boolean {
   }
 }
 
-function waitForExitOrTimeout(child: ChildProcess, ms: number): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
-  return new Promise((resolve) => {
-    let done = false
-    const finish = (): void => {
-      if (done) return
-      done = true
-      child.off('exit', finish)
-      child.off('close', finish)
-      clearTimeout(timer)
-      resolve()
+function signalOwnedTree(child: ChildProcess, pgid: number, signal: NodeJS.Signals): void {
+  const childLive = child.exitCode === null && child.signalCode === null
+  if (process.platform !== 'win32' && processGroupMayExist(pgid)) {
+    if (trySignal(-pgid, signal)) return
+  }
+  if (childLive) trySignal(pgid, signal)
+}
+
+async function waitForOwnedTreeGone(child: ChildProcess, pgid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (child.exitCode === null && child.signalCode === null || processGroupMayExist(pgid)) {
+    if (Date.now() >= deadline) return false
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  return true
+}
+
+function processGroupMayExist(pgid: number): boolean {
+  if (process.platform === 'linux') return processGroupHasLiveMember(pgid)
+  if (process.platform === 'win32') return false
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function processGroupHasLiveMember(pgid: number): boolean {
+  let entries: string[]
+  try { entries = readdirSync('/proc') } catch { return false }
+  for (const entry of entries) {
+    if (!/^\d+$/u.test(entry)) continue
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, 'utf8')
+      const match = stat.match(/^\d+ \(.*\) ([A-Z]) \d+ (\d+)/u)
+      if (match && Number(match[2]) === pgid && match[1] !== 'Z') return true
+    } catch {
+      // The process can disappear between /proc enumeration and stat read.
     }
-    const timer = setTimeout(finish, ms)
-    timer.unref?.()
-    child.once('exit', finish)
-    child.once('close', finish)
-  })
+  }
+  return false
 }

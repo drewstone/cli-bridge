@@ -10,21 +10,23 @@
  *   → session/new {cwd, mcpServers}            → { sessionId }
  *   → session/prompt {sessionId, prompt:[{type:'text',text}]}
  *   ← stream session/update {update:{content:{type:'text',text}}}  → ChatDelta.content
- *   ← session/request_permission               → auto-allow (first option)
+ *   ← session/request_permission               → deny unless an explicit named unattended policy is attached
  *   ← session/prompt result {stopReason}        → finish_reason
  *
  * One bin per backend instance (hermes→`hermes acp`, openclaw→`openclaw acp`).
  */
 
+import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import type { Backend, BackendHealth, ChatDelta, ChatMessage, ChatRequest } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { Spawner } from '../executors/types.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
 import { contentToText } from './content.js'
-import { buildAcpMcpServers, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { buildAcpMcpServers, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+import { versionHealth } from './health.js'
 
 export interface AcpBackendOptions {
   /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
@@ -85,30 +87,8 @@ export class AcpBackend implements Backend {
     return model === this.name || model.startsWith(`${this.name}/`)
   }
 
-  async health(): Promise<BackendHealth> {
-    let release: (() => void) | null = null
-    try {
-      const spawned = await this.spawner(this.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      release = spawned.release
-      const child = spawned.child
-      const early = spawned.spawnError?.()
-      if (early) return { name: this.name, state: 'unavailable', detail: `spawn failed: ${early.message}` }
-      const out = new BoundedDiagnosticBuffer()
-      child.stdout?.on('data', (b) => { out.append(b) })
-      child.stderr?.on('data', (b) => { out.append(b) })
-      const code = await new Promise<number>((resolve) => {
-        const t = setTimeout(() => { void terminateSpawned(spawned); resolve(124) }, 5000)
-        child.on('exit', (c) => { clearTimeout(t); resolve(c ?? 0) })
-        child.on('error', () => { clearTimeout(t); resolve(1) })
-      })
-      const output = out.render()
-      if (code !== 0 && !output.trim()) return { name: this.name, state: 'error', detail: `${this.bin} --version exit ${code}` }
-      return { name: this.name, state: 'ready', version: output.split('\n')[0]?.trim() || this.bin }
-    } catch (err) {
-      return { name: this.name, state: 'error', detail: `health probe failed: ${(err as Error).message}` }
-    } finally {
-      release?.()
-    }
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.bin, this.spawner, undefined, signal)
   }
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
@@ -122,6 +102,7 @@ export class AcpBackend implements Backend {
     const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session))
 
     const spawned = await this.spawner(this.bin, this.acpArgs, {
+      signal,
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd,
       env: process.env,
@@ -129,7 +110,6 @@ export class AcpBackend implements Backend {
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
     })
     const child = spawned.child
-    const release = spawned.release
     const stderr = new BoundedDiagnosticBuffer()
     child.stderr?.on('data', (chunk) => { stderr.append(chunk) })
     let spawnErrorMessage = spawned.spawnError?.()?.message ?? ''
@@ -183,10 +163,35 @@ export class AcpBackend implements Backend {
               push({ content: c.text })
             }
           } else if (m.method === 'session/request_permission' && m.id !== undefined) {
-            // auto-allow: pick the first offered option (cli-bridge runs in a trusted scope).
             const opts = (m.params as { options?: Array<{ optionId?: string }> })?.options
-            const optionId = opts?.[0]?.optionId ?? 'allow'
-            send({ jsonrpc: '2.0', id: m.id, result: { outcome: { outcome: 'selected', optionId } } })
+            const profile = resolveAgentProfile(req, session)
+            const receipt = req.interaction_policy_receipt
+            if (
+              req.interaction_policy === 'unattended-allow'
+              && receipt?.name === 'unattended-allow'
+              && receipt.schema === 'cli-bridge.interaction-policy.v1'
+              && profile !== null
+              && receipt.profileDigest === canonicalCandidateDigest(profile)
+            ) {
+              // The first option is used only after the request has carried a
+              // profile-scoped, named policy receipt. Interactive/default paths
+              // never cross this branch.
+              const optionId = opts?.[0]?.optionId
+              if (!optionId) {
+                send({ jsonrpc: '2.0', id: m.id, error: { code: -32001, message: 'unattended policy offered no selectable permission' } })
+              } else {
+                send({ jsonrpc: '2.0', id: m.id, result: { outcome: { outcome: 'selected', optionId } } })
+              }
+            } else {
+              send({
+                jsonrpc: '2.0',
+                id: m.id,
+                error: {
+                  code: -32001,
+                  message: 'interactive permission requires a retained-session response transport; no permission was auto-approved',
+                },
+              })
+            }
           } else if (m.method && m.id !== undefined) {
             // any other agent→client request (fs reads we declined in capabilities, etc.): refuse cleanly.
             send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not supported by cli-bridge ACP client' } })
@@ -227,8 +232,7 @@ export class AcpBackend implements Backend {
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      await terminateSpawned(spawned)
-      release()
+      await finalizeSpawned(spawned)
     }
   }
 }

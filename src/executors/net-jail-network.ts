@@ -52,6 +52,7 @@
 import { fileURLToPath } from 'node:url'
 import { dockerCli, type DockerCli } from './docker-cli.js'
 import { assertDockerNetworkName } from './docker-network.js'
+import { dockerOwnerLabels, removeOwnedDockerResource } from './docker-resource-owner.js'
 import {
   applyNetJailEgressFilter,
   containerAddressOn,
@@ -106,6 +107,8 @@ export interface ProvisionNetJailOptions {
   /** Docker object name prefix, shared with the container pool so two bridges
    * with distinct pool prefixes do not fight over one network. */
   namePrefix: string
+  /** Stable owner label derived from this bridge's data directory. */
+  resourceOwner: string
   /** Image used for the relay and the verification probe — the same runtime
    * image the workers run, so no additional image is a prerequisite. */
   image: string
@@ -153,9 +156,19 @@ export async function provisionNetJail(opts: ProvisionNetJailOptions): Promise<N
   const destroy = async (): Promise<void> => {
     // The probe and peer are removed by their own `finally`; naming them here
     // too is what makes a hard-killed process's leftovers reclaimable.
-    await cli(['rm', '-f', relay, probeName, peerName], { timeoutMs: 30_000 })
-    await cli(['network', 'rm', network], { timeoutMs: 30_000 })
-    await cli(['network', 'rm', egressNetwork], { timeoutMs: 30_000 })
+    const failures: unknown[] = []
+    for (const name of [relay, probeName, peerName]) {
+      try { await removeOwnedDockerResource(cli, 'container', name, opts.resourceOwner) } catch (error) {
+        failures.push(error)
+      }
+    }
+    for (const name of [network, egressNetwork]) {
+      try { await removeOwnedDockerResource(cli, 'network', name, opts.resourceOwner) } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, `could not remove net-jail resources for ${opts.backend}`)
   }
 
   // A previous process may have exited without running its shutdown hook. The
@@ -165,7 +178,12 @@ export async function provisionNetJail(opts: ProvisionNetJailOptions): Promise<N
 
   try {
     for (const [name, extraArgs] of [[network, ['--internal']], [egressNetwork, []]] as const) {
-      const created = await cli(['network', 'create', ...extraArgs, name], { timeoutMs: 30_000 })
+      const created = await cli([
+        'network', 'create',
+        ...dockerOwnerLabels(opts.resourceOwner, 'net-jail-network'),
+        ...extraArgs,
+        name,
+      ], { timeoutMs: 30_000 })
       if (created.code !== 0) {
         throw new NetJailProvisionError(
           `backend ${opts.backend}: could not create net-jail network ${name} — ${firstLine(created)}`,
@@ -177,6 +195,7 @@ export async function provisionNetJail(opts: ProvisionNetJailOptions): Promise<N
     const started = await cli([
       'run', '-d',
       '--name', relay,
+      ...dockerOwnerLabels(opts.resourceOwner, 'net-jail-relay'),
       '--network', egressNetwork,
       '--restart', 'on-failure:3',
       '--memory', '256m', '--memory-swap', '256m',
@@ -242,6 +261,7 @@ export async function provisionNetJail(opts: ProvisionNetJailOptions): Promise<N
       gateway,
       probeName,
       peerName,
+      resourceOwner: opts.resourceOwner,
       skipEgressFilter: opts.skipEgressFilterForVerification === true,
       skipRestartRearm: opts.skipRestartRearmForVerification === true,
       onProgress,
@@ -257,7 +277,11 @@ export async function provisionNetJail(opts: ProvisionNetJailOptions): Promise<N
       destroy,
     }
   } catch (error) {
-    await destroy()
+    try {
+      await destroy()
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `net-jail provisioning and cleanup failed for ${opts.backend}`)
+    }
     throw error
   }
 }
@@ -326,6 +350,7 @@ async function verifyNetJail(opts: {
   gateway: string
   probeName: string
   peerName: string
+  resourceOwner: string
   skipEgressFilter: boolean
   skipRestartRearm: boolean
   onProgress: (message: string) => void
@@ -337,9 +362,11 @@ async function verifyNetJail(opts: {
   // A peer that LISTENS. Probing a silent address cannot tell "filtered" from
   // "nothing there", and the interesting case is precisely a worker dialling a
   // service its neighbour exposes.
-  await opts.cli(['rm', '-f', opts.peerName], { timeoutMs: 30_000 })
+  await removeOwnedDockerResource(opts.cli, 'container', opts.peerName, opts.resourceOwner)
   const peerStarted = await opts.cli([
-    'run', '-d', '--name', opts.peerName, '--network', opts.network, '--entrypoint', 'node', opts.image,
+    'run', '-d', '--name', opts.peerName,
+    ...dockerOwnerLabels(opts.resourceOwner, 'net-jail-verification-peer'),
+    '--network', opts.network, '--entrypoint', 'node', opts.image,
     '-e', `require('node:net').createServer((s) => s.end('peer\\n')).listen(${PEER_PORT})`,
   ], { timeoutMs: 60_000 })
   if (peerStarted.code !== 0) {
@@ -434,6 +461,7 @@ async function verifyNetJail(opts: {
       cli: opts.cli,
       label: 'verification probe',
       name: opts.probeName,
+      resourceOwner: opts.resourceOwner,
       skipFilter: opts.skipEgressFilter,
     }, async (containerId) => {
       await probeOnce(containerId, 'as provisioned')
@@ -445,7 +473,7 @@ async function verifyNetJail(opts: {
       )
     })
   } finally {
-    await opts.cli(['rm', '-f', opts.peerName], { timeoutMs: 30_000 })
+    await removeOwnedDockerResource(opts.cli, 'container', opts.peerName, opts.resourceOwner)
   }
 }
 

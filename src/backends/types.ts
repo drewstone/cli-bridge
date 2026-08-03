@@ -18,6 +18,10 @@ import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
 import type { JailSpec } from '../jail/index.js'
 import type { AgentProfile, ReasoningEffort } from '@tangle-network/agent-interface'
+import type {
+  AgentEnvironmentCapabilities,
+  NativeContextBoundaryProof,
+} from '@tangle-network/agent-interface'
 
 export type ChatContentPart =
   | { type: 'text'; text: string }
@@ -196,6 +200,17 @@ export interface ChatRequest {
   jailSpec?: JailSpec | null
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
+  /**
+   * Interactive approval posture. `interactive` is the retained-session
+   * default; unattended execution is only accepted when named explicitly.
+   */
+  interaction_policy?: 'interactive' | 'unattended-deny' | 'unattended-allow'
+  /** Internal receipt proving the named unattended policy was profile-scoped. */
+  interaction_policy_receipt?: {
+    schema: 'cli-bridge.interaction-policy.v1'
+    name: 'unattended-allow'
+    profileDigest: string
+  }
   /** Internal receipt populated by profile provisioning before the harness spawns. */
   profile_materialization_receipt?: ProfileMaterializationReceipt
 }
@@ -262,6 +277,7 @@ export interface ChatDelta {
   }
   /** Safe proof of the AgentProfile files applied before this run. */
   profile_materialization?: ProfileMaterializationReceipt
+  interaction_policy_receipt?: ChatRequest['interaction_policy_receipt']
   /** Backend assigned id for this turn. Written to session store. */
   internal_session_id?: string
   /**
@@ -294,7 +310,7 @@ export interface Backend {
   matches(model: string): boolean
 
   /** Sync health check — exit-code probe on the CLI, etc. */
-  health(): Promise<BackendHealth>
+  health(signal?: AbortSignal): Promise<BackendHealth>
 
   /**
    * Stream a chat completion. Must be an async iterator of ChatDelta.
@@ -306,6 +322,40 @@ export interface Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta>
+}
+
+/**
+ * The native session seam is deliberately raw at the adapter boundary: each
+ * runner speaks its own protocol, while the retained-session service maps the
+ * observations into the public Agent Interface event and interaction schemas.
+ */
+export interface NativeSession {
+  readonly capabilities: AgentEnvironmentCapabilities
+  isClosed(): boolean
+  onClose(listener: (reason: Error) => void): () => void
+  /** Resolves only after child termination, executor release, and file cleanup. */
+  whenClosed(): Promise<void>
+  providerSessionId(): string | null
+  turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown>
+  steer?(prompt: string): Promise<void>
+  abort(): Promise<void>
+  respondToNativeInteraction(id: string, response: Record<string, unknown>): Promise<void>
+  contextBoundary(input: {
+    runId: string
+    environmentId: string
+    sessionId: string
+  }): Promise<NativeContextBoundaryProof | null>
+  close(): Promise<void>
+}
+
+export interface NativeSessionBackend extends Backend {
+  readonly nativeModes: readonly NonNullable<ChatRequest['mode']>[]
+  nativeCapabilities?(): AgentEnvironmentCapabilities
+  startNativeSession(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal?: AbortSignal,
+  ): Promise<NativeSession>
 }
 
 /**
@@ -326,7 +376,7 @@ export function wantsJsonObject(req: ChatRequest): boolean {
 export class BackendError extends Error {
   constructor(
     message: string,
-    public readonly code: 'not_configured' | 'cli_missing' | 'upstream' | 'timeout' | 'aborted' | 'parse_error',
+    public readonly code: 'not_configured' | 'cli_missing' | 'upstream' | 'timeout' | 'aborted' | 'parse_error' | 'capability_denied',
     public readonly cause?: unknown,
   ) {
     super(message)

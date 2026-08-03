@@ -139,18 +139,18 @@ describe('a removed container is not reported as a failure to terminate', () => 
   })
 })
 
-describe('a cleanup failure is not the answer to the request', () => {
-  it('terminateSpawned reports a failed termination without rejecting into the response path', async () => {
+describe('termination proof', () => {
+  it('terminateSpawned rejects when the executor cannot prove termination', async () => {
     const spawned = {
       child: child(0, ''),
       release: () => {},
       terminate: async () => { throw new Error('docker executor could not terminate container c60496099aaa') },
     } as unknown as SpawnResult
 
-    await expect(terminateSpawned(spawned)).resolves.toBeUndefined()
+    await expect(terminateSpawned(spawned)).rejects.toThrow(/could not terminate/)
   })
 
-  it('keeps the CLI outcome when termination fails after a successful run', async () => {
+  it('does not report a successful run when termination fails after output', async () => {
     // The live shape: the CLI finished, the container was swept, and the caller
     // received a 500 about `docker restart` instead of the completion.
     const app = new Hono()
@@ -182,6 +182,7 @@ describe('a cleanup failure is not the answer to the request', () => {
 
     expect(res.status).toBe(200)
     expect(json.choices[0].message.content).toBe('answer')
-    expect(JSON.stringify(json)).not.toMatch(/could not terminate/)
+    expect(json.choices[0].finish_reason).toBe('error')
+    expect(JSON.stringify(json)).toMatch(/could not terminate/)
   })
 })

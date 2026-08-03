@@ -17,6 +17,8 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
+const TEST_RESOURCE_OWNER = '3'.repeat(64)
+
 async function waitFor(predicate: () => void, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let lastErr: unknown
@@ -51,8 +53,7 @@ describe('host executor semaphore', () => {
     const elapsed = Date.now() - t0
     expect(elapsed).toBeGreaterThanOrEqual(80)
     for (const r of results) {
-      r.child.kill()
-      r.release()
+      await r.terminate!()
     }
   })
 
@@ -74,18 +75,15 @@ describe('host executor semaphore', () => {
     })
 
     const t0 = Date.now()
-    holder.release()
-    holder.child.kill()
+    await holder.terminate!()
     const late = await hostSpawner('node', ['-e', 'setTimeout(()=>{},10)'], {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     expect(Date.now() - t0).toBeGreaterThanOrEqual(150)
 
     const queuedResult = await queued
-    queuedResult.release()
-    queuedResult.child.kill()
-    late.release()
-    late.child.kill()
+    await queuedResult.terminate!()
+    await late.terminate!()
     expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
   })
 
@@ -102,8 +100,7 @@ describe('host executor semaphore', () => {
         hostSpawner('node', ['-e', '0'], { stdio: ['ignore', 'pipe', 'pipe'] }),
       ).rejects.toThrow(/acquire timeout/)
     } finally {
-      holder.child.kill()
-      holder.release()
+      await holder.terminate!()
     }
   })
 
@@ -121,8 +118,7 @@ describe('host executor semaphore', () => {
     const snap = hostExecutorSnapshot()
     expect(snap.acquires).toBeGreaterThanOrEqual(2)
     expect(snap.timeouts).toBeGreaterThanOrEqual(1)
-    holder.child.kill()
-    holder.release()
+    await holder.terminate!()
   })
 })
 
@@ -136,7 +132,7 @@ describe('container pool — snapshot + counters', async () => {
 
   it('snapshot returns the documented shape', async () => {
     const { ContainerPool } = await import('../src/executors/container-pool.js')
-    const pool = await ContainerPool.create({
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 2,
       image: 'fake',
       namePrefix: 'cli-bridge-test',
@@ -145,11 +141,19 @@ describe('container pool — snapshot + counters', async () => {
       maxQueueDepth: 4,
       acquireDeadlineMs: 1000,
       slotMaxHoldMs: 60_000,
-      cli: async (args) => ({
-        code: 0,
-        stdout: args.includes('run') ? `fakeid-${Math.random().toString(36).slice(2)}` : '',
-        stderr: '',
-      }),
+      cli: async (args) => {
+        if (args[0] === 'container' && args[1] === 'inspect') {
+          const name = args[args.length - 1]!
+          return name.startsWith('fakeid-')
+            ? { code: 0, stdout: `${TEST_RESOURCE_OWNER}\n`, stderr: '' }
+            : { code: 1, stdout: '', stderr: `Error: No such container: ${name}` }
+        }
+        return {
+          code: 0,
+          stdout: args.includes('run') ? `fakeid-${Math.random().toString(36).slice(2)}` : '',
+          stderr: '',
+        }
+      },
     })
     const snap = pool.snapshot()
     expect(snap.size).toBe(2)

@@ -23,7 +23,13 @@ export interface DockerCliResult {
   spawnError?: string
 }
 
-export type DockerCli = (args: string[], opts?: { timeoutMs?: number }) => Promise<DockerCliResult>
+export interface DockerCliOptions {
+  timeoutMs?: number
+  /** Abort the local Docker client when its owning request is cancelled. */
+  signal?: AbortSignal
+}
+
+export type DockerCli = (args: string[], opts?: DockerCliOptions) => Promise<DockerCliResult>
 
 const DEFAULT_TIMEOUT_MS = 20_000
 
@@ -32,7 +38,12 @@ export const dockerCli: DockerCli = (args, opts = {}) =>
     execFile(
       'docker',
       args,
-      { timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, killSignal: 'SIGKILL' },
+      {
+        timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        maxBuffer: 4 * 1024 * 1024,
+        killSignal: 'SIGKILL',
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      },
       (error, stdout, stderr) => {
         if (!error) {
           resolve({ code: 0, stdout, stderr })

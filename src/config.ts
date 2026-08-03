@@ -10,6 +10,7 @@
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { assertDockerNetworkName } from './executors/docker-network.js'
+import { defaultDockerNamePrefix, dockerResourceOwner } from './executors/docker-resource-owner.js'
 import { formatAllowEntry, parseAllowList } from './jail/net-allowlist.js'
 
 export interface Config {
@@ -158,6 +159,8 @@ export interface BackendExecutorConfig {
   poolSize?: number
   oauthMode?: 'share' | 'per-slot'
   namePrefix?: string
+  /** Stable owner label derived from this bridge's data directory and host uid. */
+  resourceOwner?: string
   /** Host path that gets bind-mounted (share mode). */
   hostConfigDir?: string
   /** Mount target inside the container, e.g. /root/.claude or /root/.config/opencode. */
@@ -229,7 +232,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const bearer = env.BRIDGE_BEARER?.trim() || null
   const dataDir = resolve(env.BRIDGE_DATA_DIR ?? './data')
   const backends = new Set(
-    (env.BRIDGE_BACKENDS ?? 'claude,kimi,gemini,sandbox,passthrough')
+    (env.BRIDGE_BACKENDS ?? 'claude,codex,opencode,kimi,gemini,pi,passthrough')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean),
@@ -537,7 +540,8 @@ function parseAllExecutors(env: NodeJS.ProcessEnv, dataDir: string): Record<stri
       cfg.image = env[`${upper}_DOCKER_IMAGE`] ?? defaults.image
       cfg.poolSize = parsePositiveInt(env[`${upper}_DOCKER_POOL_SIZE`], 4)
       cfg.oauthMode = parseOauthMode(`${upper}_DOCKER_OAUTH_MOUNT`, env[`${upper}_DOCKER_OAUTH_MOUNT`], 'share')
-      cfg.namePrefix = env[`${upper}_DOCKER_NAME_PREFIX`] ?? `cli-bridge-${name}-pool`
+      cfg.resourceOwner = dockerResourceOwner(dataDir)
+      cfg.namePrefix = env[`${upper}_DOCKER_NAME_PREFIX`] ?? defaultDockerNamePrefix(name, cfg.resourceOwner)
       // The host directory treated as this CLI's home for credential purposes.
       // One knob for the whole mount set, because the set only makes sense
       // together: it is one CLI's home seen from the host and from the container.
@@ -554,7 +558,11 @@ function parseAllExecutors(env: NodeJS.ProcessEnv, dataDir: string): Record<stri
         )
       }
       const hostBase = rawHostHome || env.HOME || DEFAULT_CONTAINER_HOME
-      cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.configRel}`)
+      const configuredPiAgentDir = name === 'pi' ? env.PI_CODING_AGENT_DIR?.trim() : undefined
+      const piAgentHostPath = configuredPiAgentDir
+        ? configuredPiAgentDir.startsWith('~/') ? join(hostBase, configuredPiAgentDir.slice(2)) : configuredPiAgentDir
+        : undefined
+      cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? piAgentHostPath ?? `${hostBase}/${defaults.configRel}`)
       if (rawNetwork !== undefined && rawNetwork !== '') {
         cfg.network = assertDockerNetworkName(rawNetwork, networkKey)
       }

@@ -20,6 +20,7 @@
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { basename, dirname, join } from 'node:path'
 import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
@@ -35,11 +36,12 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { registerJailReadable } from '../jail/index.js'
+import { describeCliExit, prepareSpawnerPrivatePath, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -135,8 +137,14 @@ export class ClaudeBackend implements Backend {
     return m === this.name || m.startsWith(this.prefix)
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.bin, this.spawner, this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(
+      this.name,
+      this.bin,
+      this.spawner,
+      this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined,
+      signal,
+    )
   }
 
   async *chat(
@@ -192,8 +200,20 @@ export class ClaudeBackend implements Backend {
     // `resolveMcpServers` for the contract.
     const mcpMaterialized = writeMcpConfigFile(
       resolveMcpServers(req, session),
+      this.spawner.preparePrivatePath ? cwd : undefined,
     )
-    const args = this.buildArgs(req, session, mode, mcpMaterialized, {
+    if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
+    let runtimeMcp = mcpMaterialized
+    try {
+      if (mcpMaterialized) {
+        const runtimeRoot = await prepareSpawnerPrivatePath(this.spawner, dirname(mcpMaterialized.configPath))
+        runtimeMcp = { ...mcpMaterialized, configPath: join(runtimeRoot, basename(mcpMaterialized.configPath)) }
+      }
+    } catch (error) {
+      mcpMaterialized?.cleanup()
+      throw error
+    }
+    const args = this.buildArgs(req, session, mode, runtimeMcp, {
       userTextForArgv: userFitsInArgv ? userText : undefined,
     })
 
@@ -210,6 +230,7 @@ export class ClaudeBackend implements Backend {
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       spawned = await this.spawner(this.bin, args, {
+        signal,
         stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
         cwd,
         env: childEnv,
@@ -221,7 +242,6 @@ export class ClaudeBackend implements Backend {
       throw error
     }
     const child = spawned.child
-    const releaseSpawner = spawned.release
 
     // The spawner registers a synchronous 'error' listener so the spawn
     // failure event doesn't crash the process before our own listener
@@ -356,9 +376,7 @@ export class ClaudeBackend implements Backend {
       // Always tear down the whole subtree before releasing the slot.
       // Reaps MCP servers and tool sub-processes claude spawned. Pre-fix
       // this was `child.kill('SIGTERM')` which leaked grand-children.
-      await terminateSpawned(spawned)
-      releaseSpawner()
-      mcpMaterialized?.cleanup()
+      await finalizeSpawned(spawned, [mcpMaterialized ? () => mcpMaterialized.cleanup() : null])
     }
   }
 

@@ -6,13 +6,14 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
-import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
+import { canonicalCandidateDigest, defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
 import { BackendError } from '../src/backends/types.js'
@@ -85,6 +86,147 @@ function argValue(args: readonly string[], flag: string): string | undefined {
 }
 
 describe('PiBackend', () => {
+  it('gives Pi an exact least-privilege child environment for the selected provider', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-child-env-'))
+    const names = [
+      'BRIDGE_BEARER',
+      'OPENAI_API_KEY',
+      'ANTHROPIC_API_KEY',
+      'DEEPSEEK_API_KEY',
+      'TANGLE_API_KEY',
+      'ZAI_API_KEY',
+      'MOONSHOT_API_KEY',
+      'DATABASE_URL',
+      'AWS_SECRET_ACCESS_KEY',
+    ] as const
+    const previous = Object.fromEntries(names.map(name => [name, process.env[name]]))
+    for (const name of names) process.env[name] = `canary-${name}`
+    let childEnv: NodeJS.ProcessEnv | undefined
+    let exactEnv = false
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1_000,
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+      ], (_bin, _args, options) => {
+        childEnv = options.env
+        exactEnv = options.exactEnv === true
+      }),
+    })
+
+    try {
+      await collect(backend.chat({
+        model: 'pi/deepseek/deepseek-test',
+        messages: [{ role: 'user', content: 'task' }],
+        cwd,
+      }, null, new AbortController().signal))
+
+      const expectedBase = Object.fromEntries([
+        'HOME', 'PATH', 'SHELL', 'TMPDIR', 'TEMP', 'TMP', 'USER', 'LOGNAME',
+        'LANG', 'LC_ALL', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+        'XDG_RUNTIME_DIR', 'NVM_DIR', 'PNPM_HOME', 'PI_CODING_AGENT_DIR',
+        'PI_CODING_AGENT_SESSION_DIR', 'PI_PACKAGE_DIR',
+      ].flatMap(name => typeof process.env[name] === 'string' && process.env[name]!.length > 0
+        ? [[name, process.env[name]!]]
+        : []))
+      const expected = { ...expectedBase, PWD: cwd, DEEPSEEK_API_KEY: 'canary-DEEPSEEK_API_KEY' }
+      expect(childEnv).toEqual(expected)
+      expect(exactEnv).toBe(true)
+      expect(childEnv?.BRIDGE_BEARER).toBeUndefined()
+      expect(childEnv?.OPENAI_API_KEY).toBeUndefined()
+      expect(childEnv?.ANTHROPIC_API_KEY).toBeUndefined()
+      expect(childEnv?.TANGLE_API_KEY).toBeUndefined()
+      expect(childEnv?.ZAI_API_KEY).toBeUndefined()
+      expect(childEnv?.MOONSHOT_API_KEY).toBeUndefined()
+      expect(childEnv?.DATABASE_URL).toBeUndefined()
+      expect(childEnv?.AWS_SECRET_ACCESS_KEY).toBeUndefined()
+    } finally {
+      for (const name of names) {
+        const value = previous[name]
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('passes only the selected router credential for provider aliases', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-router-env-'))
+    const previous = {
+      TANGLE_API_KEY: process.env.TANGLE_API_KEY,
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    }
+    process.env.TANGLE_API_KEY = 'selected-router-canary'
+    process.env.OPENAI_API_KEY = 'unrelated-provider-canary'
+    let childEnv: NodeJS.ProcessEnv | undefined
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1_000,
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+      ], (_bin, _args, options) => {
+        childEnv = options.env
+      }),
+    })
+
+    try {
+      await collect(backend.chat({
+        model: 'pi/tangle-router/gpt-5-mini',
+        messages: [{ role: 'user', content: 'task' }],
+        cwd,
+      }, null, new AbortController().signal))
+      expect(childEnv?.TANGLE_API_KEY).toBe('selected-router-canary')
+      expect(childEnv?.OPENAI_API_KEY).toBeUndefined()
+    } finally {
+      if (previous.TANGLE_API_KEY === undefined) delete process.env.TANGLE_API_KEY
+      else process.env.TANGLE_API_KEY = previous.TANGLE_API_KEY
+      if (previous.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY
+      else process.env.OPENAI_API_KEY = previous.OPENAI_API_KEY
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves Pi default provider from the installed settings and passes only that credential', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-default-provider-'))
+    const agentDir = join(cwd, 'agent')
+    mkdirSync(agentDir, { recursive: true })
+    writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ defaultProvider: 'google' }))
+    const previous = {
+      PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+      GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    }
+    process.env.PI_CODING_AGENT_DIR = agentDir
+    process.env.GOOGLE_API_KEY = 'google-default-canary'
+    process.env.OPENAI_API_KEY = 'unrelated-openai-canary'
+    let childEnv: NodeJS.ProcessEnv | undefined
+    let args: string[] = []
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1_000,
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+      ], (_bin, receivedArgs, options) => {
+        args = receivedArgs
+        childEnv = options.env
+      }),
+    })
+    try {
+      await collect(backend.chat({ model: 'pi', messages: [{ role: 'user', content: 'task' }], cwd }, null, new AbortController().signal))
+      expect(argValue(args, '--provider')).toBe('google')
+      expect(childEnv?.GOOGLE_API_KEY).toBe('google-default-canary')
+      expect(childEnv?.OPENAI_API_KEY).toBeUndefined()
+    } finally {
+      if (previous.PI_CODING_AGENT_DIR === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previous.PI_CODING_AGENT_DIR
+      if (previous.GOOGLE_API_KEY === undefined) delete process.env.GOOGLE_API_KEY
+      else process.env.GOOGLE_API_KEY = previous.GOOGLE_API_KEY
+      if (previous.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY
+      else process.env.OPENAI_API_KEY = previous.OPENAI_API_KEY
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   it('applies one exact profile while leaving the task unchanged', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-exact-profile-'))
     const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
@@ -138,23 +280,55 @@ describe('PiBackend', () => {
       expect(args.at(-1)).toBe('TASK_UNCHANGED')
       expect(args.at(-1)).not.toContain('SYSTEM_ONCE')
       expect(directTools).toBe('coordination')
-      expect(mcp).toEqual({
-        mcpServers: {
-          // Materialized servers carry `directTools: true` so pi registers their verbs as native
-          // tools rather than hiding them behind the proxy's connect/describe discovery.
-          coordination: {
-            command: 'node',
-            args: ['coordinator.mjs'],
-            env: { RUN_ID: 'exact-profile' },
-            directTools: true,
-          },
-        },
-      })
+      const coordination = (mcp as { mcpServers: Record<string, Record<string, any>> }).mcpServers.coordination!
+      expect(coordination).toMatchObject({ command: '/usr/bin/env', directTools: true })
+      expect(coordination.env).toBeUndefined()
+      expect(coordination.args).toContain('RUN_ID=exact-profile')
+      expect(coordination.args).toContain('--')
+      expect(coordination.args.slice(-2)).toEqual(['node', 'coordinator.mjs'])
+      expect(coordination.args.some((arg: string) => arg.startsWith('HOME='))).toBe(true)
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
       expect(mcpConfigPath && existsSync(mcpConfigPath)).toBe(false)
     } finally {
       if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
       else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('only enables headless tool approval for the named profile-scoped policy', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-interaction-policy-'))
+    const profile = { metadata: { cliBridge: { interactionPolicy: 'unattended-allow-v1' } } }
+    let extension = ''
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ], (_bin, args) => {
+        const path = argValue(args, '--extension')
+        if (!path) throw new Error('missing Pi interaction extension')
+        extension = readFileSync(path, 'utf8')
+      }),
+    })
+
+    try {
+      await collect(backend.chat({
+        model: 'pi/tangle-router/glm-5.2',
+        messages: [{ role: 'user', content: 'task' }],
+        cwd,
+        agent_profile: profile,
+        interaction_policy: 'unattended-allow',
+        interaction_policy_receipt: {
+          schema: 'cli-bridge.interaction-policy.v1',
+          name: 'unattended-allow',
+          profileDigest: canonicalCandidateDigest(profile),
+        },
+      }, null, new AbortController().signal))
+      expect(extension).toContain('cli-bridge unattended-allow-v1')
+      expect(extension).toContain("async () => undefined")
+    } finally {
       rmSync(cwd, { recursive: true, force: true })
     }
   })
@@ -213,6 +387,10 @@ describe('PiBackend', () => {
         const promptTemplatePath = argValue(args, '--prompt-template')
         if (!systemPromptPath || !instructionsPath || !skillPath || !promptTemplatePath) {
           throw new Error('missing native Pi profile flag')
+        }
+        expect(statSync(dirname(dirname(systemPromptPath))).mode & 0o777).toBe(0o700)
+        for (const path of [systemPromptPath, instructionsPath, skillPath, promptTemplatePath]) {
+          expect(statSync(path).mode & 0o777).toBe(0o600)
         }
         captured.push({
           args,
@@ -325,7 +503,7 @@ describe('PiBackend', () => {
     }
   })
 
-  it('keeps anonymous calls stateless, creates caller sessions, then resumes the mapped Pi session', async () => {
+  it('keeps anonymous calls stateless and resumes only the Pi id, not secret profile input', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-session-'))
     const cwd = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-session-cwd-'))
     const sessions = new SessionStore(dataDir)
@@ -392,8 +570,11 @@ describe('PiBackend', () => {
         internalId: 'created-pi-session',
         turns: 1,
       })
+      expect(sessions.get('discovery-run', 'pi')?.metadata.agent_profile).toBeUndefined()
 
-      expect((await post('discovery-run')).status).toBe(200)
+      expect((await post('discovery-run', {
+        prompt: { systemPrompt: 'PERSISTED_PROFILE_SYSTEM' },
+      })).status).toBe(200)
       const sessionFlag = argv[2]?.indexOf('--session') ?? -1
       expect(argv[2]?.[sessionFlag + 1]).toBe('created-pi-session')
       expect(argv[2]).not.toContain('--no-session')
@@ -1113,16 +1294,11 @@ describe('PiBackend', () => {
       expect(cwdAtSpawn).toBe(cwd)
       expect(configPathAtSpawn?.startsWith(join(cwd, '.cli-bridge-pi-mcp-'))).toBe(true)
       expect(directToolsAtSpawn).toBe('legal-tools')
-      expect(configAtSpawn).toEqual({
-        mcpServers: {
-          'legal-tools': {
-            command: 'tsx',
-            args: ['proposal-server.ts'],
-            env: { CASE_ID: 'c-1' },
-            directTools: true,
-          },
-        },
-      })
+      const legalTools = (configAtSpawn as { mcpServers: Record<string, Record<string, any>> }).mcpServers['legal-tools']!
+      expect(legalTools).toMatchObject({ command: '/usr/bin/env', directTools: true })
+      expect(legalTools.env).toBeUndefined()
+      expect(legalTools.args).toContain('CASE_ID=c-1')
+      expect(legalTools.args.slice(-2)).toEqual(['tsx', 'proposal-server.ts'])
       expect(deltas.slice(-2)).toEqual([
         { usage: { input_tokens: 5, output_tokens: 2 } },
         { finish_reason: 'stop' },
@@ -1195,10 +1371,14 @@ describe('PiBackend', () => {
       expect(configPaths).toHaveLength(2)
       expect(new Set(configPaths).size).toBe(2)
       expect(bothConfigsExistedTogether).toBe(true)
-      expect(configs).toEqual(expect.arrayContaining([
-        { mcpServers: { alpha: { command: 'alpha-server', directTools: true } } },
-        { mcpServers: { beta: { command: 'beta-server', directTools: true } } },
-      ]))
+      for (const [name, command] of [['alpha', 'alpha-server'], ['beta', 'beta-server']] as const) {
+        const entry = (configs as Array<{ mcpServers?: Record<string, Record<string, any>> }>).find(config => config.mcpServers?.[name])?.mcpServers?.[name]
+        expect(entry).toBeDefined()
+        if (!entry) continue
+        expect(entry).toMatchObject({ command: '/usr/bin/env', directTools: true })
+        expect(entry.env).toBeUndefined()
+        expect(entry.args.at(-1)).toBe(command)
+      }
       expect(configPaths.every((path) => !existsSync(path))).toBe(true)
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
     } finally {

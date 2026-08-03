@@ -30,19 +30,20 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   const hasUsage = !!delta.usage
   const hasSessionId = !!delta.internal_session_id
   const hasProfileMaterialization = !!delta.profile_materialization
+  const hasInteractionPolicyReceipt = !!delta.interaction_policy_receipt
 
   // Pure keepalive deltas don't go on the OpenAI wire — surface as SSE
   // comments via `deltaToSseComment` instead. `internal_session_id`-only
   // deltas are also non-OpenAI metadata (consumed by the session store)
   // and are intentionally skipped here.
-  if (!hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (!hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization && !hasInteractionPolicyReceipt) {
     return null
   }
   // internal_session_id-only deltas: the session id is bookkeeping for
   // the bridge's own store, not OpenAI surface area. Skip to avoid
   // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
   // some agent harnesses) reject as malformed.
-  if (hasSessionId && !hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (hasSessionId && !hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization && !hasInteractionPolicyReceipt) {
     return null
   }
 
@@ -59,7 +60,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
 
   // Usage/profile metadata without content/tool_calls/finish carries `choices: []`,
   // not an empty choice, so strict OpenAI clients do not parse it as output.
-  const metadataOnly = (hasUsage || hasProfileMaterialization) && !hasContent && !hasToolCalls && !hasFinish
+  const metadataOnly = (hasUsage || hasProfileMaterialization || hasInteractionPolicyReceipt) && !hasContent && !hasToolCalls && !hasFinish
   const payload = {
     id: meta.id,
     object: 'chat.completion.chunk',
@@ -83,6 +84,9 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     } : {}),
     ...(delta.profile_materialization
       ? { profile_materialization: delta.profile_materialization }
+      : {}),
+    ...(delta.interaction_policy_receipt
+      ? { interaction_policy_receipt: delta.interaction_policy_receipt }
       : {}),
   }
   return `data: ${JSON.stringify(payload)}\n\n`
@@ -129,6 +133,7 @@ export async function collectNonStreaming(
   let finishReason: string | null = null
   let usage: CollectedUsage | undefined
   let profileMaterialization: ChatDelta['profile_materialization']
+  let interactionPolicyReceipt: ChatDelta['interaction_policy_receipt']
   let error: ChatDelta['error']
 
   for await (const d of iter) {
@@ -140,6 +145,7 @@ export async function collectNonStreaming(
     if (d.finish_reason) finishReason = d.finish_reason
     if (d.usage) usage = addUsage(usage, d.usage)
     if (d.profile_materialization) profileMaterialization = d.profile_materialization
+    if (d.interaction_policy_receipt) interactionPolicyReceipt = d.interaction_policy_receipt
     if (d.error) error = d.error
   }
 
@@ -180,10 +186,10 @@ export async function collectNonStreaming(
     ],
     ...(usageOut ? { usage: usageOut } : {}),
     ...(profileMaterialization ? { profile_materialization: profileMaterialization } : {}),
+    ...(interactionPolicyReceipt ? { interaction_policy_receipt: interactionPolicyReceipt } : {}),
     // A run that failed says so IN the body. Dropping the reason here is what
     // made `finish_reason: 'error'` with an empty message the caller's whole
     // explanation for a bridge-side failure.
     ...(error ? { error } : {}),
   }
 }
-

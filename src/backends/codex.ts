@@ -39,10 +39,10 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, prepareSpawnerPrivatePath, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -63,8 +63,8 @@ export class CodexBackend implements Backend {
     return m === 'codex' || m.startsWith('codex/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
   async *chat(
@@ -115,7 +115,15 @@ export class CodexBackend implements Backend {
     const codexHome = materializeMcpServersForCodex(
       resolveMcpServers(req, session),
       resolveCodexAuthPath(),
+      this.spawner.preparePrivatePath ? cwd : undefined,
     )
+    let runtimeCodexHome = codexHome?.homePath
+    try {
+      if (codexHome) runtimeCodexHome = await prepareSpawnerPrivatePath(this.spawner, codexHome.homePath)
+    } catch (error) {
+      codexHome?.cleanup()
+      throw error
+    }
 
     // When MCP passthrough is active, the synthetic CODEX_HOME (merged MCP config
     // + copied auth) is the source of truth. Register it as the jail's codex auth
@@ -132,12 +140,13 @@ export class CodexBackend implements Backend {
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       spawned = await this.spawner(this.opts.bin, args, {
+        signal,
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
         env: {
           ...process.env,
           ...provisioned.env,
-          ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
+          ...(runtimeCodexHome ? { CODEX_HOME: runtimeCodexHome } : {}),
         },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
@@ -147,7 +156,6 @@ export class CodexBackend implements Backend {
       throw error
     }
     const child = spawned.child
-    const releaseSpawner = spawned.release
 
     // The spawner registers a synchronous 'error' listener so the spawn
     // failure event doesn't crash the process before our own listener
@@ -238,9 +246,7 @@ export class CodexBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree — codex spawns sub-processes for MCP
       // tool calls, model HTTP I/O, etc. and we owe them a clean exit.
-      await terminateSpawned(spawned)
-      releaseSpawner()
-      codexHome?.cleanup()
+      await finalizeSpawned(spawned, [codexHome ? () => codexHome.cleanup() : null])
     }
   }
 

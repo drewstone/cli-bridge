@@ -43,15 +43,31 @@ export class ExecutorConfigurationError extends Error {
   }
 }
 
+/** A request was cancelled before the executor could start its workload. */
+export class ExecutorAbortedError extends Error {
+  constructor(reason?: unknown) {
+    super('executor request was cancelled before spawn', reason === undefined ? undefined : { cause: reason })
+    this.name = 'AbortError'
+  }
+}
+
+export function throwIfExecutorAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ExecutorAbortedError(signal.reason)
+}
+
 export interface SpawnOpts {
   /** Working directory inside the executor's filesystem. */
   cwd?: string
   /** Env to set on the child. */
   env?: NodeJS.ProcessEnv
+  /** Replace the executor/container environment with `env` instead of extending it. */
+  exactEnv?: boolean
   /** Stdio config — defaults to ['ignore', 'pipe', 'pipe']. */
   stdio?: ['ignore' | 'pipe' | 'inherit', 'pipe' | 'inherit', 'pipe' | 'inherit']
   /** Sticky session id (Docker variant uses this to route to a warm slot). */
   sessionId?: string
+  /** Cancel queued capacity acquisition and prevent a late spawn. */
+  signal?: AbortSignal
   /**
    * Resolved write-jail spec for this spawn. When set, the host and
    * scoped-host spawners wrap `(bin, args)` via `wrapInJail` before
@@ -168,6 +184,20 @@ export interface ExecutorReadiness {
 
 export interface Spawner {
   (bin: string, args: string[], opts: SpawnOpts): Promise<SpawnResult>
+  /** Translate a host-visible configuration path into this executor's path. */
+  mapPath?(path: string): string
+  /**
+   * Make a private, host-owned generated tree accessible only to the executor's
+   * configured identity, then return its executor-visible path. Docker needs
+   * this when its numeric user differs from the bridge process; host executors
+   * omit it because they already run as the tree owner.
+   */
+  preparePrivatePath?(path: string): Promise<string>
+  /**
+   * Temporarily expose a project-scoped config directory to the executor and
+   * return a disposer that restores its previous access controls.
+   */
+  prepareWorkspacePath?(path: string): Promise<PreparedWorkspacePath>
   /**
    * Resolve and validate a requested cwd before any backend writes profile or
    * MCP files into it. Docker spawners use this to enforce their bind root.
@@ -202,7 +232,29 @@ export interface Spawner {
    * request can trip over beyond spawning the binary, which `versionHealth`
    * already covers.
    */
-  probeRequestPath?(): Promise<ExecutorReadiness>
+  probeRequestPath?(signal?: AbortSignal): Promise<ExecutorReadiness>
+}
+
+export interface PreparedWorkspacePath {
+  path: string
+  cleanup(): Promise<void>
+}
+
+/** Prepare a generated private tree when needed, otherwise only map its path. */
+export async function prepareSpawnerPrivatePath(spawner: Spawner, path: string): Promise<string> {
+  if (spawner.preparePrivatePath) return await spawner.preparePrivatePath(path)
+  return spawner.mapPath?.(path) ?? path
+}
+
+export async function prepareSpawnerWorkspacePath(
+  spawner: Spawner,
+  path: string,
+): Promise<PreparedWorkspacePath> {
+  if (spawner.prepareWorkspacePath) return await spawner.prepareWorkspacePath(path)
+  return {
+    path: spawner.mapPath?.(path) ?? path,
+    cleanup: async () => {},
+  }
 }
 
 /**
@@ -227,13 +279,24 @@ export function resolveSpawnerCwd(spawner: Spawner, cwd: string | undefined): st
  * `cwd` is what the probe must then spawn in — the same directory a cwd-less
  * request gets — so `/health` cannot pass through a door requests never use.
  */
-export async function probeExecutorReadiness(spawner: Spawner): Promise<ExecutorReadiness> {
-  if (spawner.probeRequestPath) return await spawner.probeRequestPath()
-  try {
-    return { cwd: resolveSpawnerCwd(spawner, undefined), findings: [] }
-  } catch (error) {
-    return { cwd: undefined, findings: [cwdPolicyFinding(error)] }
+export async function probeExecutorReadiness(
+  spawner: Spawner,
+  signal?: AbortSignal,
+): Promise<ExecutorReadiness> {
+  throwIfExecutorAborted(signal)
+  if (spawner.probeRequestPath) {
+    const readiness = await spawner.probeRequestPath(signal)
+    throwIfExecutorAborted(signal)
+    return readiness
   }
+  let readiness: ExecutorReadiness
+  try {
+    readiness = { cwd: resolveSpawnerCwd(spawner, undefined), findings: [] }
+  } catch (error) {
+    readiness = { cwd: undefined, findings: [cwdPolicyFinding(error)] }
+  }
+  throwIfExecutorAborted(signal)
+  return readiness
 }
 
 /**

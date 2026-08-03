@@ -236,6 +236,29 @@ async function postChat(app: Hono, body: object, headers: Record<string, string>
 // ─── the shape: the probe takes the request path ──────────────────────────
 
 describe('the readiness probe traverses the request path', () => {
+  it('finishes and releases when the probe child exited before listeners attached', async () => {
+    const child = new EventEmitter() as unknown as ChildProcess
+    ;(child as unknown as { stdout: Readable }).stdout = Readable.from([])
+    ;(child as unknown as { stderr: Readable }).stderr = Readable.from([])
+    ;(child as unknown as { stdin: PassThrough }).stdin = new PassThrough()
+    ;(child as unknown as { exitCode: number | null }).exitCode = 0
+    ;(child as unknown as { signalCode: NodeJS.Signals | null }).signalCode = null
+    let releases = 0
+    const spawner: Spawner = async () => ({
+      child,
+      terminate: async () => {},
+      release: () => { releases += 1 },
+      spawnError: () => null,
+    })
+
+    const health = await Promise.race([
+      versionHealth('fast', 'fast', spawner),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('fast probe hung')), 250)),
+    ])
+    expect(health.state).toBe('ready')
+    expect(releases).toBe(1)
+  })
+
   it('refuses when the executor cwd policy a request would hit refuses', async () => {
     // A real request calls `resolveSpawnerCwd(spawner, undefined)`, which asks the
     // executor. The probe skipped that call entirely by passing no cwd, so the one
@@ -315,7 +338,10 @@ describe('the readiness probe traverses the request path', () => {
     // traffic goes to all of them, so every slot's own volumes must be named.
     let acquires = 0
     const pool = {
-      liveContainerIds: () => ['container-slot-0', 'container-slot-1'],
+      liveContainerIds: () => [
+        { slotIndex: 0, containerId: 'container-slot-0' },
+        { slotIndex: 1, containerId: 'container-slot-1' },
+      ],
       // Acquiring would make /health queue behind real traffic, so a busy pool
       // would read as unhealthy. The `--version` spawn exercises acquire.
       acquire: async () => { acquires += 1; throw new Error('must not acquire for a readiness probe') },
@@ -357,6 +383,52 @@ describe('the readiness probe traverses the request path', () => {
     expect(detail).toContain('cli-bridge-pool-oauth1-1')
     expect(seen.join(' ')).toContain('container-slot-0')
     expect(seen.join(' ')).toContain('container-slot-1')
+  })
+
+  it('aborts the active Docker command when a readiness caller times out', async () => {
+    const pool = {
+      liveContainerIds: () => [{ slotIndex: 0, containerId: 'container-slot-0' }],
+      acquire: async () => { throw new Error('must not acquire for a readiness probe') },
+      reportContainerUnusable: async () => {},
+      recycleHeldSlot: async () => {},
+    } as unknown as ContainerPool
+    let starts = 0
+    let active = 0
+    let observedSignal: AbortSignal | undefined
+    const cli: DockerCli = async (_args, options) => await new Promise(resolve => {
+      starts += 1
+      active += 1
+      observedSignal = options?.signal
+      let stopped = false
+      const stop = (): void => {
+        if (stopped) return
+        stopped = true
+        active -= 1
+        resolve(ok())
+      }
+      options?.signal?.addEventListener('abort', stop, { once: true })
+      if (options?.signal?.aborted) stop()
+    })
+    const spawner = createDockerSpawner({
+      pool,
+      backend: 'opencode',
+      envPrefix: 'OPENCODE',
+      cli,
+      preflightTarget: () => preflightTarget(),
+    })
+    const controller = new AbortController()
+    const readiness = spawner.probeRequestPath!(controller.signal)
+    const deadline = Date.now() + 1_000
+    while (active === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    expect({ starts, active, observedSignal }).toEqual({
+      starts: 1,
+      active: 1,
+      observedSignal: controller.signal,
+    })
+
+    controller.abort(new Error('readiness timed out'))
+    await expect(readiness).rejects.toMatchObject({ name: 'AbortError' })
+    expect({ starts, active }).toEqual({ starts: 1, active: 0 })
   })
 })
 

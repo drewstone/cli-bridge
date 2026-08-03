@@ -34,6 +34,7 @@ vi.mock('../src/executors/docker-preflight.js', async () => {
 
 import { loadConfig } from '../src/config.js'
 import { buildApp } from '../src/server.js'
+import { SessionStore } from '../src/sessions/store.js'
 
 describe('Docker server wiring', () => {
   const dataDirs: string[] = []
@@ -48,8 +49,15 @@ describe('Docker server wiring', () => {
     for (const dir of dataDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
   })
 
-  function fakePool(containerIds: string[]): { destroy: ReturnType<typeof vi.fn>; liveContainerIds: () => string[] } {
-    return { destroy: vi.fn(async () => {}), liveContainerIds: () => containerIds }
+  function fakePool(containerIds: Array<string | { slotIndex: number; containerId: string }>): {
+    destroy: ReturnType<typeof vi.fn>
+    liveContainerIds: () => Array<{ slotIndex: number; containerId: string }>
+  } {
+    return {
+      destroy: vi.fn(async () => {}),
+      liveContainerIds: () => containerIds.map((entry, slotIndex) =>
+        typeof entry === 'string' ? { slotIndex, containerId: entry } : entry),
+    }
   }
 
   it('carries OPENCODE_DOCKER_NETWORK from startup config into the container pool', async () => {
@@ -115,5 +123,60 @@ describe('Docker server wiring', () => {
 
     for (const shutdown of built.extras.shutdownHooks) await shutdown()
     built.sessions.close()
+  })
+
+  it('keeps the original credential-volume index when an earlier slot is dead', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-dead-slot-wiring-'))
+    dataDirs.push(dataDir)
+    const pool = fakePool([{ slotIndex: 1, containerId: 'fake-slot-1' }])
+    mocks.createPool.mockResolvedValue(pool)
+    mocks.createSpawner.mockReturnValue(async () => {
+      throw new Error('not called while building the server')
+    })
+
+    const config = loadConfig({
+      HOME: '/home/test',
+      BRIDGE_BACKENDS: 'opencode',
+      BRIDGE_DATA_DIR: dataDir,
+      OPENCODE_EXECUTOR: 'docker',
+      OPENCODE_DOCKER_POOL_SIZE: '2',
+      OPENCODE_DOCKER_OAUTH_MOUNT: 'per-slot',
+      OPENCODE_DOCKER_NAME_PREFIX: 'cli-bridge-gap',
+    })
+    const built = await buildApp(config)
+
+    const target = (mocks.preflightSlot.mock.calls[0] as unknown[])[0] as DockerPreflightTarget
+    expect(target.mounts.map(mount => mount.source)).toContain('cli-bridge-gap-oauth-1')
+    expect(target.mounts.map(mount => mount.source)).not.toContain('cli-bridge-gap-oauth-0')
+
+    for (const shutdown of built.extras.shutdownHooks) await shutdown()
+    built.sessions.close()
+  })
+
+  it('destroys earlier pools and closes SQLite when a later backend fails startup', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-partial-startup-'))
+    dataDirs.push(dataDir)
+    const pool = fakePool(['fake-slot-0'])
+    mocks.createPool.mockResolvedValue(pool)
+    mocks.createSpawner.mockReturnValue(async () => {
+      throw new Error('not called while building the server')
+    })
+    const close = vi.spyOn(SessionStore.prototype, 'close')
+    try {
+      const config = loadConfig({
+        HOME: '/home/test',
+        BRIDGE_BACKENDS: 'opencode,sandbox',
+        BRIDGE_DATA_DIR: dataDir,
+        OPENCODE_EXECUTOR: 'docker',
+        // Deliberately omit SANDBOX_API_URL + SANDBOX_API_KEY. The first
+        // backend owns a live pool before the second backend rejects startup.
+      })
+
+      await expect(buildApp(config)).rejects.toThrow(/sandbox backend enabled/u)
+      expect(pool.destroy).toHaveBeenCalledOnce()
+      expect(close).toHaveBeenCalledOnce()
+    } finally {
+      close.mockRestore()
+    }
   })
 })

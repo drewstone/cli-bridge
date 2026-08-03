@@ -13,8 +13,10 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { spawn, spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import {
   defineAgentProfilePublicConfig as pub,
   defineAgentProfileSecretRef as secretRef,
@@ -26,12 +28,30 @@ import {
   materializeMcpConfig,
   writeMcpConfigFile,
   materializeMcpServersForCodex,
+  materializeMcpServersForFactory,
   materializeMcpServersForOpencode,
   materializeMcpServersForPi,
   materializeOpencodeMcpConfig,
+  reapStalePiMcpConfigs,
   resolveMcpServers,
 } from '../src/backends/profile-support.js'
 import type { ChatRequest } from '../src/backends/types.js'
+
+async function childResult(child: ReturnType<typeof spawn>): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  let stdout = ''
+  let stderr = ''
+  child.stdout?.on('data', chunk => { stdout += chunk.toString() })
+  child.stderr?.on('data', chunk => { stderr += chunk.toString() })
+  const code = await new Promise<number | null>((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve(child.exitCode)
+      return
+    }
+    child.once('error', reject)
+    child.once('exit', resolve)
+  })
+  return { code, stdout, stderr }
+}
 
 describe('materializeMcpConfig', () => {
   it('returns null when the profile has no mcp section', () => {
@@ -75,6 +95,8 @@ describe('materializeMcpConfig', () => {
         },
       },
     })
+    expect(statSync(dirname(m.configPath)).mode & 0o777).toBe(0o700)
+    expect(statSync(m.configPath).mode & 0o777).toBe(0o600)
     m.cleanup()
     expect(existsSync(m.configPath)).toBe(false)
   })
@@ -108,7 +130,7 @@ describe('materializeMcpConfig', () => {
 })
 
 describe('materializeOpencodeMcpConfig', () => {
-  it('writes headless permissions even when no MCP servers are declared', () => {
+  it('denies one-shot permissions by default even when no MCP servers are declared', () => {
     const m = materializeOpencodeMcpConfig(null)
     expect(m).not.toBeNull()
     if (!m) return
@@ -116,21 +138,20 @@ describe('materializeOpencodeMcpConfig', () => {
 
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.permission).toMatchObject({
-      external_directory: 'allow',
-      bash: 'allow',
-      edit: 'allow',
-      read: 'allow',
-      write: 'allow',
-      webfetch: 'allow',
+      external_directory: 'deny',
+      bash: 'deny',
+      edit: 'deny',
+      read: 'deny',
+      write: 'deny',
+      webfetch: 'deny',
     })
     expect(written.mcp).toEqual({})
     m.cleanup()
     expect(existsSync(m.configPath)).toBe(false)
   })
 
-  it('honors agent_profile.permissions over the headless allow defaults', () => {
-    // The no-web arm sets webfetch:'deny'; it must reach opencode's config,
-    // not be overwritten by the hardcoded headless 'allow'.
+  it('honors profile restrictions without widening the one-shot default', () => {
+    // The no-web arm sets webfetch:'deny'; it must reach opencode's config.
     const m = materializeOpencodeMcpConfig({
       permissions: { webfetch: 'deny', websearch: 'deny' },
     } as unknown as Parameters<typeof materializeOpencodeMcpConfig>[0])
@@ -139,7 +160,16 @@ describe('materializeOpencodeMcpConfig', () => {
     const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.permission.webfetch).toBe('deny')
     expect(written.permission.websearch).toBe('deny')
-    // untouched keys keep their headless default
+    // untouched keys keep the fail-closed one-shot default
+    expect(written.permission.bash).toBe('deny')
+    m.cleanup()
+  })
+
+  it('writes allow only for the explicit named unattended profile policy', () => {
+    const m = materializeOpencodeMcpConfig({
+      metadata: { cliBridge: { interactionPolicy: 'unattended-allow-v1' } },
+    } as unknown as Parameters<typeof materializeOpencodeMcpConfig>[0])
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
     expect(written.permission.bash).toBe('allow')
     m.cleanup()
   })
@@ -271,7 +301,7 @@ describe('resolveMcpServers', () => {
     expect(merged).toEqual({ echo: { command: 'from-body' } })
   })
 
-  it('falls back to session.metadata.agent_profile when req.agent_profile is absent', () => {
+  it('never executes an AgentProfile copied from durable legacy session metadata', () => {
     const merged = resolveMcpServers(
       req({}),
       {
@@ -284,7 +314,7 @@ describe('resolveMcpServers', () => {
         },
       } as never,
     )
-    expect(merged).toEqual({ coord: { command: 'tsx' } })
+    expect(merged).toBeNull()
   })
 })
 
@@ -333,10 +363,204 @@ describe('writeMcpConfigFile', () => {
   it('returns null when given a null map (no entries at all)', () => {
     expect(writeMcpConfigFile(null)).toBeNull()
   })
+
+  it('reaps generic, opencode, and codex credential roots after SIGKILL', () => {
+    const fs = require('node:fs') as typeof import('node:fs')
+    const os = require('node:os') as typeof import('node:os')
+    const dir = fs.mkdtempSync(join(os.tmpdir(), 'cb-private-config-crash-'))
+    const marker = join(dir, 'roots.json')
+    try {
+      const isolatedTmp = join(dir, 'tmp')
+      const isolatedHome = join(dir, 'home')
+      const reaperMarker = join(dir, 'reaped.txt')
+      fs.mkdirSync(isolatedTmp, { mode: 0o700 })
+      fs.mkdirSync(isolatedHome, { mode: 0o700 })
+      const isolatedEnv = {
+        ...process.env,
+        HOME: isolatedHome,
+        TMPDIR: isolatedTmp,
+        TMP: isolatedTmp,
+        TEMP: isolatedTmp,
+      }
+      const tsx = join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs')
+      const moduleUrl = pathToFileURL(join(process.cwd(), 'src', 'backends', 'profile-support.ts')).href
+      const reaperUrl = pathToFileURL(join(process.cwd(), 'src', 'runtime', 'private-temporary.ts')).href
+      const source = [
+        `import { writeMcpConfigFile, materializeMcpServersForOpencode, materializeMcpServersForCodex } from ${JSON.stringify(moduleUrl)}`,
+        `import { existsSync, writeFileSync } from 'node:fs'`,
+        `import { dirname } from 'node:path'`,
+        `const generic = writeMcpConfigFile({ remote: { type: 'http', url: 'https://mcp.example.test', headers: { Authorization: 'Bearer generic-secret' } } })`,
+        `const opencode = materializeMcpServersForOpencode({ remote: { type: 'http', url: 'https://mcp.example.test', headers: { Authorization: 'Bearer opencode-secret' } } })`,
+        `const codex = materializeMcpServersForCodex({ remote: { type: 'http', url: 'https://mcp.example.test', headers: { Authorization: 'Bearer codex-secret' } } })`,
+        `if (!generic || !codex) throw new Error('fixture did not materialize')`,
+        `writeFileSync(${JSON.stringify(marker)}, JSON.stringify([dirname(generic.configPath), dirname(opencode.configPath), codex.homePath]))`,
+        `process.kill(process.pid, 'SIGKILL')`,
+      ].join(';')
+      const child = spawnSync(process.execPath, [tsx, '-e', source], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: isolatedEnv,
+      })
+      expect(child.status).not.toBe(0)
+      const roots = JSON.parse(readFileSync(marker, 'utf8')) as string[]
+      expect(roots).toHaveLength(3)
+      for (const root of roots) {
+        expect(existsSync(root)).toBe(true)
+        expect(statSync(root).mode & 0o777).toBe(0o700)
+      }
+      const reaper = spawnSync(process.execPath, [
+        tsx,
+        '-e',
+        `import { writeFileSync } from 'node:fs'; import { reapStalePrivateTemporaryRoots } from ${JSON.stringify(reaperUrl)}; writeFileSync(${JSON.stringify(reaperMarker)}, String(reapStalePrivateTemporaryRoots()))`,
+      ], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: isolatedEnv,
+      })
+      expect(reaper.status, reaper.stderr).toBe(0)
+      expect(Number(readFileSync(reaperMarker, 'utf8'))).toBeGreaterThanOrEqual(3)
+      for (const root of roots) expect(existsSync(root)).toBe(false)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('private temporary ownership records', () => {
+  const fs = require('node:fs') as typeof import('node:fs')
+  const os = require('node:os') as typeof import('node:os')
+  const tsx = join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs')
+  const moduleUrl = pathToFileURL(join(process.cwd(), 'src', 'runtime', 'private-temporary.ts')).href
+
+  function registryPath(isolatedTmp: string): string {
+    const owner = typeof process.getuid === 'function' ? process.getuid() : 'user'
+    return join(isolatedTmp, `cli-bridge-private-temp-registry-${owner}`)
+  }
+
+  function reap(isolatedEnv: NodeJS.ProcessEnv): number {
+    const result = spawnSync(process.execPath, [tsx, '-e', [
+      `import { reapStalePrivateTemporaryRoots } from ${JSON.stringify(moduleUrl)}`,
+      `process.stdout.write(String(reapStalePrivateTemporaryRoots()))`,
+    ].join(';')], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: isolatedEnv,
+    })
+    expect(result.status, result.stderr).toBe(0)
+    return Number(result.stdout)
+  }
+
+  it('keeps the shared registry after cleanup so a parallel creator cannot lose it', () => {
+    const dir = fs.mkdtempSync(join(os.tmpdir(), 'cb-private-registry-'))
+    const isolatedTmp = join(dir, 'tmp')
+    const parent = join(dir, 'parent')
+    fs.mkdirSync(isolatedTmp)
+    fs.mkdirSync(parent)
+    const isolatedEnv = { ...process.env, TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp }
+    try {
+      const source = [
+        `import { createPrivateTemporaryRoot } from ${JSON.stringify(moduleUrl)}`,
+        `const root = createPrivateTemporaryRoot(${JSON.stringify(parent)}, '.cli-bridge-test-')`,
+        `root.cleanup()`,
+      ].join(';')
+      const child = spawnSync(process.execPath, [tsx, '-e', source], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: isolatedEnv,
+      })
+      expect(child.status, child.stderr).toBe(0)
+      const registry = registryPath(isolatedTmp)
+      expect(fs.statSync(registry).isDirectory()).toBe(true)
+      expect(fs.readdirSync(registry)).toEqual([])
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('treats a live reused pid with a different birth identity as stale', async () => {
+    const dir = fs.mkdtempSync(join(os.tmpdir(), 'cb-private-pid-reuse-'))
+    const isolatedTmp = join(dir, 'tmp')
+    const parent = join(dir, 'parent')
+    const marker = join(dir, 'root')
+    fs.mkdirSync(isolatedTmp)
+    fs.mkdirSync(parent)
+    const isolatedEnv = { ...process.env, TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp }
+    const source = [
+      `import { writeFileSync } from 'node:fs'`,
+      `import { createPrivateTemporaryRoot } from ${JSON.stringify(moduleUrl)}`,
+      `void (async () => {`,
+      `const root = createPrivateTemporaryRoot(${JSON.stringify(parent)}, '.cli-bridge-test-')`,
+      `writeFileSync(${JSON.stringify(marker)}, root.path)`,
+      `await new Promise(() => {})`,
+      `})().catch(error => { console.error(error); process.exitCode = 1 })`,
+    ].join(';')
+    const owner = spawn(process.execPath, [tsx, '-e', source], {
+      cwd: process.cwd(),
+      env: isolatedEnv,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    try {
+      const deadline = Date.now() + 5_000
+      while (!fs.existsSync(marker) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(fs.existsSync(marker)).toBe(true)
+      const root = fs.readFileSync(marker, 'utf8')
+      const registry = registryPath(isolatedTmp)
+      const manifestPath = join(registry, fs.readdirSync(registry).find(name => name.endsWith('.json'))!)
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      manifest.processStart = 'linux:not-the-owner-birth'
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest), { mode: 0o600 })
+
+      expect(reap(isolatedEnv)).toBe(1)
+      expect(fs.existsSync(root)).toBe(false)
+      expect(fs.existsSync(manifestPath)).toBe(false)
+    } finally {
+      owner.kill('SIGKILL')
+      await childResult(owner).catch(() => {})
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses cleanup after the registered parent path is replaced', () => {
+    const dir = fs.mkdtempSync(join(os.tmpdir(), 'cb-private-parent-swap-'))
+    const isolatedTmp = join(dir, 'tmp')
+    const parent = join(dir, 'parent')
+    const movedParent = join(dir, 'parent-original')
+    const marker = join(dir, 'root')
+    fs.mkdirSync(isolatedTmp)
+    fs.mkdirSync(parent)
+    const isolatedEnv = { ...process.env, TMPDIR: isolatedTmp, TMP: isolatedTmp, TEMP: isolatedTmp }
+    try {
+      const source = [
+        `import { writeFileSync } from 'node:fs'`,
+        `import { createPrivateTemporaryRoot } from ${JSON.stringify(moduleUrl)}`,
+        `const root = createPrivateTemporaryRoot(${JSON.stringify(parent)}, '.cli-bridge-test-')`,
+        `writeFileSync(${JSON.stringify(marker)}, root.path)`,
+        `process.kill(process.pid, 'SIGKILL')`,
+      ].join(';')
+      const child = spawnSync(process.execPath, [tsx, '-e', source], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: isolatedEnv,
+      })
+      expect(child.status).not.toBe(0)
+      const originalRoot = fs.readFileSync(marker, 'utf8')
+      const movedRoot = join(movedParent, originalRoot.slice(parent.length + 1))
+      fs.renameSync(parent, movedParent)
+      fs.mkdirSync(parent)
+      const registry = registryPath(isolatedTmp)
+      const manifestPath = join(registry, fs.readdirSync(registry).find(name => name.endsWith('.json'))!)
+
+      expect(reap(isolatedEnv)).toBe(0)
+      expect(fs.existsSync(movedRoot)).toBe(true)
+      expect(fs.existsSync(manifestPath)).toBe(true)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('materializeMcpServersForOpencode', () => {
-  it('writes opencode shape with command-as-array + headless permissions', () => {
+  it('writes opencode shape with command-as-array + fail-closed permissions', () => {
     const m = materializeMcpServersForOpencode({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } },
     })
@@ -350,7 +574,9 @@ describe('materializeMcpServersForOpencode', () => {
         enabled: true,
       },
     })
-    expect(written.permission.bash).toBe('allow')
+    expect(written.permission.bash).toBe('deny')
+    expect(statSync(dirname(m.configPath)).mode & 0o777).toBe(0o700)
+    expect(statSync(m.configPath).mode & 0o777).toBe(0o600)
     m.cleanup()
   })
 
@@ -378,6 +604,8 @@ describe('materializeMcpServersForPi', () => {
       if (!m) return
       expect(m.configPath.startsWith(join(cwd, '.cli-bridge-pi-mcp-'))).toBe(true)
       expect(m.serverNames).toEqual(['echo'])
+      expect(statSync(dirname(m.configPath)).mode & 0o777).toBe(0o700)
+      expect(statSync(m.configPath).mode & 0o777).toBe(0o600)
       expect(JSON.parse(readFileSync(m.configPath, 'utf-8'))).toEqual({
         mcpServers: {
           echo: {
@@ -392,6 +620,36 @@ describe('materializeMcpServersForPi', () => {
       m.cleanup()
       m.cleanup()
       expect(existsSync(m.configPath)).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('reaps a private credential file left by SIGKILL', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-crash-'))
+    const marker = join(cwd, 'config-path.txt')
+    try {
+      const tsx = join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs')
+      const moduleUrl = pathToFileURL(join(process.cwd(), 'src', 'backends', 'profile-support.ts')).href
+      const source = [
+        `import { materializeMcpServersForPi } from ${JSON.stringify(moduleUrl)}`,
+        `import { writeFileSync } from 'node:fs'`,
+        `const mounted = materializeMcpServersForPi({ remote: { type: 'http', url: 'https://mcp.example.test', headers: { Authorization: 'Bearer crash-secret' } } }, ${JSON.stringify(cwd)})`,
+        `if (!mounted) throw new Error('fixture did not materialize')`,
+        `writeFileSync(${JSON.stringify(marker)}, mounted.configPath)`,
+        `process.kill(process.pid, 'SIGKILL')`,
+      ].join(';')
+      const child = spawnSync(process.execPath, [tsx, '-e', source], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+      })
+      expect(child.status).not.toBe(0)
+      const configPath = readFileSync(marker, 'utf8')
+      expect(existsSync(configPath)).toBe(true)
+      expect(statSync(dirname(configPath)).mode & 0o777).toBe(0o700)
+      expect(statSync(configPath).mode & 0o777).toBe(0o600)
+      expect(reapStalePiMcpConfigs()).toBeGreaterThanOrEqual(1)
+      expect(existsSync(configPath)).toBe(false)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }
@@ -417,6 +675,27 @@ describe('materializeMcpServersForPi', () => {
       expect(existsSync(alpha.configPath)).toBe(false)
       expect(existsSync(beta.configPath)).toBe(true)
       beta.cleanup()
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('hardens Pi stdio children with an env -i boundary and rejects secret-shaped vars', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    try {
+      const m = materializeMcpServersForPi({ safe: { command: 'node', args: ['server.js'], env: { MODE: 'test' } } }, cwd, { isolateChildren: true })
+      expect(m).not.toBeNull()
+      const server = JSON.parse(readFileSync(m!.configPath, 'utf8')).mcpServers.safe
+      expect(server.command).toBe('/usr/bin/env')
+      expect(server.env).toBeUndefined()
+      expect(server.args).toContain('MODE=test')
+      expect(server.args).toContain('--')
+      expect(server.args.at(-2)).toBe('node')
+      expect(server.args.at(-1)).toBe('server.js')
+      expect(server.args.some((arg: string) => arg.includes('API_KEY') || arg.includes('TOKEN'))).toBe(false)
+      m!.cleanup()
+      expect(() => materializeMcpServersForPi({ unsafe: { command: 'node', env: { API_TOKEN: 'secret' } } }, cwd, { isolateChildren: true })).toThrow(/secret-shaped/u)
+      expect(() => materializeMcpServersForPi({ unsafe: { command: 'node', env: { HOME: '/home/drew' } } }, cwd, { isolateChildren: true })).toThrow(/cannot override isolated environment key.*HOME/u)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }
@@ -451,6 +730,157 @@ describe('materializeMcpServersForPi', () => {
   })
 })
 
+describe('cwd-native MCP lock ownership', () => {
+  const fs = require('node:fs') as typeof import('node:fs')
+  const os = require('node:os') as typeof import('node:os')
+  const tsx = join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs')
+  const moduleUrl = pathToFileURL(join(process.cwd(), 'src', 'backends', 'profile-support.ts')).href
+
+  it('admits exactly one of two simultaneous first mounts', async () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-race-'))
+    const barrier = join(cwd, 'go')
+    try {
+      const source = [
+        `import { existsSync, writeFileSync } from 'node:fs'`,
+        `import { materializeMcpServersForFactory } from ${JSON.stringify(moduleUrl)}`,
+        `void (async () => {`,
+        `writeFileSync(${JSON.stringify(join(cwd, 'ready-'))} + process.pid, '')`,
+        `while (!existsSync(${JSON.stringify(barrier)})) await new Promise(resolve => setTimeout(resolve, 5))`,
+        `try { const mounted = materializeMcpServersForFactory({ echo: { command: 'echo' } }, ${JSON.stringify(cwd)}); process.stdout.write('acquired'); await new Promise(resolve => setTimeout(resolve, 300)); mounted?.cleanup() } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 2 }`,
+        `})().catch(error => { console.error(error); process.exitCode = 1 })`,
+      ].join(';')
+      const first = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] })
+      const second = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] })
+      const deadline = Date.now() + 5_000
+      while (fs.readdirSync(cwd).filter(name => name.startsWith('ready-')).length < 2 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(fs.readdirSync(cwd).filter(name => name.startsWith('ready-'))).toHaveLength(2)
+      fs.writeFileSync(barrier, '')
+      const results = await Promise.all([childResult(first), childResult(second)])
+      expect(results.filter(result => result.code === 0)).toHaveLength(1)
+      expect(results.filter(result => result.code === 2)).toHaveLength(1)
+      expect(results.find(result => result.code === 2)?.stderr).toMatch(/another run.*holds the mount/u)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers the exact original config after a lock owner is SIGKILLed', async () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-crash-'))
+    const factoryDir = join(cwd, '.factory')
+    const configPath = join(factoryDir, 'mcp.json')
+    const ready = join(cwd, 'ready')
+    const crash = join(cwd, 'crash')
+    fs.mkdirSync(factoryDir)
+    fs.writeFileSync(configPath, '{"keep":true}\n', { mode: 0o640 })
+    try {
+      const source = [
+        `import { existsSync, writeFileSync } from 'node:fs'`,
+        `import { materializeMcpServersForFactory } from ${JSON.stringify(moduleUrl)}`,
+        `void (async () => {`,
+        `const mounted = materializeMcpServersForFactory({ crash: { command: 'crash-cmd' } }, ${JSON.stringify(cwd)})`,
+        `if (!mounted) throw new Error('fixture did not mount')`,
+        `writeFileSync(${JSON.stringify(ready)}, '')`,
+        `while (!existsSync(${JSON.stringify(crash)})) await new Promise(resolve => setTimeout(resolve, 5))`,
+        `process.kill(process.pid, 'SIGKILL')`,
+        `})().catch(error => { console.error(error); process.exitCode = 1 })`,
+      ].join(';')
+      const owner = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] })
+      const deadline = Date.now() + 5_000
+      while (!fs.existsSync(ready) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(fs.existsSync(ready)).toBe(true)
+      fs.writeFileSync(crash, '')
+      await childResult(owner)
+
+      const recovered = materializeMcpServersForFactory({ recovered: { command: 'ok' } }, cwd)
+      expect(recovered).not.toBeNull()
+      recovered?.cleanup()
+      expect(fs.readFileSync(configPath, 'utf8')).toBe('{"keep":true}\n')
+      expect(fs.statSync(configPath).mode & 0o777).toBe(0o640)
+      expect(fs.existsSync(`${configPath}.lock`)).toBe(false)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a config edited during the run and keeps the ownership lock', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-edited-'))
+    const factoryDir = join(cwd, '.factory')
+    const configPath = join(factoryDir, 'mcp.json')
+    fs.mkdirSync(factoryDir)
+    fs.writeFileSync(configPath, '{"keep":true}\n', { mode: 0o640 })
+    try {
+      const mounted = materializeMcpServersForFactory({ temporary: { command: 'temporary' } }, cwd)
+      expect(mounted).not.toBeNull()
+      fs.writeFileSync(configPath, '{"user":"changed-during-run"}\n', { mode: 0o640 })
+
+      expect(() => mounted?.cleanup()).toThrow(/changed during the run.*preserving/u)
+      expect(fs.readFileSync(configPath, 'utf8')).toBe('{"user":"changed-during-run"}\n')
+      expect(fs.existsSync(`${configPath}.lock`)).toBe(true)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a user-recreated file even when its bytes match the mounted config', () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-recreated-'))
+    const factoryDir = join(cwd, '.factory')
+    const configPath = join(factoryDir, 'mcp.json')
+    try {
+      const mounted = materializeMcpServersForFactory({ temporary: { command: 'temporary' } }, cwd)
+      expect(mounted).not.toBeNull()
+      const mountedBytes = fs.readFileSync(configPath, 'utf8')
+      fs.rmSync(configPath)
+      fs.writeFileSync(configPath, mountedBytes, { mode: 0o600 })
+
+      expect(() => mounted?.cleanup()).toThrow(/changed during the run.*preserving/u)
+      expect(fs.readFileSync(configPath, 'utf8')).toBe(mountedBytes)
+      expect(fs.existsSync(`${configPath}.lock`)).toBe(true)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves a file replaced after a crashed mount instead of deleting it during stale recovery', async () => {
+    const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-stale-replaced-'))
+    const factoryDir = join(cwd, '.factory')
+    const configPath = join(factoryDir, 'mcp.json')
+    const ready = join(cwd, 'ready')
+    const crash = join(cwd, 'crash')
+    try {
+      const source = [
+        `import { existsSync, writeFileSync } from 'node:fs'`,
+        `import { materializeMcpServersForFactory } from ${JSON.stringify(moduleUrl)}`,
+        `void (async () => {`,
+        `materializeMcpServersForFactory({ crash: { command: 'crash-cmd' } }, ${JSON.stringify(cwd)})`,
+        `writeFileSync(${JSON.stringify(ready)}, '')`,
+        `while (!existsSync(${JSON.stringify(crash)})) await new Promise(resolve => setTimeout(resolve, 5))`,
+        `process.kill(process.pid, 'SIGKILL')`,
+        `})().catch(error => { console.error(error); process.exitCode = 1 })`,
+      ].join(';')
+      const owner = spawn(process.execPath, [tsx, '-e', source], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      const deadline = Date.now() + 5_000
+      while (!fs.existsSync(ready) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(fs.existsSync(ready)).toBe(true)
+      fs.writeFileSync(crash, '')
+      await childResult(owner)
+
+      fs.rmSync(configPath)
+      fs.writeFileSync(configPath, '{"user":"recreated-after-crash"}\n', { mode: 0o600 })
+      expect(() => materializeMcpServersForFactory({ next: { command: 'next' } }, cwd))
+        .toThrow(/changed after its owner exited.*preserving/u)
+      expect(fs.readFileSync(configPath, 'utf8')).toBe('{"user":"recreated-after-crash"}\n')
+      expect(fs.existsSync(`${configPath}.lock`)).toBe(true)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('materializeMcpServersForCodex', () => {
   it('writes a TOML config.toml with stdio servers under [mcp_servers.<name>]', () => {
     const m = materializeMcpServersForCodex({
@@ -464,6 +894,8 @@ describe('materializeMcpServersForCodex', () => {
     expect(toml).toContain('command = "node"')
     expect(toml).toContain('args = ["./echo.js"]')
     expect(toml).toContain('env = { FOO = "bar" }')
+    expect(statSync(m.homePath).mode & 0o777).toBe(0o700)
+    expect(statSync(join(m.homePath, 'config.toml')).mode & 0o777).toBe(0o600)
     m.cleanup()
     expect(existsSync(m.homePath)).toBe(false)
   })
@@ -498,6 +930,7 @@ describe('materializeMcpServersForCodex', () => {
       if (!m) return
       const copied = readFileSync(join(m.homePath, 'auth.json'), 'utf-8')
       expect(copied).toBe('{"token":"test"}')
+      expect(statSync(join(m.homePath, 'auth.json')).mode & 0o777).toBe(0o600)
       m.cleanup()
     } finally {
       fs.rmSync(srcDir, { recursive: true, force: true })

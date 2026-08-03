@@ -56,6 +56,7 @@
 
 import { isIP } from 'node:net'
 import type { DockerCli } from './docker-cli.js'
+import { dockerOwnerLabels, removeOwnedDockerResource } from './docker-resource-owner.js'
 
 /** Printed by the sidecar only after every rule is in place. */
 const APPLIED_MARK = 'netjail-egress-applied'
@@ -207,6 +208,8 @@ export interface JailedContainerOptions {
   label: string
   /** Container name; must be unique on the host for the call's duration. */
   name: string
+  /** Stable owner label used to reclaim this throwaway safely. */
+  resourceOwner: string
   /** Command the container runs. Defaults to an idle sleep. */
   command?: string[]
   /** Skip filter installation. Only for calibration: proves the verifier catches an unfiltered jail. */
@@ -230,9 +233,10 @@ export async function withJailedContainer<T>(
   opts: JailedContainerOptions,
   fn: (containerId: string) => Promise<T>,
 ): Promise<T> {
-  await opts.cli(['rm', '-f', opts.name], { timeoutMs: 30_000 })
+  await removeOwnedDockerResource(opts.cli, 'container', opts.name, opts.resourceOwner)
   const started = await opts.cli([
     'run', '-d', '--name', opts.name,
+    ...dockerOwnerLabels(opts.resourceOwner, 'net-jail-probe'),
     '--network', opts.network,
     '--entrypoint', 'sh',
     opts.image,
@@ -258,7 +262,7 @@ export async function withJailedContainer<T>(
     }
     return await fn(containerId)
   } finally {
-    await opts.cli(['rm', '-f', opts.name], { timeoutMs: 30_000 })
+    await removeOwnedDockerResource(opts.cli, 'container', opts.name, opts.resourceOwner)
   }
 }
 

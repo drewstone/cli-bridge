@@ -59,13 +59,15 @@
  * the slot that last served that session.
  */
 
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import { assertDockerNetworkName } from './docker-network.js'
 import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
 import { buildCommandFor, isInside } from './docker-preflight.js'
-
-const execFileAsync = promisify(execFile)
+import {
+  dockerOwnerLabels,
+  ensureOwnedDockerVolume,
+  removeOwnedDockerResource,
+} from './docker-resource-owner.js'
+import { ExecutorAbortedError, throwIfExecutorAborted } from './types.js'
 
 export interface ContainerPoolOptions {
   /** Number of containers in the pool. */
@@ -74,6 +76,8 @@ export interface ContainerPoolOptions {
   image: string
   /** Container name prefix; slots are `<prefix>-<i>`. */
   namePrefix: string
+  /** Stable owner label shared by every Docker object created for this pool. */
+  resourceOwner: string
   /**
    * Volume mounts. Either:
    *   - 'share'    — all slots mount the same host paths (oauth shared).
@@ -116,6 +120,8 @@ export interface ContainerPoolOptions {
   slotMaxHoldMs?: number
   /** Consecutive provision failures that take a slot permanently out. Default 3. */
   maxConsecutiveFailures?: number
+  /** Initial retry delay after a transient reprovision failure. Default 250ms. */
+  reprovisionBackoffMs?: number
   /**
    * How long a slot's container liveness is trusted before the next acquire
    * re-checks it with `docker inspect`. Default 30_000. Set 0 to check every
@@ -171,6 +177,9 @@ interface SlotState {
   busy: boolean
   /** Slot is dead (provision keeps failing). Not routed to. */
   dead: boolean
+  /** Temporarily unavailable while a failed reprovision is retried. */
+  recovering: boolean
+  recoveryTimer: NodeJS.Timeout | null
   /** Last sessionId served (for sticky routing). */
   lastSession: string | null
   /** Holder watchdog timer; cleared on release(). */
@@ -194,24 +203,30 @@ const DEFAULTS = {
   ACQUIRE_DEADLINE_MS: 60_000,
   SLOT_MAX_HOLD_MS: 600_000,
   MAX_CONSECUTIVE_FAILURES: 3,
+  REPROVISION_BACKOFF_MS: 250,
   LIVENESS_TTL_MS: 30_000,
 }
 
 interface Waiter {
   sessionId: string | undefined
-  resolve: (slot: SlotState) => void
+  signal: AbortSignal | undefined
+  resolve: (slot: AcquiredSlot) => void
   reject: (err: Error) => void
   timer: NodeJS.Timeout
+  state: 'queued' | 'checking' | 'settled'
+  onAbort?: () => void
 }
 
 export class ContainerPool {
   private readonly slots: SlotState[]
   private readonly waiters: Waiter[] = []
+  private readonly activeWaiters = new Set<Waiter>()
   private readonly opts: ContainerPoolOptions
   private readonly maxQueueDepth: number
   private readonly acquireDeadlineMs: number
   private readonly slotMaxHoldMs: number
   private readonly maxConsecutiveFailures: number
+  private readonly reprovisionBackoffMs: number
   private readonly livenessTtlMs: number
   private readonly cli: DockerCli
   private destroyed = false
@@ -239,6 +254,7 @@ export class ContainerPool {
     this.acquireDeadlineMs = opts.acquireDeadlineMs ?? DEFAULTS.ACQUIRE_DEADLINE_MS
     this.slotMaxHoldMs = opts.slotMaxHoldMs ?? DEFAULTS.SLOT_MAX_HOLD_MS
     this.maxConsecutiveFailures = opts.maxConsecutiveFailures ?? DEFAULTS.MAX_CONSECUTIVE_FAILURES
+    this.reprovisionBackoffMs = opts.reprovisionBackoffMs ?? DEFAULTS.REPROVISION_BACKOFF_MS
     // A pool whose slots carry start-scoped state cannot cache liveness. The TTL
     // exists to skip a `docker inspect` on a warm path, and the very thing the
     // inspect now reads — which START this container is on — is what changes
@@ -250,14 +266,34 @@ export class ContainerPool {
 
   static async create(opts: ContainerPoolOptions): Promise<ContainerPool> {
     if (opts.size < 1) throw new Error('pool size must be >= 1')
+    if (!/^[a-f0-9]{64}$/u.test(opts.resourceOwner)) {
+      throw new Error('container pool resourceOwner must be a 64-character lowercase sha256')
+    }
     if (opts.network !== undefined) assertDockerNetworkName(opts.network)
     const onProgress = opts.onProgress ?? (() => {})
     onProgress(`provisioning container pool size=${opts.size} image=${opts.image} (parallel)`)
 
     const slotIndices = Array.from({ length: opts.size }, (_, i) => i)
-    const slots = await Promise.all(
+    const results = await Promise.allSettled(
       slotIndices.map((i) => provisionSlot(opts, i, onProgress)),
     )
+    const slots = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+    const failures = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : [])
+    if (failures.length > 0) {
+      const cleanup = await Promise.allSettled(
+        slots.map((slot) => destroySlot(opts, slot.containerId)),
+      )
+      const cleanupFailures = cleanup.flatMap((result) => result.status === 'rejected' ? [result.reason] : [])
+      if (failures.length === 1 && cleanupFailures.length === 0) throw failures[0]
+      const detail = [...failures, ...cleanupFailures]
+        .map((failure) => failure instanceof Error ? failure.message : String(failure))
+        .join('; ')
+      throw new AggregateError(
+        [...failures, ...cleanupFailures],
+        `container-pool: ${failures.length}/${opts.size} slots failed to provision; ` +
+          `${slots.length - cleanupFailures.length}/${slots.length} successful slots were removed — ${detail}`,
+      )
+    }
     return new ContainerPool(slots, opts)
   }
 
@@ -268,8 +304,10 @@ export class ContainerPool {
    * — the same containers that will serve traffic, so a passing preflight is
    * evidence about production and not about a throwaway probe container.
    */
-  liveContainerIds(): string[] {
-    return this.slots.filter((s) => !s.dead).map((s) => s.containerId)
+  liveContainerIds(): Array<{ slotIndex: number; containerId: string }> {
+    return this.slots
+      .filter((slot) => !slot.dead && !slot.recovering)
+      .map((slot) => ({ slotIndex: slot.index, containerId: slot.containerId }))
   }
 
   snapshot(): {
@@ -278,6 +316,7 @@ export class ContainerPool {
     queued: number
     max_queue: number
     dead: number
+    recovering: number
     acquires: number
     queue_full_rejects: number
     acquire_timeouts: number
@@ -294,22 +333,24 @@ export class ContainerPool {
       queued: this.waiters.length,
       max_queue: this.maxQueueDepth,
       dead: this.slots.filter((s) => s.dead).length,
+      recovering: this.slots.filter((s) => s.recovering).length,
       ...this.counters,
     }
   }
 
-  async acquire(sessionId?: string): Promise<AcquiredSlot> {
+  async acquire(sessionId?: string, signal?: AbortSignal): Promise<AcquiredSlot> {
     if (this.destroyed) throw new Error('container pool destroyed')
     this.counters.acquires += 1
+    throwIfExecutorAborted(signal)
 
     // Sticky preference: prefer a free, non-dead slot that last served
     // this session.
     if (sessionId) {
-      const sticky = this.slots.find((s) => !s.busy && !s.dead && s.lastSession === sessionId)
-      if (sticky) return await this.handOut(sticky, sessionId)
+      const sticky = this.slots.find((s) => !s.busy && !s.dead && !s.recovering && s.lastSession === sessionId)
+      if (sticky) return await this.handOut(sticky, sessionId, signal)
     }
-    const free = this.slots.find((s) => !s.busy && !s.dead)
-    if (free) return await this.handOut(free, sessionId)
+    const free = this.slots.find((s) => !s.busy && !s.dead && !s.recovering)
+    if (free) return await this.handOut(free, sessionId, signal)
 
     // All slots busy or dead — count alive slots so we don't queue
     // against a permanently-dead pool.
@@ -331,11 +372,13 @@ export class ContainerPool {
     }
 
     return new Promise<AcquiredSlot>((resolve, reject) => {
+      let waiter: Waiter
       const timer = setTimeout(() => {
-        const idx = this.waiters.findIndex((w) => w.timer === timer)
+        if (waiter.state === 'settled') return
+        const idx = this.waiters.indexOf(waiter)
         if (idx >= 0) this.waiters.splice(idx, 1)
         this.counters.acquire_timeouts += 1
-        reject(
+        this.rejectWaiter(waiter,
           new Error(
             `container-pool: acquire timeout after ${this.acquireDeadlineMs}ms ` +
               `(in_flight=${this.slots.filter((s) => s.busy).length}/${aliveCount}, ` +
@@ -343,29 +386,41 @@ export class ContainerPool {
           ),
         )
       }, this.acquireDeadlineMs).unref()
-      this.waiters.push({
+      waiter = {
         sessionId,
-        resolve: (slot) => {
-          clearTimeout(timer)
-          resolve(this.markAcquired(slot, sessionId))
-        },
+        signal,
+        resolve,
         reject,
         timer,
-      })
+        state: 'queued',
+      }
+      const onAbort = (): void => {
+        if (waiter.state === 'settled') return
+        if (waiter.state === 'queued') {
+          const idx = this.waiters.indexOf(waiter)
+          if (idx >= 0) this.waiters.splice(idx, 1)
+        }
+        this.rejectWaiter(waiter, new ExecutorAbortedError(signal?.reason))
+      }
+      waiter.onAbort = onAbort
+      this.activeWaiters.add(waiter)
+      this.waiters.push(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
     })
   }
 
   async destroy(): Promise<void> {
     this.destroyed = true
-    for (const w of this.waiters) {
-      clearTimeout(w.timer)
-      w.reject(new Error('container pool destroyed'))
+    for (const waiter of this.activeWaiters) {
+      this.rejectWaiter(waiter, new Error('container pool destroyed'))
     }
     this.waiters.length = 0
     for (const s of this.slots) {
       if (s.holdTimer) clearTimeout(s.holdTimer)
+      if (s.recoveryTimer) clearTimeout(s.recoveryTimer)
     }
-    await Promise.all(this.slots.map((s) => destroySlot(s.containerId)))
+    await Promise.all(this.slots.map((s) => destroySlot(this.opts, s.containerId)))
   }
 
   /**
@@ -384,7 +439,8 @@ export class ContainerPool {
     // watchdog; recycling underneath an in-flight exec would swap the
     // container id out from under it.
     if (slot.busy) return
-    await this.recycleSlot(slot)
+    const error = await this.recycleSlot(slot)
+    if (error) throw error
   }
 
   /**
@@ -399,7 +455,8 @@ export class ContainerPool {
     const slot = this.slots.find((s) => s.containerId === containerId)
     if (!slot || this.destroyed) return
     this.counters.slot_liveness_recoveries += 1
-    await this.recycleSlot(slot)
+    const error = await this.recycleSlot(slot)
+    if (error) throw error
   }
 
   /**
@@ -407,12 +464,18 @@ export class ContainerPool {
    * Reservation happens BEFORE the async liveness probe so two concurrent
    * acquires cannot both be handed the same slot while one is verifying.
    */
-  private async handOut(slot: SlotState, sessionId: string | undefined): Promise<AcquiredSlot> {
+  private async handOut(
+    slot: SlotState,
+    sessionId: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<AcquiredSlot> {
     slot.busy = true
     try {
       await this.ensureSlotUsable(slot)
+      throwIfExecutorAborted(signal)
     } catch (err) {
-      slot.busy = false
+      if (!slot.dead && !slot.recovering) slot.busy = false
+      if (!slot.recovering) this.serveWaiterWith(slot)
       throw err
     }
     slot.busy = false
@@ -464,6 +527,7 @@ export class ContainerPool {
     // holders. The reservation is held across the whole rebuild.
     const error = await this.reprovisionSlot(slot)
     if (error) {
+      this.quarantineSlot(slot)
       throw new Error(
         `container-pool: slot ${slot.index} ${reason} and could not be recreated — ${error.message}. ` +
           `Verify the Docker daemon is up and image ${this.opts.image} still exists ` +
@@ -497,6 +561,7 @@ export class ContainerPool {
       )
       const error = await this.reprovisionSlot(slot)
       if (error) {
+        this.quarantineSlot(slot)
         throw new Error(
           `container-pool: slot ${slot.index} restarted, its afterCreate setup could not be re-applied ` +
             `(${cause}), and the container could not be replaced either — ${error.message}. Refusing to hand ` +
@@ -550,30 +615,39 @@ export class ContainerPool {
    * can take it while it is being verified or rebuilt.
    */
   private serveWaiterWith(slot: SlotState): void {
-    if (this.destroyed || slot.dead || slot.busy) return
+    if (this.destroyed || slot.dead || slot.busy || slot.recovering) return
     const waiter = this.takeWaiterFor(slot)
     if (!waiter) return
     slot.busy = true
     void this.ensureSlotUsable(slot).then(
       () => {
         slot.busy = false
-        if (waiter.sessionId) slot.lastSession = waiter.sessionId
-        // `waiter.resolve` runs markAcquired, which reserves the slot and bumps
-        // the generation the waiter's own release() is bound to.
-        waiter.resolve(slot)
+        // A waiter can time out while this asynchronous slot check is still in
+        // progress. Never hand a late result to a promise that already rejected.
+        if (waiter.state !== 'checking') {
+          this.serveWaiterWith(slot)
+          return
+        }
+        this.resolveWaiter(waiter, slot)
       },
       (err: Error) => {
-        slot.busy = false
+        if (!slot.dead && !slot.recovering) slot.busy = false
+        if (waiter.state !== 'checking') {
+          if (!slot.recovering) this.serveWaiterWith(slot)
+          return
+        }
         // This slot could not be made usable. Another alive slot may still
         // serve the waiter; only when none exists does the waiter learn why.
-        const alternative = this.slots.find((s) => s !== slot && !s.busy && !s.dead)
+        const alternative = this.slots.find(
+          (s) => s !== slot && !s.busy && !s.dead && !s.recovering,
+        )
         if (alternative) {
+          waiter.state = 'queued'
           this.waiters.unshift(waiter)
           this.serveWaiterWith(alternative)
           return
         }
-        clearTimeout(waiter.timer)
-        waiter.reject(err)
+        this.rejectWaiter(waiter, err)
       },
     )
   }
@@ -582,7 +656,27 @@ export class ContainerPool {
   private takeWaiterFor(slot: SlotState): Waiter | undefined {
     if (this.waiters.length === 0) return undefined
     const stickyIdx = this.waiters.findIndex((w) => w.sessionId && w.sessionId === slot.lastSession)
-    return this.waiters.splice(stickyIdx >= 0 ? stickyIdx : 0, 1)[0]
+    const waiter = this.waiters.splice(stickyIdx >= 0 ? stickyIdx : 0, 1)[0]
+    if (waiter) waiter.state = 'checking'
+    return waiter
+  }
+
+  private resolveWaiter(waiter: Waiter, slot: SlotState): void {
+    if (waiter.state !== 'checking') return
+    waiter.state = 'settled'
+    clearTimeout(waiter.timer)
+    if (waiter.onAbort) waiter.signal?.removeEventListener('abort', waiter.onAbort)
+    this.activeWaiters.delete(waiter)
+    waiter.resolve(this.markAcquired(slot, waiter.sessionId))
+  }
+
+  private rejectWaiter(waiter: Waiter, error: Error): void {
+    if (waiter.state === 'settled') return
+    waiter.state = 'settled'
+    clearTimeout(waiter.timer)
+    if (waiter.onAbort) waiter.signal?.removeEventListener('abort', waiter.onAbort)
+    this.activeWaiters.delete(waiter)
+    waiter.reject(error)
   }
 
   /**
@@ -595,13 +689,23 @@ export class ContainerPool {
    * so acquires stop being routed to a busted image or daemon.
    */
   private async recycleSlot(slot: SlotState): Promise<Error | null> {
-    const error = await this.reprovisionSlot(slot)
-    slot.busy = false
+    let error: Error | null
+    try {
+      error = await this.reprovisionSlot(slot)
+    } catch (cause) {
+      error = cause instanceof Error ? cause : new Error(String(cause))
+    }
     if (!error) {
+      slot.busy = false
+      slot.recovering = false
       // Wake a waiter if any.
-      if (this.waiters.length > 0) this.releaseSlot(slot)
+      if (this.waiters.length > 0) this.serveWaiterWith(slot)
       return null
     }
+    // A single daemon hiccup must not permanently shrink the pool. The slot is
+    // kept unroutable and retried with bounded backoff; only the configured
+    // consecutive-failure threshold marks it dead.
+    this.quarantineSlot(slot)
     // Wake any waiter that still has work to do; they'll be routed to another
     // alive slot, through the same liveness gate as every other handoff. The
     // handoff must NOT pre-acquire the slot — `waiter.resolve` runs markAcquired
@@ -609,16 +713,64 @@ export class ContainerPool {
     // waiter's own release() a no-op, leaking the slot as busy until the hold
     // watchdog fired.
     if (this.waiters.length > 0) {
-      const free = this.slots.find((s) => !s.busy && !s.dead)
+      const free = this.slots.find((s) => !s.busy && !s.dead && !s.recovering)
       if (free) {
         this.serveWaiterWith(free)
-      } else {
+      } else if (this.slots.every((s) => s.dead)) {
         const w = this.waiters.shift()!
-        clearTimeout(w.timer)
-        w.reject(new Error(`container-pool: no alive slots after recycle (${error.message})`))
+        this.rejectWaiter(w, new Error(`container-pool: no alive slots after recycle (${error.message})`))
       }
     }
     return error
+  }
+
+  private quarantineSlot(slot: SlotState): void {
+    if (slot.dead || this.destroyed) return
+    slot.busy = false
+    slot.recovering = true
+    if (slot.recoveryTimer) return
+    const exponent = Math.max(0, slot.consecutiveFailures - 1)
+    const delay = Math.min(this.reprovisionBackoffMs * (2 ** exponent), 5_000)
+    slot.recoveryTimer = setTimeout(() => {
+      slot.recoveryTimer = null
+      void this.retryRecoveringSlot(slot)
+    }, delay).unref()
+  }
+
+  private async retryRecoveringSlot(slot: SlotState): Promise<void> {
+    if (this.destroyed || slot.dead || !slot.recovering) return
+    slot.busy = true
+    const error = await this.reprovisionSlot(slot).catch((cause) =>
+      cause instanceof Error ? cause : new Error(String(cause)))
+    slot.busy = false
+    if (!error) {
+      slot.recovering = false
+      this.serveWaiterWith(slot)
+      return
+    }
+    if (slot.dead) {
+      slot.recovering = false
+      const free = this.slots.find((candidate) => !candidate.busy && !candidate.dead && !candidate.recovering)
+      if (free) this.serveWaiterWith(free)
+      if (this.slots.every((candidate) => candidate.dead)) {
+        for (const waiter of [...this.waiters]) {
+          this.rejectWaiter(waiter, new Error(`container-pool: all slots dead (${error.message})`))
+        }
+        this.waiters.length = 0
+      }
+      return
+    }
+    this.quarantineSlot(slot)
+  }
+
+  private markSlotDead(slot: SlotState): void {
+    if (slot.dead) return
+    slot.dead = true
+    slot.busy = false
+    slot.recovering = false
+    if (slot.recoveryTimer) clearTimeout(slot.recoveryTimer)
+    slot.recoveryTimer = null
+    this.counters.slots_marked_dead += 1
   }
 
   /**
@@ -630,8 +782,8 @@ export class ContainerPool {
   private async reprovisionSlot(slot: SlotState): Promise<Error | null> {
     if (slot.holdTimer) { clearTimeout(slot.holdTimer); slot.holdTimer = null }
     this.counters.slot_reprovisions += 1
-    await destroySlot(slot.containerId)
     try {
+      await destroySlot(this.opts, slot.containerId)
       const reborn = await provisionSlot(this.opts, slot.index, this.opts.onProgress ?? (() => {}))
       slot.containerId = reborn.containerId
       // The new container has its own start, and `provisionSlot` already armed
@@ -642,6 +794,8 @@ export class ContainerPool {
       slot.lastSession = null
       slot.generation += 1
       slot.consecutiveFailures = 0
+      slot.dead = false
+      slot.recovering = false
       slot.lastVerifiedAt = Date.now()
       return null
     } catch (err) {
@@ -653,8 +807,7 @@ export class ContainerPool {
       // stamp left over from a container that no longer exists.
       slot.armedStart = ''
       if (slot.consecutiveFailures >= this.maxConsecutiveFailures) {
-        slot.dead = true
-        this.counters.slots_marked_dead += 1
+        this.markSlotDead(slot)
       }
       return error
     }
@@ -667,13 +820,21 @@ async function provisionSlot(
   onProgress: (m: string) => void,
 ): Promise<SlotState> {
   const name = `${opts.namePrefix}-${index}`
+  const cli = opts.cli ?? dockerCli
   // Tear down any stale container with the same name (idempotent).
-  await execFileAsync('docker', ['rm', '-f', name]).catch(() => {})
+  await removeOwnedDockerResource(cli, 'container', name, opts.resourceOwner)
+
+  if (opts.oauthMode === 'per-slot') {
+    if (!opts.perSlotVolumes || opts.perSlotVolumes.length === 0) {
+      throw new Error('per-slot oauthMode requires at least one perSlotVolumes entry')
+    }
+    await Promise.all(opts.perSlotVolumes.map(async ({ volumePrefix }) =>
+      await ensureOwnedDockerVolume(cli, `${volumePrefix}-${index}`, opts.resourceOwner)))
+  }
 
   const args = buildContainerRunArgs(opts, index, name)
 
   onProgress(`[slot ${index}] docker run ${name}`)
-  const cli = opts.cli ?? dockerCli
   const r = await cli(args, { timeoutMs: 120_000 })
   const containerId = r.stdout.trim()
   if (r.code !== 0 || !containerId) {
@@ -694,23 +855,32 @@ async function provisionSlot(
   // the only moment a slot has unrestricted egress, and the only thing running
   // in it is the idle `tail -f /dev/null` entrypoint.
   let armedStart = ''
-  if (opts.afterCreate) {
-    try {
+  try {
+    if (opts.afterCreate) {
       armedStart = await armContainerStart(opts, containerId, index, cli)
-    } catch (error) {
-      await cli(['rm', '-f', containerId], { timeoutMs: 30_000 })
-      throw error instanceof Error
-        ? new Error(`container-pool: slot ${index} was destroyed unused — ${error.message}`, { cause: error })
-        : error
     }
+    await normalizeContainerHome(opts, containerId, cli)
+  } catch (error) {
+    try {
+      await removeOwnedDockerResource(cli, 'container', containerId, opts.resourceOwner)
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `container-pool: slot ${index} setup failed and its unused container could not be removed`,
+      )
+    }
+    throw error instanceof Error
+      ? new Error(`container-pool: slot ${index} was destroyed unused — ${error.message}`, { cause: error })
+      : error
   }
-  await normalizeContainerHome(opts, containerId, cli)
   onProgress(`[slot ${index}] ready @ ${containerId.slice(0, 12)}`)
   return {
     containerId,
     index,
     busy: false,
     dead: false,
+    recovering: false,
+    recoveryTimer: null,
     lastSession: null,
     holdTimer: null,
     generation: 0,
@@ -868,6 +1038,7 @@ export function buildContainerRunArgs(
   const args = [
     'run', '-d',
     '--name', name,
+    ...dockerOwnerLabels(opts.resourceOwner, 'pool-slot'),
     '--restart', restartPolicyFor(opts),
     '--memory', memory, '--memory-swap', memory,
     '--cpus', cpus,
@@ -941,7 +1112,7 @@ function isSafeWorkspaceBindPath(path: string): boolean {
   return path.startsWith('/') && path !== '/' && !path.includes(',')
 }
 
-async function destroySlot(containerId: string): Promise<void> {
+async function destroySlot(opts: ContainerPoolOptions, containerId: string): Promise<void> {
   if (!containerId) return
-  await execFileAsync('docker', ['rm', '-f', containerId]).catch(() => {})
+  await removeOwnedDockerResource(opts.cli ?? dockerCli, 'container', containerId, opts.resourceOwner)
 }

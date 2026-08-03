@@ -10,11 +10,28 @@
  * full chat() loop without spawning anything.
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { spawn, spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { Readable, PassThrough } from 'node:stream'
 import { describe, expect, it } from 'vitest'
+
+const TEST_RESOURCE_OWNER = '0'.repeat(64)
+
+function ownershipInspect(
+  args: string[],
+  exists: (name: string) => boolean,
+): { code: number; stdout: string; stderr: string } | null {
+  if (args[0] !== 'container' || args[1] !== 'inspect') return null
+  const name = args[args.length - 1]!
+  return exists(name)
+    ? { code: 0, stdout: `${TEST_RESOURCE_OWNER}\n`, stderr: '' }
+    : { code: 1, stdout: '', stderr: `Error: No such container: ${name}` }
+}
+import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { BackendError, type ChatDelta } from '../src/backends/types.js'
 import { CodexBackend } from '../src/backends/codex.js'
@@ -27,6 +44,7 @@ import type { DockerCli } from '../src/executors/docker-cli.js'
 import { assertDockerWorkspaceCwd, buildDockerExecArgs, createDockerSpawner } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
 import { killTree } from '../src/executors/process-tree.js'
+import { grantTemporaryTreeToUid } from '../src/executors/private-path-access.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
 import { writeStdinPayload } from '../src/backends/stdin-payload.js'
@@ -102,9 +120,9 @@ describe('hostSpawner', () => {
   })
 
   it('passes only the materializer-owned Gemini activation into a real host child', async () => {
-    const result = await hostSpawner(process.execPath, [
-      '-e',
-      'process.stdout.write(JSON.stringify({ system: process.env.GEMINI_SYSTEM_MD, timeout: process.env.GEMINI_TIMEOUT_MS ?? null }))',
+    const result = await hostSpawner('python3', [
+      '-c',
+      'import json,os,sys; sys.stdout.write(json.dumps({"system": os.environ.get("GEMINI_SYSTEM_MD"), "timeout": os.environ.get("GEMINI_TIMEOUT_MS")}))',
     ], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
@@ -123,6 +141,30 @@ describe('hostSpawner', () => {
     expect(JSON.parse(stdout)).toEqual({ system: '1', timeout: null })
     result.release()
   })
+
+  it('passes an exact Pi environment through the host executor without ambient additions', async () => {
+    const result = await hostSpawner('python3', [
+      '-c',
+      'import json, os; print(json.dumps({"selected": os.environ.get("DEEPSEEK_API_KEY"), "ambient": os.environ.get("OPENAI_API_KEY")}))',
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      exactEnv: true,
+      env: {
+        PATH: process.env.PATH ?? '/usr/bin:/bin',
+        DEEPSEEK_API_KEY: 'selected-provider-canary',
+        OPENAI_API_KEY: undefined,
+      },
+    })
+    let stdout = ''
+    result.child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8') })
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      result.child.once('error', reject)
+      result.child.once('close', resolve)
+    })
+    expect(exitCode).toBe(0)
+    expect(JSON.parse(stdout)).toEqual({ selected: 'selected-provider-canary', ambient: null })
+    result.release()
+  })
 })
 
 // ─── killTree process-group teardown ─────────────────────────────────────
@@ -135,18 +177,31 @@ describe('hostSpawner', () => {
  * and were reparented to init. Tests pin the contract.
  */
 describe('killTree', () => {
+  it('hard-stops a child that ignores SIGTERM and waits for exit proof', async () => {
+    const result = await hostSpawner('python3', ['-c', 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print("ready", flush=True); time.sleep(30)'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('stubborn child did not start')), 2_000)
+      result.child.stdout?.once('data', () => { clearTimeout(timer); resolve() })
+    })
+    await result.terminate?.()
+    expect(result.child.exitCode !== null || result.child.signalCode !== null).toBe(true)
+    result.release()
+  })
+
   it('kills the entire process group, including grandchildren', async () => {
     // hostSpawner uses detached:true, so the spawned node becomes a
     // pgrp leader. Its child (default attached) inherits that pgid.
     // Signaling -pgid reaches both. Print grandchild pid to stdout so
     // the test can verify it died after killTree returns.
-    const parent = await hostSpawner('node', [
-      '-e',
+    const parent = await hostSpawner('python3', [
+      '-c',
       [
-        'const { spawn } = require("node:child_process");',
-        'const g = spawn("node", ["-e", "setInterval(() => {}, 100)"]);',
-        'process.stdout.write(String(g.pid) + "\\n");',
-        'setInterval(() => {}, 100);',
+        'import subprocess,sys,time;',
+        'g = subprocess.Popen(["python3", "-c", "import time; time.sleep(30)"]);',
+        'print(g.pid, flush=True);',
+        'time.sleep(30);',
       ].join(''),
     ], { stdio: ['ignore', 'pipe', 'pipe'] })
     try {
@@ -180,6 +235,78 @@ describe('killTree', () => {
     } finally {
       parent.release()
     }
+  })
+
+  it('kills descendants after the process-group leader has already exited', async () => {
+    const parent = spawn('python3', [
+      '-c',
+      [
+        'import subprocess,sys;',
+        'g = subprocess.Popen(["python3", "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL);',
+        'print(g.pid, flush=True);',
+      ].join(''),
+    ], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    let grandchildPid = 0
+    try {
+      grandchildPid = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('detached leader fixture did not report its child')), 2_000)
+        parent.stdout?.once('data', chunk => {
+          clearTimeout(timer)
+          resolve(Number(chunk.toString().trim()))
+        })
+      })
+      if (parent.exitCode === null && parent.signalCode === null) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('process-group leader did not exit')), 2_000)
+          parent.once('exit', () => { clearTimeout(timer); resolve() })
+        })
+      }
+      expect(parent.exitCode).toBe(0)
+      expect(processExists(grandchildPid)).toBe(true)
+
+      await killTree(parent, { gracefulMs: 50 })
+      const deadline = Date.now() + 2_000
+      while (processExists(grandchildPid) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(processExists(grandchildPid)).toBe(false)
+    } finally {
+      if (grandchildPid > 0 && processExists(grandchildPid)) {
+        try { process.kill(grandchildPid, 'SIGKILL') } catch { /* already gone */ }
+      }
+    }
+  })
+
+  it('keeps host capacity occupied until descendants are gone', () => {
+    const tsx = join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs')
+    const hostUrl = pathToFileURL(join(process.cwd(), 'src', 'executors', 'host.ts')).href
+    const source = [
+      `import { once } from 'node:events'`,
+      `import { hostSpawner } from ${JSON.stringify(hostUrl)}`,
+      `void (async () => {`,
+      `const first = await hostSpawner('python3', ['-c', 'import subprocess; g=subprocess.Popen(["python3", "-c", "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); os.write(1,bytes([82])); time.sleep(30)"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL); g.stdout.read(1)'], { stdio: ['ignore', 'pipe', 'pipe'] })`,
+      `if (first.child.exitCode === null) await once(first.child, 'exit')`,
+      `const started = Date.now()`,
+      `const second = await hostSpawner('/bin/true', [], { stdio: ['ignore', 'pipe', 'pipe'] })`,
+      `const elapsed = Date.now() - started`,
+      `await second.terminate()`,
+      `second.release()`,
+      `first.release()`,
+      `process.stdout.write(String(elapsed))`,
+      `})().catch(error => { console.error(error); process.exitCode = 1 })`,
+    ].join(';')
+    const result = spawnSync(process.execPath, [tsx, '-e', source], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        BRIDGE_HOST_MAX_CONCURRENCY: '1',
+        BRIDGE_HOST_ACQUIRE_DEADLINE_MS: '8000',
+      },
+    })
+    expect(result.status, result.stderr).toBe(0)
+    expect(Number(result.stdout)).toBeGreaterThanOrEqual(1_800)
   })
 
   it('is idempotent — calling twice does not throw', async () => {
@@ -358,6 +485,61 @@ describe('buildDockerExecArgs', () => {
     expect(flat).not.toContain('-e HOME=')
   })
 
+  it('replaces the container environment for exact child launches', () => {
+    const args = buildDockerExecArgs('cid', 'pi', ['--mode', 'rpc'], {
+      exactEnv: true,
+      env: { HOME: '/work/home', PATH: '/usr/bin', DEEPSEEK_API_KEY: 'selected' },
+    })
+    expect(args).toEqual([
+      'exec', '-i', 'cid', 'env', '-i',
+      'HOME=/work/home', 'PATH=/usr/bin', 'DEEPSEEK_API_KEY=selected',
+      'pi', '--mode', 'rpc',
+    ])
+  })
+
+  it('uses the container PATH for an exact environment', () => {
+    const args = buildDockerExecArgs('cid', 'pi', [], {
+      exactEnv: true,
+      env: { PATH: '/host/only/bin', DEEPSEEK_API_KEY: 'selected' },
+    }, '', '/usr/local/sbin:/usr/local/bin:/usr/bin:/bin')
+    expect(args).toContain('PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin')
+    expect(args).not.toContain('PATH=/host/only/bin')
+  })
+
+  it('uses the container HOME for an exact environment', () => {
+    const args = buildDockerExecArgs('cid', 'pi', [], {
+      exactEnv: true,
+      env: { HOME: '/home/drew', PATH: '/host/only/bin' },
+    }, '', '/usr/local/bin:/usr/bin:/bin', '/home/node')
+    expect(args).toContain('HOME=/home/node')
+    expect(args).not.toContain('HOME=/home/drew')
+  })
+
+  it('maps explicit Pi and XDG paths but rejects an unmounted host path', () => {
+    const mapPath = (value: string): string => {
+      if (value === '/host/pi') return '/root/.pi/agent'
+      if (value.startsWith('/host/pi/')) return `/root/.pi/agent${value.slice('/host/pi'.length)}`
+      if (value === '/host/work') return '/host/work'
+      throw new Error(`unmapped host path: ${value}`)
+    }
+    const args = buildDockerExecArgs('cid', 'pi', [], {
+      exactEnv: true,
+      env: {
+        HOME: '/host/home',
+        PATH: '/host/bin',
+        PI_CODING_AGENT_DIR: '/host/pi',
+        XDG_CONFIG_HOME: '/host/pi/config',
+      },
+    }, '', '/usr/bin:/bin', '/root', mapPath)
+    expect(args).toContain('PI_CODING_AGENT_DIR=/root/.pi/agent')
+    expect(args).toContain('XDG_CONFIG_HOME=/root/.pi/agent/config')
+    expect(args).not.toContain('PI_CODING_AGENT_DIR=/host/pi')
+    expect(() => buildDockerExecArgs('cid', 'pi', [], {
+      exactEnv: true,
+      env: { PI_PACKAGE_DIR: '/host/not-mounted' },
+    }, '', '/usr/bin:/bin', '/root', mapPath)).toThrow(/unmapped host path/u)
+  })
+
   it('respects binPrefix when specified', () => {
     const args = buildDockerExecArgs('cid', 'claude', ['-p', 'x'], {}, '/usr/local/bin/')
     expect(args).toContain('/usr/local/bin/claude')
@@ -365,6 +547,37 @@ describe('buildDockerExecArgs', () => {
 })
 
 describe('Docker cancellation ownership', () => {
+  it('restarts the exclusive slot after a clean docker-exec exit', async () => {
+    const stdout = new PassThrough()
+    const child = makeFakeChild(stdout, new PassThrough(), () => {})
+    let restartCalls = 0
+    let releases = 0
+    const pool = {
+      acquire: async () => ({
+        containerId: 'clean-exit-container',
+        slotIndex: 0,
+        release: () => { releases += 1 },
+      }),
+    } as unknown as ContainerPool
+    const spawner = createDockerSpawner({
+      pool,
+      spawnProcess: (() => child) as unknown as typeof import('node:child_process').spawn,
+      restartContainer: async () => { restartCalls += 1 },
+    })
+
+    const spawned = await spawner('opencode', ['run'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    const closed = new Promise<void>(resolve => child.once('close', () => resolve()))
+    stdout.resume()
+    stdout.end()
+    await closed
+    await spawned.terminate?.()
+    spawned.release()
+
+    expect(child.exitCode).toBe(0)
+    expect(restartCalls).toBe(1)
+    expect(releases).toBe(1)
+  })
+
   it('does not return a slot until container restart has completed', async () => {
     const stdout = new PassThrough()
     const stderr = new PassThrough()
@@ -408,6 +621,155 @@ describe('Docker cancellation ownership', () => {
     expect(restartCalls).toBe(1)
     expect(slotReleases).toBe(1)
   })
+
+  it('quarantines capacity when both termination and container replacement fail', async () => {
+    const child = makeFakeChild(new PassThrough(), new PassThrough(), () => {})
+    let slotReleases = 0
+    let recycleAttempts = 0
+    const pool = {
+      acquire: async () => ({
+        containerId: 'unproved-container',
+        slotIndex: 0,
+        release: () => { slotReleases += 1 },
+      }),
+      recycleHeldSlot: async () => {
+        recycleAttempts += 1
+        throw new Error('replacement failed')
+      },
+    } as unknown as ContainerPool
+    const spawner = createDockerSpawner({
+      pool,
+      spawnProcess: (() => child) as unknown as typeof import('node:child_process').spawn,
+      restartContainer: async () => { throw new Error('restart failed') },
+      cli: async () => ({ code: 0, stdout: 'running\n', stderr: '' }),
+    })
+    const spawned = await spawner('opencode', ['run'], { stdio: ['pipe', 'pipe', 'pipe'] })
+
+    spawned.release()
+    const deadline = Date.now() + 1_000
+    while (recycleAttempts === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    expect(recycleAttempts).toBe(1)
+    expect(slotReleases).toBe(0)
+    await expect(spawned.terminate?.()).rejects.toThrow(/restart failed/)
+    expect(slotReleases).toBe(0)
+  })
+})
+
+describe('temporary container-user access', () => {
+  it.skipIf(
+    process.platform !== 'linux'
+      || !existsSync('/usr/bin/getfacl')
+      || !existsSync('/usr/bin/setfacl'),
+  )('restores an existing project ACL exactly and removes a generated directory', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-acl-restore-'))
+    const existing = join(root, '.gemini')
+    const existingConfig = join(existing, 'settings.json')
+    const created = join(root, '.factory')
+    const uid = (process.getuid?.() ?? 1_000) + 10_000
+    const acl = (path: string): string => {
+      const result = spawnSync('getfacl', ['-R', '--absolute-names', '--numeric', '--', path], { encoding: 'utf8' })
+      if (result.status !== 0) throw new Error(result.stderr)
+      return result.stdout
+    }
+    try {
+      mkdirSync(existing, { mode: 0o700 })
+      writeFileSync(existingConfig, '{"keep":true}\n', { mode: 0o600 })
+      const before = acl(existing)
+      const existingAccess = await grantTemporaryTreeToUid(existing, uid)
+      expect(acl(existing)).toContain(`user:${uid}:rw`)
+      const createdDuringRun = join(existing, 'created-during-run.json')
+      writeFileSync(createdDuringRun, '{}', { mode: 0o600 })
+      expect(acl(createdDuringRun)).not.toContain(`user:${uid}:`)
+      await existingAccess.cleanup()
+      await existingAccess.cleanup()
+      // The child survives rollback and still carries no inherited access for
+      // the temporary container uid.
+      expect(existsSync(createdDuringRun)).toBe(true)
+      expect(acl(createdDuringRun)).not.toContain(`user:${uid}:`)
+      rmSync(createdDuringRun)
+      expect(acl(existing)).toBe(before)
+
+      const firstLease = await grantTemporaryTreeToUid(existing, uid)
+      let secondGranted = false
+      const secondLeasePromise = grantTemporaryTreeToUid(existing, uid).then(access => {
+        secondGranted = true
+        return access
+      })
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(secondGranted).toBe(false)
+      await firstLease.cleanup()
+      const secondLease = await secondLeasePromise
+      await secondLease.cleanup()
+      expect(acl(existing)).toBe(before)
+
+      const createdAccess = await grantTemporaryTreeToUid(created, uid)
+      writeFileSync(join(created, 'mcp.json'), '{}', { mode: 0o600 })
+      expect(acl(created)).toContain(`user:${uid}:rw`)
+      rmSync(join(created, 'mcp.json'))
+      await createdAccess.cleanup()
+      expect(existsSync(created)).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(
+    process.platform !== 'linux'
+      || !existsSync('/usr/bin/getfacl')
+      || !existsSync('/usr/bin/setfacl'),
+  )('releases ACL ownership after a failed restore so later requests are not blocked', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-acl-release-'))
+    const active = join(root, 'workspace')
+    const moved = join(root, 'workspace-before-replacement')
+    const uid = (process.getuid?.() ?? 1_000) + 10_000
+    try {
+      mkdirSync(active, { mode: 0o700 })
+      writeFileSync(join(active, 'settings.json'), '{}', { mode: 0o600 })
+      const first = await grantTemporaryTreeToUid(active, uid)
+      renameSync(active, moved)
+      mkdirSync(active, { mode: 0o700 })
+
+      await expect(first.cleanup()).rejects.toThrow(/replaced path/u)
+      const second = await grantTemporaryTreeToUid(active, uid)
+      await second.cleanup()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.skipIf(
+    process.platform !== 'linux'
+      || !existsSync('/usr/bin/getfacl')
+      || !existsSync('/usr/bin/setfacl'),
+  )('never steals a malformed cross-process ACL lock based only on its age', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-acl-malformed-'))
+    const runtime = join(root, 'runtime')
+    const workspace = join(root, 'workspace')
+    const uid = (process.getuid?.() ?? 1_000) + 10_000
+    const previousRuntime = process.env.XDG_RUNTIME_DIR
+    const previousTimeout = process.env.CLI_BRIDGE_ACL_LOCK_TIMEOUT_MS
+    try {
+      mkdirSync(runtime, { mode: 0o700 })
+      mkdirSync(workspace, { mode: 0o700 })
+      process.env.XDG_RUNTIME_DIR = runtime
+      process.env.CLI_BRIDGE_ACL_LOCK_TIMEOUT_MS = '40'
+      const registry = join(runtime, `cli-bridge-acl-locks-${process.getuid?.() ?? 0}`)
+      mkdirSync(registry, { mode: 0o700 })
+      const digest = createHash('sha256').update(realpathSync(workspace)).digest('hex')
+      const lockPath = join(registry, `${digest}.lock`)
+      writeFileSync(lockPath, '{incomplete', { mode: 0o600 })
+
+      await expect(grantTemporaryTreeToUid(workspace, uid)).rejects.toThrow(/timed out waiting/u)
+      expect(existsSync(lockPath)).toBe(true)
+      expect(require('node:fs').readFileSync(lockPath, 'utf8')).toBe('{incomplete')
+    } finally {
+      if (previousRuntime === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = previousRuntime
+      if (previousTimeout === undefined) delete process.env.CLI_BRIDGE_ACL_LOCK_TIMEOUT_MS
+      else process.env.CLI_BRIDGE_ACL_LOCK_TIMEOUT_MS = previousTimeout
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('Docker container run configuration', () => {
@@ -415,6 +777,7 @@ describe('Docker container run configuration', () => {
     size: 1,
     image: 'runtime:latest',
     namePrefix: 'test-pool',
+    resourceOwner: TEST_RESOURCE_OWNER,
     oauthMode: 'share' as const,
     shareMounts: ['/home/test/.claude:/root/.claude'],
   }
@@ -618,6 +981,8 @@ describe('ContainerPool afterCreate hook', () => {
   /** Records docker argv so the test can prove the container was destroyed. */
   const recordingCli = (calls: string[][]): DockerCli => async (args) => {
     calls.push(args)
+    const ownership = ownershipInspect(args, (name) => name === 'container-abc')
+    if (ownership) return ownership
     if (args[0] === 'run') return { code: 0, stdout: 'container-abc\n', stderr: '' }
     if (args[0] === 'inspect') return { code: 0, stdout: 'true 2026-08-01T00:00:00Z\n', stderr: '' }
     return { code: 0, stdout: '', stderr: '' }
@@ -628,7 +993,7 @@ describe('ContainerPool afterCreate hook', () => {
     // after the filter failed would serve requests with unrestricted egress —
     // the exact silent non-enforcement the jail exists to eliminate.
     const calls: string[][] = []
-    await expect(ContainerPool.create({
+    await expect(ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1,
       image: 'x:latest',
       namePrefix: 'p',
@@ -643,7 +1008,7 @@ describe('ContainerPool afterCreate hook', () => {
   it('runs the hook before anything execs in the container', async () => {
     const calls: string[][] = []
     const seen: string[] = []
-    const pool = await ContainerPool.create({
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1,
       image: 'x:latest',
       namePrefix: 'p',
@@ -657,7 +1022,9 @@ describe('ContainerPool afterCreate hook', () => {
     // which container start the hook's work belongs to, and it touches nothing.
     const armed = seen.indexOf('afterCreate')
     expect(armed).toBeGreaterThan(seen.indexOf('run'))
-    expect(seen.slice(0, armed).every((op) => op === 'run' || op === 'inspect')).toBe(true)
+    // `container inspect` is the ownership check before stale-name cleanup; it
+    // also reads Docker metadata and never executes inside the worker.
+    expect(seen.slice(0, armed).every((op) => ['container', 'run', 'inspect'].includes(op))).toBe(true)
     await pool.destroy()
   })
 })
@@ -684,9 +1051,17 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
 
   const fakeDocker = (daemon: FakeDaemon): DockerCli => {
     let runSeq = 0
+    const alive = new Set<string>()
     return async (args) => {
       daemon.calls.push(args)
-      if (args[0] === 'run') return { code: 0, stdout: `${daemon.runIds[runSeq++] ?? 'container-abc'}\n`, stderr: '' }
+      const ownership = ownershipInspect(args, (name) => alive.has(name))
+      if (ownership) return ownership
+      if (args[0] === 'run') {
+        const id = daemon.runIds[runSeq++] ?? 'container-abc'
+        alive.add(id)
+        return { code: 0, stdout: `${id}\n`, stderr: '' }
+      }
+      if (args[0] === 'rm') alive.delete(args[args.length - 1]!)
       if (args[0] === 'inspect') return { code: 0, stdout: `true ${daemon.startedAt}\n`, stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
     }
@@ -700,13 +1075,13 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
     // namespaces, and nothing in this process observes it happening. The pool
     // already models a dead slot correctly — `rm -f` then provision, which
     // re-runs the hook — so a hook means the slot opts out of revival.
-    const jailed = buildContainerRunArgs({
+    const jailed = buildContainerRunArgs({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
       afterCreate: async () => {},
     }, 0)
     expect(jailed[jailed.indexOf('--restart') + 1]).toBe('no')
 
-    const plain = buildContainerRunArgs({
+    const plain = buildContainerRunArgs({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
     }, 0)
     expect(plain[plain.indexOf('--restart') + 1]).toBe('on-failure:3')
@@ -715,7 +1090,7 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
   it('re-runs the hook before handing out a slot whose container has restarted', async () => {
     const daemon = newDaemon()
     const armedFor: string[] = []
-    const pool = await ContainerPool.create({
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1,
       image: 'x:latest',
       namePrefix: 'p',
@@ -750,7 +1125,7 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
   it('replaces the container rather than serving it when the re-arm fails', async () => {
     const daemon = newDaemon()
     let refuse = false
-    const pool = await ContainerPool.create({
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1,
       image: 'x:latest',
       namePrefix: 'p',
@@ -782,7 +1157,7 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
     const daemon = newDaemon(['c-first', 'c-second'])
     let armCount = 0
     let vanished = false
-    const pool = await ContainerPool.create({
+    const pool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1,
       image: 'x:latest',
       namePrefix: 'p',
@@ -790,6 +1165,8 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
       shareMounts: [],
       cli: async (args) => {
         daemon.calls.push(args)
+        const ownership = ownershipInspect(args, (name) => /^c-/u.test(name))
+        if (ownership) return ownership
         if (args[0] === 'run') return { code: 0, stdout: `${daemon.runIds.shift() ?? 'c-extra'}\n`, stderr: '' }
         if (args[0] === 'inspect') {
           // Once the first container has been swept, only the replacement
@@ -826,12 +1203,12 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
     // inside the cached window, so a 30-second cache is 30 seconds of serving a
     // restarted container with its previous incarnation's setup.
     const jailed = newDaemon()
-    const jailedPool = await ContainerPool.create({
+    const jailedPool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
       livenessTtlMs: 600_000, cli: fakeDocker(jailed), afterCreate: async () => {},
     })
     const plain = newDaemon()
-    const plainPool = await ContainerPool.create({
+    const plainPool = await ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1, image: 'x:latest', namePrefix: 'p', oauthMode: 'share', shareMounts: [],
       livenessTtlMs: 600_000, cli: fakeDocker(plain),
     })
@@ -857,7 +1234,7 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
     // Reading the start before AND after is what catches it.
     const daemon = newDaemon()
     let restarts = 0
-    await expect(ContainerPool.create({
+    await expect(ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 1,
       image: 'x:latest',
       namePrefix: 'p',
@@ -871,7 +1248,7 @@ describe('ContainerPool re-arms start-scoped setup across a container restart', 
 
 describe('ContainerPool.create rejects pool size < 1', async () => {
   it('throws on size 0', async () => {
-    await expect(ContainerPool.create({
+    await expect(ContainerPool.create({ resourceOwner: TEST_RESOURCE_OWNER,
       size: 0,
       image: 'x:latest',
       namePrefix: 'p',
@@ -1095,6 +1472,16 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     expect(config.executors.gemini!.kind).toBe('host')
     expect(config.executors.codex!.kind).toBe('host')
     expect(config.executors.opencode!.kind).toBe('host')
+    expect(config.backends).toEqual(new Set([
+      'claude',
+      'codex',
+      'opencode',
+      'kimi',
+      'gemini',
+      'pi',
+      'passthrough',
+    ]))
+    expect(config.backends.has('sandbox')).toBe(false)
   })
 
   it('BRIDGE_DEFAULT_EXECUTOR=docker flips every backend that has no override', () => {
@@ -1124,7 +1511,8 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     expect(c.poolSize).toBe(4)
     expect(c.containerConfigDir).toBe('/root/.claude')
     expect(c.hostConfigDir).toContain('/.claude')
-    expect(c.namePrefix).toBe('cli-bridge-claude-pool')
+    expect(c.namePrefix).toMatch(/^cli-bridge-claude-[a-f0-9]{12}-pool$/u)
+    expect(c.resourceOwner).toMatch(/^[a-f0-9]{64}$/u)
   })
 
   it('loads an explicit non-root Docker identity and HOME', () => {
@@ -1138,6 +1526,22 @@ describe('per-backend executor config (parseAllExecutors)', () => {
     const c = config.executors.claude!
     expect(c.containerUser).toBe('1000:1000')
     expect(c.containerHome).toBe('/tmp/claude-home')
+  })
+
+  it('maps a custom Pi agent directory into Docker instead of leaking the host path', () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'pi-docker-workspace-'))
+    try {
+      const config = loadConfig({
+        HOME: '/home/test',
+        PI_EXECUTOR: 'docker',
+        PI_CODING_AGENT_DIR: '/srv/pi-agent',
+        PI_DOCKER_WORKSPACE_ROOT: workspace,
+      })
+      expect(config.executors.pi!.hostConfigDir).toBe('/srv/pi-agent')
+      expect(config.executors.pi!.containerConfigDir).toBe('/root/.pi/agent')
+    } finally {
+      rmSync(workspace, { recursive: true, force: true })
+    }
   })
 
   it('loads a backend Docker network only in Docker mode', () => {
@@ -1290,6 +1694,154 @@ function subprocessBackendCases(spawner: Spawner) {
 }
 
 describe('Spawner injection works across all subprocess backends', () => {
+  it('maps every generated config path into the Docker-visible workspace before spawn', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-docker-config-paths-'))
+    const originalPiAdapter = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    const valueAfter = (args: string[] | null, flag: string): string | undefined => {
+      const index = args?.indexOf(flag) ?? -1
+      return index >= 0 ? args?.[index + 1] : undefined
+    }
+    const mappedStub = (lines: string[], cwd: string) => {
+      const stub = createStubSpawner(lines)
+      const prepared: Array<{ host: string; runtime: string; entries: string[] }> = []
+      const mapPath = (path: string): string => path.startsWith(`${cwd}/`)
+        ? `/executor${path.slice(cwd.length)}`
+        : `/executor-mount${path}`
+      const baseSpawner = stub.spawner
+      stub.spawner = async (bin, args, opts) => {
+        for (const item of prepared) {
+          if (existsSync(item.host)) item.entries = readdirSync(item.host, { recursive: true }).map(String).sort()
+        }
+        return await baseSpawner(bin, args, opts)
+      }
+      stub.spawner.resolveCwd = requested => requested ?? cwd
+      stub.spawner.mapPath = mapPath
+      stub.spawner.preparePrivatePath = async path => {
+        expect(existsSync(path)).toBe(true)
+        const runtime = mapPath(path)
+        prepared.push({
+          host: path,
+          runtime,
+          entries: readdirSync(path, { recursive: true }).map(String).sort(),
+        })
+        return runtime
+      }
+      stub.spawner.prepareWorkspacePath = async path => {
+        if (!existsSync(path)) mkdirSync(path)
+        const runtime = mapPath(path)
+        prepared.push({ host: path, runtime, entries: [] })
+        return { path: runtime, cleanup: async () => {} }
+      }
+      return { stub, prepared }
+    }
+    const request = (model: string, cwd: string) => ({
+      model,
+      cwd,
+      messages: [{ role: 'user' as const, content: 'work' }],
+      mcp: { mcpServers: { echo: { command: 'echo', args: ['ok'] } } },
+    })
+
+    try {
+      const claudeCwd = join(root, 'claude')
+      mkdirSync(claudeCwd)
+      const claude = mappedStub([
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 'claude-paths' }),
+        JSON.stringify({ type: 'result', subtype: 'success' }),
+      ], claudeCwd)
+      for await (const _ of new ClaudeBackend({ bin: 'claude', timeoutMs: 5_000, spawner: claude.stub.spawner }).chat(
+        request('claude/sonnet', claudeCwd), null, new AbortController().signal,
+      )) { /* drain */ }
+      expect(valueAfter(claude.stub.observedArgs, '--mcp-config')).toMatch(/^\/executor\//u)
+      expect(claude.prepared.some(item => item.entries.includes('mcp-config.json'))).toBe(true)
+
+      const opencodeCwd = join(root, 'opencode')
+      mkdirSync(opencodeCwd)
+      const opencode = mappedStub([
+        JSON.stringify({ type: 'message', text: 'ok' }),
+        JSON.stringify({ type: 'run.completed' }),
+      ], opencodeCwd)
+      for await (const _ of new OpencodeBackend({ bin: 'opencode', timeoutMs: 5_000, spawner: opencode.stub.spawner }).chat(
+        request('opencode/test/model', opencodeCwd), null, new AbortController().signal,
+      )) { /* drain */ }
+      expect(opencode.stub.observedOpts?.env?.OPENCODE_CONFIG).toMatch(/^\/executor\//u)
+      expect(opencode.prepared.some(item => item.entries.includes('opencode.json'))).toBe(true)
+
+      const kimiCwd = join(root, 'kimi')
+      mkdirSync(kimiCwd)
+      const kimi = mappedStub([
+        JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: 'ok' }] }),
+        JSON.stringify({ type: 'result' }),
+      ], kimiCwd)
+      for await (const _ of new KimiBackend({ bin: 'kimi', timeoutMs: 5_000, spawner: kimi.stub.spawner }).chat(
+        request('kimi-code/kimi-for-coding', kimiCwd), null, new AbortController().signal,
+      )) { /* drain */ }
+      expect(valueAfter(kimi.stub.observedArgs, '--mcp-config-file')).toMatch(/^\/executor\//u)
+      expect(kimi.prepared.some(item => item.entries.includes('mcp-config.json'))).toBe(true)
+
+      const codexCwd = join(root, 'codex')
+      mkdirSync(codexCwd)
+      const codex = mappedStub([
+        JSON.stringify({ type: 'thread.started', thread_id: 'codex-paths' }),
+        JSON.stringify({ type: 'turn.completed' }),
+      ], codexCwd)
+      for await (const _ of new CodexBackend({ bin: 'codex', timeoutMs: 5_000, spawner: codex.stub.spawner }).chat(
+        request('codex/default', codexCwd), null, new AbortController().signal,
+      )) { /* drain */ }
+      expect(codex.stub.observedOpts?.env?.CODEX_HOME).toMatch(/^\/executor\//u)
+      expect(codex.prepared.some(item => item.entries.includes('config.toml'))).toBe(true)
+
+      const geminiCwd = join(root, 'gemini')
+      mkdirSync(geminiCwd)
+      const gemini = mappedStub(['ok'], geminiCwd)
+      for await (const _ of new GeminiBackend({ bin: 'gemini', timeoutMs: 5_000, spawner: gemini.stub.spawner }).chat(
+        request('gemini/gemini-2.5-pro', geminiCwd), null, new AbortController().signal,
+      )) { /* drain */ }
+      expect(gemini.prepared).toEqual(expect.arrayContaining([
+        expect.objectContaining({ host: join(geminiCwd, '.gemini'), entries: expect.arrayContaining(['settings.json']) }),
+      ]))
+
+      const piCwd = join(root, 'pi')
+      mkdirSync(piCwd)
+      const pi = mappedStub([
+        JSON.stringify({ type: 'session', id: 'pi-paths' }),
+        JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } }),
+        JSON.stringify({ type: 'turn_end', message: { usage: { input: 1, output: 1 } } }),
+        JSON.stringify({ type: 'agent_end' }),
+      ], piCwd)
+      const piProfile = {
+        prompt: { systemPrompt: 'private profile instruction' },
+        resources: { skills: [{ kind: 'inline' as const, name: 'private-skill', content: 'private skill' }] },
+      }
+      for await (const _ of new PiBackend({ bin: 'pi', timeoutMs: 5_000, spawner: pi.stub.spawner }).chat(
+        {
+          ...request('pi/openai/gpt-5', piCwd),
+          interaction_policy: 'unattended-allow',
+          interaction_policy_receipt: {
+            schema: 'cli-bridge.interaction-policy.v1',
+            name: 'unattended-allow',
+            profileDigest: canonicalCandidateDigest(piProfile),
+          },
+          agent_profile: piProfile,
+        },
+        null,
+        new AbortController().signal,
+      )) { /* drain */ }
+      expect(valueAfter(pi.stub.observedArgs, '--mcp-config')).toMatch(/^\/executor\//u)
+      expect(valueAfter(pi.stub.observedArgs, '--system-prompt')).toMatch(/^\/executor\//u)
+      expect(valueAfter(pi.stub.observedArgs, '--skill')).toMatch(/^\/executor\//u)
+      const generatedExtensions = (pi.stub.observedArgs ?? [])
+        .flatMap((arg, index, args) => arg === '--extension' ? [args[index + 1]!] : [])
+        .filter(path => path.startsWith('/executor/'))
+      expect(generatedExtensions.length).toBeGreaterThan(0)
+      expect(pi.prepared.every(item => item.host.startsWith(`${piCwd}/`))).toBe(true)
+    } finally {
+      if (originalPiAdapter === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = originalPiAdapter
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('rejects an unsafe profile before materializing MCP secrets or spawning any backend', async () => {
     const root = mkdtempSync(join(tmpdir(), 'cli-bridge-pre-spawn-'))
     const originalTmpdir = process.env.TMPDIR
@@ -1356,15 +1908,20 @@ describe('Spawner injection works across all subprocess backends', () => {
             messages: [{ role: 'user', content: 'work' }],
             mcp: {
               mcpServers: {
-                secret: { command: 'node', env: { TOKEN: 'secret-witness' } },
+                server: { command: 'node', env: { SAFE_SETTING: 'witness' } },
               },
             },
           }, null, new AbortController().signal)) { /* drain */ }
         }).rejects.toThrow('backend spawn refused')
 
-        const residue = readdirSync(root, { recursive: true })
-          .map(String)
-          .filter((path) => path !== '.gemini' && path !== '.pi')
+        const entries = readdirSync(root, { recursive: true }).map(String)
+        const privateRegistry = entries.find(path => path.startsWith('cli-bridge-private-temp-registry-'))
+        if (privateRegistry) expect(readdirSync(join(root, privateRegistry))).toEqual([])
+        const residue = entries.filter(
+          path => path !== '.gemini'
+            && path !== '.pi'
+            && !path.startsWith('cli-bridge-private-temp-registry-'),
+        )
         expect(residue).toEqual([])
       }
       expect(spawnCalls).toBe(6)

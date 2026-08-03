@@ -17,6 +17,7 @@
  * right headers so Moonshot's backend accepts the call.
  */
 
+import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
@@ -24,14 +25,14 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { registerJailReadable } from '../jail/index.js'
-import { dirname } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, prepareSpawnerPrivatePath, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
 
@@ -59,8 +60,8 @@ export class OpencodeBackend implements Backend {
     return m === 'opencode' || m.startsWith('opencode/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
   async *chat(
@@ -93,7 +94,17 @@ export class OpencodeBackend implements Backend {
     const mcpMaterialized = materializeMcpServersForOpencode(
       resolveMcpServers(req, session),
       (resolveAgentProfile(req, session) as { permissions?: Record<string, unknown> } | null)?.permissions,
+      resolveOneShotInteractionPolicy(req, session),
+      this.spawner.preparePrivatePath ? cwd : undefined,
     )
+    let runtimeConfigPath = mcpMaterialized.configPath
+    try {
+      const runtimeRoot = await prepareSpawnerPrivatePath(this.spawner, dirname(mcpMaterialized.configPath))
+      runtimeConfigPath = join(runtimeRoot, basename(mcpMaterialized.configPath))
+    } catch (error) {
+      mcpMaterialized.cleanup()
+      throw error
+    }
     // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
     // expose its dir read-only so the confined opencode can still read it.
     if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
@@ -119,6 +130,7 @@ export class OpencodeBackend implements Backend {
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       spawned = await this.spawner(this.opts.bin, args, {
+        signal,
         stdio: ['pipe', 'pipe', 'pipe'],
         cwd,
         env: {
@@ -146,7 +158,7 @@ export class OpencodeBackend implements Backend {
           ...(process.env.OPENCODE_RUN_TIMEOUT_SECONDS
             ? { OPENCODE_RUN_TIMEOUT_SECONDS: process.env.OPENCODE_RUN_TIMEOUT_SECONDS }
             : {}),
-          ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
+          OPENCODE_CONFIG: runtimeConfigPath,
         },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
@@ -156,7 +168,6 @@ export class OpencodeBackend implements Backend {
       throw error
     }
     const child = spawned.child
-    const releaseSpawner = spawned.release
 
     // The spawner registers a synchronous 'error' listener to prevent
     // uncaught exceptions on spawn ENOENT/EACCES; we both attach our
@@ -293,9 +304,7 @@ export class OpencodeBackend implements Backend {
       // A terminal response and slot reuse both wait for executor-owned
       // termination. In Docker mode this includes the in-container process,
       // not merely the local attach client.
-      await terminateSpawned(spawned)
-      releaseSpawner()
-      mcpMaterialized?.cleanup()
+      await finalizeSpawned(spawned, [mcpMaterialized ? () => mcpMaterialized.cleanup() : null])
     }
   }
 
@@ -313,6 +322,35 @@ export class OpencodeBackend implements Backend {
     }
     return null
   }
+}
+
+function resolveOneShotInteractionPolicy(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): 'interactive' | 'unattended-deny' | 'unattended-allow' {
+  const policy = req.interaction_policy
+  if (policy === 'interactive') {
+    throw new BackendError(
+      'opencode one-shot mode cannot carry interactive responses; use a retained native session or an explicit unattended policy',
+      'capability_denied',
+    )
+  }
+  if (policy !== 'unattended-allow') return policy ?? 'unattended-deny'
+
+  const profile = resolveAgentProfile(req, session)
+  const receipt = req.interaction_policy_receipt
+  if (
+    !profile
+    || receipt?.schema !== 'cli-bridge.interaction-policy.v1'
+    || receipt.name !== 'unattended-allow'
+    || receipt.profileDigest !== canonicalCandidateDigest(profile)
+  ) {
+    throw new BackendError(
+      'unattended-allow requires a matching profile-scoped interaction-policy receipt',
+      'capability_denied',
+    )
+  }
+  return 'unattended-allow'
 }
 
 export function opencodeVariantForEffort(effort: ChatRequest['effort']): string | null {

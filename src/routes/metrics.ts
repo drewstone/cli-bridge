@@ -21,6 +21,11 @@ export function registerPoolForMetrics(name: string, pool: ContainerPool): void 
   registeredPools.set(name, pool)
 }
 
+export function unregisterPoolForMetrics(name: string, pool?: ContainerPool): void {
+  if (pool && registeredPools.get(name) !== pool) return
+  registeredPools.delete(name)
+}
+
 export function mountMetrics(app: Hono): void {
   app.get('/metrics', (c) => {
     const pools: Record<string, ReturnType<ContainerPool['snapshot']>> = {}

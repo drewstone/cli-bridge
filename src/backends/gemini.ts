@@ -13,18 +13,19 @@
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { join } from 'node:path'
 import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { describeCliExit, prepareSpawnerWorkspacePath, resolveSpawnerCwd, type PreparedWorkspacePath, type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
 
 export interface GeminiBackendOptions {
   bin: string
@@ -46,8 +47,8 @@ export class GeminiBackend implements Backend {
     return m === 'gemini' || m.startsWith('gemini/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
   async *chat(
@@ -75,11 +76,36 @@ export class GeminiBackend implements Backend {
     // layering the project settings over the user's global ones. Cleanup in
     // the outer finally restores the workspace so it never leaks. Fail-loud:
     // a symlink/lock violation throws rather than silently dropping MCP.
-    const mcpMaterialized = materializeMcpServersForGemini(resolveMcpServers(req, session), cwd)
+    const mcpSpecs = resolveMcpServers(req, session)
+    let mcpMaterialized: ReturnType<typeof materializeMcpServersForGemini> = null
+    let workspaceAccess: PreparedWorkspacePath | null = null
+    const cleanupMcpWorkspace = async (): Promise<void> => {
+      const failures: unknown[] = []
+      try { mcpMaterialized?.cleanup() } catch (error) { failures.push(error) }
+      try { await workspaceAccess?.cleanup() } catch (error) { failures.push(error) }
+      if (failures.length === 1) throw failures[0]
+      if (failures.length > 1) throw new AggregateError(failures, 'gemini MCP workspace cleanup failed')
+    }
+    try {
+      if (mcpSpecs && cwd && this.spawner.prepareWorkspacePath) {
+        workspaceAccess = await prepareSpawnerWorkspacePath(this.spawner, join(cwd, '.gemini'))
+      }
+      mcpMaterialized = materializeMcpServersForGemini(mcpSpecs, cwd)
+      if (!mcpMaterialized && workspaceAccess) {
+        await workspaceAccess.cleanup()
+        workspaceAccess = null
+      }
+    } catch (error) {
+      try { await cleanupMcpWorkspace() } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'gemini MCP preparation and cleanup failed')
+      }
+      throw error
+    }
 
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       spawned = await this.spawner(this.opts.bin, args, {
+        signal,
         stdio: ['pipe', 'pipe', 'pipe'],
         cwd,
         env: { ...process.env, ...provisioned.env },
@@ -87,11 +113,12 @@ export class GeminiBackend implements Backend {
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })
     } catch (error) {
-      mcpMaterialized?.cleanup()
+      try { await cleanupMcpWorkspace() } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'gemini spawn and cleanup failed')
+      }
       throw error
     }
     const child = spawned.child
-    const releaseSpawner = spawned.release
 
     let spawnErrorMessage = ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
@@ -184,9 +211,7 @@ export class GeminiBackend implements Backend {
     } finally {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      await terminateSpawned(spawned)
-      releaseSpawner()
-      mcpMaterialized?.cleanup()
+      await finalizeSpawned(spawned, [cleanupMcpWorkspace])
     }
   }
 

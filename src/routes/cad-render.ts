@@ -31,10 +31,14 @@
 
 import type { Context, Hono } from 'hono'
 import { z } from 'zod'
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn, type ChildProcess } from 'node:child_process'
+import {
+  createPrivateTemporaryRoot,
+  type PrivateTemporaryRoot,
+} from '../runtime/private-temporary.js'
 
 const DEFAULT_TIMEOUT_MS = 60_000
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024 // 10MB
@@ -105,9 +109,10 @@ export function mountCadRender(app: Hono): void {
     const timeoutMs = resolveTimeoutMs()
     const deadline = startedAt + timeoutMs
 
-    let tmpRoot: string | null = null
+    let temporary: PrivateTemporaryRoot | null = null
     try {
-      tmpRoot = await mkdtemp(join(tmpdir(), 'cli-bridge-cad-'))
+      temporary = createPrivateTemporaryRoot(tmpdir(), 'cli-bridge-cad-')
+      const tmpRoot = temporary.path
       const scadPath = join(tmpRoot, 'model.scad')
       await writeFile(scadPath, parsed.data.code, 'utf8')
 
@@ -217,8 +222,11 @@ export function mountCadRender(app: Hono): void {
       const message = err instanceof Error ? err.message : String(err)
       return errorResponse(c, message, Date.now() - startedAt)
     } finally {
-      if (tmpRoot) {
-        await rm(tmpRoot, { recursive: true, force: true }).catch(() => {})
+      try {
+        temporary?.cleanup()
+      } catch (error) {
+        // The manifest remains registered so the next bridge startup retries.
+        console.error('[cli-bridge] failed to remove CAD temporary files:', error)
       }
     }
   })

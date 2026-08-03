@@ -10,10 +10,10 @@
  * and a provider+model registered in pi's settings (see `pi --list-models`).
  * `pi/<model>` (no provider) routes through pi's default provider.
  *
- * Auth: pi reads `<PROVIDER>_API_KEY` env vars itself; the bridge inherits
- * `process.env` into the subprocess. ZAI_GLM_API_KEY, DEEPSEEK_API_KEY,
- * MOONSHOT_API_KEY etc. must be set in the bridge's environment (sourced
- * via the kick-script's `.env` chain).
+ * Auth: pi reads its provider's environment variables itself. The bridge
+ * passes only the selected provider's known auth/base-url variables plus a
+ * small runtime environment; bridge credentials and unrelated provider keys
+ * never cross the child boundary.
  *
  * MCP: MCP support comes from the `pi-mcp-adapter` extension. When a request
  * carries MCP servers (X-Mcp-Config header, body `mcp.mcpServers`, or
@@ -42,6 +42,7 @@
  *   {"type":"tool_execution_start","toolCallId":"...","toolName":"...","args":{...}}
  *   {"type":"turn_end","message":{"usage":{...}}}
  *   {"type":"agent_end","messages":[...]}
+ *   {"type":"agent_settled"}
  *
  * We surface text_delta as ChatDelta.content and pi tool-call lifecycle events
  * as OpenAI-shaped tool_calls so downstream trace consumers can observe native
@@ -49,11 +50,12 @@
  * handles its `think` blocks for non-thinking-aware callers).
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { canonicalCandidateDigest, type AgentEnvironmentCapabilities, type NativeContextBoundaryProof } from '@tangle-network/agent-interface'
 import { homedir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import type { Backend, ChatDelta, ChatRequest, BackendHealth, NativeSession, NativeSessionBackend } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -67,10 +69,17 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { prepareSpawnerPrivatePath, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { finalizeSpawned, retryCleanupUntilSuccessful, terminateSpawned } from '../executors/process-tree.js'
+import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
+import {
+  PI_PERMISSION_MARKER_PREFIX,
+  piPermissionMarker,
+  piPermissionTokenFromTitle,
+  piSelectedValue,
+} from './pi-interaction.js'
 
 export interface PiBackendOptions {
   bin: string
@@ -78,6 +87,8 @@ export interface PiBackendOptions {
   /** Subprocess spawner. Defaults to scoped host. */
   spawner?: Spawner
 }
+
+const PI_RPC_REQUEST_TIMEOUT_CAP_MS = 30_000
 
 /** `pi/<provider>/<model>` or `pi/<model>` (default provider). */
 interface PiModelSpec {
@@ -93,6 +104,49 @@ function parsePiModelId(model: string): PiModelSpec {
   const slash = rest.indexOf('/')
   if (slash === -1) return { model: rest }
   return { provider: rest.slice(0, slash), model: rest.slice(slash + 1) }
+}
+
+function mapPrivateTreeArgs(args: readonly string[], hostRoot: string, runtimeRoot: string): string[] {
+  const prefix = `${hostRoot}/`
+  return args.map(value => value === hostRoot
+    ? runtimeRoot
+    : value.startsWith(prefix)
+      ? `${runtimeRoot}/${value.slice(prefix.length)}`
+      : value)
+}
+
+function mapPrivateTreeEnv(
+  env: Readonly<Record<string, string>>,
+  hostRoot: string,
+  runtimeRoot: string,
+): Record<string, string> {
+  return Object.fromEntries(Object.entries(env).map(([key, value]) => [
+    key,
+    mapPrivateTreeArgs([value], hostRoot, runtimeRoot)[0]!,
+  ]))
+}
+
+function piAgentDir(): string {
+  const configured = process.env.PI_CODING_AGENT_DIR
+  if (!configured) return join(homedir(), '.pi', 'agent')
+  return resolve(configured.startsWith('~/') ? join(homedir(), configured.slice(2)) : configured)
+}
+
+/** Pi's compiled default is google, but settings.json is the installed agent's real override. */
+function resolvePiDefaultProvider(): string {
+  try {
+    const settings = JSON.parse(readFileSync(join(piAgentDir(), 'settings.json'), 'utf8')) as { defaultProvider?: unknown }
+    if (typeof settings.defaultProvider === 'string' && /^[A-Za-z0-9._-]+$/u.test(settings.defaultProvider.trim())) {
+      return settings.defaultProvider.trim()
+    }
+  } catch {
+    // The binary's documented default is used when no readable settings override exists.
+  }
+  return 'google'
+}
+
+function resolvePiModelSpec(spec: PiModelSpec): PiModelSpec {
+  return { ...spec, provider: spec.provider ?? resolvePiDefaultProvider() }
 }
 
 /** Map ReasoningEffort to pi's `--thinking` flag. */
@@ -160,6 +214,7 @@ function piExtensionArgs(
   req: ChatRequest,
   session: SessionRecord | null,
   needsMcpAdapter: boolean,
+  spawner: Spawner,
 ): string[] {
   const pi = resolveAgentProfile(req, session)?.extensions?.pi
   if (pi === undefined) return []
@@ -190,14 +245,14 @@ function piExtensionArgs(
     )
   }
 
-  const configuredAgentDir = process.env.PI_CODING_AGENT_DIR
-  const hostNpmRoot = join(configuredAgentDir ?? join(homedir(), '.pi', 'agent'), 'npm', 'node_modules')
+  const hostNpmRoot = join(piAgentDir(), 'npm', 'node_modules')
   // Pi expands `~` itself. Keeping the default path HOME-relative makes the
   // same argv work for host execution and for a container whose mounted Pi
   // agent directory lives under a different HOME.
-  const runtimeNpmRoot = join(configuredAgentDir ?? '~/.pi/agent', 'npm', 'node_modules')
+  const runtimeAgentDir = spawner.mapPath?.(piAgentDir()) ?? piAgentDir()
+  const runtimeNpmRoot = join(runtimeAgentDir, 'npm', 'node_modules')
   const entries = new Set((load as string[]).map((spec) =>
-    resolvePiExtensionPath(spec.trim(), hostNpmRoot, runtimeNpmRoot),
+    resolvePiExtensionPath(spec.trim(), hostNpmRoot, runtimeNpmRoot, spawner),
   ))
   return [
     '--no-extensions',
@@ -205,10 +260,10 @@ function piExtensionArgs(
   ]
 }
 
-function resolvePiExtensionPath(spec: string, hostNpmRoot: string, runtimeNpmRoot: string): string {
+function resolvePiExtensionPath(spec: string, hostNpmRoot: string, runtimeNpmRoot: string, spawner: Spawner): string {
   const normalized = spec.startsWith('npm:') ? spec.slice(4) : spec
   if (isAbsolute(normalized)) {
-    if (existsSync(normalized)) return normalized
+    if (existsSync(normalized)) return spawner.mapPath?.(normalized) ?? normalized
     throw new BackendError(
       `backend pi cannot load extension "${spec}": ${normalized} does not exist`,
       'not_configured',
@@ -247,7 +302,7 @@ export function piMcpAdapterAvailable(): boolean {
   const override = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
   if (override === '1' || override === 'true') return true
   if (override === '0' || override === 'false') return false
-  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')
+  const agentDir = piAgentDir()
   if (existsSync(join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter'))) return true
   try {
     const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf-8')) as { packages?: unknown }
@@ -280,8 +335,151 @@ export function piMcpAdapterAvailable(): boolean {
   return false
 }
 
-export class PiBackend implements Backend {
+const PI_NATIVE_CAPABILITIES: AgentEnvironmentCapabilities = {
+  profile: {
+    namedProfiles: false,
+    systemPrompt: true,
+    instructions: true,
+    tools: true,
+    permissions: true,
+    mcp: true,
+    subagents: true,
+    resources: { files: false, instructions: true, tools: false, skills: true, agents: true, commands: true },
+    hooks: false,
+    modes: true,
+    runtimeUpdate: false,
+    validation: true,
+    extensions: ['pi'],
+  },
+  streaming: { live: true, replay: true, detach: true, turnIdempotency: true },
+  retainedControl: {
+    exactRunIdentity: true,
+    resultIdentity: true,
+    eventIdentity: true,
+    cancellationIdempotency: true,
+  },
+  sessions: { continue: true, list: true, messages: true },
+  // Pi's RPC has no provider-side compare-and-admit or operation-id replay
+  // primitive. The retained bridge still checks its boundary before a turn,
+  // but cannot honestly advertise Agent Interface nativeContinuation.
+  interactions: {
+    kinds: ['permission'],
+    answerFieldTypes: ['select'],
+    responseScopes: ['interaction'],
+    secretAnswers: false,
+    concurrentRequests: false,
+    replay: true,
+    responseIdempotency: true,
+  },
+  workspace: { read: true, write: true, exec: true, git: true, upload: false, download: false },
+  branching: { checkpoint: false, fork: false },
+  placement: true,
+  usage: true,
+  confidential: false,
+}
+
+const PI_CHILD_BASE_ENV_KEYS = [
+  'HOME',
+  'PATH',
+  'SHELL',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'USER',
+  'LOGNAME',
+  'LANG',
+  'LC_ALL',
+  'PWD',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+  'XDG_DATA_HOME',
+  'XDG_RUNTIME_DIR',
+  'NVM_DIR',
+  'PNPM_HOME',
+  'PI_CODING_AGENT_DIR',
+  'PI_CODING_AGENT_SESSION_DIR',
+  'PI_PACKAGE_DIR',
+] as const
+
+const PI_PROVIDER_ENV_ALIASES: Record<string, readonly string[]> = {
+  anthropic: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_OAUTH_TOKEN', 'ANTHROPIC_BASE_URL'],
+  openai: ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_ORG_ID'],
+  google: ['GOOGLE_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY'],
+  gemini: ['GOOGLE_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY'],
+  deepseek: ['DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL'],
+  moonshot: ['MOONSHOT_API_KEY', 'MOONSHOT_BASE_URL'],
+  'zai-coding-paas': ['ZAI_API_KEY', 'ZAI_GLM_API_KEY', 'ZAI_BASE_URL', 'ZAI_GLM_BASE_URL'],
+  'zai-glm': ['ZAI_GLM_API_KEY', 'ZAI_GLM_BASE_URL', 'ZAI_API_KEY', 'ZAI_BASE_URL'],
+  zai: ['ZAI_API_KEY', 'ZAI_BASE_URL'],
+  zhipu: ['ZHIPU_API_KEY', 'ZHIPU_BASE_URL'],
+  'tangle-router': ['TANGLE_API_KEY', 'TANGLE_BASE_URL', 'TANGLE_ROUTER_BASE_URL'],
+  xai: ['XAI_API_KEY', 'XAI_BASE_URL'],
+  groq: ['GROQ_API_KEY', 'GROQ_BASE_URL'],
+  mistral: ['MISTRAL_API_KEY', 'MISTRAL_BASE_URL'],
+  openrouter: ['OPENROUTER_API_KEY', 'OPENROUTER_BASE_URL'],
+  ollama: ['OLLAMA_HOST'],
+}
+
+const PI_BLOCKED_ENV_KEY = /(?:^|_)(?:API[_-]?KEY|AUTH(?:ORIZATION|ENTICATION)?|BEARER|COOKIE|CREDENTIALS?|PASSWORD|PASSPHRASE|PRIVATE[_-]?KEY|SECRET|TOKEN)(?:_|$)/iu
+
+function piProviderEnvKeys(provider: string | undefined): Set<string> {
+  if (!provider) return new Set()
+  const normalized = provider.toLowerCase()
+  const prefix = normalized.replace(/[^a-z0-9]+/gu, '_').replace(/^_|_$/gu, '').toUpperCase()
+  return new Set([
+    ...(PI_PROVIDER_ENV_ALIASES[normalized] ?? []),
+    ...(prefix ? [`${prefix}_API_KEY`, `${prefix}_AUTH_TOKEN`, `${prefix}_BASE_URL`] : []),
+  ])
+}
+
+function isSafeProfileEnvKey(key: string): boolean {
+  return /^[A-Z][A-Z0-9_]*$/u.test(key)
+    && !key.startsWith('BRIDGE_')
+    && !key.startsWith('CLI_BRIDGE_')
+    && !PI_BLOCKED_ENV_KEY.test(key)
+}
+
+/** Build the exact environment granted to one Pi child. */
+function piChildEnv(
+  spec: PiModelSpec,
+  cwd: string | undefined,
+  profileEnv: Record<string, string> | undefined,
+  directTools: string | undefined,
+): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {}
+  const providerKeys = piProviderEnvKeys(spec.provider)
+  const allowedParentKeys = new Set<string>([...PI_CHILD_BASE_ENV_KEYS, ...providerKeys])
+  for (const key of allowedParentKeys) {
+    const value = process.env[key]
+    if (typeof value === 'string' && value.length > 0) out[key] = value
+  }
+  if (cwd) out.PWD = cwd
+  if (directTools) out.MCP_DIRECT_TOOLS = directTools
+
+  // Profile materialization values are explicit public configuration, but a
+  // profile cannot smuggle a bridge credential or a provider credential for a
+  // different model through the child boundary.
+  for (const [key, value] of Object.entries(profileEnv ?? {})) {
+    if (!isSafeProfileEnvKey(key)) continue
+    if (allowedParentKeys.has(key) || key === 'MCP_DIRECT_TOOLS') continue
+    out[key] = value
+  }
+  return out
+}
+
+function piNativeCapabilities(): AgentEnvironmentCapabilities {
+  return {
+    ...PI_NATIVE_CAPABILITIES,
+    profile: {
+      ...PI_NATIVE_CAPABILITIES.profile,
+      mcp: piMcpAdapterAvailable(),
+    },
+  }
+}
+
+export class PiBackend implements NativeSessionBackend {
   readonly name = 'pi'
+  readonly nativeModes = ['byob'] as const
   private readonly spawner: Spawner
 
   constructor(private readonly opts: PiBackendOptions) {
@@ -293,8 +491,123 @@ export class PiBackend implements Backend {
     return m === 'pi' || m.startsWith('pi/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
+  }
+
+  nativeCapabilities(): AgentEnvironmentCapabilities {
+    return piNativeCapabilities()
+  }
+
+  async startNativeSession(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal?: AbortSignal,
+  ): Promise<NativeSession> {
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
+      'pi has native tools (read/bash/edit/write); hosted-safe requires a verified --no-tools enforcement path')
+    if (req.interaction_policy === 'unattended-allow') {
+      throw new BackendError('native Pi sessions require interaction_policy=interactive; use one-shot for explicit unattended policy', 'parse_error')
+    }
+
+    const spec = resolvePiModelSpec(parsePiModelId(req.model))
+    const profile = resolveAgentProfile(req, session)
+    const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
+    const mcpSpecs = resolveMcpServers(req, session)
+    const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []
+    if (requestedMcpNames.length > 0 && !piMcpAdapterAvailable()) {
+      throw new BackendError(
+        `backend pi cannot mount MCP servers: pi-mcp-adapter extension not installed; requested: ${requestedMcpNames.join(', ')}`,
+        'not_configured',
+      )
+    }
+
+    let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
+    let provisioned: ReturnType<typeof provisionPiProfile> = null
+    let runtimeProvisionedEnv: Record<string, string> | undefined
+    let adapterRoot: PrivateTemporaryRoot | null = null
+    let spawned: Awaited<ReturnType<Spawner>> | null = null
+    const cleanupOwnedFiles = (): void => {
+      const failures: unknown[] = []
+      for (const cleanup of [
+        mcpMounted ? () => mcpMounted?.cleanup() : null,
+        provisioned ? () => provisioned?.cleanup() : null,
+        adapterRoot ? () => adapterRoot?.cleanup() : null,
+      ]) {
+        if (!cleanup) continue
+        try { cleanup() } catch (error) { failures.push(error) }
+      }
+      if (failures.length === 1) throw failures[0]
+      if (failures.length > 1) throw new AggregateError(failures, 'pi native session file cleanup failed')
+    }
+    try {
+      const args: string[] = ['--mode', 'rpc']
+      if (spec.provider) args.push('--provider', spec.provider)
+      if (spec.model) args.push('--model', spec.model)
+      if (session?.internalId) args.push('--session', session.internalId)
+      else args.push('--session-id', randomUUID())
+      const thinking = thinkingFlagForEffort(resolveReasoningEffort(req, profile))
+      if (thinking) args.push('--thinking', thinking)
+      args.push(...piExtensionArgs(req, session, requestedMcpNames.length > 0, this.spawner))
+
+      // Pi's extension UI is the native approval transport. This adapter is
+      // deliberately tiny: it asks Pi to display its own dialog and only
+      // translates the resulting JSONL request/response at the bridge edge.
+      adapterRoot = createPrivateTemporaryRoot(runCwd ?? process.cwd(), '.cli-bridge-pi-rpc-')
+      const interactionExtension = join(adapterRoot.path, 'interaction-gate.mjs')
+      const interactionNonce = randomUUID().replaceAll('-', '')
+      writeFileSync(interactionExtension, piInteractionExtension(false, interactionNonce), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+      const runtimeAdapterRoot = await prepareSpawnerPrivatePath(this.spawner, adapterRoot.path)
+      args.push('--extension', join(runtimeAdapterRoot, 'interaction-gate.mjs'))
+
+      provisioned = provisionPiProfile(req, session, runCwd)
+      if (provisioned) {
+        const runtimeProfileRoot = await prepareSpawnerPrivatePath(this.spawner, provisioned.rootPath)
+        args.push(...mapPrivateTreeArgs(provisioned.flags, provisioned.rootPath, runtimeProfileRoot))
+        runtimeProvisionedEnv = mapPrivateTreeEnv(provisioned.env, provisioned.rootPath, runtimeProfileRoot)
+      }
+      if (requestedMcpNames.length > 0) {
+        const mounted = materializeMcpServersForPi(mcpSpecs, runCwd, { isolateChildren: true })
+        if (!mounted) throw new BackendError('backend pi could not materialize the requested MCP servers', 'not_configured')
+        mcpMounted = mounted
+        const runtimeMcpRoot = await prepareSpawnerPrivatePath(this.spawner, dirname(mounted.configPath))
+        args.push('--mcp-config', join(runtimeMcpRoot, basename(mounted.configPath)))
+      }
+
+      spawned = await this.spawner(this.opts.bin, args, {
+        signal,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: runCwd,
+        env: piChildEnv(
+          spec,
+          runCwd,
+          runtimeProvisionedEnv,
+          requestedMcpNames.length > 0
+            ? piDirectToolSelection(requestedMcpNames, process.env.MCP_DIRECT_TOOLS)
+            : undefined,
+        ),
+        exactEnv: true,
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      })
+      const child = spawned.child
+      if (!child.stdin || !child.stdout) {
+        throw new BackendError('pi RPC subprocess has no stdin/stdout pipes', 'upstream')
+      }
+      return new PiNativeSession(spawned, {
+        capabilities: piNativeCapabilities(),
+        requestTimeoutMs: Math.max(1, Math.min(this.opts.timeoutMs, PI_RPC_REQUEST_TIMEOUT_CAP_MS)),
+        cleanup: cleanupOwnedFiles,
+      })
+    } catch (error) {
+      try {
+        if (spawned) await finalizeSpawned(spawned, [cleanupOwnedFiles])
+        else cleanupOwnedFiles()
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'pi native session startup and cleanup failed')
+      }
+      throw error
+    }
   }
 
   async *chat(
@@ -302,12 +615,14 @@ export class PiBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
+    assertOneShotInteractionPolicy(req, session)
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'pi has native tools (read/bash/edit/write); hosted-safe requires a verified --no-tools enforcement path')
 
-    const spec = parsePiModelId(req.model)
+    const spec = resolvePiModelSpec(parsePiModelId(req.model))
     const prompt = this.buildPrompt(req)
     const profile = resolveAgentProfile(req, session)
+    const unattendedAllow = req.interaction_policy === 'unattended-allow'
 
     const args: string[] = [
       '--print',
@@ -329,6 +644,7 @@ export class PiBackend implements Backend {
     }
     const thinking = thinkingFlagForEffort(resolveReasoningEffort(req, profile))
     if (thinking) args.push('--thinking', thinking)
+    if (!unattendedAllow) args.push('--no-tools')
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
@@ -351,45 +667,59 @@ export class PiBackend implements Backend {
     // The provider-specific extension namespace, MCP config, and canonical profile
     // files all use Pi's per-process loaders. Every flag precedes the positional
     // prompt, and large prompt material rides file paths rather than argv.
-    args.push(...piExtensionArgs(req, session, requestedMcpNames.length > 0))
+    args.push(...piExtensionArgs(req, session, requestedMcpNames.length > 0, this.spawner))
     let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
     let provisioned: ReturnType<typeof provisionPiProfile> = null
+    let runtimeProvisionedEnv: Record<string, string> | undefined
+    let interactionRoot: PrivateTemporaryRoot | null = null
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      mcpMounted = requestedMcpNames.length > 0
-        ? materializeMcpServersForPi(mcpSpecs, runCwd)
-        : null
-      if (mcpMounted) args.push('--mcp-config', mcpMounted.configPath)
       provisioned = provisionPiProfile(req, session, runCwd)
-      if (provisioned) args.push(...provisioned.flags)
+      if (provisioned) {
+        const runtimeProfileRoot = await prepareSpawnerPrivatePath(this.spawner, provisioned.rootPath)
+        args.push(...mapPrivateTreeArgs(provisioned.flags, provisioned.rootPath, runtimeProfileRoot))
+        runtimeProvisionedEnv = mapPrivateTreeEnv(provisioned.env, provisioned.rootPath, runtimeProfileRoot)
+      }
+      mcpMounted = requestedMcpNames.length > 0
+        ? materializeMcpServersForPi(mcpSpecs, runCwd, { isolateChildren: true })
+        : null
+      if (mcpMounted) {
+        const runtimeMcpRoot = await prepareSpawnerPrivatePath(this.spawner, dirname(mcpMounted.configPath))
+        args.push('--mcp-config', join(runtimeMcpRoot, basename(mcpMounted.configPath)))
+      }
+      if (unattendedAllow) {
+        interactionRoot = createPrivateTemporaryRoot(runCwd ?? process.cwd(), '.cli-bridge-pi-interaction-')
+        const interactionExtension = join(interactionRoot.path, 'interaction-gate.mjs')
+        writeFileSync(interactionExtension, piInteractionExtension(true), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+        const runtimeInteractionRoot = await prepareSpawnerPrivatePath(this.spawner, interactionRoot.path)
+        args.push('--extension', join(runtimeInteractionRoot, basename(interactionExtension)))
+      }
       // The task prompt remains the sole positional message. Profile system and
       // additive instructions retain their native, separate authority channels.
       args.push(prompt)
       spawned = await this.spawner(this.opts.bin, args, {
+        signal,
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
-        env: {
-          ...process.env,
-          ...(provisioned?.env ?? {}),
-          ...(requestedMcpNames.length > 0
-            ? {
-                MCP_DIRECT_TOOLS: piDirectToolSelection(
-                  requestedMcpNames,
-                  process.env.MCP_DIRECT_TOOLS,
-                ),
-              }
-            : {}),
-        },
+        env: piChildEnv(
+          spec,
+          runCwd,
+          runtimeProvisionedEnv,
+          requestedMcpNames.length > 0
+            ? piDirectToolSelection(requestedMcpNames, process.env.MCP_DIRECT_TOOLS)
+            : undefined,
+        ),
+        exactEnv: true,
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })
     } catch (err) {
       mcpMounted?.cleanup()
       provisioned?.cleanup()
+      interactionRoot?.cleanup()
       throw err
     }
     const child = spawned.child
-    const releaseSpawner = spawned.release
 
     let spawnErrorMessage = ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
@@ -539,7 +869,6 @@ export class PiBackend implements Backend {
       const exitCode = await waitForProcessClose(child)
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
-      releaseSpawner()
 
       // Per-turn token receipts stay observable. Cost is emitted once, only
       // after every contributing call proved its amount; a partial sum must
@@ -591,10 +920,11 @@ export class PiBackend implements Backend {
       clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree before releasing the slot.
-      await terminateSpawned(spawned)
-      try { releaseSpawner() } catch { /* best effort */ }
-      mcpMounted?.cleanup()
-      provisioned?.cleanup()
+      await finalizeSpawned(spawned, [
+        mcpMounted ? () => mcpMounted.cleanup() : null,
+        provisioned ? () => provisioned.cleanup() : null,
+        interactionRoot ? () => interactionRoot.cleanup() : null,
+      ])
     }
   }
 
@@ -617,6 +947,492 @@ export class PiBackend implements Backend {
       parts.push(`${prefix}${text}`)
     }
     return parts.join('\n\n')
+  }
+}
+
+function assertOneShotInteractionPolicy(req: ChatRequest, session: SessionRecord | null): void {
+  if (req.interaction_policy === 'interactive') {
+    throw new BackendError(
+      'pi one-shot mode cannot carry interactive responses; use a retained native session or an explicit unattended policy',
+      'capability_denied',
+    )
+  }
+  if (req.interaction_policy !== 'unattended-allow') return
+  const profile = resolveAgentProfile(req, session)
+  const receipt = req.interaction_policy_receipt
+  if (
+    !profile
+    || receipt?.schema !== 'cli-bridge.interaction-policy.v1'
+    || receipt.name !== 'unattended-allow'
+    || receipt.profileDigest !== canonicalCandidateDigest(profile)
+  ) {
+    throw new BackendError(
+      'unattended-allow requires a matching profile-scoped interaction-policy receipt',
+      'capability_denied',
+    )
+  }
+}
+
+function piInteractionExtension(unattendedAllow: boolean, interactionNonce?: string): string {
+  if (unattendedAllow) {
+    return `export default function (pi) {
+  pi.on('tool_call', async () => undefined)
+  // cli-bridge unattended-allow-v1 is only emitted with a matching profile receipt.
+}
+`
+  }
+  if (!interactionNonce) throw new Error('interactive Pi extension requires a unique marker nonce')
+  const nonce = JSON.stringify(interactionNonce)
+  const markerPrefix = JSON.stringify(PI_PERMISSION_MARKER_PREFIX)
+  return `export default function (pi) {
+  const bridgeNonce = ${nonce}
+  let permissionNumber = 0
+  const sanitizePublicTitle = (value) => String(value ?? '')
+    .replace(/[^\\p{L}\\p{N} .,_:\\/-]/gu, ' ')
+    .replace(/\\s+/gu, ' ')
+    .trim()
+    .slice(0, 120) || 'tool'
+  pi.on('tool_call', async (event, ctx) => {
+    if (!ctx.hasUI) return { block: true, reason: 'interactive approval is unavailable' }
+    const token = bridgeNonce + '-' + (++permissionNumber)
+    const publicTitle = 'Permission: ' + sanitizePublicTitle(event.toolName)
+    const choice = await ctx.ui.select(publicTitle + ' [cli-bridge-marker:' + token + ']', ['allow_once', 'deny'])
+    await ctx.ui.notify(${markerPrefix} + ':' + token + ':' + String(choice), 'info')
+    if (choice !== 'allow_once') return { block: true, reason: 'permission denied' }
+    return undefined
+  })
+}
+`
+}
+
+interface PiNativeSessionOptions {
+  capabilities: AgentEnvironmentCapabilities
+  requestTimeoutMs: number
+  cleanup(): void
+}
+
+interface PiRpcResponse {
+  type?: string
+  id?: string | number
+  command?: string
+  success?: boolean
+  error?: string
+  data?: unknown
+}
+
+interface PiRpcWaiter {
+  resolve: (value: PiRpcResponse) => void
+  reject: (error: Error) => void
+}
+
+interface PiRpcRequestOptions {
+  signal?: AbortSignal
+  timeoutMs?: number
+}
+
+interface PiMarkerWaiter {
+  readonly marker: string
+  readonly afterSequence: number
+  resolve: () => void
+  reject: (error: Error) => void
+  timer?: ReturnType<typeof setTimeout>
+}
+
+/** A single Pi RPC child; the retained-session service owns the public events. */
+class PiNativeSession implements NativeSession {
+  readonly capabilities: AgentEnvironmentCapabilities
+  private readonly child: Awaited<ReturnType<Spawner>>['child']
+  private readonly release: () => void
+  private readonly terminate: () => Promise<void>
+  private readonly cleanup: () => void
+  private readonly requestTimeoutMs: number
+  private readonly stderr = new BoundedDiagnosticBuffer()
+  private readonly pending = new Map<string | number, PiRpcWaiter>()
+  private readonly queue: Record<string, unknown>[] = []
+  private readonly waiters: Array<{ resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }> = []
+  private readonly markerWaiters = new Set<PiMarkerWaiter>()
+  private readonly interactionMarkers = new Map<string, string>()
+  private readonly closeListeners = new Set<(reason: Error) => void>()
+  private buffer = ''
+  private eventSequence = 0
+  private closed = false
+  private closing: Promise<void> | null = null
+  private providerSession: string | null = null
+  private turnActive = false
+  private childError: Error | null = null
+  private abortInFlight: Promise<void> | null = null
+  private terminationInFlight: Promise<void> | null = null
+
+  constructor(
+    spawned: Awaited<ReturnType<Spawner>>,
+    options: PiNativeSessionOptions,
+  ) {
+    this.capabilities = options.capabilities
+    this.requestTimeoutMs = options.requestTimeoutMs
+    this.child = spawned.child
+    this.release = spawned.release
+    this.terminate = async () => {
+      if (this.terminationInFlight) return this.terminationInFlight
+      this.terminationInFlight = (spawned.terminate ? spawned.terminate() : terminateSpawned(spawned))
+      try { await this.terminationInFlight } finally { this.terminationInFlight = null }
+    }
+    this.cleanup = options.cleanup
+    this.child.stdout?.on('data', chunk => this.consume(chunk.toString()))
+    this.child.stderr?.on('data', chunk => this.stderr.append(chunk))
+    this.child.stdin?.on('error', error => this.end(error))
+    this.child.stdout?.on('end', () => this.end(new Error('pi RPC stdout ended')))
+    this.child.on('error', error => {
+      this.childError = error
+      this.end(error)
+    })
+    this.child.on('close', () => this.end(this.childError ?? new Error('pi RPC process closed')))
+  }
+
+  providerSessionId(): string | null {
+    return this.providerSession
+  }
+
+  isClosed(): boolean {
+    return this.closed
+  }
+
+  onClose(listener: (reason: Error) => void): () => void {
+    if (this.closed) {
+      queueMicrotask(() => {
+        try {
+          listener(this.childError ?? new Error('pi RPC process closed'))
+        } catch {
+          // A late owner cannot break child cleanup.
+        }
+      })
+      return () => {}
+    }
+    this.closeListeners.add(listener)
+    return () => this.closeListeners.delete(listener)
+  }
+
+  whenClosed(): Promise<void> {
+    if (this.closed) return this.startCleanup()
+    return new Promise<void>((resolve, reject) => {
+      const unsubscribe = this.onClose(() => {
+        unsubscribe()
+        this.startCleanup().then(resolve, reject)
+      })
+    })
+  }
+
+  async *turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
+    if (this.closed) throw new BackendError('pi native session is closed', 'upstream')
+    if (this.turnActive) throw new BackendError('pi native session already has an active turn', 'upstream')
+    this.turnActive = true
+    const requestId = `prompt-${randomUUID()}`
+    const onAbort = (): void => { void this.abort() }
+    signal.addEventListener('abort', onAbort, { once: true })
+    try {
+      await this.request(
+        { id: requestId, type: 'prompt', message: prompt },
+        { signal, timeoutMs: this.requestTimeoutMs },
+      )
+      while (!this.closed) {
+        const event = await this.nextEvent(signal)
+        if (event.type === 'session' && typeof event.id === 'string') this.providerSession = event.id
+        yield event
+        // `agent_end` closes one low-level model attempt and may be followed by
+        // an automatic retry or compaction. `agent_settled` is Pi's documented
+        // session-level terminal boundary, so only it ends a retained turn.
+        if (event.type === 'agent_settled') return
+      }
+      throw this.childError ?? new Error('pi native session ended before agent_settled')
+    } catch (error) {
+      if (signal.aborted || (error instanceof BackendError && (error.code === 'timeout' || error.code === 'aborted'))) {
+        // A prompt can be accepted by the OS while Pi never acknowledges it.
+        // Try the native abort command within the same bounded window, then
+        // close the child so the retained session cannot keep a lease.
+        await this.abort()
+      }
+      throw error
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+      this.turnActive = false
+    }
+  }
+
+  async steer(prompt: string): Promise<void> {
+    await this.request({ id: `steer-${randomUUID()}`, type: 'steer', message: prompt })
+  }
+
+  async abort(): Promise<void> {
+    if (this.closed) return
+    if (this.abortInFlight) return this.abortInFlight
+    this.abortInFlight = (async () => {
+      const termination = this.terminate()
+      try {
+        await this.request(
+          { id: `abort-${randomUUID()}`, type: 'abort' },
+          // Abort is a courtesy protocol message. The executor hard-stop runs
+          // in parallel because Pi may ignore it or stop answering JSON-RPC.
+          { timeoutMs: Math.min(this.requestTimeoutMs, 1_000) },
+        )
+      } catch {
+        // The owned Run turns an abort into a cancelled terminal state even when
+        // Pi closes the RPC pipe before acknowledging the command.
+      } finally {
+        await termination
+        this.end(new Error('pi native session aborted'))
+        await this.closing
+        this.abortInFlight = null
+      }
+    })()
+    return this.abortInFlight
+  }
+
+  async respondToNativeInteraction(id: string, response: Record<string, unknown>): Promise<void> {
+    if (this.closed) throw new BackendError('pi native session is closed', 'upstream')
+    const token = this.interactionMarkers.get(id)
+    if (!token) {
+      throw new BackendError('Pi interaction is not an instrumented permission dialog', 'capability_denied')
+    }
+    const marker = piPermissionMarker(token, piSelectedValue(response))
+    const afterSequence = this.eventSequence
+    const waitForMarker = this.waitForMarkerAfter(marker, afterSequence)
+    try {
+      this.write({ type: 'extension_ui_response', id, ...response })
+      // Pi 0.83 does not acknowledge extension_ui_response on the command
+      // channel. The injected extension's exact notify marker is the only
+      // proof that this specific select response was applied.
+      await waitForMarker
+    } finally {
+      this.interactionMarkers.delete(id)
+    }
+  }
+
+  async contextBoundary(input: { runId: string; environmentId: string; sessionId: string }): Promise<NativeContextBoundaryProof | null> {
+    if (this.closed) return null
+    let response: PiRpcResponse
+    try {
+      response = await this.request({ type: 'get_state' }, { timeoutMs: this.requestTimeoutMs })
+    } catch (error) {
+      if (error instanceof BackendError && error.code === 'timeout') await this.close()
+      throw error
+    }
+    const data = record(response.data)
+    const sessionId = typeof data?.sessionId === 'string' ? data.sessionId : this.providerSession
+    const messageCount = typeof data?.messageCount === 'number' ? data.messageCount : null
+    if (!sessionId || messageCount === null || !Number.isSafeInteger(messageCount) || messageCount < 0) return null
+    this.providerSession = sessionId
+    return {
+      runId: input.runId,
+      provider: 'pi',
+      environmentId: input.environmentId,
+      sessionId: input.sessionId,
+      boundary: { kind: 'revision', revision: boundedPiId(`pi:${sessionId}:${messageCount}`) },
+      observedAt: new Date().toISOString(),
+    }
+  }
+
+  async close(): Promise<void> {
+    this.end(new Error('pi native session closed'))
+    await this.closing
+  }
+
+  private request(command: Record<string, unknown>, options: PiRpcRequestOptions = {}): Promise<PiRpcResponse> {
+    const id = (command.id as string | number | undefined) ?? `rpc-${randomUUID()}`
+    const wireCommand = { ...command, id }
+    return new Promise((resolve, reject) => {
+      if (this.closed) {
+        reject(new Error('pi RPC process is closed'))
+        return
+      }
+      if (options.signal?.aborted) {
+        reject(new BackendError(`pi RPC ${String(command.type ?? 'request')} aborted`, 'aborted'))
+        return
+      }
+
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let settled = false
+      let onAbort: (() => void) | undefined
+      const cleanup = (): void => {
+        if (timer) clearTimeout(timer)
+        if (onAbort && options.signal) options.signal.removeEventListener('abort', onAbort)
+      }
+      const settle = (callback: () => void): void => {
+        if (settled) return
+        settled = true
+        this.pending.delete(id)
+        cleanup()
+        callback()
+      }
+      const waiter: PiRpcWaiter = {
+        resolve: value => settle(() => resolve(value)),
+        reject: error => settle(() => reject(error)),
+      }
+      this.pending.set(id, waiter)
+      onAbort = (): void => settle(() => reject(new BackendError(`pi RPC ${String(command.type ?? 'request')} aborted`, 'aborted')))
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      // AbortSignal does not invoke a listener added after the signal became
+      // aborted. Re-check after registration so a prompt cannot slip into a
+      // child after its owning run has already been cancelled.
+      if (options.signal?.aborted) {
+        onAbort()
+        return
+      }
+      const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => settle(() => reject(new BackendError(
+          `pi RPC ${String(command.type ?? 'request')} timed out after ${timeoutMs}ms`,
+          'timeout',
+        ))), timeoutMs)
+        timer.unref?.()
+      }
+      try {
+        if (settled) return
+        this.write(wireCommand)
+      } catch (error) {
+        settle(() => reject(error instanceof Error ? error : new Error(String(error))))
+        this.end(error instanceof Error ? error : new Error(String(error)))
+      }
+    })
+  }
+
+  private write(value: Record<string, unknown>): void {
+    if (!this.child.stdin || this.closed) throw new Error('pi RPC stdin is closed')
+    this.child.stdin.write(`${JSON.stringify(value)}\n`)
+  }
+
+  private consume(chunk: string): void {
+    this.buffer += chunk
+    while (true) {
+      const newline = this.buffer.indexOf('\n')
+      if (newline < 0) return
+      const line = this.buffer.slice(0, newline).trim()
+      this.buffer = this.buffer.slice(newline + 1)
+      if (!line) continue
+      let value: unknown
+      try { value = JSON.parse(line) } catch { continue }
+      const message = record(value)
+      if (!message) continue
+      const id = message.id as string | number | undefined
+      if (message.type === 'response' && id !== undefined && this.pending.has(id)) {
+        const waiter = this.pending.get(id)!
+        this.pending.delete(id)
+        if (message.success === false) waiter.reject(new Error(String(message.error ?? 'pi RPC command failed')))
+        else waiter.resolve(message as PiRpcResponse)
+        continue
+      }
+      this.eventSequence += 1
+      this.observeInteractionMarker(message)
+      const waiter = this.waiters.shift()
+      if (waiter) waiter.resolve(message)
+      else this.queue.push(message)
+    }
+  }
+
+  private waitForMarkerAfter(marker: string, afterSequence: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this.closed) {
+        reject(this.childError ?? new Error('pi RPC process closed'))
+        return
+      }
+      const waiter: PiMarkerWaiter = { marker, afterSequence, resolve, reject }
+      const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : 30_000
+      waiter.timer = setTimeout(() => {
+        this.markerWaiters.delete(waiter)
+        reject(new BackendError(
+          `pi RPC interaction response produced no exact marker after ${timeoutMs}ms`,
+          'timeout',
+        ))
+      }, timeoutMs)
+      waiter.timer.unref?.()
+      this.markerWaiters.add(waiter)
+    })
+  }
+
+  private observeInteractionMarker(message: Record<string, unknown>): void {
+    if (message.type === 'extension_ui_request' && message.method === 'select') {
+      const id = typeof message.id === 'string' ? message.id : null
+      const token = typeof message.title === 'string' ? piPermissionTokenFromTitle(message.title) : null
+      if (id && token) this.interactionMarkers.set(id, token)
+    }
+    if (message.type !== 'extension_ui_request' || message.method !== 'notify' || typeof message.message !== 'string') return
+    for (const waiter of this.markerWaiters) {
+      if (this.eventSequence <= waiter.afterSequence || message.message !== waiter.marker) continue
+      this.markerWaiters.delete(waiter)
+      if (waiter.timer) clearTimeout(waiter.timer)
+      waiter.resolve()
+    }
+  }
+
+  private nextEvent(signal: AbortSignal): Promise<Record<string, unknown>> {
+    if (signal.aborted) return Promise.reject(new Error('pi native turn aborted'))
+    const queued = this.queue.shift()
+    if (queued) return Promise.resolve(queued)
+    if (this.closed) return Promise.reject(this.childError ?? new Error('pi RPC process closed'))
+    return new Promise((resolve, reject) => {
+      const onAbort = (): void => {
+        const index = this.waiters.findIndex(waiter => waiter.resolve === resolve)
+        if (index >= 0) this.waiters.splice(index, 1)
+        signal.removeEventListener('abort', onAbort)
+        reject(new Error('pi native turn aborted'))
+      }
+      this.waiters.push({
+        resolve: value => { signal.removeEventListener('abort', onAbort); resolve(value) },
+        reject: error => { signal.removeEventListener('abort', onAbort); reject(error) },
+      })
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  private end(error: Error): void {
+    const firstClose = !this.closed
+    if (firstClose) this.closed = true
+    this.childError ??= error
+    for (const waiter of this.waiters.splice(0)) waiter.reject(this.childError)
+    for (const [id, waiter] of this.pending) {
+      this.pending.delete(id)
+      waiter.reject(this.childError)
+    }
+    for (const waiter of this.markerWaiters) {
+      this.markerWaiters.delete(waiter)
+      if (waiter.timer) clearTimeout(waiter.timer)
+      waiter.reject(this.childError)
+    }
+    this.interactionMarkers.clear()
+    const cleanup = this.startCleanup()
+    if (firstClose) {
+      for (const listener of [...this.closeListeners]) {
+        try {
+          listener(this.childError)
+        } catch {
+          // A session owner cannot break child cleanup.
+        }
+      }
+      this.closeListeners.clear()
+    }
+    void cleanup.catch(cleanupError => {
+      this.childError ??= cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError))
+    })
+  }
+
+  private startCleanup(): Promise<void> {
+    if (this.closing) return this.closing
+    const attempt = (async () => {
+      await this.terminate()
+      const failures: unknown[] = []
+      try {
+        this.cleanup()
+      } catch (error) {
+        failures.push(error)
+        retryCleanupUntilSuccessful(this.cleanup)
+      }
+      try { this.release() } catch (error) { failures.push(error) }
+      if (failures.length === 1) throw failures[0]
+      if (failures.length > 1) throw new AggregateError(failures, 'pi native session cleanup failed')
+    })()
+    this.closing = attempt
+    void attempt.catch(() => {
+      if (this.closing === attempt) this.closing = null
+    })
+    return attempt
   }
 }
 
@@ -750,6 +1566,12 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined
+}
+
+function boundedPiId(candidate: string): string {
+  const trimmed = candidate.trim()
+  if (trimmed.length > 0 && trimmed.length <= 512) return trimmed
+  return `id:${canonicalCandidateDigest(candidate).slice('sha256:'.length)}`
 }
 
 /**
