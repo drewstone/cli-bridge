@@ -53,8 +53,10 @@ export interface CodexBackendOptions {
 
 export class CodexBackend implements Backend {
   readonly name = 'codex'
+  readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
   constructor(private readonly opts: CodexBackendOptions) {
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? scopedHostSpawner
   }
 
@@ -163,8 +165,7 @@ export class CodexBackend implements Backend {
     const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
-    // Group-kill on timeout/abort — see backends/opencode.ts.
-    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.opts.timeoutMs)
+    // The durable run owns the deadline and delivers it through this signal.
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -239,7 +240,6 @@ export class CodexBackend implements Backend {
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree — codex spawns sub-processes for MCP
       // tool calls, model HTTP I/O, etc. and we owe them a clean exit.

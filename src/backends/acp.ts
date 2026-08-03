@@ -33,7 +33,7 @@ export interface AcpBackendOptions {
   bin: string
   /** Subcommand args that start the ACP server. Default ['acp']. */
   acpArgs?: string[]
-  /** Per-request wall cap (ms). */
+  /** Operator fallback when the caller omits `execution.timeoutMs`; zero means none. */
   timeoutMs: number
   /** Subprocess spawner; defaults to the scoped host spawner. */
   spawner?: Spawner
@@ -68,16 +68,16 @@ function renderPrompt(messages: ChatMessage[]): string {
 
 export class AcpBackend implements Backend {
   readonly name: string
+  readonly defaultExecutionTimeoutMs: number
   private readonly bin: string
   private readonly acpArgs: string[]
-  private readonly timeoutMs: number
   private readonly spawner: Spawner
 
   constructor(opts: AcpBackendOptions) {
     this.name = opts.name
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.bin = opts.bin
     this.acpArgs = opts.acpArgs ?? ['acp']
-    this.timeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? scopedHostSpawner
   }
 
@@ -135,7 +135,6 @@ export class AcpBackend implements Backend {
     let spawnErrorMessage = spawned.spawnError?.()?.message ?? ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
 
-    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.timeoutMs)
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -225,7 +224,6 @@ export class AcpBackend implements Backend {
         await new Promise<void>((resolve) => { wake = () => { wake = null; resolve() } })
       }
     } finally {
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       await terminateSpawned(spawned)
       release()

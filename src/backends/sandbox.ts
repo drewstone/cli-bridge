@@ -34,7 +34,7 @@ export interface SandboxBackendOptions {
   apiUrl: string
   /** Bearer token for sandbox-api. */
   apiKey: string
-  /** Per-task timeout in ms forwarded to sandbox-api. */
+  /** Operator fallback when the caller omits `execution.timeoutMs`; zero means none. */
   timeoutMs: number
   /** Profile resolver — returns the AgentProfile for a cataloged id, or null if unknown. */
   resolveProfile: (id: string) => AgentProfile | null
@@ -51,8 +51,11 @@ const PREFIX = `${HARNESS}/`
 
 export class SandboxBackend implements Backend {
   readonly name = HARNESS
+  readonly defaultExecutionTimeoutMs: number
 
-  constructor(private readonly opts: SandboxBackendOptions) {}
+  constructor(private readonly opts: SandboxBackendOptions) {
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
+  }
 
   matches(model: string): boolean {
     const m = model.toLowerCase()
@@ -96,11 +99,12 @@ export class SandboxBackend implements Backend {
       : 'opencode'
 
     const sandboxOpts = req.execution?.kind === 'sandbox' ? req.execution : null
+    const timeoutMs = req.execution?.timeoutMs ?? this.defaultExecutionTimeoutMs
 
     const requestBody = {
-      tasks: [{ id: taskId, message, timeoutMs: this.opts.timeoutMs }],
+      tasks: [{ id: taskId, message, ...(timeoutMs > 0 ? { timeoutMs } : {}) }],
       backend: { type: backendType, profile },
-      timeoutMs: this.opts.timeoutMs,
+      ...(timeoutMs > 0 ? { timeoutMs } : {}),
       scalingMode: 'balanced' as const,
       persistent: Boolean(session),
       // Sandbox provisioning hints from execution.* — sandbox-api

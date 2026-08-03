@@ -29,7 +29,7 @@ export interface NanoclawBackendOptions {
   name?: string
   /** Unix socket path of the running daemon's CLI channel (NanoClaw `data/cli.sock`). */
   socketPath: string
-  /** Hard per-request cap (ms). */
+  /** Operator fallback when the caller omits `execution.timeoutMs`; zero means none. */
   timeoutMs: number
   /** Quiet period after the first reply that ends the turn (NanoClaw has no done event;
    *  see scripts/chat.ts, default 2s there). Default 3000ms. */
@@ -45,14 +45,14 @@ function renderPrompt(messages: ChatMessage[]): string {
 
 export class NanoclawBackend implements Backend {
   readonly name: string
+  readonly defaultExecutionTimeoutMs: number
   private readonly socketPath: string
-  private readonly timeoutMs: number
   private readonly silenceMs: number
 
   constructor(opts: NanoclawBackendOptions) {
     this.name = opts.name ?? 'nanoclaw'
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.socketPath = opts.socketPath
-    this.timeoutMs = opts.timeoutMs
     this.silenceMs = opts.silenceMs ?? 3000
   }
 
@@ -98,7 +98,6 @@ export class NanoclawBackend implements Backend {
       silenceTimer = setTimeout(() => finish('stop'), this.silenceMs)
     }
 
-    const hardTimer = setTimeout(() => finish('timeout'), this.timeoutMs)
     const onAbort = (): void => { pendingError = new BackendError('nanoclaw request aborted', 'upstream'); try { socket.destroy() } catch { /* ignore */ } wake?.() }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -137,7 +136,6 @@ export class NanoclawBackend implements Backend {
         await new Promise<void>((resolve) => { wake = () => { wake = null; resolve() } })
       }
     } finally {
-      clearTimeout(hardTimer)
       if (silenceTimer) clearTimeout(silenceTimer)
       signal.removeEventListener('abort', onAbort)
       try { socket.destroy() } catch { /* ignore */ }

@@ -136,6 +136,7 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 - `agent_profile`: full `AgentProfile` object
 - `mcp`: standardised MCP server passthrough (see [MCP passthrough](#mcp-passthrough))
 - `run_id`: caller-owned durable job id (also accepted as `X-Run-Id`)
+- `execution`: execution location plus an optional caller-owned `timeoutMs` process deadline
 
 Behavior:
 
@@ -172,6 +173,12 @@ curl http://127.0.0.1:3344/v1/chat/completions \
 Once accepted, a chat job belongs to the bridge process rather than to the HTTP connection that dispatched it.
 Closing an SSE response detaches that reader and does not cancel the backend CLI process.
 Only `POST /v1/runs/:id/cancel` sends the backend abort signal.
+
+Set `execution.timeoutMs` to a positive integer up to `2147483647` to bound the backend process in milliseconds.
+The deadline belongs to the durable run, so disconnecting and replaying do not stop or restart it.
+If the field is omitted, the matching backend's timeout environment setting is an operator fallback; all timeout fallbacks default to `0`, which means no deadline.
+An explicit request value always wins over that fallback and is also forwarded to sandbox tasks and the OpenCode wrapper.
+`CLI_BRIDGE_SCOPE_RUNTIME_MAX_SEC` and `BRIDGE_SLOT_MAX_HOLD_MS` are separate operator safety caps; both default to disabled and may preempt a longer request only when an operator explicitly configures them.
 
 Supply `run_id` in the body or `X-Run-Id` in the header to make dispatch idempotent.
 If both are present they must match.

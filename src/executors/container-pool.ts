@@ -20,8 +20,8 @@
  *      `acquireDeadlineMs` (default 60s) rejects with `acquire timeout`.
  *      Env: BRIDGE_POOL_ACQUIRE_DEADLINE_MS.
  *
- *   4. Slot-hold watchdog — every acquired slot must release within
- *      `slotMaxHoldMs` (default 10min). If not, the slot is recycled
+ *   4. Optional slot-hold watchdog — when an operator configures
+ *      `slotMaxHoldMs`, every acquired slot must release within it. If not, the slot is recycled
  *      (container `docker rm -f` + reprovision) and the holder's release
  *      becomes a no-op. Defends against a CLI inside the container that
  *      wedges forever and starves the pool from the inside.
@@ -112,7 +112,7 @@ export interface ContainerPoolOptions {
   maxQueueDepth?: number
   /** Per-acquire deadline in ms. Default 60_000. */
   acquireDeadlineMs?: number
-  /** Per-slot-hold deadline in ms. Default 600_000 (10min). */
+  /** Optional operator safety cap for one slot hold. Zero disables it (default). */
   slotMaxHoldMs?: number
   /** Consecutive provision failures that take a slot permanently out. Default 3. */
   maxConsecutiveFailures?: number
@@ -192,7 +192,7 @@ interface SlotState {
 
 const DEFAULTS = {
   ACQUIRE_DEADLINE_MS: 60_000,
-  SLOT_MAX_HOLD_MS: 600_000,
+  SLOT_MAX_HOLD_MS: 0,
   MAX_CONSECUTIVE_FAILURES: 3,
   LIVENESS_TTL_MS: 30_000,
 }
@@ -511,14 +511,16 @@ export class ContainerPool {
     slot.generation += 1
     const generationAtAcquire = slot.generation
     if (sessionId) slot.lastSession = sessionId
-    // Slot-hold watchdog: if the holder doesn't release within
-    // slotMaxHoldMs, recycle the slot. The release() closure binds to
-    // generationAtAcquire so a late release becomes a no-op.
-    slot.holdTimer = setTimeout(() => {
-      if (slot.generation !== generationAtAcquire) return
-      this.counters.slot_force_releases += 1
-      this.recycleSlot(slot).catch(() => {/* swallowed; counters track it */})
-    }, this.slotMaxHoldMs).unref()
+    // An operator may impose a pool safety cap independently from a caller's
+    // execution deadline. With the default zero, the caller or explicit run
+    // cancellation owns process lifetime.
+    slot.holdTimer = this.slotMaxHoldMs > 0
+      ? setTimeout(() => {
+          if (slot.generation !== generationAtAcquire) return
+          this.counters.slot_force_releases += 1
+          this.recycleSlot(slot).catch(() => {/* swallowed; counters track it */})
+        }, this.slotMaxHoldMs).unref()
+      : null
     return {
       containerId: slot.containerId,
       slotIndex: slot.index,

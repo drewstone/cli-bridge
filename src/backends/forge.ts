@@ -18,7 +18,10 @@ export interface ForgeBackendOptions {
 
 export class ForgeBackend implements Backend {
   readonly name = 'forge'
-  constructor(private readonly opts: ForgeBackendOptions) {}
+  readonly defaultExecutionTimeoutMs: number
+  constructor(private readonly opts: ForgeBackendOptions) {
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
+  }
 
   matches(model: string): boolean {
     const m = model.toLowerCase()

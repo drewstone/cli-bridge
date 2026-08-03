@@ -15,7 +15,11 @@
  * integration path is covered by tests/docker-executor.test.ts.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest'
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 async function waitFor(predicate: () => void, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -164,6 +168,33 @@ describe('container pool — snapshot + counters', async () => {
     expect(typeof snap.slot_reprovisions).toBe('number')
     expect(typeof snap.slots_marked_dead).toBe('number')
     expect(typeof snap.slot_liveness_recoveries).toBe('number')
+    await pool.destroy()
+  })
+
+  it('does not silently recycle a live slot when no operator hold cap is configured', async () => {
+    vi.useFakeTimers()
+    const { ContainerPool } = await import('../src/executors/container-pool.js')
+    const pool = await ContainerPool.create({
+      size: 1,
+      image: 'fake',
+      namePrefix: 'cli-bridge-timeout-test',
+      oauthMode: 'share',
+      shareMounts: [],
+      cli: async (args) => ({
+        code: 0,
+        stdout: args.includes('run') ? 'fakeid-no-hold-cap' : '',
+        stderr: '',
+      }),
+    })
+    const slot = await pool.acquire()
+
+    await vi.advanceTimersByTimeAsync(600_001)
+    expect(pool.snapshot()).toMatchObject({
+      in_flight: 1,
+      slot_force_releases: 0,
+    })
+
+    slot.release()
     await pool.destroy()
   })
 })

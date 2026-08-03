@@ -115,16 +115,16 @@ export interface ClaudeBackendOptions {
 
 export class ClaudeBackend implements Backend {
   readonly name: string
+  readonly defaultExecutionTimeoutMs: number
   private readonly bin: string
-  private readonly timeoutMs: number
   private readonly anthropicBaseUrl: string | null
   private readonly prefix: string
   private readonly spawner: Spawner
 
   constructor(opts: ClaudeBackendOptions) {
     this.name = opts.harness ?? 'claude'
+    this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.bin = opts.bin
-    this.timeoutMs = opts.timeoutMs
     this.anthropicBaseUrl = opts.anthropicBaseUrl ?? null
     this.prefix = `${this.name}/`
     this.spawner = opts.spawner ?? scopedHostSpawner
@@ -234,7 +234,6 @@ export class ClaudeBackend implements Backend {
 
     // Tear down the whole process group (claude + every MCP/tool fork
     // it owns). See backends/opencode.ts for rationale.
-    const timeoutHandle = setTimeout(() => { void terminateSpawned(spawned) }, this.timeoutMs)
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
 
@@ -351,7 +350,6 @@ export class ClaudeBackend implements Backend {
 
       yield { finish_reason: 'stop', internal_session_id: internalSessionId }
     } finally {
-      clearTimeout(timeoutHandle)
       signal.removeEventListener('abort', onAbort)
       // Always tear down the whole subtree before releasing the slot.
       // Reaps MCP servers and tool sub-processes claude spawned. Pre-fix
