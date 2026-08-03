@@ -82,8 +82,7 @@ export class GeminiBackend implements Backend {
     )
     args.push(...provisioned.flags)
 
-    // Materialize MCP servers (request-body `mcp.mcpServers` ∪
-    // `agent_profile.mcp`) into the project-scope `<cwd>/.gemini/settings.json`.
+    // Materialize the one selected MCP source into `<cwd>/.gemini/settings.json`.
     // Gemini CLI has no per-invocation MCP flag — it discovers MCP by cwd,
     // layering the project settings over the user's global ones. Cleanup in
     // the outer finally restores the workspace so it never leaks. Fail-loud:

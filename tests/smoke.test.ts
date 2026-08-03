@@ -581,7 +581,7 @@ describe('POST /v1/chat/completions', () => {
       profile_materialization?: { workspacePlanDigest?: string; files?: unknown[] }
     }
     expect(body.profile_materialization).toMatchObject({
-      workspacePlanDigest: 'a'.repeat(64),
+      workspacePlanDigest: `sha256:${'a'.repeat(64)}`,
       files: [{ path: '.agent/skill.md', mode: 0o644 }],
     })
 
@@ -592,7 +592,7 @@ describe('POST /v1/chat/completions', () => {
     })
     const text = await streaming.text()
     expect(text.match(/"profile_materialization"/gu)).toHaveLength(1)
-    expect(text).toContain('"workspacePlanDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"')
+    expect(text).toContain(`"workspacePlanDigest":"sha256:${'a'.repeat(64)}"`)
     expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
   })
 
@@ -868,7 +868,6 @@ describe('POST /v1/chat/completions', () => {
     const profile = {
       name: 'local-coder',
       prompt: { systemPrompt: 'Be surgical.' },
-      skills: ['critical-audit'],
     }
     await app.request('/v1/chat/completions', {
       method: 'POST',
@@ -960,7 +959,7 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     expect(args[effortIndex + 1]).toBe('xhigh')
   })
 
-  it('uses AgentProfile effort and lets an explicit request override it', () => {
+  it('uses AgentProfile effort and rejects an out-of-profile override', () => {
     const profileRequest = {
       ...baseReq,
       agent_profile: { model: { reasoningEffort: 'xhigh' } } as const,
@@ -969,9 +968,8 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     expect(profileArgs.slice(profileArgs.indexOf('--effort'), profileArgs.indexOf('--effort') + 2))
       .toEqual(['--effort', 'xhigh'])
 
-    const overrideArgs = b.buildArgs({ ...profileRequest, effort: 'low' }, null, 'byob')
-    expect(overrideArgs.slice(overrideArgs.indexOf('--effort'), overrideArgs.indexOf('--effort') + 2))
-      .toEqual(['--effort', 'low'])
+    expect(() => b.buildArgs({ ...profileRequest, effort: 'low' }, null, 'byob'))
+      .toThrow(/conflicts with agent_profile/)
   })
 
   it('uses effort from a resumed session AgentProfile', () => {
@@ -985,7 +983,10 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
       lastUsedAt: 1,
       metadata: { agent_profile: { model: { reasoningEffort: 'high' } } },
     }
-    const args = b.buildArgs(baseReq, session, 'byob')
+    // A ChatRequest snapshots its profile source on first read. A resumed turn
+    // is a fresh request object; mutating the session beside an already-read
+    // request must not change its execution identity.
+    const args = b.buildArgs({ ...baseReq }, session, 'byob')
     expect(args.slice(args.indexOf('--effort'), args.indexOf('--effort') + 2))
       .toEqual(['--effort', 'high'])
   })

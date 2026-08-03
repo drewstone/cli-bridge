@@ -94,8 +94,7 @@ export class OpencodeBackend implements Backend {
       profileExecutionIdentity(req, session, 'opencode', variant),
     )
 
-    // Materialize MCP servers (request-body `mcp.mcpServers` ∪
-    // `agent_profile.mcp`) into a temp opencode-shape config file.
+    // Materialize the one selected MCP source into a temporary OpenCode config.
     // opencode-cli has no per-invocation `--mcp-config-file` flag —
     // config layering is the only inline injection point. We set
     // OPENCODE_CONFIG to the temp file path; opencode loads it on top

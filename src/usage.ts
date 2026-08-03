@@ -10,6 +10,8 @@
 import type { ChatDelta } from './backends/types.js'
 
 export interface CollectedUsage {
+  /** True after at least one token-bearing receipt; cost-only receipts do not affect completeness. */
+  hasTokenUsage: boolean
   inputTokens: number
   inputTokensKnown: boolean
   freshInputTokens: number
@@ -52,6 +54,7 @@ export function addUsage(
     || nonnegativeFinite(next.cache_read_input_tokens)
     || nonnegativeFinite(next.cache_write_input_tokens)
     || nonnegativeFinite(next.output_tokens)
+  const hadTokenReceipt = current?.hasTokenUsage ?? false
   const trustedProvenance = next.cost_provenance === 'provider-receipt'
     || next.cost_provenance === 'billing-receipt'
     ? next.cost_provenance
@@ -67,25 +70,26 @@ export function addUsage(
       ? next.estimated_cost
       : undefined
   return {
+    hasTokenUsage: hadTokenReceipt || hasTokenReceipt,
     inputTokens: (current?.inputTokens ?? 0) + finiteTokenCount(next.input_tokens),
     inputTokensKnown: hasTokenReceipt
-      ? (current?.inputTokensKnown ?? true) && nonnegativeFinite(next.input_tokens)
+      ? (!hadTokenReceipt || current?.inputTokensKnown === true) && nonnegativeFinite(next.input_tokens)
       : current?.inputTokensKnown ?? false,
     freshInputTokens: (current?.freshInputTokens ?? 0) + finiteTokenCount(next.fresh_input_tokens),
     freshInputTokensKnown: hasTokenReceipt
-      ? (current?.freshInputTokensKnown ?? true) && nonnegativeFinite(next.fresh_input_tokens)
+      ? (!hadTokenReceipt || current?.freshInputTokensKnown === true) && nonnegativeFinite(next.fresh_input_tokens)
       : current?.freshInputTokensKnown ?? false,
     cacheReadInputTokens: (current?.cacheReadInputTokens ?? 0) + finiteTokenCount(next.cache_read_input_tokens),
     cacheReadInputTokensKnown: hasTokenReceipt
-      ? (current?.cacheReadInputTokensKnown ?? true) && nonnegativeFinite(next.cache_read_input_tokens)
+      ? (!hadTokenReceipt || current?.cacheReadInputTokensKnown === true) && nonnegativeFinite(next.cache_read_input_tokens)
       : current?.cacheReadInputTokensKnown ?? false,
     cacheWriteInputTokens: (current?.cacheWriteInputTokens ?? 0) + finiteTokenCount(next.cache_write_input_tokens),
     cacheWriteInputTokensKnown: hasTokenReceipt
-      ? (current?.cacheWriteInputTokensKnown ?? true) && nonnegativeFinite(next.cache_write_input_tokens)
+      ? (!hadTokenReceipt || current?.cacheWriteInputTokensKnown === true) && nonnegativeFinite(next.cache_write_input_tokens)
       : current?.cacheWriteInputTokensKnown ?? false,
     outputTokens: (current?.outputTokens ?? 0) + finiteTokenCount(next.output_tokens),
     outputTokensKnown: hasTokenReceipt
-      ? (current?.outputTokensKnown ?? true) && nonnegativeFinite(next.output_tokens)
+      ? (!hadTokenReceipt || current?.outputTokensKnown === true) && nonnegativeFinite(next.output_tokens)
       : current?.outputTokensKnown ?? false,
     cost: totalCost ? (trustedCost ?? 0) : (current?.cost ?? 0) + (trustedCost ?? 0),
     costComplete: totalCost

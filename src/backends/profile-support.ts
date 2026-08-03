@@ -368,9 +368,42 @@ export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | n
   const raw = req.agent_profile && typeof req.agent_profile === 'object'
     ? req.agent_profile
     : session?.metadata?.agent_profile
-  const profile = raw && typeof raw === 'object' ? snapshotAgentProfile(raw) : null
+  let profile: AgentProfile | null = null
+  if (raw && typeof raw === 'object') {
+    try {
+      profile = snapshotAgentProfile(raw)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new BackendError(`invalid agent_profile: ${message}`, 'parse_error', error)
+    }
+  }
   profileSnapshots.set(req, profile)
-  if (profile) req.agent_profile = profile
+  if (profile) {
+    req.agent_profile = profile
+  }
+  return profile
+}
+
+/** Reject any second behavioral authority beside an exact AgentProfile. */
+export function assertProfileRequestAuthority(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): AgentProfile | null {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return null
+  if (Object.keys(req.mcp?.mcpServers ?? {}).length > 0) {
+    throw new BackendError(
+      'request mcp cannot accompany agent_profile; declare the exact MCP servers in agent_profile.mcp',
+      'parse_error',
+    )
+  }
+  if (req.messages.some((message) => message.role === 'system')) {
+    throw new BackendError(
+      'system-role messages cannot accompany agent_profile; declare standing instructions in agent_profile.prompt',
+      'parse_error',
+    )
+  }
+  resolveRequestedReasoningEffort(req, session)
   return profile
 }
 
@@ -396,7 +429,7 @@ export function profileExecutionIdentity(
   harness: HarnessId,
   appliedReasoningEffort: string | null,
 ): ProfileExecutionIdentity {
-  const profile = resolveAgentProfile(req, session)
+  const profile = assertProfileRequestAuthority(req, session)
   if (profile) assertExactProfileRequest(req, profile, harness)
   const wireModel = modelWithinHarness(req.model, harness)
   const slash = wireModel.indexOf('/')
@@ -453,18 +486,6 @@ function assertExactProfileRequest(
     }
   }
 
-  if (Object.keys(req.mcp?.mcpServers ?? {}).length > 0) {
-    throw new BackendError(
-      'request mcp cannot accompany agent_profile; declare the exact MCP servers in agent_profile.mcp',
-      'parse_error',
-    )
-  }
-  if (req.messages.some((message) => message.role === 'system')) {
-    throw new BackendError(
-      'system-role messages cannot accompany agent_profile; declare standing instructions in agent_profile.prompt',
-      'parse_error',
-    )
-  }
 }
 
 function modelWithinHarness(model: string, harness: HarnessId): string {
@@ -484,10 +505,9 @@ function modelWithinHarness(model: string, harness: HarnessId): string {
 }
 
 /**
- * Merge request-body `mcp.mcpServers` and `agent_profile.mcp` into a
- * single normalized map keyed by server name. Request-body wins on
- * name collisions — caller's per-turn intent overrides profile
- * defaults.
+ * Normalize the one authoritative MCP source. A request without an
+ * AgentProfile may use body/header `mcp.mcpServers`; an exact profile must put
+ * every server in `agent_profile.mcp`, and a second channel is refused.
  *
  * Returns `null` when neither source supplies any entries. Callers
  * that need a non-null result (e.g. opencode, which always writes a
@@ -503,24 +523,24 @@ export function resolveMcpServers(
   const merged: Record<string, McpServerSpec> = {}
 
   const profile = resolveAgentProfile(req, session)
+  const requestMcp = req.mcp?.mcpServers
+  if (profile && Object.keys(requestMcp ?? {}).length > 0) {
+    throw new BackendError(
+      'request mcp cannot accompany agent_profile; declare the exact MCP servers in agent_profile.mcp',
+      'parse_error',
+    )
+  }
   if (profile && typeof profile === 'object') {
     const profileMcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
     if (profileMcp && typeof profileMcp === 'object') {
-      const overriddenByRequest = new Set(Object.keys(req.mcp?.mcpServers ?? {}))
       for (const [name, raw] of Object.entries(profileMcp)) {
         if (!name || !raw || typeof raw !== 'object') continue
-        // An entry the request replaces below, and an entry explicitly disabled, are both dropped
-        // before anything reads them. Converting them anyway would let a value nobody uses turn a
-        // working request into a hard 400 — the validation must follow the value into use, not
-        // stand in front of entries that never get there.
-        if (overriddenByRequest.has(name)) continue
         if ((raw as { enabled?: unknown }).enabled === false) continue
         merged[name] = profileMcpToSpec(raw, name)
       }
     }
   }
 
-  const requestMcp = req.mcp?.mcpServers
   if (requestMcp && typeof requestMcp === 'object') {
     for (const [name, raw] of Object.entries(requestMcp)) {
       if (!name || !raw || typeof raw !== 'object') continue
@@ -622,8 +642,8 @@ function normalizeMcpServerSpec(
   const out: McpServerSpec = {}
   if (r.type === 'stdio' || r.type === 'http' || r.type === 'sse') out.type = r.type
   if (typeof r.command === 'string') out.command = r.command
-  // A request-body server WINS over a profile server of the same name, so this path decides the
-  // bytes that reach argv and the on-disk MCP config. It used to drop every non-string silently,
+  // A profile-less request owns these bytes all the way to argv/on-disk MCP config. This path used
+  // to drop every non-string silently,
   // which turned a secret-ref in `args` into a SHORTER command line and a server that spawned
   // wrong for a reason nothing reported. Same refusal as the profile path, same reason.
   const where = `mcp.mcpServers[${JSON.stringify(name)}]`

@@ -120,7 +120,7 @@ export class CodexBackend implements Backend {
     // MCP server passthrough — codex has no `--mcp-config` flag.
     // Servers are loaded from `$CODEX_HOME/config.toml`'s
     // `[mcp_servers.<name>]` stanzas. We synthesise a temp HOME
-    // containing the merged servers and copy the user's persistent
+    // containing the selected servers and copy the user's persistent
     // `auth.json` so the spawned codex still authenticates as the
     // operator. Cleanup runs in the outer finally so the temp dir
     // doesn't leak on subprocess crash.
@@ -129,7 +129,7 @@ export class CodexBackend implements Backend {
       resolveCodexAuthPath(),
     )
 
-    // When MCP passthrough is active, the synthetic CODEX_HOME (merged MCP config
+    // When MCP passthrough is active, the synthetic CODEX_HOME (selected MCP config
     // + copied auth) is the source of truth. Register it as the jail's codex auth
     // source so a CONFINED run gets it surfaced inside the jail with CODEX_HOME
     // redirected there. The jail applies this only when it actually wraps; on

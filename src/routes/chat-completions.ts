@@ -49,6 +49,7 @@ import { BackendReportedFailureError } from '../runs/error-shape.js'
 import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
 import {
+  assertProfileRequestAuthority,
   resolveAgentProfile,
   resolveRequestedReasoningEffort,
 } from '../backends/profile-support.js'
@@ -375,10 +376,10 @@ export function mountChatCompletions(
       resume_id: _bodyResumeId,
       ...rest
     } = parsed.data
-    // MCP can arrive in the body OR the `X-Mcp-Config` header. Body
-    // wins on conflict — header is for callers that can't extend the
-    // request body (e.g. forwarding through a third-party gateway that
-    // strips unknown JSON fields).
+    // Without an exact AgentProfile, MCP can arrive in the body OR the
+    // `X-Mcp-Config` header and the body wins on conflict. When a profile is
+    // present, any body/header MCP is refused before execution; the profile is
+    // the only behavioral authority.
     const mcpHeader = parseMcpHeader(c.req.header('x-mcp-config'))
     const mergedMcp = mergeMcpInputs(mcpHeader, bodyMcp as ChatRequest['mcp'] | undefined)
     const req: ChatRequest = {
@@ -501,6 +502,7 @@ export function mountChatCompletions(
       if (!req.cwd && session?.cwd) {
         req.cwd = session.cwd
       }
+      assertProfileRequestAuthority(req, session)
       const sessionProfileBinding = exactSessionProfileBinding(req, session)
       if (session) {
         assertSessionProfileBinding(session, sessionProfileBinding)
@@ -1071,6 +1073,9 @@ function errorResponse(c: Context, err: unknown): Response {
     return c.json({ error: { message: err.message, type: err.code } }, err.code === 'timeout' ? 504 : 502)
   }
   if (err instanceof BackendError) {
+    if (err.code === 'parse_error') {
+      return c.json({ error: { message: err.message, type: err.code } }, 400)
+    }
     // Hono's typed status gate treats 499 as an unofficial code; collapse
     // that one to 504 and keep the rest as documented codes.
     const status: 500 | 501 | 502 | 503 | 504 =

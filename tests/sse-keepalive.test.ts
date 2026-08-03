@@ -75,6 +75,7 @@ describe('deltaToOpenAIChunk', () => {
       prompt_tokens: 100,
       completion_tokens: 13,
       total_tokens: 113,
+      cost_known: false,
       estimated: true,
     })
   })
@@ -108,6 +109,8 @@ describe('collectNonStreaming', () => {
           input_tokens: 0,
           output_tokens: 0,
           cost: 0.005,
+          cost_known: true,
+          cost_provenance: 'provider-receipt',
           cost_scope: 'total',
         },
       }
@@ -127,6 +130,9 @@ describe('collectNonStreaming', () => {
       completion_tokens: 55,
       total_tokens: 395,
       cost: 0.005,
+      cost_known: true,
+      cost_provenance: 'provider-receipt',
+      cost_scope: 'total',
     })
   })
 
@@ -145,6 +151,106 @@ describe('collectNonStreaming', () => {
       prompt_tokens: 340,
       completion_tokens: 55,
       total_tokens: 395,
+      cost_known: false,
+      cost_scope: 'total',
+    })
+  })
+
+  it('preserves cache dimensions and leaves a mixed present/missing split unknown', async () => {
+    async function* deltas(): AsyncIterable<ChatDelta> {
+      yield {
+        usage: {
+          input_tokens: 110,
+          fresh_input_tokens: 10,
+          cache_read_input_tokens: 100,
+          cache_write_input_tokens: 0,
+          output_tokens: 4,
+        },
+      }
+      yield { usage: { input_tokens: 20, output_tokens: 2 } }
+      yield { finish_reason: 'stop' }
+    }
+
+    const body = await collectNonStreaming(deltas(), 'test') as {
+      usage?: Record<string, unknown>
+    }
+    expect(body.usage).toMatchObject({
+      prompt_tokens: 130,
+      completion_tokens: 6,
+      total_tokens: 136,
+      cost_known: false,
+    })
+    expect(body.usage).not.toHaveProperty('fresh_input_tokens')
+    expect(body.usage).not.toHaveProperty('cache_read_input_tokens')
+    expect(body.usage).not.toHaveProperty('cache_write_input_tokens')
+  })
+
+  it('does not let a cost-only trailer make later complete token counts unknown', async () => {
+    async function* deltas(): AsyncIterable<ChatDelta> {
+      yield {
+        usage: {
+          cost: 0.005,
+          cost_known: true,
+          cost_provenance: 'provider-receipt',
+          cost_scope: 'total',
+        },
+      }
+      yield {
+        usage: {
+          input_tokens: 110,
+          fresh_input_tokens: 10,
+          cache_read_input_tokens: 100,
+          cache_write_input_tokens: 0,
+          output_tokens: 4,
+        },
+      }
+      yield { finish_reason: 'stop' }
+    }
+
+    const body = await collectNonStreaming(deltas(), 'test') as {
+      usage?: Record<string, unknown>
+    }
+    expect(body.usage).toMatchObject({
+      prompt_tokens: 110,
+      fresh_input_tokens: 10,
+      cache_read_input_tokens: 100,
+      cache_write_input_tokens: 0,
+      completion_tokens: 4,
+      total_tokens: 114,
+      cost_known: false,
+    })
+  })
+
+  it('keeps catalog dollars separate from a trusted provider receipt on the stream wire', () => {
+    const catalog = deltaToOpenAIChunk({
+      usage: {
+        estimated_cost: 0,
+        cost_known: false,
+        cost_provenance: 'catalog-estimate',
+        cost_scope: 'total',
+      },
+    }, makeChunkMeta('pi/tangle-router/deepseek-v4-flash'))
+    const provider = deltaToOpenAIChunk({
+      usage: {
+        cost: 0.03,
+        cost_known: true,
+        cost_provenance: 'provider-receipt',
+        cost_scope: 'total',
+      },
+    }, makeChunkMeta('trusted/model'))
+    const catalogUsage = JSON.parse(catalog!.slice(6)).usage as Record<string, unknown>
+    const providerUsage = JSON.parse(provider!.slice(6)).usage as Record<string, unknown>
+
+    expect(catalogUsage).toMatchObject({
+      estimated_cost: 0,
+      cost_known: false,
+      cost_provenance: 'catalog-estimate',
+    })
+    expect(catalogUsage).not.toHaveProperty('cost')
+    expect(providerUsage).toMatchObject({
+      cost: 0.03,
+      cost_known: true,
+      cost_provenance: 'provider-receipt',
     })
   })
 })

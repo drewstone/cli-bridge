@@ -15,9 +15,9 @@
  * MOONSHOT_API_KEY etc. must be set in the bridge's environment (sourced
  * via the kick-script's `.env` chain).
  *
- * MCP: MCP support comes from the `pi-mcp-adapter` extension. When a request
- * carries MCP servers (X-Mcp-Config header, body `mcp.mcpServers`, or
- * `agent_profile.mcp`), the bridge writes a unique request-scoped config and
+ * MCP: MCP support comes from the `pi-mcp-adapter` extension. A profile-less
+ * request may use X-Mcp-Config/body `mcp.mcpServers`; an exact profile uses
+ * `agent_profile.mcp`. The bridge writes the selected set to a unique config and
  * passes it through the adapter's `--mcp-config` flag. Concurrent Pi agents may
  * therefore share a task cwd without sharing control config. If the adapter is NOT
  * installed the request is REJECTED (`not_configured`) instead of
@@ -365,8 +365,7 @@ export class PiBackend implements Backend {
       )
     }
 
-    // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
-    // `agent_profile.mcp`) reach pi-mcp-adapter through its per-process
+    // The single selected MCP source reaches pi-mcp-adapter through its per-process
     // config flag. FAIL-LOUD, not fail-safe: if the caller
     // requested MCP tools pi can't provide, reject the request — a
     // silently tool-less run scores zero for the wrong reason.
@@ -767,7 +766,6 @@ function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['usage']> 
     ...(receipt.cacheRead !== undefined ? { cache_read_input_tokens: receipt.cacheRead } : {}),
     ...(receipt.cacheWrite !== undefined ? { cache_write_input_tokens: receipt.cacheWrite } : {}),
     ...(receipt.output !== undefined ? { output_tokens: receipt.output } : {}),
-    cost_known: false,
   }
 }
 

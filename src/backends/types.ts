@@ -141,7 +141,7 @@ export interface ChatRequest {
    * route boundary to this prompt-side `json_object` directive.
    */
   responseFormat?: { type: 'text' | 'json_object' }
-  /** Optional caller-declared AgentProfile. Sandbox uses it natively; local harnesses honor a prompt/context subset. */
+  /** Optional canonical AgentProfile materialized through the selected harness's native controls. */
   agent_profile?: AgentProfile
   /**
    * Standard MCP server passthrough. Canonical shape mirrors the
@@ -151,9 +151,9 @@ export interface ChatRequest {
    * `CODEX_HOME/config.toml`, opencode `OPENCODE_CONFIG`, kimi
    * `--mcp-config-file`).
    *
-   * When the same server name appears in both `agent_profile.mcp` and
-   * this field, request-body `mcp` wins — caller's explicit intent for
-   * THIS turn overrides any profile default.
+   * This channel is available only when `agent_profile` is absent. With an
+   * exact profile, declare every MCP server in `agent_profile.mcp`; a second
+   * body/header MCP channel is refused before spawn.
    *
    * Also accepted via the `X-Mcp-Config` request header (JSON-encoded
    * same shape) for callers that cannot extend the body.

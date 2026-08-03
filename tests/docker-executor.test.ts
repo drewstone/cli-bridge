@@ -1290,7 +1290,7 @@ function subprocessBackendCases(spawner: Spawner) {
 }
 
 describe('Spawner injection works across all subprocess backends', () => {
-  it('rejects an unsafe profile before materializing MCP secrets or spawning any backend', async () => {
+  it('rejects an unsafe profile before writing profile files or spawning any backend', async () => {
     const root = mkdtempSync(join(tmpdir(), 'cli-bridge-pre-spawn-'))
     const originalTmpdir = process.env.TMPDIR
     const originalPiAdapter = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
@@ -1310,11 +1310,6 @@ describe('Spawner injection works across all subprocess backends', () => {
             model,
             cwd: root,
             messages: [{ role: 'user', content: 'work' }],
-            mcp: {
-              mcpServers: {
-                secret: { command: 'node', env: { TOKEN: 'secret-witness' } },
-              },
-            },
             agent_profile: {
               resources: {
                 skills: [{ kind: 'inline', name: '../../../unsafe', content: 'unsafe' }],
@@ -1709,8 +1704,14 @@ describe('Spawner injection works across all subprocess backends', () => {
     expect(JSON.parse(tool?.arguments ?? '{}')).toEqual({ filePath: '/tmp/hello.txt', content: 'hello' })
     expect(deltas.at(-1)?.usage).toEqual({
       input_tokens: 26945,
+      fresh_input_tokens: 25153,
+      cache_read_input_tokens: 1792,
+      cache_write_input_tokens: 0,
       output_tokens: 100,
-      cost: 0.04437406,
+      estimated_cost: 0.04437406,
+      cost_known: false,
+      cost_provenance: 'catalog-estimate',
+      cost_scope: 'total',
     })
   })
 
@@ -1766,9 +1767,19 @@ describe('Spawner injection works across all subprocess backends', () => {
       new AbortController().signal,
     )) deltas.push(delta)
 
-    const receipt = deltas.at(-1)?.usage as (ChatDelta['usage'] & { cost?: number }) | undefined
-    expect(receipt).toMatchObject({ input_tokens: 190, output_tokens: 32 })
-    expect(receipt?.cost).toBeCloseTo(0.03, 12)
+    const receipt = deltas.at(-1)?.usage
+    expect(receipt).toMatchObject({
+      input_tokens: 190,
+      fresh_input_tokens: 140,
+      cache_read_input_tokens: 38,
+      cache_write_input_tokens: 12,
+      output_tokens: 32,
+      cost_known: false,
+      cost_provenance: 'catalog-estimate',
+      cost_scope: 'total',
+    })
+    expect(receipt?.estimated_cost).toBeCloseTo(0.03, 12)
+    expect(receipt).not.toHaveProperty('cost')
     expect(receipt?.estimated).toBeUndefined()
     expect(deltas.filter((delta) => delta.finish_reason)).toHaveLength(1)
     expect(stub.releaseCalls).toBe(1)
@@ -1817,7 +1828,11 @@ describe('Spawner injection works across all subprocess backends', () => {
 
     expect(deltas.at(-1)?.usage).toEqual({
       input_tokens: 190,
+      fresh_input_tokens: 140,
+      cache_read_input_tokens: 38,
+      cache_write_input_tokens: 12,
       output_tokens: 25,
+      cost_known: false,
     })
   })
 
