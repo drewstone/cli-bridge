@@ -242,9 +242,16 @@ function backendChatWithDeadline(
   request: ChatRequest,
   session: SessionRecord | null,
   runSignal: AbortSignal,
+  receiptTarget: ChatRequest = request,
 ): AsyncIterable<ChatDelta> {
   const timeoutMs = request.execution?.timeoutMs ?? backend.defaultExecutionTimeoutMs ?? 0
-  if (timeoutMs === 0) return backend.chat(request, session, runSignal)
+  if (timeoutMs === 0) {
+    return relayProfileMaterialization(
+      backend.chat(request, session, runSignal),
+      request,
+      receiptTarget,
+    )
+  }
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maxExecutionTimeoutMs) {
     throw new BackendError(
       `${backend.name} execution timeout must be an integer from 1 to ${maxExecutionTimeoutMs}ms`,
@@ -275,7 +282,12 @@ function backendChatWithDeadline(
       }, timeoutMs)
 
       try {
-        for await (const delta of backend.chat(effectiveRequest, session, controller.signal)) {
+        const source = relayProfileMaterialization(
+          backend.chat(effectiveRequest, session, controller.signal),
+          effectiveRequest,
+          receiptTarget,
+        )
+        for await (const delta of source) {
           if (timedOut) throw timeoutError
           yield delta
         }
@@ -286,6 +298,32 @@ function backendChatWithDeadline(
       } finally {
         clearTimeout(timer)
         runSignal.removeEventListener('abort', onRunAbort)
+      }
+    },
+  }
+}
+
+/** Keep a backend-owned acknowledgment attached to the route-owned request across request copies. */
+function relayProfileMaterialization(
+  source: AsyncIterable<ChatDelta>,
+  sourceRequest: ChatRequest,
+  targetRequest: ChatRequest,
+): AsyncIterable<ChatDelta> {
+  const transfer = (): void => {
+    if (sourceRequest.profile_materialization_receipt) {
+      targetRequest.profile_materialization_receipt = sourceRequest.profile_materialization_receipt
+    }
+  }
+  return {
+    async *[Symbol.asyncIterator](): AsyncIterator<ChatDelta> {
+      try {
+        for await (const delta of source) {
+          transfer()
+          yield delta
+        }
+      } finally {
+        // A backend may materialize successfully and then produce no deltas.
+        transfer()
       }
     },
   }
@@ -544,7 +582,13 @@ export function mountChatCompletions(
             sandboxBackendType,
           },
         }
-        makeSource = (run) => backendChatWithDeadline(sandboxBackend, delegatedReq, session, run.signal)
+        makeSource = (run) => backendChatWithDeadline(
+          sandboxBackend,
+          delegatedReq,
+          session,
+          run.signal,
+          req,
+        )
       } else {
         // Host execution: resolve the write-jail spec from execution.jail
         // (host variant) layered over the BRIDGE_JAIL_* env defaults, using
@@ -584,6 +628,7 @@ export function mountChatCompletions(
         [Symbol.asyncIterator]: async function* () {
           let sawUsage = false
           let failed = false
+          let emittedProfileMaterialization = false
           let completionChars = 0
           try {
             for await (const delta of source) {
@@ -614,9 +659,18 @@ export function mountChatCompletions(
                   },
                 })
               }
-              yield delta.finish_reason && req.profile_materialization_receipt
+              const committed = delta.finish_reason && req.profile_materialization_receipt
                 ? { ...delta, profile_materialization: req.profile_materialization_receipt }
                 : delta
+              if (committed.profile_materialization) emittedProfileMaterialization = true
+              yield committed
+            }
+            if (req.profile_materialization_receipt && !emittedProfileMaterialization) {
+              const acknowledgment = {
+                profile_materialization: req.profile_materialization_receipt,
+              } satisfies ChatDelta
+              recorder?.observe(acknowledgment)
+              yield acknowledgment
             }
             // Successful backends whose CLI reports no usage (kimi-code, opencode)
             // get a bounded estimate. A failure without measured usage stays unknown:
