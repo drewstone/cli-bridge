@@ -195,8 +195,8 @@ export class RequestSpanRecorder {
       if (delta.keepalive) return
       if (delta.usage) {
         this.usage = addUsage(this.usage, delta.usage)
-        if (delta.usage.input_tokens !== undefined) this.sawInputTokens = true
-        if (delta.usage.output_tokens !== undefined) this.sawOutputTokens = true
+        this.sawInputTokens = this.usage.inputTokensKnown
+        this.sawOutputTokens = this.usage.outputTokensKnown
       }
       if (delta.internal_session_id) this.backendSessionId = delta.internal_session_id
       if (delta.finish_reason) this.finishReason = delta.finish_reason

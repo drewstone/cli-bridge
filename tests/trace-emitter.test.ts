@@ -74,7 +74,14 @@ class ToolUsingBackend extends TestBackend {
     yield { tool_calls: [{ id: 'call_2', name: 'Bash', arguments: '{"cmd":"ls"}' }] }
     yield {
       finish_reason: 'tool_calls',
-      usage: { input_tokens: 1200, output_tokens: 340, cost: 0.0042, cost_scope: 'total' },
+      usage: {
+        input_tokens: 1200,
+        output_tokens: 340,
+        cost: 0.0042,
+        cost_known: true,
+        cost_provenance: 'provider-receipt',
+        cost_scope: 'total',
+      },
     }
   }
 }
@@ -766,8 +773,24 @@ describe('RequestSpanRecorder', () => {
   it('replaces the running cost when a record declares itself the total', () => {
     const written: ContractSpan[][] = []
     const rec = recorder({ write: (spans) => { written.push([...spans]) } })
-    rec.observe({ usage: { input_tokens: 5, output_tokens: 5, cost: 0.01 } })
-    rec.observe({ finish_reason: 'stop', usage: { cost: 0.04, cost_scope: 'total' } })
+    rec.observe({
+      usage: {
+        input_tokens: 5,
+        output_tokens: 5,
+        cost: 0.01,
+        cost_known: true,
+        cost_provenance: 'provider-receipt',
+      },
+    })
+    rec.observe({
+      finish_reason: 'stop',
+      usage: {
+        cost: 0.04,
+        cost_known: true,
+        cost_provenance: 'billing-receipt',
+        cost_scope: 'total',
+      },
+    })
     rec.end()
 
     expect(written[0]?.[0]?.attributes).toMatchObject({
