@@ -68,7 +68,11 @@ import {
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { registerJailArgumentRewrite } from '../jail/index.js'
+import {
+  registerJailArgumentRewrite,
+  registerJailEnvironment,
+  resolveJailRoot,
+} from '../jail/index.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -206,7 +210,7 @@ function piExtensionArgs(
     'node_modules',
   )
   const jailedNpmRoot = req.jailSpec
-    ? join(req.jailSpec.root, '.pi', 'agent', 'npm', 'node_modules')
+    ? join(confinedPiAgentDir(req.jailSpec), 'npm', 'node_modules')
     : runtimeNpmRoot
   const entries = new Set((load as string[]).map((spec) => {
     const normalizedSpec = spec.trim()
@@ -219,6 +223,21 @@ function piExtensionArgs(
     '--no-extensions',
     ...[...entries].flatMap((entry) => ['--extension', entry]),
   ]
+}
+
+function confinedPiAgentDir(spec: NonNullable<ChatRequest['jailSpec']>): string {
+  const root = resolveJailRoot(spec.root, spec.projectDir)
+  const source = spec.authSources?.find(
+    (entry) => entry.envVar === 'PI_CODING_AGENT_DIR',
+  )
+  return source
+    ? resolveJailRoot(source.jailRel, root)
+    : resolveJailRoot('.pi/agent', root)
+}
+
+function confinedPiSessionDir(spec: NonNullable<ChatRequest['jailSpec']>): string {
+  const root = resolveJailRoot(spec.root, spec.projectDir)
+  return resolveJailRoot('.pi-sessions', root)
 }
 
 function resolvePiExtensionPath(spec: string, hostNpmRoot: string, runtimeNpmRoot: string): string {
@@ -347,6 +366,13 @@ export class PiBackend implements Backend {
     if (thinking) args.push('--thinking', thinking)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
+    if (req.jailSpec && !process.env.PI_CODING_AGENT_SESSION_DIR?.trim()) {
+      registerJailEnvironment(
+        req.jailSpec,
+        'PI_CODING_AGENT_SESSION_DIR',
+        confinedPiSessionDir(req.jailSpec),
+      )
+    }
 
     // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) reach pi-mcp-adapter through its per-process

@@ -29,6 +29,11 @@ import { spawnSync } from 'node:child_process'
 import { accessSync, constants, existsSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import {
+  copyAuthIntoJail,
+  removeAuthCopies,
+  removeStaleAuthCopies,
+} from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
@@ -73,6 +78,33 @@ export class LinuxBwrapJail implements JailBackend {
     const root = resolveJailRoot(spec.root, spec.projectDir)
     await prepareJailHome(root)
     ignoreJailRoot(spec.projectDir, root)
+    const availableAuthSources = (spec.authSources ?? []).filter((source) =>
+      existsSync(source.source),
+    )
+    const writableAuthSources = availableAuthSources.filter(
+      (source) => source.mode === 'copy-writable',
+    )
+    for (const source of availableAuthSources) {
+      // Resolve every destination before any credential copy. Once bytes exist
+      // under the jail root, the remaining wrapper construction is synchronous
+      // array assembly and cannot strand a copy through a later path error.
+      resolveJailRoot(source.jailRel, root)
+    }
+    for (const source of writableAuthSources) {
+      if (!source.envVar) {
+        throw new Error('a copy-writable jail auth source requires envVar')
+      }
+    }
+    await removeStaleAuthCopies(root)
+    const copiedWritableAuth = await copyAuthIntoJail(
+      root,
+      writableAuthSources,
+      { replace: false },
+    )
+    const resolvedAuthSources = availableAuthSources.map((source) => ({
+      source,
+      destination: resolveJailRoot(source.jailRel, root),
+    }))
 
     const bwrapArgs = [
       '--unshare-user',
@@ -123,16 +155,16 @@ export class LinuxBwrapJail implements JailBackend {
     // Writable root last so it wins over any read-only mount above it.
     bwrapArgs.push('--bind', root, root)
 
-    // Make the backend's host auth readable inside the jail (read-only),
-    // bound AFTER the writable root so these specific subpaths stay read-only.
-    // HOME is the jail root, so ~/.claude etc. resolve to these binds.
-    for (const { source, jailRel, envVar } of spec.authSources ?? []) {
-      if (!existsSync(source)) continue
-      const dest = join(root, jailRel)
-      bwrapArgs.push('--ro-bind', source, dest)
+    // Make backend config available at its stable path inside the jail.
+    // Read-only sources are bound after the writable root so they stay
+    // read-only. Sources whose CLI takes settings locks were copied into the
+    // writable root above and therefore need only their env redirect here.
+    for (const { source: authSource, destination } of resolvedAuthSources) {
+      const { source, envVar, mode } = authSource
+      if (mode === 'read-only') bwrapArgs.push('--ro-bind', source, destination)
       // Point the backend's env var (e.g. CODEX_HOME) at the in-jail copy. Done
       // here, where the jail truly applies, so non-jailed paths are untouched.
-      if (envVar) bwrapArgs.push('--setenv', envVar, dest)
+      if (envVar) bwrapArgs.push('--setenv', envVar, destination)
     }
 
     // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.
@@ -146,7 +178,13 @@ export class LinuxBwrapJail implements JailBackend {
       bin, ...args,
     )
 
-    return { bin: BWRAP_BIN, args: bwrapArgs }
+    return {
+      bin: BWRAP_BIN,
+      args: bwrapArgs,
+      ...(copiedWritableAuth.length > 0
+        ? { cleanup: () => removeAuthCopies(copiedWritableAuth) }
+        : {}),
+    }
   }
 }
 

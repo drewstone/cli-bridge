@@ -125,7 +125,12 @@ export class CodexBackend implements Backend {
     if (req.jailSpec && codexHome) {
       req.jailSpec.authSources = [
         ...(req.jailSpec.authSources ?? []).filter((s) => s.envVar !== 'CODEX_HOME'),
-        { source: codexHome.homePath, jailRel: '.codex', envVar: 'CODEX_HOME' },
+        {
+          source: codexHome.homePath,
+          jailRel: '.codex',
+          mode: 'read-only',
+          envVar: 'CODEX_HOME',
+        },
       ]
     }
 

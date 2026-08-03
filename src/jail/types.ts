@@ -38,17 +38,20 @@ export interface JailSpec {
    * noop backends confine writes only and ignore this flag.
    */
   readConfine?: boolean
-  /** Host auth/config sources made available inside the jail (read-only bind
-   * on Linux, copy on macOS) so a confined run still authenticates as the
-   * operator. Each carries an explicit jail-relative target so a source OUTSIDE
-   * the operator HOME (e.g. a custom `CODEX_HOME`) still lands at the location
-   * the confined CLI reads. Populated per backend by {@link authSourcesFor}. */
+  /** Host auth/config sources made available inside the jail so a confined run
+   * still authenticates as the operator. Each source explicitly declares
+   * whether Linux may read-only bind it or must make an ephemeral writable
+   * copy for a CLI that locks its own settings. Populated per backend by
+   * {@link authSourcesFor}. */
   authSources?: JailAuthSource[]
   /** Exact argv values that differ only while the OS jail is active.
    * Backends declare both values; the executor applies the rewrite after it
    * has proved a jail backend is available. Fallback and Docker paths retain
    * the original argument. */
   argumentRewrites?: JailArgumentRewrite[]
+  /** Child environment overrides that apply only when confinement is active.
+   * The explicit warn fallback must retain the ordinary host environment. */
+  environment?: Record<string, string>
 }
 
 /** One exact command argument and the value visible inside an active jail. */
@@ -63,10 +66,16 @@ export interface JailArgumentRewrite {
 export interface JailAuthSource {
   /** Absolute host path holding the backend CLI's auth/config. */
   source: string
-  /** Path relative to the jail root (== jail HOME) where `source` must appear,
-   * so the confined CLI finds it at the same logical location. Always inside
-   * the root, even when `source` lives outside the operator HOME. */
+  /** Path relative to the jail root (== jail HOME) where `source` must appear.
+   * Read-only sources normally retain their logical HOME location; writable
+   * copies use a unique request path and redirect the CLI through `envVar`.
+   * Always inside the root, even when `source` lives outside operator HOME. */
   jailRel: string
+  /** `read-only` preserves the host path through a Linux bind mount.
+   * `copy-writable` copies it inside the writable jail HOME and removes that
+   * copy when the process exits. macOS must copy either mode because
+   * sandbox-exec cannot bind mount. */
+  mode: 'read-only' | 'copy-writable'
   /** Optional env var the jail must point at this source's IN-JAIL location
    * (`<root>/<jailRel>`). Set ONLY by the jail backend when it actually wraps,
    * so e.g. codex's `CODEX_HOME` is redirected into the jail for confined runs

@@ -21,6 +21,7 @@ import type { SpawnResult, Spawner } from '../src/executors/types.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
+import { authSourcesFor } from '../src/jail/auth-preserve.js'
 
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
@@ -1449,15 +1450,18 @@ describe('PiBackend', () => {
     }
   })
 
-  it('loads a custom AgentDir extension through its stable in-jail path', async () => {
+  it('loads a custom AgentDir extension from the same per-run config copy Pi reads', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-jailed-extension-'))
     const jailRoot = join(cwd, '.agent-home')
     const agentDir = mkdtempSync(join(tmpdir(), 'pi-profile-custom-agent-dir-'))
     const packageDir = join(agentDir, 'npm', 'node_modules', 'pi-zai-glm')
     const extensionDir = join(packageDir, 'extensions')
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR
     let args: string[] = []
     let jail: ChatRequest['jailSpec']
+    let jailedSessionDir: string | undefined
+    let spawnedSessionDir: string | undefined
     try {
       mkdirSync(extensionDir, { recursive: true })
       writeFileSync(
@@ -1466,6 +1470,9 @@ describe('PiBackend', () => {
       )
       writeFileSync(join(extensionDir, 'provider.ts'), 'export default () => undefined\n')
       process.env.PI_CODING_AGENT_DIR = agentDir
+      delete process.env.PI_CODING_AGENT_SESSION_DIR
+      const authSources = authSourcesFor('pi')
+      const confinedAgentDir = join(jailRoot, authSources[0]!.jailRel)
 
       const backend = new PiBackend({
         bin: 'pi',
@@ -1476,25 +1483,36 @@ describe('PiBackend', () => {
         ], (_bin, rawArgs, opts) => {
           args = [...rawArgs]
           jail = opts.jail
+          jailedSessionDir = opts.jail?.environment?.PI_CODING_AGENT_SESSION_DIR
+          spawnedSessionDir = opts.env?.PI_CODING_AGENT_SESSION_DIR
         }),
       })
       await collect(backend.chat({
         model: 'pi/zai-coding-paas/glm-5.2',
         messages: [{ role: 'user', content: 'work' }],
         cwd,
-        jailSpec: { root: jailRoot, projectDir: cwd, readConfine: true },
+        jailSpec: {
+          root: jailRoot,
+          projectDir: cwd,
+          readConfine: true,
+          authSources,
+        },
         agent_profile: { extensions: { pi: { load: ['pi-zai-glm'] } } },
       }, null, new AbortController().signal))
 
       expect(argValue(args, '--extension')).toBe(packageDir)
       expect(jail?.argumentRewrites).toEqual([{
         from: packageDir,
-        to: join(jailRoot, '.pi', 'agent', 'npm', 'node_modules', 'pi-zai-glm'),
+        to: join(confinedAgentDir, 'npm', 'node_modules', 'pi-zai-glm'),
         precededBy: '--extension',
       }])
+      expect(jailedSessionDir).toBe(join(jailRoot, '.pi-sessions'))
+      expect(spawnedSessionDir).toBeUndefined()
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+      if (previousSessionDir === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR
+      else process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionDir
       rmSync(cwd, { recursive: true, force: true })
       rmSync(agentDir, { recursive: true, force: true })
     }

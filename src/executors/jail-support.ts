@@ -72,7 +72,9 @@ export async function applyJail(
   // Merge any jail-supplied env onto the child env. The merged result
   // still flows through sanitizeHostEnv at the spawn site, so the host
   // env allowlist continues to apply.
-  const env = wrap.env ? { ...(opts.env ?? {}), ...wrap.env } : opts.env
+  const env = opts.jail.environment || wrap.env
+    ? { ...(opts.env ?? {}), ...(opts.jail.environment ?? {}), ...(wrap.env ?? {}) }
+    : opts.env
   return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup }
 }
 

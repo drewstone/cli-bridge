@@ -88,6 +88,21 @@ export function registerJailArgumentRewrite(
   ]
 }
 
+/** Register one child environment override that applies only when a jail is
+ * available and actually wraps the command. */
+export function registerJailEnvironment(
+  spec: JailSpec | null | undefined,
+  name: string,
+  value: string,
+): void {
+  if (!spec) return
+  const existing = spec.environment?.[name]
+  if (existing !== undefined && existing !== value) {
+    throw new Error(`conflicting jail environment override for ${name}`)
+  }
+  spec.environment = { ...(spec.environment ?? {}), [name]: value }
+}
+
 export function selectJailBackend(platform: NodeJS.Platform = process.platform): JailBackend {
   if (platform === 'linux') return new LinuxBwrapJail()
   if (platform === 'darwin') return new MacosSeatbeltJail()

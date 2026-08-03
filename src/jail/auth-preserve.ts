@@ -4,20 +4,23 @@
  * A jailed run sets HOME to the (empty) jail root, so a CLI would no longer
  * find the operator's credentials at ~/.claude, ~/.config/opencode, etc. and
  * could not authenticate. This module declares, per backend, the host paths
- * that hold its auth/config and makes them available inside the jail at the
- * same $HOME-relative location:
- *   - Linux (bwrap): read-only bind-mounted (free, no copy) — see linux-bwrap.
+ * that hold its auth/config and makes them available inside the jail:
+ *   - Linux (bwrap): read-only bind-mounted unless the CLI must lock settings;
+ *     those exact sources are copied into writable jail storage.
  *   - macOS (sandbox-exec, no bind): copied in via {@link copyAuthIntoJail}.
  *
  * Only paths that actually exist on the host are surfaced. The mapping mirrors
  * what codex.ts already does for CODEX_HOME, generalized to every host CLI.
  */
 
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { cp } from 'node:fs/promises'
+import { chmod, cp, readdir, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import type { JailAuthSource } from './types.js'
+import { resolveJailRoot, type JailAuthSource } from './types.js'
+
+const PI_AUTH_COPY_PREFIX = `pi-${process.pid}-`
 
 /**
  * $HOME-relative auth/config paths per REGISTERED backend name. Aliases that
@@ -57,7 +60,7 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
   for (const rel of AUTH_PATHS[backendName] ?? []) {
     const source = join(home, rel)
     // rel is already a POSIX-style jail-relative target ('.claude', '.config/opencode').
-    if (existsSync(source)) out.push({ source, jailRel: rel })
+    if (existsSync(source)) out.push({ source, jailRel: rel, mode: 'read-only' })
   }
   if (backendName === 'codex') {
     // codex.ts honors $CODEX_HOME (src/backends/codex.ts) and only falls back to
@@ -70,7 +73,9 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
       const source = resolve(codexHome)
       const idx = out.findIndex((e) => e.jailRel === '.codex')
       if (idx >= 0) out.splice(idx, 1)
-      if (existsSync(source)) out.push({ source, jailRel: '.codex' })
+      if (existsSync(source)) {
+        out.push({ source, jailRel: '.codex', mode: 'read-only' })
+      }
     }
     // Redirect CODEX_HOME at the in-jail copy so a confined codex reads creds
     // there rather than the (read-only) host path. The jail applies this only
@@ -78,35 +83,102 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     for (const e of out) if (e.jailRel === '.codex') e.envVar = 'CODEX_HOME'
   }
   if (backendName === 'pi') {
+    const writableAgentRel = `.auth-copies/${PI_AUTH_COPY_PREFIX}${randomUUID()}`
     // Mirror CODEX_HOME: a custom Pi directory is the real provider catalog,
-    // not an alias for ~/.pi/agent. Surface that exact source at Pi's stable
-    // in-jail location, then redirect the child-only env var to it.
+    // not an alias for ~/.pi/agent. Surface that exact source at a request-
+    // unique in-jail location, then redirect the child-only env var to it.
     const piAgentDir = process.env.PI_CODING_AGENT_DIR?.trim()
     if (piAgentDir) {
       const source = resolve(piAgentDir)
       const idx = out.findIndex((e) => e.jailRel === '.pi/agent')
       if (idx >= 0) out.splice(idx, 1)
-      if (existsSync(source)) out.push({ source, jailRel: '.pi/agent' })
+      if (existsSync(source)) {
+        out.push({ source, jailRel: '.pi/agent', mode: 'copy-writable' })
+      }
     }
-    for (const e of out) if (e.jailRel === '.pi/agent') e.envVar = 'PI_CODING_AGENT_DIR'
+    for (const e of out) {
+      if (e.jailRel !== '.pi/agent') continue
+      e.jailRel = writableAgentRel
+      e.mode = 'copy-writable'
+      e.envVar = 'PI_CODING_AGENT_DIR'
+    }
   }
   return out
 }
 
 /**
- * Copy each auth source into the jail HOME at its $HOME-relative path. Used on
- * macOS where sandbox-exec cannot bind-mount; the copy lands under the
- * (writable) jail root so the CLI can read its creds and write state. Returns
- * the copied destination paths so the caller can remove them on cleanup — the
- * jail root is project-local, so copied credentials must NOT linger there.
+ * Copy each auth source into the jail HOME at its $HOME-relative path. macOS
+ * uses this for every source because sandbox-exec cannot bind-mount; Linux uses
+ * it only for CLIs that lock their settings. Returns the copied destination
+ * paths so the caller can remove them on cleanup — the jail root is
+ * project-local, so copied credentials must NOT linger there.
  */
-export async function copyAuthIntoJail(root: string, sources: JailAuthSource[] | undefined): Promise<string[]> {
+export async function copyAuthIntoJail(
+  root: string,
+  sources: JailAuthSource[] | undefined,
+  options: { replace?: boolean } = {},
+): Promise<string[]> {
   const copied: string[] = []
-  for (const { source, jailRel } of sources ?? []) {
-    if (!existsSync(source)) continue
-    const dest = join(root, jailRel)
-    await cp(source, dest, { recursive: true, force: true, errorOnExist: false })
-    copied.push(dest)
+  try {
+    for (const { source, jailRel } of sources ?? []) {
+      if (!existsSync(source)) continue
+      const dest = resolveJailRoot(jailRel, root)
+      // Request-unique writable copies cannot be shared, so track them before
+      // copying and remove even a partial tree after failure. Stable macOS auth
+      // paths can be shared by concurrent runs: preserve the established
+      // in-place copy behavior and never delete another run's live directory.
+      if (options.replace === false) copied.push(dest)
+      await cp(source, dest, {
+        recursive: true,
+        force: options.replace !== false,
+        errorOnExist: options.replace === false,
+      })
+      await chmod(dest, 0o700)
+      if (options.replace !== false) copied.push(dest)
+    }
+    return copied
+  } catch (error) {
+    await removeAuthCopies(copied)
+    throw error
   }
-  return copied
+}
+
+/** Remove writable Pi config copies owned by bridge processes that no longer
+ * exist. Live processes use unique request paths and are never age-limited, so
+ * arbitrarily long caller-authorized runs remain safe from scavenging. */
+export async function removeStaleAuthCopies(root: string): Promise<void> {
+  const parent = resolveJailRoot('.auth-copies', root)
+  let names: string[]
+  try {
+    names = await readdir(parent)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  for (const name of names) {
+    const match = /^pi-(\d+)-/u.exec(name)
+    if (!match) continue
+    const ownerPid = Number(match[1])
+    if (ownerPid === process.pid || processExists(ownerPid)) continue
+    await rm(resolveJailRoot(`.auth-copies/${name}`, root), {
+      recursive: true,
+      force: true,
+    })
+  }
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+/** Remove ephemeral auth/config copies after a confined process exits. */
+export async function removeAuthCopies(paths: readonly string[]): Promise<void> {
+  for (const path of paths) {
+    await rm(path, { recursive: true, force: true })
+  }
 }

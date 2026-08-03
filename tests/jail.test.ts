@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -24,13 +24,18 @@ import {
   LinuxBwrapJail,
   MacosSeatbeltJail,
   NoopJail,
+  registerJailEnvironment,
   registerJailReadable,
   resolveJailRoot,
 } from '../src/jail/index.js'
 import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
-import { authSourcesFor } from '../src/jail/auth-preserve.js'
+import {
+  authSourcesFor,
+  copyAuthIntoJail,
+  removeStaleAuthCopies,
+} from '../src/jail/auth-preserve.js'
 import { ignoreJailRoot } from '../src/jail/types.js'
 import { anyBackendSpawnsOnHost } from '../src/config.js'
 import type { BackendExecutorConfig } from '../src/config.js'
@@ -293,19 +298,21 @@ describe('auth preservation', () => {
     expect(authSourcesFor('claude-code')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('claudish')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('kimi-code')).toEqual(authSourcesFor('kimi'))
-    for (const { source, jailRel } of authSourcesFor('claude-code')) {
+    for (const { source, jailRel, mode } of authSourcesFor('claude-code')) {
       expect(existsSync(source), `${source} should exist`).toBe(true)
       expect(source.startsWith(homedir())).toBe(true)
       // jailRel must be a relative location strictly inside the jail root.
       expect(jailRel.startsWith('/'), `${jailRel} must be relative`).toBe(false)
       expect(jailRel.startsWith('..'), `${jailRel} must not escape the root`).toBe(false)
+      expect(mode).toBe('read-only')
     }
     // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex),
     // and tagged so the jail redirects CODEX_HOME at the in-jail copy.
-    for (const { source, jailRel, envVar } of authSourcesFor('codex')) {
+    for (const { source, jailRel, envVar, mode } of authSourcesFor('codex')) {
       expect(source.endsWith('.codex')).toBe(true)
       expect(jailRel).toBe('.codex')
       expect(envVar).toBe('CODEX_HOME')
+      expect(mode).toBe('read-only')
     }
   })
 
@@ -339,10 +346,11 @@ describe('auth preservation', () => {
     try {
       const sources = authSourcesFor('pi')
       expect(sources).toHaveLength(1)
-      // Lands at the jail's ~/.pi/agent, where pi (HOME=root) reads its state.
-      expect(sources[0]?.jailRel).toBe('.pi/agent')
+      expect(sources[0]?.jailRel).toMatch(/^\.auth-copies\/pi-\d+-[0-9a-f-]+$/u)
       expect(sources[0]?.source).toBe(join(fakeHome, '.pi', 'agent'))
       expect(sources[0]?.envVar).toBe('PI_CODING_AGENT_DIR')
+      expect(sources[0]?.mode).toBe('copy-writable')
+      expect(authSourcesFor('pi')[0]?.jailRel).not.toBe(sources[0]?.jailRel)
     } finally {
       if (prev === undefined) delete process.env.HOME
       else process.env.HOME = prev
@@ -362,11 +370,14 @@ describe('auth preservation', () => {
     process.env.HOME = fakeHome
     process.env.PI_CODING_AGENT_DIR = customAgentDir
     try {
-      expect(authSourcesFor('pi')).toEqual([{
+      const sources = authSourcesFor('pi')
+      expect(sources).toHaveLength(1)
+      expect(sources[0]).toMatchObject({
         source: resolve(customAgentDir),
-        jailRel: '.pi/agent',
+        mode: 'copy-writable',
         envVar: 'PI_CODING_AGENT_DIR',
-      }])
+      })
+      expect(sources[0]?.jailRel).toMatch(/^\.auth-copies\/pi-\d+-[0-9a-f-]+$/u)
     } finally {
       if (previousHome === undefined) delete process.env.HOME
       else process.env.HOME = previousHome
@@ -401,7 +412,7 @@ describe('auth preservation', () => {
     const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
       root,
       projectDir,
-      authSources: [{ source: authDir, jailRel: '.claude' }],
+      authSources: [{ source: authDir, jailRel: '.claude', mode: 'read-only' }],
     })
     const expectedRoot = resolveJailRoot(root, projectDir)
     expect(
@@ -418,7 +429,12 @@ describe('auth preservation', () => {
     const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
       root,
       projectDir,
-      authSources: [{ source: authDir, jailRel: '.codex', envVar: 'CODEX_HOME' }],
+      authSources: [{
+        source: authDir,
+        jailRel: '.codex',
+        mode: 'read-only',
+        envVar: 'CODEX_HOME',
+      }],
     })
     const expectedRoot = resolveJailRoot(root, projectDir)
     expect(seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.codex'))).toBeGreaterThanOrEqual(0)
@@ -428,21 +444,106 @@ describe('auth preservation', () => {
     ).toBeGreaterThanOrEqual(0)
   })
 
-  it('bwrap redirects PI_CODING_AGENT_DIR at Pi config inside the jail', async () => {
+  it('bwrap gives Pi an ephemeral writable config copy and removes it on cleanup', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-piauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    await writeFile(join(authDir, 'settings.json'), '{"ok":true}')
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const firstRel = '.auth-copies/pi-first'
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{
+        source: authDir,
+        jailRel: firstRel,
+        mode: 'copy-writable',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }],
+    })
+    const expectedRoot = resolveJailRoot(root, projectDir)
+    const envIndex = seqIndex(wrap.args, '--setenv', 'PI_CODING_AGENT_DIR')
+    expect(envIndex).toBeGreaterThanOrEqual(0)
+    const copiedAgentDir = wrap.args[envIndex + 2]!
+    expect(copiedAgentDir).toBe(join(expectedRoot, firstRel))
+    expect(await readFile(join(copiedAgentDir, 'settings.json'), 'utf8')).toBe('{"ok":true}')
+    expect((await stat(copiedAgentDir)).mode & 0o777).toBe(0o700)
+    expect(seqIndex(wrap.args, '--ro-bind', authDir, copiedAgentDir)).toBe(-1)
+    const concurrentRel = '.auth-copies/pi-second'
+    const concurrentWrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'y'], {
+      root,
+      projectDir,
+      authSources: [{
+        source: authDir,
+        jailRel: concurrentRel,
+        mode: 'copy-writable',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }],
+    })
+    const concurrentEnvIndex = seqIndex(
+      concurrentWrap.args,
+      '--setenv',
+      'PI_CODING_AGENT_DIR',
+    )
+    expect(concurrentEnvIndex).toBeGreaterThanOrEqual(0)
+    const concurrentAgentDir = concurrentWrap.args[concurrentEnvIndex + 2]!
+    expect(concurrentAgentDir).not.toBe(copiedAgentDir)
+    await wrap.cleanup?.()
+    expect(existsSync(copiedAgentDir)).toBe(false)
+    expect(existsSync(concurrentAgentDir)).toBe(true)
+    await concurrentWrap.cleanup?.()
+    expect(existsSync(concurrentAgentDir)).toBe(false)
+  })
+
+  it('updates a stable auth copy in place without deleting files used by another run', async () => {
+    const source = await mkdtemp(join(homedir(), '.cli-bridge-stable-source-'))
+    cleanups.push(() => rm(source, { recursive: true, force: true }))
+    await writeFile(join(source, 'settings.json'), 'updated')
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const destination = join(root, '.claude')
+    await mkdir(destination, { recursive: true })
+    await writeFile(join(destination, 'settings.json'), 'old')
+    await writeFile(join(destination, 'live-run.json'), 'still in use')
+
+    await copyAuthIntoJail(root, [
+      { source, jailRel: '.claude', mode: 'read-only' },
+    ])
+
+    expect(await readFile(join(destination, 'settings.json'), 'utf8')).toBe('updated')
+    expect(await readFile(join(destination, 'live-run.json'), 'utf8')).toBe('still in use')
+  })
+
+  it('removes dead-process Pi config copies without touching a live process copy', async () => {
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const copies = join(root, '.auth-copies')
+    const live = join(copies, `pi-${process.pid}-live`)
+    const dead = join(copies, 'pi-2147483646-dead')
+    await mkdir(live, { recursive: true })
+    await mkdir(dead, { recursive: true })
+    await writeFile(join(live, 'auth.json'), 'live')
+    await writeFile(join(dead, 'auth.json'), 'dead')
+
+    await removeStaleAuthCopies(root)
+
+    expect(existsSync(live)).toBe(true)
+    expect(existsSync(dead)).toBe(false)
+  })
+
+  it('rejects a writable auth copy with no environment redirect before copying', async () => {
     const authDir = await mkdtemp(join(homedir(), '.cli-bridge-piauth-'))
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
     const projectDir = await tempProjectDir()
     const root = join(projectDir, '.agent-home')
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+    const jailRel = `.auth-copies/pi-${process.pid}-missing-env`
+
+    await expect(new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
       root,
       projectDir,
-      authSources: [{ source: authDir, jailRel: '.pi/agent', envVar: 'PI_CODING_AGENT_DIR' }],
-    })
-    const expectedRoot = resolveJailRoot(root, projectDir)
-    expect(
-      seqIndex(wrap.args, '--setenv', 'PI_CODING_AGENT_DIR', join(expectedRoot, '.pi/agent')),
-      'PI_CODING_AGENT_DIR redirected to the in-jail config',
-    ).toBeGreaterThanOrEqual(0)
+      authSources: [{ source: authDir, jailRel, mode: 'copy-writable' }],
+    })).rejects.toThrow(/requires envVar/u)
+    expect(existsSync(join(root, jailRel))).toBe(false)
   })
 
   it('seatbelt returns an auth env var (CODEX_HOME) pointing at the in-jail copy', async () => {
@@ -453,7 +554,12 @@ describe('auth preservation', () => {
     const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], {
       root,
       projectDir,
-      authSources: [{ source: authDir, jailRel: '.codex', envVar: 'CODEX_HOME' }],
+      authSources: [{
+        source: authDir,
+        jailRel: '.codex',
+        mode: 'read-only',
+        envVar: 'CODEX_HOME',
+      }],
     })
     if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
     const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
@@ -465,14 +571,23 @@ describe('auth preservation', () => {
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
     const projectDir = await tempProjectDir()
     const root = join(projectDir, '.agent-home')
+    const writableRel = '.auth-copies/pi-seatbelt'
     const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], {
       root,
       projectDir,
-      authSources: [{ source: authDir, jailRel: '.pi/agent', envVar: 'PI_CODING_AGENT_DIR' }],
+      authSources: [{
+        source: authDir,
+        jailRel: writableRel,
+        mode: 'copy-writable',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }],
     })
-    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
     const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
-    expect(wrap.env?.PI_CODING_AGENT_DIR).toBe(join(expectedRoot, '.pi/agent'))
+    const copiedAgentDir = join(expectedRoot, writableRel)
+    expect(wrap.env?.PI_CODING_AGENT_DIR).toBe(copiedAgentDir)
+    expect(existsSync(copiedAgentDir)).toBe(true)
+    await wrap.cleanup?.()
+    expect(existsSync(copiedAgentDir)).toBe(false)
   })
 })
 
@@ -482,7 +597,14 @@ describe('applyJail fail-closed', () => {
     isAvailable: () => false,
     wrap: () => { throw new Error('should not wrap when unavailable') },
   }
-  const jailedOpts = { jail: { root: '/proj/.agent-home', projectDir: '/proj' } } as never
+  const jailedOpts = {
+    env: { BASE: 'kept' },
+    jail: {
+      root: '/proj/.agent-home',
+      projectDir: '/proj',
+      environment: { PI_CODING_AGENT_SESSION_DIR: '/proj/.agent-home/.pi-sessions' },
+    },
+  } as never
 
   it('throws (refuses to run unconfined) when a jail is requested but the backend is unavailable', async () => {
     await expect(applyJail('/bin/sh', ['-c', 'x'], jailedOpts, unavailable))
@@ -495,9 +617,31 @@ describe('applyJail fail-closed', () => {
       const r = await applyJail('/bin/sh', ['-c', 'x'], jailedOpts, unavailable)
       expect(r.bin).toBe('/bin/sh')
       expect(r.args).toEqual(['-c', 'x'])
+      expect(r.env).toEqual({ BASE: 'kept' })
     } finally {
       delete process.env.BRIDGE_JAIL_FALLBACK
     }
+  })
+
+  it('applies registered environment only when a jail actually wraps', async () => {
+    const spec = { root: '/proj/.agent-home', projectDir: '/proj' }
+    registerJailEnvironment(spec, 'PI_CODING_AGENT_SESSION_DIR', '/proj/.agent-home/.pi-sessions')
+    const available: JailBackend = {
+      name: 'available',
+      isAvailable: () => true,
+      wrap: (bin, args) => ({ bin, args, env: { WRAP: 'active' } }),
+    }
+
+    const result = await applyJail('/bin/sh', ['-c', 'x'], {
+      env: { BASE: 'kept' },
+      jail: spec,
+    }, available)
+
+    expect(result.env).toEqual({
+      BASE: 'kept',
+      PI_CODING_AGENT_SESSION_DIR: '/proj/.agent-home/.pi-sessions',
+      WRAP: 'active',
+    })
   })
 
   it('rewrites exact path arguments only when an available jail wraps the command', async () => {
