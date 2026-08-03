@@ -17,7 +17,10 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
-import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
+import {
+  canonicalAgentProfileDigest,
+  canonicalCandidateDigest,
+} from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
@@ -45,6 +48,10 @@ import {
 import { BackendReportedFailureError } from '../runs/error-shape.js'
 import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
+import {
+  resolveAgentProfile,
+  resolveRequestedReasoningEffort,
+} from '../backends/profile-support.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -494,6 +501,10 @@ export function mountChatCompletions(
       if (!req.cwd && session?.cwd) {
         req.cwd = session.cwd
       }
+      const sessionProfileBinding = exactSessionProfileBinding(req, session)
+      if (session) {
+        assertSessionProfileBinding(session, sessionProfileBinding)
+      }
 
       // Deny-by-default egress, gated before any execution path is chosen so a
       // net-jail cannot be requested of a mode that would not apply it.
@@ -589,9 +600,15 @@ export function mountChatCompletions(
                   internalId: delta.internal_session_id,
                   cwd: req.cwd ?? session?.cwd ?? null,
                   metadata: {
+                    ...(req.metadata ?? {}),
                     model: req.model,
                     ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
-                    ...(req.metadata ?? {}),
+                    ...(sessionProfileBinding
+                      ? { agent_profile_binding: sessionProfileBinding }
+                      : {}),
+                    ...(req.profile_materialization_receipt
+                      ? { profile_materialization: req.profile_materialization_receipt }
+                      : {}),
                   },
                 })
               }
@@ -899,6 +916,55 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
     request: executionRequest,
   })) as Parameters<typeof canonicalCandidateDigest>[0]
   return canonicalCandidateDigest(normalized)
+}
+
+interface SessionProfileBinding {
+  schema: 'cli-bridge.session-agent-profile.v1'
+  effectiveProfileDigest: `sha256:${string}`
+  provider: string | null
+  model: string
+  requestedReasoningEffort: string | null
+}
+
+function exactSessionProfileBinding(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): SessionProfileBinding | null {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return null
+  const parts = req.model.split('/')
+  const provider = parts.length >= 3 && parts[1]
+    ? parts[1]
+    : profile.model?.provider ?? null
+  return {
+    schema: 'cli-bridge.session-agent-profile.v1',
+    effectiveProfileDigest: canonicalAgentProfileDigest(profile),
+    provider,
+    model: req.model,
+    requestedReasoningEffort: resolveRequestedReasoningEffort(req, session),
+  }
+}
+
+function assertSessionProfileBinding(
+  session: SessionRecord,
+  received: SessionProfileBinding | null,
+): void {
+  const stored = session.metadata.agent_profile_binding
+  if (!stored || typeof stored !== 'object') {
+    if (received) {
+      throw new BackendError(
+        `session ${JSON.stringify(session.externalId)} predates exact AgentProfile binding; start a new session`,
+        'parse_error',
+      )
+    }
+    return
+  }
+  if (!received || JSON.stringify(stored) !== JSON.stringify(received)) {
+    throw new BackendError(
+      `session ${JSON.stringify(session.externalId)} is bound to a different AgentProfile/model`,
+      'parse_error',
+    )
+  }
 }
 
 function invalidRequest(c: Context, message: string): Response {

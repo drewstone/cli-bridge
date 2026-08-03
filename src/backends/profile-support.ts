@@ -20,6 +20,11 @@ import type {
   AgentProfile,
   AgentProfileConfigValue,
   AgentProfileMcpServer,
+  ReasoningEffort,
+} from '@tangle-network/agent-interface'
+import {
+  canonicalAgentProfileDigest,
+  snapshotAgentProfile,
 } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
@@ -35,6 +40,15 @@ import {
   type WorkspacePlanConfigValue,
   type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
+
+export interface ProfileExecutionIdentity {
+  provider: string | null
+  model: string
+  reasoningEffort: {
+    requested: ReasoningEffort | null
+    applied: string | null
+  }
+}
 
 /**
  * The host directory request-scoped files are written into.
@@ -110,6 +124,7 @@ export function provisionProfileWorkspace(
   session: SessionRecord | null,
   harness: HarnessId,
   cwd: string | undefined,
+  executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, harness, null),
 ): {
   env: Record<string, string>
   flags: string[]
@@ -126,7 +141,14 @@ export function provisionProfileWorkspace(
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
     assertWorkspacePlanSupported(plan)
     const applied = applyWorkspacePlan(plan, workspaceCwd)
-    const receipt = retainProfileMaterializationReceipt(req, harness, plan, applied)
+    const receipt = retainProfileMaterializationReceipt(
+      req,
+      profile,
+      harness,
+      executionIdentity,
+      plan,
+      applied,
+    )
     return {
       env: requirePublicPlanEnv(applied.env, harness),
       flags: applied.flags.map((flag, index) =>
@@ -172,6 +194,7 @@ export function provisionPiProfile(
   req: ChatRequest,
   session: SessionRecord | null,
   cwd: string | undefined,
+  executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, 'pi', null),
 ): ProvisionedPiProfile | null {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
@@ -197,7 +220,14 @@ export function provisionPiProfile(
     chmodSync(profileRoot, 0o755)
     const applied = applyWorkspacePlan(plan, profileRoot, { existingFiles: 'reject' })
     const flags = piProfileFlags(plan, applied, profileRoot, nativeLoaders)
-    const receipt = retainProfileMaterializationReceipt(req, 'pi', plan, applied)
+    const receipt = retainProfileMaterializationReceipt(
+      req,
+      profile,
+      'pi',
+      executionIdentity,
+      plan,
+      applied,
+    )
 
     let cleaned = false
     return {
@@ -308,14 +338,20 @@ function piProfileFileFlag(path: string): '--append-system-prompt' | '--skill' |
 
 function retainProfileMaterializationReceipt(
   req: ChatRequest,
+  profile: AgentProfile,
   harness: HarnessId,
+  executionIdentity: ProfileExecutionIdentity,
   plan: WorkspacePlan,
   applied: WorkspacePlanReceipt,
 ): ProfileMaterializationReceipt {
   const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
   const receipt: ProfileMaterializationReceipt = {
-    schema: 'cli-bridge.profile-materialization.v1',
+    schema: 'cli-bridge.profile-materialization.v2',
+    effectiveProfileDigest: canonicalAgentProfileDigest(profile),
     harness,
+    provider: executionIdentity.provider,
+    model: executionIdentity.model,
+    reasoningEffort: executionIdentity.reasoningEffort,
     workspacePlanDigest: applied.workspacePlanDigest,
     files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
     unsupported: applied.unsupported,
@@ -325,10 +361,126 @@ function retainProfileMaterializationReceipt(
   return receipt
 }
 
+const profileSnapshots = new WeakMap<ChatRequest, AgentProfile | null>()
+
 export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | null): AgentProfile | null {
-  if (req.agent_profile && typeof req.agent_profile === 'object') return req.agent_profile
-  const stored = session?.metadata?.agent_profile
-  return stored && typeof stored === 'object' ? stored as AgentProfile : null
+  if (profileSnapshots.has(req)) return profileSnapshots.get(req) ?? null
+  const raw = req.agent_profile && typeof req.agent_profile === 'object'
+    ? req.agent_profile
+    : session?.metadata?.agent_profile
+  const profile = raw && typeof raw === 'object' ? snapshotAgentProfile(raw) : null
+  profileSnapshots.set(req, profile)
+  if (profile) req.agent_profile = profile
+  return profile
+}
+
+/** Resolve one canonical reasoning request; an out-of-profile override is a hard conflict. */
+export function resolveRequestedReasoningEffort(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): ReasoningEffort | null {
+  const profileEffort = resolveAgentProfile(req, session)?.model?.reasoningEffort
+  if (profileEffort && req.effort && profileEffort !== req.effort) {
+    throw new BackendError(
+      `request effort ${JSON.stringify(req.effort)} conflicts with agent_profile.model.reasoningEffort ${JSON.stringify(profileEffort)}`,
+      'parse_error',
+    )
+  }
+  return profileEffort ?? req.effort ?? null
+}
+
+/** Bind a receipt to the actual transport model/provider and native reasoning control. */
+export function profileExecutionIdentity(
+  req: ChatRequest,
+  session: SessionRecord | null,
+  harness: HarnessId,
+  appliedReasoningEffort: string | null,
+): ProfileExecutionIdentity {
+  const profile = resolveAgentProfile(req, session)
+  if (profile) assertExactProfileRequest(req, profile, harness)
+  const wireModel = modelWithinHarness(req.model, harness)
+  const slash = wireModel.indexOf('/')
+  const wireProvider = slash > 0 ? wireModel.slice(0, slash) : undefined
+  return {
+    provider: wireProvider ?? profile?.model?.provider ?? null,
+    model: req.model,
+    reasoningEffort: {
+      requested: resolveRequestedReasoningEffort(req, session),
+      applied: appliedReasoningEffort,
+    },
+  }
+}
+
+/**
+ * A materialization receipt can acknowledge one AgentProfile only when no
+ * second behavioral channel changes it. Limits and execution mode may still
+ * constrain the run; model, prompt, MCP, and reasoning must agree with the
+ * profile before any harness process starts.
+ */
+function assertExactProfileRequest(
+  req: ChatRequest,
+  profile: AgentProfile,
+  harness: HarnessId,
+): void {
+  if (profile.harness !== undefined && profile.harness !== harness) {
+    throw new BackendError(
+      `agent_profile.harness ${JSON.stringify(profile.harness)} conflicts with selected harness ${JSON.stringify(harness)}`,
+      'parse_error',
+    )
+  }
+
+  const wireModel = modelWithinHarness(req.model, harness)
+  const requestedModel = profile.model?.default
+  const requestedProvider = profile.model?.provider
+  if (requestedModel !== undefined) {
+    const qualified = requestedProvider && !requestedModel.includes('/')
+      ? `${requestedProvider}/${requestedModel}`
+      : requestedModel
+    if (wireModel !== qualified) {
+      throw new BackendError(
+        `request model ${JSON.stringify(req.model)} conflicts with agent_profile.model ${JSON.stringify(qualified)}`,
+        'parse_error',
+      )
+    }
+  } else if (requestedProvider !== undefined) {
+    const slash = wireModel.indexOf('/')
+    const wireProvider = slash > 0 ? wireModel.slice(0, slash) : null
+    if (wireProvider !== requestedProvider) {
+      throw new BackendError(
+        `request model ${JSON.stringify(req.model)} does not select agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
+        'parse_error',
+      )
+    }
+  }
+
+  if (Object.keys(req.mcp?.mcpServers ?? {}).length > 0) {
+    throw new BackendError(
+      'request mcp cannot accompany agent_profile; declare the exact MCP servers in agent_profile.mcp',
+      'parse_error',
+    )
+  }
+  if (req.messages.some((message) => message.role === 'system')) {
+    throw new BackendError(
+      'system-role messages cannot accompany agent_profile; declare standing instructions in agent_profile.prompt',
+      'parse_error',
+    )
+  }
+}
+
+function modelWithinHarness(model: string, harness: HarnessId): string {
+  const prefixes = harness === 'claude-code'
+    ? ['claude-code', 'claude', 'claudish']
+    : harness === 'kimi-code'
+      ? ['kimi-code', 'kimi']
+      : [harness]
+  for (const prefix of prefixes) {
+    if (model === prefix) return ''
+    if (model.startsWith(`${prefix}/`)) return model.slice(prefix.length + 1)
+  }
+  throw new BackendError(
+    `request model ${JSON.stringify(model)} does not select harness ${JSON.stringify(harness)}`,
+    'parse_error',
+  )
 }
 
 /**

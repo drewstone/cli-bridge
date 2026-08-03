@@ -84,7 +84,13 @@ class MeasuredReceiptBackend extends FakeBackend {
   override async *chat(): AsyncIterable<ChatDelta> {
     yield {
       finish_reason: 'stop',
-      usage: { input_tokens: 140, output_tokens: 25, cost: 0.03 },
+      usage: {
+        input_tokens: 140,
+        output_tokens: 25,
+        cost: 0.03,
+        cost_known: true,
+        cost_provenance: 'provider-receipt',
+      },
     } as ChatDelta
   }
 }
@@ -92,9 +98,13 @@ class MeasuredReceiptBackend extends FakeBackend {
 class MaterializationReceiptBackend extends FakeBackend {
   override async *chat(req: ChatRequest): AsyncIterable<ChatDelta> {
     req.profile_materialization_receipt = {
-      schema: 'cli-bridge.profile-materialization.v1',
+      schema: 'cli-bridge.profile-materialization.v2',
+      effectiveProfileDigest: `sha256:${'b'.repeat(64)}`,
       harness: 'receipt',
-      workspacePlanDigest: 'a'.repeat(64),
+      provider: null,
+      model: req.model,
+      reasoningEffort: { requested: null, applied: null },
+      workspacePlanDigest: `sha256:${'a'.repeat(64)}`,
       files: [{ path: '.agent/skill.md', mode: 0o644 }],
       unsupported: [],
     }

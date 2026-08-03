@@ -41,10 +41,12 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   materializeEmptyMcpConfig,
+  profileExecutionIdentity,
   writeMcpConfigFile,
   provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
+  resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -104,7 +106,16 @@ export class KimiBackend implements Backend {
 
     // Reject unsupported profile plans before creating either temporary
     // Kimi config. Both files can contain provider or MCP credentials.
-    const provisioned = provisionProfileWorkspace(req, session, 'kimi-code', cwd)
+    const thinkingFlag = thinkingFlagForEffort(
+      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    )
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'kimi-code',
+      cwd,
+      profileExecutionIdentity(req, session, 'kimi-code', thinkingFlag),
+    )
 
     const args = [
       '--print',
@@ -117,7 +128,6 @@ export class KimiBackend implements Backend {
     if (model) {
       args.push('--model', model)
     }
-    const thinkingFlag = thinkingFlagForEffort(req.effort)
     if (thinkingFlag) args.push(thinkingFlag)
     args.push(...provisioned.flags)
 

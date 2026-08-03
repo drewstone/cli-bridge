@@ -31,7 +31,9 @@ import {
   resolveAgentProfile,
   resolveMcpServers,
   type MaterializedMcpConfig,
+  profileExecutionIdentity,
   provisionProfileWorkspace,
+  resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -181,7 +183,16 @@ export class ClaudeBackend implements Backend {
 
     // Validate and apply the profile before allocating request-scoped MCP
     // files. A rejected plan must never strand a config containing secrets.
-    const provisioned = provisionProfileWorkspace(req, session, 'claude-code', cwd)
+    const appliedReasoningEffort = claudeEffort(
+      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    )
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'claude-code',
+      cwd,
+      profileExecutionIdentity(req, session, 'claude-code', appliedReasoningEffort),
+    )
 
     // Materialize MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
@@ -386,9 +397,7 @@ export class ClaudeBackend implements Backend {
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
       : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
-    const effort = claudeEffort(
-      req.effort ?? resolveAgentProfile(req, session)?.model?.reasoningEffort,
-    )
+    const effort = claudeEffort(resolveRequestedReasoningEffort(req, session) ?? undefined)
     if (effort) args.push('--effort', effort)
 
     // Fold every system source into --append-system-prompt so

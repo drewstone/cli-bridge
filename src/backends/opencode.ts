@@ -22,7 +22,15 @@ import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveAgentProfile, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import {
+  materializeMcpServersForOpencode,
+  profileExecutionIdentity,
+  provisionProfileWorkspace,
+  resolveAgentProfile,
+  resolveMcpServers,
+  resolvePromptMessages,
+  resolveRequestedReasoningEffort,
+} from './profile-support.js'
 import { registerJailReadable } from '../jail/index.js'
 import { dirname } from 'node:path'
 import { contentToText } from './content.js'
@@ -32,13 +40,9 @@ import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { addUsage as collectUsage, type CollectedUsage } from '../usage.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
-
-interface UsageTotal {
-  receipt: UsageReceipt
-  costComplete: boolean
-}
 
 export interface OpencodeBackendOptions {
   bin: string
@@ -79,7 +83,16 @@ export class OpencodeBackend implements Backend {
 
     // Reject unsupported profile plans before writing a request-scoped
     // opencode.json that may contain MCP credentials.
-    const provisioned = provisionProfileWorkspace(req, session, 'opencode', cwd)
+    const variant = opencodeVariantForEffort(
+      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    )
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'opencode',
+      cwd,
+      profileExecutionIdentity(req, session, 'opencode', variant),
+    )
 
     // Materialize MCP servers (request-body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) into a temp opencode-shape config file.
@@ -113,7 +126,6 @@ export class OpencodeBackend implements Backend {
     // not NDJSON — see writeStdinPayload's 'raw' format.
     const args: string[] = ['run', '--format', 'json']
     if (model) args.push('-m', model)
-    const variant = opencodeVariantForEffort(req.effort)
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
 
@@ -199,7 +211,7 @@ export class OpencodeBackend implements Backend {
       let sawError: string | null = null
       let emittedContent = false
       let emittedToolCall = false
-      let stepUsage: UsageTotal | undefined
+      let stepUsage: CollectedUsage | undefined
       let fallbackUsage: UsageReceipt | undefined
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
 
@@ -233,7 +245,7 @@ export class OpencodeBackend implements Backend {
         const type = String(ev.type ?? '')
         const eventUsage = extractUsage(ev)
         if (eventUsage) {
-          if (isStepReceipt(ev)) stepUsage = addUsage(stepUsage, eventUsage)
+          if (isStepReceipt(ev)) stepUsage = collectUsage(stepUsage, eventUsage)
           else fallbackUsage = eventUsage
         }
         if (type === 'error' || ev.error) {
@@ -348,7 +360,10 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
   const direct = ev.usage as Record<string, unknown> | undefined
   if (direct) {
     return usageFromValues({
-      input_tokens: direct.input_tokens ?? direct.input,
+      input_tokens: direct.input_tokens ?? direct.prompt_tokens ?? direct.input,
+      fresh_input_tokens: direct.fresh_input_tokens ?? direct.input,
+      cache_read_input_tokens: direct.cache_read_input_tokens ?? direct.cacheRead,
+      cache_write_input_tokens: direct.cache_write_input_tokens ?? direct.cacheWrite,
       output_tokens: direct.output_tokens ?? direct.output,
       cost: direct.cost ?? ev.cost,
     })
@@ -366,6 +381,9 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
       cache?.read,
       cache?.write,
     ]),
+    fresh_input_tokens: tokens?.input_tokens ?? tokens?.input,
+    cache_read_input_tokens: cache?.read,
+    cache_write_input_tokens: cache?.write,
     output_tokens: sumKnown([
       tokens?.output_tokens ?? tokens?.output,
       tokens?.reasoning,
@@ -376,13 +394,32 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
 
 function usageFromValues(values: Record<string, unknown>): UsageReceipt | null {
   const inputTokens = nonnegativeFinite(values.input_tokens)
+  const freshInputTokens = nonnegativeFinite(values.fresh_input_tokens)
+  const cacheReadInputTokens = nonnegativeFinite(values.cache_read_input_tokens)
+  const cacheWriteInputTokens = nonnegativeFinite(values.cache_write_input_tokens)
   const outputTokens = nonnegativeFinite(values.output_tokens)
   const cost = nonnegativeFinite(values.cost)
-  if (inputTokens === undefined && outputTokens === undefined && cost === undefined) return null
+  if (
+    inputTokens === undefined
+    && freshInputTokens === undefined
+    && cacheReadInputTokens === undefined
+    && cacheWriteInputTokens === undefined
+    && outputTokens === undefined
+    && cost === undefined
+  ) return null
   return {
     ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+    ...(freshInputTokens !== undefined ? { fresh_input_tokens: freshInputTokens } : {}),
+    ...(cacheReadInputTokens !== undefined ? { cache_read_input_tokens: cacheReadInputTokens } : {}),
+    ...(cacheWriteInputTokens !== undefined ? { cache_write_input_tokens: cacheWriteInputTokens } : {}),
     ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
-    ...(cost !== undefined ? { cost } : {}),
+    cost_known: false,
+    ...(cost !== undefined
+      ? {
+          estimated_cost: cost,
+          cost_provenance: 'catalog-estimate' as const,
+        }
+      : {}),
   }
 }
 
@@ -395,29 +432,24 @@ function isStepReceipt(ev: Record<string, unknown>): boolean {
     || partType === 'step-finish'
 }
 
-function addUsage(total: UsageTotal | undefined, next: UsageReceipt): UsageTotal {
-  const sum = (left: number | undefined, right: number | undefined): number | undefined =>
-    left === undefined ? right : right === undefined ? left : left + right
+function completeUsage(total: CollectedUsage): UsageReceipt {
   return {
-    receipt: {
-      input_tokens: sum(total?.receipt.input_tokens, next.input_tokens),
-      output_tokens: sum(total?.receipt.output_tokens, next.output_tokens),
-      cost: sum(total?.receipt.cost, next.cost),
-    },
-    costComplete: (total?.costComplete ?? true) && next.cost !== undefined,
-  }
-}
-
-function completeUsage(total: UsageTotal): UsageReceipt {
-  return {
-    ...(total.receipt.input_tokens !== undefined
-      ? { input_tokens: total.receipt.input_tokens }
+    ...(total.inputTokensKnown ? { input_tokens: total.inputTokens } : {}),
+    ...(total.freshInputTokensKnown ? { fresh_input_tokens: total.freshInputTokens } : {}),
+    ...(total.cacheReadInputTokensKnown
+      ? { cache_read_input_tokens: total.cacheReadInputTokens }
       : {}),
-    ...(total.receipt.output_tokens !== undefined
-      ? { output_tokens: total.receipt.output_tokens }
+    ...(total.cacheWriteInputTokensKnown
+      ? { cache_write_input_tokens: total.cacheWriteInputTokens }
       : {}),
-    ...(total.costComplete && total.receipt.cost !== undefined
-      ? { cost: total.receipt.cost }
+    ...(total.outputTokensKnown ? { output_tokens: total.outputTokens } : {}),
+    cost_known: false,
+    ...(total.estimatedCostComplete
+      ? {
+          estimated_cost: total.estimatedCost,
+          cost_provenance: 'catalog-estimate' as const,
+          cost_scope: 'total' as const,
+        }
       : {}),
   }
 }

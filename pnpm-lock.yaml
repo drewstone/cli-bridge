@@ -12,11 +12,11 @@ importers:
         specifier: ^1.13.0
         version: 1.19.14(hono@4.12.14)
       '@tangle-network/agent-interface':
-        specifier: 0.40.0
-        version: 0.40.0
+        specifier: 0.43.0
+        version: 0.43.0
       '@tangle-network/agent-profile-materialize':
-        specifier: 0.9.4
-        version: 0.9.4(@tangle-network/agent-interface@0.40.0)
+        specifier: 0.10.2
+        version: 0.10.2(@tangle-network/agent-interface@0.43.0)
       '@tangle-network/agent-trace-contract':
         specifier: ^1.0.2
         version: 1.0.2
@@ -493,13 +493,13 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@tangle-network/agent-interface@0.40.0':
-    resolution: {integrity: sha512-4A6+bb5Ub22WJsVQRNuNIr6BSsfQG4ZZT436GZ2qUcZocjJ7186MEbN7kOmYq9TQ9qeMSUh/HbyYw2nsok5b+w==}
+  '@tangle-network/agent-interface@0.43.0':
+    resolution: {integrity: sha512-t35nGOJ3sWouHoUM/5A8eUmsR+8JcuRF6VFQbT9cPzxIMUV3NsFMJgYXPGmyIj65vtvs73O6Mvijp47FAAGbuQ==}
 
-  '@tangle-network/agent-profile-materialize@0.9.4':
-    resolution: {integrity: sha512-LCKfohFcjzeDz+WrPx6lXyZvn0CYyw0Y3/sBCaJ6fqj2Sgg7KwG178eg/LhlqNPz6xJzBh0g4iHxPge1kNn4nw==}
+  '@tangle-network/agent-profile-materialize@0.10.2':
+    resolution: {integrity: sha512-u3MtUy8BD5odTWu/nK0b2XuieBSZMMx1kR9izwqIoR+c8pQaIRQiENNms9qeyQFLqqm7ewC1/Qq5oTtuihs/5g==}
     peerDependencies:
-      '@tangle-network/agent-interface': '>=0.38.0 <0.41.0'
+      '@tangle-network/agent-interface': '>=0.38.0 <0.44.0'
 
   '@tangle-network/agent-trace-contract@1.0.2':
     resolution: {integrity: sha512-v7uMh56jkEp4vckevEU9xKsIatbs5dqzGPp69dFLSSXUVit0RP6VD6EANMXVlTCUk+6wVKBLHJx23XspVCEiIA==}
@@ -1126,15 +1126,15 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.60.2':
     optional: true
 
-  '@tangle-network/agent-interface@0.40.0':
+  '@tangle-network/agent-interface@0.43.0':
     dependencies:
       '@noble/hashes': 1.8.0
       spdx-expression-parse: 5.0.0
       zod: 4.4.3
 
-  '@tangle-network/agent-profile-materialize@0.9.4(@tangle-network/agent-interface@0.40.0)':
+  '@tangle-network/agent-profile-materialize@0.10.2(@tangle-network/agent-interface@0.43.0)':
     dependencies:
-      '@tangle-network/agent-interface': 0.40.0
+      '@tangle-network/agent-interface': 0.43.0
 
   '@tangle-network/agent-trace-contract@1.0.2': {}
 

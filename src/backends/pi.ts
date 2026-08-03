@@ -61,9 +61,11 @@ import type { SessionRecord } from '../sessions/store.js'
 import {
   buildCanonicalMcpServers,
   materializeMcpServersForPi,
+  profileExecutionIdentity,
   provisionPiProfile,
   resolveAgentProfile,
   resolveMcpServers,
+  resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -108,20 +110,6 @@ function thinkingFlagForEffort(effort?: string): string | null {
   // Canonical ladder → pi's: none → off, ultracode → xhigh (pi's ceiling); the rest pass through.
   const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'xhigh' : effort
   return allowed.has(e) ? e : null
-}
-
-function resolveReasoningEffort(
-  req: ChatRequest,
-  profile: ReturnType<typeof resolveAgentProfile>,
-): ChatRequest['effort'] {
-  const profileEffort = profile?.model?.reasoningEffort
-  if (profileEffort && req.effort && profileEffort !== req.effort) {
-    throw new BackendError(
-      `request effort ${JSON.stringify(req.effort)} conflicts with agent_profile.model.reasoningEffort ${JSON.stringify(profileEffort)}`,
-      'parse_error',
-    )
-  }
-  return profileEffort ?? req.effort
 }
 
 /**
@@ -344,7 +332,6 @@ export class PiBackend implements Backend {
 
     const spec = parsePiModelId(req.model)
     const prompt = this.buildPrompt(req)
-    const profile = resolveAgentProfile(req, session)
 
     const args: string[] = [
       '--print',
@@ -364,7 +351,9 @@ export class PiBackend implements Backend {
       // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
-    const thinking = thinkingFlagForEffort(resolveReasoningEffort(req, profile))
+    const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
+    const thinking = thinkingFlagForEffort(requestedReasoningEffort ?? undefined)
+    const executionIdentity = profileExecutionIdentity(req, session, 'pi', thinking)
     if (thinking) args.push('--thinking', thinking)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
@@ -404,7 +393,12 @@ export class PiBackend implements Backend {
         ? materializeMcpServersForPi(mcpSpecs, runCwd)
         : null
       if (mcpMounted) args.push('--mcp-config', mcpMounted.configPath)
-      provisioned = provisionPiProfile(req, session, runCwd)
+      provisioned = provisionPiProfile(
+        req,
+        session,
+        runCwd,
+        executionIdentity,
+      )
       if (provisioned) args.push(...provisioned.flags)
       // The task prompt remains the sole positional message. Profile system and
       // additive instructions retain their native, separate authority channels.
@@ -583,15 +577,15 @@ export class PiBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
 
-      // Per-turn token receipts stay observable. Cost is emitted once, only
-      // after every contributing call proved its amount; a partial sum must
-      // never be presented as the run's complete cost.
+      // Per-turn token receipts stay observable. Pi computes dollars from its
+      // local model catalog, so even a complete numeric sum is only an estimate;
+      // it must never cross the bridge as provider-billed spend.
       if (usageCost.receipts > 0 && usageCost.complete) {
         yield {
           usage: {
-            input_tokens: 0,
-            output_tokens: 0,
-            cost: usageCost.total,
+            estimated_cost: usageCost.total,
+            cost_known: false,
+            cost_provenance: 'catalog-estimate',
             cost_scope: 'total',
           },
         }
@@ -662,9 +656,12 @@ export class PiBackend implements Backend {
 }
 
 interface PiUsageReceipt {
-  input: number
-  output: number
-  cost?: number
+  input?: number
+  freshInput?: number
+  cacheRead?: number
+  cacheWrite?: number
+  output?: number
+  estimatedCost?: number
 }
 
 interface PiUsageCost {
@@ -748,27 +745,39 @@ function piUsageFromRecord(usage: Record<string, unknown>): PiUsageReceipt | und
   const rawCost = usage.cost
   const nestedCost = record(rawCost)
   const cost = piCost(nestedCost ? nestedCost.total : rawCost)
+  const aggregateInput = openAiInput ?? (
+    nativeInput !== undefined || cacheRead !== undefined || cacheWrite !== undefined
+      ? (nativeInput ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0)
+      : undefined
+  )
   return {
-    input: openAiInput ?? (nativeInput ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0),
-    output: output ?? 0,
-    ...(cost !== undefined ? { cost } : {}),
+    ...(aggregateInput !== undefined ? { input: aggregateInput } : {}),
+    ...(nativeInput !== undefined ? { freshInput: nativeInput } : {}),
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+    ...(output !== undefined ? { output } : {}),
+    ...(cost !== undefined ? { estimatedCost: cost } : {}),
   }
 }
 
 function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['usage']> {
   return {
-    input_tokens: receipt.input,
-    output_tokens: receipt.output,
+    ...(receipt.input !== undefined ? { input_tokens: receipt.input } : {}),
+    ...(receipt.freshInput !== undefined ? { fresh_input_tokens: receipt.freshInput } : {}),
+    ...(receipt.cacheRead !== undefined ? { cache_read_input_tokens: receipt.cacheRead } : {}),
+    ...(receipt.cacheWrite !== undefined ? { cache_write_input_tokens: receipt.cacheWrite } : {}),
+    ...(receipt.output !== undefined ? { output_tokens: receipt.output } : {}),
+    cost_known: false,
   }
 }
 
 function recordPiUsageCost(total: PiUsageCost, receipt: PiUsageReceipt): void {
   total.receipts += 1
-  if (receipt.cost === undefined) {
+  if (receipt.estimatedCost === undefined) {
     total.complete = false
     return
   }
-  total.total += receipt.cost
+  total.total += receipt.estimatedCost
 }
 
 function piTokenCount(value: unknown, field: string): number | undefined {

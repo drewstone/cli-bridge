@@ -33,9 +33,11 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   materializeMcpServersForCodex,
+  profileExecutionIdentity,
   provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
+  resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -93,7 +95,9 @@ export class CodexBackend implements Backend {
       '--dangerously-bypass-approvals-and-sandbox',
     ]
     if (modelArg) args.push('-c', `model="${modelArg}"`)
-    const reasoningEffort = codexReasoningEffort(req.effort)
+    const reasoningEffort = codexReasoningEffort(
+      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    )
     if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`)
 
     if (session?.internalId) {
@@ -104,7 +108,13 @@ export class CodexBackend implements Backend {
 
     // Reject unsupported profile plans before copying auth or writing MCP
     // credentials into a synthetic CODEX_HOME.
-    const provisioned = provisionProfileWorkspace(req, session, 'codex', cwd)
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'codex',
+      cwd,
+      profileExecutionIdentity(req, session, 'codex', reasoningEffort),
+    )
     args.push(...provisioned.flags)
 
     // MCP server passthrough — codex has no `--mcp-config` flag.

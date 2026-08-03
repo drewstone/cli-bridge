@@ -470,6 +470,10 @@ export async function buildApp(config: Config): Promise<{
     name: 'cli-bridge',
     version: '0.2.0',
     scheme: 'bridge/<harness>/<model>',
+    capabilities: {
+      profileMaterialization: 'cli-bridge.profile-materialization.v2',
+      usageCostProvenance: 'cli-bridge.usage-cost.v1',
+    },
     backends: registry.all().map(b => b.name),
     endpoints: [
       '/health',

@@ -9,7 +9,7 @@
  * must treat the old job as unknown rather than proven stopped.
  */
 
-import type { ChatDelta } from '../backends/types.js'
+import type { ChatDelta, ProfileMaterializationReceipt } from '../backends/types.js'
 import { BackendReportedFailureError, describeRunFailure, reasonForTerminalDelta } from './error-shape.js'
 
 /** A buffered delta plus its per-run monotonic sequence number. */
@@ -54,6 +54,8 @@ export interface RunSnapshot {
   endedAt: number | null
   /** Run-id binding survives replay expiry until this time. */
   identityExpiresAt: number | null
+  /** Exact profile acknowledgment retained for the full run-identity lifetime. */
+  profileMaterialization: ProfileMaterializationReceipt | null
 }
 
 /** A caller attempted to reuse a durable run id for different execution bytes. */
@@ -115,6 +117,7 @@ export class Run {
   private replayExpiresAt: number | null = null
   private identityExpiresAt: number | null = null
   private replayExpired = false
+  private profileMaterialization: ProfileMaterializationReceipt | null = null
   private readonly waiters = new Set<Waiter>()
   private replayTimer: ReturnType<typeof setTimeout> | null = null
   private identityTimer: ReturnType<typeof setTimeout> | null = null
@@ -168,6 +171,9 @@ export class Run {
       startedAt: this.startedAt,
       endedAt: this.endedAt,
       identityExpiresAt: this.identityExpiresAt,
+      profileMaterialization: this.profileMaterialization
+        ? structuredClone(this.profileMaterialization)
+        : null,
     }
   }
 
@@ -379,8 +385,20 @@ export class Run {
   }
 
   private append(delta: ChatDelta): void {
+    let committed = delta
+    if (delta.profile_materialization) {
+      const receipt = structuredClone(delta.profile_materialization)
+      if (
+        this.profileMaterialization
+        && JSON.stringify(this.profileMaterialization) !== JSON.stringify(receipt)
+      ) {
+        throw new Error(`run ${JSON.stringify(this.id)} emitted conflicting profile materialization receipts`)
+      }
+      this.profileMaterialization = receipt
+      committed = { ...delta, profile_materialization: receipt }
+    }
     this.seq += 1
-    this.buffer.push({ seq: this.seq, delta })
+    this.buffer.push({ seq: this.seq, delta: committed })
     while (this.buffer.length > this.retention.maxReplayDeltas) this.buffer.shift()
     this.wakeAll()
   }
