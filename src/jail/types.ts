@@ -44,6 +44,31 @@ export interface JailSpec {
    * the operator HOME (e.g. a custom `CODEX_HOME`) still lands at the location
    * the confined CLI reads. Populated per backend by {@link authSourcesFor}. */
   authSources?: JailAuthSource[]
+  /** Backend state paths redirected into writable jail storage even when no
+   * host config/auth source exists. */
+  writableEnvironment?: readonly JailWritableEnvironment[]
+  /** Exact argv values that differ only while the OS jail is active.
+   * Backends declare both values; the executor applies the rewrite after it
+   * has proved a jail backend is available. Fallback and Docker paths retain
+   * the original argument. */
+  argumentRewrites?: JailArgumentRewrite[]
+}
+
+/** One exact command argument and the value visible inside an active jail. */
+export interface JailArgumentRewrite {
+  from: string
+  to: string
+  /** Optional flag that must immediately precede the rewritten value. */
+  precededBy?: string
+  /** Apply only to these active jail implementations. Omitted means all. */
+  backends?: readonly string[]
+}
+
+export interface JailWritableEnvironment {
+  /** Environment variable exposed to the confined child. */
+  envVar: string
+  /** Writable path relative to the confined HOME. */
+  jailRel: string
 }
 
 /** A host credential/config path and where it must appear inside the jail. */

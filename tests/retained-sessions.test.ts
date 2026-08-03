@@ -239,6 +239,128 @@ class DeferredResponseNative extends FakeNative {
   }
 }
 
+class DeferredBoundaryNative extends FakeNative {
+  private releaseBoundary!: () => void
+  private signalBoundaryStarted!: () => void
+  readonly boundaryStarted: Promise<void>
+  private readonly boundaryReady: Promise<void>
+
+  constructor() {
+    super()
+    this.boundaryStarted = new Promise(resolve => { this.signalBoundaryStarted = resolve })
+    this.boundaryReady = new Promise(resolve => { this.releaseBoundary = resolve })
+  }
+
+  allowBoundary(): void { this.releaseBoundary() }
+
+  override async contextBoundary(
+    input: { runId: string; environmentId: string; sessionId: string },
+  ): Promise<NativeContextBoundaryProof | null> {
+    this.signalBoundaryStarted()
+    await this.boundaryReady
+    return await super.contextBoundary(input)
+  }
+}
+
+class DeferredCloseNative extends FakeNative {
+  private releaseClose!: () => void
+  private signalCloseStarted!: () => void
+  readonly closeStarted: Promise<void>
+  private readonly closeReady: Promise<void>
+  boundaryDuringCloseCalls = 0
+
+  constructor() {
+    super()
+    this.closeStarted = new Promise(resolve => { this.signalCloseStarted = resolve })
+    this.closeReady = new Promise(resolve => { this.releaseClose = resolve })
+  }
+
+  allowClose(): void { this.releaseClose() }
+
+  override contextBoundary(
+    input: { runId: string; environmentId: string; sessionId: string },
+  ): Promise<NativeContextBoundaryProof | null> {
+    if (this.closeCalls > 0 && !this.isClosed()) {
+      this.boundaryDuringCloseCalls += 1
+      return Promise.reject(new Error('boundary inspection overlapped native close'))
+    }
+    return super.contextBoundary(input)
+  }
+
+  override async close(): Promise<void> {
+    this.closeCalls += 1
+    this.signalCloseStarted()
+    await this.closeReady
+    this.crash(new Error('fake native session closed'))
+  }
+}
+
+class CloseFailureContinuationNative extends FakeNative {
+  private signalCloseStarted!: () => void
+  private signalSecondTurnStarted!: () => void
+  private releaseCloseFailure!: () => void
+  private releaseSecondTurn!: () => void
+  readonly closeStarted: Promise<void>
+  readonly secondTurnStarted: Promise<void>
+  private readonly closeFailureReady: Promise<void>
+  private readonly secondTurnReady: Promise<void>
+  private failedClose = false
+
+  constructor() {
+    super()
+    this.closeStarted = new Promise(resolve => { this.signalCloseStarted = resolve })
+    this.secondTurnStarted = new Promise(resolve => { this.signalSecondTurnStarted = resolve })
+    this.closeFailureReady = new Promise(resolve => { this.releaseCloseFailure = resolve })
+    this.secondTurnReady = new Promise(resolve => { this.releaseSecondTurn = resolve })
+  }
+
+  allowCloseFailure(): void { this.releaseCloseFailure() }
+
+  allowSecondTurn(): void { this.releaseSecondTurn() }
+
+  override async *turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
+    if (this.prompts.length === 1) {
+      this.signalSecondTurnStarted()
+      await this.secondTurnReady
+    }
+    yield* super.turn(prompt, signal)
+  }
+
+  override async close(): Promise<void> {
+    if (!this.failedClose) {
+      this.failedClose = true
+      this.closeCalls += 1
+      this.signalCloseStarted()
+      await this.closeFailureReady
+      throw new Error('transient close failure')
+    }
+    return await super.close()
+  }
+}
+
+class DeferredSecondTurnNative extends FakeNative {
+  private signalSecondTurnStarted!: () => void
+  private releaseSecondTurn!: () => void
+  readonly secondTurnStarted: Promise<void>
+  private readonly secondTurnReady: Promise<void>
+
+  constructor() {
+    super()
+    this.secondTurnStarted = new Promise(resolve => { this.signalSecondTurnStarted = resolve })
+    this.secondTurnReady = new Promise(resolve => { this.releaseSecondTurn = resolve })
+  }
+
+  allowSecondTurn(): void { this.releaseSecondTurn() }
+
+  override async *turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
+    if (this.prompts.length === 1) {
+      this.signalSecondTurnStarted()
+      await this.secondTurnReady
+    }
+    yield* super.turn(prompt, signal)
+  }
+}
+
 class HangingNative extends FakeNative {
   override async *turn(_prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
     yield { type: 'session', id: 'pi-hanging' }
@@ -255,7 +377,18 @@ class NeverClosingNative extends FakeNative {
 }
 
 class RejectingCloseNative extends FakeNative {
-  override close(): Promise<void> { return Promise.reject(new Error('injected native cleanup failure')) }
+  override close(): Promise<void> {
+    this.closeCalls += 1
+    return Promise.reject(new Error('injected native cleanup failure'))
+  }
+}
+
+class RejectingAbortNative extends FakeNative {
+  override abort(): Promise<void> { return Promise.reject(new Error('injected native abort failure')) }
+}
+
+class RejectingAbortAndCloseNative extends RejectingCloseNative {
+  override abort(): Promise<void> { return Promise.reject(new Error('injected native abort failure')) }
 }
 
 class FailOnceCloseNative extends FakeNative {
@@ -270,6 +403,16 @@ class FailOnceCloseNative extends FakeNative {
 
 class SyncThrowWhenClosedNative extends FakeNative {
   override whenClosed(): Promise<void> { throw new Error('synchronous whenClosed failure') }
+}
+
+class FailOnceUnexpectedCleanupNative extends FakeNative {
+  whenClosedCalls = 0
+
+  override whenClosed(): Promise<void> {
+    this.whenClosedCalls += 1
+    if (this.whenClosedCalls === 1) return Promise.reject(new Error('unexpected-close cleanup failed'))
+    return super.whenClosed()
+  }
 }
 
 class PrematureNative extends FakeNative {
@@ -310,6 +453,27 @@ class FakeNativeBackend implements NativeSessionBackend {
   }
   async *chat(_req: ChatRequest, _session: SessionRecord | null, _signal: AbortSignal): AsyncIterable<ChatDelta> {
     yield { content: 'one-shot', finish_reason: 'stop' }
+  }
+}
+
+class DeferredStartNativeBackend extends FakeNativeBackend {
+  private signalStart!: () => void
+  private releaseStart!: () => void
+  readonly startEntered: Promise<void>
+  private readonly startReady: Promise<void>
+
+  constructor(makeNative: () => FakeNative = () => new FakeNative()) {
+    super(makeNative)
+    this.startEntered = new Promise(resolve => { this.signalStart = resolve })
+    this.startReady = new Promise(resolve => { this.releaseStart = resolve })
+  }
+
+  allowStart(): void { this.releaseStart() }
+
+  override async startNativeSession(req: ChatRequest): Promise<NativeSession> {
+    this.signalStart()
+    await this.startReady
+    return await super.startNativeSession(req)
   }
 }
 
@@ -1077,12 +1241,52 @@ describe('retained Agent Interface sessions', () => {
     await expect(runs.shutdown(20)).rejects.toBeInstanceOf(RunShutdownTimeoutError)
   })
 
-  it('reports a disposal failure once and lets a later shutdown finish', async () => {
+  it('retains a failed disposal and retries the same child on later shutdown', async () => {
     const registry = new RunRegistry()
     const run = registry.claim('rejecting-cleanup', 'sha256:' + 'c'.repeat(64)).run
-    run.setNativeControl(new RejectingCloseNative())
-    await expect(registry.shutdown(1_000)).rejects.toThrow(/injected native cleanup failure/)
+    const native = new FailOnceCloseNative()
+    run.setNativeControl(native)
+    await expect(registry.shutdown(1_000)).rejects.toThrow(/transient close failure/)
+    expect(native.closeCalls).toBe(1)
+    expect(native.isClosed()).toBe(false)
     await expect(registry.shutdown(1_000)).resolves.toBeUndefined()
+    expect(native.closeCalls).toBe(2)
+    expect(native.isClosed()).toBe(true)
+  })
+
+  it('does not drop ownership when every shutdown cleanup attempt fails', async () => {
+    const registry = new RunRegistry()
+    const run = registry.claim('permanent-cleanup', 'sha256:' + 'e'.repeat(64)).run
+    const native = new RejectingCloseNative()
+    run.setNativeControl(native)
+    await expect(registry.shutdown(1_000)).rejects.toThrow(/injected native cleanup failure/)
+    await expect(registry.shutdown(1_000)).rejects.toThrow(/injected native cleanup failure/)
+    expect(native.closeCalls).toBe(2)
+    expect(native.isClosed()).toBe(false)
+  })
+
+  it('treats a successful close as final even when native abort reports an error', async () => {
+    const registry = new RunRegistry()
+    const run = registry.claim('abort-close-wins', 'sha256:' + 'f'.repeat(64)).run
+    const native = new RejectingAbortNative()
+    run.setNativeControl(native)
+
+    await expect(run.requestNativeCancellation()).resolves.toBe(true)
+    expect(native.isClosed()).toBe(true)
+    expect(run.nativeSession()).toBeNull()
+    run.failCanonicalSetup(new Error('cancelled during test'))
+    await expect(run.whenTerminal()).resolves.toMatchObject({ status: 'cancelled', terminal: true })
+    await expect(registry.shutdown(1_000)).resolves.toBeUndefined()
+  })
+
+  it('never transfers a native child after cancellation cleanup failed', async () => {
+    const run = new RunRegistry().claim('tainted-cancel', 'sha256:' + '1'.repeat(64)).run
+    const native = new RejectingAbortAndCloseNative()
+    run.setNativeControl(native)
+
+    await expect(run.requestNativeCancellation()).rejects.toThrow(/abort and close both failed/)
+    await expect(run.takeNativeControl(native)).resolves.toBe(false)
+    expect(run.nativeSession()).toBe(native)
   })
 
   it('turns a synchronous whenClosed throw into an owned cleanup rejection', async () => {
@@ -1091,6 +1295,30 @@ describe('retained Agent Interface sessions', () => {
     run.setNativeControl(native)
     expect(() => native.crash()).not.toThrow()
     await expect(run.dispose()).rejects.toThrow(/synchronous whenClosed failure/)
+  })
+
+  it('retains an unexpected-close cleanup failure for shutdown retry', async () => {
+    const registry = new RunRegistry()
+    const run = registry.claim('unexpected-close-retry', 'sha256:' + '9'.repeat(64)).run
+    const native = new FailOnceUnexpectedCleanupNative()
+    run.setNativeControl(native)
+
+    native.crash(new Error('child exited unexpectedly'))
+    await waitFor(() => native.whenClosedCalls === 1)
+    await expect(registry.shutdown(1_000)).rejects.toThrow(/unexpected-close cleanup failed/)
+    expect(native.closeCalls).toBe(0)
+
+    await expect(registry.shutdown(1_000)).resolves.toBeUndefined()
+    expect(native.closeCalls).toBe(1)
+    expect(run.nativeSession()).toBeNull()
+  })
+
+  it('refuses every new run claim after shutdown admission closes', async () => {
+    const registry = new RunRegistry()
+    registry.closeAdmission()
+    expect(() => registry.claim('late-run', 'sha256:' + '8'.repeat(64)))
+      .toThrow(/run admission is closed/)
+    await expect(registry.shutdown(1_000)).resolves.toBeUndefined()
   })
 
   it('keeps an expired run cleanup visible to shutdown after the run leaves the registry', async () => {
@@ -1192,6 +1420,517 @@ describe('retained Agent Interface sessions', () => {
     expect(fixture.runs.nativeSession('close-idle')).toBeNull()
   })
 
+  it('keeps a concurrently closed session closed after delayed turn finalization', async () => {
+    const native = new DeferredBoundaryNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'close-during-finalization', model: 'pi/test' }),
+    })
+    try {
+      const turn = await fixture.app.request('/v1/sessions/close-during-finalization/turns', {
+        method: 'POST', body: turnBody('close-during-finalization', { message: 'finish' }),
+      })
+      expect(turn.status).toBe(202)
+      await native.boundaryStarted
+
+      const closed = await fixture.app.request('/v1/sessions/close-during-finalization/close', { method: 'POST' })
+      expect(closed.status).toBe(200)
+      expect((await json(closed)).session.status).toBe('closed')
+
+      native.allowBoundary()
+      await waitFor(() => fixture!.store.getRetained('close-during-finalization')?.turns === 1)
+      expect(fixture.store.getRetained('close-during-finalization')?.status).toBe('closed')
+    } finally {
+      native.allowBoundary()
+    }
+  })
+
+  it('keeps a session unknown after its native child exits during delayed finalization', async () => {
+    const native = new DeferredBoundaryNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'unknown-during-finalization', model: 'pi/test' }),
+    })
+
+    try {
+      const turn = await fixture.app.request('/v1/sessions/unknown-during-finalization/turns', {
+        method: 'POST', body: turnBody('unknown-during-finalization', { message: 'finish' }),
+      })
+      expect(turn.status).toBe(202)
+      await native.boundaryStarted
+
+      native.crash()
+      await waitFor(() => fixture!.store.getRetained('unknown-during-finalization')?.status === 'unknown')
+      native.allowBoundary()
+
+      await waitFor(() => fixture!.store.getRetained('unknown-during-finalization')?.turns === 1)
+      expect(fixture.store.getRetained('unknown-during-finalization')?.status).toBe('unknown')
+    } finally {
+      native.allowBoundary()
+    }
+  })
+
+  it('lets close win a native ownership race without starting a continuation', async () => {
+    const native = new DeferredCloseNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'close-transfer-race', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/close-transfer-race/turns', {
+      method: 'POST', body: turnBody('close-transfer-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('close-transfer-race')?.turns === 1)
+
+    try {
+      const closing = fixture.app.request('/v1/sessions/close-transfer-race/close', { method: 'POST' })
+      await native.closeStarted
+      const continuation = fixture.app.request('/v1/sessions/close-transfer-race/turns', {
+        method: 'POST', body: turnBody('close-transfer-second', { message: 'second' }),
+      })
+      const continued = await continuation
+      expect(continued.status).toBe(409)
+      expect((await json(continued)).error.type).toBe('invalid_state')
+      expect(native.boundaryDuringCloseCalls).toBe(0)
+
+      native.allowClose()
+      const closed = await closing
+      expect(closed.status).toBe(200)
+      expect(native.prompts).toEqual(['first'])
+      expect(native.closeCalls).toBe(1)
+      expect(fixture.store.getRetained('close-transfer-race')?.status).toBe('closed')
+      expect(fixture.store.getRetainedRun('run-close-transfer-second')).toBeNull()
+    } finally {
+      native.allowClose()
+    }
+  })
+
+  it('rejects close while a first turn owns startup before attaching its native child', async () => {
+    const backend = new DeferredStartNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'close-first-startup', model: 'pi/test' }),
+    })
+
+    try {
+      const turn = fixture.app.request('/v1/sessions/close-first-startup/turns', {
+        method: 'POST', body: turnBody('close-first-startup', { message: 'first' }),
+      })
+      await backend.startEntered
+      expect(fixture.runs.nativeSession('close-first-startup')).toBeNull()
+      const status = await fixture.app.request('/v1/sessions/close-first-startup')
+      expect(status.status).toBe(200)
+      expect((await json(status)).status).toBe('running')
+      expect(fixture.store.getRetained('close-first-startup')?.status).toBe('running')
+
+      const closed = await fixture.app.request('/v1/sessions/close-first-startup/close', { method: 'POST' })
+      expect(closed.status).toBe(409)
+      expect((await json(closed)).error.type).toBe('active_run')
+
+      backend.allowStart()
+      expect((await turn).status).toBe(202)
+      await waitFor(() => fixture!.store.getRetained('close-first-startup')?.turns === 1)
+      expect(fixture.store.getRetained('close-first-startup')?.status).toBe('idle')
+    } finally {
+      backend.allowStart()
+    }
+  })
+
+  it('terminalizes a claimed run when initial run publication fails before startup', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'run-publication-failure', model: 'pi/test' }),
+    })
+    const body = turnBody('run-publication-failure', { message: 'first' })
+    const updateRetainedRun = fixture.store.updateRetainedRun.bind(fixture.store)
+    let injected = false
+    fixture.store.updateRetainedRun = ((...args: Parameters<typeof updateRetainedRun>) => {
+      if (!injected) {
+        injected = true
+        throw new Error('injected run publication failure')
+      }
+      return updateRetainedRun(...args)
+    }) as typeof fixture.store.updateRetainedRun
+
+    const first = await fixture.app.request('/v1/sessions/run-publication-failure/turns', {
+      method: 'POST', body,
+    })
+    fixture.store.updateRetainedRun = updateRetainedRun
+
+    expect(first.status).toBeGreaterThanOrEqual(500)
+    expect(backend.natives).toHaveLength(0)
+    expect(fixture.runs.get('run-run-publication-failure')?.snapshot()).toMatchObject({
+      status: 'error',
+      terminal: true,
+    })
+    expect(fixture.store.getRetainedRun('run-run-publication-failure')?.snapshot).toMatchObject({
+      status: 'error',
+      terminal: true,
+    })
+
+    const retried = await fixture.app.request('/v1/sessions/run-publication-failure/turns', {
+      method: 'POST', body,
+    })
+    expect(retried.status).toBe(202)
+    expect(await json(retried)).toMatchObject({ run: { status: 'error', terminal: true } })
+    expect(backend.natives).toHaveLength(0)
+  })
+
+  it('terminalizes a claimed run when session publication fails before startup', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'session-publication-failure', model: 'pi/test' }),
+    })
+    const body = turnBody('session-publication-failure', { message: 'first' })
+    const updateRetained = fixture.store.updateRetained.bind(fixture.store)
+    let injected = false
+    fixture.store.updateRetained = ((id, patch) => {
+      if (!injected && patch.status === 'running' && patch.runId === 'run-session-publication-failure') {
+        injected = true
+        throw new Error('injected session publication failure')
+      }
+      return updateRetained(id, patch)
+    }) as typeof fixture.store.updateRetained
+
+    const first = await fixture.app.request('/v1/sessions/session-publication-failure/turns', {
+      method: 'POST', body,
+    })
+    fixture.store.updateRetained = updateRetained
+
+    expect(first.status).toBeGreaterThanOrEqual(500)
+    expect(backend.natives).toHaveLength(0)
+    expect(fixture.store.getRetainedRun('run-session-publication-failure')?.snapshot).toMatchObject({
+      status: 'error',
+      terminal: true,
+    })
+
+    const retried = await fixture.app.request('/v1/sessions/session-publication-failure/turns', {
+      method: 'POST', body,
+    })
+    expect(retried.status).toBe(202)
+    expect(await json(retried)).toMatchObject({ run: { status: 'error', terminal: true } })
+    expect(backend.natives).toHaveLength(0)
+  })
+
+  it('waits for and closes a child that returns after run shutdown starts', async () => {
+    const backend = new DeferredStartNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'shutdown-first-startup', model: 'pi/test' }),
+    })
+    const runId = 'run-shutdown-first-startup'
+
+    try {
+      const turn = fixture.app.request('/v1/sessions/shutdown-first-startup/turns', {
+        method: 'POST', body: turnBody('shutdown-first-startup', { message: 'first' }),
+      })
+      await backend.startEntered
+      const run = fixture.runs.get(runId)
+      if (!run) throw new Error('pending startup run is missing')
+
+      const shuttingDown = fixture.runs.shutdown(1_000)
+      await waitFor(() => run.signal.aborted)
+      backend.allowStart()
+
+      const [turned] = await Promise.all([turn, shuttingDown])
+      expect(turned.status).toBe(409)
+      expect((await json(turned)).error.type).toBe('cancelled')
+      expect(backend.natives).toHaveLength(1)
+      expect(backend.natives[0]!.closeCalls).toBe(1)
+      expect(backend.natives[0]!.isClosed()).toBe(true)
+    } finally {
+      backend.allowStart()
+    }
+  })
+
+  it('cancels a first turn while native startup is still pending', async () => {
+    const backend = new DeferredStartNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'cancel-first-startup', model: 'pi/test' }),
+    })
+    const runId = 'run-cancel-first-startup'
+
+    try {
+      const turn = fixture.app.request('/v1/sessions/cancel-first-startup/turns', {
+        method: 'POST', body: turnBody('cancel-first-startup', { message: 'first' }),
+      })
+      await backend.startEntered
+      const admission = fixture.store.getRetainedRun(runId)
+      if (!admission) throw new Error('pending startup run admission is missing')
+      const cancellation = {
+        operationId: 'cancel-first-startup-operation',
+        run: {
+          runId,
+          provider: 'cli-bridge' as const,
+          environmentId: 'cli-bridge',
+          sessionId: 'cancel-first-startup',
+          executionId: admission.executionId,
+          requestDigest: admission.requestDigest as `sha256:${string}`,
+        },
+      }
+      const cancelling = fixture.app.request('/v1/sessions/cancel-first-startup/cancel?wait_ms=1000', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...cancellation,
+          requestDigest: agentRunCancellationRequestDigest(cancellation),
+        }),
+      })
+      await waitFor(() => fixture!.runs.get(runId)?.signal.aborted === true)
+
+      backend.allowStart()
+      const [turned, cancelled] = await Promise.all([turn, cancelling])
+      expect(turned.status).toBe(409)
+      expect((await json(turned)).error.type).toBe('cancelled')
+      expect(cancelled.status).toBe(200)
+      expect(await json(cancelled)).toMatchObject({ status: 'accepted', effect: 'cancelled' })
+      expect(fixture.store.getRetained('cancel-first-startup')?.status).toBe('cancelled')
+      expect(backend.natives[0]!.closeCalls).toBe(1)
+    } finally {
+      backend.allowStart()
+    }
+  })
+
+  it('retains a late startup child when its first cancellation cleanup fails', async () => {
+    const native = new FailOnceCloseNative()
+    const backend = new DeferredStartNativeBackend(() => native)
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'cancel-startup-close-failure', model: 'pi/test' }),
+    })
+    const runId = 'run-cancel-startup-close-failure'
+
+    try {
+      const turn = fixture.app.request('/v1/sessions/cancel-startup-close-failure/turns', {
+        method: 'POST', body: turnBody('cancel-startup-close-failure', { message: 'first' }),
+      })
+      await backend.startEntered
+      const cancelling = fixture.app.request('/v1/sessions/cancel-startup-close-failure/cancel?wait_ms=1000', {
+        method: 'POST',
+        body: cancellationBody(fixture, 'cancel-startup-close-failure', 'cancel-startup-close-failure-operation'),
+      })
+      await waitFor(() => fixture!.runs.get(runId)?.signal.aborted === true)
+
+      backend.allowStart()
+      const [turned, cancelled] = await Promise.all([turn, cancelling])
+      expect(turned.status).toBe(502)
+      expect((await json(turned)).error.type).toBe('close_failed')
+      expect(cancelled.status).toBe(502)
+      expect(await json(cancelled)).toMatchObject({ status: 'unknown', effect: 'unknown', retryable: false })
+      expect(fixture.store.getRetained('cancel-startup-close-failure')?.status).toBe('unknown')
+      expect(fixture.runs.nativeSession('cancel-startup-close-failure')?.session).toBe(native)
+      expect(native.closeCalls).toBe(1)
+
+      const closed = await fixture.app.request('/v1/sessions/cancel-startup-close-failure/close', { method: 'POST' })
+      expect(closed.status).toBe(200)
+      expect((await json(closed)).session.status).toBe('closed')
+      expect(native.closeCalls).toBe(2)
+      expect(fixture.runs.nativeSession('cancel-startup-close-failure')).toBeNull()
+    } finally {
+      backend.allowStart()
+    }
+  })
+
+  it('rejects close while continuation ownership is between native runs', async () => {
+    const native = new FakeNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'close-transfer-gap', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/close-transfer-gap/turns', {
+      method: 'POST', body: turnBody('close-transfer-gap-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('close-transfer-gap')?.turns === 1)
+
+    const prior = fixture.runs.nativeSession('close-transfer-gap')
+    if (!prior) throw new Error('first native run is missing')
+    const takeNativeControl = prior.run.takeNativeControl.bind(prior.run)
+    let signalTaken!: () => void
+    let releaseTransfer!: () => void
+    const taken = new Promise<void>(resolve => { signalTaken = resolve })
+    const transferReady = new Promise<void>(resolve => { releaseTransfer = resolve })
+    prior.run.takeNativeControl = async control => {
+      signalTaken()
+      await transferReady
+      return await takeNativeControl(control)
+    }
+
+    try {
+      const continuation = fixture.app.request('/v1/sessions/close-transfer-gap/turns', {
+        method: 'POST', body: turnBody('close-transfer-gap-second', { message: 'second' }),
+      })
+      await taken
+      expect(fixture.runs.nativeSession('close-transfer-gap')?.run.id).toBe('run-close-transfer-gap-first')
+      const status = await fixture.app.request('/v1/sessions/close-transfer-gap')
+      expect(status.status).toBe(200)
+      expect(await json(status)).toMatchObject({
+        status: 'running',
+        run_id: 'run-close-transfer-gap-second',
+        run: { id: 'run-close-transfer-gap-second', status: 'running' },
+      })
+      expect(fixture.store.getRetained('close-transfer-gap')?.status).toBe('running')
+
+      const closed = await fixture.app.request('/v1/sessions/close-transfer-gap/close', { method: 'POST' })
+      expect(closed.status).toBe(409)
+      expect((await json(closed)).error.type).toBe('active_run')
+
+      releaseTransfer()
+      expect((await continuation).status).toBe(202)
+      await waitFor(() => fixture!.store.getRetained('close-transfer-gap')?.turns === 2)
+      expect(fixture.store.getRetained('close-transfer-gap')?.status).toBe('idle')
+      expect(native.prompts).toEqual(['first', 'second'])
+    } finally {
+      releaseTransfer()
+    }
+  })
+
+  it('closes a transferred child when shutdown starts during the ownership gap', async () => {
+    const native = new FakeNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'shutdown-transfer-gap', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/shutdown-transfer-gap/turns', {
+      method: 'POST', body: turnBody('shutdown-transfer-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('shutdown-transfer-gap')?.turns === 1)
+
+    const prior = fixture.runs.nativeSession('shutdown-transfer-gap')
+    if (!prior) throw new Error('first native run is missing')
+    const takeNativeControl = prior.run.takeNativeControl.bind(prior.run)
+    let signalTaken!: () => void
+    let releaseTransfer!: () => void
+    const taken = new Promise<void>(resolve => { signalTaken = resolve })
+    const transferReady = new Promise<void>(resolve => { releaseTransfer = resolve })
+    prior.run.takeNativeControl = async control => {
+      const accepted = await takeNativeControl(control)
+      signalTaken()
+      await transferReady
+      return accepted
+    }
+
+    try {
+      const continuation = fixture.app.request('/v1/sessions/shutdown-transfer-gap/turns', {
+        method: 'POST', body: turnBody('shutdown-transfer-second', { message: 'second' }),
+      })
+      await taken
+      const run = fixture.runs.get('run-shutdown-transfer-second')
+      if (!run) throw new Error('continuation run is missing')
+      expect(fixture.runs.nativeSession('shutdown-transfer-gap')).toBeNull()
+
+      const shuttingDown = fixture.runs.shutdown(1_000)
+      await waitFor(() => run.signal.aborted)
+      releaseTransfer()
+
+      const [continued] = await Promise.all([continuation, shuttingDown])
+      expect(continued.status).toBe(409)
+      expect((await json(continued)).error.type).toBe('cancelled')
+      expect(native.closeCalls).toBe(1)
+      expect(native.isClosed()).toBe(true)
+    } finally {
+      releaseTransfer()
+    }
+  })
+
+  it('cancels and closes a continuation while native ownership is between runs', async () => {
+    const native = new FakeNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'cancel-transfer-gap', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/cancel-transfer-gap/turns', {
+      method: 'POST', body: turnBody('cancel-transfer-gap-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('cancel-transfer-gap')?.turns === 1)
+
+    const prior = fixture.runs.nativeSession('cancel-transfer-gap')
+    if (!prior) throw new Error('first native run is missing')
+    const takeNativeControl = prior.run.takeNativeControl.bind(prior.run)
+    let signalTaken!: () => void
+    let releaseTransfer!: () => void
+    const taken = new Promise<void>(resolve => { signalTaken = resolve })
+    const transferReady = new Promise<void>(resolve => { releaseTransfer = resolve })
+    prior.run.takeNativeControl = async control => {
+      const accepted = await takeNativeControl(control)
+      signalTaken()
+      await transferReady
+      return accepted
+    }
+
+    try {
+      const continuation = fixture.app.request('/v1/sessions/cancel-transfer-gap/turns', {
+        method: 'POST', body: turnBody('cancel-transfer-gap-second', { message: 'second' }),
+      })
+      await taken
+      expect(fixture.runs.nativeSession('cancel-transfer-gap')).toBeNull()
+      expect(fixture.store.getRetained('cancel-transfer-gap')?.runId).toBe('run-cancel-transfer-gap-second')
+
+      const cancelling = fixture.app.request('/v1/sessions/cancel-transfer-gap/cancel?wait_ms=1000', {
+        method: 'POST',
+        body: cancellationBody(fixture, 'cancel-transfer-gap', 'cancel-transfer-gap-operation'),
+      })
+      await waitFor(() => fixture!.runs.get('run-cancel-transfer-gap-second')?.signal.aborted === true)
+      releaseTransfer()
+
+      const [continued, cancelled] = await Promise.all([continuation, cancelling])
+      expect(continued.status).toBe(409)
+      expect((await json(continued)).error.type).toBe('cancelled')
+      expect(cancelled.status).toBe(200)
+      expect(await json(cancelled)).toMatchObject({ status: 'accepted', effect: 'cancelled' })
+      expect(fixture.store.getRetained('cancel-transfer-gap')?.status).toBe('cancelled')
+      expect(native.prompts).toEqual(['first'])
+      expect(native.closeCalls).toBe(1)
+    } finally {
+      releaseTransfer()
+    }
+  })
+
+  it('blocks continuation until a failed close has fully released ownership', async () => {
+    const native = new CloseFailureContinuationNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'close-failure-continuation', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/close-failure-continuation/turns', {
+      method: 'POST', body: turnBody('close-failure-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('close-failure-continuation')?.turns === 1)
+
+    try {
+      const closing = fixture.app.request('/v1/sessions/close-failure-continuation/close', { method: 'POST' })
+      await native.closeStarted
+      const blocked = await fixture.app.request('/v1/sessions/close-failure-continuation/turns', {
+        method: 'POST', body: turnBody('close-failure-second', { message: 'second' }),
+      })
+      expect(blocked.status).toBe(409)
+      expect((await json(blocked)).error.type).toBe('invalid_state')
+
+      native.allowCloseFailure()
+      const closed = await closing
+      expect(closed.status).toBe(502)
+      expect((await json(closed)).error.type).toBe('close_failed')
+
+      const continued = await fixture.app.request('/v1/sessions/close-failure-continuation/turns', {
+        method: 'POST', body: turnBody('close-failure-second', { message: 'second' }),
+      })
+      expect(continued.status).toBe(202)
+      await native.secondTurnStarted
+      expect(fixture.store.getRetained('close-failure-continuation')).toMatchObject({
+        status: 'running',
+        runId: 'run-close-failure-second',
+      })
+
+      native.allowSecondTurn()
+      await waitFor(() => fixture!.store.getRetained('close-failure-continuation')?.turns === 2)
+      expect(fixture.store.getRetained('close-failure-continuation')?.status).toBe('idle')
+      expect(native.prompts).toEqual(['first', 'second'])
+    } finally {
+      native.allowCloseFailure()
+      native.allowSecondTurn()
+    }
+  })
+
   it('retains close ownership after a transient failure so the same close can retry', async () => {
     const backend = new FakeNativeBackend(() => new FailOnceCloseNative())
     fixture = setup(backend)
@@ -1212,6 +1951,98 @@ describe('retained Agent Interface sessions', () => {
     expect((await json(second)).session.status).toBe('closed')
     expect(backend.natives[0]!.closeCalls).toBe(2)
     expect(fixture.runs.nativeSession('close-retry')).toBeNull()
+  })
+
+  it('lets close retry after active cancellation cleanup fails', async () => {
+    const native = new FailOnceCloseNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'cancel-close-retry', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/cancel-close-retry/turns', {
+      method: 'POST', body: turnBody('cancel-close-retry', { message: 'ask' }),
+    })
+    await waitFor(() => fixture!.store.retainedEventsAfter('cancel-close-retry')
+      .some(item => item.envelope.event.type === 'interaction'))
+
+    const cancelled = await fixture.app.request('/v1/sessions/cancel-close-retry/cancel?wait_ms=1000', {
+      method: 'POST',
+      body: cancellationBody(fixture, 'cancel-close-retry', 'cancel-close-retry-operation'),
+    })
+    expect(cancelled.status).toBe(502)
+    expect(await json(cancelled)).toMatchObject({ status: 'unknown', effect: 'unknown' })
+    expect(native.closeCalls).toBe(1)
+    expect(native.isClosed()).toBe(false)
+    expect(fixture.runs.nativeSession('cancel-close-retry')?.session).toBe(native)
+
+    const closed = await fixture.app.request('/v1/sessions/cancel-close-retry/close', { method: 'POST' })
+    expect(closed.status).toBe(200)
+    expect((await json(closed)).session.status).toBe('closed')
+    expect(native.closeCalls).toBe(2)
+    expect(native.isClosed()).toBe(true)
+    expect(fixture.runs.nativeSession('cancel-close-retry')).toBeNull()
+  })
+
+  it('does not reopen a closed session when its completed run is cancelled late', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'late-cancel-closed', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/late-cancel-closed/turns', {
+      method: 'POST', body: turnBody('late-cancel-closed', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('late-cancel-closed')?.turns === 1)
+    const lateCancellation = cancellationBody(fixture, 'late-cancel-closed', 'late-cancel-closed-operation')
+
+    const closed = await fixture.app.request('/v1/sessions/late-cancel-closed/close', { method: 'POST' })
+    expect(closed.status).toBe(200)
+    const cancelled = await fixture.app.request('/v1/sessions/late-cancel-closed/cancel?wait_ms=1000', {
+      method: 'POST', body: lateCancellation,
+    })
+    expect(cancelled.status).toBe(200)
+    expect(fixture.store.getRetained('late-cancel-closed')?.status).toBe('closed')
+    expect(backend.natives[0]!.closeCalls).toBe(1)
+  })
+
+  it('does not let a late cancellation for the prior run overwrite its continuation', async () => {
+    const native = new DeferredSecondTurnNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST', body: JSON.stringify({ id: 'late-cancel-continuation', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/late-cancel-continuation/turns', {
+      method: 'POST', body: turnBody('late-cancel-prior', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('late-cancel-continuation')?.turns === 1)
+    const priorCancellation = cancellationBody(fixture, 'late-cancel-continuation', 'late-cancel-prior-operation')
+
+    try {
+      const continuation = await fixture.app.request('/v1/sessions/late-cancel-continuation/turns', {
+        method: 'POST', body: turnBody('late-cancel-current', { message: 'second' }),
+      })
+      expect(continuation.status).toBe(202)
+      await native.secondTurnStarted
+      expect(fixture.store.getRetained('late-cancel-continuation')).toMatchObject({
+        status: 'running',
+        runId: 'run-late-cancel-current',
+      })
+
+      const cancelled = await fixture.app.request('/v1/sessions/late-cancel-continuation/cancel?wait_ms=1000', {
+        method: 'POST', body: priorCancellation,
+      })
+      expect(cancelled.status).toBe(200)
+      expect(fixture.store.getRetained('late-cancel-continuation')).toMatchObject({
+        status: 'running',
+        runId: 'run-late-cancel-current',
+      })
+
+      native.allowSecondTurn()
+      await waitFor(() => fixture!.store.getRetained('late-cancel-continuation')?.turns === 2)
+      expect(fixture.store.getRetained('late-cancel-continuation')?.status).toBe('idle')
+    } finally {
+      native.allowSecondTurn()
+    }
   })
 
   it('steers an active native run only through the advertised adapter control', async () => {

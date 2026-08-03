@@ -50,7 +50,7 @@ export async function applyJail(
         warnedFallback = true
         console.warn(
           `[cli-bridge] write-jail requested but '${backend.name}' unavailable — running ` +
-          `UNCONFINED (BRIDGE_JAIL_FALLBACK=warn). ${ENABLE_HINT}`,
+            `UNCONFINED (BRIDGE_JAIL_FALLBACK=warn). ${ENABLE_HINT}`,
         )
       }
       return { bin, args, env: opts.env }
@@ -59,15 +59,43 @@ export async function applyJail(
     // real config error (5xx / typed SSE), not an opaque finish_reason:'error'.
     throw new BackendError(
       `write-jail requested but '${backend.name}' cannot run on this host, refusing to run ` +
-      `unconfined. ${ENABLE_HINT} Or set BRIDGE_JAIL_FALLBACK=warn to run without confinement.`,
+        `unconfined. ${ENABLE_HINT} Or set BRIDGE_JAIL_FALLBACK=warn to run without confinement.`,
       'not_configured',
     )
   }
 
-  const wrap = await backend.wrap(bin, args, opts.jail)
+  // Only the executor knows that the jail will actually run. Apply backend-
+  // declared path translations here, after availability is proven; the
+  // explicit warn fallback above must preserve the normal host/Docker argv.
+  const rewrittenArgs = rewriteJailArguments(args, opts.jail.argumentRewrites, backend.name)
+  const wrap = await backend.wrap(bin, rewrittenArgs, opts.jail)
   // Merge any jail-supplied env onto the child env. The merged result
   // still flows through sanitizeHostEnv at the spawn site, so the host
   // env allowlist continues to apply.
   const env = wrap.env ? { ...(opts.env ?? {}), ...wrap.env } : opts.env
   return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup }
+}
+
+export function rewriteJailArguments(
+  args: string[],
+  rewrites:
+    | ReadonlyArray<{
+        from: string
+        to: string
+        precededBy?: string
+        backends?: readonly string[]
+      }>
+    | undefined,
+  backendName?: string,
+): string[] {
+  if (!rewrites?.length) return args
+  return args.map((arg, index) => {
+    const rewrite = rewrites.find(
+      (entry) =>
+        entry.from === arg &&
+        (entry.precededBy === undefined || args[index - 1] === entry.precededBy) &&
+        (entry.backends === undefined || (backendName !== undefined && entry.backends.includes(backendName))),
+    )
+    return rewrite?.to ?? arg
+  })
 }

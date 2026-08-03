@@ -157,8 +157,10 @@ Behavior:
 - `sandbox` backends honor the full `agent_profile` natively
 - local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`) apply the full profile to that request and reject profile dimensions they cannot execute
 - resumed one-shot calls must send `agent_profile` again; the session database stores only the model and a non-secret profile digest, never the profile, MCP credentials, forwarded authorization, or request metadata
-- Pi passes the replacement system prompt, additive instructions, skills, and prompt templates through Pi's native per-process flags using unique files that are removed after the run; a profile also disables ambient context, skill, and prompt-template discovery
+- Pi passes the replacement system prompt, additive instructions, skills, and prompt templates through Pi's native per-process flags using unique files that are removed after the run; a profile grants run-scoped project-file trust without persisting approval, while ambient context, skill, and prompt-template discovery stays disabled
 - `agent_profile.extensions.pi.load` selects an exact Pi extension set from installed package names or absolute paths; when present, the bridge passes `--no-extensions` plus one `--extension` flag per resolved entry
+- when Pi runs inside the OS filesystem jail, the executor translates each installed-package path only after confinement is confirmed; host, Docker, and explicit unconfined-fallback paths keep their normal argv
+- confined Pi runs always redirect `PI_CODING_AGENT_SESSION_DIR` to writable `.pi/sessions` under the jail, independently of whether a host AgentDir exists, so an inherited host session path is never used for jailed state
 - an EMPTY `load` list (`"extensions": { "pi": { "load": [] } }`) is the complete-isolation request: `--no-extensions` and nothing else, so no installed extension loads. Use it when a run must not inherit state an extension persists across runs — a paired experiment whose two arms share such an extension is silently unpaired, and nothing in the response reports it
 - Pi rejects generic profile file mounts because Pi has no request-scoped loader that can preserve their declared task-relative paths
 

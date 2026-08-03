@@ -20,10 +20,7 @@ import { accessSync, constants, existsSync } from 'node:fs'
 import { mkdir, realpath, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
-import {
-  createPrivateTemporaryRoot,
-  type PrivateTemporaryRoot,
-} from '../runtime/private-temporary.js'
+import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import { copyAuthIntoJail } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
@@ -35,14 +32,7 @@ const SANDBOX_EXEC_BIN = 'sandbox-exec'
 // the jail root" guarantee. We deliberately do NOT allow the shared temp trees
 // (/private/tmp, /private/var/folders): the CLI's temp writes are redirected to
 // TMPDIR=<root>/.tmp (jailEnv), which sits inside the writable root.
-const DEVICE_WRITABLE = [
-  '/dev/null',
-  '/dev/zero',
-  '/dev/random',
-  '/dev/urandom',
-  '/dev/dtracehelper',
-  '/dev/tty',
-]
+const DEVICE_WRITABLE = ['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom', '/dev/dtracehelper', '/dev/tty']
 
 export class MacosSeatbeltJail implements JailBackend {
   readonly name = 'seatbelt'
@@ -76,6 +66,9 @@ export class MacosSeatbeltJail implements JailBackend {
       const authEnv: Record<string, string> = {}
       for (const { source, jailRel, envVar } of spec.authSources ?? []) {
         if (envVar && existsSync(source)) authEnv[envVar] = join(homeRoot.path, jailRel)
+      }
+      for (const target of spec.writableEnvironment ?? []) {
+        authEnv[target.envVar] = join(homeRoot.path, target.jailRel)
       }
 
       const profile = buildProfile(writable)

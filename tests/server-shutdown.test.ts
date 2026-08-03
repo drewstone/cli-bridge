@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createConnection, createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -168,6 +168,98 @@ describe('server shutdown', () => {
     await waitFor(() => !processExists(childPid), 2_000)
     expect(output).toContain('SIGTERM — shutting down')
     expect(readdirSync(dir).filter(name => name.startsWith('.cli-bridge-pi-rpc-'))).toEqual([])
+  })
+
+  it('rejects a request completed on an existing connection after shutdown starts', async ({ skip }) => {
+    dir = mkdtempSync(`${tmpdir()}/cli-bridge-server-admission-`)
+    const dataDir = join(dir, 'data')
+    const spawnMarker = join(dir, 'late-child-started')
+    const piPath = join(dir, 'must-not-start-pi.sh')
+    writeFileSync(piPath, `#!/bin/sh\ntouch ${JSON.stringify(spawnMarker)}\nexit 91\n`, { mode: 0o755 })
+    const bootstrapPath = join(dir, 'server-with-shutdown-window.mts')
+    const serverModule = join(process.cwd(), 'src/server.ts')
+    writeFileSync(bootstrapPath, `
+      import { startServer } from ${JSON.stringify(serverModule)}
+      void startServer({
+        shutdownTimeoutMs: 2_000,
+        shutdownHooks: [() => new Promise(resolve => setTimeout(resolve, 600))],
+      }).catch(error => {
+        console.error(error)
+        process.exit(1)
+      })
+    `)
+
+    let port: number
+    try {
+      port = await freePort()
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+        skip()
+        return
+      }
+      throw error
+    }
+
+    const tsx = join(process.cwd(), 'node_modules/tsx/dist/cli.mjs')
+    serverChild = spawn(process.execPath, [tsx, bootstrapPath], {
+      cwd: process.cwd(),
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: process.env.HOME ?? tmpdir(),
+        USER: process.env.USER ?? 'test',
+        LANG: process.env.LANG ?? 'C',
+        BRIDGE_HOST: '127.0.0.1',
+        BRIDGE_PORT: String(port),
+        BRIDGE_DATA_DIR: dataDir,
+        BRIDGE_BACKENDS: 'pi',
+        BRIDGE_DEFAULT_EXECUTOR: 'host',
+        PI_EXECUTOR: 'host',
+        PI_BIN: piPath,
+        BRIDGE_TRACE: 'off',
+        BRIDGE_JAIL_MODE: 'off',
+        BRIDGE_NET_JAIL_MODE: 'off',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let output = ''
+    serverChild.stdout?.on('data', chunk => { output += chunk.toString() })
+    serverChild.stderr?.on('data', chunk => { output += chunk.toString() })
+    await waitFor(() => output.includes('listening on http://'), 10_000)
+
+    openSocket = createConnection({ host: '127.0.0.1', port })
+    let response = ''
+    openSocket.on('data', chunk => { response += chunk.toString() })
+    await new Promise<void>((resolve, reject) => {
+      openSocket?.once('connect', resolve)
+      openSocket?.once('error', reject)
+    })
+    const body = JSON.stringify({
+      model: 'pi/test',
+      messages: [{ role: 'user', content: 'must not start' }],
+      stream: false,
+      run_id: 'late-shutdown-run',
+    })
+    const prefix = body.slice(0, -1)
+    openSocket.write([
+      'POST /v1/chat/completions HTTP/1.1',
+      `Host: 127.0.0.1:${port}`,
+      'Content-Type: application/json',
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      'Connection: keep-alive',
+      '',
+      prefix,
+    ].join('\r\n'))
+
+    serverChild.kill('SIGTERM')
+    await waitFor(() => output.includes('SIGTERM — shutting down'), 1_000)
+    openSocket.write(body.slice(-1))
+    await waitFor(() => response.includes('run_admission_closed'), 1_500)
+    expect(response).toContain('HTTP/1.1 503')
+    expect(response).toContain('run_admission_closed')
+    expect(existsSync(spawnMarker)).toBe(false)
+
+    const exit = await waitForExit(serverChild, 3_000)
+    expect(exit).toEqual({ code: 0, signal: null })
   })
 
   it('forces a bounded exit, closes active sockets, and releases data ownership when a hook hangs', async ({ skip }) => {

@@ -50,6 +50,10 @@ Uninstrumented Pi dialogs are warnings rather than answerable public interaction
 
 The profile path uses the existing exact Pi materializer and stores its `cli-bridge.profile-materialization.v1` receipt on the retained session.
 
+Filesystem confinement mounts an existing Pi AgentDir read-only and independently redirects `PI_CODING_AGENT_SESSION_DIR` into writable jail-owned state.
+
+The state redirect remains active when the configured AgentDir is missing, and macOS CI executes the custom-extension and state-write path through `sandbox-exec`.
+
 Pi's advertised `profile.mcp` capability is dynamic: it is `true` only when the installed `pi-mcp-adapter` is detected, and MCP session creation is rejected otherwise.
 
 Pi 0.83.0 is the pinned minimum for the current advertisement because that is the installed binary whose RPC protocol and subscription path were inspected.

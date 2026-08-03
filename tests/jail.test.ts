@@ -33,6 +33,7 @@ import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
 import { authSourcesFor } from '../src/jail/auth-preserve.js'
+import { writableEnvironmentFor } from '../src/jail/backend-state.js'
 import { ignoreJailRoot } from '../src/jail/types.js'
 import { anyBackendSpawnsOnHost } from '../src/config.js'
 import type { BackendExecutorConfig } from '../src/config.js'
@@ -404,9 +405,76 @@ describe('auth preservation', () => {
       // Lands at the jail's ~/.pi/agent, where pi (HOME=root) reads its state.
       expect(sources[0]?.jailRel).toBe('.pi/agent')
       expect(sources[0]?.source).toBe(join(fakeHome, '.pi', 'agent'))
+      expect(sources[0]?.envVar).toBe('PI_CODING_AGENT_DIR')
+      expect(writableEnvironmentFor('pi')).toEqual([
+        { envVar: 'PI_CODING_AGENT_SESSION_DIR', jailRel: '.pi/sessions' },
+      ])
     } finally {
       if (prev === undefined) delete process.env.HOME
       else process.env.HOME = prev
+    }
+  })
+
+  it('authSourcesFor(pi) honors a custom PI_CODING_AGENT_DIR instead of substituting the default', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-pihome-custom-'))
+    const customAgentDir = await mkdtemp(join(tmpdir(), 'cli-bridge-piagent-custom-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    cleanups.push(() => rm(customAgentDir, { recursive: true, force: true }))
+    await mkdir(join(fakeHome, '.pi', 'agent'), { recursive: true })
+    await writeFile(join(fakeHome, '.pi', 'agent', 'models.json'), '{"default":true}')
+    await writeFile(join(customAgentDir, 'models.json'), '{"custom":true}')
+    const previousHome = process.env.HOME
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    process.env.HOME = fakeHome
+    process.env.PI_CODING_AGENT_DIR = customAgentDir
+    try {
+      expect(authSourcesFor('pi')).toEqual([{
+        source: resolve(customAgentDir),
+        jailRel: '.pi/agent',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }])
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+    }
+  })
+
+  it('authSourcesFor(pi) expands a home-relative custom PI_CODING_AGENT_DIR', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-pihome-tilde-'))
+    const customAgentDir = join(fakeHome, 'pi-config')
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    await mkdir(customAgentDir, { recursive: true })
+    const previousHome = process.env.HOME
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    process.env.HOME = fakeHome
+    process.env.PI_CODING_AGENT_DIR = '~/pi-config'
+    try {
+      expect(authSourcesFor('pi')[0]?.source).toBe(customAgentDir)
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+    }
+  })
+
+  it('authSourcesFor(pi) does not fall back to ~/.pi/agent when a custom directory is missing', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-pihome-missing-custom-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    await mkdir(join(fakeHome, '.pi', 'agent'), { recursive: true })
+    const previousHome = process.env.HOME
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    process.env.HOME = fakeHome
+    process.env.PI_CODING_AGENT_DIR = join(fakeHome, 'missing-custom-agent-dir')
+    try {
+      expect(authSourcesFor('pi')).toEqual([])
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
     }
   })
 
@@ -445,6 +513,32 @@ describe('auth preservation', () => {
     ).toBeGreaterThanOrEqual(0)
   })
 
+  it('bwrap redirects PI_CODING_AGENT_DIR at Pi config inside the jail', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-piauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{
+        source: authDir,
+        jailRel: '.pi/agent',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }],
+      writableEnvironment: writableEnvironmentFor('pi'),
+    })
+    const expectedRoot = resolveJailRoot(root, projectDir)
+    expect(
+      seqIndex(wrap.args, '--setenv', 'PI_CODING_AGENT_DIR', join(expectedRoot, '.pi/agent')),
+      'PI_CODING_AGENT_DIR redirected to the in-jail config',
+    ).toBeGreaterThanOrEqual(0)
+    expect(
+      seqIndex(wrap.args, '--setenv', 'PI_CODING_AGENT_SESSION_DIR', join(expectedRoot, '.pi/sessions')),
+      'Pi sessions redirected to writable jail state',
+    ).toBeGreaterThanOrEqual(0)
+  })
+
   it('seatbelt returns an auth env var (CODEX_HOME) pointing at the in-jail copy', async () => {
     const authDir = await mkdtemp(join(tmpdir(), 'cli-bridge-codexauth-'))
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
@@ -458,6 +552,145 @@ describe('auth preservation', () => {
     if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
     expect(wrap.env?.HOME).toContain(`${await realpath(resolveJailRoot(root, projectDir))}/.cli-bridge-jail-home-`)
     expect(wrap.env?.CODEX_HOME).toBe(join(wrap.env!.HOME!, '.codex'))
+  })
+
+  it('seatbelt points PI_CODING_AGENT_DIR at the copied in-jail config', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-piauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{
+        source: authDir,
+        jailRel: '.pi/agent',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }],
+      writableEnvironment: writableEnvironmentFor('pi'),
+    })
+    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+    expect(wrap.env?.HOME).toContain(`${await realpath(resolveJailRoot(root, projectDir))}/.cli-bridge-jail-home-`)
+    expect(wrap.env?.PI_CODING_AGENT_DIR).toBe(join(wrap.env!.HOME!, '.pi/agent'))
+    expect(wrap.env?.PI_CODING_AGENT_SESSION_DIR).toBe(join(wrap.env!.HOME!, '.pi/sessions'))
+  })
+
+  it('lets a real jailed Pi process read config and write its session journal', async ({ skip }) => {
+    const jail = new LinuxBwrapJail()
+    if (!jail.isAvailable()) {
+      skip()
+      return
+    }
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const authDir = await mkdtemp(join(tmpdir(), 'cli-bridge-pi-real-auth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    await writeFile(join(authDir, 'settings.json'), '{"defaultProvider":"probe"}')
+    const script = join(projectDir, 'fake-pi.sh')
+    await writeFile(script, [
+      '#!/bin/sh',
+      'test "$(cat "$PI_CODING_AGENT_DIR/settings.json")" = \'{"defaultProvider":"probe"}\'',
+      'mkdir -p "$PI_CODING_AGENT_SESSION_DIR"',
+      'printf \'session-written\\n\' > "$PI_CODING_AGENT_SESSION_DIR/turn.jsonl"',
+    ].join('\n'), { mode: 0o700 })
+    const wrap = await jail.wrap(script, [], {
+      root,
+      projectDir,
+      readConfine: true,
+      authSources: [{
+        source: authDir,
+        jailRel: '.pi/agent',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }],
+      writableEnvironment: writableEnvironmentFor('pi'),
+    })
+    const child = spawnSync(wrap.bin, wrap.args, {
+      encoding: 'utf8',
+      env: { ...process.env, ...wrap.env },
+    })
+    expect(child.status, child.stderr).toBe(0)
+    expect(await readFile(join(root, '.pi', 'sessions', 'turn.jsonl'), 'utf8')).toBe('session-written\n')
+  })
+
+  it('redirects Pi session state when the configured AgentDir does not exist', async ({ skip }) => {
+    const jail = new LinuxBwrapJail()
+    if (!jail.isAvailable()) {
+      skip()
+      return
+    }
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const inheritedSessionDir = await mkdtemp(join(tmpdir(), 'cli-bridge-pi-host-sessions-'))
+    cleanups.push(() => rm(inheritedSessionDir, { recursive: true, force: true }))
+    const script = join(projectDir, 'fake-pi-missing-config.sh')
+    await writeFile(script, [
+      '#!/bin/sh',
+      `test "$PI_CODING_AGENT_SESSION_DIR" != ${JSON.stringify(inheritedSessionDir)}`,
+      'mkdir -p "$PI_CODING_AGENT_SESSION_DIR"',
+      'printf \'isolated-session\\n\' > "$PI_CODING_AGENT_SESSION_DIR/turn.jsonl"',
+    ].join('\n'), { mode: 0o700 })
+    const wrap = await jail.wrap(script, [], {
+      root,
+      projectDir,
+      readConfine: true,
+      authSources: [],
+      writableEnvironment: writableEnvironmentFor('pi'),
+    })
+    const child = spawnSync(wrap.bin, wrap.args, {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PI_CODING_AGENT_DIR: join(projectDir, 'missing-agent-dir'),
+        PI_CODING_AGENT_SESSION_DIR: inheritedSessionDir,
+        ...wrap.env,
+      },
+    })
+    expect(child.status, child.stderr).toBe(0)
+    expect(await readFile(join(root, '.pi', 'sessions', 'turn.jsonl'), 'utf8')).toBe('isolated-session\n')
+    expect(existsSync(join(inheritedSessionDir, 'turn.jsonl'))).toBe(false)
+  })
+
+  it('loads a custom Pi extension and writes state through real macOS seatbelt', async ({ skip }) => {
+    const jail = new MacosSeatbeltJail()
+    if (process.platform !== 'darwin' || !(await jail.isAvailable())) {
+      skip()
+      return
+    }
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const authDir = await mkdtemp(join(tmpdir(), 'cli-bridge-pi-seatbelt-auth-'))
+    const extensionDir = await mkdtemp(join(tmpdir(), 'cli-bridge-pi-seatbelt-extension-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    cleanups.push(() => rm(extensionDir, { recursive: true, force: true }))
+    await writeFile(join(authDir, 'settings.json'), '{"defaultProvider":"probe"}')
+    await writeFile(join(extensionDir, 'visible.txt'), 'seatbelt-extension\n')
+    const script = join(projectDir, 'fake-pi-seatbelt.sh')
+    await writeFile(script, [
+      '#!/bin/sh',
+      'test "$1" = "--extension"',
+      'test "$(cat "$2/visible.txt")" = "seatbelt-extension"',
+      'test "$(cat "$PI_CODING_AGENT_DIR/settings.json")" = \'{"defaultProvider":"probe"}\'',
+      'mkdir -p "$PI_CODING_AGENT_SESSION_DIR"',
+      'printf \'seatbelt-session\\n\' > "$PI_CODING_AGENT_SESSION_DIR/turn.jsonl"',
+    ].join('\n'), { mode: 0o700 })
+    const wrap = await jail.wrap(script, ['--extension', extensionDir], {
+      root,
+      projectDir,
+      authSources: [{
+        source: authDir,
+        jailRel: '.pi/agent',
+        envVar: 'PI_CODING_AGENT_DIR',
+      }],
+      writableEnvironment: writableEnvironmentFor('pi'),
+    })
+    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+    const child = spawnSync(wrap.bin, wrap.args, {
+      encoding: 'utf8',
+      env: { ...process.env, ...wrap.env },
+    })
+    expect(child.status, child.stderr).toBe(0)
+    expect(await readFile(join(wrap.env!.PI_CODING_AGENT_SESSION_DIR!, 'turn.jsonl'), 'utf8'))
+      .toBe('seatbelt-session\n')
   })
 })
 
@@ -483,6 +716,90 @@ describe('applyJail fail-closed', () => {
     } finally {
       delete process.env.BRIDGE_JAIL_FALLBACK
     }
+  })
+
+  it('rewrites exact path arguments only when an available jail wraps the command', async () => {
+    const available: JailBackend = {
+      name: 'available-stub',
+      isAvailable: () => true,
+      wrap: (bin, args) => ({ bin, args }),
+    }
+    const opts = {
+      jail: {
+        root: '/proj/.agent-home',
+        projectDir: '/proj',
+        argumentRewrites: [{
+          from: '/host/pi-extension',
+          to: '/proj/.agent-home/pi-extension',
+          precededBy: '--extension',
+        }],
+      },
+    } as never
+
+    const result = await applyJail(
+      'pi',
+      ['--extension', '/host/pi-extension', '/host/pi-extension'],
+      opts,
+      available,
+    )
+
+    expect(result.args).toEqual([
+      '--extension',
+      '/proj/.agent-home/pi-extension',
+      '/host/pi-extension',
+    ])
+  })
+
+  it('keeps ordinary path arguments when explicit warn fallback runs unconfined', async () => {
+    process.env.BRIDGE_JAIL_FALLBACK = 'warn'
+    try {
+      const opts = {
+        jail: {
+          root: '/proj/.agent-home',
+          projectDir: '/proj',
+          argumentRewrites: [{
+            from: '/host/pi-extension',
+            to: '/proj/.agent-home/pi-extension',
+            precededBy: '--extension',
+          }],
+        },
+      } as never
+      const result = await applyJail(
+        'pi',
+        ['--extension', '/host/pi-extension'],
+        opts,
+        unavailable,
+      )
+      expect(result.args).toEqual(['--extension', '/host/pi-extension'])
+    } finally {
+      delete process.env.BRIDGE_JAIL_FALLBACK
+    }
+  })
+
+  it('applies a backend-scoped argument rewrite only to the named jail', async () => {
+    const opts = {
+      jail: {
+        root: '/proj/.agent-home',
+        projectDir: '/proj',
+        argumentRewrites: [{
+          from: '/host/pi-extension',
+          to: '/proj/.agent-home/pi-extension',
+          precededBy: '--extension',
+          backends: ['bwrap'],
+        }],
+      },
+    } as never
+    const backend = (name: string): JailBackend => ({
+      name,
+      isAvailable: () => true,
+      wrap: (bin, args) => ({ bin, args }),
+    })
+
+    const linux = await applyJail('pi', ['--extension', '/host/pi-extension'], opts, backend('bwrap'))
+    const macos = await applyJail('pi', ['--extension', '/host/pi-extension'], opts, backend('seatbelt'))
+
+    expect(linux.args).toEqual(['--extension', '/proj/.agent-home/pi-extension'])
+    expect(macos.args).toEqual(['--extension', '/host/pi-extension'])
   })
 
   it('is a pure pass-through when no jail is requested (never throws)', async () => {

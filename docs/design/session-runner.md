@@ -229,6 +229,12 @@ Persisted events remain readable for transcript and replay queries after this st
 
 Persisted create, public execution identity, run, and cancellation digests remain authoritative after restart, so retries either recover the exact prior admission or fail with a conflict.
 
+Shutdown synchronously closes run admission before the HTTP server and current run collection begin draining.
+
+Requests already reading a body on a persistent connection therefore receive `503 run_admission_closed` and cannot create a child outside the shutdown snapshot.
+
+An unexpected native close retains its cleanup owner and first cleanup failure until shutdown reports it; a later shutdown call retries the same owner.
+
 ## Proof commands
 
 The real-child subprocess proof is `tests/pi-native.test.ts`.

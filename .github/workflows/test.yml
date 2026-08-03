@@ -47,3 +47,27 @@ jobs:
 
       - name: Clean source install
         run: pnpm source-install:check
+
+  macos-seatbelt:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Execute Pi paths inside seatbelt
+        run: pnpm exec vitest run tests/jail.test.ts tests/pi-backend.test.ts

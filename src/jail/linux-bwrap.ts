@@ -55,7 +55,12 @@ const BWRAP_BIN = 'bwrap'
  */
 const SYSTEM_RO_PATHS: readonly string[] = [
   '/usr',
-  '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32',
+  '/bin',
+  '/sbin',
+  '/lib',
+  '/lib64',
+  '/lib32',
+  '/libx32',
   '/etc',
   '/opt',
   '/run/systemd/resolve',
@@ -74,13 +79,7 @@ export class LinuxBwrapJail implements JailBackend {
     await prepareJailHome(root)
     ignoreJailRoot(spec.projectDir, root)
 
-    const bwrapArgs = [
-      '--unshare-user',
-      '--unshare-pid',
-      '--unshare-ipc',
-      '--unshare-uts',
-      '--share-net',
-    ]
+    const bwrapArgs = ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--share-net']
 
     if (spec.readConfine) {
       // fs-jail: ALLOWLIST reads. Bind only the minimal system + toolchain
@@ -104,11 +103,7 @@ export class LinuxBwrapJail implements JailBackend {
       // OPENCODE_CONFIG) under the host tmpdir before spawn, and the CLI must
       // still read those paths. /tmp stays readable (read-only) via this bind;
       // the CLI's own temp WRITES are redirected to TMPDIR=<root>/.tmp (jailEnv).
-      bwrapArgs.push(
-        '--ro-bind', '/', '/',
-        '--dev', '/dev',
-        '--ro-bind', spec.projectDir, spec.projectDir,
-      )
+      bwrapArgs.push('--ro-bind', '/', '/', '--dev', '/dev', '--ro-bind', spec.projectDir, spec.projectDir)
     }
 
     for (const path of spec.extraReadablePaths ?? []) {
@@ -134,17 +129,16 @@ export class LinuxBwrapJail implements JailBackend {
       // here, where the jail truly applies, so non-jailed paths are untouched.
       if (envVar) bwrapArgs.push('--setenv', envVar, dest)
     }
+    for (const target of spec.writableEnvironment ?? []) {
+      bwrapArgs.push('--setenv', target.envVar, join(root, target.jailRel))
+    }
 
     // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.
     for (const [key, value] of Object.entries(jailEnv(root))) {
       bwrapArgs.push('--setenv', key, value)
     }
 
-    bwrapArgs.push(
-      '--chdir', spec.projectDir,
-      '--die-with-parent',
-      bin, ...args,
-    )
+    bwrapArgs.push('--chdir', spec.projectDir, '--die-with-parent', bin, ...args)
 
     return { bin: BWRAP_BIN, args: bwrapArgs }
   }
@@ -218,7 +212,8 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
 function isSafeReadPath(p: string, home: string, base: string): boolean {
   if (!isAbsolute(p) || p === '/' || p === '/home' || p === home) return false
   const relToBase = relative(p, base)
-  const isBaseOrAncestor = relToBase === '' || (!relToBase.startsWith(`..${sep}`) && relToBase !== '..' && !isAbsolute(relToBase))
+  const isBaseOrAncestor =
+    relToBase === '' || (!relToBase.startsWith(`..${sep}`) && relToBase !== '..' && !isAbsolute(relToBase))
   return !isBaseOrAncestor
 }
 
