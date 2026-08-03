@@ -20,7 +20,7 @@ import { accessSync, constants, existsSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { copyAuthIntoJail } from './auth-preserve.js'
+import { copyAuthIntoJail, removeAuthCopies } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
@@ -57,12 +57,38 @@ export class MacosSeatbeltJail implements JailBackend {
     // jail HOME (writable, under root) — the CLI authenticates as the operator.
     // The copies are removed in cleanup() so credentials never linger in the
     // project-local jail root.
-    const copiedAuth = await copyAuthIntoJail(root, spec.authSources)
-    const removeCopiedAuth = async (): Promise<void> => {
-      for (const copied of copiedAuth) {
-        await rm(copied, { recursive: true, force: true })
+    const stableAuthSources = (spec.authSources ?? []).filter(
+      (source) => source.mode === 'read-only',
+    )
+    const writableAuthSources = (spec.authSources ?? []).filter(
+      (source) => source.mode === 'copy-writable',
+    )
+    for (const source of writableAuthSources) {
+      if (!source.envVar) {
+        throw new Error('a copy-writable jail auth source requires envVar')
       }
     }
+    const copiedAuth = await copyAuthIntoJail(root, stableAuthSources)
+    let authCopyRoot: string | null = null
+    try {
+      if (writableAuthSources.length > 0) {
+        const authCopyParent = join(root, '.auth-copies')
+        await mkdir(authCopyParent, { recursive: true })
+        authCopyRoot = await mkdtemp(join(authCopyParent, 'run-'))
+        await copyAuthIntoJail(authCopyRoot, writableAuthSources)
+      }
+    } catch (error) {
+      await removeAuthCopies([
+        ...copiedAuth,
+        ...(authCopyRoot ? [authCopyRoot] : []),
+      ])
+      throw error
+    }
+    const removeCopiedAuth = (): Promise<void> =>
+      removeAuthCopies([
+        ...copiedAuth,
+        ...(authCopyRoot ? [authCopyRoot] : []),
+      ])
     // From here on, any failure must remove the copied credentials — otherwise a
     // throw before `cleanup` is returned leaves real auth under the repo jail root.
     try {
@@ -74,8 +100,12 @@ export class MacosSeatbeltJail implements JailBackend {
       // Point any backend env var (e.g. CODEX_HOME) at the in-jail copy. Done
       // here, where the jail truly applies, so non-jailed paths are untouched.
       const authEnv: Record<string, string> = {}
-      for (const { source, jailRel, envVar } of spec.authSources ?? []) {
-        if (envVar && existsSync(source)) authEnv[envVar] = join(root, jailRel)
+      for (const { source, jailRel, envVar, mode } of spec.authSources ?? []) {
+        if (!envVar || !existsSync(source)) continue
+        authEnv[envVar] = resolveJailRoot(
+          jailRel,
+          mode === 'copy-writable' ? authCopyRoot! : root,
+        )
       }
 
       const profile = buildProfile(writable)

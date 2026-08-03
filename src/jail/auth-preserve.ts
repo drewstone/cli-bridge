@@ -6,7 +6,8 @@
  * could not authenticate. This module declares, per backend, the host paths
  * that hold its auth/config and makes them available inside the jail at the
  * same $HOME-relative location:
- *   - Linux (bwrap): read-only bind-mounted (free, no copy) — see linux-bwrap.
+ *   - Linux (bwrap): read-only bind-mounted unless the CLI must lock settings;
+ *     those exact sources are copied into writable jail storage.
  *   - macOS (sandbox-exec, no bind): copied in via {@link copyAuthIntoJail}.
  *
  * Only paths that actually exist on the host are surfaced. The mapping mirrors
@@ -14,10 +15,10 @@
  */
 
 import { existsSync } from 'node:fs'
-import { cp } from 'node:fs/promises'
+import { cp, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import type { JailAuthSource } from './types.js'
+import { resolveJailRoot, type JailAuthSource } from './types.js'
 
 /**
  * $HOME-relative auth/config paths per REGISTERED backend name. Aliases that
@@ -57,7 +58,7 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
   for (const rel of AUTH_PATHS[backendName] ?? []) {
     const source = join(home, rel)
     // rel is already a POSIX-style jail-relative target ('.claude', '.config/opencode').
-    if (existsSync(source)) out.push({ source, jailRel: rel })
+    if (existsSync(source)) out.push({ source, jailRel: rel, mode: 'read-only' })
   }
   if (backendName === 'codex') {
     // codex.ts honors $CODEX_HOME (src/backends/codex.ts) and only falls back to
@@ -70,7 +71,9 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
       const source = resolve(codexHome)
       const idx = out.findIndex((e) => e.jailRel === '.codex')
       if (idx >= 0) out.splice(idx, 1)
-      if (existsSync(source)) out.push({ source, jailRel: '.codex' })
+      if (existsSync(source)) {
+        out.push({ source, jailRel: '.codex', mode: 'read-only' })
+      }
     }
     // Redirect CODEX_HOME at the in-jail copy so a confined codex reads creds
     // there rather than the (read-only) host path. The jail applies this only
@@ -86,27 +89,46 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
       const source = resolve(piAgentDir)
       const idx = out.findIndex((e) => e.jailRel === '.pi/agent')
       if (idx >= 0) out.splice(idx, 1)
-      if (existsSync(source)) out.push({ source, jailRel: '.pi/agent' })
+      if (existsSync(source)) {
+        out.push({ source, jailRel: '.pi/agent', mode: 'copy-writable' })
+      }
     }
-    for (const e of out) if (e.jailRel === '.pi/agent') e.envVar = 'PI_CODING_AGENT_DIR'
+    for (const e of out) {
+      if (e.jailRel !== '.pi/agent') continue
+      e.mode = 'copy-writable'
+      e.envVar = 'PI_CODING_AGENT_DIR'
+    }
   }
   return out
 }
 
 /**
- * Copy each auth source into the jail HOME at its $HOME-relative path. Used on
- * macOS where sandbox-exec cannot bind-mount; the copy lands under the
- * (writable) jail root so the CLI can read its creds and write state. Returns
- * the copied destination paths so the caller can remove them on cleanup — the
- * jail root is project-local, so copied credentials must NOT linger there.
+ * Copy each auth source into the jail HOME at its $HOME-relative path. macOS
+ * uses this for every source because sandbox-exec cannot bind-mount; Linux uses
+ * it only for CLIs that lock their settings. Returns the copied destination
+ * paths so the caller can remove them on cleanup — the jail root is
+ * project-local, so copied credentials must NOT linger there.
  */
 export async function copyAuthIntoJail(root: string, sources: JailAuthSource[] | undefined): Promise<string[]> {
   const copied: string[] = []
-  for (const { source, jailRel } of sources ?? []) {
-    if (!existsSync(source)) continue
-    const dest = join(root, jailRel)
-    await cp(source, dest, { recursive: true, force: true, errorOnExist: false })
-    copied.push(dest)
+  try {
+    for (const { source, jailRel } of sources ?? []) {
+      if (!existsSync(source)) continue
+      const dest = resolveJailRoot(jailRel, root)
+      await rm(dest, { recursive: true, force: true })
+      await cp(source, dest, { recursive: true, force: true, errorOnExist: false })
+      copied.push(dest)
+    }
+    return copied
+  } catch (error) {
+    await removeAuthCopies(copied)
+    throw error
   }
-  return copied
+}
+
+/** Remove ephemeral auth/config copies after a confined process exits. */
+export async function removeAuthCopies(paths: readonly string[]): Promise<void> {
+  for (const path of paths) {
+    await rm(path, { recursive: true, force: true })
+  }
 }

@@ -38,11 +38,11 @@ export interface JailSpec {
    * noop backends confine writes only and ignore this flag.
    */
   readConfine?: boolean
-  /** Host auth/config sources made available inside the jail (read-only bind
-   * on Linux, copy on macOS) so a confined run still authenticates as the
-   * operator. Each carries an explicit jail-relative target so a source OUTSIDE
-   * the operator HOME (e.g. a custom `CODEX_HOME`) still lands at the location
-   * the confined CLI reads. Populated per backend by {@link authSourcesFor}. */
+  /** Host auth/config sources made available inside the jail so a confined run
+   * still authenticates as the operator. Each source explicitly declares
+   * whether Linux may read-only bind it or must make an ephemeral writable
+   * copy for a CLI that locks its own settings. Populated per backend by
+   * {@link authSourcesFor}. */
   authSources?: JailAuthSource[]
   /** Exact argv values that differ only while the OS jail is active.
    * Backends declare both values; the executor applies the rewrite after it
@@ -67,6 +67,11 @@ export interface JailAuthSource {
    * so the confined CLI finds it at the same logical location. Always inside
    * the root, even when `source` lives outside the operator HOME. */
   jailRel: string
+  /** `read-only` preserves the host path through a Linux bind mount.
+   * `copy-writable` copies it inside the writable jail HOME and removes that
+   * copy when the process exits. macOS must copy either mode because
+   * sandbox-exec cannot bind mount. */
+  mode: 'read-only' | 'copy-writable'
   /** Optional env var the jail must point at this source's IN-JAIL location
    * (`<root>/<jailRel>`). Set ONLY by the jail backend when it actually wraps,
    * so e.g. codex's `CODEX_HOME` is redirected into the jail for confined runs
