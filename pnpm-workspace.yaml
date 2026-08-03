@@ -3,7 +3,7 @@
 # must NOT become a standing bypass of that supply-chain control. Each entry is dead weight
 # once its version is older than the minimum release age.
 minimumReleaseAgeExclude:
-  - '@tangle-network/agent-profile-materialize@0.9.4'
+  - '@tangle-network/agent-profile-materialize@0.9.4 || 0.10.2'
   - '@tangle-network/agent-trace-contract@1.0.2'
 
 # Dependencies allowed to run install scripts. better-sqlite3 needs its install script to

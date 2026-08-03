@@ -388,9 +388,9 @@ Per-server fields:
 | `enabled`  | boolean                  | set `false` to drop without removing the entry         |
 | `timeout`  | number (ms)              | per-tool-call timeout                                  |
 
-`agent_profile.mcp` (sandbox-native shape) is also honored — request
-body `mcp.mcpServers` wins on per-name collision so caller's per-turn
-intent always overrides profile defaults.
+`agent_profile.mcp` is the sole MCP authority for an exact profile.
+Without a profile, callers may use body/header `mcp.mcpServers`.
+Sending both is refused before the harness starts.
 
 ### Per-backend support matrix
 

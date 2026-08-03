@@ -33,9 +33,11 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   materializeMcpServersForCodex,
+  profileExecutionIdentity,
   provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
+  resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -93,7 +95,9 @@ export class CodexBackend implements Backend {
       '--dangerously-bypass-approvals-and-sandbox',
     ]
     if (modelArg) args.push('-c', `model="${modelArg}"`)
-    const reasoningEffort = codexReasoningEffort(req.effort)
+    const reasoningEffort = codexReasoningEffort(
+      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    )
     if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`)
 
     if (session?.internalId) {
@@ -104,13 +108,19 @@ export class CodexBackend implements Backend {
 
     // Reject unsupported profile plans before copying auth or writing MCP
     // credentials into a synthetic CODEX_HOME.
-    const provisioned = provisionProfileWorkspace(req, session, 'codex', cwd)
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'codex',
+      cwd,
+      profileExecutionIdentity(req, session, 'codex', reasoningEffort),
+    )
     args.push(...provisioned.flags)
 
     // MCP server passthrough — codex has no `--mcp-config` flag.
     // Servers are loaded from `$CODEX_HOME/config.toml`'s
     // `[mcp_servers.<name>]` stanzas. We synthesise a temp HOME
-    // containing the merged servers and copy the user's persistent
+    // containing the selected servers and copy the user's persistent
     // `auth.json` so the spawned codex still authenticates as the
     // operator. Cleanup runs in the outer finally so the temp dir
     // doesn't leak on subprocess crash.
@@ -119,7 +129,7 @@ export class CodexBackend implements Backend {
       resolveCodexAuthPath(),
     )
 
-    // When MCP passthrough is active, the synthetic CODEX_HOME (merged MCP config
+    // When MCP passthrough is active, the synthetic CODEX_HOME (selected MCP config
     // + copied auth) is the source of truth. Register it as the jail's codex auth
     // source so a CONFINED run gets it surfaced inside the jail with CODEX_HOME
     // redirected there. The jail applies this only when it actually wraps; on

@@ -79,8 +79,19 @@ export interface McpRequestConfig {
 
 /** Safe proof of the exact AgentProfile workspace plan applied before spawn. */
 export interface ProfileMaterializationReceipt {
-  schema: 'cli-bridge.profile-materialization.v1'
+  schema: 'cli-bridge.profile-materialization.v2'
+  /** Canonical identity of the immutable AgentProfile that was actually materialized. */
+  effectiveProfileDigest: `sha256:${string}`
   harness: string
+  /** Provider selected for execution when it can be determined before spawn. */
+  provider: string | null
+  /** Exact bridge wire model selected for execution, including its harness prefix. */
+  model: string
+  /** Canonical intent and the exact native control passed after backend mapping/clamping. */
+  reasoningEffort: {
+    requested: ReasoningEffort | null
+    applied: string | null
+  }
   /** Covers planned file contents/modes, flags, environment, and unsupported dimensions. */
   workspacePlanDigest: string
   /** Relative paths only; profile contents and environment values never cross the API. */
@@ -130,7 +141,7 @@ export interface ChatRequest {
    * route boundary to this prompt-side `json_object` directive.
    */
   responseFormat?: { type: 'text' | 'json_object' }
-  /** Optional caller-declared AgentProfile. Sandbox uses it natively; local harnesses honor a prompt/context subset. */
+  /** Optional canonical AgentProfile materialized through the selected harness's native controls. */
   agent_profile?: AgentProfile
   /**
    * Standard MCP server passthrough. Canonical shape mirrors the
@@ -140,9 +151,9 @@ export interface ChatRequest {
    * `CODEX_HOME/config.toml`, opencode `OPENCODE_CONFIG`, kimi
    * `--mcp-config-file`).
    *
-   * When the same server name appears in both `agent_profile.mcp` and
-   * this field, request-body `mcp` wins — caller's explicit intent for
-   * THIS turn overrides any profile default.
+   * This channel is available only when `agent_profile` is absent. With an
+   * exact profile, declare every MCP server in `agent_profile.mcp`; a second
+   * body/header MCP channel is refused before spawn.
    *
    * Also accepted via the `X-Mcp-Config` request header (JSON-encoded
    * same shape) for callers that cannot extend the body.
@@ -254,9 +265,24 @@ export interface ChatDelta {
    */
   usage?: {
     input_tokens?: number
+    /** Fresh, non-cached input tokens when the backend reports the split. */
+    fresh_input_tokens?: number
+    /** Input tokens served from a provider cache. */
+    cache_read_input_tokens?: number
+    /** Input tokens written into a provider cache. */
+    cache_write_input_tokens?: number
     output_tokens?: number
-    /** Backend-reported USD cost. Omitted when the backend did not report one. */
+    /**
+     * Billed USD cost. Valid only with `cost_known: true` and trusted provenance;
+     * serializers refuse to promote an unclassified number to billed spend.
+     */
     cost?: number
+    /** Local catalog estimate. Never used as billed spend or a dollar-budget truth. */
+    estimated_cost?: number
+    /** True only when `cost` is backed by a provider or billing receipt. */
+    cost_known?: boolean
+    /** Where the dollar number came from. */
+    cost_provenance?: 'provider-receipt' | 'billing-receipt' | 'catalog-estimate'
     /**
      * Incremental by default. `total` proves the cost covers all usage emitted
      * through this record and replaces any incomplete incremental sum.

@@ -114,8 +114,8 @@ export class AcpBackend implements Backend {
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
     const promptText = renderPrompt(resolvePromptMessages(req, session))
-    // MCP servers (request-body `mcp.mcpServers` ∪ `agent_profile.mcp`)
-    // are passed INLINE to session/new — ACP's native mount point, no
+    // Profile MCP, or body/header MCP when no profile is present, is passed
+    // INLINE to session/new — ACP's native mount point, no
     // temp file. Schema verified live against `hermes acp`: remote is
     // `{type, name, url, headers:[{name,value}]}`, stdio is
     // `{name, command, args, env:[{name,value}]}`.

@@ -20,6 +20,11 @@ import type {
   AgentProfile,
   AgentProfileConfigValue,
   AgentProfileMcpServer,
+  ReasoningEffort,
+} from '@tangle-network/agent-interface'
+import {
+  canonicalAgentProfileDigest,
+  snapshotAgentProfile,
 } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
@@ -35,6 +40,15 @@ import {
   type WorkspacePlanConfigValue,
   type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
+
+export interface ProfileExecutionIdentity {
+  provider: string | null
+  model: string
+  reasoningEffort: {
+    requested: ReasoningEffort | null
+    applied: string | null
+  }
+}
 
 /**
  * The host directory request-scoped files are written into.
@@ -110,6 +124,7 @@ export function provisionProfileWorkspace(
   session: SessionRecord | null,
   harness: HarnessId,
   cwd: string | undefined,
+  executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, harness, null),
 ): {
   env: Record<string, string>
   flags: string[]
@@ -126,7 +141,14 @@ export function provisionProfileWorkspace(
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
     assertWorkspacePlanSupported(plan)
     const applied = applyWorkspacePlan(plan, workspaceCwd)
-    const receipt = retainProfileMaterializationReceipt(req, harness, plan, applied)
+    const receipt = retainProfileMaterializationReceipt(
+      req,
+      profile,
+      harness,
+      executionIdentity,
+      plan,
+      applied,
+    )
     return {
       env: requirePublicPlanEnv(applied.env, harness),
       flags: applied.flags.map((flag, index) =>
@@ -172,6 +194,7 @@ export function provisionPiProfile(
   req: ChatRequest,
   session: SessionRecord | null,
   cwd: string | undefined,
+  executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, 'pi', null),
 ): ProvisionedPiProfile | null {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
@@ -197,7 +220,14 @@ export function provisionPiProfile(
     chmodSync(profileRoot, 0o755)
     const applied = applyWorkspacePlan(plan, profileRoot, { existingFiles: 'reject' })
     const flags = piProfileFlags(plan, applied, profileRoot, nativeLoaders)
-    const receipt = retainProfileMaterializationReceipt(req, 'pi', plan, applied)
+    const receipt = retainProfileMaterializationReceipt(
+      req,
+      profile,
+      'pi',
+      executionIdentity,
+      plan,
+      applied,
+    )
 
     let cleaned = false
     return {
@@ -308,14 +338,20 @@ function piProfileFileFlag(path: string): '--append-system-prompt' | '--skill' |
 
 function retainProfileMaterializationReceipt(
   req: ChatRequest,
+  profile: AgentProfile,
   harness: HarnessId,
+  executionIdentity: ProfileExecutionIdentity,
   plan: WorkspacePlan,
   applied: WorkspacePlanReceipt,
 ): ProfileMaterializationReceipt {
   const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
   const receipt: ProfileMaterializationReceipt = {
-    schema: 'cli-bridge.profile-materialization.v1',
+    schema: 'cli-bridge.profile-materialization.v2',
+    effectiveProfileDigest: canonicalAgentProfileDigest(profile),
     harness,
+    provider: executionIdentity.provider,
+    model: executionIdentity.model,
+    reasoningEffort: executionIdentity.reasoningEffort,
     workspacePlanDigest: applied.workspacePlanDigest,
     files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
     unsupported: applied.unsupported,
@@ -325,17 +361,153 @@ function retainProfileMaterializationReceipt(
   return receipt
 }
 
+const profileSnapshots = new WeakMap<ChatRequest, AgentProfile | null>()
+
 export function resolveAgentProfile(req: ChatRequest, session: SessionRecord | null): AgentProfile | null {
-  if (req.agent_profile && typeof req.agent_profile === 'object') return req.agent_profile
-  const stored = session?.metadata?.agent_profile
-  return stored && typeof stored === 'object' ? stored as AgentProfile : null
+  if (profileSnapshots.has(req)) return profileSnapshots.get(req) ?? null
+  const raw = req.agent_profile && typeof req.agent_profile === 'object'
+    ? req.agent_profile
+    : session?.metadata?.agent_profile
+  let profile: AgentProfile | null = null
+  if (raw && typeof raw === 'object') {
+    try {
+      profile = snapshotAgentProfile(raw)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new BackendError(`invalid agent_profile: ${message}`, 'parse_error', error)
+    }
+  }
+  profileSnapshots.set(req, profile)
+  if (profile) {
+    req.agent_profile = profile
+  }
+  return profile
+}
+
+/** Reject any second behavioral authority beside an exact AgentProfile. */
+export function assertProfileRequestAuthority(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): AgentProfile | null {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return null
+  if (Object.keys(req.mcp?.mcpServers ?? {}).length > 0) {
+    throw new BackendError(
+      'request mcp cannot accompany agent_profile; declare the exact MCP servers in agent_profile.mcp',
+      'parse_error',
+    )
+  }
+  if (req.messages.some((message) => message.role === 'system')) {
+    throw new BackendError(
+      'system-role messages cannot accompany agent_profile; declare standing instructions in agent_profile.prompt',
+      'parse_error',
+    )
+  }
+  resolveRequestedReasoningEffort(req, session)
+  return profile
+}
+
+/** Resolve one canonical reasoning request; an out-of-profile override is a hard conflict. */
+export function resolveRequestedReasoningEffort(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): ReasoningEffort | null {
+  const profileEffort = resolveAgentProfile(req, session)?.model?.reasoningEffort
+  if (profileEffort && req.effort && profileEffort !== req.effort) {
+    throw new BackendError(
+      `request effort ${JSON.stringify(req.effort)} conflicts with agent_profile.model.reasoningEffort ${JSON.stringify(profileEffort)}`,
+      'parse_error',
+    )
+  }
+  return profileEffort ?? req.effort ?? null
+}
+
+/** Bind a receipt to the actual transport model/provider and native reasoning control. */
+export function profileExecutionIdentity(
+  req: ChatRequest,
+  session: SessionRecord | null,
+  harness: HarnessId,
+  appliedReasoningEffort: string | null,
+): ProfileExecutionIdentity {
+  const profile = assertProfileRequestAuthority(req, session)
+  if (profile) assertExactProfileRequest(req, profile, harness)
+  const wireModel = modelWithinHarness(req.model, harness)
+  const slash = wireModel.indexOf('/')
+  const wireProvider = slash > 0 ? wireModel.slice(0, slash) : undefined
+  return {
+    provider: wireProvider ?? profile?.model?.provider ?? null,
+    model: req.model,
+    reasoningEffort: {
+      requested: resolveRequestedReasoningEffort(req, session),
+      applied: appliedReasoningEffort,
+    },
+  }
 }
 
 /**
- * Merge request-body `mcp.mcpServers` and `agent_profile.mcp` into a
- * single normalized map keyed by server name. Request-body wins on
- * name collisions — caller's per-turn intent overrides profile
- * defaults.
+ * A materialization receipt can acknowledge one AgentProfile only when no
+ * second behavioral channel changes it. Limits and execution mode may still
+ * constrain the run; model, prompt, MCP, and reasoning must agree with the
+ * profile before any harness process starts.
+ */
+function assertExactProfileRequest(
+  req: ChatRequest,
+  profile: AgentProfile,
+  harness: HarnessId,
+): void {
+  if (profile.harness !== undefined && profile.harness !== harness) {
+    throw new BackendError(
+      `agent_profile.harness ${JSON.stringify(profile.harness)} conflicts with selected harness ${JSON.stringify(harness)}`,
+      'parse_error',
+    )
+  }
+
+  const wireModel = modelWithinHarness(req.model, harness)
+  const requestedModel = profile.model?.default
+  const requestedProvider = profile.model?.provider
+  if (requestedModel !== undefined) {
+    const qualified = requestedProvider && !requestedModel.includes('/')
+      ? `${requestedProvider}/${requestedModel}`
+      : requestedModel
+    if (wireModel !== qualified) {
+      throw new BackendError(
+        `request model ${JSON.stringify(req.model)} conflicts with agent_profile.model ${JSON.stringify(qualified)}`,
+        'parse_error',
+      )
+    }
+  } else if (requestedProvider !== undefined) {
+    const slash = wireModel.indexOf('/')
+    const wireProvider = slash > 0 ? wireModel.slice(0, slash) : null
+    if (wireProvider !== requestedProvider) {
+      throw new BackendError(
+        `request model ${JSON.stringify(req.model)} does not select agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
+        'parse_error',
+      )
+    }
+  }
+
+}
+
+function modelWithinHarness(model: string, harness: HarnessId): string {
+  const prefixes = harness === 'claude-code'
+    ? ['claude-code', 'claude', 'claudish']
+    : harness === 'kimi-code'
+      ? ['kimi-code', 'kimi']
+      : [harness]
+  for (const prefix of prefixes) {
+    if (model === prefix) return ''
+    if (model.startsWith(`${prefix}/`)) return model.slice(prefix.length + 1)
+  }
+  throw new BackendError(
+    `request model ${JSON.stringify(model)} does not select harness ${JSON.stringify(harness)}`,
+    'parse_error',
+  )
+}
+
+/**
+ * Normalize the one authoritative MCP source. A request without an
+ * AgentProfile may use body/header `mcp.mcpServers`; an exact profile must put
+ * every server in `agent_profile.mcp`, and a second channel is refused.
  *
  * Returns `null` when neither source supplies any entries. Callers
  * that need a non-null result (e.g. opencode, which always writes a
@@ -351,24 +523,24 @@ export function resolveMcpServers(
   const merged: Record<string, McpServerSpec> = {}
 
   const profile = resolveAgentProfile(req, session)
+  const requestMcp = req.mcp?.mcpServers
+  if (profile && Object.keys(requestMcp ?? {}).length > 0) {
+    throw new BackendError(
+      'request mcp cannot accompany agent_profile; declare the exact MCP servers in agent_profile.mcp',
+      'parse_error',
+    )
+  }
   if (profile && typeof profile === 'object') {
     const profileMcp = (profile as { mcp?: Record<string, AgentProfileMcpServer> }).mcp
     if (profileMcp && typeof profileMcp === 'object') {
-      const overriddenByRequest = new Set(Object.keys(req.mcp?.mcpServers ?? {}))
       for (const [name, raw] of Object.entries(profileMcp)) {
         if (!name || !raw || typeof raw !== 'object') continue
-        // An entry the request replaces below, and an entry explicitly disabled, are both dropped
-        // before anything reads them. Converting them anyway would let a value nobody uses turn a
-        // working request into a hard 400 — the validation must follow the value into use, not
-        // stand in front of entries that never get there.
-        if (overriddenByRequest.has(name)) continue
         if ((raw as { enabled?: unknown }).enabled === false) continue
         merged[name] = profileMcpToSpec(raw, name)
       }
     }
   }
 
-  const requestMcp = req.mcp?.mcpServers
   if (requestMcp && typeof requestMcp === 'object') {
     for (const [name, raw] of Object.entries(requestMcp)) {
       if (!name || !raw || typeof raw !== 'object') continue
@@ -470,8 +642,8 @@ function normalizeMcpServerSpec(
   const out: McpServerSpec = {}
   if (r.type === 'stdio' || r.type === 'http' || r.type === 'sse') out.type = r.type
   if (typeof r.command === 'string') out.command = r.command
-  // A request-body server WINS over a profile server of the same name, so this path decides the
-  // bytes that reach argv and the on-disk MCP config. It used to drop every non-string silently,
+  // A profile-less request owns these bytes all the way to argv/on-disk MCP config. This path used
+  // to drop every non-string silently,
   // which turned a secret-ref in `args` into a SHORTER command line and a server that spawned
   // wrong for a reason nothing reported. Same refusal as the profile path, same reason.
   const where = `mcp.mcpServers[${JSON.stringify(name)}]`

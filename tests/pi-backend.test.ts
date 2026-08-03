@@ -92,7 +92,12 @@ describe('PiBackend', () => {
     process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
     const profile: NonNullable<ChatRequest['agent_profile']> = {
       prompt: { systemPrompt: 'SYSTEM_ONCE' },
-      model: { reasoningEffort: 'xhigh' },
+      harness: 'pi',
+      model: {
+        provider: 'tangle-router',
+        default: 'glm-5.2',
+        reasoningEffort: 'ultracode',
+      },
       mcp: {
         coordination: {
           transport: 'stdio',
@@ -126,17 +131,19 @@ describe('PiBackend', () => {
     })
 
     try {
-      await collect(backend.chat({
+      const request: ChatRequest = {
         model: 'pi/tangle-router/glm-5.2',
         messages: [{ role: 'user', content: 'TASK_UNCHANGED' }],
         cwd,
         agent_profile: profile,
-      }, null, new AbortController().signal))
+      }
+      await collect(backend.chat(request, null, new AbortController().signal))
 
       expect(args.filter((arg) => arg === '--system-prompt')).toHaveLength(1)
       expect(args).toContain('--approve')
       expect(systemPrompt).toBe('SYSTEM_ONCE')
       expect(argValue(args, '--thinking')).toBe('xhigh')
+      expect(profile.model?.reasoningEffort).toBe('ultracode')
       expect(args.at(-1)).toBe('TASK_UNCHANGED')
       expect(args.at(-1)).not.toContain('SYSTEM_ONCE')
       expect(directTools).toBe('coordination')
@@ -154,6 +161,14 @@ describe('PiBackend', () => {
       })
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
       expect(mcpConfigPath && existsSync(mcpConfigPath)).toBe(false)
+      expect(args).not.toContain('ultracode')
+      expect(request.profile_materialization_receipt).toMatchObject({
+        schema: 'cli-bridge.profile-materialization.v2',
+        harness: 'pi',
+        provider: 'tangle-router',
+        model: 'pi/tangle-router/glm-5.2',
+        reasoningEffort: { requested: 'ultracode', applied: 'xhigh' },
+      })
     } finally {
       if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
       else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
@@ -182,6 +197,98 @@ describe('PiBackend', () => {
       }, null, new AbortController().signal))
 
       await expect(run).rejects.toThrow(/effort .* conflicts with agent_profile/u)
+      expect(spawns).toBe(0)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    {
+      name: 'provider',
+      model: 'pi/other-provider/glm-5.2',
+      messages: [{ role: 'user' as const, content: 'task' }],
+      profile: {
+        harness: 'pi' as const,
+        model: { provider: 'tangle-router', default: 'glm-5.2' },
+      },
+      error: /conflicts with agent_profile\.model/u,
+    },
+    {
+      name: 'model',
+      model: 'pi/tangle-router/other-model',
+      messages: [{ role: 'user' as const, content: 'task' }],
+      profile: {
+        harness: 'pi' as const,
+        model: { provider: 'tangle-router', default: 'glm-5.2' },
+      },
+      error: /conflicts with agent_profile\.model/u,
+    },
+    {
+      name: 'harness',
+      model: 'pi/tangle-router/glm-5.2',
+      messages: [{ role: 'user' as const, content: 'task' }],
+      profile: { harness: 'codex' as const },
+      error: /agent_profile\.harness/u,
+    },
+    {
+      name: 'system prompt overlay',
+      model: 'pi/tangle-router/glm-5.2',
+      messages: [
+        { role: 'system' as const, content: 'second standing prompt' },
+        { role: 'user' as const, content: 'task' },
+      ],
+      profile: { harness: 'pi' as const },
+      error: /system-role messages cannot accompany agent_profile/u,
+    },
+  ])('refuses an exact-profile $name mismatch before spawn', async ({
+    model,
+    messages,
+    profile,
+    error,
+  }) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-identity-conflict-'))
+    let spawns = 0
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([], () => { spawns += 1 }),
+    })
+    try {
+      await expect(collect(backend.chat({
+        model,
+        messages,
+        cwd,
+        agent_profile: profile,
+      }, null, new AbortController().signal))).rejects.toThrow(error)
+      expect(spawns).toBe(0)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses request MCP beside an exact profile before spawn', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-mcp-conflict-'))
+    let spawns = 0
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([], () => { spawns += 1 }),
+    })
+    try {
+      await expect(collect(backend.chat({
+        model: 'pi/tangle-router/glm-5.2',
+        messages: [{ role: 'user', content: 'task' }],
+        cwd,
+        agent_profile: { harness: 'pi' },
+        mcp: {
+          mcpServers: {
+            bypass: { command: 'node', args: ['server.mjs'] },
+          },
+        },
+      }, null, new AbortController().signal))).rejects.toThrow(
+        /request mcp cannot accompany agent_profile/u,
+      )
       expect(spawns).toBe(0)
     } finally {
       rmSync(cwd, { recursive: true, force: true })
@@ -405,6 +512,27 @@ describe('PiBackend', () => {
         'PERSISTED_PROFILE_SYSTEM',
         'PERSISTED_PROFILE_SYSTEM',
       ])
+
+      const conflictingResume = await app.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'pi/zai-coding-paas/glm-5-turbo',
+          messages: [{ role: 'user', content: 'change the worker' }],
+          stream: false,
+          cwd,
+          session_id: 'discovery-run',
+          agent_profile: {
+            prompt: { systemPrompt: 'DIFFERENT_PROFILE_SYSTEM' },
+            model: { provider: 'zai-coding-paas', default: 'glm-5-turbo' },
+          },
+        }),
+      })
+      expect(conflictingResume.status).toBe(400)
+      expect(argv).toHaveLength(3)
+      expect(sessions.get('discovery-run', 'pi')?.metadata.agent_profile).toMatchObject({
+        prompt: { systemPrompt: 'PERSISTED_PROFILE_SYSTEM' },
+      })
       for (const root of profileRoots) expect(existsSync(root)).toBe(false)
     } finally {
       sessions.close()
@@ -482,7 +610,7 @@ describe('PiBackend', () => {
       { internal_session_id: 'pi-session-1' },
       { content: 'pi' },
       { content: '-ok' },
-      { usage: { input_tokens: 8417, output_tokens: 30 } },
+      { usage: { input_tokens: 8417, fresh_input_tokens: 8417, output_tokens: 30 } },
       { finish_reason: 'stop' },
     ])
   })
@@ -550,13 +678,29 @@ describe('PiBackend', () => {
     }, null, new AbortController().signal))
 
     expect(deltas).toEqual([
-      { usage: { input_tokens: 1_030, output_tokens: 20 } },
-      { usage: { input_tokens: 1_990, output_tokens: 35 } },
       {
         usage: {
-          input_tokens: 0,
-          output_tokens: 0,
-          cost: 0.005,
+          input_tokens: 1_030,
+          fresh_input_tokens: 100,
+          cache_read_input_tokens: 900,
+          cache_write_input_tokens: 30,
+          output_tokens: 20,
+        },
+      },
+      {
+        usage: {
+          input_tokens: 1_990,
+          fresh_input_tokens: 240,
+          cache_read_input_tokens: 1_700,
+          cache_write_input_tokens: 50,
+          output_tokens: 35,
+        },
+      },
+      {
+        usage: {
+          estimated_cost: 0.005,
+          cost_known: false,
+          cost_provenance: 'catalog-estimate',
           cost_scope: 'total',
         },
       },
@@ -604,13 +748,29 @@ describe('PiBackend', () => {
     }, null, new AbortController().signal))
 
     expect(deltas).toEqual([
-      { usage: { input_tokens: 103, output_tokens: 7 } },
-      { usage: { input_tokens: 128, output_tokens: 9 } },
       {
         usage: {
-          input_tokens: 0,
-          output_tokens: 0,
-          cost: 0.003,
+          input_tokens: 103,
+          fresh_input_tokens: 19,
+          cache_read_input_tokens: 80,
+          cache_write_input_tokens: 4,
+          output_tokens: 7,
+        },
+      },
+      {
+        usage: {
+          input_tokens: 128,
+          fresh_input_tokens: 23,
+          cache_read_input_tokens: 100,
+          cache_write_input_tokens: 5,
+          output_tokens: 9,
+        },
+      },
+      {
+        usage: {
+          estimated_cost: 0.003,
+          cost_known: false,
+          cost_provenance: 'catalog-estimate',
           cost_scope: 'total',
         },
       },
@@ -640,8 +800,8 @@ describe('PiBackend', () => {
     }, null, new AbortController().signal))
 
     expect(deltas).toEqual([
-      { usage: { input_tokens: 10, output_tokens: 2 } },
-      { usage: { input_tokens: 20, output_tokens: 3 } },
+      { usage: { input_tokens: 10, fresh_input_tokens: 10, output_tokens: 2 } },
+      { usage: { input_tokens: 20, fresh_input_tokens: 20, output_tokens: 3 } },
       { finish_reason: 'stop' },
     ])
   })
@@ -679,7 +839,13 @@ describe('PiBackend', () => {
     expect(first.value).toEqual({ content: 'partial' })
     const second = await iterator.next()
     expect(second.value).toEqual({
-      usage: { input_tokens: 408, output_tokens: 12 },
+      usage: {
+        input_tokens: 408,
+        fresh_input_tokens: 80,
+        cache_read_input_tokens: 320,
+        cache_write_input_tokens: 8,
+        output_tokens: 12,
+      },
     })
     const pending = iterator.next()
     await new Promise((resolve) => setTimeout(resolve, 20))
@@ -697,9 +863,9 @@ describe('PiBackend', () => {
     expect(tail).toEqual([
       {
         usage: {
-          input_tokens: 0,
-          output_tokens: 0,
-          cost: 0.004,
+          estimated_cost: 0.004,
+          cost_known: false,
+          cost_provenance: 'catalog-estimate',
           cost_scope: 'total',
         },
       },
@@ -914,7 +1080,7 @@ describe('PiBackend', () => {
     expect(deltas).toEqual([
       { internal_session_id: 'pi-tools-1' },
       { tool_calls: [{ id: 'call_read_1', name: 'read', arguments: '{"path":"src/lib.rs"}' }] },
-      { usage: { input_tokens: 20, output_tokens: 8 } },
+      { usage: { input_tokens: 20, fresh_input_tokens: 20, output_tokens: 8 } },
       { finish_reason: 'tool_calls' },
     ])
   })
@@ -991,7 +1157,7 @@ describe('PiBackend', () => {
     expect(deltas).toEqual([
       { internal_session_id: 'pi-real-tools-1' },
       { tool_calls: [{ id: 'call_read_1', name: 'read', arguments: '{"path":"/tmp/secret.txt"}' }] },
-      { usage: { input_tokens: 31, output_tokens: 12 } },
+      { usage: { input_tokens: 31, fresh_input_tokens: 31, output_tokens: 12 } },
       { finish_reason: 'tool_calls' },
     ])
   })
@@ -1025,7 +1191,7 @@ describe('PiBackend', () => {
 
     expect(deltas).toEqual([
       { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
-      { usage: { input_tokens: 10, output_tokens: 5 } },
+      { usage: { input_tokens: 10, fresh_input_tokens: 10, output_tokens: 5 } },
       { finish_reason: 'tool_calls' },
     ])
   })
@@ -1061,7 +1227,7 @@ describe('PiBackend', () => {
 
     expect(deltas).toEqual([
       { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
-      { usage: { input_tokens: 10, output_tokens: 5 } },
+      { usage: { input_tokens: 10, fresh_input_tokens: 10, output_tokens: 5 } },
       { finish_reason: 'tool_calls' },
     ])
   })
@@ -1153,7 +1319,7 @@ describe('PiBackend', () => {
         },
       })
       expect(deltas.slice(-2)).toEqual([
-        { usage: { input_tokens: 5, output_tokens: 2 } },
+        { usage: { input_tokens: 5, fresh_input_tokens: 5, output_tokens: 2 } },
         { finish_reason: 'stop' },
       ])
       expect(configPathAtSpawn && existsSync(configPathAtSpawn)).toBe(false)
@@ -1344,7 +1510,7 @@ describe('PiBackend', () => {
       expect(mcpConfigFlagAtSpawn).toBeUndefined()
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
       expect(deltas.slice(-2)).toEqual([
-        { usage: { input_tokens: 3, output_tokens: 1 } },
+        { usage: { input_tokens: 3, fresh_input_tokens: 3, output_tokens: 1 } },
         { finish_reason: 'stop' },
       ])
     } finally {

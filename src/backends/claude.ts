@@ -31,7 +31,9 @@ import {
   resolveAgentProfile,
   resolveMcpServers,
   type MaterializedMcpConfig,
+  profileExecutionIdentity,
   provisionProfileWorkspace,
+  resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -181,15 +183,23 @@ export class ClaudeBackend implements Backend {
 
     // Validate and apply the profile before allocating request-scoped MCP
     // files. A rejected plan must never strand a config containing secrets.
-    const provisioned = provisionProfileWorkspace(req, session, 'claude-code', cwd)
+    const appliedReasoningEffort = claudeEffort(
+      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    )
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'claude-code',
+      cwd,
+      profileExecutionIdentity(req, session, 'claude-code', appliedReasoningEffort),
+    )
 
     // Materialize MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
     // up the temp dir after the subprocess exits.
     //
-    // Merges request-body `mcp.mcpServers` and `agent_profile.mcp` into
-    // one map; request-body wins on name collisions. See
-    // `resolveMcpServers` for the contract.
+    // One MCP authority reaches this point: profile MCP for an exact profile,
+    // otherwise body/header MCP. `resolveMcpServers` refuses mixed channels.
     const mcpMaterialized = writeMcpConfigFile(
       resolveMcpServers(req, session),
     )
@@ -386,9 +396,7 @@ export class ClaudeBackend implements Backend {
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
       : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
-    const effort = claudeEffort(
-      req.effort ?? resolveAgentProfile(req, session)?.model?.reasoningEffort,
-    )
+    const effort = claudeEffort(resolveRequestedReasoningEffort(req, session) ?? undefined)
     if (effort) args.push('--effort', effort)
 
     // Fold every system source into --append-system-prompt so
@@ -429,18 +437,10 @@ export class ClaudeBackend implements Backend {
       }
     }
 
-    // MCP wiring — when the caller passed `mcp.mcpServers` (or the
-    // agent profile carries one), register the servers via --mcp-config
-    // and auto-allow their tools so byob mode doesn't hang on the
-    // per-call permission prompt. Hosted-safe mode keeps the gate
-    // (callers using hosted-safe explicitly want tool grants confirmed
-    // elsewhere).
-    // MCP wiring — the canonical custom-tool surface. The caller
-    // passes `mcp.mcpServers` in the request body (or via X-Mcp-Config
-    // header, or via agent_profile.mcp); `resolveMcpServers` merges
-    // those sources into the `mcp` value materialized here. Every
-    // backend translates the merged map into its native loader; for
-    // claude that's `--mcp-config <path>`.
+    // MCP wiring — the canonical custom-tool surface. A profile-less request
+    // may pass body/header MCP; an exact profile uses `agent_profile.mcp` and
+    // rejects that second channel. Claude receives the selected set through
+    // `--mcp-config <path>`, with its tools auto-allowed in byob mode.
     //
     // We always pair with `--strict-mcp-config` so the operator's
     // `~/.claude/` inherited servers (Google Drive, Linear, etc.) do

@@ -62,6 +62,27 @@ class MetadataReplayBackend extends TestBackend {
   }
 }
 
+class ProfileReceiptReplayBackend extends TestBackend {
+  calls = 0
+
+  async *chat(req: ChatRequest): AsyncIterable<ChatDelta> {
+    this.calls += 1
+    req.profile_materialization_receipt = {
+      schema: 'cli-bridge.profile-materialization.v2',
+      effectiveProfileDigest: `sha256:${'1'.repeat(64)}`,
+      harness: 'pi',
+      provider: 'tangle-router',
+      model: req.model,
+      reasoningEffort: { requested: 'ultracode', applied: 'xhigh' },
+      workspacePlanDigest: `sha256:${'2'.repeat(64)}`,
+      files: [{ path: 'AGENTS.md', mode: 0o644 }],
+      unsupported: [],
+    }
+    yield { content: 'done' }
+    yield { finish_reason: 'stop', usage: { input_tokens: 1, output_tokens: 1 } }
+  }
+}
+
 class ControlledBackend extends TestBackend {
   calls = 0
   private finishRun!: () => void
@@ -507,6 +528,44 @@ describe('durable run contract', () => {
       expect(replayText).toContain('two')
       expect(replayText).not.toContain('"content":"one"')
       expect(backend.calls).toBe(1)
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
+  it('replays and retains the exact profile acknowledgment for the run identity lifetime', async () => {
+    const backend = new ProfileReceiptReplayBackend()
+    const ctx = fixture(backend, {
+      replayRetentionMs: 20,
+      identityRetentionMs: 2_000,
+    })
+    const body = {
+      ...chatBody('profile-receipt-replay'),
+      model: 'durable/tangle-router/deepseek-v4-flash',
+    }
+    try {
+      const initial = await postChat(ctx.app, body)
+      const initialText = await initial.text()
+      expect(initialText).toContain('cli-bridge.profile-materialization.v2')
+      expect(initialText).toContain('"requested":"ultracode","applied":"xhigh"')
+
+      const replay = await postChat(ctx.app, body, { 'Last-Event-ID': '1' })
+      const replayText = await replay.text()
+      expect(replayText).toContain('cli-bridge.profile-materialization.v2')
+      expect(backend.calls).toBe(1)
+
+      await waitFor(() => ctx.runs.get('profile-receipt-replay')?.snapshot().replay.expired === true)
+      const state = await ctx.app.request('/v1/runs/profile-receipt-replay')
+      await expect(state.json()).resolves.toMatchObject({
+        requestDigest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u),
+        profileMaterialization: {
+          schema: 'cli-bridge.profile-materialization.v2',
+          effectiveProfileDigest: `sha256:${'1'.repeat(64)}`,
+          provider: 'tangle-router',
+          model: 'durable/tangle-router/deepseek-v4-flash',
+          reasoningEffort: { requested: 'ultracode', applied: 'xhigh' },
+        },
+      })
     } finally {
       ctx.cleanup()
     }

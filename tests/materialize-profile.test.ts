@@ -173,11 +173,15 @@ describe('materializeProfile — verified per-harness routing', () => {
       }
       const result = provisionProfileWorkspace(req, null, 'claude-code', root)
       expect(result.receipt).toMatchObject({
-        schema: 'cli-bridge.profile-materialization.v1',
+        schema: 'cli-bridge.profile-materialization.v2',
         harness: 'claude-code',
+        provider: null,
+        model: 'claude-code/opus',
+        reasoningEffort: { requested: null, applied: null },
         files: [{ path: '.claude/skills/receipt-skill/SKILL.md', mode: 0o644 }],
         unsupported: [],
       })
+      expect(result.receipt?.effectiveProfileDigest).toMatch(/^sha256:[a-f0-9]{64}$/u)
       expect(result.receipt?.workspacePlanDigest).toMatch(/^(?:sha256:)?[a-f0-9]{64}$/u)
       expect(req.profile_materialization_receipt).toEqual(result.receipt)
       expect(existsSync(join(root, '.claude/skills/receipt-skill/SKILL.md'))).toBe(true)
@@ -192,10 +196,7 @@ describe('materializeProfile — verified per-harness routing', () => {
     try {
       const req: ChatRequest = {
         model: 'gemini/gemini-2.5-pro',
-        messages: [
-          { role: 'system', content: 'Keep this request-specific system message.' },
-          { role: 'user', content: 'work' },
-        ],
+        messages: [{ role: 'user', content: 'work' }],
         agent_profile: {
           prompt: {
             systemPrompt: marker,
@@ -219,8 +220,7 @@ describe('materializeProfile — verified per-harness routing', () => {
       expect(provisioned.env.GEMINI_SYSTEM_MD).toBe('1')
       expect(hostEnv?.GEMINI_SYSTEM_MD).toBe('1')
       expect(dockerArgs).toContain('GEMINI_SYSTEM_MD=1')
-      expect(prompt).toContain('[system] Keep this request-specific system message.')
-      expect(prompt).toContain('[user] work')
+      expect(prompt).toBe('work')
       expect(nativeSystemPrompt).toBe(marker)
       expect(workspaceInstructions).toContain('Keep the workspace instruction.')
       expect(workspaceInstructions).not.toContain(marker)

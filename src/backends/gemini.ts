@@ -16,7 +16,12 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
-import { materializeMcpServersForGemini, provisionProfileWorkspace, resolveMcpServers } from './profile-support.js'
+import {
+  materializeMcpServersForGemini,
+  profileExecutionIdentity,
+  provisionProfileWorkspace,
+  resolveMcpServers,
+} from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
@@ -68,11 +73,16 @@ export class GeminiBackend implements Backend {
 
     // Validate the profile before touching project-scoped Gemini settings,
     // which can contain MCP headers and other credentials.
-    const provisioned = provisionProfileWorkspace(req, session, 'gemini', cwd)
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'gemini',
+      cwd,
+      profileExecutionIdentity(req, session, 'gemini', null),
+    )
     args.push(...provisioned.flags)
 
-    // Materialize MCP servers (request-body `mcp.mcpServers` ∪
-    // `agent_profile.mcp`) into the project-scope `<cwd>/.gemini/settings.json`.
+    // Materialize the one selected MCP source into `<cwd>/.gemini/settings.json`.
     // Gemini CLI has no per-invocation MCP flag — it discovers MCP by cwd,
     // layering the project settings over the user's global ones. Cleanup in
     // the outer finally restores the workspace so it never leaks. Fail-loud:

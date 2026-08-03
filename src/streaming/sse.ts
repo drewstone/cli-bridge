@@ -60,6 +60,21 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   // Usage/profile metadata without content/tool_calls/finish carries `choices: []`,
   // not an empty choice, so strict OpenAI clients do not parse it as output.
   const metadataOnly = (hasUsage || hasProfileMaterialization) && !hasContent && !hasToolCalls && !hasFinish
+  const usage = delta.usage
+  const trustedCostProvenance = usage?.cost_provenance === 'provider-receipt'
+    || usage?.cost_provenance === 'billing-receipt'
+    ? usage.cost_provenance
+    : undefined
+  const trustedCost = usage?.cost_known === true
+    && trustedCostProvenance !== undefined
+    && isNonnegativeFinite(usage.cost)
+      ? usage.cost
+      : undefined
+  const catalogEstimate = usage?.cost_known !== true
+    && usage?.cost_provenance === 'catalog-estimate'
+    && isNonnegativeFinite(usage.estimated_cost)
+      ? usage.estimated_cost
+      : undefined
   const payload = {
     id: meta.id,
     object: 'chat.completion.chunk',
@@ -72,13 +87,39 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
         finish_reason: delta.finish_reason ?? null,
       },
     ],
-    ...(delta.usage ? {
+    ...(usage ? {
       usage: {
-        prompt_tokens: delta.usage.input_tokens ?? 0,
-        completion_tokens: delta.usage.output_tokens ?? 0,
-        total_tokens: (delta.usage.input_tokens ?? 0) + (delta.usage.output_tokens ?? 0),
-        ...(delta.usage.cost !== undefined ? { cost: delta.usage.cost } : {}),
-        ...(delta.usage.estimated ? { estimated: true } : {}),
+        ...(isNonnegativeFinite(usage.input_tokens) ? { prompt_tokens: usage.input_tokens } : {}),
+        ...(isNonnegativeFinite(usage.output_tokens) ? { completion_tokens: usage.output_tokens } : {}),
+        ...(isNonnegativeFinite(usage.input_tokens) && isNonnegativeFinite(usage.output_tokens)
+          ? { total_tokens: usage.input_tokens + usage.output_tokens }
+          : {}),
+        ...(isNonnegativeFinite(usage.fresh_input_tokens)
+          ? { fresh_input_tokens: usage.fresh_input_tokens }
+          : {}),
+        ...(isNonnegativeFinite(usage.cache_read_input_tokens)
+          ? { cache_read_input_tokens: usage.cache_read_input_tokens }
+          : {}),
+        ...(isNonnegativeFinite(usage.cache_write_input_tokens)
+          ? { cache_write_input_tokens: usage.cache_write_input_tokens }
+          : {}),
+        ...(trustedCost !== undefined
+          ? {
+              cost: trustedCost,
+              cost_known: true,
+              cost_provenance: trustedCostProvenance,
+            }
+          : {
+              cost_known: false,
+              ...(catalogEstimate !== undefined
+                ? {
+                    estimated_cost: catalogEstimate,
+                    cost_provenance: 'catalog-estimate' as const,
+                  }
+                : {}),
+            }),
+        ...(usage.cost_scope ? { cost_scope: usage.cost_scope } : {}),
+        ...(usage.estimated ? { estimated: true } : {}),
       },
     } : {}),
     ...(delta.profile_materialization
@@ -147,10 +188,34 @@ export async function collectNonStreaming(
   // here we only normalise to the OpenAI shape, preserving the `estimated` flag.
   const usageOut = usage
     ? {
-        prompt_tokens: usage.inputTokens,
-        completion_tokens: usage.outputTokens,
-        total_tokens: usage.inputTokens + usage.outputTokens,
-        ...(usage.costComplete ? { cost: usage.cost } : {}),
+        ...(usage.inputTokensKnown ? { prompt_tokens: usage.inputTokens } : {}),
+        ...(usage.outputTokensKnown ? { completion_tokens: usage.outputTokens } : {}),
+        ...(usage.inputTokensKnown && usage.outputTokensKnown
+          ? { total_tokens: usage.inputTokens + usage.outputTokens }
+          : {}),
+        ...(usage.freshInputTokensKnown ? { fresh_input_tokens: usage.freshInputTokens } : {}),
+        ...(usage.cacheReadInputTokensKnown
+          ? { cache_read_input_tokens: usage.cacheReadInputTokens }
+          : {}),
+        ...(usage.cacheWriteInputTokensKnown
+          ? { cache_write_input_tokens: usage.cacheWriteInputTokens }
+          : {}),
+        ...(usage.costComplete
+          ? {
+              cost: usage.cost,
+              cost_known: true,
+              cost_provenance: usage.costProvenance,
+            }
+          : {
+              cost_known: false,
+              ...(usage.estimatedCostComplete
+                ? {
+                    estimated_cost: usage.estimatedCost,
+                    cost_provenance: 'catalog-estimate' as const,
+                  }
+                : {}),
+            }),
+        cost_scope: 'total' as const,
         ...(usage.estimated ? { estimated: true } : {}),
       }
     : undefined
@@ -187,3 +252,6 @@ export async function collectNonStreaming(
   }
 }
 
+function isNonnegativeFinite(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value >= 0
+}

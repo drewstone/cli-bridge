@@ -17,7 +17,10 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
-import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
+import {
+  canonicalAgentProfileDigest,
+  canonicalCandidateDigest,
+} from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
@@ -45,6 +48,11 @@ import {
 import { BackendReportedFailureError } from '../runs/error-shape.js'
 import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
+import {
+  assertProfileRequestAuthority,
+  resolveAgentProfile,
+  resolveRequestedReasoningEffort,
+} from '../backends/profile-support.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -368,10 +376,10 @@ export function mountChatCompletions(
       resume_id: _bodyResumeId,
       ...rest
     } = parsed.data
-    // MCP can arrive in the body OR the `X-Mcp-Config` header. Body
-    // wins on conflict — header is for callers that can't extend the
-    // request body (e.g. forwarding through a third-party gateway that
-    // strips unknown JSON fields).
+    // Without an exact AgentProfile, MCP can arrive in the body OR the
+    // `X-Mcp-Config` header and the body wins on conflict. When a profile is
+    // present, any body/header MCP is refused before execution; the profile is
+    // the only behavioral authority.
     const mcpHeader = parseMcpHeader(c.req.header('x-mcp-config'))
     const mergedMcp = mergeMcpInputs(mcpHeader, bodyMcp as ChatRequest['mcp'] | undefined)
     const req: ChatRequest = {
@@ -494,6 +502,11 @@ export function mountChatCompletions(
       if (!req.cwd && session?.cwd) {
         req.cwd = session.cwd
       }
+      assertProfileRequestAuthority(req, session)
+      const sessionProfileBinding = exactSessionProfileBinding(req, session)
+      if (session) {
+        assertSessionProfileBinding(session, sessionProfileBinding)
+      }
 
       // Deny-by-default egress, gated before any execution path is chosen so a
       // net-jail cannot be requested of a mode that would not apply it.
@@ -589,9 +602,15 @@ export function mountChatCompletions(
                   internalId: delta.internal_session_id,
                   cwd: req.cwd ?? session?.cwd ?? null,
                   metadata: {
+                    ...(req.metadata ?? {}),
                     model: req.model,
                     ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
-                    ...(req.metadata ?? {}),
+                    ...(sessionProfileBinding
+                      ? { agent_profile_binding: sessionProfileBinding }
+                      : {}),
+                    ...(req.profile_materialization_receipt
+                      ? { profile_materialization: req.profile_materialization_receipt }
+                      : {}),
                   },
                 })
               }
@@ -901,6 +920,55 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
   return canonicalCandidateDigest(normalized)
 }
 
+interface SessionProfileBinding {
+  schema: 'cli-bridge.session-agent-profile.v1'
+  effectiveProfileDigest: `sha256:${string}`
+  provider: string | null
+  model: string
+  requestedReasoningEffort: string | null
+}
+
+function exactSessionProfileBinding(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): SessionProfileBinding | null {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return null
+  const parts = req.model.split('/')
+  const provider = parts.length >= 3 && parts[1]
+    ? parts[1]
+    : profile.model?.provider ?? null
+  return {
+    schema: 'cli-bridge.session-agent-profile.v1',
+    effectiveProfileDigest: canonicalAgentProfileDigest(profile),
+    provider,
+    model: req.model,
+    requestedReasoningEffort: resolveRequestedReasoningEffort(req, session),
+  }
+}
+
+function assertSessionProfileBinding(
+  session: SessionRecord,
+  received: SessionProfileBinding | null,
+): void {
+  const stored = session.metadata.agent_profile_binding
+  if (!stored || typeof stored !== 'object') {
+    if (received) {
+      throw new BackendError(
+        `session ${JSON.stringify(session.externalId)} predates exact AgentProfile binding; start a new session`,
+        'parse_error',
+      )
+    }
+    return
+  }
+  if (!received || JSON.stringify(stored) !== JSON.stringify(received)) {
+    throw new BackendError(
+      `session ${JSON.stringify(session.externalId)} is bound to a different AgentProfile/model`,
+      'parse_error',
+    )
+  }
+}
+
 function invalidRequest(c: Context, message: string): Response {
   return c.json({ error: { message, type: 'invalid_request_error' } }, 400)
 }
@@ -1005,6 +1073,9 @@ function errorResponse(c: Context, err: unknown): Response {
     return c.json({ error: { message: err.message, type: err.code } }, err.code === 'timeout' ? 504 : 502)
   }
   if (err instanceof BackendError) {
+    if (err.code === 'parse_error') {
+      return c.json({ error: { message: err.message, type: err.code } }, 400)
+    }
     // Hono's typed status gate treats 499 as an unofficial code; collapse
     // that one to 504 and keep the rest as documented codes.
     const status: 500 | 501 | 502 | 503 | 504 =

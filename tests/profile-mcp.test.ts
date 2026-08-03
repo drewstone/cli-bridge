@@ -220,13 +220,13 @@ describe('resolveMcpServers', () => {
       ).toThrow(/NO_WRITE/)
     })
 
-    it('still accepts plain pre-0.40 strings, so mid-migration profiles keep working', () => {
+    it('rejects obsolete plain-string profile values instead of retaining a compatibility path', () => {
       const r = req({
         agent_profile: {
           mcp: { coord: { command: 'tsx', args: ['plain.ts'] } },
         } as unknown as AgentProfile,
       })
-      expect(resolveMcpServers(r, null)?.coord?.args).toEqual(['plain.ts'])
+      expect(() => resolveMcpServers(r, null)).toThrow()
     })
   })
 
@@ -246,7 +246,7 @@ describe('resolveMcpServers', () => {
     expect(merged).toEqual({ echo: { command: 'node', args: ['./echo.js'] } })
   })
 
-  it('lifts agent_profile.mcp into the merged map (transport → type)', () => {
+  it('lifts agent_profile.mcp into the selected map (transport → type)', () => {
     const r = req({
       agent_profile: {
         mcp: {
@@ -258,7 +258,7 @@ describe('resolveMcpServers', () => {
     expect(merged).toEqual({ coord: { type: 'stdio', command: 'tsx', args: ['c.ts'] } })
   })
 
-  it('request-body wins on name collision with agent_profile.mcp', () => {
+  it('refuses request-body MCP beside an exact agent_profile', () => {
     const r = req({
       agent_profile: {
         mcp: { echo: { command: 'from-profile' } },
@@ -267,8 +267,9 @@ describe('resolveMcpServers', () => {
         mcpServers: { echo: { command: 'from-body' } },
       },
     })
-    const merged = resolveMcpServers(r, null)
-    expect(merged).toEqual({ echo: { command: 'from-body' } })
+    expect(() => resolveMcpServers(r, null)).toThrow(
+      /request mcp cannot accompany agent_profile/u,
+    )
   })
 
   it('falls back to session.metadata.agent_profile when req.agent_profile is absent', () => {

@@ -175,7 +175,7 @@ describe('chat-completions route — mcp body field', () => {
     expect(res.status).toBe(400)
   })
 
-  it('resolveMcpServers merges body + agent_profile.mcp on the backend side', async () => {
+  it('rejects body MCP beside an exact agent_profile before the backend runs', async () => {
     const res = await app.request('/v1/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -184,7 +184,11 @@ describe('chat-completions route — mcp body field', () => {
         messages: [{ role: 'user', content: 'hi' }],
         agent_profile: {
           mcp: {
-            'profile-only': { transport: 'stdio', command: 'tsx', args: ['p.ts'] },
+            'profile-only': {
+              transport: 'stdio',
+              command: 'tsx',
+              args: [{ kind: 'public', value: 'p.ts' }],
+            },
             'shared-name': { command: 'from-profile' },
           },
         },
@@ -196,13 +200,11 @@ describe('chat-completions route — mcp body field', () => {
         },
       }),
     })
-    expect(res.status).toBe(200)
-    const merged = resolveMcpServers(backend.last!, null)
-    expect(merged).toEqual({
-      'profile-only': { type: 'stdio', command: 'tsx', args: ['p.ts'] },
-      'shared-name': { command: 'from-body' },
-      'body-only': { command: 'node', args: ['b.js'] },
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({
+      error: { type: 'parse_error', message: expect.stringContaining('cannot accompany agent_profile') },
     })
+    expect(backend.last).toBeNull()
   })
 })
 
