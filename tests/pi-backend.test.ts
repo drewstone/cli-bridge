@@ -1460,6 +1460,7 @@ describe('PiBackend', () => {
     const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR
     let args: string[] = []
     let jail: ChatRequest['jailSpec']
+    let jailedSessionDir: string | undefined
     let spawnedSessionDir: string | undefined
     try {
       mkdirSync(extensionDir, { recursive: true })
@@ -1482,6 +1483,7 @@ describe('PiBackend', () => {
         ], (_bin, rawArgs, opts) => {
           args = [...rawArgs]
           jail = opts.jail
+          jailedSessionDir = opts.jail?.environment?.PI_CODING_AGENT_SESSION_DIR
           spawnedSessionDir = opts.env?.PI_CODING_AGENT_SESSION_DIR
         }),
       })
@@ -1504,7 +1506,8 @@ describe('PiBackend', () => {
         to: join(confinedAgentDir, 'npm', 'node_modules', 'pi-zai-glm'),
         precededBy: '--extension',
       }])
-      expect(spawnedSessionDir).toBe(join(jailRoot, '.pi-sessions'))
+      expect(jailedSessionDir).toBe(join(jailRoot, '.pi-sessions'))
+      expect(spawnedSessionDir).toBeUndefined()
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir

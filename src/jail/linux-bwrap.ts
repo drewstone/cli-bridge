@@ -29,7 +29,11 @@ import { spawnSync } from 'node:child_process'
 import { accessSync, constants, existsSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { copyAuthIntoJail, removeAuthCopies } from './auth-preserve.js'
+import {
+  copyAuthIntoJail,
+  removeAuthCopies,
+  removeStaleAuthCopies,
+} from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
@@ -81,13 +85,17 @@ export class LinuxBwrapJail implements JailBackend {
       (source) => source.mode === 'copy-writable',
     )
     for (const source of availableAuthSources) {
-      if (source.mode === 'read-only') resolveJailRoot(source.jailRel, root)
+      // Resolve every destination before any credential copy. Once bytes exist
+      // under the jail root, the remaining wrapper construction is synchronous
+      // array assembly and cannot strand a copy through a later path error.
+      resolveJailRoot(source.jailRel, root)
     }
     for (const source of writableAuthSources) {
       if (!source.envVar) {
         throw new Error('a copy-writable jail auth source requires envVar')
       }
     }
+    await removeStaleAuthCopies(root)
     const copiedWritableAuth = await copyAuthIntoJail(
       root,
       writableAuthSources,

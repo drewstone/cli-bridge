@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -24,13 +24,14 @@ import {
   LinuxBwrapJail,
   MacosSeatbeltJail,
   NoopJail,
+  registerJailEnvironment,
   registerJailReadable,
   resolveJailRoot,
 } from '../src/jail/index.js'
 import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
-import { authSourcesFor } from '../src/jail/auth-preserve.js'
+import { authSourcesFor, removeStaleAuthCopies } from '../src/jail/auth-preserve.js'
 import { ignoreJailRoot } from '../src/jail/types.js'
 import { anyBackendSpawnsOnHost } from '../src/config.js'
 import type { BackendExecutorConfig } from '../src/config.js'
@@ -341,7 +342,7 @@ describe('auth preservation', () => {
     try {
       const sources = authSourcesFor('pi')
       expect(sources).toHaveLength(1)
-      expect(sources[0]?.jailRel).toMatch(/^\.auth-copies\/pi-[0-9a-f-]+$/u)
+      expect(sources[0]?.jailRel).toMatch(/^\.auth-copies\/pi-\d+-[0-9a-f-]+$/u)
       expect(sources[0]?.source).toBe(join(fakeHome, '.pi', 'agent'))
       expect(sources[0]?.envVar).toBe('PI_CODING_AGENT_DIR')
       expect(sources[0]?.mode).toBe('copy-writable')
@@ -372,7 +373,7 @@ describe('auth preservation', () => {
         mode: 'copy-writable',
         envVar: 'PI_CODING_AGENT_DIR',
       })
-      expect(sources[0]?.jailRel).toMatch(/^\.auth-copies\/pi-[0-9a-f-]+$/u)
+      expect(sources[0]?.jailRel).toMatch(/^\.auth-copies\/pi-\d+-[0-9a-f-]+$/u)
     } finally {
       if (previousHome === undefined) delete process.env.HOME
       else process.env.HOME = previousHome
@@ -462,6 +463,7 @@ describe('auth preservation', () => {
     const copiedAgentDir = wrap.args[envIndex + 2]!
     expect(copiedAgentDir).toBe(join(expectedRoot, firstRel))
     expect(await readFile(join(copiedAgentDir, 'settings.json'), 'utf8')).toBe('{"ok":true}')
+    expect((await stat(copiedAgentDir)).mode & 0o777).toBe(0o700)
     expect(seqIndex(wrap.args, '--ro-bind', authDir, copiedAgentDir)).toBe(-1)
     const concurrentRel = '.auth-copies/pi-second'
     const concurrentWrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'y'], {
@@ -487,6 +489,38 @@ describe('auth preservation', () => {
     expect(existsSync(concurrentAgentDir)).toBe(true)
     await concurrentWrap.cleanup?.()
     expect(existsSync(concurrentAgentDir)).toBe(false)
+  })
+
+  it('removes dead-process Pi config copies without touching a live process copy', async () => {
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const copies = join(root, '.auth-copies')
+    const live = join(copies, `pi-${process.pid}-live`)
+    const dead = join(copies, 'pi-2147483646-dead')
+    await mkdir(live, { recursive: true })
+    await mkdir(dead, { recursive: true })
+    await writeFile(join(live, 'auth.json'), 'live')
+    await writeFile(join(dead, 'auth.json'), 'dead')
+
+    await removeStaleAuthCopies(root)
+
+    expect(existsSync(live)).toBe(true)
+    expect(existsSync(dead)).toBe(false)
+  })
+
+  it('rejects a writable auth copy with no environment redirect before copying', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-piauth-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const jailRel = `.auth-copies/pi-${process.pid}-missing-env`
+
+    await expect(new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{ source: authDir, jailRel, mode: 'copy-writable' }],
+    })).rejects.toThrow(/requires envVar/u)
+    expect(existsSync(join(root, jailRel))).toBe(false)
   })
 
   it('seatbelt returns an auth env var (CODEX_HOME) pointing at the in-jail copy', async () => {
@@ -540,7 +574,14 @@ describe('applyJail fail-closed', () => {
     isAvailable: () => false,
     wrap: () => { throw new Error('should not wrap when unavailable') },
   }
-  const jailedOpts = { jail: { root: '/proj/.agent-home', projectDir: '/proj' } } as never
+  const jailedOpts = {
+    env: { BASE: 'kept' },
+    jail: {
+      root: '/proj/.agent-home',
+      projectDir: '/proj',
+      environment: { PI_CODING_AGENT_SESSION_DIR: '/proj/.agent-home/.pi-sessions' },
+    },
+  } as never
 
   it('throws (refuses to run unconfined) when a jail is requested but the backend is unavailable', async () => {
     await expect(applyJail('/bin/sh', ['-c', 'x'], jailedOpts, unavailable))
@@ -553,9 +594,31 @@ describe('applyJail fail-closed', () => {
       const r = await applyJail('/bin/sh', ['-c', 'x'], jailedOpts, unavailable)
       expect(r.bin).toBe('/bin/sh')
       expect(r.args).toEqual(['-c', 'x'])
+      expect(r.env).toEqual({ BASE: 'kept' })
     } finally {
       delete process.env.BRIDGE_JAIL_FALLBACK
     }
+  })
+
+  it('applies registered environment only when a jail actually wraps', async () => {
+    const spec = { root: '/proj/.agent-home', projectDir: '/proj' }
+    registerJailEnvironment(spec, 'PI_CODING_AGENT_SESSION_DIR', '/proj/.agent-home/.pi-sessions')
+    const available: JailBackend = {
+      name: 'available',
+      isAvailable: () => true,
+      wrap: (bin, args) => ({ bin, args, env: { WRAP: 'active' } }),
+    }
+
+    const result = await applyJail('/bin/sh', ['-c', 'x'], {
+      env: { BASE: 'kept' },
+      jail: spec,
+    }, available)
+
+    expect(result.env).toEqual({
+      BASE: 'kept',
+      PI_CODING_AGENT_SESSION_DIR: '/proj/.agent-home/.pi-sessions',
+      WRAP: 'active',
+    })
   })
 
   it('rewrites exact path arguments only when an available jail wraps the command', async () => {

@@ -49,6 +49,9 @@ export interface JailSpec {
    * has proved a jail backend is available. Fallback and Docker paths retain
    * the original argument. */
   argumentRewrites?: JailArgumentRewrite[]
+  /** Child environment overrides that apply only when confinement is active.
+   * The explicit warn fallback must retain the ordinary host environment. */
+  environment?: Record<string, string>
 }
 
 /** One exact command argument and the value visible inside an active jail. */

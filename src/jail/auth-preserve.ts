@@ -15,10 +15,12 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { cp, rm } from 'node:fs/promises'
+import { chmod, cp, readdir, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { resolveJailRoot, type JailAuthSource } from './types.js'
+
+const PI_AUTH_COPY_PREFIX = `pi-${process.pid}-`
 
 /**
  * $HOME-relative auth/config paths per REGISTERED backend name. Aliases that
@@ -81,7 +83,7 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     for (const e of out) if (e.jailRel === '.codex') e.envVar = 'CODEX_HOME'
   }
   if (backendName === 'pi') {
-    const writableAgentRel = `.auth-copies/pi-${randomUUID()}`
+    const writableAgentRel = `.auth-copies/${PI_AUTH_COPY_PREFIX}${randomUUID()}`
     // Mirror CODEX_HOME: a custom Pi directory is the real provider catalog,
     // not an alias for ~/.pi/agent. Surface that exact source at a request-
     // unique in-jail location, then redirect the child-only env var to it.
@@ -133,11 +135,45 @@ export async function copyAuthIntoJail(
         force: options.replace !== false,
         errorOnExist: options.replace === false,
       })
+      await chmod(dest, 0o700)
     }
     return copied
   } catch (error) {
     await removeAuthCopies(copied)
     throw error
+  }
+}
+
+/** Remove writable Pi config copies owned by bridge processes that no longer
+ * exist. Live processes use unique request paths and are never age-limited, so
+ * arbitrarily long caller-authorized runs remain safe from scavenging. */
+export async function removeStaleAuthCopies(root: string): Promise<void> {
+  const parent = resolveJailRoot('.auth-copies', root)
+  let names: string[]
+  try {
+    names = await readdir(parent)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  for (const name of names) {
+    const match = /^pi-(\d+)-/u.exec(name)
+    if (!match) continue
+    const ownerPid = Number(match[1])
+    if (ownerPid === process.pid || processExists(ownerPid)) continue
+    await rm(resolveJailRoot(`.auth-copies/${name}`, root), {
+      recursive: true,
+      force: true,
+    })
+  }
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
   }
 }
 

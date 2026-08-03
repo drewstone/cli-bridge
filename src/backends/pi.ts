@@ -68,7 +68,11 @@ import {
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { registerJailArgumentRewrite, resolveJailRoot } from '../jail/index.js'
+import {
+  registerJailArgumentRewrite,
+  registerJailEnvironment,
+  resolveJailRoot,
+} from '../jail/index.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -362,9 +366,13 @@ export class PiBackend implements Backend {
     if (thinking) args.push('--thinking', thinking)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
-    const confinedSessionDir = req.jailSpec && !process.env.PI_CODING_AGENT_SESSION_DIR?.trim()
-      ? confinedPiSessionDir(req.jailSpec)
-      : undefined
+    if (req.jailSpec && !process.env.PI_CODING_AGENT_SESSION_DIR?.trim()) {
+      registerJailEnvironment(
+        req.jailSpec,
+        'PI_CODING_AGENT_SESSION_DIR',
+        confinedPiSessionDir(req.jailSpec),
+      )
+    }
 
     // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
     // `agent_profile.mcp`) reach pi-mcp-adapter through its per-process
@@ -404,9 +412,6 @@ export class PiBackend implements Backend {
         cwd: runCwd,
         env: {
           ...process.env,
-          ...(confinedSessionDir
-            ? { PI_CODING_AGENT_SESSION_DIR: confinedSessionDir }
-            : {}),
           ...(provisioned?.env ?? {}),
           ...(requestedMcpNames.length > 0
             ? {

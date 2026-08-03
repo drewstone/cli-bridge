@@ -20,7 +20,11 @@ import { accessSync, constants, existsSync } from 'node:fs'
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { copyAuthIntoJail, removeAuthCopies } from './auth-preserve.js'
+import {
+  copyAuthIntoJail,
+  removeAuthCopies,
+  removeStaleAuthCopies,
+} from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
@@ -68,6 +72,7 @@ export class MacosSeatbeltJail implements JailBackend {
         throw new Error('a copy-writable jail auth source requires envVar')
       }
     }
+    await removeStaleAuthCopies(root)
     const copiedAuth = await copyAuthIntoJail(root, stableAuthSources)
     let copiedWritableAuth: string[] = []
     try {
