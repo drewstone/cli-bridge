@@ -63,9 +63,10 @@ export interface JailArgumentRewrite {
 export interface JailAuthSource {
   /** Absolute host path holding the backend CLI's auth/config. */
   source: string
-  /** Path relative to the jail root (== jail HOME) where `source` must appear,
-   * so the confined CLI finds it at the same logical location. Always inside
-   * the root, even when `source` lives outside the operator HOME. */
+  /** Path relative to the jail root (== jail HOME) where `source` must appear.
+   * Read-only sources normally retain their logical HOME location; writable
+   * copies use a unique request path and redirect the CLI through `envVar`.
+   * Always inside the root, even when `source` lives outside operator HOME. */
   jailRel: string
   /** `read-only` preserves the host path through a Linux bind mount.
    * `copy-writable` copies it inside the writable jail HOME and removes that

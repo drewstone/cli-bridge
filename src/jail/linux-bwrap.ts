@@ -27,7 +27,6 @@
 
 import { spawnSync } from 'node:child_process'
 import { accessSync, constants, existsSync, realpathSync } from 'node:fs'
-import { mkdir, mkdtemp } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { copyAuthIntoJail, removeAuthCopies } from './auth-preserve.js'
@@ -89,24 +88,14 @@ export class LinuxBwrapJail implements JailBackend {
         throw new Error('a copy-writable jail auth source requires envVar')
       }
     }
-    const authCopyParent = join(root, '.auth-copies')
-    let authCopyRoot: string | null = null
-    if (writableAuthSources.length > 0) {
-      await mkdir(authCopyParent, { recursive: true })
-      authCopyRoot = await mkdtemp(join(authCopyParent, 'run-'))
-      try {
-        await copyAuthIntoJail(authCopyRoot, writableAuthSources)
-      } catch (error) {
-        await removeAuthCopies([authCopyRoot])
-        throw error
-      }
-    }
+    const copiedWritableAuth = await copyAuthIntoJail(
+      root,
+      writableAuthSources,
+      { replace: false },
+    )
     const resolvedAuthSources = availableAuthSources.map((source) => ({
       source,
-      destination: resolveJailRoot(
-        source.jailRel,
-        source.mode === 'copy-writable' ? authCopyRoot! : root,
-      ),
+      destination: resolveJailRoot(source.jailRel, root),
     }))
 
     const bwrapArgs = [
@@ -184,8 +173,8 @@ export class LinuxBwrapJail implements JailBackend {
     return {
       bin: BWRAP_BIN,
       args: bwrapArgs,
-      ...(authCopyRoot
-        ? { cleanup: () => removeAuthCopies([authCopyRoot]) }
+      ...(copiedWritableAuth.length > 0
+        ? { cleanup: () => removeAuthCopies(copiedWritableAuth) }
         : {}),
     }
   }

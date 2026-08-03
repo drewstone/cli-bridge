@@ -4,8 +4,7 @@
  * A jailed run sets HOME to the (empty) jail root, so a CLI would no longer
  * find the operator's credentials at ~/.claude, ~/.config/opencode, etc. and
  * could not authenticate. This module declares, per backend, the host paths
- * that hold its auth/config and makes them available inside the jail at the
- * same $HOME-relative location:
+ * that hold its auth/config and makes them available inside the jail:
  *   - Linux (bwrap): read-only bind-mounted unless the CLI must lock settings;
  *     those exact sources are copied into writable jail storage.
  *   - macOS (sandbox-exec, no bind): copied in via {@link copyAuthIntoJail}.
@@ -14,6 +13,7 @@
  * what codex.ts already does for CODEX_HOME, generalized to every host CLI.
  */
 
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { cp, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -81,9 +81,10 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     for (const e of out) if (e.jailRel === '.codex') e.envVar = 'CODEX_HOME'
   }
   if (backendName === 'pi') {
+    const writableAgentRel = `.auth-copies/pi-${randomUUID()}`
     // Mirror CODEX_HOME: a custom Pi directory is the real provider catalog,
-    // not an alias for ~/.pi/agent. Surface that exact source at Pi's stable
-    // in-jail location, then redirect the child-only env var to it.
+    // not an alias for ~/.pi/agent. Surface that exact source at a request-
+    // unique in-jail location, then redirect the child-only env var to it.
     const piAgentDir = process.env.PI_CODING_AGENT_DIR?.trim()
     if (piAgentDir) {
       const source = resolve(piAgentDir)
@@ -95,6 +96,7 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     }
     for (const e of out) {
       if (e.jailRel !== '.pi/agent') continue
+      e.jailRel = writableAgentRel
       e.mode = 'copy-writable'
       e.envVar = 'PI_CODING_AGENT_DIR'
     }
@@ -109,15 +111,28 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
  * paths so the caller can remove them on cleanup — the jail root is
  * project-local, so copied credentials must NOT linger there.
  */
-export async function copyAuthIntoJail(root: string, sources: JailAuthSource[] | undefined): Promise<string[]> {
+export async function copyAuthIntoJail(
+  root: string,
+  sources: JailAuthSource[] | undefined,
+  options: { replace?: boolean } = {},
+): Promise<string[]> {
   const copied: string[] = []
   try {
     for (const { source, jailRel } of sources ?? []) {
       if (!existsSync(source)) continue
       const dest = resolveJailRoot(jailRel, root)
-      await rm(dest, { recursive: true, force: true })
-      await cp(source, dest, { recursive: true, force: true, errorOnExist: false })
+      if (options.replace !== false) {
+        await rm(dest, { recursive: true, force: true })
+      }
+      // Track the destination before copying so an interrupted/failed copy is
+      // removed too; otherwise a partial credential tree could remain in the
+      // project-local jail root even though wrap() never returned a cleanup.
       copied.push(dest)
+      await cp(source, dest, {
+        recursive: true,
+        force: options.replace !== false,
+        errorOnExist: options.replace === false,
+      })
     }
     return copied
   } catch (error) {
