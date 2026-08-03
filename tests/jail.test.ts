@@ -31,7 +31,11 @@ import {
 import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
-import { authSourcesFor, removeStaleAuthCopies } from '../src/jail/auth-preserve.js'
+import {
+  authSourcesFor,
+  copyAuthIntoJail,
+  removeStaleAuthCopies,
+} from '../src/jail/auth-preserve.js'
 import { ignoreJailRoot } from '../src/jail/types.js'
 import { anyBackendSpawnsOnHost } from '../src/config.js'
 import type { BackendExecutorConfig } from '../src/config.js'
@@ -489,6 +493,25 @@ describe('auth preservation', () => {
     expect(existsSync(concurrentAgentDir)).toBe(true)
     await concurrentWrap.cleanup?.()
     expect(existsSync(concurrentAgentDir)).toBe(false)
+  })
+
+  it('updates a stable auth copy in place without deleting files used by another run', async () => {
+    const source = await mkdtemp(join(homedir(), '.cli-bridge-stable-source-'))
+    cleanups.push(() => rm(source, { recursive: true, force: true }))
+    await writeFile(join(source, 'settings.json'), 'updated')
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const destination = join(root, '.claude')
+    await mkdir(destination, { recursive: true })
+    await writeFile(join(destination, 'settings.json'), 'old')
+    await writeFile(join(destination, 'live-run.json'), 'still in use')
+
+    await copyAuthIntoJail(root, [
+      { source, jailRel: '.claude', mode: 'read-only' },
+    ])
+
+    expect(await readFile(join(destination, 'settings.json'), 'utf8')).toBe('updated')
+    expect(await readFile(join(destination, 'live-run.json'), 'utf8')).toBe('still in use')
   })
 
   it('removes dead-process Pi config copies without touching a live process copy', async () => {
