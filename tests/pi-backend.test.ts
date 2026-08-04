@@ -1,5 +1,6 @@
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
+import { createServer, type Server } from 'node:http'
 import {
   existsSync,
   mkdirSync,
@@ -891,6 +892,124 @@ describe('PiBackend', () => {
       { usage: { input_tokens: 20, fresh_input_tokens: 20, output_tokens: 3 } },
       { finish_reason: 'stop' },
     ])
+  })
+
+  it('accounts for Google countTokens separately from generation usage receipts', async () => {
+    const upstreamPaths: string[] = []
+    const upstream = createServer(async (request, response) => {
+      for await (const _chunk of request) {
+        // Drain the request before responding so the proxy records a settled exchange.
+      }
+      upstreamPaths.push(request.url ?? '')
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end('{}')
+    })
+    await listenTestServer(upstream)
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+    const spawner: Spawner = async (_bin, _args, opts): Promise<SpawnResult> => {
+      const child = new FakeChild()
+      queueMicrotask(() => {
+        void (async () => {
+          try {
+            const agentDir = opts.env?.PI_CODING_AGENT_DIR
+            if (!agentDir) throw new Error('missing request Pi config')
+            const config = JSON.parse(readFileSync(join(agentDir, 'models.json'), 'utf8')) as {
+              providers: Record<string, { baseUrl: string; apiKey: string }>
+            }
+            const provider = Object.values(config.providers)[0]
+            if (!provider) throw new Error('missing request provider')
+            for (const action of ['streamGenerateContent', 'countTokens']) {
+              const response = await fetch(
+                `${provider.baseUrl}/models/credential-check:${action}?key=${encodeURIComponent(provider.apiKey)}`,
+                { method: 'POST', body: '{}' },
+              )
+              if (!response.ok) throw new Error(`proxy returned ${response.status}`)
+            }
+            child.stdout.write(`${JSON.stringify({
+              type: 'turn_end',
+              message: {
+                usage: {
+                  input: 10,
+                  output: 2,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  cost: { total: 0 },
+                },
+              },
+            })}\n`)
+            child.stdout.end()
+            child.stderr.end()
+            child.exitCode = 0
+            child.emit('close', 0)
+          } catch (error) {
+            child.stderr.end(error instanceof Error ? error.message : String(error))
+            child.stdout.end()
+            child.exitCode = 1
+            child.emit('close', 1)
+          }
+        })()
+      })
+      return {
+        child: child as never,
+        release() {},
+        spawnError: () => null,
+      }
+    }
+    spawner.executionEnvironment = 'test-double'
+
+    try {
+      const backend = newTestPiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        spawner,
+        transportResolver: testPiInferenceTransport({
+          upstreamBaseUrl: `http://127.0.0.1:${address.port}/v1beta`,
+          apiMode: 'google-generative-ai',
+          upstreamApiKey: 'google-upstream-key',
+          providerConfig: { api: 'google-generative-ai' },
+          modelConfig: {
+            id: 'credential-check',
+            api: 'google-generative-ai',
+            input: ['text'],
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          },
+        }),
+      })
+      const request: ChatRequest = {
+        model: 'pi/google-test/credential-check',
+        messages: [{ role: 'user', content: 'count, then answer' }],
+        agent_profile: {
+          harness: 'pi',
+          model: { provider: 'google-test', default: 'credential-check' },
+        },
+      }
+      const deltas = await collect(backend.chat(request, null, new AbortController().signal))
+
+      expect(upstreamPaths).toEqual([
+        '/v1beta/models/credential-check:streamGenerateContent?key=google-upstream-key',
+        '/v1beta/models/credential-check:countTokens?key=google-upstream-key',
+      ])
+      expect(deltas).toContainEqual({ usage: { model_requests: 2, cost_known: false } })
+      const completed = deltas.findLast(
+        (delta) => delta.profile_materialization?.inference?.observation !== undefined,
+      )?.profile_materialization
+      expect(completed?.inference?.observation).toMatchObject({
+        requests: 2,
+        generationRequests: 1,
+        auxiliaryRequests: 1,
+        usageReceipts: 1,
+        rejectedRequests: 0,
+        failedRequests: 0,
+        inFlightRequests: 0,
+        accountingMatched: true,
+      })
+      expect(request.profile_materialization_receipt).toEqual(completed)
+    } finally {
+      await closeTestServer(upstream)
+    }
   })
 
   it('preserves completed model-call usage when the outer run is cancelled', async () => {
@@ -1882,3 +2001,16 @@ describe('PiBackend', () => {
     }
   })
 })
+
+async function listenTestServer(server: Server): Promise<void> {
+  await new Promise<void>((resolvePromise, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolvePromise)
+  })
+}
+
+async function closeTestServer(server: Server): Promise<void> {
+  server.closeAllConnections()
+  if (!server.listening) return
+  await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()))
+}

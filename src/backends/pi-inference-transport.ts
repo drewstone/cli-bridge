@@ -3,7 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import {
@@ -33,6 +33,9 @@ export const PI_API_MODES = [
 
 export type PiApiMode = typeof PI_API_MODES[number]
 
+/** High enough for large image/tool contexts; operators can raise it explicitly. */
+export const DEFAULT_PI_INFERENCE_MAX_REQUEST_BYTES = 256 * 1024 * 1024
+
 export interface PiInferenceSelection {
   provider: string
   model: string
@@ -48,6 +51,8 @@ export interface ResolvedPiInferenceTransport {
   upstreamBaseUrl: string
   apiMode: PiApiMode
   upstreamApiKey: string
+  /** Finite per-request memory boundary for the model-binding JSON inspection. */
+  maxRequestBytes: number
   providerConfig: Record<string, unknown>
   modelConfig: Record<string, unknown>
   sourceAgentDir: string
@@ -121,8 +126,10 @@ export function createPiInferenceTransportResolver(options: {
   env?: NodeJS.ProcessEnv
   agentDir?: string
   sessionDir?: string
+  maxRequestBytes?: number
 }): PiInferenceTransportResolver {
   const trustedEnv = options.env ?? process.env
+  const maxRequestBytes = resolveMaxRequestBytes(options.maxRequestBytes, trustedEnv)
   const sourceAgentDir = resolve(
     options.agentDir
       ?? trustedEnv.PI_CODING_AGENT_DIR?.trim()
@@ -174,6 +181,7 @@ export function createPiInferenceTransportResolver(options: {
     return {
       ...config,
       upstreamApiKey,
+      maxRequestBytes,
       sourceAgentDir,
       sourceSessionDir,
     }
@@ -183,7 +191,10 @@ export function createPiInferenceTransportResolver(options: {
 function readConfiguredTransport(
   sourceAgentDir: string,
   selection: PiInferenceSelection,
-): Omit<ResolvedPiInferenceTransport, 'upstreamApiKey' | 'sourceAgentDir' | 'sourceSessionDir'> {
+): Omit<
+  ResolvedPiInferenceTransport,
+  'upstreamApiKey' | 'maxRequestBytes' | 'sourceAgentDir' | 'sourceSessionDir'
+> {
   const modelsPath = join(sourceAgentDir, 'models.json')
   let parsed: ModelsFile
   try {
@@ -309,6 +320,7 @@ export async function provisionPiInferenceTransport(
     projectDir?: string
   } = {},
 ): Promise<ProvisionedPiInferenceTransport> {
+  assertExactModelBinding(resolved)
   const proxy = await startScopedProxy(resolved)
   let agentDir: string | null = null
   try {
@@ -446,12 +458,42 @@ async function forwardRequest(
     resolved.upstreamApiKey,
   )
   const method = request.method ?? 'POST'
-  const requestKind = inferenceRequestKind(resolved.apiMode, method, upstreamUrl.pathname)
+  const requestKind = inferenceRequestKind(resolved.apiMode, method, requestUrl.pathname)
   if (!requestKind) {
     traffic.rejectedRequests += 1
     writeProxyError(response, 404, 'scoped inference route not found')
     return
   }
+
+  let requestBody: Buffer
+  try {
+    requestBody = await readRequestBody(request, resolved.maxRequestBytes)
+  } catch (error) {
+    traffic.rejectedRequests += 1
+    request.resume()
+    if (error instanceof RequestTooLargeError) {
+      writeProxyError(
+        response,
+        413,
+        `scoped inference request exceeds the configured ${resolved.maxRequestBytes}-byte maximum`,
+      )
+    } else {
+      writeProxyError(response, 400, 'could not read scoped inference request')
+    }
+    return
+  }
+  if (!requestTargetsSelectedModel(
+    resolved.apiMode,
+    requestUrl.pathname,
+    upstreamUrl.pathname,
+    requestBody,
+    resolved.model,
+  )) {
+    traffic.rejectedRequests += 1
+    writeProxyError(response, 403, 'scoped inference credential cannot access that model')
+    return
+  }
+
   if (requestKind === 'generation') traffic.generationRequests += 1
   else traffic.auxiliaryRequests += 1
   traffic.inFlightRequests += 1
@@ -463,15 +505,17 @@ async function forwardRequest(
     const upstream = await fetch(upstreamUrl, {
       method,
       headers,
-      ...(hasBody ? { body: Readable.toWeb(request) as never, duplex: 'half' } : {}),
+      ...(hasBody ? { body: requestBody } : {}),
       signal: abort.signal,
       redirect: 'manual',
-    } as RequestInit & { duplex?: 'half' })
+    })
 
     const responseHeaders: Record<string, string | string[]> = {}
     upstream.headers.forEach((value, name) => {
       if (!isHopByHopHeader(name) && name.toLowerCase() !== 'content-encoding') {
         responseHeaders[name] = value
+          .split(resolved.upstreamApiKey)
+          .join(scopedApiKey)
       }
     })
     response.writeHead(upstream.status, responseHeaders)
@@ -480,7 +524,11 @@ async function forwardRequest(
       return
     }
     const body = Readable.fromWeb(upstream.body as never)
-    await pipeline(body, response)
+    await pipeline(
+      body,
+      createCredentialRedactionStream(resolved.upstreamApiKey, scopedApiKey),
+      response,
+    )
   } catch (error) {
     traffic.failedRequests += 1
     if (response.headersSent) {
@@ -529,27 +577,264 @@ function inferenceRequestKind(
   if (method !== 'POST') return null
   switch (apiMode) {
     case 'openai-completions':
-      return pathname.endsWith('/chat/completions') ? 'generation' : null
+      return pathname === '/chat/completions' ? 'generation' : null
     case 'openai-responses':
+      return pathname === '/responses' ? 'generation' : null
     case 'azure-openai-responses':
+      return pathname === '/responses' ? 'generation' : null
     case 'openai-codex-responses':
-      return pathname.endsWith('/responses') ? 'generation' : null
+      return pathname === '/codex/responses' ? 'generation' : null
     case 'anthropic-messages':
-      return pathname.endsWith('/messages') ? 'generation' : null
+      return pathname === '/v1/messages' ? 'generation' : null
     case 'mistral-conversations':
-      return pathname.endsWith('/conversations') ? 'generation' : null
+      return pathname === '/v1/chat/completions' ? 'generation' : null
     case 'google-generative-ai':
     case 'google-vertex': {
-      if (/\/models\/[^/]+:countTokens$/u.test(pathname)) return 'auxiliary'
-      return /\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/u.test(pathname)
-        ? 'generation'
-        : null
+      const request = parseGoogleModelRequest(pathname)
+      if (request?.action === 'countTokens') return 'auxiliary'
+      return request ? 'generation' : null
     }
     case 'bedrock-converse-stream':
-      return /\/model\/[^/]+\/(?:converse|converse-stream)$/u.test(pathname)
+      return /^\/model\/[^/]+\/(?:converse|converse-stream)$/u.test(pathname)
         ? 'generation'
         : null
   }
+}
+
+function requestTargetsSelectedModel(
+  apiMode: PiApiMode,
+  requestPathname: string,
+  upstreamPathname: string,
+  body: Buffer,
+  selectedModel: string,
+): boolean {
+  switch (apiMode) {
+    case 'openai-completions':
+    case 'openai-responses':
+    case 'openai-codex-responses':
+    case 'anthropic-messages':
+    case 'mistral-conversations':
+      return requestBodyModel(body) === selectedModel
+    case 'azure-openai-responses':
+      return azureRequestTargetsSelectedModel(upstreamPathname, body, selectedModel)
+    case 'google-generative-ai':
+    case 'google-vertex': {
+      const request = parseGoogleModelRequest(requestPathname)
+      const expected = googleModelResource(apiMode, selectedModel)
+      return request !== null && expected !== null && request.resource === expected
+    }
+    case 'bedrock-converse-stream': {
+      const match = requestPathname.match(/^\/model\/([^/]+)\/(?:converse|converse-stream)$/u)
+      return match !== null && decodePathSegment(match[1]!) === selectedModel
+    }
+  }
+}
+
+function requestBodyModel(body: Buffer): string | null {
+  try {
+    const parsed = JSON.parse(body.toString('utf8')) as unknown
+    return isRecord(parsed) && typeof parsed.model === 'string' ? parsed.model : null
+  } catch {
+    return null
+  }
+}
+
+function azureRequestTargetsSelectedModel(
+  pathname: string,
+  body: Buffer,
+  selectedModel: string,
+): boolean {
+  let parsed: Record<string, unknown>
+  try {
+    const value = body.length === 0 ? {} : JSON.parse(body.toString('utf8')) as unknown
+    if (!isRecord(value)) return false
+    parsed = value
+  } catch {
+    return false
+  }
+
+  const pathModel = azureDeploymentModel(pathname)
+  const bodyHasModel = Object.hasOwn(parsed, 'model')
+  if (pathModel !== null && pathModel !== selectedModel) return false
+  if (bodyHasModel && parsed.model !== selectedModel) return false
+  return pathModel === selectedModel || parsed.model === selectedModel
+}
+
+function azureDeploymentModel(pathname: string): string | null {
+  const match = pathname.match(/\/deployments\/([^/]+)\/responses$/u)
+  return match ? decodePathSegment(match[1]!) : null
+}
+
+function parseGoogleModelRequest(
+  pathname: string,
+): { resource: string; action: 'countTokens' | 'streamGenerateContent' | 'generateContent' } | null {
+  const match = pathname.match(
+    /^\/(?:v\d+(?:beta\d*)?\/)?(.+):(countTokens|streamGenerateContent|generateContent)$/u,
+  )
+  if (!match) return null
+  const resource = decodePathSegment(match[1]!)
+  if (resource === null) return null
+  return {
+    resource,
+    action: match[2] as 'countTokens' | 'streamGenerateContent' | 'generateContent',
+  }
+}
+
+/** Mirrors the model-resource normalization in @google/genai 1.52 used by Pi 0.83. */
+function googleModelResource(
+  apiMode: 'google-generative-ai' | 'google-vertex',
+  selectedModel: string,
+): string | null {
+  if (
+    !selectedModel
+    || selectedModel.includes('..')
+    || /[?&#%]/u.test(selectedModel)
+  ) return null
+  if (apiMode === 'google-generative-ai') {
+    return selectedModel.startsWith('models/') || selectedModel.startsWith('tunedModels/')
+      ? selectedModel
+      : `models/${selectedModel}`
+  }
+  if (
+    selectedModel.startsWith('publishers/')
+    || selectedModel.startsWith('projects/')
+    || selectedModel.startsWith('models/')
+  ) {
+    return selectedModel
+  }
+  const parts = selectedModel.split('/')
+  if (parts.length === 1) return `publishers/google/models/${selectedModel}`
+  if (parts.length === 2 && parts.every(Boolean)) {
+    return `publishers/${parts[0]}/models/${parts[1]}`
+  }
+  return null
+}
+
+function decodePathSegment(value: string): string | null {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return null
+  }
+}
+
+class RequestTooLargeError extends Error {}
+
+async function readRequestBody(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const contentLength = request.headers['content-length']
+  if (contentLength !== undefined) {
+    const declaredBytes = Number(contentLength)
+    if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
+      throw new RequestTooLargeError()
+    }
+  }
+  const chunks: Buffer[] = []
+  let bytes = 0
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    bytes += buffer.length
+    if (bytes > maxBytes) throw new RequestTooLargeError()
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks)
+}
+
+function createCredentialRedactionStream(secret: string, replacement: string): Transform {
+  const secretBytes = Buffer.from(secret)
+  const replacementBytes = Buffer.from(replacement)
+  let pending = Buffer.alloc(0)
+
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      pending = Buffer.concat([pending, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)])
+      while (pending.length > 0) {
+        const match = pending.indexOf(secretBytes)
+        if (match >= 0) {
+          if (match > 0) this.push(pending.subarray(0, match))
+          this.push(replacementBytes)
+          pending = pending.subarray(match + secretBytes.length)
+          continue
+        }
+
+        const retained = matchingSecretPrefixLength(pending, secretBytes)
+        const safeBytes = pending.length - retained
+        if (safeBytes > 0) this.push(pending.subarray(0, safeBytes))
+        pending = pending.subarray(safeBytes)
+        break
+      }
+      callback()
+    },
+    flush(callback) {
+      if (pending.length > 0) this.push(pending)
+      callback()
+    },
+  })
+}
+
+function matchingSecretPrefixLength(value: Buffer, secret: Buffer): number {
+  const maximum = Math.min(value.length, secret.length - 1)
+  for (let length = maximum; length > 0; length -= 1) {
+    if (value.subarray(value.length - length).equals(secret.subarray(0, length))) return length
+  }
+  return 0
+}
+
+function assertExactModelBinding(resolved: ResolvedPiInferenceTransport): void {
+  if (!Number.isSafeInteger(resolved.maxRequestBytes) || resolved.maxRequestBytes <= 0) {
+    throw new BackendError(
+      'backend pi isolated inference maxRequestBytes must be a positive safe integer',
+      'not_configured',
+    )
+  }
+  if (
+    !resolved.model
+    || !resolved.upstreamApiKey
+    || /[\r\n\0]/u.test(resolved.upstreamApiKey)
+    || resolved.modelConfig.id !== resolved.model
+    || resolved.modelConfig.api !== resolved.apiMode
+  ) {
+    throw new BackendError(
+      'backend pi isolated inference config must preserve the exact selected model and API mode',
+      'not_configured',
+    )
+  }
+  if (
+    (resolved.apiMode === 'google-generative-ai' || resolved.apiMode === 'google-vertex')
+    && googleModelResource(resolved.apiMode, resolved.model) === null
+  ) {
+    throw new BackendError(
+      `backend pi cannot bind ${resolved.apiMode} model "${resolved.model}" to one exact request path`,
+      'not_configured',
+    )
+  }
+  if (resolved.apiMode === 'azure-openai-responses') {
+    const configuredPath = `${new URL(resolved.upstreamBaseUrl).pathname.replace(/\/$/u, '')}/responses`
+    const deployment = azureDeploymentModel(configuredPath)
+    if (deployment !== null && deployment !== resolved.model) {
+      throw new BackendError(
+        `backend pi Azure deployment "${deployment}" does not match selected model "${resolved.model}"`,
+        'not_configured',
+      )
+    }
+  }
+}
+
+function resolveMaxRequestBytes(
+  explicit: number | undefined,
+  env: NodeJS.ProcessEnv,
+): number {
+  const configured = explicit ?? (
+    env.CLI_BRIDGE_PI_MAX_REQUEST_BYTES?.trim()
+      ? Number(env.CLI_BRIDGE_PI_MAX_REQUEST_BYTES)
+      : DEFAULT_PI_INFERENCE_MAX_REQUEST_BYTES
+  )
+  if (!Number.isSafeInteger(configured) || configured <= 0) {
+    throw new BackendError(
+      'CLI_BRIDGE_PI_MAX_REQUEST_BYTES must be a positive safe integer',
+      'not_configured',
+    )
+  }
+  return configured
 }
 
 function provisionSessionDirectory(

@@ -90,6 +90,8 @@ import {
 export interface PiBackendOptions {
   bin: string
   timeoutMs: number
+  /** Overrides the high finite request-inspection boundary for isolated Pi traffic. */
+  maxInferenceRequestBytes?: number
   /** Subprocess spawner. Defaults to scoped host. */
   spawner?: Spawner
   /** Trusted provider resolution. Injectable for deterministic tests. */
@@ -373,6 +375,7 @@ export class PiBackend implements Backend {
     this.spawner = opts.spawner ?? scopedHostSpawner
     this.transportResolver = opts.transportResolver ?? createPiInferenceTransportResolver({
       bin: opts.bin,
+      maxRequestBytes: opts.maxInferenceRequestBytes,
     })
   }
 
@@ -726,7 +729,7 @@ export class PiBackend implements Backend {
           },
         }
       }
-      const accountingMatched = observedModelRequests === usageCost.receipts
+      const accountingMatched = inferenceTraffic.generationRequests === usageCost.receipts
         && inferenceTraffic.rejectedRequests === 0
         && inferenceTraffic.failedRequests === 0
         && inferenceTraffic.inFlightRequests === 0

@@ -14,6 +14,7 @@ export function testPiInferenceTransport(
     upstreamBaseUrl: 'http://127.0.0.1:9/v1',
     apiMode: 'openai-completions',
     upstreamApiKey: 'test-upstream-key',
+    maxRequestBytes: 256 * 1024 * 1024,
     providerConfig: { api: 'openai-completions' },
     modelConfig: {
       id: model,
