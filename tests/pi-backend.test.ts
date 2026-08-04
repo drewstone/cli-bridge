@@ -104,8 +104,11 @@ function argValue(args: readonly string[], flag: string): string | undefined {
 describe('PiBackend', () => {
   it('applies one exact profile while leaving the task unchanged', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-exact-profile-'))
-    const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    const agentDir = mkdtempSync(join(tmpdir(), 'pi-exact-profile-agent-dir-'))
+    const adapterDir = join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter')
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    mkdirSync(adapterDir, { recursive: true })
+    process.env.PI_CODING_AGENT_DIR = agentDir
     const profile: NonNullable<ChatRequest['agent_profile']> = {
       prompt: { systemPrompt: 'SYSTEM_ONCE' },
       harness: 'pi',
@@ -156,6 +159,7 @@ describe('PiBackend', () => {
       await collect(backend.chat(request, null, new AbortController().signal))
 
       expect(args.filter((arg) => arg === '--system-prompt')).toHaveLength(1)
+      expect(argValue(args, '--extension')).toBe(adapterDir)
       expect(args).toContain('--approve')
       expect(systemPrompt).toBe('SYSTEM_ONCE')
       expect(argValue(args, '--thinking')).toBe('xhigh')
@@ -193,8 +197,9 @@ describe('PiBackend', () => {
       expect(request.profile_materialization_receipt?.effectiveProfileDigest)
         .toMatch(/^sha256:[a-f0-9]{64}$/u)
     } finally {
-      if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+      rmSync(agentDir, { recursive: true, force: true })
       rmSync(cwd, { recursive: true, force: true })
     }
   })
@@ -1472,9 +1477,13 @@ describe('PiBackend', () => {
 
   it('passes request MCP servers through a request-scoped --mcp-config file', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-mcp-test-'))
-    const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    const agentDir = mkdtempSync(join(tmpdir(), 'pi-mcp-agent-dir-'))
+    const adapterDir = join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter')
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    mkdirSync(adapterDir, { recursive: true })
+    process.env.PI_CODING_AGENT_DIR = agentDir
     try {
+      let argsAtSpawn: string[] = []
       let configAtSpawn: unknown = null
       let configPathAtSpawn: string | undefined
       let cwdAtSpawn: string | undefined
@@ -1488,6 +1497,7 @@ describe('PiBackend', () => {
             { type: 'turn_end', message: { usage: { input: 5, output: 2 } } },
           ],
           (_bin, args, opts) => {
+            argsAtSpawn = [...args]
             cwdAtSpawn = opts.cwd
             const flagIndex = args.indexOf('--mcp-config')
             expect(flagIndex).toBeGreaterThanOrEqual(0)
@@ -1512,6 +1522,8 @@ describe('PiBackend', () => {
 
       // Pi keeps the shared task cwd while receiving private control config.
       expect(cwdAtSpawn).toBe(cwd)
+      expect(argsAtSpawn).toContain('--no-extensions')
+      expect(argValue(argsAtSpawn, '--extension')).toBe(adapterDir)
       expect(configPathAtSpawn?.startsWith(join(cwd, '.cli-bridge-pi-mcp-'))).toBe(true)
       expect(directToolsAtSpawn).toBe('legal-tools')
       expect(configAtSpawn).toEqual({
@@ -1531,16 +1543,20 @@ describe('PiBackend', () => {
       expect(configPathAtSpawn && existsSync(configPathAtSpawn)).toBe(false)
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
     } finally {
-      if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
       rmSync(cwd, { recursive: true, force: true })
+      rmSync(agentDir, { recursive: true, force: true })
     }
   })
 
   it('runs two MCP-enabled Pi requests concurrently in one cwd', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-mcp-overlap-'))
-    const previousOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    const agentDir = mkdtempSync(join(tmpdir(), 'pi-mcp-overlap-agent-dir-'))
+    const adapterDir = join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter')
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+    mkdirSync(adapterDir, { recursive: true })
+    process.env.PI_CODING_AGENT_DIR = agentDir
     const configPaths: string[] = []
     const configs: unknown[] = []
     const children: FakeChild[] = []
@@ -1603,8 +1619,9 @@ describe('PiBackend', () => {
       expect(configPaths.every((path) => !existsSync(path))).toBe(true)
       expect(existsSync(join(cwd, '.pi', 'mcp.json'))).toBe(false)
     } finally {
-      if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+      rmSync(agentDir, { recursive: true, force: true })
       rmSync(cwd, { recursive: true, force: true })
     }
   })
@@ -1876,7 +1893,7 @@ describe('PiBackend', () => {
       expect(argValue(args, '--extension')).toBe(packageDir)
       expect(jail?.authSources).toEqual([])
       expect(jail?.argumentRewrites).toBeUndefined()
-      expect(jail?.extraReadablePaths).toContain(packageDir)
+      expect(jail?.extraReadablePaths).toContain(join(agentDir, 'npm', 'node_modules'))
       expect(jailedSessionDir).toBeUndefined()
       expect(spawnedSessionDir).toBeUndefined()
       expect(spawnedAgentDir).toBeTruthy()

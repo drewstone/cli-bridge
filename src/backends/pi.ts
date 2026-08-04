@@ -25,8 +25,8 @@
  * silently dropping the servers — a run whose tools never existed must
  * fail loudly, not score zero structurally. Detection: `pi-mcp-adapter`
  * in the pi agent dir's npm node_modules or `settings.json` packages
- * (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`); override with
- * `CLI_BRIDGE_PI_MCP_ADAPTER=1|0`.
+ * (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`);
+ * `CLI_BRIDGE_PI_MCP_ADAPTER=0` can disable it explicitly.
  *
  * Event shapes we parse (from `pi --print --mode json`):
  *
@@ -53,7 +53,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
@@ -73,6 +73,7 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import {
   registerJailArgumentRewrite,
+  registerJailReadable,
   resolveJailRoot,
   selectJailBackend,
 } from '../jail/index.js'
@@ -164,35 +165,43 @@ function piDirectToolSelection(
 function piExtensionArgs(
   req: ChatRequest,
   session: SessionRecord | null,
-  needsMcpAdapter: boolean,
+  mcpAdapterPath: string | null,
 ): string[] {
   const pi = resolveAgentProfile(req, session)?.extensions?.pi
-  if (pi === undefined) return []
-  if (!pi || typeof pi !== 'object' || Array.isArray(pi)) {
+  if (pi !== undefined && (!pi || typeof pi !== 'object' || Array.isArray(pi))) {
     throw new BackendError('extensions.pi must be an object', 'parse_error')
   }
-
-  const unknown = Object.keys(pi).filter((key) => key !== 'load')
+  const unknown = pi === undefined
+    ? []
+    : Object.keys(pi).filter((key) => key !== 'load')
   if (unknown.length > 0) {
     throw new BackendError(
       `unsupported extensions.pi controls: ${unknown.sort().join(', ')}`,
       'parse_error',
     )
   }
-  if (!Object.hasOwn(pi, 'load')) return []
 
-  const load = pi.load
-  if (!Array.isArray(load) || load.some((entry) => typeof entry !== 'string' || !entry.trim())) {
-    throw new BackendError('extensions.pi.load must be an array of non-empty strings', 'parse_error')
-  }
-  if (
-    needsMcpAdapter
-    && !load.some((entry) => entry === 'pi-mcp-adapter' || entry === 'npm:pi-mcp-adapter')
-  ) {
-    throw new BackendError(
-      'extensions.pi.load must include the installed pi-mcp-adapter package when the profile requests MCP servers',
-      'parse_error',
-    )
+  let load: string[]
+  if (pi === undefined || !Object.hasOwn(pi, 'load')) {
+    if (!mcpAdapterPath) return []
+    // PI_CODING_AGENT_DIR points at a fresh credential-free directory for the
+    // child. The adapter therefore cannot arrive through ambient discovery;
+    // request-level MCP must opt the already-installed package back in.
+    load = [mcpAdapterPath]
+  } else {
+    if (!Array.isArray(pi.load) || pi.load.some((entry) => typeof entry !== 'string' || !entry.trim())) {
+      throw new BackendError('extensions.pi.load must be an array of non-empty strings', 'parse_error')
+    }
+    load = pi.load as string[]
+    if (
+      mcpAdapterPath
+      && !load.some((entry) => entry === 'pi-mcp-adapter' || entry === 'npm:pi-mcp-adapter')
+    ) {
+      throw new BackendError(
+        'extensions.pi.load must include the installed pi-mcp-adapter package when the profile requests MCP servers',
+        'parse_error',
+      )
+    }
   }
 
   const configuredAgentDir = process.env.PI_CODING_AGENT_DIR?.trim()
@@ -220,9 +229,10 @@ function piExtensionArgs(
     if (runtimePath !== jailedPath) {
       registerJailArgumentRewrite(req.jailSpec, runtimePath, jailedPath, '--extension')
     } else if (req.jailSpec?.readConfine && isAbsolute(runtimePath)) {
-      req.jailSpec.extraReadablePaths = [
-        ...new Set([...(req.jailSpec.extraReadablePaths ?? []), runtimePath]),
-      ]
+      registerJailReadable(
+        req.jailSpec,
+        extensionDependencyRoot(runtimePath, hostNpmRoot),
+      )
     }
     return runtimePath
   }))
@@ -230,6 +240,15 @@ function piExtensionArgs(
     '--no-extensions',
     ...[...entries].flatMap((entry) => ['--extension', entry]),
   ]
+}
+
+function extensionDependencyRoot(extensionPath: string, hostNpmRoot: string): string {
+  const rel = relative(hostNpmRoot, extensionPath)
+  const installedPackage = rel !== ''
+    && rel !== '..'
+    && !rel.startsWith(`..${sep}`)
+    && !isAbsolute(rel)
+  return installedPackage ? hostNpmRoot : extensionPath
 }
 
 function confinedPiAgentDir(spec: NonNullable<ChatRequest['jailSpec']>): string | null {
@@ -274,22 +293,24 @@ function resolvePiExtensionPath(spec: string, hostNpmRoot: string, runtimeNpmRoo
  * support, so passing MCP config without the adapter is a silent
  * no-op; callers use this to fail loudly instead.
  *
- * `CLI_BRIDGE_PI_MCP_ADAPTER=1|0` overrides detection for nonstandard
- * installs (e.g. the adapter vendored under a local package path whose
- * name doesn't contain "pi-mcp-adapter").
+ * Local package paths are resolved through settings.json and verified by the
+ * installed package name. `CLI_BRIDGE_PI_MCP_ADAPTER=0` disables the adapter.
  */
 export function piMcpAdapterAvailable(): boolean {
   const override = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-  if (override === '1' || override === 'true') return true
   if (override === '0' || override === 'false') return false
+  return resolvePiMcpAdapterInstallPath() !== null
+}
+
+function resolvePiMcpAdapterInstallPath(): string | null {
   const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')
-  if (existsSync(join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter'))) return true
+  const installedPath = join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter')
+  if (existsSync(installedPath)) return installedPath
   try {
     const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf-8')) as { packages?: unknown }
     if (Array.isArray(settings.packages)) {
-      return settings.packages.some((p) => {
-        if (typeof p !== 'string') return false
-        if (p.includes('pi-mcp-adapter')) return true
+      for (const p of settings.packages) {
+        if (typeof p !== 'string') continue
         // Local-path installs (`/some/dir`, `./rel`, `file:…`, `path:…`) may
         // not carry the adapter's name in the path — resolve the
         // package.json name. Relative specs resolve against the agent dir
@@ -299,20 +320,20 @@ export function piMcpAdapterAvailable(): boolean {
         // forms; the explicit drive-letter check keeps a Windows-authored
         // settings.json from being misread as an npm name elsewhere.
         const winAbsolute = /^[A-Za-z]:[\\/]/.test(spec)
-        if (!isAbsolute(spec) && !winAbsolute && !spec.startsWith('.')) return false
+        if (!isAbsolute(spec) && !winAbsolute && !spec.startsWith('.')) continue
         const localPath = isAbsolute(spec) || winAbsolute ? spec : join(agentDir, spec)
         try {
           const pkg = JSON.parse(readFileSync(join(localPath, 'package.json'), 'utf-8')) as { name?: unknown }
-          return pkg.name === 'pi-mcp-adapter'
+          if (pkg.name === 'pi-mcp-adapter') return localPath
         } catch {
-          return false
+          continue
         }
-      })
+      }
     }
   } catch {
     // unreadable/absent settings — fall through to "not detected"
   }
-  return false
+  return null
 }
 
 const PI_INHERITED_ENV_KEYS = [
@@ -477,10 +498,13 @@ export class PiBackend implements Backend {
     // silently tool-less run scores zero for the wrong reason.
     const mcpSpecs = resolveMcpServers(req, session)
     const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []
-    if (requestedMcpNames.length > 0 && !piMcpAdapterAvailable()) {
+    const mcpAdapterPath = requestedMcpNames.length > 0
+      ? resolvePiMcpAdapterInstallPath()
+      : null
+    if (requestedMcpNames.length > 0 && (!piMcpAdapterAvailable() || !mcpAdapterPath)) {
       throw new BackendError(
-        `backend pi cannot mount MCP servers: pi-mcp-adapter extension not installed `
-        + `(run \`pi install npm:pi-mcp-adapter\` or set CLI_BRIDGE_PI_MCP_ADAPTER=1); `
+        `backend pi cannot mount MCP servers: no loadable pi-mcp-adapter install was found `
+        + `(run \`pi install npm:pi-mcp-adapter\` or set PI_CODING_AGENT_DIR to its install); `
         + `requested: ${requestedMcpNames.join(', ')}`,
         'not_configured',
       )
@@ -489,7 +513,7 @@ export class PiBackend implements Backend {
     // The provider-specific extension namespace, MCP config, and canonical profile
     // files all use Pi's per-process loaders. Every flag precedes the positional
     // prompt, and large prompt material rides file paths rather than argv.
-    args.push(...piExtensionArgs(req, session, requestedMcpNames.length > 0))
+    args.push(...piExtensionArgs(req, session, mcpAdapterPath))
     let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
     let provisioned: ReturnType<typeof provisionPiProfile> = null
     let inference: ProvisionedPiInferenceTransport | null = null
