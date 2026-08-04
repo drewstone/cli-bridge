@@ -30,6 +30,7 @@ import { killTree } from '../src/executors/process-tree.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
 import { writeStdinPayload } from '../src/backends/stdin-payload.js'
+import { testPiInferenceTransport } from './pi-inference-fixture.js'
 
 // ─── Spawner abstraction ─────────────────────────────────────────────────
 
@@ -1279,13 +1280,22 @@ describe('per-backend executor config (parseAllExecutors)', () => {
 // ─── non-claude backends respect injected Spawner ────────────────────────
 
 function subprocessBackendCases(spawner: Spawner) {
+  if (spawner.executionEnvironment === undefined) spawner.executionEnvironment = 'test-double'
   return [
     { model: 'claude/opus', backend: new ClaudeBackend({ bin: 'claude', timeoutMs: 100, spawner }) },
     { model: 'opencode/test/model', backend: new OpencodeBackend({ bin: 'opencode', timeoutMs: 100, spawner }) },
     { model: 'kimi-code/kimi-for-coding', backend: new KimiBackend({ bin: 'kimi', timeoutMs: 100, spawner }) },
     { model: 'codex/default', backend: new CodexBackend({ bin: 'codex', timeoutMs: 100, spawner }) },
     { model: 'gemini/gemini-2.5-pro', backend: new GeminiBackend({ bin: 'gemini', timeoutMs: 100, spawner }) },
-    { model: 'pi/openai/gpt-5', backend: new PiBackend({ bin: 'pi', timeoutMs: 100, spawner }) },
+    {
+      model: 'pi/openai/gpt-5',
+      backend: new PiBackend({
+        bin: 'pi',
+        timeoutMs: 100,
+        spawner,
+        transportResolver: testPiInferenceTransport(),
+      }),
+    },
   ]
 }
 

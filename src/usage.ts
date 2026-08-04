@@ -10,6 +10,7 @@
 import type { ChatDelta } from './backends/types.js'
 
 export interface CollectedUsage {
+  modelRequests: number
   /** True after at least one token-bearing receipt; cost-only receipts do not affect completeness. */
   hasTokenUsage: boolean
   inputTokens: number
@@ -70,6 +71,7 @@ export function addUsage(
       ? next.estimated_cost
       : undefined
   return {
+    modelRequests: (current?.modelRequests ?? 0) + finiteTokenCount(next.model_requests),
     hasTokenUsage: hadTokenReceipt || hasTokenReceipt,
     inputTokens: (current?.inputTokens ?? 0) + finiteTokenCount(next.input_tokens),
     inputTokensKnown: hasTokenReceipt

@@ -623,6 +623,26 @@ describe('applyJail fail-closed', () => {
     }
   })
 
+  it('refuses an operator warn fallback when the request requires enforcement', async () => {
+    process.env.BRIDGE_JAIL_FALLBACK = 'warn'
+    try {
+      const required = {
+        env: { BASE: 'kept' },
+        jail: {
+          root: '/proj/.agent-home',
+          projectDir: '/proj',
+          requireEnforcement: true,
+        },
+      } as never
+      await expect(applyJail('/bin/sh', ['-c', 'x'], required, unavailable))
+        .rejects.toThrow(/refusing to run unconfined/u)
+      await expect(applyJail('/bin/sh', ['-c', 'x'], required, unavailable))
+        .rejects.not.toThrow(/BRIDGE_JAIL_FALLBACK=warn/u)
+    } finally {
+      delete process.env.BRIDGE_JAIL_FALLBACK
+    }
+  })
+
   it('applies registered environment only when a jail actually wraps', async () => {
     const spec = { root: '/proj/.agent-home', projectDir: '/proj' }
     registerJailEnvironment(spec, 'PI_CODING_AGENT_SESSION_DIR', '/proj/.agent-home/.pi-sessions')

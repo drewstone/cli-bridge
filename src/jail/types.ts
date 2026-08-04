@@ -38,6 +38,8 @@ export interface JailSpec {
    * noop backends confine writes only and ignore this flag.
    */
   readConfine?: boolean
+  /** Refuse the operator's unconfined warn fallback for this request. */
+  requireEnforcement?: boolean
   /** Host auth/config sources made available inside the jail so a confined run
    * still authenticates as the operator. Each source explicitly declares
    * whether Linux may read-only bind it or must make an ephemeral writable

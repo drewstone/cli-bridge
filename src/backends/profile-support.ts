@@ -195,6 +195,7 @@ export function provisionPiProfile(
   session: SessionRecord | null,
   cwd: string | undefined,
   executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, 'pi', null),
+  inference?: NonNullable<ProfileMaterializationReceipt['inference']>,
 ): ProvisionedPiProfile | null {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
@@ -227,6 +228,7 @@ export function provisionPiProfile(
       executionIdentity,
       plan,
       applied,
+      inference,
     )
 
     let cleaned = false
@@ -343,6 +345,7 @@ function retainProfileMaterializationReceipt(
   executionIdentity: ProfileExecutionIdentity,
   plan: WorkspacePlan,
   applied: WorkspacePlanReceipt,
+  inference?: NonNullable<ProfileMaterializationReceipt['inference']>,
 ): ProfileMaterializationReceipt {
   const modes = new Map(plan.files.map((file) => [file.relPath, file.mode ?? 0o644]))
   const receipt: ProfileMaterializationReceipt = {
@@ -355,6 +358,7 @@ function retainProfileMaterializationReceipt(
     workspacePlanDigest: applied.workspacePlanDigest,
     files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
     unsupported: applied.unsupported,
+    ...(inference ? { inference } : {}),
   }
   req.profile_materialization_receipt = receipt
   console.info(`[cli-bridge] profile materialization receipt ${JSON.stringify(receipt)}`)

@@ -203,6 +203,11 @@ export interface Spawner {
    * already covers.
    */
   probeRequestPath?(): Promise<ExecutorReadiness>
+  /**
+   * Isolation boundary the spawned CLI inhabits. Pi refuses an undeclared
+   * executor because credential safety cannot depend on guessing its behavior.
+   */
+  executionEnvironment?: 'host' | 'docker' | 'test-double'
 }
 
 /**

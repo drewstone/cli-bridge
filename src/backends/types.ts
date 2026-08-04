@@ -97,6 +97,37 @@ export interface ProfileMaterializationReceipt {
   /** Relative paths only; profile contents and environment values never cross the API. */
   files: Array<{ path: string; mode: number }>
   unsupported: Array<{ dimension: string; reason: string }>
+  /** Exact model transport selected before the agent process started. */
+  inference?: {
+    /** The upstream endpoint reached by the bridge-owned transport. */
+    effectiveEndpoint: string
+    /** Provider wire protocol used by the selected model. */
+    apiMode: string
+    /** Authentication stayed in a request-scoped loopback forwarder. */
+    transport: 'scoped-loopback'
+    /** Filled after Pi exits; absent while materialization is still in progress. */
+    observation?: {
+      requests: number
+      generationRequests: number
+      auxiliaryRequests: number
+      usageReceipts: number
+      rejectedRequests: number
+      failedRequests: number
+      inFlightRequests: number
+      accountingMatched: boolean
+      usage: {
+        inputTokens?: number
+        freshInputTokens?: number
+        cacheReadInputTokens?: number
+        cacheWriteInputTokens?: number
+        outputTokens?: number
+        /** Provider-billed dollars are not reported by Pi or the proxy. */
+        costKnown: false
+        /** Pi's local catalog estimate, never billed spend. */
+        estimatedCost?: number
+      }
+    }
+  }
 }
 
 /**
@@ -264,6 +295,8 @@ export interface ChatDelta {
    * (~4 chars/token) because the backend CLI reported none.
    */
   usage?: {
+    /** Provider inference requests represented by this record. */
+    model_requests?: number
     input_tokens?: number
     /** Fresh, non-cached input tokens when the backend reports the split. */
     fresh_input_tokens?: number

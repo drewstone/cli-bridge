@@ -96,7 +96,7 @@ pnpm install:harnesses      # all harnesses
 | `codex` | `brew install openai/homebrew-tap/codex` | `codex login` |
 | `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
 | `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
-| `pi` | `npm install -g @earendil-works/pi-coding-agent` | Provider credentials in `~/.pi/agent` |
+| `pi` | `npm install -g @earendil-works/pi-coding-agent` | Explicit provider/model config in `~/.pi/agent/models.json`; cli-bridge resolves its credential before spawn |
 | `passthrough` | (none) | provider API keys in `.env` |
 
 For a Nix-provisioned host shell with the shared prerequisites:
@@ -142,6 +142,12 @@ Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
 - local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`) persist the full profile and reject profile dimensions they cannot execute
+- Pi requires `pi/<provider>/<model>`. The provider and model must have an explicit `baseUrl` and API mode in Pi's `models.json`; the bridge refuses missing or ambiguous selections before Pi starts
+- Pi model traffic uses a request-scoped local forwarder. The Pi process, its Bash tools, and descendants receive only a short-lived local token—not daemon provider or GitHub credentials—and the forwarder closes when the run ends. Request bodies and non-authentication headers pass through unchanged, including provider prompt-caching controls
+- Pi's isolated transport requires `PI_EXECUTOR=host` plus `execution.jail.mode=fs-jail` on a Linux host with bubblewrap. The bridge refuses before credential resolution when real read isolation is unavailable, and `BRIDGE_JAIL_FALLBACK=warn` cannot downgrade a Pi request. Docker refuses because its separate network cannot reach the bridge's loopback address without reintroducing mounted provider credentials
+- caller sessions use Pi's native `--session-dir`, with one stable opaque directory per external session under `PI_CODING_AGENT_SESSION_DIR`. Only that directory enters the read-confined process, so continuation works without exposing sibling sessions; anonymous calls remain temporary
+- every request accepted by the local forwarder is counted. The run refuses completion when forwarded calls differ from Pi's usage receipts, when any scoped request is rejected or fails, or when traffic remains in flight
+- an exact Pi profile's completed `profile_materialization` acknowledgement includes the upstream endpoint and API mode, request counts, token and prompt-cache usage, and `costKnown: false` because Pi exposes a local catalog estimate rather than provider-billed dollars; neither credential is exposed
 - Pi passes the replacement system prompt, additive instructions, skills, and prompt templates through Pi's native per-process flags using unique files that are removed after the run; a profile grants run-scoped project-file trust without persisting approval, while ambient context, skill, and prompt-template discovery stays disabled
 - `agent_profile.extensions.pi.load` selects an exact Pi extension set from installed package names or absolute paths; when present, the bridge passes `--no-extensions` plus one `--extension` flag per resolved entry
 - when Pi runs inside the OS filesystem jail, the executor translates each installed-package path only after confinement is confirmed; host, Docker, and explicit unconfined-fallback paths keep their normal argv

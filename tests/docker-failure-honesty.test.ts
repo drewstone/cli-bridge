@@ -51,6 +51,7 @@ import { PiBackend } from '../src/backends/pi.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { RunRegistry } from '../src/runs/registry.js'
+import { testPiInferenceTransport } from './pi-inference-fixture.js'
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
@@ -557,7 +558,15 @@ describe('defect 2 — every docker-capable backend reports through the SAME pro
     { name: 'claude-code', make: (s: never) => new ClaudeBackend({ bin: 'claude', timeoutMs: 5_000, harness: 'claude-code', spawner: s }) },
     { name: 'codex', make: (s: never) => new CodexBackend({ bin: 'codex', timeoutMs: 5_000, spawner: s }) },
     { name: 'kimi-code', make: (s: never) => new KimiBackend({ bin: 'kimi', timeoutMs: 5_000, harness: 'kimi-code', spawner: s }) },
-    { name: 'pi', make: (s: never) => new PiBackend({ bin: 'pi', timeoutMs: 5_000, spawner: s }) },
+    {
+      name: 'pi',
+      make: (s: never) => new PiBackend({
+        bin: 'pi',
+        timeoutMs: 5_000,
+        spawner: s,
+        transportResolver: testPiInferenceTransport(),
+      }),
+    },
   ]
 
   for (const { name, make } of cases) {
