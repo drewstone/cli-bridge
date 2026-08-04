@@ -1,5 +1,6 @@
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
+import { createServer, type Server } from 'node:http'
 import {
   existsSync,
   mkdirSync,
@@ -22,6 +23,7 @@ import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { authSourcesFor } from '../src/jail/auth-preserve.js'
+import { testPiInferenceTransport } from './pi-inference-fixture.js'
 
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
@@ -33,7 +35,7 @@ function piSpawner(
   lines: Array<Record<string, unknown>>,
   onSpawn?: (...spawnArgs: Parameters<Spawner>) => void,
 ): Spawner {
-  return async (...spawnArgs): Promise<SpawnResult> => {
+  const spawner: Spawner = async (...spawnArgs): Promise<SpawnResult> => {
     onSpawn?.(...spawnArgs)
     const child = new FakeChild()
     queueMicrotask(() => {
@@ -51,10 +53,22 @@ function piSpawner(
       spawnError: () => null,
     }
   }
+  spawner.executionEnvironment = 'test-double'
+  return spawner
+}
+
+function newTestPiBackend(options: ConstructorParameters<typeof PiBackend>[0]): PiBackend {
+  if (options.spawner && options.spawner.executionEnvironment === undefined) {
+    options.spawner.executionEnvironment = 'test-double'
+  }
+  return new PiBackend({
+    ...options,
+    transportResolver: options.transportResolver ?? testPiInferenceTransport(),
+  })
 }
 
 function pausingPiSpawner(lines: Array<Record<string, unknown>>): Spawner {
-  return async (): Promise<SpawnResult> => {
+  const spawner: Spawner = async (): Promise<SpawnResult> => {
     const child = new FakeChild()
     queueMicrotask(() => {
       for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`)
@@ -72,6 +86,8 @@ function pausingPiSpawner(lines: Array<Record<string, unknown>>): Spawner {
       spawnError: () => null,
     }
   }
+  spawner.executionEnvironment = 'test-double'
+  return spawner
 }
 
 async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
@@ -112,7 +128,7 @@ describe('PiBackend', () => {
     let mcp: unknown
     let mcpConfigPath: string | undefined
     let directTools: string | undefined
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -168,7 +184,14 @@ describe('PiBackend', () => {
         provider: 'tangle-router',
         model: 'pi/tangle-router/glm-5.2',
         reasoningEffort: { requested: 'ultracode', applied: 'xhigh' },
+        inference: {
+          effectiveEndpoint: 'http://127.0.0.1:9/v1',
+          apiMode: 'openai-completions',
+          transport: 'scoped-loopback',
+        },
       })
+      expect(request.profile_materialization_receipt?.effectiveProfileDigest)
+        .toMatch(/^sha256:[a-f0-9]{64}$/u)
     } finally {
       if (previousOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
       else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = previousOverride
@@ -176,10 +199,75 @@ describe('PiBackend', () => {
     }
   })
 
+  it('refuses an incomplete Pi model id before resolving auth or spawning a child', async () => {
+    let resolves = 0
+    let spawns = 0
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      transportResolver: async () => {
+        resolves += 1
+        return await testPiInferenceTransport()(
+          { provider: 'unused', model: 'unused' },
+          new AbortController().signal,
+        )
+      },
+      spawner: piSpawner([], () => { spawns += 1 }),
+    })
+
+    await expect(collect(backend.chat({
+      model: 'pi/glm-5.2',
+      messages: [{ role: 'user', content: 'task' }],
+    }, null, new AbortController().signal))).rejects.toThrow(/explicit pi\/<provider>\/<model>/u)
+    expect(resolves).toBe(0)
+    expect(spawns).toBe(0)
+  })
+
+  it('refuses a failed isolated transport before spawning a Pi child', async () => {
+    let spawns = 0
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      transportResolver: async () => {
+        throw new BackendError('isolated transport unavailable', 'not_configured')
+      },
+      spawner: piSpawner([], () => { spawns += 1 }),
+    })
+
+    await expect(collect(backend.chat({
+      model: 'pi/tangle-router/glm-5.2',
+      messages: [{ role: 'user', content: 'task' }],
+    }, null, new AbortController().signal))).rejects.toThrow(/isolated transport unavailable/u)
+    expect(spawns).toBe(0)
+  })
+
+  it('refuses Docker before auth resolution instead of using mounted provider credentials', async () => {
+    let resolves = 0
+    let spawns = 0
+    const spawner = piSpawner([], () => { spawns += 1 })
+    spawner.executionEnvironment = 'docker'
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      transportResolver: async (selection, signal) => {
+        resolves += 1
+        return await testPiInferenceTransport()(selection, signal)
+      },
+      spawner,
+    })
+
+    await expect(collect(backend.chat({
+      model: 'pi/tangle-router/glm-5.2',
+      messages: [{ role: 'user', content: 'task' }],
+    }, null, new AbortController().signal))).rejects.toThrow(/PI_EXECUTOR=host/u)
+    expect(resolves).toBe(0)
+    expect(spawns).toBe(0)
+  })
+
   it('rejects a turn-level effort that conflicts with the exact profile', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-effort-conflict-'))
     let spawns = 0
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([], () => {
@@ -249,7 +337,7 @@ describe('PiBackend', () => {
   }) => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-identity-conflict-'))
     let spawns = 0
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([], () => { spawns += 1 }),
@@ -270,7 +358,7 @@ describe('PiBackend', () => {
   it('refuses request MCP beside an exact profile before spawn', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-mcp-conflict-'))
     let spawns = 0
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([], () => { spawns += 1 }),
@@ -308,7 +396,7 @@ describe('PiBackend', () => {
       skill: string
       promptTemplate: string
     }> = []
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -403,7 +491,7 @@ describe('PiBackend', () => {
     const instructions = `LARGE_INSTRUCTION_START\n${'x'.repeat(140_000)}\nLARGE_INSTRUCTION_END`
     let instructionPath = ''
     let argvBytes = 0
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -442,7 +530,7 @@ describe('PiBackend', () => {
     const argv: string[][] = []
     const profilePrompts: Array<string | null> = []
     const profileRoots: string[] = []
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -545,7 +633,7 @@ describe('PiBackend', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-no-profile-approval-'))
     let args: string[] = []
     try {
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner([
@@ -568,7 +656,7 @@ describe('PiBackend', () => {
   })
 
   it('emits only text deltas and streams turn usage separately from completion', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -616,7 +704,7 @@ describe('PiBackend', () => {
   })
 
   it('streams every model call including cache traffic and reports complete nested cost once', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -709,7 +797,7 @@ describe('PiBackend', () => {
   })
 
   it('streams agent_end messages as the legacy fallback when turn receipts are absent', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -779,7 +867,7 @@ describe('PiBackend', () => {
   })
 
   it('omits aggregate cost when any contributing model call has unknown cost', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -806,9 +894,127 @@ describe('PiBackend', () => {
     ])
   })
 
+  it('accounts for Google countTokens separately from generation usage receipts', async () => {
+    const upstreamPaths: string[] = []
+    const upstream = createServer(async (request, response) => {
+      for await (const _chunk of request) {
+        // Drain the request before responding so the proxy records a settled exchange.
+      }
+      upstreamPaths.push(request.url ?? '')
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end('{}')
+    })
+    await listenTestServer(upstream)
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+    const spawner: Spawner = async (_bin, _args, opts): Promise<SpawnResult> => {
+      const child = new FakeChild()
+      queueMicrotask(() => {
+        void (async () => {
+          try {
+            const agentDir = opts.env?.PI_CODING_AGENT_DIR
+            if (!agentDir) throw new Error('missing request Pi config')
+            const config = JSON.parse(readFileSync(join(agentDir, 'models.json'), 'utf8')) as {
+              providers: Record<string, { baseUrl: string; apiKey: string }>
+            }
+            const provider = Object.values(config.providers)[0]
+            if (!provider) throw new Error('missing request provider')
+            for (const action of ['streamGenerateContent', 'countTokens']) {
+              const response = await fetch(
+                `${provider.baseUrl}/models/credential-check:${action}?key=${encodeURIComponent(provider.apiKey)}`,
+                { method: 'POST', body: '{}' },
+              )
+              if (!response.ok) throw new Error(`proxy returned ${response.status}`)
+            }
+            child.stdout.write(`${JSON.stringify({
+              type: 'turn_end',
+              message: {
+                usage: {
+                  input: 10,
+                  output: 2,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  cost: { total: 0 },
+                },
+              },
+            })}\n`)
+            child.stdout.end()
+            child.stderr.end()
+            child.exitCode = 0
+            child.emit('close', 0)
+          } catch (error) {
+            child.stderr.end(error instanceof Error ? error.message : String(error))
+            child.stdout.end()
+            child.exitCode = 1
+            child.emit('close', 1)
+          }
+        })()
+      })
+      return {
+        child: child as never,
+        release() {},
+        spawnError: () => null,
+      }
+    }
+    spawner.executionEnvironment = 'test-double'
+
+    try {
+      const backend = newTestPiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        spawner,
+        transportResolver: testPiInferenceTransport({
+          upstreamBaseUrl: `http://127.0.0.1:${address.port}/v1beta`,
+          apiMode: 'google-generative-ai',
+          upstreamApiKey: 'google-upstream-key',
+          providerConfig: { api: 'google-generative-ai' },
+          modelConfig: {
+            id: 'credential-check',
+            api: 'google-generative-ai',
+            input: ['text'],
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          },
+        }),
+      })
+      const request: ChatRequest = {
+        model: 'pi/google-test/credential-check',
+        messages: [{ role: 'user', content: 'count, then answer' }],
+        agent_profile: {
+          harness: 'pi',
+          model: { provider: 'google-test', default: 'credential-check' },
+        },
+      }
+      const deltas = await collect(backend.chat(request, null, new AbortController().signal))
+
+      expect(upstreamPaths).toEqual([
+        '/v1beta/models/credential-check:streamGenerateContent?key=google-upstream-key',
+        '/v1beta/models/credential-check:countTokens?key=google-upstream-key',
+      ])
+      expect(deltas).toContainEqual({ usage: { model_requests: 2, cost_known: false } })
+      const completed = deltas.findLast(
+        (delta) => delta.profile_materialization?.inference?.observation !== undefined,
+      )?.profile_materialization
+      expect(completed?.inference?.observation).toMatchObject({
+        requests: 2,
+        generationRequests: 1,
+        auxiliaryRequests: 1,
+        usageReceipts: 1,
+        rejectedRequests: 0,
+        failedRequests: 0,
+        inFlightRequests: 0,
+        accountingMatched: true,
+      })
+      expect(request.profile_materialization_receipt).toEqual(completed)
+    } finally {
+      await closeTestServer(upstream)
+    }
+  })
+
   it('preserves completed model-call usage when the outer run is cancelled', async () => {
     const controller = new AbortController()
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: pausingPiSpawner([
@@ -874,7 +1080,7 @@ describe('PiBackend', () => {
   })
 
   it('rejects invalid Pi token counts instead of recording them as zero', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -915,7 +1121,7 @@ describe('PiBackend', () => {
   }
 
   it('fails the request when pi reports a provider failure on the assistant turn', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -943,7 +1149,7 @@ describe('PiBackend', () => {
   })
 
   it('fails a truncated turn: partial text streamed before the provider failure is not success', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -978,7 +1184,7 @@ describe('PiBackend', () => {
   })
 
   it('fails on a bare errorMessage even when stopReason is absent', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -1002,7 +1208,7 @@ describe('PiBackend', () => {
   })
 
   it('does not fail a run whose failed turn pi retried successfully', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -1043,7 +1249,7 @@ describe('PiBackend', () => {
   })
 
   it('surfaces pi assistantMessageEvent tool_call_start as OpenAI tool_calls', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -1086,7 +1292,7 @@ describe('PiBackend', () => {
   })
 
   it('surfaces real pi toolcall_end frames nested under assistantMessageEvent.partial.content', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -1163,7 +1369,7 @@ describe('PiBackend', () => {
   })
 
   it('surfaces real pi tool_execution_start events as OpenAI tool_calls', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -1197,7 +1403,7 @@ describe('PiBackend', () => {
   })
 
   it('surfaces pi nested tool_call_request events once', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -1233,7 +1439,7 @@ describe('PiBackend', () => {
   })
 
   it('also accepts prompt_tokens/completion_tokens usage from partial.usage', async () => {
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: piSpawner([
@@ -1273,7 +1479,7 @@ describe('PiBackend', () => {
       let configPathAtSpawn: string | undefined
       let cwdAtSpawn: string | undefined
       let directToolsAtSpawn: string | undefined
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner(
@@ -1371,7 +1577,7 @@ describe('PiBackend', () => {
         spawnError: () => null,
       }
     }
-    const backend = new PiBackend({ bin: 'pi', timeoutMs: 1000, spawner })
+    const backend = newTestPiBackend({ bin: 'pi', timeoutMs: 1000, spawner })
 
     try {
       const request = (name: string): ChatRequest => ({
@@ -1409,7 +1615,7 @@ describe('PiBackend', () => {
     process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '0'
     try {
       let spawnCount = 0
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner([], () => { spawnCount += 1 }),
@@ -1489,7 +1695,7 @@ describe('PiBackend', () => {
     process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '0'
     try {
       let mcpConfigFlagAtSpawn: string | undefined
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner(
@@ -1534,7 +1740,7 @@ describe('PiBackend', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-extension-none-'))
     let args: string[] = []
     try {
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner([
@@ -1584,7 +1790,7 @@ describe('PiBackend', () => {
       writeFileSync(join(extensionDir, 'provider.ts'), 'export default () => undefined\n')
       process.env.PI_CODING_AGENT_DIR = agentDir
 
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner([
@@ -1616,7 +1822,7 @@ describe('PiBackend', () => {
     }
   })
 
-  it('loads a custom AgentDir extension from the same per-run config copy Pi reads', async () => {
+  it('exposes an exact extension to a read-confined run without copying ambient Pi credentials', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-jailed-extension-'))
     const jailRoot = join(cwd, '.agent-home')
     const agentDir = mkdtempSync(join(tmpdir(), 'pi-profile-custom-agent-dir-'))
@@ -1628,6 +1834,7 @@ describe('PiBackend', () => {
     let jail: ChatRequest['jailSpec']
     let jailedSessionDir: string | undefined
     let spawnedSessionDir: string | undefined
+    let spawnedAgentDir: string | undefined
     try {
       mkdirSync(extensionDir, { recursive: true })
       writeFileSync(
@@ -1638,9 +1845,8 @@ describe('PiBackend', () => {
       process.env.PI_CODING_AGENT_DIR = agentDir
       delete process.env.PI_CODING_AGENT_SESSION_DIR
       const authSources = authSourcesFor('pi')
-      const confinedAgentDir = join(jailRoot, authSources[0]!.jailRel)
 
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner([
@@ -1651,6 +1857,7 @@ describe('PiBackend', () => {
           jail = opts.jail
           jailedSessionDir = opts.jail?.environment?.PI_CODING_AGENT_SESSION_DIR
           spawnedSessionDir = opts.env?.PI_CODING_AGENT_SESSION_DIR
+          spawnedAgentDir = opts.env?.PI_CODING_AGENT_DIR
         }),
       })
       await collect(backend.chat({
@@ -1667,13 +1874,17 @@ describe('PiBackend', () => {
       }, null, new AbortController().signal))
 
       expect(argValue(args, '--extension')).toBe(packageDir)
-      expect(jail?.argumentRewrites).toEqual([{
-        from: packageDir,
-        to: join(confinedAgentDir, 'npm', 'node_modules', 'pi-zai-glm'),
-        precededBy: '--extension',
-      }])
-      expect(jailedSessionDir).toBe(join(jailRoot, '.pi-sessions'))
+      expect(jail?.authSources).toEqual([])
+      expect(jail?.argumentRewrites).toBeUndefined()
+      expect(jail?.extraReadablePaths).toContain(packageDir)
+      expect(jailedSessionDir).toBeUndefined()
       expect(spawnedSessionDir).toBeUndefined()
+      expect(spawnedAgentDir).toBeTruthy()
+      expect(argValue(args, '--session-dir')).toBe(join(spawnedAgentDir!, 'sessions'))
+      expect(jail?.extraWritablePaths).toEqual(expect.arrayContaining([
+        spawnedAgentDir,
+        join(spawnedAgentDir!, 'sessions'),
+      ]))
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
       else process.env.PI_CODING_AGENT_DIR = previousAgentDir
@@ -1688,7 +1899,7 @@ describe('PiBackend', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-extension-unknown-'))
     let spawns = 0
     try {
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner([], () => {
@@ -1717,7 +1928,7 @@ describe('PiBackend', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-generic-file-'))
     let spawns = 0
     try {
-      const backend = new PiBackend({
+      const backend = newTestPiBackend({
         bin: 'pi',
         timeoutMs: 1000,
         spawner: piSpawner([], () => {
@@ -1761,7 +1972,7 @@ describe('PiBackend', () => {
   it('removes request-scoped profile files when Pi fails to spawn', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-spawn-failure-'))
     let profileRoot = ''
-    const backend = new PiBackend({
+    const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
       spawner: async (_bin, args) => {
@@ -1790,3 +2001,16 @@ describe('PiBackend', () => {
     }
   })
 })
+
+async function listenTestServer(server: Server): Promise<void> {
+  await new Promise<void>((resolvePromise, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolvePromise)
+  })
+}
+
+async function closeTestServer(server: Server): Promise<void> {
+  server.closeAllConnections()
+  if (!server.listening) return
+  await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()))
+}

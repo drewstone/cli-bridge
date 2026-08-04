@@ -8,12 +8,13 @@
  *
  * Model id scheme: `pi/<provider>/<model>` — callers select pi as the harness
  * and a provider+model registered in pi's settings (see `pi --list-models`).
- * `pi/<model>` (no provider) routes through pi's default provider.
+ * Provider and model are both required so the bridge can pin the exact
+ * credential-free child configuration before Pi starts.
  *
- * Auth: pi reads `<PROVIDER>_API_KEY` env vars itself; the bridge inherits
- * `process.env` into the subprocess. ZAI_GLM_API_KEY, DEEPSEEK_API_KEY,
- * MOONSHOT_API_KEY etc. must be set in the bridge's environment (sourced
- * via the kick-script's `.env` chain).
+ * Auth: the bridge resolves provider auth before Pi starts and forwards model
+ * traffic through a request-scoped loopback endpoint. Pi and every tool it
+ * launches receive neither the daemon credential nor ambient GitHub/provider
+ * variables.
  *
  * MCP: MCP support comes from the `pi-mcp-adapter` extension. A profile-less
  * request may use X-Mcp-Config/body `mcp.mcpServers`; an exact profile uses
@@ -72,21 +73,32 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import {
   registerJailArgumentRewrite,
-  registerJailEnvironment,
   resolveJailRoot,
+  selectJailBackend,
 } from '../jail/index.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { addUsage, type CollectedUsage } from '../usage.js'
+import {
+  createPiInferenceTransportResolver,
+  provisionPiInferenceTransport,
+  type PiInferenceTransportResolver,
+  type ProvisionedPiInferenceTransport,
+} from './pi-inference-transport.js'
 
 export interface PiBackendOptions {
   bin: string
   timeoutMs: number
+  /** Overrides the high finite request-inspection boundary for isolated Pi traffic. */
+  maxInferenceRequestBytes?: number
   /** Subprocess spawner. Defaults to scoped host. */
   spawner?: Spawner
+  /** Trusted provider resolution. Injectable for deterministic tests. */
+  transportResolver?: PiInferenceTransportResolver
 }
 
-/** `pi/<provider>/<model>` or `pi/<model>` (default provider). */
+/** Parsed `pi/<provider>/<model>` selection. Incomplete ids are rejected before spawn. */
 interface PiModelSpec {
   provider?: string
   model?: string
@@ -193,18 +205,25 @@ function piExtensionArgs(
   // Pi directory lives under a different HOME. The executor rewrites exact
   // package arguments only after it proves the OS jail will actually apply.
   const runtimeNpmRoot = join(
-    configuredAgentDir ? hostAgentDir : '~/.pi/agent',
+    (configuredAgentDir || req.jailSpec) ? hostAgentDir : '~/.pi/agent',
     'npm',
     'node_modules',
   )
-  const jailedNpmRoot = req.jailSpec
-    ? join(confinedPiAgentDir(req.jailSpec), 'npm', 'node_modules')
+  const confinedAgentDir = req.jailSpec ? confinedPiAgentDir(req.jailSpec) : null
+  const jailedNpmRoot = confinedAgentDir
+    ? join(confinedAgentDir, 'npm', 'node_modules')
     : runtimeNpmRoot
   const entries = new Set((load as string[]).map((spec) => {
     const normalizedSpec = spec.trim()
     const runtimePath = resolvePiExtensionPath(normalizedSpec, hostNpmRoot, runtimeNpmRoot)
     const jailedPath = resolvePiExtensionPath(normalizedSpec, hostNpmRoot, jailedNpmRoot)
-    registerJailArgumentRewrite(req.jailSpec, runtimePath, jailedPath, '--extension')
+    if (runtimePath !== jailedPath) {
+      registerJailArgumentRewrite(req.jailSpec, runtimePath, jailedPath, '--extension')
+    } else if (req.jailSpec?.readConfine && isAbsolute(runtimePath)) {
+      req.jailSpec.extraReadablePaths = [
+        ...new Set([...(req.jailSpec.extraReadablePaths ?? []), runtimePath]),
+      ]
+    }
     return runtimePath
   }))
   return [
@@ -213,19 +232,12 @@ function piExtensionArgs(
   ]
 }
 
-function confinedPiAgentDir(spec: NonNullable<ChatRequest['jailSpec']>): string {
+function confinedPiAgentDir(spec: NonNullable<ChatRequest['jailSpec']>): string | null {
   const root = resolveJailRoot(spec.root, spec.projectDir)
   const source = spec.authSources?.find(
     (entry) => entry.envVar === 'PI_CODING_AGENT_DIR',
   )
-  return source
-    ? resolveJailRoot(source.jailRel, root)
-    : resolveJailRoot('.pi/agent', root)
-}
-
-function confinedPiSessionDir(spec: NonNullable<ChatRequest['jailSpec']>): string {
-  const root = resolveJailRoot(spec.root, spec.projectDir)
-  return resolveJailRoot('.pi-sessions', root)
+  return source ? resolveJailRoot(source.jailRel, root) : null
 }
 
 function resolvePiExtensionPath(spec: string, hostNpmRoot: string, runtimeNpmRoot: string): string {
@@ -303,14 +315,68 @@ export function piMcpAdapterAvailable(): boolean {
   return false
 }
 
+const PI_INHERITED_ENV_KEYS = [
+  'HOME',
+  'PATH',
+  'SHELL',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'USER',
+  'LOGNAME',
+  'LANG',
+  'LC_ALL',
+  'PWD',
+  'DBUS_SESSION_BUS_ADDRESS',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+  'XDG_DATA_HOME',
+  'XDG_RUNTIME_DIR',
+  'NVM_DIR',
+  'PNPM_HOME',
+  'NODE_PATH',
+  'TERM',
+  'COLORTERM',
+  'NO_COLOR',
+  'FORCE_COLOR',
+  'PI_PACKAGE_DIR',
+  'PI_OFFLINE',
+  'PI_TELEMETRY',
+] as const
+
+/**
+ * Build Pi's environment from a neutral allowlist plus request-owned values.
+ * Starting from `process.env` and deleting known keys is deliberately forbidden:
+ * the next provider alias would recreate the credential leak.
+ */
+export function piToolProcessEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  requestValues: Record<string, string | undefined>,
+): NodeJS.ProcessEnv {
+  const child: NodeJS.ProcessEnv = {}
+  for (const key of PI_INHERITED_ENV_KEYS) {
+    const value = inherited[key]
+    if (typeof value === 'string' && value.length > 0) child[key] = value
+  }
+  for (const [key, value] of Object.entries(requestValues)) {
+    if (typeof value === 'string' && value.length > 0) child[key] = value
+  }
+  return child
+}
+
 export class PiBackend implements Backend {
   readonly name = 'pi'
   readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
+  private readonly transportResolver: PiInferenceTransportResolver
 
   constructor(private readonly opts: PiBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? scopedHostSpawner
+    this.transportResolver = opts.transportResolver ?? createPiInferenceTransportResolver({
+      bin: opts.bin,
+      maxRequestBytes: opts.maxInferenceRequestBytes,
+    })
   }
 
   matches(model: string): boolean {
@@ -330,15 +396,59 @@ export class PiBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'pi has native tools (read/bash/edit/write); hosted-safe requires a verified --no-tools enforcement path')
 
+    if (this.spawner.executionEnvironment === undefined) {
+      throw new BackendError(
+        'backend pi requires an executor that declares host or docker isolation; '
+        + 'an undeclared executor cannot prove that Pi tools are separated from host credentials',
+        'not_configured',
+      )
+    }
+    if (this.spawner.executionEnvironment === 'test-double' && process.env.VITEST !== 'true') {
+      throw new BackendError(
+        'backend pi test-double executors are only accepted by the test runner',
+        'not_configured',
+      )
+    }
+    if (this.spawner.executionEnvironment === 'docker') {
+      throw new BackendError(
+        'backend pi isolated inference uses a bridge-owned loopback transport that is not reachable from the '
+        + 'Docker network namespace; set PI_EXECUTOR=host rather than falling back to mounted provider credentials',
+        'not_configured',
+      )
+    }
+    if (this.spawner.executionEnvironment === 'host') {
+      const jailBackend = selectJailBackend()
+      if (
+        !req.jailSpec?.readConfine
+        || jailBackend.name !== 'bwrap'
+        || !(await jailBackend.isAvailable())
+      ) {
+        throw new BackendError(
+          'backend pi requires an enforced Linux fs-jail so Bash and descendants cannot read host credentials '
+          + 'or sibling sessions; send execution.jail.mode=fs-jail and enable bubblewrap',
+          'not_configured',
+        )
+      }
+      // Pi carries a scoped model token inside its private config. An operator's
+      // global warn fallback must never downgrade this request to open host reads.
+      req.jailSpec.requireEnforcement = true
+    }
+
     const spec = parsePiModelId(req.model)
+    if (!spec.provider || !spec.model) {
+      throw new BackendError(
+        'backend pi requires an explicit pi/<provider>/<model> so it can pin the isolated inference endpoint',
+        'not_configured',
+      )
+    }
     const prompt = this.buildPrompt(req)
 
     const args: string[] = [
       '--print',
       '--mode', 'json',
     ]
-    if (spec.provider) args.push('--provider', spec.provider)
-    if (spec.model) args.push('--model', spec.model)
+    args.push('--provider', spec.provider)
+    args.push('--model', spec.model)
     if (session?.internalId) {
       args.push('--session', session.internalId)
     } else if (req.session_id) {
@@ -357,14 +467,10 @@ export class PiBackend implements Backend {
     if (thinking) args.push('--thinking', thinking)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
-    if (req.jailSpec && !process.env.PI_CODING_AGENT_SESSION_DIR?.trim()) {
-      registerJailEnvironment(
-        req.jailSpec,
-        'PI_CODING_AGENT_SESSION_DIR',
-        confinedPiSessionDir(req.jailSpec),
-      )
-    }
-
+    // Pi no longer authenticates from its ambient config. Keeping the old auth
+    // mount would put raw provider credentials back inside a confined process
+    // even though model traffic uses the scoped bridge transport.
+    if (req.jailSpec) req.jailSpec.authSources = []
     // The single selected MCP source reaches pi-mcp-adapter through its per-process
     // config flag. FAIL-LOUD, not fail-safe: if the caller
     // requested MCP tools pi can't provide, reject the request — a
@@ -386,8 +492,30 @@ export class PiBackend implements Backend {
     args.push(...piExtensionArgs(req, session, requestedMcpNames.length > 0))
     let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
     let provisioned: ReturnType<typeof provisionPiProfile> = null
+    let inference: ProvisionedPiInferenceTransport | null = null
     let spawned: Awaited<ReturnType<Spawner>>
     try {
+      const resolvedInference = await this.transportResolver({
+        provider: spec.provider,
+        model: spec.model,
+      }, signal)
+      inference = await provisionPiInferenceTransport(
+        resolvedInference,
+        {
+          ...(req.session_id ? { sessionId: req.session_id } : {}),
+          ...(runCwd ? { projectDir: runCwd } : {}),
+        },
+      )
+      if (req.jailSpec) {
+        req.jailSpec.extraWritablePaths = [
+          ...new Set([
+            ...(req.jailSpec.extraWritablePaths ?? []),
+            inference.agentDir,
+            inference.sessionDir,
+          ]),
+        ]
+      }
+      args.push('--session-dir', inference.sessionDir)
       mcpMounted = requestedMcpNames.length > 0
         ? materializeMcpServersForPi(mcpSpecs, runCwd)
         : null
@@ -397,6 +525,11 @@ export class PiBackend implements Backend {
         session,
         runCwd,
         executionIdentity,
+        {
+          effectiveEndpoint: inference.upstreamBaseUrl,
+          apiMode: inference.apiMode,
+          transport: 'scoped-loopback',
+        },
       )
       if (provisioned) args.push(...provisioned.flags)
       // The task prompt remains the sole positional message. Profile system and
@@ -405,8 +538,8 @@ export class PiBackend implements Backend {
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
-        env: {
-          ...process.env,
+        env: piToolProcessEnvironment(process.env, {
+          PI_CODING_AGENT_DIR: inference.agentDir,
           ...(provisioned?.env ?? {}),
           ...(requestedMcpNames.length > 0
             ? {
@@ -416,13 +549,14 @@ export class PiBackend implements Backend {
                 ),
               }
             : {}),
-        },
+        }),
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })
     } catch (err) {
       mcpMounted?.cleanup()
       provisioned?.cleanup()
+      await inference?.cleanup()
       throw err
     }
     const child = spawned.child
@@ -454,6 +588,7 @@ export class PiBackend implements Backend {
         total: 0,
         complete: true,
       }
+      let observedUsage: CollectedUsage | undefined
       const piToolCalls = new PiToolCallTracker()
 
       child.stderr?.on('data', (b) => { stderr.append(b) })
@@ -510,7 +645,9 @@ export class PiBackend implements Backend {
           if (receipts.length > 0) sawTurnUsage = true
           for (const receipt of receipts) {
             recordPiUsageCost(usageCost, receipt)
-            yield { usage: piTokenUsage(receipt) }
+            const usage = piTokenUsage(receipt)
+            observedUsage = addUsage(observedUsage, usage)
+            yield { usage }
           }
           continue
         }
@@ -522,7 +659,9 @@ export class PiBackend implements Backend {
           if (!sawTurnUsage) {
             for (const receipt of piUsageReceiptsFromEvent(ev)) {
               recordPiUsageCost(usageCost, receipt)
-              yield { usage: piTokenUsage(receipt) }
+              const usage = piTokenUsage(receipt)
+              observedUsage = addUsage(observedUsage, usage)
+              yield { usage }
             }
           }
           continue
@@ -575,6 +714,69 @@ export class PiBackend implements Backend {
       const exitCode = await waitForProcessClose(child)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
+
+      const inferenceTraffic = inference!.traffic()
+      const observedModelRequests = inferenceTraffic.generationRequests
+        + inferenceTraffic.auxiliaryRequests
+      if (observedModelRequests > 0) {
+        // The proxy is the authoritative request counter; Pi's usage events are
+        // the token receipts checked against it below. Keep the two facts
+        // distinct so a missing token receipt never turns into synthetic 0s.
+        yield {
+          usage: {
+            model_requests: observedModelRequests,
+            cost_known: false,
+          },
+        }
+      }
+      const accountingMatched = inferenceTraffic.generationRequests === usageCost.receipts
+        && inferenceTraffic.rejectedRequests === 0
+        && inferenceTraffic.failedRequests === 0
+        && inferenceTraffic.inFlightRequests === 0
+      const materialization = req.profile_materialization_receipt
+      if (materialization?.inference) {
+        materialization.inference.observation = {
+          ...inferenceTraffic,
+          usageReceipts: usageCost.receipts,
+          accountingMatched,
+          usage: {
+            ...(observedUsage?.inputTokensKnown
+              ? { inputTokens: observedUsage.inputTokens }
+              : {}),
+            ...(observedUsage?.freshInputTokensKnown
+              ? { freshInputTokens: observedUsage.freshInputTokens }
+              : {}),
+            ...(observedUsage?.cacheReadInputTokensKnown
+              ? { cacheReadInputTokens: observedUsage.cacheReadInputTokens }
+              : {}),
+            ...(observedUsage?.cacheWriteInputTokensKnown
+              ? { cacheWriteInputTokens: observedUsage.cacheWriteInputTokens }
+              : {}),
+            ...(observedUsage?.outputTokensKnown
+              ? { outputTokens: observedUsage.outputTokens }
+              : {}),
+            costKnown: false,
+            ...(usageCost.receipts > 0 && usageCost.complete
+              ? { estimatedCost: usageCost.total }
+              : {}),
+          },
+        }
+        // Emit the completed receipt before either success or a traffic refusal,
+        // so the durable run retains the exact profile and the failed comparison.
+        yield { profile_materialization: structuredClone(materialization) }
+      }
+      if (this.spawner.executionEnvironment === 'host' && !accountingMatched) {
+        throw new BackendError(
+          'pi inference traffic did not match its recorded usage: '
+          + `${inferenceTraffic.generationRequests} generation request(s), `
+          + `${usageCost.receipts} Pi usage receipt(s), `
+          + `${inferenceTraffic.auxiliaryRequests} auxiliary request(s), `
+          + `${inferenceTraffic.rejectedRequests} rejected request(s), `
+          + `${inferenceTraffic.failedRequests} failed request(s), `
+          + `${inferenceTraffic.inFlightRequests} still in flight`,
+          'upstream',
+        )
+      }
 
       // Per-turn token receipts stay observable. Pi computes dollars from its
       // local model catalog, so even a complete numeric sum is only an estimate;
@@ -629,6 +831,7 @@ export class PiBackend implements Backend {
       try { releaseSpawner() } catch { /* best effort */ }
       mcpMounted?.cleanup()
       provisioned?.cleanup()
+      await inference?.cleanup()
     }
   }
 

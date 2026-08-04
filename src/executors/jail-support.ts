@@ -45,7 +45,7 @@ export async function applyJail(
     // unconfined would be a silent security downgrade, so fail closed by
     // default. Operators who knowingly accept unconfined execution can opt out
     // with BRIDGE_JAIL_FALLBACK=warn.
-    if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
+    if (process.env.BRIDGE_JAIL_FALLBACK === 'warn' && !opts.jail.requireEnforcement) {
       if (!warnedFallback) {
         warnedFallback = true
         console.warn(
@@ -57,9 +57,12 @@ export async function applyJail(
     }
     // Typed BackendError (not a plain Error) so the chat wrapper surfaces it as a
     // real config error (5xx / typed SSE), not an opaque finish_reason:'error'.
+    const fallbackHint = opts.jail.requireEnforcement
+      ? ''
+      : ' Or set BRIDGE_JAIL_FALLBACK=warn to run without confinement.'
     throw new BackendError(
       `write-jail requested but '${backend.name}' cannot run on this host, refusing to run ` +
-      `unconfined. ${ENABLE_HINT} Or set BRIDGE_JAIL_FALLBACK=warn to run without confinement.`,
+      `unconfined. ${ENABLE_HINT}${fallbackHint}`,
       'not_configured',
     )
   }

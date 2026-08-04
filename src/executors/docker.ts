@@ -232,6 +232,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
     const findings: ExecutorFinding[] = perSlot.flat()
     return { cwd, findings }
   }
+  spawner.executionEnvironment = 'docker'
   return spawner
 }
 

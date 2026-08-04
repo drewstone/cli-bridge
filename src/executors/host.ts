@@ -148,6 +148,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     throw err
   }
 }
+hostSpawner.executionEnvironment = 'host'
 
 /** Diagnostics for /metrics. */
 export function hostExecutorSnapshot(): {

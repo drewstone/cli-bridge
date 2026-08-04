@@ -360,6 +360,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   }
   return result
 }
+scopedHostSpawner.executionEnvironment = 'host'
 
 /** Diagnostics for /metrics. */
 export function scopedHostExecutorSnapshot(): {

@@ -89,6 +89,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     ],
     ...(usage ? {
       usage: {
+        ...(isNonnegativeFinite(usage.model_requests) ? { model_requests: usage.model_requests } : {}),
         ...(isNonnegativeFinite(usage.input_tokens) ? { prompt_tokens: usage.input_tokens } : {}),
         ...(isNonnegativeFinite(usage.output_tokens) ? { completion_tokens: usage.output_tokens } : {}),
         ...(isNonnegativeFinite(usage.input_tokens) && isNonnegativeFinite(usage.output_tokens)
@@ -188,6 +189,7 @@ export async function collectNonStreaming(
   // here we only normalise to the OpenAI shape, preserving the `estimated` flag.
   const usageOut = usage
     ? {
+        ...(usage.modelRequests > 0 ? { model_requests: usage.modelRequests } : {}),
         ...(usage.inputTokensKnown ? { prompt_tokens: usage.inputTokens } : {}),
         ...(usage.outputTokensKnown ? { completion_tokens: usage.outputTokens } : {}),
         ...(usage.inputTokensKnown && usage.outputTokensKnown
