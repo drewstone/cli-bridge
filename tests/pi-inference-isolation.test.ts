@@ -17,7 +17,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { gzipSync } from 'node:zlib'
@@ -60,6 +60,13 @@ function resolvePiBin(): string | null {
 }
 
 const realPiBin = resolvePiBin()
+const realPiMcpAdapterDir = join(
+  process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), '.pi', 'agent'),
+  'npm',
+  'node_modules',
+  'pi-mcp-adapter',
+)
+const realPiMcpAdapterAvailable = existsSync(realPiMcpAdapterDir)
 
 const SENTINELS = {
   TANGLE_API_KEY: 'daemon-tangle-sentinel-113',
@@ -698,6 +705,94 @@ describe('Pi inference credential isolation', () => {
       new AbortController().signal,
     )).rejects.not.toThrow(leaked)
   })
+
+  it.skipIf(!realPiBin || !realPiMcpAdapterAvailable)(
+    'loads request MCP from the installed adapter in a real read-confined Pi run',
+    async () => {
+      const cwd = tempDir('cli-bridge-pi-real-mcp-')
+      const sourceAgentDir = tempDir('cli-bridge-pi-mcp-source-')
+      const sourceSessionDir = tempDir('cli-bridge-pi-mcp-sessions-')
+      const observedBodies: string[] = []
+      const upstream = createServer(async (request, response) => {
+        observedBodies.push(await readBody(request))
+        response.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        })
+        sendChunk(response, {
+          id: 'chatcmpl-real-mcp',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'credential-check',
+          choices: [{
+            index: 0,
+            delta: { role: 'assistant', content: 'mcp-adapter-loaded' },
+            finish_reason: null,
+          }],
+        })
+        sendChunk(response, {
+          id: 'chatcmpl-real-mcp',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'credential-check',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+        })
+        response.end('data: [DONE]\n\n')
+      })
+      await listen(upstream)
+      const address = upstream.address()
+      if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 30_000)
+      try {
+        const backend = new PiBackend({
+          bin: realPiBin!,
+          timeoutMs: 0,
+          spawner: scopedHostSpawner,
+          transportResolver: async ({ provider, model }) => fixtureTransport({
+            provider,
+            model,
+            upstreamBaseUrl: `http://127.0.0.1:${address.port}/v1`,
+            upstreamApiKey: SENTINELS.TANGLE_API_KEY,
+            sourceAgentDir,
+            sourceSessionDir,
+            modelConfig: {
+              ...fixtureTransport().modelConfig,
+              id: model,
+              name: 'Real MCP adapter fixture',
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            },
+          }),
+        })
+        const deltas = await collect(backend.chat({
+          model: 'pi/isolated-test/credential-check',
+          messages: [{ role: 'user', content: 'Reply without calling a tool.' }],
+          cwd,
+          jailSpec: {
+            root: join(cwd, '.agent-home'),
+            projectDir: cwd,
+            readConfine: true,
+          },
+          mcp: {
+            mcpServers: {
+              probe: { command: '/bin/true' },
+            },
+          },
+        }, null, controller.signal))
+
+        expect(deltas.some((delta) => delta.content?.includes('mcp-adapter-loaded'))).toBe(true)
+        expect(deltas).toContainEqual({ usage: { model_requests: 1, cost_known: false } })
+        expect(observedBodies).toHaveLength(1)
+      } finally {
+        clearTimeout(timer)
+        await close(upstream)
+      }
+    },
+    40_000,
+  )
 
   it.skipIf(!realPiBin)(
     'confines a real Pi Bash turn to its workspace and exact persistent session',

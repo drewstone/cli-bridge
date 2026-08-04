@@ -1342,8 +1342,9 @@ describe('Spawner injection works across all subprocess backends', () => {
 
   it('removes every MCP config and lock when the spawner rejects before returning a child', async () => {
     const root = mkdtempSync(join(tmpdir(), 'cli-bridge-spawn-reject-'))
+    const piAgentDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-adapter-'))
     const originalTmpdir = process.env.TMPDIR
-    const originalPiAdapter = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+    const originalPiAgentDir = process.env.PI_CODING_AGENT_DIR
     let spawnCalls = 0
     const refusingSpawner: Spawner = async () => {
       spawnCalls++
@@ -1351,7 +1352,8 @@ describe('Spawner injection works across all subprocess backends', () => {
     }
 
     process.env.TMPDIR = root
-    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
+    mkdirSync(join(piAgentDir, 'npm', 'node_modules', 'pi-mcp-adapter'), { recursive: true })
+    process.env.PI_CODING_AGENT_DIR = piAgentDir
     try {
       for (const { model, backend } of subprocessBackendCases(refusingSpawner)) {
         await expect(async () => {
@@ -1376,8 +1378,9 @@ describe('Spawner injection works across all subprocess backends', () => {
     } finally {
       if (originalTmpdir === undefined) delete process.env.TMPDIR
       else process.env.TMPDIR = originalTmpdir
-      if (originalPiAdapter === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
-      else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = originalPiAdapter
+      if (originalPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = originalPiAgentDir
+      rmSync(piAgentDir, { recursive: true, force: true })
       rmSync(root, { recursive: true, force: true })
     }
   })
