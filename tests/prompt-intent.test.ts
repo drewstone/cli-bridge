@@ -25,14 +25,21 @@
  *                        no additive control exists
  */
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import { materializeProfile } from '@tangle-network/agent-profile-materialize'
+import { AcpBackend } from '../src/backends/acp.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
+import { CodexBackend } from '../src/backends/codex.js'
+import { FactoryBackend } from '../src/backends/factory.js'
+import { KimiBackend } from '../src/backends/kimi.js'
+import { NanoclawBackend } from '../src/backends/nanoclaw.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
 import { PiBackend } from '../src/backends/pi.js'
 import {
   assertProfilePromptIntentsSupported,
@@ -478,6 +485,173 @@ describe('prompt intents reach each harness through its own control', () => {
       expect(append.appendSystemPrompt).toBe('SAME')
       expect(append.systemPrompt).toBeUndefined()
     })
+  })
+})
+
+/**
+ * The refusal has to fire on the PATH a request takes, not just when the assertion is called
+ * directly. Every case below drives the backend's own `chat`/`buildPrompt` with an intent that
+ * backend cannot execute, and asserts the BackendError kind AND that nothing was launched —
+ * deleting `assertProfilePromptIntentsSupported` from `resolvePromptMessages` turns each of these
+ * into a successful spawn carrying no intent at all, which is the silent downgrade the guard exists
+ * to stop. `assertProfilePromptIntentsSupported` tested in isolation cannot see that.
+ */
+describe('the shared refusal seam fires on the real request path', () => {
+  afterEachCleanup()
+
+  const REPLACE_REFUSAL = /cannot replace its harness's system prompt/
+  const APPEND_REFUSAL = /cannot add to its harness's system prompt/
+
+  /** A spawner that must never run. Counts attempts so "no process spawned" is measured, not assumed. */
+  function countingSpawner(counter: { calls: number }): Spawner {
+    const spawner: Spawner = async (): Promise<SpawnResult> => {
+      counter.calls += 1
+      throw new Error('spawner reached: the unsupported prompt intent was not refused')
+    }
+    spawner.executionEnvironment = 'test-double'
+    return spawner
+  }
+
+  interface SeamCase {
+    readonly label: string
+    readonly intent: 'replace' | 'append'
+    readonly refusal: RegExp
+    /** Drives the backend's real request path with a spawner that counts launches. */
+    readonly run: (profile: AgentProfile, cwd: string, spawner: Spawner) => Promise<void>
+  }
+
+  const replacement: AgentProfile = { prompt: { systemPrompt: REPLACEMENT } }
+  const addition: AgentProfile = { prompt: { appendSystemPrompt: ADDITION } }
+  const signal = (): AbortSignal => new AbortController().signal
+
+  const cases: SeamCase[] = [
+    // acp / factory / nanoclaw never materialize a profile plan, so the materializer's fail-closed
+    // record never reaches them: this seam is their ONLY guard on either intent.
+    ...(['replace', 'append'] as const).flatMap((intent): SeamCase[] => {
+      const profileOf = intent === 'replace' ? replacement : addition
+      const refusal = intent === 'replace' ? REPLACE_REFUSAL : APPEND_REFUSAL
+      void profileOf
+      return [
+        {
+          label: `acp (hermes) · ${intent}`,
+          intent,
+          refusal,
+          run: async (profile, cwd, spawner) => {
+            const backend = new AcpBackend({ name: 'hermes', bin: 'hermes', timeoutMs: 5_000, spawner })
+            await drain(backend.chat(request(profile, 'hermes', cwd), null, signal()))
+          },
+        },
+        {
+          label: `factory · ${intent}`,
+          intent,
+          refusal,
+          run: async (profile, cwd, spawner) => {
+            const backend = new FactoryBackend({ bin: 'droid', timeoutMs: 5_000, spawner })
+            await drain(backend.chat(request(profile, 'factory', cwd), null, signal()))
+          },
+        },
+        {
+          label: `kimi-code · ${intent}`,
+          intent,
+          refusal,
+          run: async (profile, cwd, spawner) => {
+            const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5_000, spawner })
+            await drain(backend.chat(request(profile, 'kimi-code', cwd), null, signal()))
+          },
+        },
+      ]
+    }),
+    // codex and opencode DO materialize, and their materializer refuses the same cells — but a
+    // second layer down, after the request path has already accepted the intent. Asserting THIS
+    // seam's wording proves the refusal happens here first, before any workspace is touched.
+    {
+      label: 'codex · append (no additive control)',
+      intent: 'append',
+      refusal: APPEND_REFUSAL,
+      run: async (profile, cwd, spawner) => {
+        const backend = new CodexBackend({ bin: 'codex', timeoutMs: 5_000, spawner })
+        await drain(backend.chat(request(profile, 'codex', cwd), null, signal()))
+      },
+    },
+    {
+      label: 'opencode · replace (its replacement binds to a launch-time agent)',
+      intent: 'replace',
+      refusal: REPLACE_REFUSAL,
+      run: async (profile, cwd, spawner) => {
+        const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5_000, spawner })
+        await drain(backend.chat(request(profile, 'opencode', cwd), null, signal()))
+      },
+    },
+  ]
+
+  for (const seamCase of cases) {
+    it(`refuses ${seamCase.label} without spawning anything`, async () => {
+      const cwd = workspace()
+      const counter = { calls: 0 }
+      const profile = seamCase.intent === 'replace' ? replacement : addition
+
+      await expect(
+        seamCase.run(profile, cwd, countingSpawner(counter)),
+      ).rejects.toMatchObject({ name: 'BackendError', code: 'not_configured' })
+      await expect(seamCase.run(profile, cwd, countingSpawner(counter))).rejects.toThrow(
+        seamCase.refusal,
+      )
+
+      expect(counter.calls).toBe(0)
+      // Nothing was written either: the refusal precedes workspace materialization.
+      expect(readdirSync(cwd)).toEqual([])
+    })
+  }
+
+  it('refuses both intents on nanoclaw without opening its socket', async () => {
+    const dir = workspace()
+    const socketPath = join(dir, 'cli.sock')
+    let connections = 0
+    const server = net.createServer((socket) => {
+      connections += 1
+      socket.destroy()
+    })
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve))
+
+    try {
+      const backend = new NanoclawBackend({ socketPath, timeoutMs: 5_000, silenceMs: 50 })
+      const cwd = workspace()
+
+      await expect(
+        drain(backend.chat(request(replacement, 'nanoclaw', cwd), null, signal())),
+      ).rejects.toMatchObject({ name: 'BackendError', code: 'not_configured' })
+      await expect(
+        drain(backend.chat(request(replacement, 'nanoclaw', cwd), null, signal())),
+      ).rejects.toThrow(REPLACE_REFUSAL)
+      await expect(
+        drain(backend.chat(request(addition, 'nanoclaw', cwd), null, signal())),
+      ).rejects.toThrow(APPEND_REFUSAL)
+
+      // nanoclaw launches nothing itself — it hands the turn to a running daemon. Reaching that
+      // daemon at all IS the downgrade here, so the socket connection count is the spawn count.
+      expect(connections).toBe(0)
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('lets a supported intent through the same seam, so the refusal is not blanket', async () => {
+    // The guard must refuse only what the backend cannot execute. codex owns replacement and
+    // opencode owns addition; both pass this seam and are stopped later (or not at all) by their
+    // own materializer, never by this assertion.
+    expect(() =>
+      resolvePromptMessages(request(replacement, 'codex', workspace()), null, 'codex'),
+    ).not.toThrow()
+    expect(() =>
+      resolvePromptMessages(request(addition, 'opencode', workspace()), null, 'opencode'),
+    ).not.toThrow()
+    // And the intent text never leaks into the flattened prompt on the way through.
+    const messages = resolvePromptMessages(
+      request(replacement, 'codex', workspace()),
+      null,
+      'codex',
+    )
+    expect(JSON.stringify(messages)).not.toContain(REPLACEMENT)
   })
 })
 
