@@ -66,7 +66,7 @@ export class FactoryBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'factory hosted modes require a verified tool-disable and sandbox contract')
 
-    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
+    const prompt = this.flattenPrompt(resolvePromptMessages(req, session, this.name))
     const model = this.extractModel(req.model)
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
 

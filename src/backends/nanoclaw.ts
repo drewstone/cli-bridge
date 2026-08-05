@@ -77,7 +77,7 @@ export class NanoclawBackend implements Backend {
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     if (!this.socketPath) throw new BackendError('nanoclaw: NANOCLAW_SOCKET not configured', 'upstream')
-    const prompt = renderPrompt(resolvePromptMessages(req, session))
+    const prompt = renderPrompt(resolvePromptMessages(req, session, this.name))
     const socket = net.connect(this.socketPath)
 
     const queue: ChatDelta[] = []

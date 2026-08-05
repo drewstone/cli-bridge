@@ -383,7 +383,7 @@ export class KimiBackend implements Backend {
    * spawning a real subprocess.
    */
   buildPrompt(req: ChatRequest, session: SessionRecord | null): string {
-    const flat = this.flattenPrompt(resolvePromptMessages(req, session))
+    const flat = this.flattenPrompt(resolvePromptMessages(req, session, 'kimi-code'))
     const preambles: string[] = []
     if (wantsJsonObject(req)) preambles.push(JSON_MODE_DIRECTIVE)
     return preambles.length > 0 ? `${preambles.join('\n\n')}\n\n${flat}` : flat

@@ -132,6 +132,15 @@ export function provisionProfileWorkspace(
   unsupported?: unknown[]
   workspacePlanDigest?: string
   receipt?: ProfileMaterializationReceipt
+  /**
+   * Prompt intents the plan carries as launch arguments rather than files.
+   *
+   * Returned separately from `flags` because only the caller knows its
+   * harness's flag names, and because the two must never be swapped: binding
+   * `systemPrompt` to an additive flag leaves the harness's own prompt running.
+   */
+  systemPrompt?: string
+  appendSystemPrompt?: string
 } {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
@@ -158,6 +167,10 @@ export function provisionProfileWorkspace(
       unsupported: applied.unsupported,
       workspacePlanDigest: applied.workspacePlanDigest,
       receipt,
+      ...(applied.systemPrompt === undefined ? {} : { systemPrompt: applied.systemPrompt }),
+      ...(applied.appendSystemPrompt === undefined
+        ? {}
+        : { appendSystemPrompt: applied.appendSystemPrompt }),
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
@@ -305,12 +318,36 @@ function piProfileFlags(
   // control ambient extensions separately through extensions.pi.load.
   const flags = ['--approve', '--no-context-files', '--no-skills', '--no-prompt-templates']
 
+  // Both intents go through files rather than argv text: Pi accepts a path for
+  // either flag (verified — it inlines the file's bytes and the literal path
+  // never reaches the request), and a path has no MAX_ARG_STRLEN ceiling, so a
+  // large prompt cannot turn into a spawn failure.
+  //
+  // `--system-prompt` REPLACES Pi's own prompt and `--append-system-prompt`
+  // ADDS to it; they are separate files under separate names so a reader of the
+  // spawn can tell which intent produced which bytes.
+  const writePromptFile = (name: string, content: string): string => {
+    const promptDir = join(profileRoot, '.cli-bridge')
+    const promptPath = join(promptDir, name)
+    mkdirSync(promptDir, { recursive: true })
+    writeFileSync(promptPath, content, { encoding: 'utf8', mode: 0o644, flag: 'wx' })
+    return promptPath
+  }
+
   if (plan.systemPrompt !== undefined) {
-    const systemPromptDir = join(profileRoot, '.cli-bridge')
-    const systemPromptPath = join(systemPromptDir, 'system-prompt.md')
-    mkdirSync(systemPromptDir, { recursive: true })
-    writeFileSync(systemPromptPath, plan.systemPrompt, { encoding: 'utf8', mode: 0o644, flag: 'wx' })
-    flags.push('--system-prompt', systemPromptPath)
+    flags.push('--system-prompt', writePromptFile('system-prompt.md', plan.systemPrompt))
+  }
+
+  // Emitted BEFORE the context-file loaders below, which reuse this same flag
+  // for AGENTS.md. Pi composes repeated `--append-system-prompt` values in
+  // argv order, so the profile's explicit addition leads and the lower-privilege
+  // project instructions follow it — a fixed order rather than whichever the
+  // plan's file list happened to produce.
+  if (plan.appendSystemPrompt !== undefined) {
+    flags.push(
+      '--append-system-prompt',
+      writePromptFile('append-system-prompt.md', plan.appendSystemPrompt),
+    )
   }
 
   for (let index = 0; index < applied.flags.length; index += 1) {
@@ -1589,21 +1626,116 @@ export function buildMcpAllowList(serverNames: string[]): string {
   return serverNames.map((n) => `mcp__${n}`).join(',')
 }
 
-export function resolvePromptMessages(req: ChatRequest, session: SessionRecord | null): ChatMessage[] {
-  const preamble = renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session))
+/**
+ * The native control each backend uses per prompt intent, or `null` where it
+ * has none.
+ *
+ * Measured against the installed CLIs, not inferred from their docs — every
+ * non-null entry was confirmed by reading the request the CLI actually sends:
+ *
+ *  - claude-code 2.1.222: `--system-prompt` drops the 27,673-byte built-in
+ *    prompt from the wire; `--append-system-prompt` leaves it in place and adds
+ *    the caller's text after it.
+ *  - pi 0.83.0: same split, `--system-prompt` (text or file path) replaces the
+ *    2,565-byte built-in prompt, `--append-system-prompt` keeps it.
+ *  - codex 0.146.0: `model_instructions_file` becomes the request's entire
+ *    `instructions` field. There is NO additive control — codex's AGENTS.md
+ *    lands in a developer/user message, not the system channel.
+ *  - gemini 0.26.0: `.gemini/system.md` with `GEMINI_SYSTEM_MD=1` replaces the
+ *    base prompt. Its only additive path is GEMINI.md memory, which is the
+ *    `instructions` surface.
+ *
+ * Everything else is `null` on both intents, INCLUDING the backends whose
+ * prompt path is a `role: 'system'` message. That message is flattened into
+ * the user turn before the CLI ever sees it, so it is not a system-prompt
+ * channel at all: honoring either intent through it would mean the caller's
+ * text arrives as ordinary user content while the harness's own prompt runs
+ * unchanged. Unknown backend names fall through to the same refusal, so a new
+ * backend cannot inherit a capability by omission.
+ */
+const HARNESS_PROMPT_CONTROLS: Record<string, { replace: string | null; append: string | null }> = {
+  'claude-code': { replace: '--system-prompt', append: '--append-system-prompt' },
+  claude: { replace: '--system-prompt', append: '--append-system-prompt' },
+  pi: { replace: '--system-prompt', append: '--append-system-prompt' },
+  codex: { replace: '-c model_instructions_file=<file>', append: null },
+  gemini: { replace: '.gemini/system.md', append: null },
+  // opencode composes its `instructions[]` files into the same system message
+  // as its built-in prompt, which stays in place — a real additive channel. Its
+  // replacement control (`agent.<name>.prompt`) binds to one agent chosen at
+  // launch, which a workspace plan cannot guarantee, so replacement is refused.
+  opencode: { replace: null, append: 'opencode.json instructions[]' },
+}
+
+const NO_PROMPT_CONTROLS = { replace: null, append: null } as const
+
+/**
+ * Refuse a prompt intent the backend cannot execute, before anything spawns.
+ *
+ * The materializer already fails closed for backends that run a profile plan,
+ * but several backends (acp, factory, nanoclaw) never materialize one and would
+ * otherwise drop the intent in silence. This is the single seam every prompt
+ * path passes through, so the refusal fires for all of them.
+ */
+export function assertProfilePromptIntentsSupported(
+  profile: AgentProfile | null,
+  backend: string,
+): void {
+  if (!profile || typeof profile !== 'object') return
+  const prompt = (profile as { prompt?: { systemPrompt?: unknown; appendSystemPrompt?: unknown } }).prompt
+  if (!prompt || typeof prompt !== 'object') return
+  const controls = HARNESS_PROMPT_CONTROLS[backend] ?? NO_PROMPT_CONTROLS
+
+  if (typeof prompt.systemPrompt === 'string' && controls.replace === null) {
+    throw new BackendError(
+      `backend ${backend} cannot replace its harness's system prompt: agent_profile.prompt.systemPrompt `
+      + 'deletes the harness\'s own prompt, and this backend has no control that does that. '
+      + 'Use agent_profile.prompt.instructions for additive context, or run a backend that does '
+      + `(${Object.entries(HARNESS_PROMPT_CONTROLS)
+        .filter(([, c]) => c.replace !== null)
+        .map(([name]) => name)
+        .join(', ')}).`,
+      'not_configured',
+    )
+  }
+  if (typeof prompt.appendSystemPrompt === 'string' && controls.append === null) {
+    throw new BackendError(
+      `backend ${backend} cannot add to its harness's system prompt: agent_profile.prompt.appendSystemPrompt `
+      + 'must reach the same privileged position as the system prompt, and this backend has no control '
+      + 'that puts it there. Use agent_profile.prompt.instructions for the project-instruction surface, '
+      + `or run a backend that does (${Object.entries(HARNESS_PROMPT_CONTROLS)
+        .filter(([, c]) => c.append !== null)
+        .map(([name]) => name)
+        .join(', ')}).`,
+      'not_configured',
+    )
+  }
+}
+
+export function resolvePromptMessages(
+  req: ChatRequest,
+  session: SessionRecord | null,
+  backend: string,
+): ChatMessage[] {
+  const profile = resolveAgentProfile(req, session)
+  assertProfilePromptIntentsSupported(profile, backend)
+  const preamble = renderLocalHarnessProfilePreamble(profile)
   if (!preamble) return req.messages
   return [{ role: 'system', content: preamble }, ...req.messages]
 }
 
+/**
+ * Summarize the profile's declared surfaces for the model.
+ *
+ * Deliberately carries NO prompt text. `prompt.systemPrompt` used to be folded
+ * in here, which made every backend that renders this preamble an additive
+ * channel for a field that means replacement — the harness's own prompt stayed
+ * in force and nothing in the result said so. Both prompt intents now travel
+ * through the harness's own control (see {@link HARNESS_PROMPT_CONTROLS}) or
+ * are refused; this preamble is only the informational summary that remains.
+ */
 export function renderLocalHarnessProfilePreamble(profile: AgentProfile | null): string | null {
   if (!profile || typeof profile !== 'object') return null
   const sections: string[] = []
-
-  const systemPrompt = pickString(
-    (profile as Record<string, unknown>).systemPrompt,
-    ((profile as Record<string, unknown>).prompt as Record<string, unknown> | undefined)?.systemPrompt,
-  )
-  if (systemPrompt) sections.push(systemPrompt)
 
   const skills = pickStringArray((profile as Record<string, unknown>).skills)
   if (skills.length) {

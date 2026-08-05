@@ -1068,21 +1068,21 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
   it('agent_profile preamble routes to argv, NOT stdin', () => {
     // Default path: system content fits in argv. Confirm
     // composeStdinInput keeps user content clean.
-    const { messages } = b.composeStdinInput(
-      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
-      null,
-    )
+    const profiled = {
+      ...baseReq,
+      agent_profile: { name: 'x', permissions: { edit: 'allow' } } as any,
+    }
+    const { messages } = b.composeStdinInput(profiled, null)
     expect(messages[0]?.content).toBe('summarize')
-    expect(messages[0]?.content).not.toContain('Be precise.')
-    // The profile preamble goes to --append-system-prompt — verified by buildArgs:
-    const args = b.buildArgs(
-      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
-      null,
-      'byob',
-    )
+    expect(messages[0]?.content).not.toContain('permission posture')
+    // The profile surface summary goes to --append-system-prompt. Note what is
+    // NOT here: prompt.systemPrompt. It REPLACES claude-code's own prompt, so
+    // it rides --system-prompt (see tests/prompt-intent.test.ts) and can never
+    // arrive as an addition, which would leave the built-in prompt running.
+    const args = b.buildArgs(profiled, null, 'byob')
     const i = args.indexOf('--append-system-prompt')
     expect(i).toBeGreaterThan(-1)
-    expect(args[i + 1]).toContain('Be precise.')
+    expect(args[i + 1]).toContain('permission posture')
   })
 
   it('falls back to [SYSTEM INSTRUCTIONS] wrapper when system content exceeds argv cap', () => {
@@ -1090,10 +1090,17 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     // typically reject this as injection-shaped, but the spawn still
     // succeeds — better than spawn E2BIG. This is the degraded
     // failsafe path.
-    const enormousProfilePrompt = 'A'.repeat(125 * 1024)
+    // An oversized ADDITIVE source. The replacement intent cannot exercise this
+    // path any more: it rides --system-prompt, which is a separate argument
+    // with its own budget, and wrapping a replacement into user content would
+    // stop it replacing anything at all.
+    const enormousSystemMessage = 'A'.repeat(125 * 1024)
     const req = {
       ...baseReq,
-      agent_profile: { name: 'x', prompt: { systemPrompt: enormousProfilePrompt } } as any,
+      messages: [
+        { role: 'system' as const, content: enormousSystemMessage },
+        ...baseReq.messages,
+      ],
     }
     // argv should NOT carry --append-system-prompt because it overflows.
     const args = b.buildArgs(req, null, 'byob')
@@ -1134,11 +1141,23 @@ describe('KimiBackend JSON mode (buildPrompt)', () => {
 
   it('prepends profile-derived context for local harnesses', () => {
     const prompt = b.buildPrompt(
-      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      { ...baseReq, agent_profile: { name: 'x', permissions: { edit: 'allow' } } as any },
       null,
     )
-    expect(prompt).toContain('Be precise.')
+    expect(prompt).toContain('permission posture')
     expect(prompt).toContain('summarize this repo')
+  })
+
+  it('refuses a system-prompt replacement instead of flattening it into the prompt', () => {
+    // kimi has no system-prompt control of either kind, and this prompt string
+    // becomes the USER turn. Accepting the field here would ship the caller's
+    // replacement as ordinary user text while kimi's own prompt kept running.
+    expect(() =>
+      b.buildPrompt(
+        { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+        null,
+      ),
+    ).toThrow(/cannot replace its harness's system prompt/)
   })
 })
 
