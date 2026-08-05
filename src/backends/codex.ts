@@ -83,7 +83,7 @@ export class CodexBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'codex hosted-safe requires verified --sandbox read-only audit')
 
-    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
+    const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
     const modelArg = this.extractModel(req.model)
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,

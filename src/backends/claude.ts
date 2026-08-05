@@ -176,13 +176,14 @@ export class ClaudeBackend implements Backend {
     // JSON-mode directive, etc.) goes through --append-system-prompt
     // regardless of which user-message transport is chosen — see
     // buildArgs/composeStdinInput.
-    const stdinInput = this.composeStdinInput(req, session)
-    const userText = stdinInput.messages[0]?.content ?? ''
-    const PROMPT_ARGV_LIMIT = 120 * 1024
-    const userFitsInArgv = Buffer.byteLength(userText, 'utf8') <= PROMPT_ARGV_LIMIT
-
     // Validate and apply the profile before allocating request-scoped MCP
     // files. A rejected plan must never strand a config containing secrets.
+    //
+    // Ordered before composeStdinInput because the profile's additive prompt is
+    // part of the system content whose size decides argv-vs-stdin. Composing
+    // stdin against a smaller block than buildArgs will emit lets the two
+    // disagree at the cap, and the disagreement drops the system content from
+    // BOTH transports rather than degrading it into the user message.
     const appliedReasoningEffort = claudeEffort(
       resolveRequestedReasoningEffort(req, session) ?? undefined,
     )
@@ -193,6 +194,19 @@ export class ClaudeBackend implements Backend {
       cwd,
       profileExecutionIdentity(req, session, 'claude-code', appliedReasoningEffort),
     )
+    const profilePrompt = {
+      ...(provisioned.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: provisioned.systemPrompt }),
+      ...(provisioned.appendSystemPrompt === undefined
+        ? {}
+        : { appendSystemPrompt: provisioned.appendSystemPrompt }),
+    }
+
+    const stdinInput = this.composeStdinInput(req, session, profilePrompt)
+    const userText = stdinInput.messages[0]?.content ?? ''
+    const PROMPT_ARGV_LIMIT = 120 * 1024
+    const userFitsInArgv = Buffer.byteLength(userText, 'utf8') <= PROMPT_ARGV_LIMIT
 
     // Materialize MCP servers (if any) into a temp config file BEFORE
     // building args — buildArgs needs the path. Tracked so we can clean
@@ -205,6 +219,7 @@ export class ClaudeBackend implements Backend {
     )
     const args = this.buildArgs(req, session, mode, mcpMaterialized, {
       userTextForArgv: userFitsInArgv ? userText : undefined,
+      profilePrompt,
     })
 
     const childEnv: NodeJS.ProcessEnv = { ...process.env }
@@ -385,7 +400,11 @@ export class ClaudeBackend implements Backend {
     session: SessionRecord | null,
     mode: BridgeMode,
     mcp?: MaterializedMcpConfig | null,
-    opts?: { userTextForArgv?: string },
+    opts?: {
+      userTextForArgv?: string
+      /** Prompt intents the profile plan carries, each bound to its own flag below. */
+      profilePrompt?: { systemPrompt?: string; appendSystemPrompt?: string }
+    },
   ): string[] {
     // Two transport modes — see chat() for the rationale:
     //   - argv (`-p <text>`):       single-shot text mode. Used when user
@@ -399,11 +418,28 @@ export class ClaudeBackend implements Backend {
     const effort = claudeEffort(resolveRequestedReasoningEffort(req, session) ?? undefined)
     if (effort) args.push('--effort', effort)
 
-    // Fold every system source into --append-system-prompt so
-    // claude-code-cli applies them as a real system slot. Sources:
-    //   1. Caller's role:'system' messages (AI SDK sends them this way)
-    //   2. agent_profile.prompt.systemPrompt preamble
-    //   3. JSON-mode directive (when responseFormat: json_object)
+    // agent_profile.prompt.systemPrompt REPLACES claude-code's own system
+    // prompt, so it goes to `--system-prompt` and nowhere else. Folding it in
+    // with the additive block below (which this code used to do) left the
+    // 27,673-byte built-in prompt on the wire while the caller believed it was
+    // deleted — verified against claude-code 2.1.222: `--system-prompt` drops
+    // the built-in prompt, `--append-system-prompt` keeps it.
+    if (opts?.profilePrompt?.systemPrompt !== undefined) {
+      args.push('--system-prompt', opts.profilePrompt.systemPrompt)
+    }
+
+    // Fold every ADDITIVE system source into ONE --append-system-prompt.
+    // One, not several: claude-code-cli takes the LAST occurrence of the flag
+    // and silently discards earlier ones (verified on the wire — two
+    // --append-system-prompt values arrive as only the second), so a second
+    // occurrence would drop whichever source lost the race. Sources, in the
+    // order they compose:
+    //   1. agent_profile.prompt.appendSystemPrompt — the profile's own
+    //      addition, which is session-level configuration
+    //   2. Caller's role:'system' messages (AI SDK sends them this way)
+    //   3. Profile surface summary (skills/MCP/resources/permissions)
+    //   4. JSON-mode directive (when responseFormat: json_object), last so
+    //      nothing above can restate the output contract after it
     //
     // Why not stdin: an earlier version of this code flattened the
     // whole messages[] array (including role:'system') with `[role]`
@@ -425,6 +461,7 @@ export class ClaudeBackend implements Backend {
       .map((m) => contentToText(m.content))
       .filter((s) => s.length > 0)
     const systemBlocks = [
+      opts?.profilePrompt?.appendSystemPrompt ?? null,
       ...systemMessages,
       renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
       wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
@@ -525,12 +562,21 @@ export class ClaudeBackend implements Backend {
   composeStdinInput(
     req: ChatRequest,
     session: SessionRecord | null,
+    profilePrompt?: { systemPrompt?: string; appendSystemPrompt?: string },
   ): { messages: Array<{ role: 'user'; content: string }> } {
     const systemMessages = (req.messages ?? [])
       .filter((m) => m.role === 'system')
       .map((m) => contentToText(m.content))
       .filter((s) => s.length > 0)
+    // Mirrors buildArgs's additive block exactly, including the profile's
+    // addition and its leading position — this function's only job is to
+    // predict whether that block fits argv, and a different block predicts the
+    // wrong answer. `profilePrompt.systemPrompt` is deliberately absent: it
+    // rides `--system-prompt`, which has no interaction with this cap and must
+    // never be wrapped into user content, where it would stop replacing
+    // anything.
     const systemBlocks = [
+      profilePrompt?.appendSystemPrompt ?? null,
       ...systemMessages,
       renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
       wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,

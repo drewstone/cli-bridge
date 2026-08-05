@@ -78,7 +78,7 @@ export class OpencodeBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
-    const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
+    const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'opencode'))
     const model = this.extractModel(req.model)
 
     // Reject unsupported profile plans before writing a request-scoped
