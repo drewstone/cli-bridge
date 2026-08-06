@@ -452,12 +452,26 @@ function assertNetJailEnforceable(
     (name) => !NON_HOST_SPAWN_BACKENDS.has(name) && executors[name]?.kind !== 'docker',
   )
   if (hostSpawned.length > 0) {
+    // <NAME>_EXECUTOR=docker is only a real remedy for backends with a docker execution
+    // mode; suggesting it for the rest sends the operator in a loop on the same refusal.
+    const dockerCapable = hostSpawned.filter((n) => SUPPORTED_EXECUTOR_BACKENDS.includes(n))
+    const hostOnly = hostSpawned.filter((n) => !SUPPORTED_EXECUTOR_BACKENDS.includes(n))
+    const remedies = [
+      ...(dockerCapable.length > 0
+        ? ['set ' + dockerCapable.map((n) => `${n.toUpperCase()}_EXECUTOR=docker`).join(' / ')]
+        : []),
+      ...(hostOnly.length > 0
+        ? [
+            `${hostOnly.join(', ')} ${hostOnly.length === 1 ? 'has' : 'have'} no docker execution mode — ` +
+              'drop it from BRIDGE_BACKENDS',
+          ]
+        : []),
+    ]
     throw new Error(
       `net-jail is enabled (BRIDGE_NET_JAIL_MODE / WORKER_NET_JAIL) but ${hostSpawned.join(', ')} ` +
         `${hostSpawned.length === 1 ? 'runs' : 'run'} on the host execution mode, which cannot enforce it: a ` +
         'host-spawned CLI shares this machine\'s network namespace and any proxy variable it is given can be ' +
-        'unset. Set ' + hostSpawned.map((n) => `${n.toUpperCase()}_EXECUTOR=docker`).join(' / ') +
-        ', drop those backends from BRIDGE_BACKENDS, or unset the net-jail. Refusing to start with a network ' +
+        `unset. ${remedies.join('; or ')}, or unset the net-jail. Refusing to start with a network ` +
         'policy that would not be applied.',
     )
   }
