@@ -97,6 +97,7 @@ pnpm install:harnesses      # all harnesses
 | `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
 | `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
 | `pi` | `npm install -g @earendil-works/pi-coding-agent` | Explicit provider/model config in `~/.pi/agent/models.json`; cli-bridge resolves its credential before spawn |
+| `prime` | prime-agent, the `@earendil-works` pi fork; its installed bin is `pi`, so point `PRIME_BIN` at that binary (the `prime-agent` default fails closed rather than driving upstream pi) | Operator `models.json` named by `PRIME_MODELS_JSON`, materialized into an isolated per-run agent dir; only the apiKey env vars it names are forwarded |
 | `passthrough` | (none) | provider API keys in `.env` |
 
 For a Nix-provisioned host shell with the shared prerequisites:
@@ -141,7 +142,7 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
-- local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`) persist the full profile and reject profile dimensions they cannot execute
+- local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`, `prime`) persist the full profile and reject profile dimensions they cannot execute
 - Pi requires `pi/<provider>/<model>`. The provider and model must have an explicit `baseUrl` and API mode in Pi's `models.json`; the bridge refuses missing or ambiguous selections before Pi starts
 - Pi model traffic uses a request-scoped local forwarder. The Pi process, its Bash tools, and descendants receive only a short-lived local token—not daemon provider or GitHub credentials—and the forwarder closes when the run ends. Request bodies and non-authentication headers pass through unchanged, including provider prompt-caching controls. Exact-model inspection defaults to a 256 MiB request maximum; callers can raise it with `maxInferenceRequestBytes`, and operators can set `CLI_BRIDGE_PI_MAX_REQUEST_BYTES`
 - Pi's isolated transport requires `PI_EXECUTOR=host` plus `execution.jail.mode=fs-jail` on a Linux host with bubblewrap. The bridge refuses before credential resolution when real read isolation is unavailable, and `BRIDGE_JAIL_FALLBACK=warn` cannot downgrade a Pi request. Docker refuses because its separate network cannot reach the bridge's loopback address without reintroducing mounted provider credentials
@@ -153,6 +154,11 @@ Behavior:
 - when Pi runs inside the OS filesystem jail, the executor translates each installed-package path only after confinement is confirmed; host, Docker, and explicit unconfined-fallback paths keep their normal argv
 - an EMPTY `load` list (`"extensions": { "pi": { "load": [] } }`) is the complete-isolation request: `--no-extensions` and nothing else, so no installed extension loads. Use it when a run must not inherit state an extension persists across runs — a paired experiment whose two arms share such an extension is silently unpaired, and nothing in the response reports it
 - Pi rejects generic profile file mounts because Pi has no request-scoped loader that can preserve their declared task-relative paths
+- Prime requires `prime/<provider>/<model>`; the run binds to a provider entry in the materialized `models.json` before the CLI starts
+- Prime drives prime-agent's `--mode rpc` inside an owned in-process worker — no shared background daemon — and pins a bridge-owned HOME + agent dir per run, so the fork's persistent self-modification state (`harness/harness_state.json`, which rides every future system prompt) never crosses runs. `PRIME_PERSISTENT_AGENT_DIR` is the explicit opt-in to shared state and cannot be combined with `PRIME_MODELS_JSON`
+- Prime's child environment is a neutral allowlist: ambient provider keys never reach the CLI or its tools; only the apiKey env vars named by the effective `models.json` are forwarded. `PRIME_AGENT_INSTALL_UV`, `PRIME_AGENT_KERNEL_PYTHON`, and `PRIME_AGENT_KERNEL_VENV` pass through so an operator-prepared Python kernel survives the HOME isolation
+- Prime sends request images through the rpc `prompt` command's native `images` field; profile prompt intents ride `--system-prompt` / `--append-system-prompt`; request-scoped MCP is refused (`not_configured`) because the fork has no per-invocation MCP loader
+- Prime sessions keep one stable state dir per bridge session and resume with `--continue` against that session's exclusive `--session-dir`; a failed provider call or dead IPython kernel surfaces as a typed error, never a silent empty completion
 
 Example:
 

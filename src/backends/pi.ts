@@ -881,7 +881,11 @@ export class PiBackend implements Backend {
   }
 }
 
-interface PiUsageReceipt {
+// The usage/receipt/tool-call helpers below are exported for the prime
+// backend: prime-agent is a fork of Pi and emits the same AgentEvent lineage
+// (message_update / turn_end / agent_end), so both backends parse through one
+// implementation instead of drifting copies.
+export interface PiUsageReceipt {
   input?: number
   freshInput?: number
   cacheRead?: number
@@ -890,7 +894,7 @@ interface PiUsageReceipt {
   estimatedCost?: number
 }
 
-interface PiUsageCost {
+export interface PiUsageCost {
   receipts: number
   total: number
   complete: boolean
@@ -905,7 +909,7 @@ interface PiUsageCost {
  *
  *  `aborted` is deliberately NOT a failure here: the caller's `AbortSignal` already owns that
  *  path and reports `finish_reason: 'error'` before this is consulted. */
-function piAssistantFailure(message: unknown): string | null {
+export function piAssistantFailure(message: unknown): string | null {
   const value = record(message)
   if (!value) return null
   const stopReason = typeof value.stopReason === 'string' ? value.stopReason : undefined
@@ -916,11 +920,11 @@ function piAssistantFailure(message: unknown): string | null {
 
 /** Auth/scope failures are a local credential problem, not a transient upstream one, whether they
  *  arrive on pi's stderr or in the provider's error body. */
-function piFailureKind(detail: string): 'not_configured' | 'upstream' {
+export function piFailureKind(detail: string): 'not_configured' | 'upstream' {
   return /401|403|token expired|forbidden|unauthorized/i.test(detail) ? 'not_configured' : 'upstream'
 }
 
-function piUsageReceiptsFromEvent(ev: Record<string, unknown>): PiUsageReceipt[] {
+export function piUsageReceiptsFromEvent(ev: Record<string, unknown>): PiUsageReceipt[] {
   const message = record(ev.message)
   const partial = record(ev.partial)
   const direct = record(ev.usage) ?? record(message?.usage) ?? record(partial?.usage)
@@ -986,7 +990,7 @@ function piUsageFromRecord(usage: Record<string, unknown>): PiUsageReceipt | und
   }
 }
 
-function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['usage']> {
+export function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['usage']> {
   return {
     ...(receipt.input !== undefined ? { input_tokens: receipt.input } : {}),
     ...(receipt.freshInput !== undefined ? { fresh_input_tokens: receipt.freshInput } : {}),
@@ -996,7 +1000,7 @@ function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['usage']> 
   }
 }
 
-function recordPiUsageCost(total: PiUsageCost, receipt: PiUsageReceipt): void {
+export function recordPiUsageCost(total: PiUsageCost, receipt: PiUsageReceipt): void {
   total.receipts += 1
   if (receipt.estimatedCost === undefined) {
     total.complete = false
@@ -1049,7 +1053,7 @@ function extractTextFromPartial(partial: unknown): string {
 
 type ToolCallDelta = NonNullable<ChatDelta['tool_calls']>[number]
 
-class PiToolCallTracker {
+export class PiToolCallTracker {
   private readonly emitted = new Set<string>()
   private readonly byIndex = new Map<number, string>()
   private nextSyntheticId = 0

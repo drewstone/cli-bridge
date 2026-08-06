@@ -40,6 +40,16 @@ export interface Config {
   nanoclawSocket: string
   piBin: string
   piTimeoutMs: number
+  primeBin: string
+  primeTimeoutMs: number
+  /** Operator models.json materialized into every isolated prime agent dir. Null = none configured. */
+  primeModelsJson: string | null
+  /**
+   * Operator-owned prime agent dir shared across runs — the explicit opt-in to
+   * prime-agent's persistent self-modification state (harness_state.json rides
+   * every future system prompt). Null = every run gets a fresh agent dir.
+   */
+  primePersistentAgentDir: string | null
   cliTimeoutMsDefault: number
   admission: {
     maxActive: number
@@ -282,6 +292,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     nanoclawSocket: env.NANOCLAW_SOCKET ?? '',
     piBin: env.PI_BIN ?? 'pi',
     piTimeoutMs: parseExecutionTimeoutMs('PI_TIMEOUT_MS', env.PI_TIMEOUT_MS, defaultTimeout),
+    primeBin: env.PRIME_BIN ?? 'prime-agent',
+    primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),
+    ...parsePrimeStateConfig(env, backends),
     cliTimeoutMsDefault: defaultTimeout,
     admission: {
       maxActive: parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8),
@@ -344,6 +357,64 @@ function parseOnOff(name: string, value: string | undefined, fallback: boolean):
   throw new Error(`invalid ${name}: ${value} — expected on|off`)
 }
 
+/**
+ * PRIME_MODELS_JSON / PRIME_PERSISTENT_AGENT_DIR — validated here so a broken
+ * or ignored setting fails the start instead of the first request. Deep schema
+ * validation of the models.json happens in the PrimeBackend constructor, which
+ * shares the fork's own comment-tolerant parser.
+ */
+function parsePrimeStateConfig(
+  env: NodeJS.ProcessEnv,
+  backends: Set<string>,
+): Pick<Config, 'primeModelsJson' | 'primePersistentAgentDir'> {
+  const modelsJson = env.PRIME_MODELS_JSON?.trim() || null
+  const persistentAgentDir = env.PRIME_PERSISTENT_AGENT_DIR?.trim() || null
+  if (modelsJson && persistentAgentDir) {
+    throw new Error(
+      'PRIME_MODELS_JSON and PRIME_PERSISTENT_AGENT_DIR are both set — a persistent agent dir owns its own ' +
+        'models.json, and materializing over it would silently clobber operator config. Unset one.',
+    )
+  }
+  for (const [key, value] of [
+    ['PRIME_MODELS_JSON', modelsJson],
+    ['PRIME_PERSISTENT_AGENT_DIR', persistentAgentDir],
+  ] as const) {
+    if (value && !backends.has('prime')) {
+      throw new Error(
+        `${key} is set but "prime" is not in BRIDGE_BACKENDS — the setting would be ignored. ` +
+          `Add prime to BRIDGE_BACKENDS, or remove ${key}.`,
+      )
+    }
+  }
+  if (modelsJson) {
+    let stat
+    try {
+      stat = statSync(modelsJson)
+    } catch {
+      throw new Error(`invalid PRIME_MODELS_JSON: path does not exist: ${modelsJson}`)
+    }
+    if (!stat.isFile()) throw new Error(`invalid PRIME_MODELS_JSON: not a file: ${modelsJson}`)
+  }
+  if (persistentAgentDir) {
+    if (!isAbsolute(persistentAgentDir)) {
+      throw new Error(`invalid PRIME_PERSISTENT_AGENT_DIR: expected an absolute path, got ${persistentAgentDir}`)
+    }
+    let stat
+    try {
+      stat = statSync(persistentAgentDir)
+    } catch {
+      throw new Error(`invalid PRIME_PERSISTENT_AGENT_DIR: path does not exist: ${persistentAgentDir}`)
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`invalid PRIME_PERSISTENT_AGENT_DIR: not a directory: ${persistentAgentDir}`)
+    }
+  }
+  return {
+    primeModelsJson: modelsJson ? resolve(modelsJson) : null,
+    primePersistentAgentDir: persistentAgentDir ? resolve(persistentAgentDir) : null,
+  }
+}
+
 function parseJailMode(value: string | undefined): 'off' | 'write-jail' | 'fs-jail' {
   if (value === undefined || value === '') return 'off'
   if (value === 'off' || value === 'write-jail' || value === 'fs-jail') return value
@@ -381,12 +452,26 @@ function assertNetJailEnforceable(
     (name) => !NON_HOST_SPAWN_BACKENDS.has(name) && executors[name]?.kind !== 'docker',
   )
   if (hostSpawned.length > 0) {
+    // <NAME>_EXECUTOR=docker is only a real remedy for backends with a docker execution
+    // mode; suggesting it for the rest sends the operator in a loop on the same refusal.
+    const dockerCapable = hostSpawned.filter((n) => SUPPORTED_EXECUTOR_BACKENDS.includes(n))
+    const hostOnly = hostSpawned.filter((n) => !SUPPORTED_EXECUTOR_BACKENDS.includes(n))
+    const remedies = [
+      ...(dockerCapable.length > 0
+        ? ['set ' + dockerCapable.map((n) => `${n.toUpperCase()}_EXECUTOR=docker`).join(' / ')]
+        : []),
+      ...(hostOnly.length > 0
+        ? [
+            `${hostOnly.join(', ')} ${hostOnly.length === 1 ? 'has' : 'have'} no docker execution mode — ` +
+              'drop it from BRIDGE_BACKENDS',
+          ]
+        : []),
+    ]
     throw new Error(
       `net-jail is enabled (BRIDGE_NET_JAIL_MODE / WORKER_NET_JAIL) but ${hostSpawned.join(', ')} ` +
         `${hostSpawned.length === 1 ? 'runs' : 'run'} on the host execution mode, which cannot enforce it: a ` +
         'host-spawned CLI shares this machine\'s network namespace and any proxy variable it is given can be ' +
-        'unset. Set ' + hostSpawned.map((n) => `${n.toUpperCase()}_EXECUTOR=docker`).join(' / ') +
-        ', drop those backends from BRIDGE_BACKENDS, or unset the net-jail. Refusing to start with a network ' +
+        `unset. ${remedies.join('; or ')}, or unset the net-jail. Refusing to start with a network ` +
         'policy that would not be applied.',
     )
   }
