@@ -1,17 +1,21 @@
 import { execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  hasPrimeProfileMaterial,
+  materializePrimeProfileAgentDir,
   parsePrimeModelsJson,
   primeApiKeyEnv,
   PrimeBackend,
   primeProcessEnvironment,
   primeThinkingFlagForEffort,
+  resolvePrimeProfileDimensions,
 } from '../src/backends/prime.js'
+import type { AgentProfile } from '@tangle-network/agent-interface'
 import { BackendError } from '../src/backends/types.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { loadConfig } from '../src/config.js'
@@ -415,7 +419,42 @@ describe('PrimeBackend', () => {
       },
       null,
       new AbortController().signal,
-    ))).rejects.toThrowError(/cannot mount request-scoped MCP servers.*coordination/)
+    ))).rejects.toThrowError(/cannot mount MCP servers.*coordination/)
+  })
+
+  it('rejects agent_profile.mcp instead of silently dropping it', async () => {
+    const backend = newBackend(primeSpawner([], []))
+    await expect(collect(backend.chat(
+      {
+        model: 'prime/tangle/glm-5.2',
+        messages: [{ role: 'user', content: 'TASK' }],
+        agent_profile: {
+          model: { provider: 'tangle', default: 'glm-5.2' },
+          mcp: { linear: { transport: 'http', url: 'https://mcp.linear.app/mcp' } },
+        },
+      },
+      null,
+      new AbortController().signal,
+    ))).rejects.toThrowError(/cannot mount MCP servers.*linear/)
+  })
+
+  it('treats a fully disabled agent_profile.mcp map as no MCP request', async () => {
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
+    const deltas = await collect(backend.chat(
+      {
+        model: 'prime/tangle/glm-5.2',
+        messages: [{ role: 'user', content: 'TASK' }],
+        agent_profile: {
+          model: { provider: 'tangle', default: 'glm-5.2' },
+          mcp: { linear: { enabled: false } },
+        },
+      },
+      null,
+      new AbortController().signal,
+    ))
+    expect(captures).toHaveLength(1)
+    expect(deltas.at(-1)).toEqual({ finish_reason: 'stop' })
   })
 
   it('binds profile prompt intents to --system-prompt / --append-system-prompt', async () => {
@@ -451,6 +490,28 @@ describe('PrimeBackend', () => {
       null,
       new AbortController().signal,
     ))).rejects.toThrowError(/agent_profile\.harness "pi" conflicts with backend prime/)
+  })
+
+  it('runs a profile pinned to harness "prime" (interface 0.45 enum)', async () => {
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
+    const deltas = await collect(backend.chat(
+      {
+        model: 'prime/tangle/glm-5.2',
+        messages: [{ role: 'user', content: 'TASK' }],
+        agent_profile: {
+          harness: 'prime',
+          model: { provider: 'tangle', default: 'glm-5.2' },
+          prompt: { appendSystemPrompt: 'PINNED_TO_PRIME' },
+        },
+      },
+      null,
+      new AbortController().signal,
+    ))
+    expect(captures).toHaveLength(1)
+    const args = captures[0]!.args
+    expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('PINNED_TO_PRIME')
+    expect(deltas.at(-1)).toEqual({ finish_reason: 'stop' })
   })
 
   it('refuses a profile whose model disagrees with the wire model', async () => {
@@ -581,6 +642,280 @@ describe('PrimeBackend', () => {
     expect(env.HOME).toBe('/isolated/home')
     expect(env.OPENAI_API_KEY).toBeUndefined()
     expect(env.XDG_DATA_HOME).toBeUndefined()
+  })
+})
+
+describe('PrimeBackend profile dimensions', () => {
+  async function chatWithProfile(
+    profile: AgentProfile,
+    sessionId?: string,
+    backend?: PrimeBackend,
+    captures: SpawnCapture[] = [],
+  ): Promise<{ backend: PrimeBackend; captures: SpawnCapture[] }> {
+    const b = backend ?? newBackend(primeSpawner(HAPPY_STREAM, captures))
+    await collect(b.chat(
+      {
+        model: 'prime/tangle/glm-5.2',
+        messages: [{ role: 'user', content: 'TASK' }],
+        agent_profile: profile,
+        ...(sessionId ? { session_id: sessionId } : {}),
+      },
+      null,
+      new AbortController().signal,
+    ))
+    return { backend: b, captures }
+  }
+
+  it('rejects every profile control the fork verifiably cannot honor', async () => {
+    const rejected: Array<[AgentProfile, RegExp]> = [
+      [{ permissions: { bash: 'deny' } }, /agent_profile\.permissions is not supported by backend prime/],
+      [{ tools: { ipython: false } }, /agent_profile\.tools is not supported by backend prime/],
+      [{ hooks: { preToolUse: [{ command: 'echo hi' }] } }, /agent_profile\.hooks is not supported by backend prime/],
+      [{ modes: { review: { prompt: 'review' } } }, /agent_profile\.modes is not supported by backend prime/],
+      [
+        { connections: [{ connectionId: 'c1', capabilities: ['gmail.read'] }] },
+        /agent_profile\.connections is not supported by backend prime/,
+      ],
+      [{ confidential: {} }, /agent_profile\.confidential is not supported by backend prime/],
+      [
+        { resources: { files: [{ path: 'x.txt', resource: { kind: 'inline', name: 'x', content: 'hi' } }] } },
+        /agent_profile\.resources\.files is not supported by backend prime/,
+      ],
+      [
+        { resources: { tools: [{ kind: 'inline', name: 'x', content: 'hi' }] } },
+        /agent_profile\.resources\.tools is not supported by backend prime/,
+      ],
+      [
+        { resources: { agents: [{ kind: 'inline', name: 'x', content: 'hi' }] } },
+        /agent_profile\.resources\.agents is not supported by backend prime/,
+      ],
+      [
+        { resources: { commands: [{ kind: 'inline', name: 'x', content: 'hi' }] } },
+        /agent_profile\.resources\.commands is not supported by backend prime/,
+      ],
+      [
+        { resources: { skills: [{ kind: 'github', path: 'skills/foo' }] } },
+        /agent_profile\.resources\.skills\[0\] is not supported by backend prime.*GitHub/,
+      ],
+      [
+        { resources: { instructions: { kind: 'github', path: 'docs/AGENTS.md' } } },
+        /agent_profile\.resources\.instructions is not supported by backend prime.*GitHub/,
+      ],
+      [
+        { subagents: { helper: { prompt: 'do it', model: 'tangle/glm-5.2' } } },
+        /agent_profile\.subagents\["helper"\]\.model is not supported by backend prime/,
+      ],
+      [
+        { subagents: { helper: { prompt: 'do it', maxSteps: 5 } } },
+        /agent_profile\.subagents\["helper"\]\.maxSteps is not supported by backend prime/,
+      ],
+      [
+        { extensions: { prime: { magic: true } } },
+        /agent_profile\.extensions\.prime is not supported by backend prime.*magic/,
+      ],
+    ]
+    for (const [profile, pattern] of rejected) {
+      await expect(chatWithProfile(profile), JSON.stringify(profile)).rejects.toThrowError(pattern)
+    }
+  })
+
+  it('ignores other backends\' extension namespaces per the extensions contract', async () => {
+    const { captures } = await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      extensions: { pi: { load: [] } },
+    })
+    expect(captures).toHaveLength(1)
+  })
+
+  it('refuses malformed skill and subagent declarations before provisioning anything', () => {
+    expect(() => resolvePrimeProfileDimensions({
+      resources: { skills: [{ kind: 'inline', name: 'Bad_Name', content: 'x' }] },
+    })).toThrowError(/not a valid prime skill name/)
+    expect(() => resolvePrimeProfileDimensions({
+      resources: {
+        skills: [
+          { kind: 'inline', name: 'dupe', content: 'a' },
+          { kind: 'inline', name: 'dupe', content: 'b' },
+        ],
+      },
+    })).toThrowError(/declares "dupe" twice/)
+    expect(() => resolvePrimeProfileDimensions({
+      subagents: { helper: { metadata: { note: 'no behavior' } } },
+    })).toThrowError(/declares no behavior/)
+    expect(() => resolvePrimeProfileDimensions({
+      subagents: { 'my agent': { prompt: 'a' }, my_agent: { prompt: 'b' } },
+    })).toThrowError(/collide on harness-state id "my_agent"/)
+  })
+
+  it('materializes instructions, inline skills, and subagents into the per-session agent dir', async () => {
+    const captures: SpawnCapture[] = []
+    await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      prompt: { instructions: ['Always run the linter.', 'Prefer small diffs.'] },
+      resources: {
+        skills: [{
+          kind: 'inline',
+          name: 'release-check',
+          content: '---\ndescription: Verify releases before shipping\n---\n\nRun the release checklist.',
+        }],
+        instructions: 'Repository conventions apply.',
+      },
+      subagents: {
+        'code reviewer': { description: 'Reviews diffs.', prompt: 'Review the diff carefully.' },
+      },
+    }, 'profile-dims-run', undefined, captures)
+
+    const agentDir = captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!
+    expect(readFileSync(join(agentDir, 'AGENTS.md'), 'utf8')).toBe(
+      'Always run the linter.\n\nPrefer small diffs.\n\nRepository conventions apply.\n',
+    )
+
+    const skillMd = readFileSync(join(agentDir, 'skills', 'release-check', 'SKILL.md'), 'utf8')
+    expect(skillMd).toContain('name: release-check')
+    expect(skillMd).toContain('Verify releases before shipping')
+    expect(skillMd).toContain('Run the release checklist.')
+
+    const state = JSON.parse(readFileSync(join(agentDir, 'harness', 'harness_state.json'), 'utf8')) as {
+      schema: number
+      entries: Record<string, Record<string, Record<string, unknown>>>
+      refinements: unknown[]
+    }
+    expect(state.schema).toBe(1)
+    expect(state.refinements).toEqual([])
+    const entry = state.entries.subagent!.code_reviewer!
+    expect(entry).toMatchObject({
+      id: 'code_reviewer',
+      kind: 'subagent',
+      title: 'code reviewer',
+      content: 'Reviews diffs.\n\nReview the diff carefully.',
+      path: 'general',
+      scope: 'global',
+      source: 'cli-bridge-profile',
+      version: 1,
+    })
+    // The kernel loader drops entries without string title/content
+    // (harness.py load); pin both are strings.
+    expect(typeof entry.title).toBe('string')
+    expect(typeof entry.content).toBe('string')
+  })
+
+  it('re-provisions a session dir: prunes stale bridge files, preserves agent-created state', async () => {
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
+    await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      resources: { skills: [{ kind: 'inline', name: 'alpha', content: 'first profile skill' }] },
+      subagents: { helper: { prompt: 'Help with tasks.' } },
+    }, 'profile-reprov', backend, captures)
+
+    const agentDir = captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!
+    // Simulate the agent's own self-modification between turns: a skill it
+    // wrote itself and a harness entry it learned.
+    mkdirSync(join(agentDir, 'skills', 'self-made'), { recursive: true })
+    writeFileSync(
+      join(agentDir, 'skills', 'self-made', 'SKILL.md'),
+      '---\nname: self-made\ndescription: agent-authored\n---\nbody\n',
+    )
+    const statePath = join(agentDir, 'harness', 'harness_state.json')
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as {
+      entries: { subagent: Record<string, Record<string, unknown>> }
+    }
+    state.entries.subagent.self_learned = {
+      id: 'self_learned',
+      kind: 'subagent',
+      title: 'self learned',
+      content: 'The agent made this one.',
+      path: 'general',
+      scope: 'global',
+      source: 'agent',
+      version: 1,
+    }
+    writeFileSync(statePath, JSON.stringify(state))
+
+    await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      resources: { skills: [{ kind: 'inline', name: 'beta', content: 'second profile skill' }] },
+      subagents: { checker: { prompt: 'Check results.' } },
+    }, 'profile-reprov', backend, captures)
+
+    expect(existsSync(join(agentDir, 'skills', 'alpha'))).toBe(false)
+    expect(existsSync(join(agentDir, 'skills', 'beta', 'SKILL.md'))).toBe(true)
+    expect(existsSync(join(agentDir, 'skills', 'self-made', 'SKILL.md'))).toBe(true)
+
+    const next = JSON.parse(readFileSync(statePath, 'utf8')) as {
+      entries: { subagent: Record<string, Record<string, unknown>> }
+    }
+    expect(next.entries.subagent.helper).toBeUndefined()
+    expect(next.entries.subagent.checker).toMatchObject({ source: 'cli-bridge-profile' })
+    expect(next.entries.subagent.self_learned).toMatchObject({ source: 'agent', title: 'self learned' })
+  })
+
+  it('refuses to overwrite a harness state file that no longer parses', async () => {
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
+    await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      subagents: { helper: { prompt: 'Help.' } },
+    }, 'profile-corrupt', backend, captures)
+    const agentDir = captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!
+    writeFileSync(join(agentDir, 'harness', 'harness_state.json'), 'not json {')
+    await expect(chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      subagents: { helper: { prompt: 'Help.' } },
+    }, 'profile-corrupt', backend, captures)).rejects.toThrowError(/harness state .*not valid JSON/)
+  })
+
+  it('never prunes outside the agent dir even when the manifest was tampered with', () => {
+    const outerDir = mkdtempSync(join(tmpdir(), 'prime-manifest-guard-'))
+    cleanupDirs.push(outerDir)
+    const agentDir = join(outerDir, 'agent')
+    mkdirSync(agentDir, { recursive: true })
+    const victim = join(outerDir, 'victim.txt')
+    writeFileSync(victim, 'must survive')
+    writeFileSync(
+      join(agentDir, '.cli-bridge-profile-manifest.json'),
+      JSON.stringify({ paths: ['../victim.txt', '/etc/hosts', '', '.'] }),
+    )
+    materializePrimeProfileAgentDir(agentDir, { instructionsMd: null, skills: [], subagents: [] })
+    expect(readFileSync(victim, 'utf8')).toBe('must survive')
+  })
+
+  it('refuses agent-dir profile material together with a persistent agent dir', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'prime-persistent-dims-'))
+    cleanupDirs.push(agentDir)
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, []), { persistentAgentDir: agentDir })
+    await expect(chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      resources: { skills: [{ kind: 'inline', name: 'alpha', content: 'skill' }] },
+    }, undefined, backend)).rejects.toThrowError(/operator-owned dir this backend must not rewrite/)
+  })
+
+  it('leaves an operator-owned persistent agent dir untouched for a material-free profile', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'prime-persistent-clean-'))
+    cleanupDirs.push(agentDir)
+    writeFileSync(join(agentDir, 'AGENTS.md'), 'operator instructions\n')
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, []), { persistentAgentDir: agentDir })
+    await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      prompt: { appendSystemPrompt: 'ADDED' },
+    }, undefined, backend)
+    expect(readFileSync(join(agentDir, 'AGENTS.md'), 'utf8')).toBe('operator instructions\n')
+    expect(existsSync(join(agentDir, 'harness', 'harness_state.json'))).toBe(false)
+  })
+
+  it('reports whether resolved material needs the agent dir', () => {
+    expect(hasPrimeProfileMaterial(resolvePrimeProfileDimensions({}))).toBe(false)
+    expect(hasPrimeProfileMaterial(resolvePrimeProfileDimensions({
+      prompt: { instructions: ['x'] },
+    }))).toBe(true)
+    // A skill body without frontmatter still gains the loader-required
+    // name/description frontmatter (a description-less SKILL.md is silently
+    // dropped by the fork).
+    const material = resolvePrimeProfileDimensions({
+      resources: { skills: [{ kind: 'inline', name: 'bare', content: 'Just a body.' }] },
+    })
+    expect(material.skills[0]!.markdown).toContain('name: bare')
+    expect(material.skills[0]!.markdown).toContain('description:')
   })
 })
 
