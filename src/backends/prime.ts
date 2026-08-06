@@ -52,6 +52,14 @@
  * Vision: images in the request ride the rpc `prompt` command's native
  * `images` field (base64 + mimeType) instead of being flattened away.
  *
+ * AgentProfile coverage: prompt (replace + append via --system-prompt /
+ * --append-system-prompt), model + reasoningEffort (--provider/--model/
+ * --thinking), harness pin `prime`, prompt.instructions +
+ * resources.instructions (agent-dir AGENTS.md), inline resources.skills
+ * (agent-dir skills/<name>/SKILL.md), and subagents as seeded harness-state
+ * entries. Every other dimension is REJECTED loudly with the fork evidence —
+ * see resolvePrimeProfileDimensions. Nothing is silently dropped.
+ *
  * Known fork defect this backend defends against: a spontaneously crashed
  * IPython kernel is never re-provisioned headlessly. The failure surfaces
  * either as a failed assistant turn (`turn_end` with `stopReason: 'error'`,
@@ -61,10 +69,11 @@
  */
 
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import type { AgentProfile } from '@tangle-network/agent-interface'
+import { isAbsolute, join, resolve, sep } from 'node:path'
+import type { AgentProfile, AgentProfileResourceRef } from '@tangle-network/agent-interface'
+import { normalizeSkillMd } from '@tangle-network/agent-profile-materialize'
 import type { Backend, BackendHealth, ChatDelta, ChatMessage, ChatRequest } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { versionHealth } from './health.js'
@@ -213,16 +222,15 @@ export function parsePrimeModelsJson(text: string, sourcePath: string): Record<s
 
 /**
  * One authority per run: an exact profile must agree with the wire model, and
- * a profile pinned to another harness must not run here. The canonical
- * AgentProfile harness enum carries no id for this fork yet, so the only pin
- * this backend can honor is none at all; the comparison reads the field
- * structurally so an enum that gains `prime` is accepted without a code change.
+ * a profile pinned to another harness must not run here. The canonical harness
+ * enum carries `prime` (agent-interface 0.45), so the only pins this backend
+ * honors are `prime` and none at all.
  */
 function assertPrimeProfileBinding(
   profile: AgentProfile,
   spec: { provider: string; model: string },
 ): void {
-  const pinned = profile.harness as string | undefined
+  const pinned = profile.harness
   if (pinned !== undefined && pinned !== 'prime') {
     throw new BackendError(
       `agent_profile.harness ${JSON.stringify(pinned)} conflicts with backend prime; `
@@ -249,6 +257,402 @@ function assertPrimeProfileBinding(
       'parse_error',
     )
   }
+}
+
+/**
+ * AgentProfile material this backend lands in the per-run agent dir, resolved
+ * and validated BEFORE any directory is provisioned. Every field maps to a
+ * loader verified in the pinned fork clone (v0.7.0, be9e2fa0):
+ *
+ *   - instructionsMd → `<agentDir>/AGENTS.md`. The fork reads the agent dir's
+ *     AGENTS.md as the global context file (core/resource-loader.ts:58-59
+ *     candidate names, :86-90 agent-dir read, :476 loaded unless
+ *     --no-context-files) and injects it into both the default and the
+ *     --system-prompt prompt paths (core/system-prompt.ts:76-82, 150-156).
+ *   - skills → `<agentDir>/skills/<name>/SKILL.md`. Auto-discovered from the
+ *     agent dir (core/package-manager.ts:884 agent dir as global base, :2171
+ *     skills dir, :2240-2246 user-scope discovery, :699 enabled by default),
+ *     loaded by core/skills.ts and injected into the system prompt in both
+ *     prompt paths (core/system-prompt.ts:87-88, 160-161).
+ *   - subagents → global harness-state entries in
+ *     `<agentDir>/harness/harness_state.json`. The host loads that exact file
+ *     on every system-prompt build (core/refinement/refinement.ts:269-283;
+ *     core/agent-session.ts:4288, 7548-7554) and renders subagent entries as
+ *     the spawnable-spec roster (core/refinement/refinement.ts:470-520); the
+ *     kernel reads the same file via RLM_GLOBAL_HARNESS_STATE_DIR
+ *     (core/agent-session.ts:8805; prime-agent-runtime/src/rlm/harness.py:77-90).
+ */
+export interface PrimeProfileAgentDirMaterial {
+  instructionsMd: string | null
+  skills: Array<{ name: string; markdown: string }>
+  subagents: Array<{ id: string; title: string; content: string; metadata: Record<string, unknown> }>
+}
+
+export function hasPrimeProfileMaterial(material: PrimeProfileAgentDirMaterial): boolean {
+  return material.instructionsMd !== null || material.skills.length > 0 || material.subagents.length > 0
+}
+
+/** Capability refusal for a profile control the fork verifiably cannot honor. */
+function rejectPrimeProfileDimension(dimension: string, reason: string): never {
+  throw new BackendError(
+    `agent_profile.${dimension} is not supported by backend prime: ${reason}`,
+    'not_configured',
+  )
+}
+
+/** Mirror of the fork's skill-name rules (core/skills.ts:122-146): the name
+ *  must equal the skill directory name, so an invalid name would load with
+ *  warnings or collide — validate here and refuse instead. */
+const PRIME_SKILL_NAME_RE = /^[a-z0-9-]+$/
+const PRIME_SKILL_NAME_MAX = 64
+
+/** Mirror of harness.py `_slug` (prime-agent-runtime/src/rlm/harness.py:31-34)
+ *  so bridge-seeded ids look like the ids the agent's own refinement creates. */
+function primeSubagentSlug(raw: string): string {
+  const normalized = [...raw.trim().toLowerCase()]
+    .map((ch) => (/[a-z0-9]/.test(ch) ? ch : '_'))
+    .join('')
+    .split('_')
+    .filter(Boolean)
+    .join('_')
+  return (normalized || 'subagent').slice(0, 80)
+}
+
+function primeInstructionsBlock(value: string | AgentProfileResourceRef, where: string): string {
+  if (typeof value === 'string') return value
+  if (value.kind === 'inline') return value.content
+  rejectPrimeProfileDimension(
+    where,
+    'cli-bridge resolves no GitHub-backed resource refs; inline the content or resolve it before the request',
+  )
+}
+
+/**
+ * Validate every AgentProfile dimension against what the pinned fork clone
+ * verifiably loads, returning the agent-dir material for the supported ones and
+ * refusing the rest loudly. Running a profile while silently dropping a control
+ * would score the wrong agent, so anything without a verified loader is a hard
+ * error, never a skip — including when `resources.failOnError` is false, the
+ * same exact-profile discipline the pi materializer applies.
+ *
+ * Rejected dimensions, with the fork evidence (v0.7.0, be9e2fa0):
+ *
+ *   - mcp / connections — rejected in chat() beside the request-scoped MCP
+ *     check: kernel MCP tools exist only as hand-written Python
+ *     `McpIntegration` skill subclasses (prime-agent-runtime/src/rlm/
+ *     mcp_base.py:112-125; only notion + linear ship, packages/coding-agent/
+ *     skills/{notion,linear}); the host skips non-http `mcpServers` settings
+ *     entries entirely (core/mcp/mcp-manager.ts:73) and for http entries only
+ *     registers OAuth/config for an already-installed integration — no config
+ *     path turns a per-run entry into callable tools.
+ *   - permissions — the fork exposes no permission control at all (full flag
+ *     scan of cli/args.ts:93-295; native tools run unconditionally).
+ *   - tools — the only per-run tool control is `--tools` over the single
+ *     builtin `ipython` (cli/args.ts:63-64, 156-167); bash/edit and the rest
+ *     are extension-provided and not addressable per run, so a harness-neutral
+ *     tool map cannot bind to that surface.
+ *   - hooks — no hook mechanism exists (cli/args.ts flag scan; extensions are
+ *     host-trusted JS modules, not caller command hooks).
+ *   - modes — no mode concept in the fork CLI (cli/args.ts flag scan).
+ *   - confidential — a sandbox-backend dimension; this backend spawns a host
+ *     process.
+ *   - resources.files — no request-scoped loader for arbitrary workspace
+ *     files; writing into the shared task cwd reintroduces the cross-run
+ *     collision the isolated agent dir exists to remove (same refusal as the
+ *     pi path in profile-support.ts).
+ *   - resources.tools — prime "tool files" would be extensions loaded INTO the
+ *     host process (core/package-manager.ts extensions dirs), i.e. caller code
+ *     in the bridge's own trust domain.
+ *   - resources.agents — the fork has no subagent-definition-file loader;
+ *     subagents live in harness state (wired separately below).
+ *   - resources.commands — prompt templates (`<agentDir>/prompts`) are
+ *     interactive slash commands with no verified invocation path in a
+ *     headless rpc turn.
+ *   - subagents[*].model/tools/permissions/maxSteps — the harness-state roster
+ *     is prompt text compacted to 180 chars (core/refinement/
+ *     refinement.ts:28, 470-520); `rlm()` honors a model only if the agent
+ *     chooses to pass one (prime-agent-runtime/src/rlm/__init__.py:143-146),
+ *     so none of these pins are mechanically guaranteed.
+ *   - extensions.prime — no prime extension controls are defined yet; other
+ *     backends' namespaces are ignored per the extensions contract.
+ */
+export function resolvePrimeProfileDimensions(profile: AgentProfile): PrimeProfileAgentDirMaterial {
+  if (Object.keys(profile.permissions ?? {}).length > 0) {
+    rejectPrimeProfileDimension('permissions', 'prime-agent has no permission controls; remove them or route to a harness that enforces permissions')
+  }
+  if (Object.keys(profile.tools ?? {}).length > 0) {
+    rejectPrimeProfileDimension('tools', "prime-agent's per-run tool surface cannot enable or disable named tools; remove the tool map")
+  }
+  if (Object.keys(profile.hooks ?? {}).length > 0) {
+    rejectPrimeProfileDimension('hooks', 'prime-agent has no hook mechanism')
+  }
+  if (Object.keys(profile.modes ?? {}).length > 0) {
+    rejectPrimeProfileDimension('modes', 'prime-agent has no mode concept')
+  }
+  if ((profile.connections ?? []).length > 0) {
+    rejectPrimeProfileDimension('connections', 'hub connection grants resolve to MCP tools, and prime-agent has no per-run MCP loader')
+  }
+  if (profile.confidential !== undefined) {
+    rejectPrimeProfileDimension('confidential', 'confidential execution is a sandbox-backend dimension and prime runs as a host process')
+  }
+  const primeExtensions = profile.extensions?.prime
+  if (primeExtensions && Object.keys(primeExtensions).length > 0) {
+    rejectPrimeProfileDimension(
+      'extensions.prime',
+      `unsupported extensions.prime controls: ${Object.keys(primeExtensions).sort().join(', ')}`,
+    )
+  }
+
+  const resources = profile.resources
+  if ((resources?.files ?? []).length > 0) {
+    rejectPrimeProfileDimension('resources.files', 'no request-scoped loader exists for generic workspace files')
+  }
+  if ((resources?.tools ?? []).length > 0) {
+    rejectPrimeProfileDimension('resources.tools', 'prime tool files are host-process extensions, which would run caller code in the bridge trust domain')
+  }
+  if ((resources?.agents ?? []).length > 0) {
+    rejectPrimeProfileDimension('resources.agents', 'prime-agent loads no subagent definition files; declare them in agent_profile.subagents instead')
+  }
+  if ((resources?.commands ?? []).length > 0) {
+    rejectPrimeProfileDimension('resources.commands', 'prompt templates are interactive slash commands with no headless rpc invocation path')
+  }
+
+  const skills: PrimeProfileAgentDirMaterial['skills'] = []
+  const seenSkillNames = new Set<string>()
+  for (const [index, ref] of (resources?.skills ?? []).entries()) {
+    if (ref.kind !== 'inline') {
+      rejectPrimeProfileDimension(
+        `resources.skills[${index}]`,
+        'cli-bridge resolves no GitHub-backed resource refs; inline the SKILL.md content or resolve it before the request',
+      )
+    }
+    const name = ref.name
+    if (
+      !PRIME_SKILL_NAME_RE.test(name)
+      || name.startsWith('-')
+      || name.endsWith('-')
+      || name.includes('--')
+      || name.length > PRIME_SKILL_NAME_MAX
+    ) {
+      throw new BackendError(
+        `agent_profile.resources.skills[${index}] name ${JSON.stringify(name)} is not a valid prime skill name `
+        + `(lowercase a-z, 0-9, single hyphens, max ${PRIME_SKILL_NAME_MAX} chars — it becomes the skill directory name)`,
+        'parse_error',
+      )
+    }
+    if (seenSkillNames.has(name)) {
+      throw new BackendError(
+        `agent_profile.resources.skills declares ${JSON.stringify(name)} twice; the fork keeps only the first and warns, so the duplicate is refused here`,
+        'parse_error',
+      )
+    }
+    seenSkillNames.add(name)
+    // normalizeSkillMd guarantees the frontmatter name/description the fork
+    // requires — a SKILL.md without a description is silently DROPPED by the
+    // loader (core/skills.ts:415-417), which is exactly the silent no-op this
+    // path exists to prevent.
+    skills.push({ name, markdown: normalizeSkillMd(name, ref.content) })
+  }
+
+  const subagents: PrimeProfileAgentDirMaterial['subagents'] = []
+  const seenSubagentIds = new Set<string>()
+  for (const [name, sub] of Object.entries(profile.subagents ?? {})) {
+    for (const pin of ['model', 'tools', 'permissions', 'maxSteps'] as const) {
+      if (sub[pin] !== undefined) {
+        rejectPrimeProfileDimension(
+          `subagents[${JSON.stringify(name)}].${pin}`,
+          'a prime harness-state subagent entry is a prompt-text spec; this pin has no mechanism that guarantees it',
+        )
+      }
+    }
+    const content = [sub.description, sub.prompt].filter(
+      (value): value is string => typeof value === 'string' && value.trim().length > 0,
+    ).join('\n\n')
+    if (!content) {
+      throw new BackendError(
+        `agent_profile.subagents[${JSON.stringify(name)}] declares no behavior (empty description and prompt)`,
+        'parse_error',
+      )
+    }
+    const id = primeSubagentSlug(name)
+    if (seenSubagentIds.has(id)) {
+      throw new BackendError(
+        `agent_profile.subagents names ${JSON.stringify(name)} collide on harness-state id ${JSON.stringify(id)}`,
+        'parse_error',
+      )
+    }
+    seenSubagentIds.add(id)
+    subagents.push({ id, title: name, content, metadata: sub.metadata ?? {} })
+  }
+
+  const instructionBlocks = [
+    ...(profile.prompt?.instructions ?? []),
+    ...(resources?.instructions !== undefined
+      ? [primeInstructionsBlock(resources.instructions, 'resources.instructions')]
+      : []),
+  ].filter((block) => block.trim().length > 0)
+
+  return {
+    instructionsMd: instructionBlocks.length > 0 ? instructionBlocks.join('\n\n') : null,
+    skills,
+    subagents,
+  }
+}
+
+/** Source tag on bridge-seeded harness-state entries: lets re-provisioning
+ *  replace exactly its own entries while the agent's self-created ones survive. */
+const PRIME_PROFILE_ENTRY_SOURCE = 'cli-bridge-profile'
+
+/** Bridge-written agent-dir paths from the previous provision of this session
+ *  dir, pruned before re-materializing so a profile change cannot leave stale
+ *  skills or instructions behind. Agent-created files are never listed. */
+const PRIME_PROFILE_MANIFEST = '.cli-bridge-profile-manifest.json'
+
+function writePrimeFileAtomic(path: string, data: string): void {
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, data)
+  renameSync(tmp, path)
+}
+
+/** True only for a relative path that stays inside root — the manifest lives in
+ *  the agent dir the CLI (and thus the agent) can write, so a tampered entry
+ *  must never turn the prune step into an arbitrary-path delete. */
+function isPathWithin(root: string, relPath: string): boolean {
+  if (typeof relPath !== 'string' || relPath.length === 0 || isAbsolute(relPath)) return false
+  const resolved = resolve(root, relPath)
+  return resolved !== resolve(root) && resolved.startsWith(`${resolve(root)}${sep}`)
+}
+
+/**
+ * Land the profile's agent-dir material. Also runs when the material is empty
+ * so a session whose in-band profile shrank still gets its stale bridge-written
+ * files pruned. Fails loudly on anything unexpected — a partially materialized
+ * profile must never run.
+ */
+export function materializePrimeProfileAgentDir(
+  agentDir: string,
+  material: PrimeProfileAgentDirMaterial,
+): void {
+  const manifestPath = join(agentDir, PRIME_PROFILE_MANIFEST)
+  if (existsSync(manifestPath)) {
+    let previous: unknown
+    try {
+      previous = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    } catch (err) {
+      throw new BackendError(
+        `prime profile manifest ${manifestPath} is not valid JSON: ${(err as Error).message}`,
+        'upstream',
+        err,
+      )
+    }
+    const paths = (previous as { paths?: unknown })?.paths
+    if (Array.isArray(paths)) {
+      for (const relPath of paths) {
+        if (typeof relPath === 'string' && isPathWithin(agentDir, relPath)) {
+          rmSync(join(agentDir, relPath), { recursive: true, force: true })
+        }
+      }
+    }
+    rmSync(manifestPath, { force: true })
+  }
+
+  const written: string[] = []
+  if (material.instructionsMd !== null) {
+    writePrimeFileAtomic(join(agentDir, 'AGENTS.md'), `${material.instructionsMd}\n`)
+    written.push('AGENTS.md')
+  }
+  for (const skill of material.skills) {
+    const skillDir = join(agentDir, 'skills', skill.name)
+    mkdirSync(skillDir, { recursive: true })
+    writePrimeFileAtomic(join(skillDir, 'SKILL.md'), skill.markdown)
+    written.push(join('skills', skill.name))
+  }
+  if (written.length > 0) {
+    writePrimeFileAtomic(manifestPath, `${JSON.stringify({ paths: written }, null, 2)}\n`)
+  }
+
+  materializePrimeSubagentEntries(agentDir, material.subagents)
+}
+
+/**
+ * Merge-seed subagent entries into the global harness state file. The agent
+ * self-modifies this file mid-session (it is the fork's continual-harness
+ * store), so the merge preserves every entry this bridge did not write and
+ * replaces exactly the `cli-bridge-profile`-sourced ones. A file that exists
+ * but no longer parses is the agent's own state — refusing beats resetting it.
+ *
+ * The written shape satisfies both readers: the host requires
+ * `{entries: {<kind>: {<id>: entry}}}` (core/refinement/refinement.ts:302-323)
+ * and the kernel additionally requires string `title`/`content`
+ * (prime-agent-runtime/src/rlm/harness.py:218-247).
+ */
+function materializePrimeSubagentEntries(
+  agentDir: string,
+  subagents: PrimeProfileAgentDirMaterial['subagents'],
+): void {
+  const harnessDir = join(agentDir, 'harness')
+  const statePath = join(harnessDir, 'harness_state.json')
+  let state: Record<string, unknown> = {}
+  if (existsSync(statePath)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(readFileSync(statePath, 'utf8'))
+    } catch (err) {
+      throw new BackendError(
+        `prime harness state ${statePath} is not valid JSON and may hold agent self-modification state; `
+        + 'refusing to overwrite it — repair or remove the file to continue',
+        'upstream',
+        err,
+      )
+    }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      state = parsed as Record<string, unknown>
+    }
+  } else if (subagents.length === 0) {
+    return
+  }
+
+  const entries = (state.entries && typeof state.entries === 'object' && !Array.isArray(state.entries)
+    ? state.entries
+    : {}) as Record<string, unknown>
+  for (const kind of ['prompt', 'memory', 'skill', 'subagent']) {
+    if (!entries[kind] || typeof entries[kind] !== 'object' || Array.isArray(entries[kind])) {
+      entries[kind] = {}
+    }
+  }
+  const subagentEntries = entries.subagent as Record<string, unknown>
+  for (const [id, entry] of Object.entries(subagentEntries)) {
+    if ((entry as { source?: unknown } | null)?.source === PRIME_PROFILE_ENTRY_SOURCE) {
+      delete subagentEntries[id]
+    }
+  }
+  const now = new Date().toISOString()
+  for (const subagent of subagents) {
+    subagentEntries[subagent.id] = {
+      id: subagent.id,
+      kind: 'subagent',
+      title: subagent.title,
+      content: subagent.content,
+      path: 'general',
+      scope: 'global',
+      reference: {},
+      arguments: {},
+      metadata: subagent.metadata,
+      source: PRIME_PROFILE_ENTRY_SOURCE,
+      created_at: now,
+      updated_at: now,
+      version: 1,
+    }
+  }
+
+  const nextState = {
+    ...state,
+    schema: typeof state.schema === 'number' ? state.schema : 1,
+    entries,
+    refinements: Array.isArray(state.refinements) ? state.refinements : [],
+  }
+  mkdirSync(harnessDir, { recursive: true })
+  writePrimeFileAtomic(statePath, `${JSON.stringify(nextState, null, 2)}\n`)
 }
 
 /**
@@ -346,22 +750,41 @@ export class PrimeBackend implements Backend {
       )
     }
 
-    // FAIL-LOUD on MCP: the fork mounts MCP through its RLM kernel runtime,
-    // not a per-invocation flag the bridge can drive. Running without the
-    // requested tools would score zero for the wrong reason.
+    // FAIL-LOUD on MCP, whether it arrives request-scoped or as
+    // agent_profile.mcp (resolveMcpServers merges both; entries with
+    // enabled:false are OFF, not requested). Verified in the pinned clone
+    // (v0.7.0): kernel MCP tools exist only as hand-written Python
+    // `McpIntegration` skill subclasses (prime-agent-runtime/src/rlm/
+    // mcp_base.py:112-125; only notion + linear ship), the host skips
+    // non-http `mcpServers` settings entries entirely
+    // (core/mcp/mcp-manager.ts:73), and an http entry only configures an
+    // already-installed integration skill — so materializing a per-run entry
+    // into settings.json would run WITHOUT the requested tools and score zero
+    // for the wrong reason.
     const mcpSpecs = resolveMcpServers(req, session)
     if (mcpSpecs && Object.keys(mcpSpecs).length > 0) {
       throw new BackendError(
-        `backend prime cannot mount request-scoped MCP servers (requested: ${Object.keys(mcpSpecs).join(', ')}); `
-        + 'prime-agent has no per-invocation MCP loader the bridge can drive',
+        `backend prime cannot mount MCP servers (requested: ${Object.keys(mcpSpecs).join(', ')}); `
+        + 'the fork resolves MCP tools only through installed Python McpIntegration skill packages, '
+        + 'and no per-run configuration materializes new ones',
         'not_configured',
       )
     }
 
     const profile = resolveAgentProfile(req, session)
+    let profileMaterial: PrimeProfileAgentDirMaterial | null = null
     if (profile) {
       assertProfileRequestAuthority(req, session)
       assertPrimeProfileBinding(profile, { provider: spec.provider, model: spec.model })
+      profileMaterial = resolvePrimeProfileDimensions(profile)
+      if (hasPrimeProfileMaterial(profileMaterial) && this.opts.persistentAgentDir) {
+        throw new BackendError(
+          'agent_profile instructions/skills/subagents materialize into the per-run agent dir, and '
+          + 'PRIME_PERSISTENT_AGENT_DIR names an operator-owned dir this backend must not rewrite; '
+          + 'drop the persistent dir or strip those profile dimensions',
+          'not_configured',
+        )
+      }
     }
     const promptMessages = resolvePromptMessages(req, session, this.name)
     const promptText = buildPromptText(promptMessages)
@@ -406,6 +829,22 @@ export class PrimeBackend implements Backend {
     }
 
     const home = this.provisionHome(req.session_id)
+    // Skipped for a persistent agent dir: material there is rejected above, and
+    // even the empty-material prune/rewrite pass must not touch an
+    // operator-owned dir.
+    if (profileMaterial && !this.opts.persistentAgentDir) {
+      try {
+        materializePrimeProfileAgentDir(home.agentDir, profileMaterial)
+      } catch (err) {
+        home.cleanup()
+        if (err instanceof BackendError) throw err
+        throw new BackendError(
+          `prime profile materialization failed: ${err instanceof Error ? err.message : String(err)}`,
+          'upstream',
+          err,
+        )
+      }
+    }
     if (req.session_id) {
       args.push('--session-dir', home.sessionArtifactDir)
       // The artifact dir is exclusive to this bridge session, so `--continue`
