@@ -5,6 +5,7 @@
 minimumReleaseAgeExclude:
   - '@tangle-network/agent-profile-materialize@0.9.4 || 0.10.2'
   - '@tangle-network/agent-trace-contract@1.0.2'
+  - '@tangle-network/agent-interface@0.44.0'
 
 # Dependencies allowed to run install scripts. better-sqlite3 needs its install script to
 # obtain the native binding the session store loads; esbuild needs its platform binary.

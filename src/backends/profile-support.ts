@@ -1657,6 +1657,7 @@ const HARNESS_PROMPT_CONTROLS: Record<string, { replace: string | null; append: 
   'claude-code': { replace: '--system-prompt', append: '--append-system-prompt' },
   claude: { replace: '--system-prompt', append: '--append-system-prompt' },
   pi: { replace: '--system-prompt', append: '--append-system-prompt' },
+  prime: { replace: '--system-prompt', append: '--append-system-prompt' },
   codex: { replace: '-c model_instructions_file=<file>', append: null },
   gemini: { replace: '.gemini/system.md', append: null },
   // opencode composes its `instructions[]` files into the same system message

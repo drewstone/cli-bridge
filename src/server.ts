@@ -6,6 +6,7 @@
  * trusts the caller is authorized if it got this far.
  */
 
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { anyBackendSpawnsOnHost, loadConfig, type Config } from './config.js'
@@ -23,6 +24,7 @@ import { ForgeBackend } from './backends/forge.js'
 import { AcpBackend } from './backends/acp.js'
 import { NanoclawBackend } from './backends/nanoclaw.js'
 import { PiBackend } from './backends/pi.js'
+import { PrimeBackend } from './backends/prime.js'
 import { PassthroughBackend } from './backends/passthrough.js'
 import { SandboxBackend } from './backends/sandbox.js'
 import { createProfileCatalog, type ProfileCatalog } from './profiles/loader.js'
@@ -419,6 +421,17 @@ export async function buildApp(config: Config): Promise<{
       bin: config.piBin,
       timeoutMs: config.piTimeoutMs,
       ...(spawner ? { spawner } : {}),
+    }))
+  }
+  // prime-agent (the pi fork) — host-spawned `--mode rpc` with a bridge-owned
+  // isolated HOME per run; see PrimeBackend for the daemon-avoidance contract.
+  if (config.backends.has('prime')) {
+    registry.register(new PrimeBackend({
+      bin: config.primeBin,
+      timeoutMs: config.primeTimeoutMs,
+      stateDir: join(config.dataDir, 'prime'),
+      ...(config.primeModelsJson ? { modelsJsonPath: config.primeModelsJson } : {}),
+      ...(config.primePersistentAgentDir ? { persistentAgentDir: config.primePersistentAgentDir } : {}),
     }))
   }
   if (config.backends.has('passthrough')) {

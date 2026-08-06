@@ -40,6 +40,16 @@ export interface Config {
   nanoclawSocket: string
   piBin: string
   piTimeoutMs: number
+  primeBin: string
+  primeTimeoutMs: number
+  /** Operator models.json materialized into every isolated prime agent dir. Null = none configured. */
+  primeModelsJson: string | null
+  /**
+   * Operator-owned prime agent dir shared across runs — the explicit opt-in to
+   * prime-agent's persistent self-modification state (harness_state.json rides
+   * every future system prompt). Null = every run gets a fresh agent dir.
+   */
+  primePersistentAgentDir: string | null
   cliTimeoutMsDefault: number
   admission: {
     maxActive: number
@@ -282,6 +292,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     nanoclawSocket: env.NANOCLAW_SOCKET ?? '',
     piBin: env.PI_BIN ?? 'pi',
     piTimeoutMs: parseExecutionTimeoutMs('PI_TIMEOUT_MS', env.PI_TIMEOUT_MS, defaultTimeout),
+    primeBin: env.PRIME_BIN ?? 'prime-agent',
+    primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),
+    ...parsePrimeStateConfig(env, backends),
     cliTimeoutMsDefault: defaultTimeout,
     admission: {
       maxActive: parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8),
@@ -342,6 +355,64 @@ function parseOnOff(name: string, value: string | undefined, fallback: boolean):
   if (['on', '1', 'true', 'yes'].includes(normalized)) return true
   if (['off', '0', 'false', 'no'].includes(normalized)) return false
   throw new Error(`invalid ${name}: ${value} — expected on|off`)
+}
+
+/**
+ * PRIME_MODELS_JSON / PRIME_PERSISTENT_AGENT_DIR — validated here so a broken
+ * or ignored setting fails the start instead of the first request. Deep schema
+ * validation of the models.json happens in the PrimeBackend constructor, which
+ * shares the fork's own comment-tolerant parser.
+ */
+function parsePrimeStateConfig(
+  env: NodeJS.ProcessEnv,
+  backends: Set<string>,
+): Pick<Config, 'primeModelsJson' | 'primePersistentAgentDir'> {
+  const modelsJson = env.PRIME_MODELS_JSON?.trim() || null
+  const persistentAgentDir = env.PRIME_PERSISTENT_AGENT_DIR?.trim() || null
+  if (modelsJson && persistentAgentDir) {
+    throw new Error(
+      'PRIME_MODELS_JSON and PRIME_PERSISTENT_AGENT_DIR are both set — a persistent agent dir owns its own ' +
+        'models.json, and materializing over it would silently clobber operator config. Unset one.',
+    )
+  }
+  for (const [key, value] of [
+    ['PRIME_MODELS_JSON', modelsJson],
+    ['PRIME_PERSISTENT_AGENT_DIR', persistentAgentDir],
+  ] as const) {
+    if (value && !backends.has('prime')) {
+      throw new Error(
+        `${key} is set but "prime" is not in BRIDGE_BACKENDS — the setting would be ignored. ` +
+          `Add prime to BRIDGE_BACKENDS, or remove ${key}.`,
+      )
+    }
+  }
+  if (modelsJson) {
+    let stat
+    try {
+      stat = statSync(modelsJson)
+    } catch {
+      throw new Error(`invalid PRIME_MODELS_JSON: path does not exist: ${modelsJson}`)
+    }
+    if (!stat.isFile()) throw new Error(`invalid PRIME_MODELS_JSON: not a file: ${modelsJson}`)
+  }
+  if (persistentAgentDir) {
+    if (!isAbsolute(persistentAgentDir)) {
+      throw new Error(`invalid PRIME_PERSISTENT_AGENT_DIR: expected an absolute path, got ${persistentAgentDir}`)
+    }
+    let stat
+    try {
+      stat = statSync(persistentAgentDir)
+    } catch {
+      throw new Error(`invalid PRIME_PERSISTENT_AGENT_DIR: path does not exist: ${persistentAgentDir}`)
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`invalid PRIME_PERSISTENT_AGENT_DIR: not a directory: ${persistentAgentDir}`)
+    }
+  }
+  return {
+    primeModelsJson: modelsJson ? resolve(modelsJson) : null,
+    primePersistentAgentDir: persistentAgentDir ? resolve(persistentAgentDir) : null,
+  }
 }
 
 function parseJailMode(value: string | undefined): 'off' | 'write-jail' | 'fs-jail' {
