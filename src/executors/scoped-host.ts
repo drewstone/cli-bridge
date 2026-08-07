@@ -314,12 +314,24 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     ...jailed.args,
   ]
 
+  // systemd-run itself resolves the user manager through XDG_RUNTIME_DIR /
+  // DBUS_SESSION_BUS_ADDRESS in ITS environment. A backend with a strict child
+  // env allowlist (prime) strips both, so without re-injecting the bridge's own
+  // transport vars the wrapper exits 1 ("Failed to connect to bus") and the
+  // failure is misattributed to the backend CLI. Transport plumbing, not
+  // credentials — the payload ignores them.
+  const busTransportEnv: Record<string, string> = {}
+  for (const key of ['XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'] as const) {
+    const value = process.env[key]
+    if (value) busTransportEnv[key] = value
+  }
+
   let child
   try {
     child = spawn(SYSTEMD_RUN_BIN, wrapped, {
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: sanitizeHostEnv(jailed.env, opts.cwd),
+      env: { ...sanitizeHostEnv(jailed.env, opts.cwd), ...busTransportEnv },
       // `detached: true` makes the wrapper a process-group leader, so
       // existing killTree() (kill -pgid) still works as the graceful
       // first signal. The cgroup-kill in release() is the hard backstop.
