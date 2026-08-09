@@ -164,6 +164,28 @@ function probeSystemdRun(): boolean {
   }
 }
 
+/**
+ * The env handed to the systemd-run wrapper.
+ *
+ * `undefined` is not an empty environment — it is Node's INHERIT, and the whole bridge environment
+ * (PATH first among it) is what lets systemd-run resolve `pi`, `claude`, `codex`, `opencode` at all.
+ * Spreading an undefined base into an object silently converted "inherit everything" into "these two
+ * transport variables and nothing else": every unjailed host spawn lost its PATH at once, and the
+ * bridge reported `Failed to find executable pi: No such file or directory` for every backend
+ * simultaneously — a total outage that reads like four missing CLIs.
+ *
+ * So an absent base stays absent. The bus transport variables are read from `process.env` and are
+ * therefore already present in an inherited environment; they only need re-injecting when a caller
+ * supplied an explicit, narrowed env that stripped them (the case #126 fixed).
+ */
+export function resolveScopedSpawnEnv(
+  hostEnv: NodeJS.ProcessEnv | undefined,
+  busTransportEnv: Record<string, string>,
+): NodeJS.ProcessEnv | undefined {
+  if (hostEnv === undefined) return undefined
+  return { ...hostEnv, ...busTransportEnv }
+}
+
 /** Resolve a process's cgroup-v2 path from `/proc/<pid>/cgroup`. */
 function resolveProcessControlGroup(pid: number): string | null {
   try {
@@ -331,7 +353,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     child = spawn(SYSTEMD_RUN_BIN, wrapped, {
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: { ...sanitizeHostEnv(jailed.env, opts.cwd), ...busTransportEnv },
+      env: resolveScopedSpawnEnv(sanitizeHostEnv(jailed.env, opts.cwd), busTransportEnv),
       // `detached: true` makes the wrapper a process-group leader, so
       // existing killTree() (kill -pgid) still works as the graceful
       // first signal. The cgroup-kill in release() is the hard backstop.

@@ -14,7 +14,11 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { describe, expect, it } from 'vitest'
-import { isOwnedScopeControlGroup, scopedHostSpawner } from '../src/executors/scoped-host.js'
+import {
+  isOwnedScopeControlGroup,
+  resolveScopedSpawnEnv,
+  scopedHostSpawner,
+} from '../src/executors/scoped-host.js'
 import { killTree } from '../src/executors/process-tree.js'
 
 const systemdRunAvailable =
@@ -28,6 +32,37 @@ const systemdRunAvailable =
 const describeReal = systemdRunAvailable && process.env.CLI_BRIDGE_REAL_CGROUP_TESTS === '1'
   ? describe
   : describe.skip
+
+describe('scopedHostSpawner — the wrapper environment', () => {
+  it('leaves an absent env absent, because undefined means INHERIT and PATH lives there', () => {
+    // The regression this pins took the whole bridge down: spreading an undefined base into an
+    // object turned "inherit the bridge environment" into "these two transport variables only", so
+    // systemd-run had no PATH and answered `Failed to find executable pi: No such file or
+    // directory` for pi, claude, codex and opencode at the same moment — four healthy CLIs
+    // reported missing.
+    expect(
+      resolveScopedSpawnEnv(undefined, {
+        XDG_RUNTIME_DIR: '/run/user/1000',
+        DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
+      }),
+    ).toBeUndefined()
+  })
+
+  it('still re-injects the bus transport into an explicit env that stripped it', () => {
+    // The case #126 fixed: a backend with a strict child-env allowlist drops the transport vars,
+    // and without them systemd-run cannot reach the user manager at all.
+    expect(
+      resolveScopedSpawnEnv(
+        { PATH: '/usr/bin', HOME: '/home/drew' },
+        { XDG_RUNTIME_DIR: '/run/user/1000' },
+      ),
+    ).toEqual({ PATH: '/usr/bin', HOME: '/home/drew', XDG_RUNTIME_DIR: '/run/user/1000' })
+  })
+
+  it('does not invent transport variables the bridge itself does not have', () => {
+    expect(resolveScopedSpawnEnv({ PATH: '/usr/bin' }, {})).toEqual({ PATH: '/usr/bin' })
+  })
+})
 
 describe('scopedHostSpawner — cgroup ownership proof', () => {
   const unit = 'cli-bridge-1234-a1b2c3d4e5f6.scope'
