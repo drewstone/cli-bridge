@@ -97,6 +97,12 @@ export interface PiBackendOptions {
   spawner?: Spawner
   /** Trusted provider resolution. Injectable for deterministic tests. */
   transportResolver?: PiInferenceTransportResolver
+  /** Attempts per turn before a transient failure is raised, counting the first. Defaults to
+   *  {@link DEFAULT_PI_TURN_ATTEMPTS}; `1` disables the retry. */
+  maxTurnAttempts?: number
+  /** Base backoff between turn attempts, multiplied by the attempt number. Defaults to
+   *  {@link PI_TURN_RETRY_BACKOFF_MS}. */
+  turnRetryBackoffMs?: number
 }
 
 /** Parsed `pi/<provider>/<model>` selection. Incomplete ids are rejected before spawn. */
@@ -409,10 +415,70 @@ export class PiBackend implements Backend {
     return versionHealth(this.name, this.opts.bin, this.spawner)
   }
 
+  /**
+   * Retry a turn that died BEFORE the caller saw anything.
+   *
+   * Pi's stream dies on transient upstream faults — a cut connection, a 5xx, a provider hiccup —
+   * and every one of those used to end the caller's turn. Measured through router.tangle.tools,
+   * that class killed four supervised runs in two days, each sinking 0.2–2.9M input tokens
+   * (drewstone/cli-bridge#125). The route's own reliability notes say every caller needs
+   * retry-with-backoff; this is that retry, placed where the failure actually happens.
+   *
+   * The gate is emission, not optimism: once ANY delta has left for the caller, a second attempt
+   * would contradict a stream the caller is already reading — duplicated content, a second usage
+   * record, a materialization receipt for a process that no longer exists. So a turn is retried
+   * only while nothing has been emitted, which is exactly the shape of the deaths in the report.
+   * After the first delta the failure is raised as before, and the caller's own driver-level retry
+   * (agent-runtime `supervise`) owns recovery from there — it can resume the harness session,
+   * which this layer cannot.
+   *
+   * `not_configured` and `parse_error` are never retried: a missing jail, a rejected credential, or
+   * an unparseable request fails identically every time.
+   */
   async *chat(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    const maxAttempts = Math.max(1, this.opts.maxTurnAttempts ?? DEFAULT_PI_TURN_ATTEMPTS)
+    for (let attempt = 1; ; attempt += 1) {
+      let emitted = 0
+      // A turn that never started is not a transient turn failure: a rejected spawn is a local
+      // condition (a missing binary, an executor refusing the request) that repeats identically,
+      // and re-entering would re-materialize every request-scoped profile and MCP file for nothing.
+      const stage = { started: false }
+      try {
+        for await (const delta of this.runTurn(req, session, signal, stage)) {
+          emitted += 1
+          yield delta
+        }
+        return
+      } catch (error) {
+        if (
+          emitted > 0
+          || !stage.started
+          || attempt >= maxAttempts
+          || signal.aborted
+          || !isRetryablePiTurnFailure(error)
+        ) {
+          throw error
+        }
+        // Linear-doubling backoff on a per-turn scale: the upstream fault this recovers from
+        // clears in seconds, and a longer wait would just burn the caller's deadline.
+        const backoffBase = this.opts.turnRetryBackoffMs ?? PI_TURN_RETRY_BACKOFF_MS
+        await delayBeforeRetry(backoffBase * attempt, signal)
+        if (signal.aborted) throw error
+      }
+    }
+  }
+
+  private async *runTurn(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+    /** Flipped the moment a child process exists, so the wrapper can tell a turn that DIED from a
+     *  turn that never began. */
+    stage: { started: boolean },
   ): AsyncIterable<ChatDelta> {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'pi has native tools (read/bash/edit/write); hosted-safe requires a verified --no-tools enforcement path')
@@ -585,6 +651,7 @@ export class PiBackend implements Backend {
     }
     const child = spawned.child
     const releaseSpawner = spawned.release
+    stage.started = true
 
     let spawnErrorMessage = ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
@@ -916,6 +983,34 @@ export function piAssistantFailure(message: unknown): string | null {
   const errorMessage = typeof value.errorMessage === 'string' ? value.errorMessage.trim() : ''
   if (stopReason !== 'error' && errorMessage === '') return null
   return errorMessage !== '' ? errorMessage : `stopReason=${stopReason ?? 'error'}`
+}
+
+/** Attempts per turn, counting the first. Two retries is what the measured transient window needs;
+ *  a third would mostly add latency to a genuinely broken route. */
+export const DEFAULT_PI_TURN_ATTEMPTS = 3
+export const PI_TURN_RETRY_BACKOFF_MS = 750
+
+/** A turn failure worth a second attempt: an upstream/timeout fault, or an unclassified error that
+ *  escaped the backend. A refused configuration or an unparseable request repeats identically, and
+ *  an abort is the caller's decision. */
+export function isRetryablePiTurnFailure(error: unknown): boolean {
+  if (error instanceof BackendError) return error.code === 'upstream' || error.code === 'timeout'
+  if (error instanceof Error && error.name === 'AbortError') return false
+  return error instanceof Error
+}
+
+async function delayBeforeRetry(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) return
+  await new Promise<void>((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    timer.unref?.()
+    signal.addEventListener('abort', done, { once: true })
+  })
 }
 
 /** Auth/scope failures are a local credential problem, not a transient upstream one, whether they
