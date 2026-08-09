@@ -15,8 +15,8 @@ importers:
         specifier: 0.45.0
         version: 0.45.0
       '@tangle-network/agent-profile-materialize':
-        specifier: 0.11.0
-        version: 0.11.0(@tangle-network/agent-interface@0.45.0)
+        specifier: 0.13.0
+        version: 0.13.0(@tangle-network/agent-interface@0.45.0)
       '@tangle-network/agent-trace-contract':
         specifier: ^1.0.2
         version: 1.0.2
@@ -496,8 +496,8 @@ packages:
   '@tangle-network/agent-interface@0.45.0':
     resolution: {integrity: sha512-VCDI+ta79cTzQbUaos6v2rBMMvuQ/Ojt2VPGkdvfAcrYubP0JVD8qRvx76pViBwh6VS+truPgeU4VvGRI6kipg==}
 
-  '@tangle-network/agent-profile-materialize@0.11.0':
-    resolution: {integrity: sha512-Z3pBDgmTYP7EFs+GwBTeHS40+rfz0I/cPXWqTYTkmGcDLwO75UT92Fx0X5i9S1mOgf9tO+kLzPAekRFJ8G0tcQ==}
+  '@tangle-network/agent-profile-materialize@0.13.0':
+    resolution: {integrity: sha512-UMycRLRcdcdQ7t9e3K51ajGP4nl83TS8Sn7mGUxStDXY5//+yeKIOVtDVEBO6H8+0EUrtllM/iPPyXd2GYC3vA==}
     peerDependencies:
       '@tangle-network/agent-interface': '>=0.45.0 <0.46.0'
 
@@ -1132,7 +1132,7 @@ snapshots:
       spdx-expression-parse: 5.0.0
       zod: 4.4.3
 
-  '@tangle-network/agent-profile-materialize@0.11.0(@tangle-network/agent-interface@0.45.0)':
+  '@tangle-network/agent-profile-materialize@0.13.0(@tangle-network/agent-interface@0.45.0)':
     dependencies:
       '@tangle-network/agent-interface': 0.45.0
 
