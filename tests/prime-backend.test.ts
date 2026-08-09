@@ -1,20 +1,25 @@
 import { execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
-  hasPrimeProfileMaterial,
-  materializePrimeProfileAgentDir,
-  parsePrimeModelsJson,
   primeApiKeyEnv,
   PrimeBackend,
   primeProcessEnvironment,
-  primeThinkingFlagForEffort,
-  resolvePrimeProfileDimensions,
 } from '../src/backends/prime.js'
+// The profile lowering itself is the shared implementation both prime
+// executors run; these tests exercise it through this backend's own contract.
+import {
+  hasPrimeProfileMaterial,
+  materializePrimeProfileControls,
+  parsePrimeModelsJson,
+  PRIME_AGENT_DIR_ENV_VARS,
+  primeThinkingLevel,
+  readPrimeProfileControls,
+} from '@tangle-network/agent-profile-materialize'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import { BackendError } from '../src/backends/types.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
@@ -35,6 +40,25 @@ interface SpawnCapture {
   env: NodeJS.ProcessEnv
   cwd: string | undefined
   stdin: string
+  /** Contents of every argv-named file, read AT SPAWN — which is when the real
+   *  process would read them, and before per-run dirs are cleaned up. */
+  argFiles: Record<string, string>
+  /** Relative paths under every argv-named directory, read at spawn. */
+  argDirs: Record<string, string[]>
+}
+
+function snapshotArgPaths(args: string[]): Pick<SpawnCapture, 'argFiles' | 'argDirs'> {
+  const argFiles: Record<string, string> = {}
+  const argDirs: Record<string, string[]> = {}
+  for (const value of args) {
+    if (!value.startsWith('/') || !existsSync(value)) continue
+    if (statSync(value).isDirectory()) {
+      argDirs[value] = readdirSync(value, { recursive: true, encoding: 'utf8' }).sort()
+    } else {
+      argFiles[value] = readFileSync(value, 'utf8')
+    }
+  }
+  return { argFiles, argDirs }
 }
 
 /** Scripted rpc-mode child: records the spawn, replays stdout lines, exits. */
@@ -52,6 +76,7 @@ function primeSpawner(
       env: { ...(opts.env ?? {}) },
       cwd: opts.cwd,
       stdin: '',
+      ...snapshotArgPaths(args),
     }
     captures.push(capture)
     child.stdin.on('data', (chunk: Buffer) => { capture.stdin += chunk.toString() })
@@ -156,13 +181,16 @@ describe('PrimeBackend', () => {
   })
 
   it('maps the canonical reasoning ladder onto the fork\'s --thinking rungs', () => {
-    expect(primeThinkingFlagForEffort('none')).toBe('off')
-    expect(primeThinkingFlagForEffort('minimal')).toBe('minimal')
-    expect(primeThinkingFlagForEffort('xhigh')).toBe('xhigh')
+    expect(primeThinkingLevel('none')).toBe('off')
+    expect(primeThinkingLevel('minimal')).toBe('minimal')
+    expect(primeThinkingLevel('xhigh')).toBe('xhigh')
     // The fork adds `max` above upstream Pi's xhigh ceiling.
-    expect(primeThinkingFlagForEffort('ultracode')).toBe('max')
-    expect(primeThinkingFlagForEffort(undefined)).toBeNull()
-    expect(primeThinkingFlagForEffort('sideways')).toBeNull()
+    expect(primeThinkingLevel('ultracode')).toBe('max')
+    expect(primeThinkingLevel(undefined)).toBeUndefined()
+    // An effort with no rung FAILS rather than dropping the flag: a silently
+    // omitted --thinking runs at the default level while the caller believes
+    // the requested effort is in force.
+    expect(() => primeThinkingLevel('sideways')).toThrowError(/no --thinking rung/)
   })
 
   it('spawns rpc mode with an isolated HOME and a daemon-proof arg/env contract', async () => {
@@ -473,8 +501,11 @@ describe('PrimeBackend', () => {
       new AbortController().signal,
     ))
     const args = captures[0]!.args
-    expect(args[args.indexOf('--system-prompt') + 1]).toBe('REPLACED_SYSTEM')
-    expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('ADDED_SYSTEM')
+    // Both intents ride FILES, not argv literals: the fork resolves a flag
+    // value as a file when the path exists, so there is no argv size ceiling.
+    const files = captures[0]!.argFiles
+    expect(files[args[args.indexOf('--system-prompt') + 1]!]).toBe('REPLACED_SYSTEM')
+    expect(files[args[args.indexOf('--append-system-prompt') + 1]!]).toContain('ADDED_SYSTEM')
     // The task prompt stays the sole stdin message.
     expect(stdinCommands(captures[0]!)[1]).toMatchObject({ message: 'TASK' })
   })
@@ -489,7 +520,7 @@ describe('PrimeBackend', () => {
       },
       null,
       new AbortController().signal,
-    ))).rejects.toThrowError(/agent_profile\.harness "pi" conflicts with backend prime/)
+    ))).rejects.toThrowError(/agent_profile\.harness is invalid: prime cannot run a profile pinned to harness "pi"/)
   })
 
   it('runs a profile pinned to harness "prime" (interface 0.45 enum)', async () => {
@@ -510,7 +541,8 @@ describe('PrimeBackend', () => {
     ))
     expect(captures).toHaveLength(1)
     const args = captures[0]!.args
-    expect(args[args.indexOf('--append-system-prompt') + 1]).toContain('PINNED_TO_PRIME')
+    expect(captures[0]!.argFiles[args[args.indexOf('--append-system-prompt') + 1]!])
+      .toContain('PINNED_TO_PRIME')
     expect(deltas.at(-1)).toEqual({ finish_reason: 'stop' })
   })
 
@@ -524,7 +556,9 @@ describe('PrimeBackend', () => {
       },
       null,
       new AbortController().signal,
-    ))).rejects.toThrowError(/conflicts with agent_profile\.model "tangle\/other-model"/)
+    ))).rejects.toThrowError(
+      /agent_profile\.model\.default is invalid: .*"tangle\/glm-5.2".*"tangle\/other-model".*does not name/s,
+    )
   })
 
   it('folds caller system messages into one --append-system-prompt', async () => {
@@ -543,7 +577,7 @@ describe('PrimeBackend', () => {
       new AbortController().signal,
     ))
     const args = captures[0]!.args
-    const appended = args[args.indexOf('--append-system-prompt') + 1]!
+    const appended = captures[0]!.argFiles[args[args.indexOf('--append-system-prompt') + 1]!]!
     expect(args.filter((value) => value === '--append-system-prompt')).toHaveLength(1)
     expect(appended).toContain('You are a security auditor.')
     expect(appended.indexOf('security auditor')).toBeLessThan(appended.indexOf('ONLY a single JSON object'))
@@ -643,6 +677,111 @@ describe('PrimeBackend', () => {
     expect(env.OPENAI_API_KEY).toBeUndefined()
     expect(env.XDG_DATA_HOME).toBeUndefined()
   })
+
+  it('forwards the operator kernel venv and never a harness-state redirect', () => {
+    // The fork reads PRIME_AGENT_KERNEL_VENV, and dropping it re-bootstraps the
+    // kernel venv through uv on every run under the isolated HOME. The RLM_*
+    // vars go the other way: either would re-point the self-modifying store
+    // outside the isolated agent dir.
+    const env = primeProcessEnvironment(
+      {
+        PATH: '/usr/bin',
+        PRIME_AGENT_KERNEL_VENV: '/opt/prime/kernel-venv',
+        RLM_GLOBAL_HARNESS_STATE_DIR: '/shared/harness',
+        RLM_HARNESS_STATE_DIR: '/shared/harness-local',
+      },
+      { RLM_HARNESS_STATE_DIR: '/attacker/harness' },
+    )
+    expect(env.PRIME_AGENT_KERNEL_VENV).toBe('/opt/prime/kernel-venv')
+    expect(env.RLM_GLOBAL_HARNESS_STATE_DIR).toBeUndefined()
+    expect(env.RLM_HARNESS_STATE_DIR).toBeUndefined()
+  })
+
+  it('pins the agent dir under every name the agent could resolve it from', async () => {
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
+    await collect(backend.chat(
+      { model: 'prime/tangle/glm-5.2', messages: [{ role: 'user', content: 'TASK' }], session_id: 'dir-pin' },
+      null,
+      new AbortController().signal,
+    ))
+    const env = captures[0]!.env
+    // PRIME_BIN can resolve to upstream pi, which reads PI_CODING_AGENT_DIR and
+    // would otherwise fall back to ONE shared config dir for every session.
+    const pinned = new Set(PRIME_AGENT_DIR_ENV_VARS.map((name) => env[name]))
+    expect(pinned.size).toBe(1)
+    expect([...pinned][0]).toBe(env.PRIME_AGENT_CODING_AGENT_DIR)
+  })
+
+  it('writes the operator models.json atomically with an owner-only mode', async () => {
+    const modelsDir = mkdtempSync(join(tmpdir(), 'prime-models-mode-'))
+    cleanupDirs.push(modelsDir)
+    const modelsJsonPath = join(modelsDir, 'models.json')
+    writeFileSync(modelsJsonPath, JSON.stringify({ providers: { tangle: { apiKey: 'K' } } }))
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures), { modelsJsonPath })
+    await collect(backend.chat(
+      { model: 'prime/tangle/glm-5.2', messages: [{ role: 'user', content: 'TASK' }], session_id: 'models-mode' },
+      null,
+      new AbortController().signal,
+    ))
+    // The fork reloads models.json at model-resolution time, and this copy
+    // holds the operator's real credential material.
+    const materialized = join(captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!, 'models.json')
+    expect(statSync(materialized).mode & 0o777).toBe(0o600)
+    expect(readdirSync(join(captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!))
+      .filter((name) => name.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('fails a run whose IPython kernel died instead of reporting a generic turn failure', async () => {
+    // The fork never re-provisions a crashed kernel headlessly, so the session
+    // is unrecoverable rather than retryable and the caller must be told which.
+    const stream = [
+      HAPPY_STREAM[0]!,
+      HAPPY_STREAM[1]!,
+      {
+        type: 'tool_execution_end',
+        toolCallId: 'call-1',
+        toolName: 'ipython',
+        isError: true,
+        result: 'Error: Kernel exited before resolving ports. stderr:\n(empty)',
+      },
+      HAPPY_STREAM.at(-2)!,
+      HAPPY_STREAM.at(-1)!,
+    ]
+    const backend = newBackend(primeSpawner(stream, []))
+    await expect(collect(backend.chat(
+      { model: 'prime/tangle/glm-5.2', messages: [{ role: 'user', content: 'TASK' }] },
+      null,
+      new AbortController().signal,
+    ))).rejects.toThrowError(/IPython kernel died \("Kernel exited before resolving ports"\).*unrecoverable/s)
+  })
+
+  it('does not fail a run because the assistant quoted a kernel marker', async () => {
+    // The model's own prose rides text_delta and is excluded from the scan;
+    // failing on it would kill healthy runs that discuss the failure mode.
+    const stream = [
+      HAPPY_STREAM[0]!,
+      HAPPY_STREAM[1]!,
+      {
+        type: 'message_update',
+        assistantMessageEvent: {
+          type: 'text_delta',
+          contentIndex: 0,
+          delta: 'If you see "Kernel has been shut down", restart the session.',
+        },
+      },
+      HAPPY_STREAM.at(-2)!,
+      HAPPY_STREAM.at(-1)!,
+    ]
+    const backend = newBackend(primeSpawner(stream, []))
+    const deltas = await collect(backend.chat(
+      { model: 'prime/tangle/glm-5.2', messages: [{ role: 'user', content: 'TASK' }] },
+      null,
+      new AbortController().signal,
+    ))
+    expect(deltas.at(-1)).toEqual({ finish_reason: 'stop' })
+  })
 })
 
 describe('PrimeBackend profile dimensions', () => {
@@ -679,19 +818,19 @@ describe('PrimeBackend profile dimensions', () => {
       [{ confidential: {} }, /agent_profile\.confidential is not supported by backend prime/],
       [
         { resources: { files: [{ path: 'x.txt', resource: { kind: 'inline', name: 'x', content: 'hi' } }] } },
-        /agent_profile\.resources\.files is not supported by backend prime/,
+        /agent_profile\.resources: files is not supported by backend prime/,
       ],
       [
         { resources: { tools: [{ kind: 'inline', name: 'x', content: 'hi' }] } },
-        /agent_profile\.resources\.tools is not supported by backend prime/,
+        /agent_profile\.resources: tools is not supported by backend prime/,
       ],
       [
         { resources: { agents: [{ kind: 'inline', name: 'x', content: 'hi' }] } },
-        /agent_profile\.resources\.agents is not supported by backend prime/,
+        /agent_profile\.resources: agents is not supported by backend prime/,
       ],
       [
         { resources: { commands: [{ kind: 'inline', name: 'x', content: 'hi' }] } },
-        /agent_profile\.resources\.commands is not supported by backend prime/,
+        /agent_profile\.resources: commands is not supported by backend prime/,
       ],
       [
         { resources: { skills: [{ kind: 'github', path: 'skills/foo' }] } },
@@ -703,11 +842,11 @@ describe('PrimeBackend profile dimensions', () => {
       ],
       [
         { subagents: { helper: { prompt: 'do it', model: 'tangle/glm-5.2' } } },
-        /agent_profile\.subagents\["helper"\]\.model is not supported by backend prime/,
+        /agent_profile\.subagents\["helper"\] fields: model is not supported by backend prime/,
       ],
       [
         { subagents: { helper: { prompt: 'do it', maxSteps: 5 } } },
-        /agent_profile\.subagents\["helper"\]\.maxSteps is not supported by backend prime/,
+        /agent_profile\.subagents\["helper"\] fields: maxSteps is not supported by backend prime/,
       ],
       [
         { extensions: { prime: { magic: true } } },
@@ -728,10 +867,10 @@ describe('PrimeBackend profile dimensions', () => {
   })
 
   it('refuses malformed skill and subagent declarations before provisioning anything', () => {
-    expect(() => resolvePrimeProfileDimensions({
+    expect(() => readPrimeProfileControls({
       resources: { skills: [{ kind: 'inline', name: 'Bad_Name', content: 'x' }] },
     })).toThrowError(/not a valid prime skill name/)
-    expect(() => resolvePrimeProfileDimensions({
+    expect(() => readPrimeProfileControls({
       resources: {
         skills: [
           { kind: 'inline', name: 'dupe', content: 'a' },
@@ -739,12 +878,28 @@ describe('PrimeBackend profile dimensions', () => {
         ],
       },
     })).toThrowError(/declares "dupe" twice/)
-    expect(() => resolvePrimeProfileDimensions({
+    expect(() => readPrimeProfileControls({
       subagents: { helper: { metadata: { note: 'no behavior' } } },
     })).toThrowError(/declares no behavior/)
-    expect(() => resolvePrimeProfileDimensions({
+    expect(() => readPrimeProfileControls({
       subagents: { 'my agent': { prompt: 'a' }, my_agent: { prompt: 'b' } },
-    })).toThrowError(/collide on harness-state id "my_agent"/)
+    })).toThrowError(/collides with subagent "my agent" on harness-state id "profile-my-agent"/)
+  })
+
+  it('surfaces a shared-lowering refusal as this backend\'s typed error', async () => {
+    // The reason text is the shared fork evidence; only the framing and the
+    // BackendError code belong to this backend.
+    await expect(chatWithProfile({ hooks: {} }))
+      .rejects.toMatchObject({
+        name: 'BackendError',
+        code: 'not_configured',
+        message: expect.stringMatching(
+          /agent_profile\.hooks is not supported by backend prime: .*no hook mechanism/s,
+        ),
+      })
+    await expect(chatWithProfile({
+      resources: { skills: [{ kind: 'inline', name: 'Bad_Name', content: 'x' }] },
+    })).rejects.toMatchObject({ name: 'BackendError', code: 'parse_error' })
   })
 
   it('materializes instructions, inline skills, and subagents into the per-session agent dir', async () => {
@@ -766,11 +921,17 @@ describe('PrimeBackend profile dimensions', () => {
     }, 'profile-dims-run', undefined, captures)
 
     const agentDir = captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!
+    // Instructions have no flag — the fork finds them BY the agent dir.
     expect(readFileSync(join(agentDir, 'AGENTS.md'), 'utf8')).toBe(
       'Always run the linter.\n\nPrefer small diffs.\n\nRepository conventions apply.\n',
     )
 
-    const skillMd = readFileSync(join(agentDir, 'skills', 'release-check', 'SKILL.md'), 'utf8')
+    // Skills are bound by an explicit --skill dir rather than left to the
+    // fork's global auto-discovery, which a same-named project-scope skill
+    // would shadow.
+    const args = captures[0]!.args
+    const skillsRoot = args[args.indexOf('--skill') + 1]!
+    const skillMd = readFileSync(join(skillsRoot, 'release-check', 'SKILL.md'), 'utf8')
     expect(skillMd).toContain('name: release-check')
     expect(skillMd).toContain('Verify releases before shipping')
     expect(skillMd).toContain('Run the release checklist.')
@@ -782,15 +943,15 @@ describe('PrimeBackend profile dimensions', () => {
     }
     expect(state.schema).toBe(1)
     expect(state.refinements).toEqual([])
-    const entry = state.entries.subagent!.code_reviewer!
+    const entry = state.entries.subagent!['profile-code-reviewer']!
     expect(entry).toMatchObject({
-      id: 'code_reviewer',
+      id: 'profile-code-reviewer',
       kind: 'subagent',
       title: 'code reviewer',
       content: 'Reviews diffs.\n\nReview the diff carefully.',
-      path: 'general',
+      path: 'profile',
       scope: 'global',
-      source: 'cli-bridge-profile',
+      source: 'profile',
       version: 1,
     })
     // The kernel loader drops entries without string title/content
@@ -809,8 +970,10 @@ describe('PrimeBackend profile dimensions', () => {
     }, 'profile-reprov', backend, captures)
 
     const agentDir = captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!
+    const firstSkillsRoot = captures[0]!.args[captures[0]!.args.indexOf('--skill') + 1]!
     // Simulate the agent's own self-modification between turns: a skill it
-    // wrote itself and a harness entry it learned.
+    // wrote itself into the agent dir's auto-discovery tree, and a harness
+    // entry it learned.
     mkdirSync(join(agentDir, 'skills', 'self-made'), { recursive: true })
     writeFileSync(
       join(agentDir, 'skills', 'self-made', 'SKILL.md'),
@@ -838,16 +1001,57 @@ describe('PrimeBackend profile dimensions', () => {
       subagents: { checker: { prompt: 'Check results.' } },
     }, 'profile-reprov', backend, captures)
 
-    expect(existsSync(join(agentDir, 'skills', 'alpha'))).toBe(false)
-    expect(existsSync(join(agentDir, 'skills', 'beta', 'SKILL.md'))).toBe(true)
+    const secondSkillsRoot = captures[1]!.args[captures[1]!.args.indexOf('--skill') + 1]!
+    expect(secondSkillsRoot).toBe(firstSkillsRoot)
+    expect(existsSync(join(secondSkillsRoot, 'alpha'))).toBe(false)
+    expect(existsSync(join(secondSkillsRoot, 'beta', 'SKILL.md'))).toBe(true)
     expect(existsSync(join(agentDir, 'skills', 'self-made', 'SKILL.md'))).toBe(true)
 
     const next = JSON.parse(readFileSync(statePath, 'utf8')) as {
       entries: { subagent: Record<string, Record<string, unknown>> }
     }
-    expect(next.entries.subagent.helper).toBeUndefined()
-    expect(next.entries.subagent.checker).toMatchObject({ source: 'cli-bridge-profile' })
+    expect(next.entries.subagent['profile-helper']).toBeUndefined()
+    expect(next.entries.subagent['profile-checker']).toMatchObject({ source: 'profile' })
     expect(next.entries.subagent.self_learned).toMatchObject({ source: 'agent', title: 'self learned' })
+  })
+
+  it('adopts subagent entries a pre-shared build of this backend left behind', async () => {
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
+    await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      subagents: { helper: { prompt: 'Help.' } },
+    }, 'profile-legacy', backend, captures)
+    const statePath = join(
+      captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!, 'harness', 'harness_state.json',
+    )
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as {
+      entries: { subagent: Record<string, Record<string, unknown>> }
+    }
+    // The id and source this backend wrote before the collapse. Each side's
+    // prune matched only its OWN source, so without adoption these entries
+    // would be unprunable and the roster would silently accumulate duplicates.
+    state.entries.subagent.legacy_helper = {
+      id: 'legacy_helper',
+      kind: 'subagent',
+      title: 'helper',
+      content: 'Help.',
+      path: 'general',
+      scope: 'global',
+      source: 'cli-bridge-profile',
+      version: 1,
+    }
+    writeFileSync(statePath, JSON.stringify(state))
+
+    await chatWithProfile({
+      model: { provider: 'tangle', default: 'glm-5.2' },
+      subagents: { helper: { prompt: 'Help.' } },
+    }, 'profile-legacy', backend, captures)
+
+    const next = JSON.parse(readFileSync(statePath, 'utf8')) as {
+      entries: { subagent: Record<string, Record<string, unknown>> }
+    }
+    expect(Object.keys(next.entries.subagent)).toEqual(['profile-helper'])
   })
 
   it('refuses to overwrite a harness state file that no longer parses', async () => {
@@ -865,57 +1069,66 @@ describe('PrimeBackend profile dimensions', () => {
     }, 'profile-corrupt', backend, captures)).rejects.toThrowError(/harness state .*not valid JSON/)
   })
 
-  it('never prunes outside the agent dir even when the manifest was tampered with', () => {
-    const outerDir = mkdtempSync(join(tmpdir(), 'prime-manifest-guard-'))
-    cleanupDirs.push(outerDir)
-    const agentDir = join(outerDir, 'agent')
-    mkdirSync(agentDir, { recursive: true })
-    const victim = join(outerDir, 'victim.txt')
-    writeFileSync(victim, 'must survive')
-    writeFileSync(
-      join(agentDir, '.cli-bridge-profile-manifest.json'),
-      JSON.stringify({ paths: ['../victim.txt', '/etc/hosts', '', '.'] }),
-    )
-    materializePrimeProfileAgentDir(agentDir, { instructionsMd: null, skills: [], subagents: [] })
-    expect(readFileSync(victim, 'utf8')).toBe('must survive')
-  })
-
-  it('refuses agent-dir profile material together with a persistent agent dir', async () => {
+  it('refuses agent-dir-only profile material together with a persistent agent dir', async () => {
     const agentDir = mkdtempSync(join(tmpdir(), 'prime-persistent-dims-'))
     cleanupDirs.push(agentDir)
     const backend = newBackend(primeSpawner(HAPPY_STREAM, []), { persistentAgentDir: agentDir })
-    await expect(chatWithProfile({
-      model: { provider: 'tangle', default: 'glm-5.2' },
-      resources: { skills: [{ kind: 'inline', name: 'alpha', content: 'skill' }] },
-    }, undefined, backend)).rejects.toThrowError(/operator-owned dir this backend must not rewrite/)
+    for (const profile of [
+      { prompt: { instructions: ['standing rule'] } },
+      { subagents: { helper: { prompt: 'Help.' } } },
+    ] as AgentProfile[]) {
+      await expect(chatWithProfile({
+        model: { provider: 'tangle', default: 'glm-5.2' },
+        ...profile,
+      }, undefined, backend)).rejects.toThrowError(/operator-owned dir this backend must not rewrite/)
+    }
   })
 
-  it('leaves an operator-owned persistent agent dir untouched for a material-free profile', async () => {
+  it('binds flag-named profile material without writing into a persistent agent dir', async () => {
     const agentDir = mkdtempSync(join(tmpdir(), 'prime-persistent-clean-'))
     cleanupDirs.push(agentDir)
     writeFileSync(join(agentDir, 'AGENTS.md'), 'operator instructions\n')
-    const backend = newBackend(primeSpawner(HAPPY_STREAM, []), { persistentAgentDir: agentDir })
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures), { persistentAgentDir: agentDir })
     await chatWithProfile({
       model: { provider: 'tangle', default: 'glm-5.2' },
       prompt: { appendSystemPrompt: 'ADDED' },
-    }, undefined, backend)
+      resources: { skills: [{ kind: 'inline', name: 'alpha', content: 'skill body' }] },
+    }, undefined, backend, captures)
+
+    // The prompt file and the skills root are named by flags, so they live in
+    // this run's own dir and the operator's files are untouched.
+    const args = captures[0]!.args
+    const appendPath = args[args.indexOf('--append-system-prompt') + 1]!
+    const skillsRoot = args[args.indexOf('--skill') + 1]!
+    expect(captures[0]!.argFiles[appendPath]).toBe('ADDED')
+    expect(captures[0]!.argDirs[skillsRoot]).toContain(join('alpha', 'SKILL.md'))
+    expect(appendPath.startsWith(agentDir)).toBe(false)
+    expect(skillsRoot.startsWith(agentDir)).toBe(false)
     expect(readFileSync(join(agentDir, 'AGENTS.md'), 'utf8')).toBe('operator instructions\n')
     expect(existsSync(join(agentDir, 'harness', 'harness_state.json'))).toBe(false)
+    expect(existsSync(join(agentDir, 'profile'))).toBe(false)
   })
 
-  it('reports whether resolved material needs the agent dir', () => {
-    expect(hasPrimeProfileMaterial(resolvePrimeProfileDimensions({}))).toBe(false)
-    expect(hasPrimeProfileMaterial(resolvePrimeProfileDimensions({
+  it('reports whether resolved controls need the agent dir itself', () => {
+    expect(hasPrimeProfileMaterial(readPrimeProfileControls({}))).toBe(false)
+    expect(hasPrimeProfileMaterial(readPrimeProfileControls({
       prompt: { instructions: ['x'] },
     }))).toBe(true)
     // A skill body without frontmatter still gains the loader-required
     // name/description frontmatter (a description-less SKILL.md is silently
     // dropped by the fork).
-    const material = resolvePrimeProfileDimensions({
-      resources: { skills: [{ kind: 'inline', name: 'bare', content: 'Just a body.' }] },
-    })
-    expect(material.skills[0]!.markdown).toContain('name: bare')
-    expect(material.skills[0]!.markdown).toContain('description:')
+    const dir = mkdtempSync(join(tmpdir(), 'prime-skill-normalize-'))
+    cleanupDirs.push(dir)
+    const args = materializePrimeProfileControls(
+      dir,
+      readPrimeProfileControls({
+        resources: { skills: [{ kind: 'inline', name: 'bare', content: 'Just a body.' }] },
+      }),
+    )
+    const md = readFileSync(join(args[args.indexOf('--skill') + 1]!, 'bare', 'SKILL.md'), 'utf8')
+    expect(md).toContain('name: bare')
+    expect(md).toContain('description:')
   })
 })
 

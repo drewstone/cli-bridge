@@ -97,7 +97,7 @@ pnpm install:harnesses      # all harnesses
 | `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
 | `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
 | `pi` | `npm install -g @earendil-works/pi-coding-agent` | Explicit provider/model config in `~/.pi/agent/models.json`; cli-bridge resolves its credential before spawn |
-| `prime` | prime-agent, the `@earendil-works` pi fork; its installed bin is `pi`, so point `PRIME_BIN` at that binary (the `prime-agent` default fails closed rather than driving upstream pi) | Operator `models.json` named by `PRIME_MODELS_JSON`, materialized into an isolated per-run agent dir; only the apiKey env vars it names are forwarded |
+| `prime` | prime-agent, the PrimeIntellect fork of pi. It is **not installable from npm**: the registry serves the upstream pi line under the fork's own package name `@earendil-works/pi-coding-agent` (latest `0.84.x`; the fork's `0.7.x` does not exist there), and the two are wire-incompatible. Run `pnpm install:harness prime` — it builds from source at the pinned commit and installs the entrypoint as `prime-agent`, which is what `PRIME_BIN` defaults to. Do **not** install it as `pi` | Operator `models.json` named by `PRIME_MODELS_JSON`, materialized into an isolated per-run agent dir; only the apiKey env vars it names are forwarded |
 | `passthrough` | (none) | provider API keys in `.env` |
 
 For a Nix-provisioned host shell with the shared prerequisites:
