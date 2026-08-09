@@ -96,10 +96,142 @@ async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
   return out
 }
 
+/** A spawner whose first `failures` attempts die the way a transient upstream fault dies: nothing
+ *  on stdout, a message on stderr, a non-zero exit. Later attempts stream `lines` and exit 0. */
+function flakyPiSpawner(
+  failures: number,
+  lines: Array<Record<string, unknown>>,
+  stderrText = 'stream closed by upstream',
+  options: { readonly linesBeforeFailure?: Array<Record<string, unknown>> } = {},
+): Spawner & { spawns: () => number } {
+  let spawns = 0
+  const spawner: Spawner = async (): Promise<SpawnResult> => {
+    const failing = spawns < failures
+    spawns += 1
+    const child = new FakeChild()
+    queueMicrotask(() => {
+      const emitted = failing ? (options.linesBeforeFailure ?? []) : lines
+      for (const line of emitted) child.stdout.write(`${JSON.stringify(line)}\n`)
+      child.stdout.end()
+      if (failing) child.stderr.write(stderrText)
+      child.stderr.end()
+      setTimeout(() => {
+        child.exitCode = failing ? 1 : 0
+        child.emit('close', child.exitCode)
+      }, 5)
+    })
+    return {
+      child: child as never,
+      release() {},
+      spawnError: () => null,
+    }
+  }
+  spawner.executionEnvironment = 'test-double'
+  return Object.assign(spawner, { spawns: () => spawns })
+}
+
 function argValue(args: readonly string[], flag: string): string | undefined {
   const index = args.indexOf(flag)
   return index >= 0 ? args[index + 1] : undefined
 }
+
+describe('PiBackend turn retry (#125)', () => {
+  const successLines = [
+    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'recovered' } },
+    { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+  ]
+  const request: ChatRequest = {
+    model: 'pi/tangle-router/glm-5.2',
+    messages: [{ role: 'user', content: 'TASK' }],
+  }
+
+  it('retries a transient death that the caller never saw and delivers the recovered turn', async () => {
+    // The measured shape: pi dies mid-stream before emitting anything. Four supervised runs ended
+    // on exactly this, each sinking 0.2-2.9M input tokens, because one cut connection failed the
+    // whole turn with no retry anywhere.
+    const spawner = flakyPiSpawner(1, successLines)
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      turnRetryBackoffMs: 1,
+    })
+    const deltas = await collect(backend.chat(request, null, new AbortController().signal))
+
+    expect(spawner.spawns()).toBe(2)
+    // Exactly one copy of the answer: the failed attempt emitted nothing, so the caller's stream
+    // never saw the death at all.
+    expect(deltas.filter((d) => d.content).map((d) => d.content)).toEqual(['recovered'])
+    expect(deltas.at(-1)?.finish_reason).toBe('stop')
+  })
+
+  it('never retries once the caller has already seen part of the stream', async () => {
+    // A second attempt here would contradict a stream the caller is already reading — duplicated
+    // content and a second usage record. The failure is raised, and the caller's driver-level
+    // retry (which can resume the harness session) owns recovery from there.
+    const spawner = flakyPiSpawner(1, successLines, 'died after content', {
+      linesBeforeFailure: [
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'partial' } },
+      ],
+    })
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      turnRetryBackoffMs: 1,
+    })
+    await expect(
+      collect(backend.chat(request, null, new AbortController().signal)),
+    ).rejects.toThrow(/died after content/)
+    expect(spawner.spawns()).toBe(1)
+  })
+
+  it('never retries a credential failure, which fails identically every time', async () => {
+    const spawner = flakyPiSpawner(3, successLines, '401 Unauthorized: token expired')
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      turnRetryBackoffMs: 1,
+    })
+    const error = await collect(backend.chat(request, null, new AbortController().signal))
+      .then(() => null)
+      .catch((e: unknown) => e)
+
+    expect(spawner.spawns()).toBe(1)
+    expect(error).toBeInstanceOf(BackendError)
+    expect((error as BackendError).code).toBe('not_configured')
+  })
+
+  it('raises the real failure once the attempts are spent', async () => {
+    const spawner = flakyPiSpawner(5, successLines)
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      maxTurnAttempts: 3,
+      turnRetryBackoffMs: 1,
+    })
+    await expect(
+      collect(backend.chat(request, null, new AbortController().signal)),
+    ).rejects.toThrow(/stream closed by upstream/)
+    expect(spawner.spawns()).toBe(3)
+  })
+
+  it('honours maxTurnAttempts: 1 as the historical no-retry behavior', async () => {
+    const spawner = flakyPiSpawner(1, successLines)
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      maxTurnAttempts: 1,
+    })
+    await expect(
+      collect(backend.chat(request, null, new AbortController().signal)),
+    ).rejects.toThrow(/stream closed by upstream/)
+    expect(spawner.spawns()).toBe(1)
+  })
+})
 
 describe('PiBackend', () => {
   it('applies one exact profile while leaving the task unchanged', async () => {
