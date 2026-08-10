@@ -157,6 +157,7 @@ export class OpencodeBackend implements Backend {
         },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
     } catch (error) {
       mcpMaterialized?.cleanup()

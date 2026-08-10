@@ -404,7 +404,13 @@ describe('span shape conformance', () => {
   })
 
   it('records a request refused at admission', async () => {
-    const admission = new AdmissionGate({ maxActive: 1, maxQueue: 0, queueTimeoutMs: 0 })
+    const admission = new AdmissionGate({
+      maxActive: 1,
+      maxQueue: 0,
+      queueTimeoutMs: 0,
+      reservedActive: 0,
+      bulkQueueTimeoutMs: 0,
+    })
     const lease = await admission.acquire()
     const ctx = fixture(new SilentBackend(), { admission })
     try {

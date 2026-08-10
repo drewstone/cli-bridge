@@ -76,62 +76,114 @@ interface Waiter {
 
 class ScopedSemaphore {
   private inFlight = 0
-  private readonly waiters: Waiter[] = []
+  private bulkInFlight = 0
+  private readonly waiters: Record<'reserved' | 'bulk', Waiter[]> = { reserved: [], bulk: [] }
   acquires = 0
   timeouts = 0
 
   constructor(
     private readonly max: number,
     private readonly acquireDeadlineMs: number,
-  ) {}
+    /**
+     * Slots inside `max` that only `reserved` callers may occupy. Mirrors the
+     * host admission lane: reserving at admission alone is not enough, because
+     * this semaphore is the tighter of the two whenever
+     * CLI_BRIDGE_SCOPE_MAX_CONCURRENCY < BRIDGE_HOST_CHAT_MAX_ACTIVE.
+     */
+    private readonly reserved: number,
+  ) {
+    if (reserved < 0 || reserved >= max) {
+      throw new Error(
+        `invalid CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY: ${reserved} — expected an integer in [0, ${max - 1}]`,
+      )
+    }
+  }
 
-  async acquire(): Promise<void> {
+  private canAdmit(admissionClass: 'reserved' | 'bulk'): boolean {
+    if (this.inFlight >= this.max) return false
+    if (admissionClass === 'bulk') return this.bulkInFlight < this.max - this.reserved
+    return true
+  }
+
+  private take(admissionClass: 'reserved' | 'bulk'): void {
+    this.inFlight += 1
+    if (admissionClass === 'bulk') this.bulkInFlight += 1
+  }
+
+  async acquire(admissionClass: 'reserved' | 'bulk' = 'bulk'): Promise<void> {
     this.acquires += 1
-    if (this.inFlight < this.max) {
-      this.inFlight += 1
+    if (this.canAdmit(admissionClass)) {
+      this.take(admissionClass)
       return
     }
     await new Promise<void>((resolve, reject) => {
+      const queue = this.waiters[admissionClass]
       const timer = setTimeout(() => {
-        const idx = this.waiters.findIndex((w) => w.timer === timer)
-        if (idx >= 0) this.waiters.splice(idx, 1)
+        const idx = queue.findIndex((w) => w.timer === timer)
+        if (idx >= 0) queue.splice(idx, 1)
         this.timeouts += 1
         reject(
           new Error(
             `scoped-host-executor: acquire timeout after ${this.acquireDeadlineMs}ms ` +
-              `(in_flight=${this.inFlight}/${this.max}, queued=${this.waiters.length}). ` +
+              `(lane=${admissionClass}, in_flight=${this.inFlight}/${this.max}, ` +
+              `bulk=${this.bulkInFlight}/${this.max - this.reserved}, queued=${queue.length}). ` +
               `Reduce parallel callers or raise CLI_BRIDGE_SCOPE_MAX_CONCURRENCY.`,
           ),
         )
       }, this.acquireDeadlineMs).unref()
-      this.waiters.push({ resolve, reject, timer })
+      queue.push({ resolve, reject, timer })
     })
   }
 
-  release(): void {
-    const next = this.waiters.shift()
-    if (next) {
-      clearTimeout(next.timer)
-      next.resolve()
-      return
-    }
+  release(admissionClass: 'reserved' | 'bulk' = 'bulk'): void {
     if (this.inFlight > 0) this.inFlight -= 1
+    if (admissionClass === 'bulk' && this.bulkInFlight > 0) this.bulkInFlight -= 1
+    // Reserved waiters first, FIFO within a lane.
+    for (const lane of ['reserved', 'bulk'] as const) {
+      const queue = this.waiters[lane]
+      while (queue.length > 0 && this.canAdmit(lane)) {
+        const next = queue.shift()
+        if (!next) break
+        clearTimeout(next.timer)
+        this.take(lane)
+        next.resolve()
+      }
+    }
   }
 
-  snapshot(): { in_flight: number; max: number; queued: number; acquires: number; timeouts: number } {
+  snapshot(): {
+    in_flight: number
+    max: number
+    queued: number
+    acquires: number
+    timeouts: number
+    reserved: number
+    bulk_in_flight: number
+    bulk_max: number
+    queued_reserved: number
+    queued_bulk: number
+  } {
     return {
       in_flight: this.inFlight,
       max: this.max,
-      queued: this.waiters.length,
+      queued: this.waiters.reserved.length + this.waiters.bulk.length,
       acquires: this.acquires,
       timeouts: this.timeouts,
+      reserved: this.reserved,
+      bulk_in_flight: this.bulkInFlight,
+      bulk_max: this.max - this.reserved,
+      queued_reserved: this.waiters.reserved.length,
+      queued_bulk: this.waiters.bulk.length,
     }
   }
 }
 
+const scopeMaxConcurrency = positiveIntEnv('CLI_BRIDGE_SCOPE_MAX_CONCURRENCY', DEFAULT_SCOPE_MAX_CONCURRENCY)
+
 const scopedSemaphore = new ScopedSemaphore(
-  positiveIntEnv('CLI_BRIDGE_SCOPE_MAX_CONCURRENCY', DEFAULT_SCOPE_MAX_CONCURRENCY),
+  scopeMaxConcurrency,
   positiveIntEnv('CLI_BRIDGE_SCOPE_ACQUIRE_DEADLINE_MS', DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS),
+  nonNegativeIntEnv('CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY', Math.min(2, scopeMaxConcurrency - 1)),
 )
 
 /** Result of the one-shot probe. `null` until first call, then cached. */
@@ -291,12 +343,13 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     return hostSpawner(bin, args, opts)
   }
 
-  await scopedSemaphore.acquire()
+  const admissionClass = opts.admissionClass ?? 'bulk'
+  await scopedSemaphore.acquire(admissionClass)
   let semaphoreReleased = false
   const releaseSemaphore = (): void => {
     if (semaphoreReleased) return
     semaphoreReleased = true
-    scopedSemaphore.release()
+    scopedSemaphore.release(admissionClass)
   }
 
   // Unit name MUST be unique per spawn; collisions would refuse to
@@ -396,6 +449,12 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
 }
 scopedHostSpawner.executionEnvironment = 'host'
 
+/** Concurrency ceiling of the scoped executor, for cross-gate coherence checks. */
+export function scopedHostConcurrencyLimits(): { max: number; reserved: number } {
+  const snap = scopedSemaphore.snapshot()
+  return { max: snap.max, reserved: snap.reserved }
+}
+
 /** Diagnostics for /metrics. */
 export function scopedHostExecutorSnapshot(): {
   in_flight: number
@@ -403,6 +462,11 @@ export function scopedHostExecutorSnapshot(): {
   queued: number
   acquires: number
   timeouts: number
+  reserved: number
+  bulk_in_flight: number
+  bulk_max: number
+  queued_reserved: number
+  queued_bulk: number
 } {
   return scopedSemaphore.snapshot()
 }
@@ -421,6 +485,16 @@ function optionalPositiveIntEnv(name: string): number | null {
   const value = Number(raw)
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new Error(`invalid ${name}: expected a positive integer or 0 to disable`)
+  }
+  return value
+}
+
+function nonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`invalid ${name}: ${raw} — expected a non-negative integer`)
   }
   return value
 }

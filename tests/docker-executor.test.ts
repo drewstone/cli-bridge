@@ -1086,7 +1086,15 @@ describe('per-backend executor config (parseAllExecutors)', () => {
       maxActive: 8,
       maxQueue: 16,
       queueTimeoutMs: 30_000,
+      reservedActive: 2,
+      bulkQueueTimeoutMs: 240_000,
     })
+    expect(config.admissionReservedClients).toEqual(['pr-reviewer'])
+  })
+
+  it('scales the reserved lane down rather than starving bulk on a tiny pool', () => {
+    const config = loadConfig({ HOME: '/home/test', BRIDGE_HOST_CHAT_MAX_ACTIVE: '1' })
+    expect(config.admission.reservedActive).toBe(0)
   })
 
   it('defaults all backends to host when no env is set', () => {
