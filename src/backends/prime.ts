@@ -52,28 +52,46 @@
  * Vision: images in the request ride the rpc `prompt` command's native
  * `images` field (base64 + mimeType) instead of being flattened away.
  *
- * AgentProfile coverage: prompt (replace + append via --system-prompt /
- * --append-system-prompt), model + reasoningEffort (--provider/--model/
- * --thinking), harness pin `prime`, prompt.instructions +
- * resources.instructions (agent-dir AGENTS.md), inline resources.skills
- * (agent-dir skills/<name>/SKILL.md), and subagents as seeded harness-state
- * entries. Every other dimension is REJECTED loudly with the fork evidence —
- * see resolvePrimeProfileDimensions. Nothing is silently dropped.
+ * AgentProfile coverage is the SHARED prime agent-dir lowering in
+ * `@tangle-network/agent-profile-materialize` — the same implementation
+ * sdk-provider-prime runs in-sandbox, so the two executors driving this fork
+ * cannot disagree about what it can honor. It accepts prompt replace/append,
+ * instructions, inline skills and subagents, and refuses every other dimension
+ * loudly with the fork evidence. This file keeps only what is genuinely
+ * transport-specific: the rpc argv/stream contract, host-process isolation
+ * (HOME + XDG + per-run daemon socket), and operator credential handling.
  *
  * Known fork defect this backend defends against: a spontaneously crashed
- * IPython kernel is never re-provisioned headlessly. The failure surfaces
- * either as a failed assistant turn (`turn_end` with `stopReason: 'error'`,
- * thrown here as a typed BackendError) or as a wedged session, which the
- * caller-owned `execution.timeoutMs` deadline terminates — never a silent
- * empty completion.
+ * IPython kernel is never re-provisioned headlessly. Every later `ipython`
+ * call fails with a known marker (PRIME_KERNEL_DEAD_MARKERS), which is treated
+ * as session-fatal rather than retryable, so a dead kernel cannot burn the
+ * caller's whole `execution.timeoutMs` against a permanently broken tool.
  */
 
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join, resolve, sep } from 'node:path'
-import type { AgentProfile, AgentProfileResourceRef } from '@tangle-network/agent-interface'
-import { normalizeSkillMd } from '@tangle-network/agent-profile-materialize'
+import { join } from 'node:path'
+import type { AgentProfile } from '@tangle-network/agent-interface'
+import {
+  assertPrimeModelAgreement,
+  matchPrimeKernelDeadMarker,
+  materializePrimeProfileControls,
+  parsePrimeModelsJson,
+  PRIME_HARNESS_STATE_ENV_DENYLIST,
+  PRIME_KERNEL_ENV_PASSTHROUGH,
+  PRIME_MCP_UNSUPPORTED_REASON,
+  primeAgentDirEnv,
+  primeProfileNeedsAgentDir,
+  primeApiKeyEnvNames,
+  PrimeHarnessStateError,
+  PrimeProfileError,
+  type PrimeProfileControls,
+  primeThinkingLevel,
+  prunePrimeProfileMaterial,
+  readPrimeProfileControls,
+  writePrimeAgentFile,
+} from '@tangle-network/agent-profile-materialize'
 import type { Backend, BackendHealth, ChatDelta, ChatMessage, ChatRequest } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { versionHealth } from './health.js'
@@ -136,26 +154,16 @@ function parsePrimeModelId(model: string): PrimeModelSpec {
   return { provider: rest.slice(0, slash), model: rest.slice(slash + 1) }
 }
 
-/** Map the canonical reasoning ladder to prime's `--thinking` flag.
- *  The fork accepts off|minimal|low|medium|high|xhigh|max (cli/args.ts), one
- *  rung above upstream Pi — so `ultracode` maps to `max`, not `xhigh`. */
-export function primeThinkingFlagForEffort(effort?: string): string | null {
-  if (!effort) return null
-  const allowed = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
-  const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'max' : effort
-  return allowed.has(e) ? e : null
-}
-
 /**
  * Neutral env allowlist for the prime-agent process tree. Deliberately absent:
  * HOME and XDG_* (pinned per run below) and every ambient provider key —
  * credentials reach the child only when the materialized models.json names
- * them. PRIME_AGENT_KERNEL_* / PRIME_AGENT_INSTALL_UV pass through so an
- * operator-prepared Python kernel survives the HOME isolation (the kernel venv
- * defaults to `$HOME/.prime/agent/kernel-venv`, which a fresh HOME would
+ * them. The prime-specific kernel knobs come from the shared fork contract, so
+ * an operator-prepared Python kernel survives the HOME isolation (the kernel
+ * venv defaults to `$HOME/.prime/agent/kernel-venv`, which a fresh HOME would
  * otherwise re-bootstrap on every run).
  */
-const PRIME_INHERITED_ENV_KEYS = [
+const PRIME_INHERITED_ENV_KEYS: readonly string[] = [
   'PATH',
   'SHELL',
   'TMPDIR',
@@ -171,10 +179,8 @@ const PRIME_INHERITED_ENV_KEYS = [
   'FORCE_COLOR',
   'NVM_DIR',
   'PNPM_HOME',
-  'PRIME_AGENT_INSTALL_UV',
-  'PRIME_AGENT_KERNEL_PYTHON',
-  'PRIME_AGENT_KERNEL_VENV',
-] as const
+  ...PRIME_KERNEL_ENV_PASSTHROUGH,
+]
 
 export function primeProcessEnvironment(
   inherited: NodeJS.ProcessEnv,
@@ -188,471 +194,12 @@ export function primeProcessEnvironment(
   for (const [key, value] of Object.entries(requestValues)) {
     if (typeof value === 'string' && value.length > 0) child[key] = value
   }
+  // The harness-store redirects are excluded from the allowlist above; deleting
+  // them again is the guard that survives a future well-meaning addition, since
+  // either one silently re-points the self-modifying store outside the isolated
+  // agent dir.
+  for (const key of PRIME_HARNESS_STATE_ENV_DENYLIST) delete child[key]
   return child
-}
-
-/** Strip `//` line comments and trailing commas, leaving string literals
- *  untouched. Byte-for-byte the fork's own `stripJsonComments`
- *  (core/model-registry.ts), so a models.json prime accepts is never refused
- *  here and vice versa. */
-function stripJsonComments(input: string): string {
-  return input
-    .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (m) => (m[0] === '"' ? m : ''))
-    .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (m, tail: string | undefined) => tail ?? (m[0] === '"' ? m : ''))
-}
-
-/** Parse an operator models.json with the fork's own laxness. Throws with the
- *  offending path on anything prime itself would reject structurally. */
-export function parsePrimeModelsJson(text: string, sourcePath: string): Record<string, unknown> {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(stripJsonComments(text))
-  } catch (err) {
-    throw new Error(`prime models.json ${sourcePath} is not valid JSON: ${(err as Error).message}`)
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`prime models.json ${sourcePath} must be a JSON object`)
-  }
-  const providers = (parsed as Record<string, unknown>).providers
-  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) {
-    throw new Error(`prime models.json ${sourcePath} must carry a "providers" object (prime's models.json schema)`)
-  }
-  return parsed as Record<string, unknown>
-}
-
-/**
- * One authority per run: an exact profile must agree with the wire model, and
- * a profile pinned to another harness must not run here. The canonical harness
- * enum carries `prime` (agent-interface 0.45), so the only pins this backend
- * honors are `prime` and none at all.
- */
-function assertPrimeProfileBinding(
-  profile: AgentProfile,
-  spec: { provider: string; model: string },
-): void {
-  const pinned = profile.harness
-  if (pinned !== undefined && pinned !== 'prime') {
-    throw new BackendError(
-      `agent_profile.harness ${JSON.stringify(pinned)} conflicts with backend prime; `
-      + 'omit the harness pin to run this profile on prime-agent',
-      'parse_error',
-    )
-  }
-  const wireModel = `${spec.provider}/${spec.model}`
-  const requestedModel = profile.model?.default
-  const requestedProvider = profile.model?.provider
-  if (requestedModel !== undefined) {
-    const qualified = requestedProvider && !requestedModel.includes('/')
-      ? `${requestedProvider}/${requestedModel}`
-      : requestedModel
-    if (wireModel !== qualified) {
-      throw new BackendError(
-        `request model ${JSON.stringify(`prime/${wireModel}`)} conflicts with agent_profile.model ${JSON.stringify(qualified)}`,
-        'parse_error',
-      )
-    }
-  } else if (requestedProvider !== undefined && requestedProvider !== spec.provider) {
-    throw new BackendError(
-      `request model ${JSON.stringify(`prime/${wireModel}`)} does not select agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
-      'parse_error',
-    )
-  }
-}
-
-/**
- * AgentProfile material this backend lands in the per-run agent dir, resolved
- * and validated BEFORE any directory is provisioned. Every field maps to a
- * loader verified in the pinned fork clone (v0.7.0, be9e2fa0):
- *
- *   - instructionsMd → `<agentDir>/AGENTS.md`. The fork reads the agent dir's
- *     AGENTS.md as the global context file (core/resource-loader.ts:58-59
- *     candidate names, :86-90 agent-dir read, :476 loaded unless
- *     --no-context-files) and injects it into both the default and the
- *     --system-prompt prompt paths (core/system-prompt.ts:76-82, 150-156).
- *   - skills → `<agentDir>/skills/<name>/SKILL.md`. Auto-discovered from the
- *     agent dir (core/package-manager.ts:884 agent dir as global base, :2171
- *     skills dir, :2240-2246 user-scope discovery, :699 enabled by default),
- *     loaded by core/skills.ts and injected into the system prompt in both
- *     prompt paths (core/system-prompt.ts:87-88, 160-161).
- *   - subagents → global harness-state entries in
- *     `<agentDir>/harness/harness_state.json`. The host loads that exact file
- *     on every system-prompt build (core/refinement/refinement.ts:269-283;
- *     core/agent-session.ts:4288, 7548-7554) and renders subagent entries as
- *     the spawnable-spec roster (core/refinement/refinement.ts:470-520); the
- *     kernel reads the same file via RLM_GLOBAL_HARNESS_STATE_DIR
- *     (core/agent-session.ts:8805; prime-agent-runtime/src/rlm/harness.py:77-90).
- */
-export interface PrimeProfileAgentDirMaterial {
-  instructionsMd: string | null
-  skills: Array<{ name: string; markdown: string }>
-  subagents: Array<{ id: string; title: string; content: string; metadata: Record<string, unknown> }>
-}
-
-export function hasPrimeProfileMaterial(material: PrimeProfileAgentDirMaterial): boolean {
-  return material.instructionsMd !== null || material.skills.length > 0 || material.subagents.length > 0
-}
-
-/** Capability refusal for a profile control the fork verifiably cannot honor. */
-function rejectPrimeProfileDimension(dimension: string, reason: string): never {
-  throw new BackendError(
-    `agent_profile.${dimension} is not supported by backend prime: ${reason}`,
-    'not_configured',
-  )
-}
-
-/** Mirror of the fork's skill-name rules (core/skills.ts:122-146): the name
- *  must equal the skill directory name, so an invalid name would load with
- *  warnings or collide — validate here and refuse instead. */
-const PRIME_SKILL_NAME_RE = /^[a-z0-9-]+$/
-const PRIME_SKILL_NAME_MAX = 64
-
-/** Mirror of harness.py `_slug` (prime-agent-runtime/src/rlm/harness.py:31-34)
- *  so bridge-seeded ids look like the ids the agent's own refinement creates. */
-function primeSubagentSlug(raw: string): string {
-  const normalized = [...raw.trim().toLowerCase()]
-    .map((ch) => (/[a-z0-9]/.test(ch) ? ch : '_'))
-    .join('')
-    .split('_')
-    .filter(Boolean)
-    .join('_')
-  return (normalized || 'subagent').slice(0, 80)
-}
-
-function primeInstructionsBlock(value: string | AgentProfileResourceRef, where: string): string {
-  if (typeof value === 'string') return value
-  if (value.kind === 'inline') return value.content
-  rejectPrimeProfileDimension(
-    where,
-    'cli-bridge resolves no GitHub-backed resource refs; inline the content or resolve it before the request',
-  )
-}
-
-/**
- * Validate every AgentProfile dimension against what the pinned fork clone
- * verifiably loads, returning the agent-dir material for the supported ones and
- * refusing the rest loudly. Running a profile while silently dropping a control
- * would score the wrong agent, so anything without a verified loader is a hard
- * error, never a skip — including when `resources.failOnError` is false, the
- * same exact-profile discipline the pi materializer applies.
- *
- * Rejected dimensions, with the fork evidence (v0.7.0, be9e2fa0):
- *
- *   - mcp / connections — rejected in chat() beside the request-scoped MCP
- *     check: kernel MCP tools exist only as hand-written Python
- *     `McpIntegration` skill subclasses (prime-agent-runtime/src/rlm/
- *     mcp_base.py:112-125; only notion + linear ship, packages/coding-agent/
- *     skills/{notion,linear}); the host skips non-http `mcpServers` settings
- *     entries entirely (core/mcp/mcp-manager.ts:73) and for http entries only
- *     registers OAuth/config for an already-installed integration — no config
- *     path turns a per-run entry into callable tools.
- *   - permissions — the fork exposes no permission control at all (full flag
- *     scan of cli/args.ts:93-295; native tools run unconditionally).
- *   - tools — the only per-run tool control is `--tools` over the single
- *     builtin `ipython` (cli/args.ts:63-64, 156-167); bash/edit and the rest
- *     are extension-provided and not addressable per run, so a harness-neutral
- *     tool map cannot bind to that surface.
- *   - hooks — no hook mechanism exists (cli/args.ts flag scan; extensions are
- *     host-trusted JS modules, not caller command hooks).
- *   - modes — no mode concept in the fork CLI (cli/args.ts flag scan).
- *   - confidential — a sandbox-backend dimension; this backend spawns a host
- *     process.
- *   - resources.files — no request-scoped loader for arbitrary workspace
- *     files; writing into the shared task cwd reintroduces the cross-run
- *     collision the isolated agent dir exists to remove (same refusal as the
- *     pi path in profile-support.ts).
- *   - resources.tools — prime "tool files" would be extensions loaded INTO the
- *     host process (core/package-manager.ts extensions dirs), i.e. caller code
- *     in the bridge's own trust domain.
- *   - resources.agents — the fork has no subagent-definition-file loader;
- *     subagents live in harness state (wired separately below).
- *   - resources.commands — prompt templates (`<agentDir>/prompts`) are
- *     interactive slash commands with no verified invocation path in a
- *     headless rpc turn.
- *   - subagents[*].model/tools/permissions/maxSteps — the harness-state roster
- *     is prompt text compacted to 180 chars (core/refinement/
- *     refinement.ts:28, 470-520); `rlm()` honors a model only if the agent
- *     chooses to pass one (prime-agent-runtime/src/rlm/__init__.py:143-146),
- *     so none of these pins are mechanically guaranteed.
- *   - extensions.prime — no prime extension controls are defined yet; other
- *     backends' namespaces are ignored per the extensions contract.
- */
-export function resolvePrimeProfileDimensions(profile: AgentProfile): PrimeProfileAgentDirMaterial {
-  if (Object.keys(profile.permissions ?? {}).length > 0) {
-    rejectPrimeProfileDimension('permissions', 'prime-agent has no permission controls; remove them or route to a harness that enforces permissions')
-  }
-  if (Object.keys(profile.tools ?? {}).length > 0) {
-    rejectPrimeProfileDimension('tools', "prime-agent's per-run tool surface cannot enable or disable named tools; remove the tool map")
-  }
-  if (Object.keys(profile.hooks ?? {}).length > 0) {
-    rejectPrimeProfileDimension('hooks', 'prime-agent has no hook mechanism')
-  }
-  if (Object.keys(profile.modes ?? {}).length > 0) {
-    rejectPrimeProfileDimension('modes', 'prime-agent has no mode concept')
-  }
-  if ((profile.connections ?? []).length > 0) {
-    rejectPrimeProfileDimension('connections', 'hub connection grants resolve to MCP tools, and prime-agent has no per-run MCP loader')
-  }
-  if (profile.confidential !== undefined) {
-    rejectPrimeProfileDimension('confidential', 'confidential execution is a sandbox-backend dimension and prime runs as a host process')
-  }
-  const primeExtensions = profile.extensions?.prime
-  if (primeExtensions && Object.keys(primeExtensions).length > 0) {
-    rejectPrimeProfileDimension(
-      'extensions.prime',
-      `unsupported extensions.prime controls: ${Object.keys(primeExtensions).sort().join(', ')}`,
-    )
-  }
-
-  const resources = profile.resources
-  if ((resources?.files ?? []).length > 0) {
-    rejectPrimeProfileDimension('resources.files', 'no request-scoped loader exists for generic workspace files')
-  }
-  if ((resources?.tools ?? []).length > 0) {
-    rejectPrimeProfileDimension('resources.tools', 'prime tool files are host-process extensions, which would run caller code in the bridge trust domain')
-  }
-  if ((resources?.agents ?? []).length > 0) {
-    rejectPrimeProfileDimension('resources.agents', 'prime-agent loads no subagent definition files; declare them in agent_profile.subagents instead')
-  }
-  if ((resources?.commands ?? []).length > 0) {
-    rejectPrimeProfileDimension('resources.commands', 'prompt templates are interactive slash commands with no headless rpc invocation path')
-  }
-
-  const skills: PrimeProfileAgentDirMaterial['skills'] = []
-  const seenSkillNames = new Set<string>()
-  for (const [index, ref] of (resources?.skills ?? []).entries()) {
-    if (ref.kind !== 'inline') {
-      rejectPrimeProfileDimension(
-        `resources.skills[${index}]`,
-        'cli-bridge resolves no GitHub-backed resource refs; inline the SKILL.md content or resolve it before the request',
-      )
-    }
-    const name = ref.name
-    if (
-      !PRIME_SKILL_NAME_RE.test(name)
-      || name.startsWith('-')
-      || name.endsWith('-')
-      || name.includes('--')
-      || name.length > PRIME_SKILL_NAME_MAX
-    ) {
-      throw new BackendError(
-        `agent_profile.resources.skills[${index}] name ${JSON.stringify(name)} is not a valid prime skill name `
-        + `(lowercase a-z, 0-9, single hyphens, max ${PRIME_SKILL_NAME_MAX} chars — it becomes the skill directory name)`,
-        'parse_error',
-      )
-    }
-    if (seenSkillNames.has(name)) {
-      throw new BackendError(
-        `agent_profile.resources.skills declares ${JSON.stringify(name)} twice; the fork keeps only the first and warns, so the duplicate is refused here`,
-        'parse_error',
-      )
-    }
-    seenSkillNames.add(name)
-    // normalizeSkillMd guarantees the frontmatter name/description the fork
-    // requires — a SKILL.md without a description is silently DROPPED by the
-    // loader (core/skills.ts:415-417), which is exactly the silent no-op this
-    // path exists to prevent.
-    skills.push({ name, markdown: normalizeSkillMd(name, ref.content) })
-  }
-
-  const subagents: PrimeProfileAgentDirMaterial['subagents'] = []
-  const seenSubagentIds = new Set<string>()
-  for (const [name, sub] of Object.entries(profile.subagents ?? {})) {
-    for (const pin of ['model', 'tools', 'permissions', 'maxSteps'] as const) {
-      if (sub[pin] !== undefined) {
-        rejectPrimeProfileDimension(
-          `subagents[${JSON.stringify(name)}].${pin}`,
-          'a prime harness-state subagent entry is a prompt-text spec; this pin has no mechanism that guarantees it',
-        )
-      }
-    }
-    const content = [sub.description, sub.prompt].filter(
-      (value): value is string => typeof value === 'string' && value.trim().length > 0,
-    ).join('\n\n')
-    if (!content) {
-      throw new BackendError(
-        `agent_profile.subagents[${JSON.stringify(name)}] declares no behavior (empty description and prompt)`,
-        'parse_error',
-      )
-    }
-    const id = primeSubagentSlug(name)
-    if (seenSubagentIds.has(id)) {
-      throw new BackendError(
-        `agent_profile.subagents names ${JSON.stringify(name)} collide on harness-state id ${JSON.stringify(id)}`,
-        'parse_error',
-      )
-    }
-    seenSubagentIds.add(id)
-    subagents.push({ id, title: name, content, metadata: sub.metadata ?? {} })
-  }
-
-  const instructionBlocks = [
-    ...(profile.prompt?.instructions ?? []),
-    ...(resources?.instructions !== undefined
-      ? [primeInstructionsBlock(resources.instructions, 'resources.instructions')]
-      : []),
-  ].filter((block) => block.trim().length > 0)
-
-  return {
-    instructionsMd: instructionBlocks.length > 0 ? instructionBlocks.join('\n\n') : null,
-    skills,
-    subagents,
-  }
-}
-
-/** Source tag on bridge-seeded harness-state entries: lets re-provisioning
- *  replace exactly its own entries while the agent's self-created ones survive. */
-const PRIME_PROFILE_ENTRY_SOURCE = 'cli-bridge-profile'
-
-/** Bridge-written agent-dir paths from the previous provision of this session
- *  dir, pruned before re-materializing so a profile change cannot leave stale
- *  skills or instructions behind. Agent-created files are never listed. */
-const PRIME_PROFILE_MANIFEST = '.cli-bridge-profile-manifest.json'
-
-function writePrimeFileAtomic(path: string, data: string): void {
-  const tmp = `${path}.${process.pid}.tmp`
-  writeFileSync(tmp, data)
-  renameSync(tmp, path)
-}
-
-/** True only for a relative path that stays inside root — the manifest lives in
- *  the agent dir the CLI (and thus the agent) can write, so a tampered entry
- *  must never turn the prune step into an arbitrary-path delete. */
-function isPathWithin(root: string, relPath: string): boolean {
-  if (typeof relPath !== 'string' || relPath.length === 0 || isAbsolute(relPath)) return false
-  const resolved = resolve(root, relPath)
-  return resolved !== resolve(root) && resolved.startsWith(`${resolve(root)}${sep}`)
-}
-
-/**
- * Land the profile's agent-dir material. Also runs when the material is empty
- * so a session whose in-band profile shrank still gets its stale bridge-written
- * files pruned. Fails loudly on anything unexpected — a partially materialized
- * profile must never run.
- */
-export function materializePrimeProfileAgentDir(
-  agentDir: string,
-  material: PrimeProfileAgentDirMaterial,
-): void {
-  const manifestPath = join(agentDir, PRIME_PROFILE_MANIFEST)
-  if (existsSync(manifestPath)) {
-    let previous: unknown
-    try {
-      previous = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    } catch (err) {
-      throw new BackendError(
-        `prime profile manifest ${manifestPath} is not valid JSON: ${(err as Error).message}`,
-        'upstream',
-        err,
-      )
-    }
-    const paths = (previous as { paths?: unknown })?.paths
-    if (Array.isArray(paths)) {
-      for (const relPath of paths) {
-        if (typeof relPath === 'string' && isPathWithin(agentDir, relPath)) {
-          rmSync(join(agentDir, relPath), { recursive: true, force: true })
-        }
-      }
-    }
-    rmSync(manifestPath, { force: true })
-  }
-
-  const written: string[] = []
-  if (material.instructionsMd !== null) {
-    writePrimeFileAtomic(join(agentDir, 'AGENTS.md'), `${material.instructionsMd}\n`)
-    written.push('AGENTS.md')
-  }
-  for (const skill of material.skills) {
-    const skillDir = join(agentDir, 'skills', skill.name)
-    mkdirSync(skillDir, { recursive: true })
-    writePrimeFileAtomic(join(skillDir, 'SKILL.md'), skill.markdown)
-    written.push(join('skills', skill.name))
-  }
-  if (written.length > 0) {
-    writePrimeFileAtomic(manifestPath, `${JSON.stringify({ paths: written }, null, 2)}\n`)
-  }
-
-  materializePrimeSubagentEntries(agentDir, material.subagents)
-}
-
-/**
- * Merge-seed subagent entries into the global harness state file. The agent
- * self-modifies this file mid-session (it is the fork's continual-harness
- * store), so the merge preserves every entry this bridge did not write and
- * replaces exactly the `cli-bridge-profile`-sourced ones. A file that exists
- * but no longer parses is the agent's own state — refusing beats resetting it.
- *
- * The written shape satisfies both readers: the host requires
- * `{entries: {<kind>: {<id>: entry}}}` (core/refinement/refinement.ts:302-323)
- * and the kernel additionally requires string `title`/`content`
- * (prime-agent-runtime/src/rlm/harness.py:218-247).
- */
-function materializePrimeSubagentEntries(
-  agentDir: string,
-  subagents: PrimeProfileAgentDirMaterial['subagents'],
-): void {
-  const harnessDir = join(agentDir, 'harness')
-  const statePath = join(harnessDir, 'harness_state.json')
-  let state: Record<string, unknown> = {}
-  if (existsSync(statePath)) {
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(readFileSync(statePath, 'utf8'))
-    } catch (err) {
-      throw new BackendError(
-        `prime harness state ${statePath} is not valid JSON and may hold agent self-modification state; `
-        + 'refusing to overwrite it — repair or remove the file to continue',
-        'upstream',
-        err,
-      )
-    }
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      state = parsed as Record<string, unknown>
-    }
-  } else if (subagents.length === 0) {
-    return
-  }
-
-  const entries = (state.entries && typeof state.entries === 'object' && !Array.isArray(state.entries)
-    ? state.entries
-    : {}) as Record<string, unknown>
-  for (const kind of ['prompt', 'memory', 'skill', 'subagent']) {
-    if (!entries[kind] || typeof entries[kind] !== 'object' || Array.isArray(entries[kind])) {
-      entries[kind] = {}
-    }
-  }
-  const subagentEntries = entries.subagent as Record<string, unknown>
-  for (const [id, entry] of Object.entries(subagentEntries)) {
-    if ((entry as { source?: unknown } | null)?.source === PRIME_PROFILE_ENTRY_SOURCE) {
-      delete subagentEntries[id]
-    }
-  }
-  const now = new Date().toISOString()
-  for (const subagent of subagents) {
-    subagentEntries[subagent.id] = {
-      id: subagent.id,
-      kind: 'subagent',
-      title: subagent.title,
-      content: subagent.content,
-      path: 'general',
-      scope: 'global',
-      reference: {},
-      arguments: {},
-      metadata: subagent.metadata,
-      source: PRIME_PROFILE_ENTRY_SOURCE,
-      created_at: now,
-      updated_at: now,
-      version: 1,
-    }
-  }
-
-  const nextState = {
-    ...state,
-    schema: typeof state.schema === 'number' ? state.schema : 1,
-    entries,
-    refinements: Array.isArray(state.refinements) ? state.refinements : [],
-  }
-  mkdirSync(harnessDir, { recursive: true })
-  writePrimeFileAtomic(statePath, `${JSON.stringify(nextState, null, 2)}\n`)
 }
 
 /**
@@ -667,26 +214,72 @@ export function primeApiKeyEnv(
   env: NodeJS.ProcessEnv,
 ): Record<string, string> {
   const out: Record<string, string> = {}
-  const providers = modelsConfig.providers
-  if (!providers || typeof providers !== 'object') return out
-  for (const provider of Object.values(providers as Record<string, unknown>)) {
-    if (!provider || typeof provider !== 'object') continue
-    const key = (provider as Record<string, unknown>).apiKey
-    if (typeof key !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(key)) continue
-    const value = env[key]
-    if (typeof value === 'string' && value.length > 0) out[key] = value
+  for (const name of primeApiKeyEnvNames(modelsConfig)) {
+    const value = env[name]
+    if (typeof value === 'string' && value.length > 0) out[name] = value
   }
   return out
 }
 
-/** Linux MAX_ARG_STRLEN is 128 KiB per argv entry; refuse oversized prompt
- *  flags with the real limit named instead of dying in execve. */
-const MAX_PROMPT_FLAG_BYTES = 120 * 1024
+/**
+ * One authority per run. The harness pin and the model agreement are both
+ * enforced by the shared lowering, so this backend only renders the refusal in
+ * its own typed error contract — a profile can never be scored against a model
+ * it does not name, and a profile pinned to another harness never runs here.
+ */
+function assertPrimeProfileBinding(
+  profile: AgentProfile,
+  spec: { provider: string; model: string },
+): void {
+  translatePrimeProfileError(() =>
+    assertPrimeModelAgreement(profile, { provider: spec.provider, model: spec.model }),
+  )
+  // `extensions.prime` is the one profile namespace that is NOT a fork fact:
+  // it names controls a specific executor implements, and this backend
+  // implements none. Other backends' namespaces are ignored per the extensions
+  // contract; this one must not be, or a caller would believe a prime-specific
+  // knob is in force.
+  const primeExtensions = Object.keys(profile.extensions?.prime ?? {})
+  if (primeExtensions.length > 0) {
+    throw new BackendError(
+      `agent_profile.extensions.prime is not supported by backend prime: unsupported controls `
+      + `(${primeExtensions.sort().join(', ')}); this backend defines no prime extension knobs`,
+      'not_configured',
+    )
+  }
+}
+
+/**
+ * Render a shared-lowering refusal as this backend's typed error.
+ *
+ * `unsupported` is a capability the fork verifiably lacks (`not_configured`);
+ * `invalid` is a caller declaration this backend cannot accept
+ * (`parse_error`). The reason text — where the fork evidence lives — is never
+ * rewritten here, so it cannot drift from the other executor's copy.
+ */
+function translatePrimeProfileError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof PrimeProfileError) {
+      throw new BackendError(
+        `agent_profile.${err.control} ${
+          err.kind === 'unsupported' ? 'is not supported by backend prime' : 'is invalid'
+        }: ${err.reason}`,
+        err.kind === 'unsupported' ? 'not_configured' : 'parse_error',
+        err,
+      )
+    }
+    throw err
+  }
+}
 
 interface ProvisionedPrimeHome {
   home: string
   agentDir: string
   sessionArtifactDir: string
+  /** Per-run dir for request-scoped prompt files, outside the agent dir. */
+  promptDir: string
   /** Short tmpdir-based socket path — AF_UNIX paths cap at ~104 bytes. */
   daemonSocketPath: string
   apiKeyEnv: Record<string, string>
@@ -752,34 +345,31 @@ export class PrimeBackend implements Backend {
 
     // FAIL-LOUD on MCP, whether it arrives request-scoped or as
     // agent_profile.mcp (resolveMcpServers merges both; entries with
-    // enabled:false are OFF, not requested). Verified in the pinned clone
-    // (v0.7.0): kernel MCP tools exist only as hand-written Python
-    // `McpIntegration` skill subclasses (prime-agent-runtime/src/rlm/
-    // mcp_base.py:112-125; only notion + linear ship), the host skips
-    // non-http `mcpServers` settings entries entirely
-    // (core/mcp/mcp-manager.ts:73), and an http entry only configures an
-    // already-installed integration skill — so materializing a per-run entry
-    // into settings.json would run WITHOUT the requested tools and score zero
-    // for the wrong reason.
+    // enabled:false are OFF, not requested). The fork evidence is the shared
+    // refusal reason, so this backend and the in-sandbox adapter cite the same
+    // facts and a fork change moves one string.
     const mcpSpecs = resolveMcpServers(req, session)
     if (mcpSpecs && Object.keys(mcpSpecs).length > 0) {
       throw new BackendError(
-        `backend prime cannot mount MCP servers (requested: ${Object.keys(mcpSpecs).join(', ')}); `
-        + 'the fork resolves MCP tools only through installed Python McpIntegration skill packages, '
-        + 'and no per-run configuration materializes new ones',
+        `backend prime cannot mount MCP servers (requested: ${Object.keys(mcpSpecs).join(', ')}): `
+        + PRIME_MCP_UNSUPPORTED_REASON,
         'not_configured',
       )
     }
 
     const profile = resolveAgentProfile(req, session)
-    let profileMaterial: PrimeProfileAgentDirMaterial | null = null
+    let profileControls: PrimeProfileControls | null = null
     if (profile) {
       assertProfileRequestAuthority(req, session)
       assertPrimeProfileBinding(profile, { provider: spec.provider, model: spec.model })
-      profileMaterial = resolvePrimeProfileDimensions(profile)
-      if (hasPrimeProfileMaterial(profileMaterial) && this.opts.persistentAgentDir) {
+      profileControls = translatePrimeProfileError(() => readPrimeProfileControls(profile))
+      // Prompts and skills are bound by flag, so they land in this run's own
+      // prompt dir and are safe against any agent dir. Instructions and the
+      // subagent roster are located BY the agent dir and have no flag, so they
+      // are refused when that dir is operator-owned.
+      if (primeProfileNeedsAgentDir(profileControls) && this.opts.persistentAgentDir) {
         throw new BackendError(
-          'agent_profile instructions/skills/subagents materialize into the per-run agent dir, and '
+          'agent_profile instructions/subagents can only be written into the agent dir itself, and '
           + 'PRIME_PERSISTENT_AGENT_DIR names an operator-owned dir this backend must not rewrite; '
           + 'drop the persistent dir or strip those profile dimensions',
           'not_configured',
@@ -799,51 +389,65 @@ export class PrimeBackend implements Backend {
 
     const args: string[] = ['--mode', 'rpc', '--provider', spec.provider, '--model', spec.model]
     const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
-    const thinking = primeThinkingFlagForEffort(requestedReasoningEffort ?? undefined)
+    const thinking = translatePrimeProfileError(() =>
+      primeThinkingLevel(requestedReasoningEffort),
+    )
     if (thinking) args.push('--thinking', thinking)
 
-    // agent_profile.prompt.systemPrompt REPLACES the harness prompt via the
-    // fork's --system-prompt; every ADDITIVE system source folds into ONE
-    // --append-system-prompt (profile addition first, caller/bridge system
-    // messages next, JSON-mode directive last so nothing restates the output
-    // contract after it).
-    const profileSystemPrompt = typeof profile?.prompt?.systemPrompt === 'string'
-      ? profile.prompt.systemPrompt
-      : null
-    if (profileSystemPrompt !== null) {
-      assertPromptFlagSize('--system-prompt', profileSystemPrompt)
-      args.push('--system-prompt', profileSystemPrompt)
+    const home = this.provisionHome(req.session_id)
+    // The shared lowering writes the profile's prompt files and skills into
+    // this run's prompt dir, its instructions and subagent roster into the
+    // agent dir, and returns the flags that bind them. The prune runs even when
+    // the current profile carries nothing, so a session dir whose in-band
+    // profile shrank does not keep serving the previous turn's material.
+    if (profileControls) {
+      const materializeOptions = { flagFileRoot: home.promptDir }
+      try {
+        prunePrimeProfileMaterial(
+          this.opts.persistentAgentDir ? home.promptDir : home.agentDir,
+          materializeOptions,
+        )
+        args.push(
+          ...materializePrimeProfileControls(home.agentDir, profileControls, materializeOptions),
+        )
+      } catch (err) {
+        home.cleanup()
+        if (err instanceof PrimeHarnessStateError) {
+          throw new BackendError(err.message, 'upstream', err)
+        }
+        throw translatePrimeProfileError(() => {
+          throw err
+        })
+      }
     }
-    const appendBlocks = [
-      typeof profile?.prompt?.appendSystemPrompt === 'string' ? profile.prompt.appendSystemPrompt : null,
+
+    // Every ADDITIVE system source the REQUEST carries folds into one more
+    // --append-system-prompt (the flag accumulates in order, fork
+    // cli/args.ts:141-143), after the profile's own addition and with the
+    // JSON-mode directive last so nothing restates the output contract after
+    // it. It is written as a FILE (resolved by the fork when the path exists,
+    // resource-loader.ts:41-56) outside the agent dir, so it carries no argv
+    // size ceiling and works unchanged against an operator-owned agent dir.
+    const requestAppendBlocks = [
       ...promptMessages
         .filter((message) => message.role === 'system')
         .map((message) => contentToText(message.content))
         .filter(Boolean),
       wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
     ].filter((value): value is string => Boolean(value))
-    if (appendBlocks.length > 0) {
-      const merged = appendBlocks.join('\n\n')
-      assertPromptFlagSize('--append-system-prompt', merged)
-      args.push('--append-system-prompt', merged)
-    }
-
-    const home = this.provisionHome(req.session_id)
-    // Skipped for a persistent agent dir: material there is rejected above, and
-    // even the empty-material prune/rewrite pass must not touch an
-    // operator-owned dir.
-    if (profileMaterial && !this.opts.persistentAgentDir) {
+    if (requestAppendBlocks.length > 0) {
+      const appendPath = join(home.promptDir, 'request-append-system-prompt.md')
       try {
-        materializePrimeProfileAgentDir(home.agentDir, profileMaterial)
+        writePrimeAgentFile(appendPath, requestAppendBlocks.join('\n\n'))
       } catch (err) {
         home.cleanup()
-        if (err instanceof BackendError) throw err
         throw new BackendError(
-          `prime profile materialization failed: ${err instanceof Error ? err.message : String(err)}`,
+          `prime could not materialize the request system prompt: ${err instanceof Error ? err.message : String(err)}`,
           'upstream',
           err,
         )
       }
+      args.push('--append-system-prompt', appendPath)
     }
     if (req.session_id) {
       args.push('--session-dir', home.sessionArtifactDir)
@@ -873,7 +477,7 @@ export class PrimeBackend implements Backend {
           XDG_DATA_HOME: join(home.home, '.local', 'share'),
           XDG_CONFIG_HOME: join(home.home, '.config'),
           XDG_CACHE_HOME: join(home.home, '.cache'),
-          PRIME_AGENT_CODING_AGENT_DIR: home.agentDir,
+          ...primeAgentDirEnv(home.agentDir),
           PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: '1',
           ...home.apiKeyEnv,
         }),
@@ -921,6 +525,7 @@ export class PrimeBackend implements Backend {
       // Only the LAST turn decides: the fork auto-retries transient provider
       // failures and the retry's turn_end supersedes the failed one.
       let turnFailure: string | null = null
+      let kernelDeadMarker: string | undefined
       const usageCost: PiUsageCost = { receipts: 0, total: 0, complete: true }
       const toolCalls = new PiToolCallTracker()
 
@@ -944,6 +549,22 @@ export class PrimeBackend implements Backend {
         }
 
         const type = String(ev.type ?? '')
+        const assistantEvent = type === 'message_update' ? record(ev.assistantMessageEvent) : undefined
+        const assistantEventType = assistantEvent ? String(assistantEvent.type ?? '') : ''
+
+        // Kernel death: a crashed IPython kernel is never re-provisioned
+        // headlessly, so every later `ipython` call fails with a known marker
+        // and the session is unrecoverable rather than retryable. Scan every
+        // non-prose frame — tool results, errors, turn failures. The model's
+        // own text rides text_delta/thinking_delta and is deliberately
+        // excluded, so an answer that quotes a marker cannot fail the run.
+        if (
+          kernelDeadMarker === undefined
+          && assistantEventType !== 'text_delta'
+          && assistantEventType !== 'thinking_delta'
+        ) {
+          kernelDeadMarker = matchPrimeKernelDeadMarker(line)
+        }
 
         // Command replies. A failed prompt is the run's failure; any other
         // failed reply is retained as context for the terminal verdict.
@@ -1002,9 +623,9 @@ export class PrimeBackend implements Backend {
         }
 
         if (type === 'message_update') {
-          const ame = record(ev.assistantMessageEvent)
+          const ame = assistantEvent
           if (!ame) continue
-          const ameType = String(ame.type ?? '')
+          const ameType = assistantEventType
           if (ameType === 'text_delta') {
             const delta = typeof ame.delta === 'string' ? ame.delta : ''
             if (delta) {
@@ -1051,6 +672,20 @@ export class PrimeBackend implements Backend {
       if (signal.aborted) {
         yield { finish_reason: 'error' }
         return
+      }
+
+      kernelDeadMarker ??= matchPrimeKernelDeadMarker(stderr.render(4000))
+
+      // A kernel-dead sighting OUTRANKS every other failure shape: whatever the
+      // turn reported, the session is unrecoverable rather than retryable, and
+      // the caller must be told that rather than left to retry into the same
+      // dead tool (or to burn its whole deadline against a wedged one).
+      if (kernelDeadMarker !== undefined) {
+        throw new BackendError(
+          `prime IPython kernel died (${JSON.stringify(kernelDeadMarker)}) and prime-agent never `
+          + 're-provisions it headlessly; this session is unrecoverable — start a new one',
+          'upstream',
+        )
       }
 
       if (spawnErrorMessage) {
@@ -1101,16 +736,23 @@ export class PrimeBackend implements Backend {
     const home = join(base, 'home')
     const agentDir = this.opts.persistentAgentDir ?? join(home, '.prime', 'agent')
     const sessionArtifactDir = join(base, 'session-artifacts')
+    // Request-scoped prompt files live beside the HOME, never inside the agent
+    // dir, so they work unchanged against an operator-owned persistent dir.
+    const promptDir = join(base, 'prompt')
     mkdirSync(home, { recursive: true })
     mkdirSync(agentDir, { recursive: true })
     mkdirSync(sessionArtifactDir, { recursive: true })
+    mkdirSync(promptDir, { recursive: true })
 
     let apiKeyEnv: Record<string, string> = {}
     if (this.opts.modelsJsonPath) {
       // Re-read per run so operator rotation lands without a bridge restart.
       const text = readFileSync(this.opts.modelsJsonPath, 'utf8')
       const parsed = parsePrimeModelsJson(text, this.opts.modelsJsonPath)
-      writeFileSync(join(agentDir, 'models.json'), text)
+      // Atomic + owner-only: the fork re-reads models.json at model-resolution
+      // time, so a live process must never observe a partial write, and this
+      // file carries the operator's real credentials.
+      writePrimeAgentFile(join(agentDir, 'models.json'), text)
       apiKeyEnv = primeApiKeyEnv(parsed, process.env)
     } else if (this.opts.persistentAgentDir) {
       // The operator dir's own models.json names the env vars its apiKeys
@@ -1134,6 +776,7 @@ export class PrimeBackend implements Backend {
       home,
       agentDir,
       sessionArtifactDir,
+      promptDir,
       daemonSocketPath: join(socketDir, 'd.sock'),
       apiKeyEnv,
       cleanup: (): void => {
@@ -1143,16 +786,6 @@ export class PrimeBackend implements Backend {
         }
       },
     }
-  }
-}
-
-function assertPromptFlagSize(flag: string, value: string): void {
-  if (Buffer.byteLength(value, 'utf8') > MAX_PROMPT_FLAG_BYTES) {
-    throw new BackendError(
-      `backend prime ${flag} exceeds ${MAX_PROMPT_FLAG_BYTES} bytes (Linux MAX_ARG_STRLEN); `
-      + 'move standing instructions into the task prompt or shorten the profile prompt',
-      'parse_error',
-    )
   }
 }
 
