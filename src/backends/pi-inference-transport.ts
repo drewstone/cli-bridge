@@ -70,6 +70,8 @@ export interface ProvisionedPiInferenceTransport {
   sessionDir: string
   upstreamBaseUrl: string
   apiMode: PiApiMode
+  /** Exact profile cap applied to this run's isolated model catalog, when requested. */
+  appliedMaxTokens?: number
   localBaseUrl: string
   traffic(): PiInferenceTrafficSnapshot
   cleanup(): Promise<void>
@@ -116,6 +118,69 @@ const SAFE_MODEL_FIELDS = [
   'maxTokens',
   'compat',
 ] as const
+
+const SUPPORTED_PROFILE_MODEL_METADATA = new Set(['maxTokens'])
+
+export interface AppliedPiModelMetadata {
+  modelConfig: Record<string, unknown>
+  appliedMaxTokens?: number
+}
+
+/**
+ * Apply only model controls that Pi can prove through its isolated models.json.
+ *
+ * The operator catalog remains the upper bound. A profile may lower that bound
+ * for one run, but the source model object is never mutated and unknown metadata
+ * is refused instead of being retained as if Pi had applied it.
+ */
+export function applyPiModelMetadata(
+  modelConfig: Record<string, unknown>,
+  metadata: Record<string, unknown> | undefined,
+): AppliedPiModelMetadata {
+  const isolatedModelConfig = structuredClone(modelConfig)
+  if (metadata === undefined) return { modelConfig: isolatedModelConfig }
+  if (!isRecord(metadata) || Array.isArray(metadata)) {
+    throw new BackendError(
+      'backend pi cannot apply agent_profile.model.metadata because it is not an object',
+      'parse_error',
+    )
+  }
+
+  const unsupported = Object.keys(metadata).filter((key) => !SUPPORTED_PROFILE_MODEL_METADATA.has(key))
+  if (unsupported.length > 0) {
+    throw new BackendError(
+      `backend pi cannot apply agent_profile.model.metadata field(s): ${unsupported.sort().join(', ')}; `
+      + 'the selected Pi model has no proven native lowering for them',
+      'not_configured',
+    )
+  }
+
+  if (!Object.hasOwn(metadata, 'maxTokens')) return { modelConfig: isolatedModelConfig }
+  const requested = metadata.maxTokens
+  if (!isPositiveSafeInteger(requested)) {
+    throw new BackendError(
+      'backend pi agent_profile.model.metadata.maxTokens must be a positive safe integer',
+      'parse_error',
+    )
+  }
+  const operatorMaxTokens = isolatedModelConfig.maxTokens
+  if (!isPositiveSafeInteger(operatorMaxTokens)) {
+    throw new BackendError(
+      'backend pi cannot apply agent_profile.model.metadata.maxTokens because the operator model '
+      + 'has no valid maxTokens cap to lower',
+      'not_configured',
+    )
+  }
+  if (requested > operatorMaxTokens) {
+    throw new BackendError(
+      `backend pi agent_profile.model.metadata.maxTokens ${requested} exceeds the operator model cap ${operatorMaxTokens}`,
+      'parse_error',
+    )
+  }
+
+  isolatedModelConfig.maxTokens = requested
+  return { modelConfig: isolatedModelConfig, appliedMaxTokens: requested }
+}
 
 /**
  * Resolve the same provider credential Pi would use, but do so in a trusted,
@@ -318,9 +383,12 @@ export async function provisionPiInferenceTransport(
     sessionId?: string
     /** Workspace Pi can read. Persistent session storage must remain outside it. */
     projectDir?: string
+    /** Model metadata from the exact AgentProfile selected for this run. */
+    modelMetadata?: Record<string, unknown>
   } = {},
 ): Promise<ProvisionedPiInferenceTransport> {
   assertExactModelBinding(resolved)
+  const applied = applyPiModelMetadata(resolved.modelConfig, options.modelMetadata)
   const proxy = await startScopedProxy(resolved)
   let agentDir: string | null = null
   try {
@@ -337,7 +405,7 @@ export async function provisionPiInferenceTransport(
           ...resolved.providerConfig,
           baseUrl: proxy.localBaseUrl,
           apiKey: proxy.scopedApiKey,
-          models: [resolved.modelConfig],
+          models: [applied.modelConfig],
         },
       },
     }
@@ -357,6 +425,9 @@ export async function provisionPiInferenceTransport(
       sessionDir,
       upstreamBaseUrl: resolved.upstreamBaseUrl,
       apiMode: resolved.apiMode,
+      ...(applied.appliedMaxTokens === undefined
+        ? {}
+        : { appliedMaxTokens: applied.appliedMaxTokens }),
       localBaseUrl: proxy.localBaseUrl,
       traffic: () => proxy.traffic(),
       cleanup: async () => {
@@ -926,4 +997,8 @@ async function closeServer(server: Server): Promise<void> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 }

@@ -105,6 +105,8 @@ export interface ProfileMaterializationReceipt {
     apiMode: string
     /** Authentication stayed in a request-scoped loopback forwarder. */
     transport: 'scoped-loopback'
+    /** Exact completion-token cap lowered from the AgentProfile into this run's model catalog. */
+    appliedMaxTokens?: number
     /** Filled after Pi exits; absent while materialization is still in progress. */
     observation?: {
       requests: number
