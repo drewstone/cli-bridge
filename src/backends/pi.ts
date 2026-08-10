@@ -548,6 +548,8 @@ export class PiBackend implements Backend {
       // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
+    const profile = resolveAgentProfile(req, session)
+    const modelMetadata = profile?.model?.metadata
     const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
     const thinking = thinkingFlagForEffort(requestedReasoningEffort ?? undefined)
     const executionIdentity = profileExecutionIdentity(req, session, 'pi', thinking)
@@ -594,6 +596,9 @@ export class PiBackend implements Backend {
         {
           ...(req.session_id ? { sessionId: req.session_id } : {}),
           ...(runCwd ? { projectDir: runCwd } : {}),
+          ...(modelMetadata === undefined
+            ? {}
+            : { modelMetadata }),
         },
       )
       if (req.jailSpec) {
@@ -619,6 +624,9 @@ export class PiBackend implements Backend {
           effectiveEndpoint: inference.upstreamBaseUrl,
           apiMode: inference.apiMode,
           transport: 'scoped-loopback',
+          ...(inference.appliedMaxTokens === undefined
+            ? {}
+            : { appliedMaxTokens: inference.appliedMaxTokens }),
         },
       )
       if (provisioned) args.push(...provisioned.flags)

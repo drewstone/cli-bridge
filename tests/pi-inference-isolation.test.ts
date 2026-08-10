@@ -24,6 +24,7 @@ import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
 import { PiBackend, piToolProcessEnvironment } from '../src/backends/pi.js'
 import {
+  applyPiModelMetadata,
   createPiInferenceTransportResolver,
   provisionPiInferenceTransport,
 } from '../src/backends/pi-inference-transport.js'
@@ -76,6 +77,37 @@ const SENTINELS = {
 } as const
 
 describe('Pi inference credential isolation', () => {
+  it('lowers only the isolated model copy and refuses unprovable profile metadata', () => {
+    const operatorModel = {
+      id: 'credential-check',
+      api: 'openai-completions',
+      maxTokens: 128_000,
+      compat: { maxTokensField: 'max_completion_tokens' },
+    }
+
+    const applied = applyPiModelMetadata(operatorModel, { maxTokens: 64_000 })
+    expect(applied).toEqual({
+      modelConfig: {
+        ...operatorModel,
+        maxTokens: 64_000,
+      },
+      appliedMaxTokens: 64_000,
+    })
+    expect(operatorModel.maxTokens).toBe(128_000)
+
+    expect(applyPiModelMetadata(operatorModel, undefined)).toEqual({
+      modelConfig: operatorModel,
+    })
+    expect(() => applyPiModelMetadata(operatorModel, { maxTokens: 0 }))
+      .toThrow(/positive safe integer/u)
+    expect(() => applyPiModelMetadata(operatorModel, { maxTokens: 128_001 }))
+      .toThrow(/exceeds the operator model cap 128000/u)
+    expect(() => applyPiModelMetadata(operatorModel, { maxTokens: 64_000, temperature: 0 }))
+      .toThrow(/no proven native lowering/u)
+    expect(() => applyPiModelMetadata({ ...operatorModel, maxTokens: undefined }, { maxTokens: 64_000 }))
+      .toThrow(/no valid maxTokens cap/u)
+  })
+
   it('starts from an allowlist, so ambient provider aliases never reach a child or descendant', () => {
     const childEnv = piToolProcessEnvironment({
       HOME: '/home/test',
@@ -786,6 +818,130 @@ describe('Pi inference credential isolation', () => {
         expect(deltas.some((delta) => delta.content?.includes('mcp-adapter-loaded'))).toBe(true)
         expect(deltas).toContainEqual({ usage: { model_requests: 1, cost_known: false } })
         expect(observedBodies).toHaveLength(1)
+      } finally {
+        clearTimeout(timer)
+        await close(upstream)
+      }
+    },
+    40_000,
+  )
+
+  it.skipIf(!realPiBin)(
+    'lowers a profile model cap in real Pi traffic without mutating the operator catalog',
+    async () => {
+      const cwd = tempDir('cli-bridge-pi-real-cap-')
+      const sourceAgentDir = tempDir('cli-bridge-pi-cap-source-')
+      const sourceSessionDir = tempDir('cli-bridge-pi-cap-sessions-')
+      const authBin = join(tempDir('cli-bridge-pi-cap-auth-'), 'pi-auth')
+      writeFileSync(authBin, [
+        '#!/bin/sh',
+        'test "$1" = auth',
+        'test "$2" = print-api-key',
+        'printf %s "$TEST_PROVIDER_KEY"',
+      ].join('\n'))
+      chmodSync(authBin, 0o700)
+
+      const observedBodies: Array<Record<string, unknown>> = []
+      const upstream = createServer(async (request, response) => {
+        observedBodies.push(JSON.parse(await readBody(request)) as Record<string, unknown>)
+        response.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        })
+        sendChunk(response, {
+          id: 'chatcmpl-cap-proof',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'credential-check',
+          choices: [{
+            index: 0,
+            delta: { role: 'assistant', content: 'profile-cap-applied' },
+            finish_reason: null,
+          }],
+        })
+        sendChunk(response, {
+          id: 'chatcmpl-cap-proof',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'credential-check',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+        })
+        response.end('data: [DONE]\n\n')
+      })
+      await listen(upstream)
+      const address = upstream.address()
+      if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+      const sourceModels = {
+        providers: {
+          'isolated-test': {
+            baseUrl: `http://127.0.0.1:${address.port}/v1`,
+            api: 'openai-completions',
+            models: [{
+              id: 'credential-check',
+              name: 'Operator catalog model',
+              api: 'openai-completions',
+              input: ['text'],
+              contextWindow: 256_000,
+              maxTokens: 128_000,
+              compat: { maxTokensField: 'max_completion_tokens' },
+            }],
+          },
+        },
+      }
+      const sourceModelsText = `${JSON.stringify(sourceModels, null, 2)}\n`
+      writeFileSync(join(sourceAgentDir, 'models.json'), sourceModelsText)
+
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 30_000)
+      try {
+        const backend = new PiBackend({
+          bin: realPiBin!,
+          timeoutMs: 0,
+          spawner: scopedHostSpawner,
+          transportResolver: createPiInferenceTransportResolver({
+            bin: authBin,
+            agentDir: sourceAgentDir,
+            sessionDir: sourceSessionDir,
+            env: {
+              HOME: cwd,
+              PATH: process.env.PATH,
+              TEST_PROVIDER_KEY: SENTINELS.TANGLE_API_KEY,
+            },
+          }),
+        })
+        const request: ChatRequest = {
+          model: 'pi/isolated-test/credential-check',
+          messages: [{ role: 'user', content: 'Reply with the cap proof.' }],
+          cwd,
+          jailSpec: {
+            root: join(cwd, '.agent-home'),
+            projectDir: cwd,
+            readConfine: true,
+          },
+          agent_profile: {
+            harness: 'pi',
+            model: {
+              provider: 'isolated-test',
+              default: 'credential-check',
+              metadata: { maxTokens: 64_000 },
+            },
+            extensions: { pi: { load: [] } },
+          },
+        }
+
+        const deltas = await collect(backend.chat(request, null, controller.signal))
+        expect(deltas.some((delta) => delta.content?.includes('profile-cap-applied'))).toBe(true)
+        expect(observedBodies).toHaveLength(1)
+        expect(observedBodies[0]).toMatchObject({ max_completion_tokens: 64_000 })
+        expect(observedBodies[0]).not.toMatchObject({ max_completion_tokens: 128_000 })
+        expect(readFileSync(join(sourceAgentDir, 'models.json'), 'utf8')).toBe(sourceModelsText)
+        expect(completedProfileReceipt(deltas)?.inference).toMatchObject({
+          appliedMaxTokens: 64_000,
+          observation: { accountingMatched: true },
+        })
       } finally {
         clearTimeout(timer)
         await close(upstream)
