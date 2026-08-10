@@ -18,6 +18,7 @@ import {
   verifyInstalledTraceContract,
 } from '../src/trace/contract-build.js'
 import { AdmissionGate } from '../src/admission.js'
+import { holdSlot } from './admission-hold.js'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { BackendError, type Backend, type BackendHealth, type ChatDelta, type ChatRequest } from '../src/backends/types.js'
 import { loadConfig } from '../src/config.js'
@@ -411,7 +412,7 @@ describe('span shape conformance', () => {
       reservedActive: 0,
       bulkQueueTimeoutMs: 0,
     })
-    const lease = await admission.acquire()
+    const held = await holdSlot(admission)
     const ctx = fixture(new SilentBackend(), { admission })
     try {
       const response = await postChat(ctx.app, chatBody())
@@ -419,7 +420,7 @@ describe('span shape conformance', () => {
       const llm = requestSpan(ctx.spans())
       expect(llm.status.code).toBe('STATUS_CODE_ERROR')
     } finally {
-      lease.release()
+      await held.end()
     }
   })
 

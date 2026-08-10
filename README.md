@@ -240,6 +240,25 @@ Lists model ids each ready backend claims, with which harness serves them.
 
 JSON report per backend — ready / unavailable / error with detail.
 
+When host admission is configured, the report carries an `admission` object.
+Read `active` against `live` first:
+
+| Field | Meaning |
+| --- | --- |
+| `active` | Slots charged against `maxActive`. Admission decisions use this. |
+| `live` | Charged slots whose job is still running. |
+| `stale` | `active - live`. Capacity charged to work that already finished. |
+| `unbound` | Charged slots no caller bound to a job lifetime. |
+| `oldestHeldMs` | Age of the longest-held slot. |
+| `reclaimed` | Slots the reconciler has taken back since start. |
+
+`stale: 0` means the count matches the work. Anything else is drift, and the
+gate reclaims those slots on its next reconcile pass:
+
+```bash
+curl -s http://127.0.0.1:3344/health | jq '.admission | {active, live, stale, reclaimed}'
+```
+
 ### `GET /v1/sessions` · `DELETE /v1/sessions/:id`
 
 Inspect / clear external-to-internal session mappings.

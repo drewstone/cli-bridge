@@ -38,7 +38,7 @@ import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { resolveNetJailSpec } from '../jail/resolve-net-spec.js'
 import { assertNetJailEnforced, type NetJailRegistry } from '../jail/enforce-net-jail.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
-import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionLease } from '../admission.js'
+import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionSlot } from '../admission.js'
 import {
   type Run,
   RunIdentityConflictError,
@@ -515,7 +515,7 @@ export function mountChatCompletions(
       }),
     }) ?? null
 
-    let admissionLease: AdmissionLease | null = null
+    let admissionSlot: AdmissionSlot | null = null
     let sessionLease: SessionExecutionLease | null = null
     try {
       // Distinct runs that continue one backend session must own its full
@@ -616,8 +616,14 @@ export function mountChatCompletions(
         req.admissionClass = admissionClassFor(req, deps.admissionReservedClients)
         if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
           // Admission is owned by the job. Explicit cancellation can remove
-          // a queued job before it ever acquires a process slot.
-          admissionLease = await deps.admission.acquire(run.signal, req.admissionClass)
+          // a queued job before it ever acquires a process slot. The slot is
+          // bound to the job's lifetime below; the run's terminal state is the
+          // gate's independent proof that the job is over.
+          admissionSlot = await deps.admission.acquire({
+            work: { id: run.id, isFinished: () => run.isTerminal() },
+            admissionClass: req.admissionClass,
+            signal: run.signal,
+          })
         }
         makeSource = (run) => backendChatWithDeadline(backend, req, session, run.signal)
       }
@@ -709,23 +715,35 @@ export function mountChatCompletions(
             // defect above.
             recorder?.fail(error)
             throw error
-          } finally {
-            // Admission is released when the job ends. Reader disconnects
-            // cannot release a slot that still owns a subprocess.
-            admissionLease?.release()
-            sessionLease?.release()
-            // No-op when the catch above already closed the span.
-            recorder?.end()
           }
         },
       })
 
       // The run pumps the source to completion on its own. This connection is only one reader;
       // dropping it never touches `run.signal` or releases job-owned admission.
-      void run.pump(wrap(makeSource(run)))
+      //
+      // Every job-owned resource is released from the JOB'S promise, never from
+      // the delta stream's `finally`: a stream that is never consumed never runs
+      // that `finally`, and `Run.pump` returns without consuming its source when
+      // the run is already committed terminal. `pump()` always settles — it
+      // returns the settled promise on that path — so this binding has no exit
+      // to skip.
+      const endJobResources = (): void => {
+        sessionLease?.release()
+        sessionLease = null
+        // No-op when the stream's catch already closed the span.
+        recorder?.end()
+      }
+      const job = run.pump(wrap(makeSource(run)))
+      admissionSlot?.holdUntil(job)
+      admissionSlot = null
+      void job.then(endJobResources, endJobResources)
     } catch (error) {
-      admissionLease?.release()
-      admissionLease = null
+      // Setup failed, so this slot's job is already over — the same one-call
+      // contract, with a lifetime that has settled. Nothing here can leak the
+      // slot: had this line been skipped, the gate would reclaim it once
+      // `run.failSetup` commits the run terminal.
+      admissionSlot?.holdUntil(Promise.resolve())
       sessionLease?.release()
       sessionLease = null
       run.failSetup(error)
