@@ -23,6 +23,7 @@ import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { authSourcesFor } from '../src/jail/auth-preserve.js'
+import { profileExecutionIdentity } from '../src/backends/profile-support.js'
 import { testPiInferenceTransport } from './pi-inference-fixture.js'
 
 class FakeChild extends EventEmitter {
@@ -234,6 +235,25 @@ describe('PiBackend turn retry (#125)', () => {
 })
 
 describe('PiBackend', () => {
+  it('accepts a profile default that already contains a nested provider model', () => {
+    const request: ChatRequest = {
+      model: 'pi/tangle-router/fireworks/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'task' }],
+      agent_profile: {
+        harness: 'pi',
+        model: {
+          provider: 'tangle-router',
+          default: 'fireworks/deepseek-v4-flash',
+        },
+      },
+    }
+
+    expect(profileExecutionIdentity(request, null, 'pi', null)).toMatchObject({
+      provider: 'tangle-router',
+      model: 'pi/tangle-router/fireworks/deepseek-v4-flash',
+    })
+  })
+
   it('applies one exact profile while leaving the task unchanged', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-exact-profile-'))
     const agentDir = mkdtempSync(join(tmpdir(), 'pi-exact-profile-agent-dir-'))

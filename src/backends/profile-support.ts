@@ -543,9 +543,12 @@ function assertExactProfileRequest(
   const requestedModel = profile.model?.default
   const requestedProvider = profile.model?.provider
   if (requestedModel !== undefined) {
-    const qualified = requestedProvider && !requestedModel.includes('/')
-      ? `${requestedProvider}/${requestedModel}`
+    const modelWithoutHarness = requestedModel.startsWith(`${harness}/`)
+      ? requestedModel.slice(harness.length + 1)
       : requestedModel
+    const qualified = requestedProvider && !modelWithoutHarness.startsWith(`${requestedProvider}/`)
+      ? `${requestedProvider}/${modelWithoutHarness}`
+      : modelWithoutHarness
     if (wireModel !== qualified) {
       throw new BackendError(
         `request model ${JSON.stringify(req.model)} conflicts with agent_profile.model ${JSON.stringify(qualified)}`,
