@@ -625,7 +625,13 @@ describe('POST /v1/chat/completions', () => {
 
   it('fails closed before spawning when host-chat admission queue is full', async () => {
     const backend = new BlockingBackend('claude')
-    const admission = new AdmissionGate({ maxActive: 1, maxQueue: 1, queueTimeoutMs: 10_000 })
+    const admission = new AdmissionGate({
+      maxActive: 1,
+      maxQueue: 1,
+      queueTimeoutMs: 10_000,
+      reservedActive: 0,
+      bulkQueueTimeoutMs: 10_000,
+    })
     app = new Hono()
     mountChatCompletions(app, {
       registry: new BackendRegistry().register(backend),

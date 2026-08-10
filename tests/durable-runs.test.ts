@@ -294,7 +294,13 @@ function sseIds(text: string): number[] {
 describe('durable run contract', () => {
   it('attaches identical racing retries to one backend job and one admission lease', async () => {
     const backend = new ControlledBackend()
-    const admission = new AdmissionGate({ maxActive: 1, maxQueue: 1, queueTimeoutMs: 1_000 })
+    const admission = new AdmissionGate({
+      maxActive: 1,
+      maxQueue: 1,
+      queueTimeoutMs: 1_000,
+      reservedActive: 0,
+      bulkQueueTimeoutMs: 1_000,
+    })
     const ctx = fixture(backend, {}, admission)
     const body = chatBody('same-run')
     try {

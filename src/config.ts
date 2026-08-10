@@ -55,7 +55,14 @@ export interface Config {
     maxActive: number
     maxQueue: number
     queueTimeoutMs: number
+    reservedActive: number
+    bulkQueueTimeoutMs: number
   }
+  /**
+   * `x-tangle-client` prefixes admitted through the reserved lane. Matched on
+   * the segment before `/`, so `pr-reviewer` covers `pr-reviewer/1`.
+   */
+  admissionReservedClients: string[]
   /**
    * When set, the `claudish` harness is registered and Claude Code is
    * spawned with ANTHROPIC_BASE_URL=<this> for `claudish/*` model ids.
@@ -296,11 +303,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),
     ...parsePrimeStateConfig(env, backends),
     cliTimeoutMsDefault: defaultTimeout,
-    admission: {
-      maxActive: parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8),
-      maxQueue: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_QUEUE, 16),
-      queueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_QUEUE_TIMEOUT_MS, 30_000),
-    },
+    admission: admissionConfig(env),
+    admissionReservedClients: parseClientList(env.BRIDGE_HOST_CHAT_RESERVED_CLIENTS, ['pr-reviewer']),
     claudishUrl: env.CLAUDISH_URL?.trim() || null,
     openaiApiKey: env.OPENAI_API_KEY?.trim() || null,
     anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || null,
@@ -484,6 +488,37 @@ function assertNetJailEnforceable(
       )
     }
   }
+}
+
+/**
+ * Host-chat admission limits.
+ *
+ * `reservedActive` defaults to 2 because the PR reviewer issues exactly two
+ * concurrent bridge calls per pull request (its value and usefulness agents);
+ * a lane narrower than that re-queues the reviewer behind fleet traffic.
+ *
+ * `bulkQueueTimeoutMs` defaults to 240s: long enough to outlast a median host
+ * call (measured p50 ≈ 137s for non-probe work) so bulk callers wait instead of
+ * failing, short enough to stay under the 300s socket idle timeout our callers
+ * use — past that, a rejection stops being a typed 503 and becomes a hang.
+ */
+function admissionConfig(env: NodeJS.ProcessEnv): Config['admission'] {
+  const maxActive = parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8)
+  return {
+    maxActive,
+    maxQueue: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_QUEUE, 16),
+    queueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_QUEUE_TIMEOUT_MS, 30_000),
+    reservedActive: parseNonNegativeInt(
+      env.BRIDGE_HOST_CHAT_RESERVED_ACTIVE,
+      Math.min(2, maxActive - 1),
+    ),
+    bulkQueueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_BULK_QUEUE_TIMEOUT_MS, 240_000),
+  }
+}
+
+function parseClientList(value: string | undefined, fallback: string[]): string[] {
+  if (value === undefined) return fallback
+  return value.split(',').map((entry) => entry.trim().toLowerCase()).filter((entry) => entry !== '')
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {

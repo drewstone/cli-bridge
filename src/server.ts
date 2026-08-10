@@ -64,6 +64,7 @@ function perSlotVolumePrefix(cfg: BackendExecutorConfig, mountIndex: number): st
 }
 import type { BackendExecutorConfig } from './config.js'
 import { AdmissionGate } from './admission.js'
+import { scopedHostConcurrencyLimits } from './executors/scoped-host.js'
 import { RunRegistry } from './runs/registry.js'
 import { TraceEmitter } from './trace/emitter.js'
 import { JsonlSpanSink, nullSpanSink } from './trace/sink.js'
@@ -474,7 +475,15 @@ export async function buildApp(config: Config): Promise<{
   mountSessions(app, { sessions })
   mountRuns(app, { runs })
   mountProfiles(app, { catalog })
-  mountChatCompletions(app, { registry, sessions, runs, admission, netJail: extras.netJail, trace })
+  mountChatCompletions(app, {
+    registry,
+    sessions,
+    runs,
+    admission,
+    admissionReservedClients: config.admissionReservedClients,
+    netJail: extras.netJail,
+    trace,
+  })
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)
@@ -563,7 +572,30 @@ export async function startServer(): Promise<void> {
     console.log(`[cli-bridge] listening on http://${info.address}:${info.port}  (host=${config.host})`)
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
-    console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue} queueTimeoutMs=${config.admission.queueTimeoutMs}`)
+    console.log(
+      `[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue}/class ` +
+      `reservedActive=${config.admission.reservedActive} (bulk ceiling ${config.admission.maxActive - config.admission.reservedActive}) ` +
+      `queueTimeoutMs=${config.admission.queueTimeoutMs} bulkQueueTimeoutMs=${config.admission.bulkQueueTimeoutMs}`,
+    )
+    console.log(`[cli-bridge] reserved-lane clients: ${config.admissionReservedClients.join(', ') || 'none'}`)
+    // Two gates ration host concurrency. If the executor's ceiling is the lower
+    // one, admission stops being the limiter that its numbers claim to be, and
+    // a caller admitted by the lane queues again at the executor.
+    const scope = scopedHostConcurrencyLimits()
+    if (scope.max < config.admission.maxActive) {
+      console.warn(
+        `[cli-bridge] admission maxActive=${config.admission.maxActive} exceeds scoped-executor ` +
+        `concurrency=${scope.max}: the executor is the real ceiling. Lower BRIDGE_HOST_CHAT_MAX_ACTIVE ` +
+        `or raise CLI_BRIDGE_SCOPE_MAX_CONCURRENCY so one gate owns the limit.`,
+      )
+    }
+    if (config.admission.reservedActive > 0 && scope.reserved === 0) {
+      console.warn(
+        '[cli-bridge] host admission reserves a lane but the scoped executor reserves none: ' +
+        'a reserved caller can clear admission and still be starved at the executor. ' +
+        'Set CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY.',
+      )
+    }
     console.log(
       config.trace.enabled
         ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)`

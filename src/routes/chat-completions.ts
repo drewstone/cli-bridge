@@ -38,7 +38,7 @@ import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { resolveNetJailSpec } from '../jail/resolve-net-spec.js'
 import { assertNetJailEnforced, type NetJailRegistry } from '../jail/enforce-net-jail.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
-import { AdmissionRejectedError, type AdmissionGate, type AdmissionLease } from '../admission.js'
+import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionLease } from '../admission.js'
 import {
   type Run,
   RunIdentityConflictError,
@@ -336,6 +336,11 @@ export function mountChatCompletions(
     sessions: SessionStore
     runs: RunRegistry
     admission?: AdmissionGate
+    /**
+     * `x-tangle-client` prefixes routed to the reserved admission lane.
+     * Absent = every caller is `bulk`.
+     */
+    admissionReservedClients?: string[]
     /** Backends with a provisioned, verified net-jail. Absent map = none. */
     netJail?: NetJailRegistry
     /** Emits one conforming span per request. Absent = no tracing. */
@@ -605,10 +610,14 @@ export function mountChatCompletions(
         // Preserve this backend's host credentials inside the jail so the
         // confined CLI still authenticates as the operator.
         if (req.jailSpec) req.jailSpec.authSources = authSourcesFor(backend.name)
+        // The lane rides on the request so the scoped-host executor honours the
+        // same reservation. Set even when this bridge has no admission gate:
+        // the executor semaphore exists either way.
+        req.admissionClass = admissionClassFor(req, deps.admissionReservedClients)
         if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
           // Admission is owned by the job. Explicit cancellation can remove
           // a queued job before it ever acquires a process slot.
-          admissionLease = await deps.admission.acquire(run.signal)
+          admissionLease = await deps.admission.acquire(run.signal, req.admissionClass)
         }
         makeSource = (run) => backendChatWithDeadline(backend, req, session, run.signal)
       }
@@ -1144,17 +1153,47 @@ function errorResponse(c: Context, err: unknown): Response {
   return c.json({ error: { message, type: 'server_error' } }, 500)
 }
 
+/**
+ * Route a request to an admission lane by `x-tangle-client` (already folded
+ * into request metadata). Matching is on the segment before `/`, so the
+ * caller can keep versioning its client string (`pr-reviewer/1`).
+ *
+ * Unknown callers are `bulk`: a new caller must not be able to claim the
+ * reserved lane by accident, and the lane is only useful while it stays small.
+ */
+function admissionClassFor(req: ChatRequest, reservedClients?: string[]): AdmissionClass {
+  if (!reservedClients || reservedClients.length === 0) return 'bulk'
+  const client = req.metadata?.tangleClient
+  if (typeof client !== 'string' || client === '') return 'bulk'
+  const name = client.split('/')[0]?.trim().toLowerCase() ?? ''
+  return reservedClients.includes(name) ? 'reserved' : 'bulk'
+}
+
 function admissionErrorResponse(c: Context, err: unknown): Response {
   if (!(err instanceof AdmissionRejectedError)) {
     return errorResponse(c, err)
   }
+  const s = err.snapshot
+  // Saturation was previously invisible: nothing logged a rejection, so the
+  // only record of a starved caller lived in that caller's own error string.
+  console.warn(
+    `[cli-bridge] admission rejected: class=${err.admissionClass} reason=${err.reason} ` +
+    `active=${s.active}/${s.maxActive} (reserved=${s.activeByClass.reserved} bulk=${s.activeByClass.bulk}/${s.bulkMaxActive}) ` +
+    `queued=${s.queued} (reserved=${s.queuedByClass.reserved} bulk=${s.queuedByClass.bulk}) maxQueue=${s.maxQueue}/class`,
+  )
   c.header('Retry-After', '5')
   return c.json({
     error: {
+      // `capacity` is the field a caller should branch on. An admission
+      // rejection means the bridge never started the model; conflating it with
+      // an upstream model failure is what let a review that could not run be
+      // reported as a review that ran and found nothing.
+      capacity: true,
       message: err.message,
       type: 'admission_rejected',
       reason: err.reason,
-      admission: err.snapshot,
+      admissionClass: err.admissionClass,
+      admission: s,
     },
   }, 503)
 }

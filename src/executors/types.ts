@@ -61,6 +61,12 @@ export interface SpawnOpts {
    * which already provides container-level isolation.
    */
   jail?: JailSpec | null
+  /**
+   * Admission lane for this spawn. The scoped-host executor keeps
+   * `reserved` slots free of `bulk` work so a merge-gating caller that already
+   * cleared host admission is not starved again at the executor.
+   */
+  admissionClass?: 'reserved' | 'bulk'
 }
 
 export interface SpawnResult {

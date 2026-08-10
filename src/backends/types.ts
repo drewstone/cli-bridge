@@ -242,6 +242,16 @@ export interface ChatRequest {
    * CLI in an OS write-jail; null/absent = no jail.
    */
   jailSpec?: JailSpec | null
+  /**
+   * Admission lane this turn was granted, set by the chat route. NOT part of
+   * the wire schema — it is derived from `x-tangle-client`.
+   *
+   * It has to travel with the request because the host admission gate is not
+   * the only limiter in the path: the scoped-host executor holds its own
+   * concurrency semaphore. A lane honoured at only one of them relocates the
+   * starvation instead of removing it.
+   */
+  admissionClass?: 'reserved' | 'bulk'
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
   /** Internal receipt populated by profile provisioning before the harness spawns. */
