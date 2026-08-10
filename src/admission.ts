@@ -15,7 +15,32 @@ export type AdmissionClass = 'reserved' | 'bulk'
 export const ADMISSION_CLASSES: readonly AdmissionClass[] = ['reserved', 'bulk']
 
 export interface AdmissionSnapshot {
+  /**
+   * Slots charged against `maxActive` right now. This is the number the gate
+   * admits or refuses on.
+   */
   active: number
+  /**
+   * Charged slots whose job is still running. `live` is what `active` claims to
+   * measure, derived independently from the admitted jobs themselves.
+   */
+  live: number
+  /**
+   * `active - live`: capacity charged to work that has already finished. Any
+   * value above 0 is a defect in this gate, and the reconciler takes those slots
+   * back on its next pass.
+   */
+  stale: number
+  /**
+   * Charged slots that no caller ever bound to a job lifetime. Binding happens
+   * in the same continuation as admission, so a non-zero value means a caller
+   * returned or threw between the two and its slot has no owner.
+   */
+  unbound: number
+  /** Age of the longest-held slot in ms; null when nothing is held. */
+  oldestHeldMs: number | null
+  /** Slots the reconciler has taken back since start. Above 0 means drift happened. */
+  reclaimed: number
   queued: number
   maxActive: number
   maxQueue: number
@@ -27,8 +52,40 @@ export interface AdmissionSnapshot {
   queuedByClass: Record<AdmissionClass, number>
 }
 
-export interface AdmissionLease {
-  release(): void
+/**
+ * The job a slot is admitted for.
+ *
+ * `isFinished` is the gate's independent ground truth. The gate charges a slot
+ * on admission and takes it back when the job's lifetime settles; `isFinished`
+ * is what lets it also take the slot back when that lifetime never settles,
+ * so an accounted slot can never outlive the work it was accounted for.
+ */
+export interface AdmissionWork {
+  /** Job identity, reported in reconciliation warnings. */
+  readonly id: string
+  /** True once this job can no longer be running. */
+  isFinished(): boolean
+}
+
+/**
+ * An admitted slot. It exposes no release: the gate owns that, so no exit path
+ * — success, throw, disconnect, abort, timeout — can skip one.
+ */
+export interface AdmissionSlot {
+  /**
+   * Bind the slot to the job's lifetime. The gate releases the slot when `job`
+   * settles, either way; the job's owner keeps its own handle and owns the
+   * outcome. Call this exactly once, in the same continuation that received the
+   * slot.
+   */
+  holdUntil(job: PromiseLike<unknown>): void
+}
+
+export interface AdmissionRequest {
+  /** The job this slot is charged to. Required — it is what makes the count auditable. */
+  work: AdmissionWork
+  admissionClass?: AdmissionClass
+  signal?: AbortSignal
 }
 
 export class AdmissionRejectedError extends Error {
@@ -43,9 +100,18 @@ export class AdmissionRejectedError extends Error {
   }
 }
 
+interface HeldSlot {
+  readonly admissionClass: AdmissionClass
+  readonly work: AdmissionWork
+  readonly acquiredAt: number
+  bound: boolean
+  released: boolean
+}
+
 interface Waiter {
-  resolve: (lease: AdmissionLease) => void
+  resolve: (slot: AdmissionSlot) => void
   reject: (err: AdmissionRejectedError) => void
+  work: AdmissionWork
   signal?: AbortSignal
   timer?: ReturnType<typeof setTimeout>
   onAbort?: () => void
@@ -69,11 +135,26 @@ export interface AdmissionGateOptions {
    * rejection still arrives as a typed 503 rather than a client-side hang.
    */
   bulkQueueTimeoutMs: number
+  /**
+   * How often the gate re-derives its charged slots from the jobs it charged
+   * them to. 0 disables the timer; `reconcile()` still runs on every admission
+   * request, so a caller-driven gate stays correct without a clock.
+   */
+  reconcileIntervalMs?: number
+  /** Injectable clock for slot ages. */
+  now?: () => number
 }
+
+const DEFAULT_RECONCILE_INTERVAL_MS = 1_000
 
 export class AdmissionGate {
   private readonly active: Record<AdmissionClass, number> = { reserved: 0, bulk: 0 }
   private readonly waiters: Record<AdmissionClass, Waiter[]> = { reserved: [], bulk: [] }
+  private readonly held = new Set<HeldSlot>()
+  private readonly now: () => number
+  private readonly reconcileIntervalMs: number
+  private reconcileTimer: ReturnType<typeof setInterval> | null = null
+  private reclaimed = 0
 
   constructor(private readonly opts: AdmissionGateOptions) {
     if (!Number.isInteger(opts.maxActive) || opts.maxActive < 1) {
@@ -95,6 +176,22 @@ export class AdmissionGate {
         `invalid reservedActive: ${opts.reservedActive} — expected an integer in [0, ${opts.maxActive - 1}]`,
       )
     }
+    const reconcileIntervalMs = opts.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS
+    if (!Number.isInteger(reconcileIntervalMs) || reconcileIntervalMs < 0) {
+      throw new Error(`invalid reconcileIntervalMs: ${opts.reconcileIntervalMs}`)
+    }
+    this.reconcileIntervalMs = reconcileIntervalMs
+    this.now = opts.now ?? Date.now
+    if (this.reconcileIntervalMs > 0) {
+      this.reconcileTimer = setInterval(() => this.reconcile(), this.reconcileIntervalMs)
+      this.reconcileTimer.unref?.()
+    }
+  }
+
+  /** Stop the reconcile timer. The gate stays usable; only the clock detaches. */
+  close(): void {
+    if (this.reconcileTimer) clearInterval(this.reconcileTimer)
+    this.reconcileTimer = null
   }
 
   /** Concurrency ceiling for `bulk`; `reserved` may use the full pool. */
@@ -107,8 +204,24 @@ export class AdmissionGate {
   }
 
   snapshot(): AdmissionSnapshot {
+    let live = 0
+    let unbound = 0
+    let oldestAcquiredAt: number | null = null
+    for (const slot of this.held) {
+      if (!slot.work.isFinished()) live += 1
+      if (!slot.bound) unbound += 1
+      if (oldestAcquiredAt === null || slot.acquiredAt < oldestAcquiredAt) {
+        oldestAcquiredAt = slot.acquiredAt
+      }
+    }
+    const active = this.activeTotal()
     return {
-      active: this.activeTotal(),
+      active,
+      live,
+      stale: active - live,
+      unbound,
+      oldestHeldMs: oldestAcquiredAt === null ? null : this.now() - oldestAcquiredAt,
+      reclaimed: this.reclaimed,
       queued: this.waiters.reserved.length + this.waiters.bulk.length,
       maxActive: this.opts.maxActive,
       maxQueue: this.opts.maxQueue,
@@ -122,14 +235,60 @@ export class AdmissionGate {
     }
   }
 
-  acquire(signal?: AbortSignal, admissionClass: AdmissionClass = 'bulk'): Promise<AdmissionLease> {
+  /**
+   * Take back every charged slot whose job has already finished.
+   *
+   * A charged slot is a claim that work is running. When the job says otherwise,
+   * the claim is drift, and drift is permanent capacity loss: the measured
+   * failure was 20 of 20 slots charged to nothing, admitting nobody, while the
+   * host executor reported zero work in flight. Reclaiming here bounds the loss
+   * to one pass, and the warning turns an unexplained queue timeout into a
+   * reported defect with the job id that caused it.
+   *
+   * Returns the number of slots reclaimed.
+   */
+  reconcile(): number {
+    let reclaimedNow = 0
+    for (const slot of [...this.held]) {
+      if (slot.released) continue
+      const heldMs = this.now() - slot.acquiredAt
+      const finished = slot.work.isFinished()
+      // Binding happens in the continuation that receives the slot, so a slot
+      // still unbound after a full pass has no owner and never will.
+      const ownerless = !slot.bound && heldMs >= this.staleUnboundMs()
+      if (!finished && !ownerless) continue
+      this.free(slot)
+      this.reclaimed += 1
+      reclaimedNow += 1
+      const cause = finished
+        ? `charged to finished job ${slot.work.id}`
+        : `charged to job ${slot.work.id}, which no caller bound to a lifetime`
+      console.warn(
+        `[cli-bridge] admission reconciled: reclaimed a ${slot.admissionClass} slot ${cause} ` +
+        `after ${heldMs}ms — its release was skipped. ` +
+        `active=${this.activeTotal()}/${this.opts.maxActive} reclaimed_total=${this.reclaimed}`,
+      )
+    }
+    return reclaimedNow
+  }
+
+  /** Grace before an unbound slot counts as ownerless. */
+  private staleUnboundMs(): number {
+    return this.reconcileIntervalMs > 0 ? this.reconcileIntervalMs : DEFAULT_RECONCILE_INTERVAL_MS
+  }
+
+  acquire(request: AdmissionRequest): Promise<AdmissionSlot> {
+    // Drift found here is capacity this admission can use immediately.
+    this.reconcile()
+
+    const admissionClass = request.admissionClass ?? 'bulk'
+    const { work, signal } = request
     if (signal?.aborted) {
       return Promise.reject(this.rejected('admission aborted before queueing', 'aborted', admissionClass))
     }
 
     if (this.canAdmit(admissionClass)) {
-      this.active[admissionClass] += 1
-      return Promise.resolve(this.makeLease(admissionClass))
+      return Promise.resolve(this.take(admissionClass, work))
     }
 
     const queue = this.waiters[admissionClass]
@@ -146,8 +305,8 @@ export class AdmissionGate {
       ? this.opts.queueTimeoutMs
       : this.opts.bulkQueueTimeoutMs
 
-    return new Promise<AdmissionLease>((resolve, reject) => {
-      const waiter: Waiter = { resolve, reject, signal }
+    return new Promise<AdmissionSlot>((resolve, reject) => {
+      const waiter: Waiter = { resolve, reject, work, signal }
       waiter.onAbort = () => {
         this.removeWaiter(admissionClass, waiter)
         reject(this.rejected('cli-bridge admission aborted while queued', 'aborted', admissionClass))
@@ -176,19 +335,35 @@ export class AdmissionGate {
     return true
   }
 
-  private makeLease(admissionClass: AdmissionClass): AdmissionLease {
-    let released = false
+  /** Charge one slot and hand back the only handle a caller gets. */
+  private take(admissionClass: AdmissionClass, work: AdmissionWork): AdmissionSlot {
+    this.active[admissionClass] += 1
+    const slot: HeldSlot = {
+      admissionClass,
+      work,
+      acquiredAt: this.now(),
+      bound: false,
+      released: false,
+    }
+    this.held.add(slot)
     return {
-      release: () => {
-        if (released) return
-        released = true
-        this.release(admissionClass)
+      holdUntil: (job: PromiseLike<unknown>): void => {
+        if (slot.bound) {
+          throw new Error(`admission slot for job ${work.id} is already bound to a job lifetime`)
+        }
+        slot.bound = true
+        // Both settlements release. The gate observes the lifetime and never the
+        // outcome — the job's owner already holds `job` and reports its failure.
+        void Promise.resolve(job).then(() => this.free(slot), () => this.free(slot))
       },
     }
   }
 
-  private release(admissionClass: AdmissionClass): void {
-    if (this.active[admissionClass] > 0) this.active[admissionClass] -= 1
+  private free(slot: HeldSlot): void {
+    if (slot.released) return
+    slot.released = true
+    this.held.delete(slot)
+    if (this.active[slot.admissionClass] > 0) this.active[slot.admissionClass] -= 1
     this.drain()
   }
 
@@ -212,8 +387,7 @@ export class AdmissionGate {
           next.reject(this.rejected('cli-bridge admission aborted while queued', 'aborted', admissionClass))
           continue
         }
-        this.active[admissionClass] += 1
-        next.resolve(this.makeLease(admissionClass))
+        next.resolve(this.take(admissionClass, next.work))
       }
     }
   }

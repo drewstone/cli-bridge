@@ -329,6 +329,7 @@ export async function buildApp(config: Config): Promise<{
   const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)
+  extras.shutdownHooks.push(async () => admission.close())
   const trace = new TraceEmitter({
     sink: config.trace.enabled
       ? new JsonlSpanSink({
