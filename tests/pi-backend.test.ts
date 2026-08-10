@@ -336,6 +336,138 @@ describe('PiBackend', () => {
     }
   })
 
+  it.each([
+    { name: 'matching max_tokens', max_tokens: 16_384 },
+    { name: 'older caller omission', max_tokens: undefined },
+  ])('accepts a $name and records the profile cap once', async ({ max_tokens }) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-max-tokens-equal-'))
+    let resolves = 0
+    let spawns = 0
+    const transport = testPiInferenceTransport()
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      transportResolver: async (selection, signal) => {
+        resolves += 1
+        return transport(selection, signal)
+      },
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ], () => {
+        spawns += 1
+      }),
+    })
+    const request: ChatRequest = {
+      model: 'pi/tangle-router/glm-5.2',
+      messages: [{ role: 'user', content: 'task' }],
+      ...(max_tokens === undefined ? {} : { max_tokens }),
+      cwd,
+      agent_profile: {
+        harness: 'pi',
+        model: {
+          provider: 'tangle-router',
+          default: 'glm-5.2',
+          metadata: { maxTokens: 16_384 },
+        },
+      },
+    }
+
+    try {
+      await collect(backend.chat(request, null, new AbortController().signal))
+      expect(resolves).toBe(1)
+      expect(spawns).toBe(1)
+      expect(request.profile_materialization_receipt?.inference).toMatchObject({
+        appliedMaxTokens: 16_384,
+      })
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    {
+      name: 'lower request',
+      max_tokens: 8_192,
+      profile: {
+        harness: 'pi' as const,
+        model: {
+          provider: 'tangle-router',
+          default: 'glm-5.2',
+          metadata: { maxTokens: 16_384 },
+        },
+      },
+      code: 'parse_error' as const,
+      error: /request max_tokens .*conflicts with agent_profile\.model\.metadata\.maxTokens/u,
+    },
+    {
+      name: 'higher request',
+      max_tokens: 32_768,
+      profile: {
+        harness: 'pi' as const,
+        model: {
+          provider: 'tangle-router',
+          default: 'glm-5.2',
+          metadata: { maxTokens: 16_384 },
+        },
+      },
+      code: 'parse_error' as const,
+      error: /request max_tokens .*conflicts with agent_profile\.model\.metadata\.maxTokens/u,
+    },
+    {
+      name: 'profile metadata missing',
+      max_tokens: 16_384,
+      profile: {
+        harness: 'pi' as const,
+        model: { provider: 'tangle-router', default: 'glm-5.2' },
+      },
+      code: 'not_configured' as const,
+      error: /agent_profile\.model\.metadata\.maxTokens is absent/u,
+    },
+    {
+      name: 'profile missing',
+      max_tokens: 16_384,
+      profile: undefined,
+      code: 'not_configured' as const,
+      error: /without an AgentProfile\.model\.metadata\.maxTokens authority/u,
+    },
+  ])('refuses a $name before provider resolution or spawn', async ({
+    max_tokens,
+    profile,
+    code,
+    error,
+  }) => {
+    let resolves = 0
+    let spawns = 0
+    const transport = testPiInferenceTransport()
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      transportResolver: async (selection, signal) => {
+        resolves += 1
+        return transport(selection, signal)
+      },
+      spawner: piSpawner([], () => {
+        spawns += 1
+      }),
+    })
+    const request: ChatRequest = {
+      model: 'pi/tangle-router/glm-5.2',
+      messages: [{ role: 'user', content: 'task' }],
+      max_tokens,
+      ...(profile ? { agent_profile: profile } : {}),
+    }
+
+    const received = await collect(backend.chat(request, null, new AbortController().signal))
+      .then(() => null)
+      .catch((caught: unknown) => caught)
+    expect(received).toBeInstanceOf(BackendError)
+    expect((received as BackendError).code).toBe(code)
+    expect(received).toMatchObject({ message: expect.stringMatching(error) })
+    expect(resolves).toBe(0)
+    expect(spawns).toBe(0)
+  })
+
   it('refuses an incomplete Pi model id before resolving auth or spawning a child', async () => {
     let resolves = 0
     let spawns = 0

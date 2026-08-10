@@ -61,6 +61,7 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   buildCanonicalMcpServers,
+  assertPiMaxTokensRequest,
   materializeMcpServersForPi,
   profileExecutionIdentity,
   provisionPiProfile,
@@ -480,6 +481,8 @@ export class PiBackend implements Backend {
      *  turn that never began. */
     stage: { started: boolean },
   ): AsyncIterable<ChatDelta> {
+    const profile = resolveAgentProfile(req, session)
+    assertPiMaxTokensRequest(req, profile)
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'pi has native tools (read/bash/edit/write); hosted-safe requires a verified --no-tools enforcement path')
 
@@ -548,7 +551,6 @@ export class PiBackend implements Backend {
       // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
-    const profile = resolveAgentProfile(req, session)
     const modelMetadata = profile?.model?.metadata
     const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
     const thinking = thinkingFlagForEffort(requestedReasoningEffort ?? undefined)

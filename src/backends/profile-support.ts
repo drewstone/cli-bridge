@@ -448,6 +448,42 @@ export function assertProfileRequestAuthority(
   return profile
 }
 
+/**
+ * Treat a top-level Pi token limit as an assertion about the exact profile.
+ *
+ * Pi does not consume ChatRequest.max_tokens itself. A caller may repeat the
+ * profile value for compatibility, but the profile metadata remains the only
+ * value that reaches the isolated model catalog.
+ */
+export function assertPiMaxTokensRequest(
+  req: ChatRequest,
+  profile: AgentProfile | null,
+): void {
+  const requested = req.max_tokens
+  if (requested === undefined) return
+  if (!profile) {
+    throw new BackendError(
+      'backend pi cannot apply request max_tokens without an AgentProfile.model.metadata.maxTokens authority',
+      'not_configured',
+    )
+  }
+
+  const metadata = profile.model?.metadata
+  if (!metadata || !Object.hasOwn(metadata, 'maxTokens')) {
+    throw new BackendError(
+      'backend pi cannot apply request max_tokens because agent_profile.model.metadata.maxTokens is absent',
+      'not_configured',
+    )
+  }
+  const profileMaxTokens = metadata.maxTokens
+  if (requested !== profileMaxTokens) {
+    throw new BackendError(
+      `request max_tokens ${String(requested)} conflicts with agent_profile.model.metadata.maxTokens ${String(profileMaxTokens)}`,
+      'parse_error',
+    )
+  }
+}
+
 /** Resolve one canonical reasoning request; an out-of-profile override is a hard conflict. */
 export function resolveRequestedReasoningEffort(
   req: ChatRequest,
