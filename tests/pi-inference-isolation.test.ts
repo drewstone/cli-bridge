@@ -915,6 +915,7 @@ describe('Pi inference credential isolation', () => {
         const request: ChatRequest = {
           model: 'pi/isolated-test/credential-check',
           messages: [{ role: 'user', content: 'Reply with the cap proof.' }],
+          max_tokens: 64_000,
           cwd,
           jailSpec: {
             root: join(cwd, '.agent-home'),
