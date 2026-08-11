@@ -84,6 +84,7 @@ import { terminateSpawned } from '../executors/process-tree.js'
 import { addUsage, type CollectedUsage } from '../usage.js'
 import {
   createPiInferenceTransportResolver,
+  ensurePiSessionFile,
   provisionPiInferenceTransport,
   type PiInferenceTransportResolver,
   type ProvisionedPiInferenceTransport,
@@ -441,7 +442,12 @@ export class PiBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    const maxAttempts = Math.max(1, this.opts.maxTurnAttempts ?? DEFAULT_PI_TURN_ATTEMPTS)
+    const maxAttempts = resolveMaxPiTurnAttempts(this.opts.maxTurnAttempts)
+    // A persistent first turn must keep one native id across an internal retry. Otherwise the
+    // first attempt can leave a durable user entry while the retry replays the task in a new file.
+    const requestedInternalSessionId = req.session_id && !session?.internalId
+      ? randomUUID()
+      : undefined
     for (let attempt = 1; ; attempt += 1) {
       let emitted = 0
       // A turn that never started is not a transient turn failure: a rejected spawn is a local
@@ -449,7 +455,13 @@ export class PiBackend implements Backend {
       // and re-entering would re-materialize every request-scoped profile and MCP file for nothing.
       const stage = { started: false }
       try {
-        for await (const delta of this.runTurn(req, session, signal, stage)) {
+        for await (const delta of this.runTurn(
+          req,
+          session,
+          signal,
+          stage,
+          requestedInternalSessionId,
+        )) {
           emitted += 1
           yield delta
         }
@@ -480,6 +492,7 @@ export class PiBackend implements Backend {
     /** Flipped the moment a child process exists, so the wrapper can tell a turn that DIED from a
      *  turn that never began. */
     stage: { started: boolean },
+    requestedInternalSessionId?: string,
   ): AsyncIterable<ChatDelta> {
     const profile = resolveAgentProfile(req, session)
     assertPiMaxTokensRequest(req, profile)
@@ -546,7 +559,8 @@ export class PiBackend implements Backend {
       // prompt overrides while creating the first session. Give Pi an explicit
       // internal id so the first turn uses the profile and report that id back
       // through the normal session event for subsequent `--session` resumes.
-      args.push('--session-id', randomUUID())
+      const nativeSessionId = requestedInternalSessionId ?? randomUUID()
+      args.push('--session-id', nativeSessionId)
     } else if (!req.session_id) {
       // Only a truly anonymous call is stateless.
       args.push('--no-session')
@@ -613,6 +627,14 @@ export class PiBackend implements Backend {
         ]
       }
       args.push('--session-dir', inference.sessionDir)
+      if (req.session_id) {
+        ensurePiSessionFile(
+          inference.sessionDir,
+          session?.internalId ?? requestedInternalSessionId!,
+          runCwd ?? process.cwd(),
+          { createIfMissing: session?.internalId === undefined },
+        )
+      }
       mcpMounted = requestedMcpNames.length > 0
         ? materializeMcpServersForPi(mcpSpecs, runCwd)
         : null
@@ -999,6 +1021,14 @@ export function piAssistantFailure(message: unknown): string | null {
  *  a third would mostly add latency to a genuinely broken route. */
 export const DEFAULT_PI_TURN_ATTEMPTS = 3
 export const PI_TURN_RETRY_BACKOFF_MS = 750
+
+/** Keep malformed or non-finite configuration from turning a transient retry into an open loop. */
+function resolveMaxPiTurnAttempts(configured: number | undefined): number {
+  if (configured === undefined || !Number.isSafeInteger(configured)) {
+    return DEFAULT_PI_TURN_ATTEMPTS
+  }
+  return Math.max(1, configured)
+}
 
 /** A turn failure worth a second attempt: an upstream/timeout fault, or an unclassified error that
  *  escaped the backend. A refused configuration or an unparseable request repeats identically, and

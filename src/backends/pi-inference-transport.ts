@@ -8,11 +8,17 @@ import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import {
   chmodSync,
+  closeSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  readdirSync,
+  readSync,
   readFileSync,
   realpathSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { BackendError } from './types.js'
@@ -75,6 +81,127 @@ export interface ProvisionedPiInferenceTransport {
   localBaseUrl: string
   traffic(): PiInferenceTrafficSnapshot
   cleanup(): Promise<void>
+}
+
+/**
+ * Reserve the exact native Pi session before the child can receive a prompt.
+ *
+ * Pi creates a session header in memory and defers the first file write until
+ * an assistant message ends. An interrupted first turn therefore loses the
+ * session file even though the bridge already emitted and stored its id. A
+ * valid header makes Pi open the same file and append the user message before
+ * the first model response, so a later `--session <id>` has a durable target.
+ *
+ * The caller owns the directory and the id. This function never generates or
+ * substitutes an id, and it refuses an existing id whose cwd differs.
+ */
+export function ensurePiSessionFile(
+  sessionDir: string,
+  sessionId: string,
+  cwd: string,
+  options: { readonly createIfMissing?: boolean } = {},
+): string {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/u.test(sessionId)) {
+    throw new BackendError(
+      `backend pi cannot reserve invalid internal session id "${sessionId}"`,
+      'upstream',
+    )
+  }
+
+  mkdirSync(sessionDir, { recursive: true, mode: 0o700 })
+  const existing = (): string | null => {
+    let found: string | null = null
+    for (const name of readdirSync(sessionDir)) {
+      if (!name.endsWith('.jsonl')) continue
+      const path = join(sessionDir, name)
+      const header = readPiSessionHeader(path)
+      if (!header) continue
+      if (header.type !== 'session' || header.id !== sessionId) continue
+      if (header.cwd !== cwd) {
+        throw new BackendError(
+          `backend pi found internal session ${sessionId} under ${sessionDir} with cwd `
+          + `"${String(header.cwd ?? '')}" instead of "${cwd}"`,
+          'upstream',
+        )
+      }
+      if (found) {
+        throw new BackendError(
+          `backend pi found multiple internal session files for ${sessionId} under ${sessionDir}`,
+          'upstream',
+        )
+      }
+      found = path
+    }
+    return found
+  }
+
+  const found = existing()
+  if (found) return found
+
+  if (options.createIfMissing === false) {
+    throw new BackendError(
+      `backend pi cannot resume internal session ${sessionId}: no matching Pi session file exists in ${sessionDir}`,
+      'upstream',
+    )
+  }
+
+  const timestamp = new Date().toISOString()
+  // The stable name is the per-id lock. Timestamped filenames would let
+  // concurrent first turns create different valid files after an empty scan.
+  const file = join(sessionDir, `${sessionId}.jsonl`)
+  const header = {
+    type: 'session',
+    version: 3,
+    id: sessionId,
+    timestamp,
+    cwd,
+  }
+
+  // Write the whole header before atomically linking it to the stable name.
+  // A competing caller either links first or observes that complete file.
+  const candidate = join(sessionDir, `.${randomBytes(16).toString('hex')}.reserve`)
+  try {
+    writeFileSync(candidate, `${JSON.stringify(header)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    })
+    linkSync(candidate, file)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    const raced = existing()
+    if (raced) return raced
+    throw new BackendError(
+      `backend pi could not reserve internal session ${sessionId} at ${file}; `
+      + 'the target path already exists but is not a matching Pi session',
+      'upstream',
+      error,
+    )
+  } finally {
+    try { unlinkSync(candidate) } catch { /* best effort */ }
+  }
+  return file
+}
+
+/** Read only the bounded session header, not a complete historical transcript. */
+function readPiSessionHeader(path: string): { type?: unknown; id?: unknown; cwd?: unknown } | null {
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(path, 'r')
+    const bytes = Buffer.alloc(64 * 1024)
+    const read = readSync(descriptor, bytes, 0, bytes.length, 0)
+    const newline = bytes.indexOf(0x0a)
+    if (newline === -1 || newline >= read) return null
+    return JSON.parse(bytes.toString('utf8', 0, newline)) as {
+      type?: unknown
+      id?: unknown
+      cwd?: unknown
+    }
+  } catch {
+    return null
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
 }
 
 export interface PiInferenceTrafficSnapshot {

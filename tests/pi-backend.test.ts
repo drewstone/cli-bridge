@@ -2,9 +2,11 @@ import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
 import { createServer, type Server } from 'node:http'
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -15,7 +17,7 @@ import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
 import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
-import { PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
+import { DEFAULT_PI_TURN_ATTEMPTS, PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
 import { BackendError } from '../src/backends/types.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
@@ -40,7 +42,14 @@ function piSpawner(
     onSpawn?.(...spawnArgs)
     const child = new FakeChild()
     queueMicrotask(() => {
-      for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`)
+      const nativeSessionId = argValue(spawnArgs[1], '--session-id')
+        ?? argValue(spawnArgs[1], '--session')
+      for (const line of lines) {
+        const output = line.type === 'session' && nativeSessionId
+          ? { ...line, id: nativeSessionId }
+          : line
+        child.stdout.write(`${JSON.stringify(output)}\n`)
+      }
       child.stdout.end()
       child.stderr.end()
       setTimeout(() => {
@@ -103,10 +112,14 @@ function flakyPiSpawner(
   failures: number,
   lines: Array<Record<string, unknown>>,
   stderrText = 'stream closed by upstream',
-  options: { readonly linesBeforeFailure?: Array<Record<string, unknown>> } = {},
+  options: {
+    readonly linesBeforeFailure?: Array<Record<string, unknown>>
+    readonly onSpawn?: (args: readonly string[]) => void
+  } = {},
 ): Spawner & { spawns: () => number } {
   let spawns = 0
-  const spawner: Spawner = async (): Promise<SpawnResult> => {
+  const spawner: Spawner = async (_bin, args): Promise<SpawnResult> => {
+    options.onSpawn?.(args)
     const failing = spawns < failures
     spawns += 1
     const child = new FakeChild()
@@ -164,6 +177,43 @@ describe('PiBackend turn retry (#125)', () => {
     // never saw the death at all.
     expect(deltas.filter((d) => d.content).map((d) => d.content)).toEqual(['recovered'])
     expect(deltas.at(-1)?.finish_reason).toBe('stop')
+  })
+
+  it('retries a persistent first turn with the same reserved native session id', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-retry-session-cwd-'))
+    const sourceSessionDir = mkdtempSync(join(tmpdir(), 'pi-retry-session-source-'))
+    const argsBySpawn: string[][] = []
+    const spawner = flakyPiSpawner(1, successLines, 'stream closed by upstream', {
+      onSpawn: (args) => { argsBySpawn.push([...args]) },
+    })
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      turnRetryBackoffMs: 0,
+      transportResolver: testPiInferenceTransport({ sourceSessionDir }),
+    })
+
+    try {
+      const deltas = await collect(backend.chat({
+        ...request,
+        cwd,
+        session_id: 'persistent-retry-regression',
+      }, null, new AbortController().signal))
+
+      const firstId = argValue(argsBySpawn[0]!, '--session-id')
+      expect(firstId).toBeTruthy()
+      expect(argValue(argsBySpawn[1]!, '--session-id')).toBe(firstId)
+      expect(argsBySpawn[1]).not.toContain('--session')
+      expect(deltas.at(-1)?.finish_reason).toBe('stop')
+
+      const sessionDir = argValue(argsBySpawn[0]!, '--session-dir')
+      expect(sessionDir).toBe(argValue(argsBySpawn[1]!, '--session-dir'))
+      expect(readdirSync(sessionDir!).filter((name) => name.endsWith('.jsonl'))).toHaveLength(1)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(sourceSessionDir, { recursive: true, force: true })
+    }
   })
 
   it('never retries once the caller has already seen part of the stream', async () => {
@@ -231,6 +281,22 @@ describe('PiBackend turn retry (#125)', () => {
       collect(backend.chat(request, null, new AbortController().signal)),
     ).rejects.toThrow(/stream closed by upstream/)
     expect(spawner.spawns()).toBe(1)
+  })
+
+  it('keeps a non-finite retry setting bounded at the default attempt count', async () => {
+    const spawner = flakyPiSpawner(5, successLines)
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      maxTurnAttempts: Number.POSITIVE_INFINITY,
+      turnRetryBackoffMs: 0,
+    })
+
+    await expect(
+      collect(backend.chat(request, null, new AbortController().signal)),
+    ).rejects.toThrow(/stream closed by upstream/)
+    expect(spawner.spawns()).toBe(DEFAULT_PI_TURN_ATTEMPTS)
   })
 })
 
@@ -815,6 +881,7 @@ describe('PiBackend', () => {
   it('keeps anonymous calls stateless, creates caller sessions, then resumes the mapped Pi session', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-session-'))
     const cwd = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-session-cwd-'))
+    const sourceSessionDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-session-source-'))
     const sessions = new SessionStore(dataDir)
     const argv: string[][] = []
     const profilePrompts: Array<string | null> = []
@@ -835,6 +902,7 @@ describe('PiBackend', () => {
         profilePrompts.push(systemPromptPath ? readFileSync(systemPromptPath, 'utf8') : null)
         if (systemPromptPath) profileRoots.push(dirname(dirname(systemPromptPath)))
       }),
+      transportResolver: testPiInferenceTransport({ sourceSessionDir }),
     })
     const app = new Hono()
     mountChatCompletions(app, {
@@ -876,13 +944,13 @@ describe('PiBackend', () => {
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
       )
       expect(sessions.get('discovery-run', 'pi')).toMatchObject({
-        internalId: 'created-pi-session',
+        internalId: argValue(argv[1]!, '--session-id'),
         turns: 1,
       })
 
       expect((await post('discovery-run')).status).toBe(200)
       const sessionFlag = argv[2]?.indexOf('--session') ?? -1
-      expect(argv[2]?.[sessionFlag + 1]).toBe('created-pi-session')
+      expect(argv[2]?.[sessionFlag + 1]).toBe(argValue(argv[1]!, '--session-id'))
       expect(argv[2]).not.toContain('--no-session')
       expect(profilePrompts).toEqual([
         null,
@@ -915,6 +983,136 @@ describe('PiBackend', () => {
       sessions.close()
       rmSync(dataDir, { recursive: true, force: true })
       rmSync(cwd, { recursive: true, force: true })
+      rmSync(sourceSessionDir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps an interrupted first turn resumable with the exact Pi session id', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-interrupt-cwd-'))
+    const sourceSessionDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-interrupt-sessions-'))
+    const argv: string[][] = []
+    let resolveFirstSession: ((id: string) => void) | undefined
+    const firstSession = new Promise<string>((resolve) => { resolveFirstSession = resolve })
+    const spawner: Spawner = async (_bin, args): Promise<SpawnResult> => {
+      argv.push([...args])
+      const call = argv.length
+      const child = new FakeChild()
+      if (call === 1) {
+        queueMicrotask(() => {
+          const internalId = argValue(args, '--session-id')
+          if (!internalId) throw new Error('first Pi call did not receive --session-id')
+          child.stdout.write(`${JSON.stringify({ type: 'session', id: internalId })}\n`)
+
+          // Native Pi appends the user message as soon as message_end fires.
+          // The assistant message is deliberately absent because this turn is interrupted.
+          const sessionDir = argValue(args, '--session-dir')
+          if (!sessionDir) throw new Error('first Pi call did not receive --session-dir')
+          const sessionFile = readdirSync(sessionDir)
+            .filter((name) => name.endsWith('.jsonl'))
+            .map((name) => join(sessionDir, name))
+            .find((path) => readFileSync(path, 'utf8').includes(`"id":"${internalId}"`))
+          if (!sessionFile) throw new Error('bridge did not reserve the Pi session before spawn')
+          appendFileSync(sessionFile, `${JSON.stringify({
+            type: 'message',
+            id: 'first-user-entry',
+            parentId: null,
+            timestamp: new Date().toISOString(),
+            message: {
+              role: 'user',
+              content: args.at(-1),
+              timestamp: Date.now(),
+            },
+          })}\n`)
+          resolveFirstSession?.(internalId)
+        })
+        return {
+          child: child as never,
+          async terminate() {
+            if (child.exitCode !== null) return
+            child.stdout.end()
+            child.stderr.end()
+            child.exitCode = 143
+            child.emit('close', 143)
+          },
+          release() {},
+          spawnError: () => null,
+        }
+      }
+
+      const internalId = argValue(args, '--session')
+      queueMicrotask(() => {
+        if (!internalId) throw new Error('resume Pi call did not receive --session')
+        child.stdout.write(`${JSON.stringify({ type: 'session', id: internalId })}\n`)
+        child.stdout.write(`${JSON.stringify({
+          type: 'message_update',
+          assistantMessageEvent: { type: 'text_delta', delta: 'second instruction executed' },
+        })}\n`)
+        child.stdout.write(`${JSON.stringify({ type: 'turn_end', message: { usage: { input: 2, output: 1 } } })}\n`)
+        child.stdout.end()
+        child.stderr.end()
+        child.exitCode = 0
+        child.emit('close', 0)
+      })
+      return {
+        child: child as never,
+        release() {},
+        spawnError: () => null,
+      }
+    }
+    spawner.executionEnvironment = 'test-double'
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner,
+      transportResolver: testPiInferenceTransport({ sourceSessionDir }),
+    })
+    const firstRequest: ChatRequest = {
+      model: 'pi/isolated-test/credential-check',
+      messages: [{ role: 'user', content: 'first instruction must survive interruption' }],
+      cwd,
+      session_id: 'interrupt-resume-regression',
+    }
+    const controller = new AbortController()
+
+    try {
+      const firstRun = collect(backend.chat(firstRequest, null, controller.signal))
+      const internalId = await firstSession
+      controller.abort()
+      const firstDeltas = await firstRun
+      expect(firstDeltas.at(-1)?.finish_reason).toBe('error')
+
+      const sessionDir = argValue(argv[0]!, '--session-dir')!
+      const sessionFile = readdirSync(sessionDir)
+        .filter((name) => name.endsWith('.jsonl'))
+        .map((name) => join(sessionDir, name))
+        .find((path) => readFileSync(path, 'utf8').includes(`"id":"${internalId}"`))
+      expect(sessionFile).toBeTruthy()
+      const persisted = readFileSync(sessionFile!, 'utf8')
+      expect(persisted).toContain(`"id":"${internalId}"`)
+      expect(persisted).toContain('first instruction must survive interruption')
+      expect(persisted).not.toContain('assistant')
+
+      const resumed = await collect(backend.chat({
+        ...firstRequest,
+        messages: [{ role: 'user', content: 'second instruction' }],
+      }, {
+        externalId: 'interrupt-resume-regression',
+        backend: 'pi',
+        internalId,
+        cwd,
+        turns: 1,
+        createdAt: Date.now(),
+        lastUsedAt: Date.now(),
+        metadata: {},
+      }, new AbortController().signal))
+
+      expect(argValue(argv[1]!, '--session')).toBe(internalId)
+      expect(resumed.find((delta) => delta.internal_session_id)?.internal_session_id).toBe(internalId)
+      expect(resumed.some((delta) => delta.content === 'second instruction executed')).toBe(true)
+      expect(resumed.at(-1)?.finish_reason).toBe('stop')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(sourceSessionDir, { recursive: true, force: true })
     }
   })
 
