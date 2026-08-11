@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import {
   createServer,
   request as httpRequest,
@@ -26,6 +26,7 @@ import { PiBackend, piToolProcessEnvironment } from '../src/backends/pi.js'
 import {
   applyPiModelMetadata,
   createPiInferenceTransportResolver,
+  ensurePiSessionFile,
   provisionPiInferenceTransport,
 } from '../src/backends/pi-inference-transport.js'
 import type {
@@ -38,6 +39,103 @@ import { scopedHostSpawner } from '../src/executors/scoped-host.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 
 const tempDirs: string[] = []
+
+interface PiSessionReservationChild {
+  ready: Promise<void>
+  release(): void
+  stop(): void
+  result: Promise<string>
+}
+
+/** Start a separate Node process so each reservation can race the same empty directory. */
+function spawnPiSessionReservation(
+  sessionDir: string,
+  sessionId: string,
+  cwd: string,
+  epochMs: number,
+): PiSessionReservationChild {
+  const script = [
+    "import { once } from 'node:events'",
+    `import { ensurePiSessionFile } from ${JSON.stringify(
+      new URL('../src/backends/pi-inference-transport.ts', import.meta.url).href,
+    )}`,
+    'const NativeDate = Date',
+    'const epochMs = Number(process.env.CLI_BRIDGE_PI_RESERVATION_EPOCH_MS)',
+    'globalThis.Date = class FixedDate extends NativeDate {',
+    '  constructor(...args) { super(args.length === 0 ? epochMs : args[0]) }',
+    '  static now() { return epochMs }',
+    '}',
+    "process.stdout.write('ready\\n')",
+    "await once(process.stdin, 'data')",
+    'process.stdout.write(`result:${ensurePiSessionFile(',
+    '  process.env.CLI_BRIDGE_PI_SESSION_DIR,',
+    '  process.env.CLI_BRIDGE_PI_SESSION_ID,',
+    '  process.env.CLI_BRIDGE_PI_SESSION_CWD,',
+    ')}\\n`)',
+  ].join('\n')
+  const child = spawn(process.execPath, [
+    '--import',
+    'tsx',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      CLI_BRIDGE_PI_RESERVATION_EPOCH_MS: String(epochMs),
+      CLI_BRIDGE_PI_SESSION_DIR: sessionDir,
+      CLI_BRIDGE_PI_SESSION_ID: sessionId,
+      CLI_BRIDGE_PI_SESSION_CWD: cwd,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+
+  let stdout = ''
+  let stderr = ''
+  let resolveReady: () => void
+  let rejectReady: (error: Error) => void
+  let resolveResult: (path: string) => void
+  let rejectResult: (error: Error) => void
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
+  const result = new Promise<string>((resolve, reject) => {
+    resolveResult = resolve
+    rejectResult = reject
+  })
+  const fail = (error: Error): void => {
+    rejectReady(error)
+    rejectResult(error)
+  }
+
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', (chunk: string) => {
+    stdout += chunk
+    if (stdout.includes('ready\n')) resolveReady()
+  })
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', (chunk: string) => { stderr += chunk })
+  child.on('error', (error) => fail(error))
+  child.on('close', (code) => {
+    const match = /(?:^|\n)result:(.+)\n/u.exec(stdout)
+    if (code === 0 && match?.[1]) {
+      resolveResult(match[1])
+      return
+    }
+    fail(new Error(`native Pi session reservation child exited ${code ?? 'unknown'}: ${stderr || stdout}`))
+  })
+
+  return {
+    ready,
+    release: () => {
+      try { child.stdin.end('reserve\n') } catch { /* best effort */ }
+    },
+    stop: () => { child.kill() },
+    result,
+  }
+}
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
@@ -642,6 +740,72 @@ describe('Pi inference credential isolation', () => {
     }
   })
 
+  it('reserves native sessions once and rejects invalid or conflicting paths', () => {
+    const sessionDir = tempDir('cli-bridge-pi-native-session-files-')
+    const cwd = tempDir('cli-bridge-pi-native-session-cwd-')
+    const otherCwd = tempDir('cli-bridge-pi-native-session-other-cwd-')
+    const sessionId = 'native-session-id'
+
+    const first = ensurePiSessionFile(sessionDir, sessionId, cwd)
+    expect(first).toBe(join(sessionDir, `${sessionId}.jsonl`))
+    expect(ensurePiSessionFile(sessionDir, sessionId, cwd)).toBe(first)
+    expect(JSON.parse(readFileSync(first, 'utf8').split('\n', 1)[0]!)).toMatchObject({
+      type: 'session',
+      version: 3,
+      id: sessionId,
+      cwd,
+    })
+    expect(() => ensurePiSessionFile(sessionDir, sessionId, otherCwd))
+      .toThrow(/instead of/u)
+    expect(() => ensurePiSessionFile(sessionDir, '../escape', cwd))
+      .toThrow(/invalid internal session id/u)
+
+    writeFileSync(join(sessionDir, 'duplicate-native-session.jsonl'), `${JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: sessionId,
+      timestamp: new Date().toISOString(),
+      cwd,
+    })}\n`)
+    expect(() => ensurePiSessionFile(sessionDir, sessionId, cwd))
+      .toThrow(/multiple internal session files/u)
+
+    const missingResumeDir = tempDir('cli-bridge-pi-native-session-missing-resume-')
+    expect(() => ensurePiSessionFile(missingResumeDir, 'missing-resume-id', cwd, {
+      createIfMissing: false,
+    })).toThrow(/no matching Pi session file exists/u)
+    expect(readdirSync(missingResumeDir)).toHaveLength(0)
+
+    const collisionDir = tempDir('cli-bridge-pi-native-session-collision-')
+    const collisionId = 'collision-id'
+    const collisionPath = join(collisionDir, `${collisionId}.jsonl`)
+    writeFileSync(collisionPath, `${JSON.stringify({ type: 'unexpected', id: 'other' })}\n`)
+    expect(() => ensurePiSessionFile(collisionDir, collisionId, cwd))
+      .toThrow(/target path already exists/u)
+  })
+
+  it('atomically reserves one deterministic native file when concurrent first turns race', async () => {
+    const sessionDir = tempDir('cli-bridge-pi-native-session-race-')
+    const cwd = tempDir('cli-bridge-pi-native-session-race-cwd-')
+    const sessionId = 'concurrent-native-session-id'
+    const workers = Array.from({ length: 8 }, (_, index) => spawnPiSessionReservation(
+      sessionDir,
+      sessionId,
+      cwd,
+      Date.parse('2026-08-10T12:34:56.000Z') + index,
+    ))
+
+    try {
+      await Promise.all(workers.map((worker) => worker.ready))
+      for (const worker of workers) worker.release()
+      const paths = await Promise.all(workers.map((worker) => worker.result))
+      expect(new Set(paths)).toEqual(new Set([join(sessionDir, `${sessionId}.jsonl`)]))
+      expect(readdirSync(sessionDir)).toEqual([`${sessionId}.jsonl`])
+    } finally {
+      for (const worker of workers) worker.stop()
+    }
+  })
+
   it('refuses a production host Pi run before auth unless real read isolation was requested', async () => {
     let authResolutions = 0
     const spawner: Spawner = async () => {
@@ -1155,6 +1319,170 @@ describe('Pi inference credential isolation', () => {
           if (value === undefined) delete process.env[key]
           else process.env[key] = value
         }
+        await close(upstream)
+      }
+    },
+    70_000,
+  )
+
+  it.skipIf(!realPiBin)(
+    'persists an interrupted native first turn before resuming the exact Pi session',
+    async () => {
+      const cwd = tempDir('cli-bridge-pi-real-interrupt-cwd-')
+      const sourceAgentDir = tempDir('cli-bridge-pi-real-interrupt-source-')
+      const sourceSessionDir = tempDir('cli-bridge-pi-real-interrupt-sessions-')
+      const externalSessionId = 'native-interrupt-resume-session'
+      const observedBodies: string[] = []
+      let hangingResponse: ServerResponse | undefined
+      const upstream = createServer(async (request, response) => {
+        const body = await readBody(request)
+        observedBodies.push(body)
+        response.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        })
+        if (observedBodies.length === 1) {
+          // Keep the first generation in flight until the bridge aborts Pi.
+          hangingResponse = response
+          return
+        }
+        sendChunk(response, {
+          id: 'chatcmpl-native-resume',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'credential-check',
+          choices: [{
+            index: 0,
+            delta: { role: 'assistant', content: 'native-continuation-ok' },
+            finish_reason: null,
+          }],
+        })
+        sendChunk(response, {
+          id: 'chatcmpl-native-resume',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: 'credential-check',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+        })
+        response.end('data: [DONE]\n\n')
+      })
+      await listen(upstream)
+      const address = upstream.address()
+      if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+      const backend = new PiBackend({
+        bin: realPiBin!,
+        timeoutMs: 0,
+        spawner: scopedHostSpawner,
+        transportResolver: async ({ provider, model }) => fixtureTransport({
+          provider,
+          model,
+          upstreamBaseUrl: `http://127.0.0.1:${address.port}/v1`,
+          upstreamApiKey: SENTINELS.TANGLE_API_KEY,
+          sourceAgentDir,
+          sourceSessionDir,
+          modelConfig: {
+            ...fixtureTransport().modelConfig,
+            id: model,
+            name: 'Native session resume fixture',
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          },
+        }),
+      })
+      const firstRequest: ChatRequest = {
+        model: 'pi/isolated-test/credential-check',
+        messages: [{ role: 'user', content: 'first native instruction before interruption' }],
+        cwd,
+        session_id: externalSessionId,
+        jailSpec: {
+          root: join(cwd, '.agent-home-first'),
+          projectDir: cwd,
+          readConfine: true,
+        },
+      }
+      const firstController = new AbortController()
+      const firstDeltas: ChatDelta[] = []
+      let firstError: unknown
+      const firstRun = (async () => {
+        try {
+          for await (const delta of backend.chat(firstRequest, null, firstController.signal)) {
+            firstDeltas.push(delta)
+          }
+        } catch (error) {
+          firstError = error
+        }
+      })()
+
+      try {
+        await waitFor(() => observedBodies.length === 1)
+        firstController.abort()
+        await firstRun
+        hangingResponse?.destroy()
+
+        expect(firstError).toBeInstanceOf(Error)
+        expect(firstDeltas.some((delta) => delta.finish_reason === 'stop')).toBe(false)
+        const firstErrorMessage = firstError instanceof Error ? firstError.message : String(firstError)
+        expect(firstErrorMessage).not.toMatch(/No session found matching/u)
+        const internalId = firstDeltas.find((delta) => delta.internal_session_id)?.internal_session_id
+        expect(internalId).toBeTruthy()
+
+        const sessionParent = join(sourceSessionDir, 'cli-bridge')
+        expect(readdirSync(sessionParent)).toHaveLength(1)
+        const persistedSessionDir = join(sessionParent, readdirSync(sessionParent)[0]!)
+        const sessionFiles = allFiles(persistedSessionDir).filter((path) => path.endsWith('.jsonl'))
+        expect(sessionFiles).toHaveLength(1)
+        const records = readFileSync(sessionFiles[0]!, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as Record<string, unknown>)
+        expect(records[0]).toMatchObject({
+          type: 'session',
+          version: 3,
+          id: internalId,
+          cwd,
+        })
+        expect(readFileSync(sessionFiles[0]!, 'utf8'))
+          .toContain('first native instruction before interruption')
+        expect(records.some((record) => (
+          record.type === 'message'
+          && (record.message as { role?: unknown } | undefined)?.role === 'user'
+        ))).toBe(true)
+
+        const resumedRequest: ChatRequest = {
+          ...firstRequest,
+          messages: [{ role: 'user', content: 'second native instruction executes now' }],
+          jailSpec: {
+            root: join(cwd, '.agent-home-second'),
+            projectDir: cwd,
+            readConfine: true,
+          },
+        }
+        const resumedSession: SessionRecord = {
+          externalId: externalSessionId,
+          backend: 'pi',
+          internalId: internalId!,
+          cwd,
+          turns: 1,
+          createdAt: Date.now(),
+          lastUsedAt: Date.now(),
+          metadata: {},
+        }
+        const resumedDeltas = await collect(
+          backend.chat(resumedRequest, resumedSession, new AbortController().signal),
+        )
+        expect(resumedDeltas.some((delta) => delta.content?.includes('native-continuation-ok')))
+          .toBe(true)
+        expect(resumedDeltas.find((delta) => delta.internal_session_id)?.internal_session_id)
+          .toBe(internalId)
+        expect(resumedDeltas.at(-1)?.finish_reason).toBe('stop')
+        expect(observedBodies[0]).toContain('first native instruction before interruption')
+        expect(observedBodies[1]).toContain('first native instruction before interruption')
+        expect(observedBodies[1]).toContain('second native instruction executes now')
+      } finally {
+        firstController.abort()
+        hangingResponse?.destroy()
         await close(upstream)
       }
     },
