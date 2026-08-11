@@ -224,11 +224,21 @@ A bridge restart loses the in-memory registry; `404` after a restart means the o
 The `state` field is `running` while a reader is attached, `detached` while the job continues without readers, `cancelling` after explicit cancellation but before process exit, and `terminal` only after the backend iterator exits.
 The separate `status` field records the outcome as `running`, `done`, `error`, or `cancelled`.
 
+`GET /v1/runs/:id/events` opens a replay-only SSE reader without repeating the original dispatch request.
+Send `Last-Event-ID` or `X-Last-Event-Id` to resume strictly after one retained event.
+The endpoint returns the same conflict and expiry errors as request replay and ends with the `[DONE]` protocol marker.
+
 `POST /v1/runs/:id/cancel?wait_ms=N` returns:
 
 - `202` while cancellation was requested but process exit is not yet proven.
 - `200` only with `terminal: true` and the terminal run snapshot.
 - `404` when this bridge process has no record of the run; this is not termination proof.
+
+An empty cancellation body keeps the simple local API above.
+For retry-safe control, send the `AgentRunCancellationRequest` from `@tangle-network/agent-interface`.
+It contains a stable `operationId`, the complete run control reference, an optional reason, and the canonical request digest.
+Repeating the same operation returns the stored acknowledgement.
+Changing its digest returns `409`, and a run id that differs from the URL returns `409` before replay lookup.
 
 The `wait_ms` query is an integer from `0` through `30000` on both endpoints.
 

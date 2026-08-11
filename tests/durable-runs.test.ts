@@ -4,6 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
+import {
+  agentRunCancellationRequestDigest,
+  type AgentExactRunControlRef,
+  type AgentRunCancellationRequest,
+} from '@tangle-network/agent-interface'
 import { AdmissionGate } from '../src/admission.js'
 import { BackendRegistry } from '../src/backends/registry.js'
 import type { Backend, BackendHealth, ChatDelta, ChatRequest } from '../src/backends/types.js'
@@ -539,6 +544,35 @@ describe('durable run contract', () => {
     }
   })
 
+  it('reconnects from run coordinates alone without replaying the dispatch request', async () => {
+    const backend = new ReplayBackend(10)
+    const ctx = fixture(backend)
+    const runId = 'coordinate-reconnect'
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+    try {
+      const initial = await postChat(ctx.app, chatBody(runId))
+      reader = initial.body?.getReader()
+      expect(reader).toBeDefined()
+      await reader?.read()
+      await reader?.cancel()
+      await waitFor(() => ctx.runs.get(runId)?.snapshot().state === 'detached')
+
+      const reconnect = await ctx.app.request(`/v1/runs/${runId}/events`, {
+        headers: { 'Last-Event-ID': '0' },
+      })
+      const text = await reconnect.text()
+
+      expect(reconnect.status).toBe(200)
+      expect(sseIds(text)).toEqual([1, 2, 3])
+      expect(text).toContain('one')
+      expect(text).toContain('two')
+      expect(backend.calls).toBe(1)
+    } finally {
+      await reader?.cancel()
+      ctx.cleanup()
+    }
+  })
+
   it('replays and retains the exact profile acknowledgment for the run identity lifetime', async () => {
     const backend = new ProfileReceiptReplayBackend()
     const ctx = fixture(backend, {
@@ -672,6 +706,81 @@ describe('durable run contract', () => {
     }
   })
 
+  it('binds exact cancellation to one operation and replays its acknowledgement', async () => {
+    const backend = new ControlledCancelBackend()
+    const ctx = fixture(backend)
+    const runId = 'exact-cancel'
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+    try {
+      const response = await postChat(ctx.app, chatBody(runId))
+      reader = response.body?.getReader()
+      await reader?.read()
+      const snapshotResponse = await ctx.app.request(`/v1/runs/${runId}`)
+      const snapshot = await snapshotResponse.json() as { requestDigest: `sha256:${string}` }
+      const run: AgentExactRunControlRef = {
+        runId,
+        provider: 'cli-bridge',
+        environmentId: 'environment-exact-cancel',
+        sessionId: runId,
+        executionId: runId,
+        requestDigest: snapshot.requestDigest,
+      }
+      const request = cancellationRequest('cancel-exact-operation', run, 'user requested stop')
+
+      const accepted = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      })
+      expect(accepted.status).toBe(202)
+      await expect(accepted.json()).resolves.toMatchObject({
+        operationId: request.operationId,
+        requestDigest: request.requestDigest,
+        status: 'accepted',
+        effect: 'cancel_requested',
+        run,
+      })
+
+      const replayed = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      })
+      expect(replayed.status).toBe(202)
+      await expect(replayed.json()).resolves.toMatchObject({
+        status: 'replayed',
+        effect: 'cancel_requested',
+      })
+
+      const wrongPath = await ctx.app.request('/v1/runs/another-run/cancel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      })
+      expect(wrongPath.status).toBe(409)
+      await expect(wrongPath.json()).resolves.toMatchObject({
+        error: { message: 'cancellation run id does not match the request path' },
+      })
+
+      const changed = cancellationRequest(request.operationId, run, 'changed reason')
+      const conflict = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(changed),
+      })
+      expect(conflict.status).toBe(409)
+      await expect(conflict.json()).resolves.toMatchObject({
+        status: 'conflict',
+        effect: 'unknown',
+        existingRequestDigest: request.requestDigest,
+      })
+    } finally {
+      backend.finishCancellation()
+      await reader?.cancel()
+      ctx.cleanup()
+    }
+  })
+
   it('detaches a cancelled socket reader without killing the child; explicit cancel kills it', async () => {
     const backend = new ChildProcessBackend()
     const ctx = fixture(backend)
@@ -757,4 +866,13 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function cancellationRequest(
+  operationId: string,
+  run: AgentExactRunControlRef,
+  reason: string,
+): AgentRunCancellationRequest {
+  const material = { operationId, run, reason }
+  return { ...material, requestDigest: agentRunCancellationRequestDigest(material) }
 }
