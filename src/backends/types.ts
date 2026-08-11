@@ -17,6 +17,7 @@
 import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
 import type { JailSpec } from '../jail/index.js'
+import type { CallerTrace } from '../trace/ids.js'
 import type { AgentProfile, ReasoningEffort } from '@tangle-network/agent-interface'
 
 export type ChatContentPart =
@@ -242,6 +243,16 @@ export interface ChatRequest {
    * CLI in an OS write-jail; null/absent = no jail.
    */
   jailSpec?: JailSpec | null
+  /**
+   * Trace context the spawned harness child inherits over its environment
+   * (`TRACEPARENT` + legacy `TRACE_ID` / `PARENT_SPAN_ID`), set by the chat
+   * route from the request's trace correlation headers. NOT part of the wire
+   * schema — the wire is `traceparent` / `x-trace-id` / `x-parent-span-id`.
+   * It rides on the request to the spawn seam the way `jailSpec` does.
+   * null/absent = the caller sent no correlation and the child env is
+   * unchanged.
+   */
+  childTrace?: CallerTrace | null
   /**
    * Admission lane this turn was granted, set by the chat route. NOT part of
    * the wire schema — it is derived from `x-tangle-client`.

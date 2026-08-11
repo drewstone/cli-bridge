@@ -499,6 +499,11 @@ export function mountChatCompletions(
     // One span per RUN, opened by its creator. A reconnecting reader attaches to
     // the run above and never reaches here, so replay cannot double-count a
     // request that only ran once.
+    const callerTrace = resolveCallerTrace({
+      traceparent: c.req.header('traceparent'),
+      traceId: c.req.header('x-trace-id'),
+      parentSpanId: c.req.header('x-parent-span-id'),
+    })
     const recorder: RequestSpanRecorder | null = deps.trace?.beginRequest({
       runId,
       model: req.model,
@@ -506,12 +511,21 @@ export function mountChatCompletions(
       sessionId: req.session_id ?? null,
       mode: req.mode ?? 'byob',
       execution: req.execution?.kind ?? 'host',
-      caller: resolveCallerTrace({
-        traceparent: c.req.header('traceparent'),
-        traceId: c.req.header('x-trace-id'),
-        parentSpanId: c.req.header('x-parent-span-id'),
-      }),
+      caller: callerTrace,
     }) ?? null
+
+    // The harness child inherits this over its environment (`TRACEPARENT` +
+    // the legacy `TRACE_ID` / `PARENT_SPAN_ID` pair), so the spans it emits
+    // join the caller's trace instead of opening an orphan root. The parent
+    // span is the bridge's own request span when one records — the child
+    // then nests under the node that actually spawned it — else the caller's
+    // ids travel through verbatim. A request with no correlation stamps
+    // nothing: the child env stays byte-identical to the pre-channel bridge.
+    req.childTrace = callerTrace.caller === null
+      ? null
+      : recorder !== null
+        ? { traceId: recorder.traceId, parentSpanId: recorder.spanId }
+        : callerTrace.caller
 
     let admissionSlot: AdmissionSlot | null = null
     let sessionLease: SessionExecutionLease | null = null

@@ -135,3 +135,30 @@ export function resolveCallerTrace(headers: CallerTraceHeaders): ResolvedCallerT
 function isPresent(value: string | undefined): boolean {
   return typeof value === 'string' && value.trim().length > 0
 }
+
+/**
+ * Env vars a spawned harness child inherits so its spans join the caller's
+ * trace across the process boundary.
+ *
+ * The wire is what agent-runtime's `readTraceContextFromEnv` reads at child
+ * startup: W3C `TRACEPARENT` first, its bespoke `TRACE_ID` /
+ * `PARENT_SPAN_ID` pair as the fallback. Both spellings are written so a
+ * child on either package generation joins the SAME trace. `TRACEPARENT`
+ * requires a span id by grammar; with a trace id alone only the legacy pair
+ * carries the trace, which is the degradation the runtime's reader expects.
+ *
+ * A `null` context returns `{}`: a request that carried no correlation
+ * stamps nothing, and the child env stays byte-identical to what it was
+ * before this channel existed.
+ */
+export function traceContextToChildEnv(
+  ctx: CallerTrace | null | undefined,
+): Record<string, string> {
+  if (!ctx) return {}
+  const env: Record<string, string> = { TRACE_ID: ctx.traceId }
+  if (ctx.parentSpanId) {
+    env.PARENT_SPAN_ID = ctx.parentSpanId
+    env.TRACEPARENT = `00-${ctx.traceId}-${ctx.parentSpanId}-01`
+  }
+  return env
+}

@@ -70,6 +70,7 @@ import {
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
+import { traceContextToChildEnv } from '../trace/ids.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import {
@@ -662,6 +663,11 @@ export class PiBackend implements Backend {
         cwd: runCwd,
         env: piToolProcessEnvironment(process.env, {
           PI_CODING_AGENT_DIR: inference.agentDir,
+          // Request-owned, never inherited: adding TRACEPARENT to the
+          // allowlist above would leak the bridge DAEMON's own ambient trace
+          // context into every child and mis-parent its spans. Absent caller
+          // correlation contributes no keys, so the env is unchanged.
+          ...traceContextToChildEnv(req.childTrace),
           ...(provisioned?.env ?? {}),
           ...(requestedMcpNames.length > 0
             ? {

@@ -173,6 +173,19 @@ export function sanitizeHostEnv(env: NodeJS.ProcessEnv | undefined, cwd?: string
   for (const [key, value] of Object.entries(env)) {
     if (typeof value !== 'string' || value.length === 0) continue
     if (value.length > MAX_ENV_VALUE_BYTES) continue
+    // Trace-context keys pass only when they are NOT the daemon's own ambient
+    // value. A backend that stamps per-request trace context (pi, from
+    // `ChatRequest.childTrace`) produces a value the daemon env does not
+    // hold, and that correlation must reach the child. A backend that spreads
+    // the whole `process.env` (codex, opencode, kimi, gemini) copies the
+    // BRIDGE's launch-time `TRACEPARENT` — e.g. from a traced shell that
+    // restarted the daemon — and letting that through would parent every
+    // child's spans under the bridge's own launch context instead of its
+    // caller's trace. Same value as ambient = inherited, so it stays stripped.
+    if (TRACE_PROPAGATION_ENV_KEYS.has(key)) {
+      if (process.env[key] !== value) out[key] = value
+      continue
+    }
     if (BASE_HOST_ENV_KEYS.has(key) || PROXIED_ENV_KEYS.has(key) || PROXIED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
       out[key] = value
     }
@@ -209,6 +222,20 @@ const BASE_HOST_ENV_KEYS = new Set([
   'XDG_RUNTIME_DIR',
   'NVM_DIR',
   'PNPM_HOME',
+])
+
+/**
+ * Trace-context vars a backend may stamp into a child env so the harness
+ * joins its caller's trace: W3C `TRACEPARENT`, plus agent-runtime's legacy
+ * `TRACE_ID` / `PARENT_SPAN_ID` fallback pair — the exact spellings its
+ * `readTraceContextFromEnv` reads at child startup. Guarded in the filter
+ * above: request-stamped values pass, the daemon's own ambient values never
+ * do.
+ */
+const TRACE_PROPAGATION_ENV_KEYS = new Set([
+  'TRACEPARENT',
+  'TRACE_ID',
+  'PARENT_SPAN_ID',
 ])
 
 const PROXIED_ENV_KEYS = new Set([
