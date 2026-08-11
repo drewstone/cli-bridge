@@ -15,7 +15,6 @@
  */
 
 import type { Context, Hono } from 'hono'
-import { streamSSE } from 'hono/streaming'
 import { z } from 'zod'
 import {
   canonicalAgentProfileDigest,
@@ -32,7 +31,7 @@ import type { Backend, ChatDelta, ChatRequest } from '../backends/types.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
-import { collectNonStreaming, deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
+import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { resolveNetJailSpec } from '../jail/resolve-net-spec.js'
@@ -53,8 +52,7 @@ import {
   resolveAgentProfile,
   resolveRequestedReasoningEffort,
 } from '../backends/profile-support.js'
-
-const DEFAULT_SSE_HEARTBEAT_MS = 15_000
+import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
 
 class SandboxBackendUnavailableError extends Error {
   readonly code = 'not_found_error' as const
@@ -459,7 +457,7 @@ export function mountChatCompletions(
     const runId = runIdResult.value
     const standardCursor = c.req.header('last-event-id')
     const aliasCursor = c.req.header('x-last-event-id')
-    const cursorResult = resolveLastEventId(standardCursor, aliasCursor)
+    const cursorResult = resolveRunEventCursor(standardCursor, aliasCursor)
     if (!cursorResult.ok) return invalidRequest(c, cursorResult.message)
     const afterSeq = cursorResult.value
     if ((standardCursor !== undefined || aliasCursor !== undefined) && req.stream !== true) {
@@ -832,96 +830,7 @@ async function respondFromRun(
     }
   }
 
-  return streamSSE(c, async (stream) => {
-    const meta = makeChunkMeta(req.model)
-    const heartbeatMs = resolveSseHeartbeatMs()
-    // `clientGone` ends THIS reader on a write failure (socket closed). It
-    // does NOT cancel the run — that is the whole point of the decoupling.
-    let clientGone = false
-    const readerController = new AbortController()
-    stream.onAbort(() => {
-      clientGone = true
-      readerController.abort()
-    })
-    const writeRaw = async (chunk: string): Promise<boolean> => {
-      if (clientGone || stream.aborted) return false
-      try {
-        await stream.write(chunk)
-        return !stream.aborted
-      } catch {
-        clientGone = true
-        readerController.abort()
-        return false
-      }
-    }
-    // SSE `id:` carries the per-run seq so the client's next reconnect can
-    // send it back as Last-Event-ID and replay exactly what it missed.
-    const writeSse = async (data: string, id?: number): Promise<boolean> => {
-      if (clientGone || stream.aborted) return false
-      try {
-        await stream.writeSSE(id !== undefined ? { data, id: String(id) } : { data })
-        return !stream.aborted
-      } catch {
-        clientGone = true
-        readerController.abort()
-        return false
-      }
-    }
-    const heartbeat = setInterval(() => {
-      void writeRaw(': keepalive\n\n')
-    }, heartbeatMs)
-    try {
-      if (!await writeRaw(': connected\n\n')) return
-      for await (const { seq, delta } of run.attach(afterSeq, readerController.signal)) {
-        if (clientGone) break
-        // The run pump attaches the reason to the terminal delta itself, so a
-        // failure at ANY point in the stream — not only before the first delta —
-        // becomes one OpenAI error frame here, and a reconnecting reader replays
-        // the same reason instead of a bare terminal marker.
-        //
-        // BOTH terminal failure reasons, because enumerating one of them is the
-        // same defect one level down: a `timeout` delta carrying a reason was
-        // written out as an ordinary chunk and the frame never appeared.
-        if ((delta.finish_reason === 'error' || delta.finish_reason === 'timeout') && delta.error) {
-          await writeSse(JSON.stringify({ error: delta.error }), seq)
-          break
-        }
-        // Backend-level liveness ping (e.g. kimi/opencode stdout idle):
-        // render as SSE comment so the consumer (AI SDK, openai-node)
-        // ignores it per spec instead of trying to route a fake tool
-        // call. SSE comments also count as transport heartbeats.
-        const comment = deltaToSseComment(delta)
-        if (comment) {
-          // Every buffered delta advances the durable replay cursor, including
-          // liveness and bridge-internal metadata that OpenAI clients should
-          // otherwise ignore. Carry the id on an SSE comment frame so an exact
-          // client can reject a missing sequence instead of silently skipping it.
-          if (!await writeRaw(`id: ${seq}\n${comment}`)) break
-          continue
-        }
-        const chunk = deltaToOpenAIChunk(delta, meta)
-        // Metadata-only deltas (e.g. internal_session_id) yield null —
-        // consumed by the run/session store. Emit an id-only comment frame so
-        // the replay sequence remains gap-free without exposing a fake chunk.
-        if (!chunk) {
-          if (!await writeRaw(`id: ${seq}\n: bridge-metadata\n\n`)) break
-          continue
-        }
-        // deltaToOpenAIChunk returns a complete "data: …\n\n" line. Strip
-        // the framing so streamSSE can re-add it (with the seq as id).
-        const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')
-        if (!await writeSse(payload, seq)) break
-      }
-    } catch (err) {
-      if (clientGone) return
-      const message = err instanceof Error ? err.message : String(err)
-      const type = err instanceof RunReplayCursorError ? err.code : 'server_error'
-      await writeSse(JSON.stringify({ error: { message, type } }))
-    } finally {
-      clearInterval(heartbeat)
-    }
-    await writeSse('[DONE]')
-  })
+  return streamRunEvents(c, run, req.model, afterSeq)
 }
 
 /** Unwrap SeqDelta → ChatDelta for the non-streaming collector. */
@@ -946,38 +855,6 @@ function resolveRunId(
     return { ok: false, message: parsed.error.issues[0]?.message ?? 'invalid run id' }
   }
   return { ok: true, value: parsed.data }
-}
-
-function resolveLastEventId(
-  standardValue: string | undefined,
-  aliasValue: string | undefined,
-): ParsedHeader<number> {
-  const parse = (value: string | undefined): ParsedHeader<number | undefined> => {
-    if (value === undefined) return { ok: true, value: undefined }
-    if (!/^(0|[1-9][0-9]*)$/u.test(value)) {
-      return { ok: false, message: 'Last-Event-ID must be a non-negative base-10 integer' }
-    }
-    const parsed = Number(value)
-    if (!Number.isSafeInteger(parsed)) {
-      return { ok: false, message: 'Last-Event-ID exceeds the safe integer range' }
-    }
-    return { ok: true, value: parsed }
-  }
-  const standard = parse(standardValue)
-  if (!standard.ok) return standard
-  const alias = parse(aliasValue)
-  if (!alias.ok) return alias
-  if (
-    standard.value !== undefined &&
-    alias.value !== undefined &&
-    standard.value !== alias.value
-  ) {
-    return {
-      ok: false,
-      message: 'Last-Event-ID and X-Last-Event-Id must match when both are provided',
-    }
-  }
-  return { ok: true, value: standard.value ?? alias.value ?? 0 }
 }
 
 /** Bind a run id to execution semantics, not response representation. `stream` and runtime-owned
@@ -1082,11 +959,6 @@ function replayCursorError(c: Context, error: RunReplayCursorError): Response {
     },
     error.reason === 'expired' ? 410 : 409,
   )
-}
-
-function resolveSseHeartbeatMs(): number {
-  const raw = Number(process.env.BRIDGE_SSE_HEARTBEAT_MS)
-  return Number.isFinite(raw) && raw >= 10 ? raw : DEFAULT_SSE_HEARTBEAT_MS
 }
 
 /**

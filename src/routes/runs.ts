@@ -10,11 +10,26 @@
 
 import type { Context } from 'hono'
 import { Hono } from 'hono'
-import type { Run, RunRegistry, RunSnapshot } from '../runs/registry.js'
+import {
+  AgentRunCancellationAcknowledgementSchema,
+  AgentRunCancellationRequestSchema,
+  type AgentRunCancellationAcknowledgement,
+  type AgentRunCancellationRequest,
+  type Sha256Digest,
+} from '@tangle-network/agent-interface'
+import {
+  type Run,
+  type RunRegistry,
+  RunReplayCursorError,
+  type RunSnapshot,
+} from '../runs/registry.js'
+import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
 
 export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
+  const cancellations = new Map<string, CancellationRecord>()
+
   app.get('/v1/runs/:id', async (c) => {
     const run = deps.runs.get(c.req.param('id'))
     if (!run) return runNotFound(c)
@@ -25,10 +40,33 @@ export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
     return c.json(snapshot)
   })
 
+  app.get('/v1/runs/:id/events', (c) => {
+    const run = deps.runs.get(c.req.param('id'))
+    if (!run) return runNotFound(c)
+    const cursor = resolveRunEventCursor(
+      c.req.header('Last-Event-ID'),
+      c.req.header('X-Last-Event-Id'),
+    )
+    if (!cursor.ok) return invalidRequest(c, cursor.message)
+    try {
+      run.assertReplayCursor(cursor.value)
+    } catch (error) {
+      if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
+      throw error
+    }
+    setRunHeaders(c, run.snapshot())
+    return streamRunEvents(c, run, 'cli-bridge', cursor.value)
+  })
+
   // POST (not DELETE) — cancelling mutates the run's lifecycle and is the
   // semantic counterpart to dispatch, not a resource deletion.
   app.post('/v1/runs/:id/cancel', async (c) => {
     const id = c.req.param('id')
+    const parsedBody = await cancellationBody(c)
+    if (!parsedBody.ok) return invalidRequest(c, parsedBody.message)
+    if (parsedBody.request) {
+      return exactCancellation(c, deps.runs, cancellations, id, parsedBody.request)
+    }
     const run = deps.runs.get(id)
     // Unknown is not proof that a process is gone. Return 404 so a cleanup caller cannot
     // reinterpret "this bridge has no record" as a terminal acknowledgement.
@@ -51,6 +89,132 @@ export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
     }
     return c.json(body)
   })
+}
+
+interface CancellationRecord {
+  readonly requestDigest: Sha256Digest
+  readonly acknowledgement: AgentRunCancellationAcknowledgement
+}
+
+type CancellationBody =
+  | { readonly ok: true; readonly request?: AgentRunCancellationRequest }
+  | { readonly ok: false; readonly message: string }
+
+async function cancellationBody(c: Context): Promise<CancellationBody> {
+  const text = await c.req.text()
+  if (text.trim() === '') return { ok: true }
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    return { ok: false, message: 'cancellation body must be valid JSON' }
+  }
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 0
+  ) {
+    return { ok: true }
+  }
+  const request = AgentRunCancellationRequestSchema.safeParse(value)
+  if (!request.success) {
+    return {
+      ok: false,
+      message: request.error.issues[0]?.message ?? 'invalid cancellation request',
+    }
+  }
+  return { ok: true, request: request.data }
+}
+
+async function exactCancellation(
+  c: Context,
+  runs: RunRegistry,
+  cancellations: Map<string, CancellationRecord>,
+  runId: string,
+  request: AgentRunCancellationRequest,
+): Promise<Response> {
+  if (request.run.runId !== runId) {
+    return invalidRequest(c, 'cancellation run id does not match the request path', 409)
+  }
+  const existing = cancellations.get(request.operationId)
+  if (existing) {
+    if (existing.requestDigest !== request.requestDigest) {
+      const conflict = cancellationAcknowledgement({
+        operationId: request.operationId,
+        requestDigest: request.requestDigest,
+        run: request.run,
+        status: 'conflict',
+        effect: 'unknown',
+        existingRequestDigest: existing.requestDigest,
+      })
+      return c.json(conflict, 409)
+    }
+    const replayed = existing.acknowledgement.status === 'unknown'
+      ? existing.acknowledgement
+      : cancellationAcknowledgement({
+          ...existing.acknowledgement,
+          status: 'replayed',
+        })
+    return c.json(replayed, replayed.effect === 'cancel_requested' ? 202 : 200)
+  }
+
+  const run = runs.get(runId)
+  if (!run) {
+    const unknown = cancellationAcknowledgement({
+      operationId: request.operationId,
+      requestDigest: request.requestDigest,
+      run: request.run,
+      status: 'unknown',
+      effect: 'unknown',
+      message: 'this bridge process has no record of the run',
+      retryable: false,
+    })
+    cancellations.set(request.operationId, {
+      requestDigest: request.requestDigest,
+      acknowledgement: unknown,
+    })
+    return c.json(unknown)
+  }
+  if (request.run.requestDigest !== run.requestDigest) {
+    return invalidRequest(c, 'cancellation request digest does not match the retained run', 409)
+  }
+
+  const waitMs = parseWaitMs(c)
+  if (!waitMs.ok) return invalidWait(c, waitMs.message)
+  const cancelRequested = runs.cancel(runId)
+  const snapshot = await terminalSnapshot(run, waitMs.value)
+  setRunHeaders(c, snapshot)
+  const effect = snapshot.status === 'cancelled'
+    ? 'cancelled' as const
+    : snapshot.terminal
+      ? 'not_live' as const
+      : 'cancel_requested' as const
+  const acknowledgement = cancellationAcknowledgement({
+    operationId: request.operationId,
+    requestDigest: request.requestDigest,
+    run: request.run,
+    status: 'accepted',
+    effect,
+    ...(!cancelRequested && effect === 'cancel_requested'
+      ? { message: 'cancellation was already requested' }
+      : {}),
+  })
+  cancellations.set(request.operationId, {
+    requestDigest: request.requestDigest,
+    acknowledgement,
+  })
+  if (effect === 'cancel_requested') {
+    c.header('Retry-After', '1')
+    return c.json(acknowledgement, 202)
+  }
+  return c.json(acknowledgement)
+}
+
+function cancellationAcknowledgement(
+  value: AgentRunCancellationAcknowledgement,
+): AgentRunCancellationAcknowledgement {
+  return AgentRunCancellationAcknowledgementSchema.parse(value)
 }
 
 type WaitMsResult =
@@ -101,6 +265,26 @@ function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
 
 function invalidWait(c: Context, message: string): Response {
   return c.json({ error: { message, type: 'invalid_request_error' } }, 400)
+}
+
+function invalidRequest(c: Context, message: string, status: 400 | 409 = 400): Response {
+  return c.json({ error: { message, type: 'invalid_request_error' } }, status)
+}
+
+function replayCursorError(c: Context, error: RunReplayCursorError): Response {
+  return c.json(
+    {
+      error: {
+        message: error.message,
+        type: error.code,
+        run_id: error.runId,
+        requested_event_id: error.cursor,
+        first_available_event_id: error.firstAvailableSeq,
+        last_event_id: error.lastSeq,
+      },
+    },
+    error.reason === 'expired' ? 410 : 409,
+  )
 }
 
 function runNotFound(c: Context): Response {
