@@ -298,6 +298,10 @@ export function terminalOutcome(
 export interface ChatDelta {
   /** Incremental text appended to the assistant message. */
   content?: string
+  /** Provider-reported response model. This is distinct from the requested route model. */
+  model?: string
+  /** Provider response fingerprint, when the upstream protocol exposes one. */
+  system_fingerprint?: string
   /** Tool calls the assistant emitted this delta. Each is appended. */
   tool_calls?: Array<{ id: string; name: string; arguments: string }>
   /** Terminal reason. Emitted once on the final chunk. */

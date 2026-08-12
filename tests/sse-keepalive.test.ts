@@ -79,6 +79,17 @@ describe('deltaToOpenAIChunk', () => {
       estimated: true,
     })
   })
+
+  it('uses the observed provider identity and preserves its fingerprint', () => {
+    const out = deltaToOpenAIChunk({
+      model: 'deepseek-v4-flash@fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+      system_fingerprint: 'fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+      content: 'identified',
+    }, meta)
+    const payload = JSON.parse(out!.slice('data: '.length).replace(/\n\n$/, ''))
+    expect(payload.model).toBe('deepseek-v4-flash@fp_a18b46594c_prod0820_fp8_kvcache_20260402')
+    expect(payload.system_fingerprint).toBe('fp_a18b46594c_prod0820_fp8_kvcache_20260402')
+  })
 })
 
 describe('collectNonStreaming', () => {
@@ -98,6 +109,23 @@ describe('collectNonStreaming', () => {
     expect(body.choices[0]?.message.tool_calls).toBeUndefined()
     expect(body.usage?.prompt_tokens).toBe(3)
     expect(body.usage?.completion_tokens).toBe(2)
+  })
+
+  it('returns the observed provider identity instead of the requested model', async () => {
+    async function* deltas(): AsyncIterable<ChatDelta> {
+      yield {
+        model: 'deepseek-v4-flash@fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+        system_fingerprint: 'fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+        content: 'identified',
+      }
+      yield { finish_reason: 'stop' }
+    }
+    const body = await collectNonStreaming(deltas(), 'deepseek-v4-flash') as {
+      model: string
+      system_fingerprint?: string
+    }
+    expect(body.model).toBe('deepseek-v4-flash@fp_a18b46594c_prod0820_fp8_kvcache_20260402')
+    expect(body.system_fingerprint).toBe('fp_a18b46594c_prod0820_fp8_kvcache_20260402')
   })
 
   it('sums incremental usage records and a complete aggregate cost', async () => {

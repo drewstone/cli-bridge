@@ -17,7 +17,12 @@ import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
 import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
-import { DEFAULT_PI_TURN_ATTEMPTS, PiBackend, piMcpAdapterAvailable } from '../src/backends/pi.js'
+import {
+  DEFAULT_PI_TURN_ATTEMPTS,
+  PiBackend,
+  piMcpAdapterAvailable,
+  piResponseIdentityFromEvent,
+} from '../src/backends/pi.js'
 import { BackendError } from '../src/backends/types.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
@@ -301,6 +306,52 @@ describe('PiBackend turn retry (#125)', () => {
 })
 
 describe('PiBackend', () => {
+  it('preserves the provider response model and fingerprint in every emitted delta', async () => {
+    const responseModel = 'deepseek-v4-flash@fp_a18b46594c_prod0820_fp8_kvcache_20260402'
+    expect(piResponseIdentityFromEvent({
+      type: 'message_start',
+      message: {
+        model: 'deepseek-v4-flash',
+        responseModel,
+      },
+    })).toEqual({
+      model: responseModel,
+      systemFingerprint: 'fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+    })
+
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        {
+          type: 'message_start',
+          message: { model: 'deepseek-v4-flash', responseModel },
+        },
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'identified' } },
+        {
+          type: 'turn_end',
+          message: {
+            responseModel,
+            usage: { input: 2, output: 1 },
+          },
+        },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/tangle-router/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'task' }],
+    }, null, new AbortController().signal))
+
+    expect(deltas.filter((delta) => delta.content)).toContainEqual({
+      model: responseModel,
+      system_fingerprint: 'fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+      content: 'identified',
+    })
+    expect(deltas.find((delta) => delta.usage)?.model).toBe(responseModel)
+    expect(deltas.find((delta) => delta.finish_reason)?.model).toBe(responseModel)
+  })
+
   it('accepts a profile default that already contains a nested provider model', () => {
     const request: ChatRequest = {
       model: 'pi/tangle-router/fireworks/deepseek-v4-flash',

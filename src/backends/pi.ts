@@ -719,6 +719,7 @@ export class PiBackend implements Backend {
       }
       let observedUsage: CollectedUsage | undefined
       const piToolCalls = new PiToolCallTracker()
+      let responseIdentity: PiResponseIdentity | undefined
 
       child.stderr?.on('data', (b) => { stderr.append(b) })
 
@@ -744,6 +745,8 @@ export class PiBackend implements Backend {
         }
 
         const type = String(ev.type ?? '')
+        const eventIdentity = piResponseIdentityFromEvent(ev)
+        if (eventIdentity) responseIdentity = mergePiResponseIdentity(responseIdentity, eventIdentity)
 
         // Session id is on the first `session` event.
         if (type === 'session' && typeof ev.id === 'string' && !internalSessionId) {
@@ -776,7 +779,7 @@ export class PiBackend implements Backend {
             recordPiUsageCost(usageCost, receipt)
             const usage = piTokenUsage(receipt)
             observedUsage = addUsage(observedUsage, usage)
-            yield { usage }
+            yield { ...piResponseIdentityDelta(responseIdentity), usage }
           }
           continue
         }
@@ -790,7 +793,7 @@ export class PiBackend implements Backend {
               recordPiUsageCost(usageCost, receipt)
               const usage = piTokenUsage(receipt)
               observedUsage = addUsage(observedUsage, usage)
-              yield { usage }
+              yield { ...piResponseIdentityDelta(responseIdentity), usage }
             }
           }
           continue
@@ -811,13 +814,13 @@ export class PiBackend implements Backend {
             const delta = typeof ame.delta === 'string' ? ame.delta : ''
             if (delta) {
               emittedContent = true
-              yield { content: delta }
+              yield { ...piResponseIdentityDelta(responseIdentity), content: delta }
             }
           }
           const toolCall = piToolCalls.observe(ame, ameType)
           if (toolCall) {
             emittedToolCall = true
-            yield { tool_calls: [toolCall] }
+            yield { ...piResponseIdentityDelta(responseIdentity), tool_calls: [toolCall] }
           }
           // thinking_*, message_start, message_end — drop for now.
           // Future enhancement: surface thinking as a separate ChatDelta
@@ -828,7 +831,7 @@ export class PiBackend implements Backend {
         const toolCall = piToolCalls.observe(ev, type)
         if (toolCall) {
           emittedToolCall = true
-          yield { tool_calls: [toolCall] }
+          yield { ...piResponseIdentityDelta(responseIdentity), tool_calls: [toolCall] }
           continue
         }
 
@@ -852,6 +855,7 @@ export class PiBackend implements Backend {
         // the token receipts checked against it below. Keep the two facts
         // distinct so a missing token receipt never turns into synthetic 0s.
         yield {
+          ...piResponseIdentityDelta(responseIdentity),
           usage: {
             model_requests: observedModelRequests,
             cost_known: false,
@@ -912,6 +916,7 @@ export class PiBackend implements Backend {
       // it must never cross the bridge as provider-billed spend.
       if (usageCost.receipts > 0 && usageCost.complete) {
         yield {
+          ...piResponseIdentityDelta(responseIdentity),
           usage: {
             estimated_cost: usageCost.total,
             cost_known: false,
@@ -922,7 +927,7 @@ export class PiBackend implements Backend {
       }
 
       if (signal.aborted) {
-        yield { finish_reason: 'error' }
+        yield { ...piResponseIdentityDelta(responseIdentity), finish_reason: 'error' }
         return
       }
 
@@ -951,6 +956,7 @@ export class PiBackend implements Backend {
       }
 
       yield {
+        ...piResponseIdentityDelta(responseIdentity),
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
       }
     } finally {
@@ -1003,6 +1009,110 @@ export interface PiUsageCost {
   receipts: number
   total: number
   complete: boolean
+}
+
+export interface PiResponseIdentity {
+  model: string
+  systemFingerprint?: string
+}
+
+/**
+ * Read Pi's provider response identity before any text delta reaches the bridge.
+ * Pi keeps the optional `system_fingerprint` out of its JSON event stream, so
+ * the scoped inference proxy carries it in `responseModel` as `model@fingerprint`.
+ */
+export function piResponseIdentityFromEvent(
+  ev: Record<string, unknown>,
+): PiResponseIdentity | undefined {
+  const candidates: Array<Record<string, unknown> | undefined> = [
+    record(ev.message),
+    record(record(ev.assistantMessageEvent)?.partial),
+    record(ev.partial),
+    record(ev.assistantMessageEvent),
+    ev,
+  ]
+  let model: string | undefined
+  let fingerprint: string | undefined
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    const responseModel = nonEmptyString(candidate.responseModel)
+    const configuredModel = nonEmptyString(candidate.model)
+    if (!model && responseModel) model = responseModel
+    if (!fingerprint) {
+      fingerprint = nonEmptyString(candidate.system_fingerprint)
+        ?? nonEmptyString(candidate.systemFingerprint)
+    }
+    if (!model && fingerprint && configuredModel) model = configuredModel
+    if (model && fingerprint) break
+  }
+  if (!model) return undefined
+  const suffix = modelIdentityFingerprint(model)
+  const systemFingerprint = fingerprint ?? suffix
+  return {
+    model: systemFingerprint && suffix === undefined
+      ? `${model}@${systemFingerprint}`
+      : model,
+    ...(systemFingerprint ? { systemFingerprint } : {}),
+  }
+}
+
+function mergePiResponseIdentity(
+  current: PiResponseIdentity | undefined,
+  next: PiResponseIdentity,
+): PiResponseIdentity {
+  if (!current) return next
+  if (current.model !== next.model) {
+    const currentBase = modelIdentityBase(current.model)
+    const nextBase = modelIdentityBase(next.model)
+    // Pi emits the configured base `message.model` alongside its provider's
+    // fingerprinted `responseModel`; those two observations are one identity.
+    if (currentBase !== nextBase) {
+      throw new BackendError(
+        `pi reported response model changed from ${JSON.stringify(current.model)} to ${JSON.stringify(next.model)}`,
+        'upstream',
+      )
+    }
+  }
+  if (
+    current.systemFingerprint !== undefined
+    && next.systemFingerprint !== undefined
+    && current.systemFingerprint !== next.systemFingerprint
+  ) {
+    throw new BackendError(
+      `pi reported system fingerprint changed from ${JSON.stringify(current.systemFingerprint)} to ${JSON.stringify(next.systemFingerprint)}`,
+      'upstream',
+    )
+  }
+  return {
+    model: current.model.includes('@') ? current.model : next.model,
+    ...(current.systemFingerprint ?? next.systemFingerprint
+      ? { systemFingerprint: current.systemFingerprint ?? next.systemFingerprint }
+      : {}),
+  }
+}
+
+function piResponseIdentityDelta(identity: PiResponseIdentity | undefined): Pick<ChatDelta, 'model' | 'system_fingerprint'> {
+  if (!identity) return {}
+  return {
+    model: identity.model,
+    ...(identity.systemFingerprint ? { system_fingerprint: identity.systemFingerprint } : {}),
+  }
+}
+
+function modelIdentityBase(model: string): string {
+  const at = model.lastIndexOf('@')
+  return at > 0 ? model.slice(0, at) : model
+}
+
+function modelIdentityFingerprint(model: string): string | undefined {
+  const at = model.lastIndexOf('@')
+  if (at <= 0) return undefined
+  const suffix = model.slice(at + 1)
+  return /^[A-Za-z0-9._-]+$/u.test(suffix) ? suffix : undefined
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 /** Read a provider failure off a `turn_end` assistant message, or null when the turn succeeded.
