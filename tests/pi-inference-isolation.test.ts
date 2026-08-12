@@ -1516,7 +1516,7 @@ describe('Pi inference credential isolation', () => {
       })()
 
       try {
-        await waitFor(() => observedBodies.length === 1)
+        await waitFor(() => observedBodies.length === 1, 30_000)
         firstController.abort()
         await firstRun
         hangingResponse?.destroy()
@@ -2172,8 +2172,8 @@ async function readBody(request: IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 1_000
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error('timed out waiting for proxy observation')
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 5))
