@@ -1,7 +1,7 @@
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
 import { describe, expect, it } from 'vitest'
-import { CodexBackend } from '../src/backends/codex.js'
+import { CodexBackend, splitCodexModel } from '../src/backends/codex.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
 
@@ -11,8 +11,12 @@ class FakeChild extends EventEmitter {
   exitCode: number | null = null
 }
 
-function codexSpawner(lines: Array<Record<string, unknown>>): Spawner {
-  return async (): Promise<SpawnResult> => {
+function codexSpawner(
+  lines: Array<Record<string, unknown>>,
+  observed?: { args?: string[] },
+): Spawner {
+  return async (_bin, args): Promise<SpawnResult> => {
+    if (observed) observed.args = [...args]
     const child = new FakeChild()
     queueMicrotask(() => {
       for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`)
@@ -128,5 +132,52 @@ describe('CodexBackend tool-call translation', () => {
     expect(deltas.flatMap((d) => d.tool_calls ?? [])).toEqual([])
     // Reasoning text still surfaces through the permissive extractor.
     expect(deltas.some((d) => d.content === 'thinking')).toBe(true)
+  })
+})
+
+describe('CodexBackend model translation', () => {
+  // The canonical wire id is `codex/<provider>/<model>` (agent-runtime's
+  // profileBridgeWireModel). Passing the provider-qualified remainder
+  // verbatim as `-c model=` was rejected by the API as a nonexistent model
+  // ("The 'openai/codex' model is not supported"), killing every
+  // profile-declared codex lead under supervise.
+  it('splits the wire provider segment into model_provider + model config', async () => {
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+    await collect(backend.chat(
+      { ...request(), model: 'codex/openai/gpt-5.1-codex' },
+      null,
+      new AbortController().signal,
+    ))
+    expect(observed.args).toContain('model_provider="openai"')
+    expect(observed.args).toContain('model="gpt-5.1-codex"')
+  })
+
+  it('leaves a bare model remainder on the account default provider', async () => {
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+    await collect(backend.chat(
+      { ...request(), model: 'codex/gpt-5.1-codex' },
+      null,
+      new AbortController().signal,
+    ))
+    expect(observed.args!.some((a) => a.startsWith('model_provider='))).toBe(false)
+    expect(observed.args).toContain('model="gpt-5.1-codex"')
+  })
+
+  it('splitCodexModel covers the alias/bare/qualified shapes', () => {
+    expect(splitCodexModel(null)).toEqual({ provider: null, model: null })
+    expect(splitCodexModel('gpt-5.1-codex')).toEqual({ provider: null, model: 'gpt-5.1-codex' })
+    expect(splitCodexModel('openai/gpt-5.1-codex')).toEqual({ provider: 'openai', model: 'gpt-5.1-codex' })
+    // OSS models qualify with a colon, never a slash — the split must not eat them.
+    expect(splitCodexModel('ollama/gpt-oss:20b')).toEqual({ provider: 'ollama', model: 'gpt-oss:20b' })
   })
 })

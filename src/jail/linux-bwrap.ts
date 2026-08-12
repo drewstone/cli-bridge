@@ -33,6 +33,7 @@ import {
   copyAuthIntoJail,
   removeAuthCopies,
   removeStaleAuthCopies,
+  seedAuthIntoJail,
 } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
@@ -84,6 +85,9 @@ export class LinuxBwrapJail implements JailBackend {
     const writableAuthSources = availableAuthSources.filter(
       (source) => source.mode === 'copy-writable',
     )
+    const seededAuthSources = availableAuthSources.filter(
+      (source) => source.mode === 'seed-writable',
+    )
     for (const source of availableAuthSources) {
       // Resolve every destination before any credential copy. Once bytes exist
       // under the jail root, the remaining wrapper construction is synchronous
@@ -101,6 +105,10 @@ export class LinuxBwrapJail implements JailBackend {
       writableAuthSources,
       { replace: false },
     )
+    // Stable writable homes (codex/claude) live inside the bind-writable root:
+    // refreshed here, retained after exit so a later turn's `resume` still
+    // finds the session state the CLI wrote beside the seed.
+    await seedAuthIntoJail(root, seededAuthSources)
     const resolvedAuthSources = availableAuthSources.map((source) => ({
       source,
       destination: resolveJailRoot(source.jailRel, root),

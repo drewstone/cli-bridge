@@ -526,7 +526,12 @@ export class ClaudeBackend implements Backend {
       args.push('--resume', session.internalId)
     }
 
-    const modelArg = this.extractModel(req.model)
+    // The canonical wire id is `<harness>/<provider>/<model>` (agent-runtime's
+    // profileBridgeWireModel), and anthropic is claude-code's only provider —
+    // the CLI's --model takes the bare model id, so the provider segment is
+    // stripped here. Any OTHER provider segment passes through untouched and
+    // fails loud in the CLI rather than being silently reinterpreted.
+    const modelArg = this.extractModel(req.model)?.replace(/^anthropic\//u, '') ?? null
     if (modelArg) {
       args.push('--model', modelArg)
     }
