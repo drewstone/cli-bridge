@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
 import { describe, expect, it } from 'vitest'
@@ -179,5 +181,47 @@ describe('CodexBackend model translation', () => {
     expect(splitCodexModel('openai/gpt-5.1-codex')).toEqual({ provider: 'openai', model: 'gpt-5.1-codex' })
     // OSS models qualify with a colon, never a slash — the split must not eat them.
     expect(splitCodexModel('ollama/gpt-oss:20b')).toEqual({ provider: 'ollama', model: 'gpt-oss:20b' })
+  })
+})
+
+describe('CodexBackend jailed MCP visibility', () => {
+  it('registers the synthetic CODEX_HOME as a writable seed so a confined codex reads its MCP config', async () => {
+    // The MCP stanzas live in the synthetic CODEX_HOME's config.toml. Under
+    // an fs-jail that home must arrive INSIDE the jail (seed-writable, the
+    // jail copies it to <root>/.codex and redirects CODEX_HOME) — the host
+    // path itself is not mounted there.
+    const jailSpec = {
+      root: '/ws/.agent-home',
+      projectDir: '/ws',
+      readConfine: true,
+    } as NonNullable<ChatRequest['jailSpec']>
+    // The synthetic home is removed in chat()'s finally, so its config must
+    // be captured while the subprocess is (fake-)running — exactly when the
+    // real jail would seed it.
+    let seededConfig: string | null = null
+    const inner = codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE])
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: async (bin, args, opts) => {
+        const source = (jailSpec.authSources ?? []).find((s) => s.envVar === 'CODEX_HOME')?.source
+        if (source) seededConfig = readFileSync(join(source, 'config.toml'), 'utf8')
+        return inner(bin, args, opts)
+      },
+    })
+    await collect(backend.chat(
+      {
+        ...request(),
+        mcp: { mcpServers: { coordination: { command: '/bin/true' } } },
+        jailSpec,
+      },
+      null,
+      new AbortController().signal,
+    ))
+    const codexSources = (jailSpec.authSources ?? []).filter((s) => s.envVar === 'CODEX_HOME')
+    expect(codexSources).toHaveLength(1)
+    expect(codexSources[0]).toMatchObject({ jailRel: '.codex', mode: 'seed-writable' })
+    expect(seededConfig).toContain('[mcp_servers.coordination]')
+    expect(seededConfig).toContain('command = "/bin/true"')
   })
 })

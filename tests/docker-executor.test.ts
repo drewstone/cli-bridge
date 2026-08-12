@@ -12,11 +12,11 @@
 
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Readable, PassThrough } from 'node:stream'
 import { describe, expect, it } from 'vitest'
 import { ClaudeBackend } from '../src/backends/claude.js'
-import { BackendError, type ChatDelta } from '../src/backends/types.js'
+import { BackendError, type ChatDelta, type ChatRequest } from '../src/backends/types.js'
 import { CodexBackend } from '../src/backends/codex.js'
 import { KimiBackend } from '../src/backends/kimi.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
@@ -989,6 +989,41 @@ describe('ClaudeBackend with injected spawner', () => {
       new AbortController().signal,
     )) { /* drain */ }
     expect(modelFlag(bare.observedArgs ?? [])).toBe('sonnet')
+  })
+
+  it('registers the materialized MCP config dir as jail-readable so a confined claude can load it', async () => {
+    // Measured on discovery-lab strong-lead-smoke-b: the bridge wrote
+    // mcp-config.json under the host /tmp, the fs-jail's fresh tmpfs hid it,
+    // and the jailed claude died with `claude exited 1: Invalid MCP
+    // configuration: MCP config file not found: /tmp/cli-bridge-mcp-...`.
+    // kimi/opencode already register their config dirs; claude must too.
+    const stub = createStubSpawner([
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sm' }),
+      JSON.stringify({ type: 'result', subtype: 'success', session_id: 'sm' }),
+    ])
+    const backend = new ClaudeBackend({
+      bin: 'claude', timeoutMs: 5000, harness: 'claude-code', spawner: stub.spawner,
+    })
+    const jailSpec = {
+      root: '/ws/.agent-home',
+      projectDir: '/ws',
+      readConfine: true,
+      extraReadablePaths: undefined as string[] | undefined,
+    }
+    for await (const _ of backend.chat(
+      {
+        model: 'claude-code/sonnet',
+        messages: [{ role: 'user', content: 'hi' }],
+        mcp: { mcpServers: { coordination: { command: '/bin/true' } } },
+        jailSpec,
+      } as ChatRequest,
+      null,
+      new AbortController().signal,
+    )) { /* drain */ }
+    const configIndex = (stub.observedArgs ?? []).indexOf('--mcp-config')
+    expect(configIndex).toBeGreaterThanOrEqual(0)
+    const configPath = (stub.observedArgs ?? [])[configIndex + 1]!
+    expect(jailSpec.extraReadablePaths).toContain(dirname(configPath))
   })
 
   it('forwards req.session_id into spawner opts so the docker pool can route stickily', async () => {
