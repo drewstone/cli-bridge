@@ -58,7 +58,10 @@ import { isLoopbackRequest } from '../http/request-source.js'
 
 /** Header accepted only from the local Runtime → cli-bridge transport. */
 export const PROTECTED_MODEL_CREDENTIAL_HEADER = 'x-cli-bridge-model-credential'
+/** Exact HTTPS gateway header paired with {@link PROTECTED_MODEL_CREDENTIAL_HEADER}. */
+export const PROTECTED_MODEL_BASE_URL_HEADER = 'x-cli-bridge-model-base-url'
 const protectedCredentialMaxLength = 16 * 1024
+const protectedModelBaseUrlMaxLength = 2 * 1024
 
 class SandboxBackendUnavailableError extends Error {
   readonly code = 'not_found_error' as const
@@ -410,6 +413,7 @@ export function mountChatCompletions(
     const tangleClient = c.req.header('x-tangle-client')
     const tangleSource = c.req.header('x-tangle-source')
     const protectedCredentialHeader = c.req.header(PROTECTED_MODEL_CREDENTIAL_HEADER)
+    const protectedBaseUrlHeader = c.req.header(PROTECTED_MODEL_BASE_URL_HEADER)
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
@@ -440,11 +444,11 @@ export function mountChatCompletions(
         },
       }, 404)
     }
-    if (protectedCredentialHeader !== undefined) {
+    if (protectedCredentialHeader !== undefined || protectedBaseUrlHeader !== undefined) {
       if (!isLoopbackRequest(c.req.raw)) {
         return c.json({
           error: {
-            message: `${PROTECTED_MODEL_CREDENTIAL_HEADER} is accepted only on a loopback connection`,
+            message: `${PROTECTED_MODEL_CREDENTIAL_HEADER} and ${PROTECTED_MODEL_BASE_URL_HEADER} are accepted only on a loopback connection`,
             type: 'invalid_authentication_error',
           },
         }, 403)
@@ -456,15 +460,26 @@ export function mountChatCompletions(
         )
       }
       if (
-        protectedCredentialHeader.length === 0
+        protectedCredentialHeader === undefined
+        || protectedBaseUrlHeader === undefined
+        || protectedCredentialHeader.length === 0
         || protectedCredentialHeader.length > protectedCredentialMaxLength
         || /[\r\n\0]/u.test(protectedCredentialHeader)
+        || protectedBaseUrlHeader.length === 0
+        || protectedBaseUrlHeader.length > protectedModelBaseUrlMaxLength
+        || /[\r\n\0]/u.test(protectedBaseUrlHeader)
       ) {
-        return invalidRequest(c, `${PROTECTED_MODEL_CREDENTIAL_HEADER} is malformed`)
+        return invalidRequest(c, `${PROTECTED_MODEL_CREDENTIAL_HEADER} and ${PROTECTED_MODEL_BASE_URL_HEADER} must be provided as a pair`)
+      }
+      const protectedBaseUrl = canonicalProtectedModelBaseUrl(protectedBaseUrlHeader)
+      if (protectedBaseUrl === undefined) {
+        return invalidRequest(c, `${PROTECTED_MODEL_BASE_URL_HEADER} must be an HTTPS URL without credentials, query, or fragment`)
       }
       protectedModelCredential = {
         token: protectedCredentialHeader,
         digest: protectedCredentialDigest(protectedCredentialHeader),
+        baseUrl: protectedBaseUrl,
+        baseUrlDigest: protectedCredentialDigest(protectedBaseUrl),
       }
     }
     const req: ChatRequest = {
@@ -925,7 +940,10 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
     backend,
     request: executionRequest,
     ...(protectedModelCredential
-      ? { protectedModelCredentialDigest: protectedModelCredential.digest }
+      ? {
+          protectedModelCredentialDigest: protectedModelCredential.digest,
+          protectedModelBaseUrlDigest: protectedModelCredential.baseUrlDigest,
+        }
       : {}),
   })) as Parameters<typeof canonicalCandidateDigest>[0]
   return canonicalCandidateDigest(normalized)
@@ -933,6 +951,25 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
 
 function protectedCredentialDigest(token: string): `sha256:${string}` {
   return `sha256:${createHash('sha256').update(token).digest('hex')}`
+}
+
+function canonicalProtectedModelBaseUrl(value: string): string | undefined {
+  let target: URL
+  try {
+    target = new URL(value)
+  } catch {
+    return undefined
+  }
+  if (
+    target.protocol !== 'https:'
+    || target.username
+    || target.password
+    || target.search
+    || target.hash
+  ) {
+    return undefined
+  }
+  return target.toString().replace(/\/$/u, '')
 }
 
 interface SessionProfileBinding {

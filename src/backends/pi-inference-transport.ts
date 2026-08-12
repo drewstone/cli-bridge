@@ -51,6 +51,8 @@ export interface PiInferenceSelection {
 export interface PiInferenceCredentialOverride {
   token: string
   digest: `sha256:${string}`
+  baseUrl: string
+  baseUrlDigest: `sha256:${string}`
 }
 
 /**
@@ -63,6 +65,8 @@ export interface ResolvedPiInferenceTransport {
   upstreamBaseUrl: string
   apiMode: PiApiMode
   upstreamApiKey: string
+  /** True when the endpoint came from a protected request header. */
+  requestScopedEndpoint?: boolean
   /** Finite per-request memory boundary for the model-binding JSON inspection. */
   maxRequestBytes: number
   providerConfig: Record<string, unknown>
@@ -82,6 +86,8 @@ export interface ProvisionedPiInferenceTransport {
   agentDir: string
   sessionDir: string
   upstreamBaseUrl: string
+  /** True when the endpoint came from a protected request header. */
+  requestScopedEndpoint?: boolean
   apiMode: PiApiMode
   /** Exact profile cap applied to this run's isolated model catalog, when requested. */
   appliedMaxTokens?: number
@@ -345,11 +351,13 @@ export function createPiInferenceTransportResolver(options: {
     const config = readConfiguredTransport(sourceAgentDir, selection)
     if (credential !== undefined) {
       const expectedDigest = `sha256:${createHash('sha256').update(credential.token).digest('hex')}` as const
+      const expectedBaseUrlDigest = `sha256:${createHash('sha256').update(credential.baseUrl).digest('hex')}` as const
       if (
         !credential.token
         || credential.token.length > MAX_PROTECTED_CREDENTIAL_LENGTH
         || /[\r\n\0]/u.test(credential.token)
         || credential.digest !== expectedDigest
+        || credential.baseUrlDigest !== expectedBaseUrlDigest
       ) {
         throw new BackendError(
           `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model}: `
@@ -359,7 +367,9 @@ export function createPiInferenceTransportResolver(options: {
       }
       return {
         ...config,
+        upstreamBaseUrl: validateProtectedUpstreamBaseUrl(credential.baseUrl, selection),
         upstreamApiKey: credential.token,
+        requestScopedEndpoint: true,
         maxRequestBytes,
         sourceAgentDir,
         sourceSessionDir,
@@ -407,6 +417,34 @@ export function createPiInferenceTransportResolver(options: {
       sourceSessionDir,
     }
   }
+}
+
+function validateProtectedUpstreamBaseUrl(
+  baseUrl: string,
+  selection: PiInferenceSelection,
+): string {
+  let parsed: URL
+  try {
+    parsed = new URL(baseUrl)
+  } catch {
+    throw new BackendError(
+      `backend pi protected provider ${selection.provider}/${selection.model} has an invalid HTTPS gateway URL`,
+      'not_configured',
+    )
+  }
+  if (
+    parsed.protocol !== 'https:'
+    || parsed.username
+    || parsed.password
+    || parsed.search
+    || parsed.hash
+  ) {
+    throw new BackendError(
+      `backend pi protected provider ${selection.provider}/${selection.model} requires an HTTPS gateway URL without credentials, query, or fragment`,
+      'not_configured',
+    )
+  }
+  return parsed.toString().replace(/\/$/u, '')
 }
 
 function readConfiguredTransport(
@@ -580,6 +618,7 @@ export async function provisionPiInferenceTransport(
       agentDir,
       sessionDir,
       upstreamBaseUrl: resolved.upstreamBaseUrl,
+      ...(resolved.requestScopedEndpoint ? { requestScopedEndpoint: true } : {}),
       apiMode: resolved.apiMode,
       ...(applied.appliedMaxTokens === undefined
         ? {}

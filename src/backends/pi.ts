@@ -646,7 +646,9 @@ export class PiBackend implements Backend {
         runCwd,
         executionIdentity,
         {
-          effectiveEndpoint: inference.upstreamBaseUrl,
+          effectiveEndpoint: inference.requestScopedEndpoint
+            ? new URL(inference.upstreamBaseUrl).origin
+            : inference.upstreamBaseUrl,
           apiMode: inference.apiMode,
           transport: 'scoped-loopback',
           ...(inference.appliedMaxTokens === undefined
