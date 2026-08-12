@@ -898,7 +898,10 @@ export class PiBackend implements Backend {
         }
         // Emit the completed receipt before either success or a traffic refusal,
         // so the durable run retains the exact profile and the failed comparison.
-        yield { profile_materialization: structuredClone(materialization) }
+        yield {
+          ...piResponseIdentityDelta(responseIdentity),
+          profile_materialization: structuredClone(materialization),
+        }
       }
       if (this.spawner.executionEnvironment === 'host' && !accountingMatched) {
         throw new BackendError(

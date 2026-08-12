@@ -388,6 +388,10 @@ describe('PiBackend', () => {
     const deltas = await collect(backend.chat({
       model: 'pi/tangle-router/deepseek-v4-flash',
       messages: [{ role: 'user', content: 'task' }],
+      agent_profile: {
+        harness: 'pi',
+        model: { provider: 'tangle-router', default: 'deepseek-v4-flash' },
+      },
     }, null, new AbortController().signal))
 
     expect(deltas.filter((delta) => delta.content)).toContainEqual({
@@ -396,6 +400,7 @@ describe('PiBackend', () => {
       content: 'identified',
     })
     expect(deltas.find((delta) => delta.usage)?.model).toBe(responseModel)
+    expect(deltas.find((delta) => delta.profile_materialization)?.model).toBe(responseModel)
     expect(deltas.find((delta) => delta.finish_reason)?.model).toBe(responseModel)
   })
 
