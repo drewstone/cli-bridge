@@ -19,6 +19,7 @@
  * model-id prefixes makes the choice explicit at call time.
  */
 
+import { dirname } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
@@ -36,6 +37,7 @@ import {
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
+import { registerJailReadable } from '../jail/index.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
@@ -217,6 +219,13 @@ export class ClaudeBackend implements Backend {
     const mcpMaterialized = writeMcpConfigFile(
       resolveMcpServers(req, session),
     )
+    // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
+    // expose its dir read-only so the confined claude can still read the
+    // `--mcp-config` path. Same idiom as kimi/opencode. Measured without it:
+    // `claude exited 1: Invalid MCP configuration: MCP config file not found`.
+    if (mcpMaterialized) {
+      registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
+    }
     const args = this.buildArgs(req, session, mode, mcpMaterialized, {
       userTextForArgv: userFitsInArgv ? userText : undefined,
       profilePrompt,
