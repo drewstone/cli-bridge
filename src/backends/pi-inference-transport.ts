@@ -41,10 +41,16 @@ export type PiApiMode = typeof PI_API_MODES[number]
 
 /** High enough for large image/tool contexts; operators can raise it explicitly. */
 export const DEFAULT_PI_INFERENCE_MAX_REQUEST_BYTES = 256 * 1024 * 1024
+const MAX_PROTECTED_CREDENTIAL_LENGTH = 16 * 1024
 
 export interface PiInferenceSelection {
   provider: string
   model: string
+}
+
+export interface PiInferenceCredentialOverride {
+  token: string
+  digest: `sha256:${string}`
 }
 
 /**
@@ -69,6 +75,7 @@ export interface ResolvedPiInferenceTransport {
 export type PiInferenceTransportResolver = (
   selection: PiInferenceSelection,
   signal: AbortSignal,
+  credential?: PiInferenceCredentialOverride,
 ) => Promise<ResolvedPiInferenceTransport>
 
 export interface ProvisionedPiInferenceTransport {
@@ -334,8 +341,30 @@ export function createPiInferenceTransportResolver(options: {
       ?? join(sourceAgentDir, 'sessions'),
   )
 
-  return async (selection, signal) => {
+  return async (selection, signal, credential) => {
     const config = readConfiguredTransport(sourceAgentDir, selection)
+    if (credential !== undefined) {
+      const expectedDigest = `sha256:${createHash('sha256').update(credential.token).digest('hex')}` as const
+      if (
+        !credential.token
+        || credential.token.length > MAX_PROTECTED_CREDENTIAL_LENGTH
+        || /[\r\n\0]/u.test(credential.token)
+        || credential.digest !== expectedDigest
+      ) {
+        throw new BackendError(
+          `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model}: `
+          + 'the request-scoped credential is empty, malformed, or has a mismatched digest',
+          'not_configured',
+        )
+      }
+      return {
+        ...config,
+        upstreamApiKey: credential.token,
+        maxRequestBytes,
+        sourceAgentDir,
+        sourceSessionDir,
+      }
+    }
     let stdout: string
     try {
       const result = await execFileAsync(

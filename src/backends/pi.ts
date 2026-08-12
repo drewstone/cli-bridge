@@ -607,7 +607,7 @@ export class PiBackend implements Backend {
       const resolvedInference = await this.transportResolver({
         provider: spec.provider,
         model: spec.model,
-      }, signal)
+      }, signal, req.protectedModelCredential)
       inference = await provisionPiInferenceTransport(
         resolvedInference,
         {

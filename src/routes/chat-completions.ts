@@ -15,6 +15,7 @@
  */
 
 import type { Context, Hono } from 'hono'
+import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import {
   canonicalAgentProfileDigest,
@@ -27,7 +28,7 @@ import {
   type SessionRecord,
   type SessionStore,
 } from '../sessions/store.js'
-import type { Backend, ChatDelta, ChatRequest } from '../backends/types.js'
+import type { Backend, ChatDelta, ChatRequest, ProtectedModelCredential } from '../backends/types.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
@@ -53,6 +54,11 @@ import {
   resolveRequestedReasoningEffort,
 } from '../backends/profile-support.js'
 import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
+import { isLoopbackRequest } from '../http/request-source.js'
+
+/** Header accepted only from the local Runtime → cli-bridge transport. */
+export const PROTECTED_MODEL_CREDENTIAL_HEADER = 'x-cli-bridge-model-credential'
+const protectedCredentialMaxLength = 16 * 1024
 
 class SandboxBackendUnavailableError extends Error {
   readonly code = 'not_found_error' as const
@@ -403,6 +409,7 @@ export function mountChatCompletions(
     const forwardedAuthz = c.req.header('x-tangle-forwarded-authorization')
     const tangleClient = c.req.header('x-tangle-client')
     const tangleSource = c.req.header('x-tangle-source')
+    const protectedCredentialHeader = c.req.header(PROTECTED_MODEL_CREDENTIAL_HEADER)
     // Pull response_format off so it doesn't bleed through the spread
     // as an unknown extra field — we translate snake_case → camelCase
     // here to match the ChatRequest type.
@@ -423,6 +430,43 @@ export function mountChatCompletions(
     // the only behavioral authority.
     const mcpHeader = parseMcpHeader(c.req.header('x-mcp-config'))
     const mergedMcp = mergeMcpInputs(mcpHeader, bodyMcp as ChatRequest['mcp'] | undefined)
+    let protectedModelCredential: ProtectedModelCredential | undefined
+    const backend = deps.registry.resolve(rest.model)
+    if (!backend) {
+      return c.json({
+        error: {
+          message: `no backend matches model "${rest.model}". Check /health for registered backends.`,
+          type: 'not_found_error',
+        },
+      }, 404)
+    }
+    if (protectedCredentialHeader !== undefined) {
+      if (!isLoopbackRequest(c.req.raw)) {
+        return c.json({
+          error: {
+            message: `${PROTECTED_MODEL_CREDENTIAL_HEADER} is accepted only on a loopback connection`,
+            type: 'invalid_authentication_error',
+          },
+        }, 403)
+      }
+      if (backend.name !== 'pi' || execution?.kind === 'sandbox') {
+        return invalidRequest(
+          c,
+          `${PROTECTED_MODEL_CREDENTIAL_HEADER} is supported only by host Pi execution`,
+        )
+      }
+      if (
+        protectedCredentialHeader.length === 0
+        || protectedCredentialHeader.length > protectedCredentialMaxLength
+        || /[\r\n\0]/u.test(protectedCredentialHeader)
+      ) {
+        return invalidRequest(c, `${PROTECTED_MODEL_CREDENTIAL_HEADER} is malformed`)
+      }
+      protectedModelCredential = {
+        token: protectedCredentialHeader,
+        digest: protectedCredentialDigest(protectedCredentialHeader),
+      }
+    }
     const req: ChatRequest = {
       ...rest,
       session_id: bodySession ?? headerSession,
@@ -432,22 +476,13 @@ export function mountChatCompletions(
       ...(mergedMcp ? { mcp: mergedMcp } : {}),
       ...(cwd ? { cwd } : {}),
       ...(execution ? { execution: execution as ChatRequest['execution'] } : {}),
+      ...(protectedModelCredential ? { protectedModelCredential } : {}),
       metadata: {
         ...(parsed.data.metadata ?? {}),
         ...(tangleClient ? { tangleClient } : {}),
         ...(tangleSource ? { tangleSource } : {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
       },
-    }
-
-    const backend = deps.registry.resolve(req.model)
-    if (!backend) {
-      return c.json({
-        error: {
-          message: `no backend matches model "${req.model}". Check /health for registered backends.`,
-          type: 'not_found_error',
-        },
-      }, 404)
     }
 
     // Durable-run identity and replay cursor are exact claims. Conflicting aliases, malformed ids,
@@ -878,6 +913,7 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
     stream: _stream,
     jailSpec: _jailSpec,
     profile_materialization_receipt: _materialization,
+    protectedModelCredential,
     ...executionRequest
   } = req
   // The request originated as JSON, but object spreads can reintroduce
@@ -888,8 +924,15 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
     schema: 'cli-bridge.durable-run-request.v1',
     backend,
     request: executionRequest,
+    ...(protectedModelCredential
+      ? { protectedModelCredentialDigest: protectedModelCredential.digest }
+      : {}),
   })) as Parameters<typeof canonicalCandidateDigest>[0]
   return canonicalCandidateDigest(normalized)
+}
+
+function protectedCredentialDigest(token: string): `sha256:${string}` {
+  return `sha256:${createHash('sha256').update(token).digest('hex')}`
 }
 
 interface SessionProfileBinding {

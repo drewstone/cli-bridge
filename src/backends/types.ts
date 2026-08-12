@@ -20,6 +20,14 @@ import type { JailSpec } from '../jail/index.js'
 import type { CallerTrace } from '../trace/ids.js'
 import type { AgentProfile, ReasoningEffort } from '@tangle-network/agent-interface'
 
+/** Request-scoped model credential supplied only by the trusted local bridge caller. */
+export interface ProtectedModelCredential {
+  /** The raw token lives only for this in-memory request. */
+  token: string
+  /** The token digest binds durable run identity without retaining the secret. */
+  digest: `sha256:${string}`
+}
+
 export type ChatContentPart =
   | { type: 'text'; text: string }
   | { type: 'image_url' | 'input_image'; image_url: string | { url: string } }
@@ -265,6 +273,11 @@ export interface ChatRequest {
   admissionClass?: 'reserved' | 'bulk'
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
+  /**
+   * Internal loopback-only credential. The route never copies this into the
+   * body, session metadata, trace, or durable run record.
+   */
+  protectedModelCredential?: ProtectedModelCredential
   /** Internal receipt populated by profile provisioning before the harness spawns. */
   profile_materialization_receipt?: ProfileMaterializationReceipt
 }
