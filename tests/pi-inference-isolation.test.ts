@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import {
   createServer,
   request as httpRequest,
@@ -248,6 +249,75 @@ describe('Pi inference credential isolation', () => {
       expect(output).not.toContain(value)
     }
     expect(childEnv.PI_CODING_AGENT_DIR).toBe('/tmp/request-pi')
+  })
+
+  it('uses a request credential override without invoking pi auth, while preserving the old no-header path', async () => {
+    const sourceAgentDir = tempDir('cli-bridge-pi-request-credential-config-')
+    const sourceSessionDir = tempDir('cli-bridge-pi-request-credential-sessions-')
+    const marker = join(tempDir('cli-bridge-pi-request-credential-marker-'), 'auth-called')
+    const fakePi = join(tempDir('cli-bridge-pi-request-credential-bin-'), 'pi')
+    const operatorToken = 'operator-token-for-pi-auth'
+    const requestToken = 'request-scoped-model-token'
+    writeFileSync(fakePi, [
+      '#!/bin/sh',
+      `printf invoked > ${JSON.stringify(marker)}`,
+      'printf %s "$TEST_PROVIDER_KEY"',
+    ].join('\n'))
+    chmodSync(fakePi, 0o700)
+    writeFileSync(join(sourceAgentDir, 'models.json'), JSON.stringify({
+      providers: {
+        'isolated-test': {
+          baseUrl: 'https://router.example.invalid/v1',
+          api: 'openai-completions',
+          models: [{ id: 'credential-check', maxTokens: 128_000 }],
+        },
+      },
+    }))
+
+    const resolver = createPiInferenceTransportResolver({
+      bin: fakePi,
+      agentDir: sourceAgentDir,
+      sessionDir: sourceSessionDir,
+      env: {
+        HOME: tempDir('cli-bridge-pi-request-credential-home-'),
+        PATH: process.env.PATH,
+        TEST_PROVIDER_KEY: operatorToken,
+      },
+    })
+    const selection = { provider: 'isolated-test', model: 'credential-check' }
+    const signal = new AbortController().signal
+    const digest = `sha256:${createHash('sha256').update(requestToken).digest('hex')}` as const
+
+    const overridden = await resolver(selection, signal, { token: requestToken, digest })
+    expect(overridden.upstreamApiKey).toBe(requestToken)
+    expect(existsSync(marker)).toBe(false)
+
+    const operatorResolved = await resolver(selection, signal)
+    expect(operatorResolved.upstreamApiKey).toBe(operatorToken)
+    expect(readFileSync(marker, 'utf8')).toBe('invoked')
+  })
+
+  it('rejects a request credential whose identity digest does not match its token', async () => {
+    const sourceAgentDir = tempDir('cli-bridge-pi-request-credential-digest-config-')
+    const fakePi = join(tempDir('cli-bridge-pi-request-credential-digest-bin-'), 'pi')
+    writeFileSync(fakePi, '#!/bin/sh\nprintf should-not-run')
+    chmodSync(fakePi, 0o700)
+    writeFileSync(join(sourceAgentDir, 'models.json'), JSON.stringify({
+      providers: {
+        'isolated-test': {
+          baseUrl: 'https://router.example.invalid/v1',
+          api: 'openai-completions',
+          models: [{ id: 'credential-check' }],
+        },
+      },
+    }))
+
+    const resolver = createPiInferenceTransportResolver({ bin: fakePi, agentDir: sourceAgentDir })
+    await expect(resolver(
+      { provider: 'isolated-test', model: 'credential-check' },
+      new AbortController().signal,
+      { token: 'request-secret', digest: 'sha256:wrong' },
+    )).rejects.toThrow(/mismatched digest/u)
   })
 
   it('pins explicit Pi config and closes the scoped model-only transport after one run', async () => {

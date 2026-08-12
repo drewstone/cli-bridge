@@ -70,6 +70,7 @@ import { TraceEmitter } from './trace/emitter.js'
 import { JsonlSpanSink, nullSpanSink } from './trace/sink.js'
 import { selectJailBackend } from './jail/index.js'
 import { acquireInstanceLock, PortAlreadyBoundError } from './runtime/single-instance.js'
+import { bindIncomingRequest } from './http/request-source.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -558,7 +559,13 @@ export async function startServer(): Promise<void> {
   // a process.exit() path (fatal error) must not strand the pidfile.
   process.once('exit', () => instanceLock.release())
   const server = serve({
-    fetch: app.fetch,
+    // @hono/node-server passes the native IncomingMessage as the second
+    // callback argument. Bind it to this Request before Hono runs so routes
+    // can enforce socket-local capabilities without trusting caller headers.
+    fetch: ((request: Request, info?: { incoming?: import('node:http').IncomingMessage }) => {
+      if (info?.incoming) bindIncomingRequest(request, info.incoming)
+      return app.fetch(request)
+    }) as typeof app.fetch,
     hostname: config.host,
     port: config.port,
     // Pass timeouts at create-time so they apply to the http.Server
