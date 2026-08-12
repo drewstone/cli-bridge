@@ -75,9 +75,22 @@ export interface JailAuthSource {
   jailRel: string
   /** `read-only` preserves the host path through a Linux bind mount.
    * `copy-writable` copies it inside the writable jail HOME and removes that
-   * copy when the process exits. macOS must copy either mode because
-   * sandbox-exec cannot bind mount. */
-  mode: 'read-only' | 'copy-writable'
+   * copy when the process exits.
+   * `seed-writable` copies it to a STABLE path inside the writable jail HOME,
+   * refreshed on every run and deliberately NOT removed when the process
+   * exits: the CLI keeps its own session state (codex rollouts, claude
+   * project transcripts) next to the seed, and a later turn of the same
+   * bridge session must find that state or `resume` breaks. Use `only` to
+   * keep the seed small — a full home tree (host codex sessions run to
+   * hundreds of GB) must never be copied. The jail root is operator scratch
+   * (git-ignored by prepareJailHome), so the seed cannot be committed.
+   * macOS must copy every mode because sandbox-exec cannot bind mount. */
+  mode: 'read-only' | 'copy-writable' | 'seed-writable'
+  /** For `seed-writable`: the source-relative entries to copy. An entry
+   * missing on the host is skipped, never fatal. Absent means the whole
+   * source tree — only safe for a synthesized directory that is known small
+   * (e.g. codex's MCP-passthrough CODEX_HOME). */
+  only?: readonly string[]
   /** Optional env var the jail must point at this source's IN-JAIL location
    * (`<root>/<jailRel>`). Set ONLY by the jail backend when it actually wraps,
    * so e.g. codex's `CODEX_HOME` is redirected into the jail for confined runs

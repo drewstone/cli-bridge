@@ -15,9 +15,9 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, cp, readdir, rm } from 'node:fs/promises'
+import { chmod, cp, mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { resolveJailRoot, type JailAuthSource } from './types.js'
 
 const PI_AUTH_COPY_PREFIX = `pi-${process.pid}-`
@@ -46,6 +46,24 @@ const AUTH_PATHS: Record<string, readonly string[]> = {
   pi: ['.pi/agent'],
 }
 
+/**
+ * Codex must WRITE inside `$CODEX_HOME` before it can execute at all: PATH
+ * aliases under `tmp/arg0/`, the in-process app-server state, session
+ * rollouts. A read-only bind therefore kills every jailed codex run at spawn
+ * ("Read-only file system (os error 30)"). Seed only the config surface —
+ * the host `sessions/` tree runs to hundreds of GB and belongs to OTHER runs.
+ */
+const CODEX_SEED_ENTRIES = ['auth.json', 'config.toml'] as const
+
+/**
+ * Claude Code rewrites `~/.claude.json` on startup and persists session
+ * transcripts under `~/.claude/projects/` — with those paths read-only a
+ * jailed run cannot boot or `--resume` across turns. Seed the credential and
+ * settings surface only; `projects/`, plugin caches, and history stay host-
+ * private. Both credential spellings exist across claude versions.
+ */
+const CLAUDE_SEED_ENTRIES = ['.credentials.json', 'credentials.json', 'settings.json'] as const
+
 /** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME
  * override (matches how the backends resolve config/auth at runtime). */
 function backendHome(): string {
@@ -62,6 +80,16 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     // rel is already a POSIX-style jail-relative target ('.claude', '.config/opencode').
     if (existsSync(source)) out.push({ source, jailRel: rel, mode: 'read-only' })
   }
+  if (backendName === 'claude-code' || backendName === 'claude' || backendName === 'claudish') {
+    // A stateful CLI whose home must be writable: seed the credential/settings
+    // surface into the jail's stable `$HOME/.claude` + `$HOME/.claude.json`
+    // and let the CLI own everything else it writes there. No envVar — the
+    // jail's HOME redirect already points claude at these exact paths.
+    for (const entry of out) {
+      entry.mode = 'seed-writable'
+      if (entry.jailRel === '.claude') entry.only = [...CLAUDE_SEED_ENTRIES]
+    }
+  }
   if (backendName === 'codex') {
     // codex.ts honors $CODEX_HOME (src/backends/codex.ts) and only falls back to
     // ~/.codex when it is unset. Mirror that: when CODEX_HOME points elsewhere,
@@ -77,10 +105,17 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
         out.push({ source, jailRel: '.codex', mode: 'read-only' })
       }
     }
-    // Redirect CODEX_HOME at the in-jail copy so a confined codex reads creds
-    // there rather than the (read-only) host path. The jail applies this only
-    // when it actually wraps — docker/fallback runs keep the host CODEX_HOME.
-    for (const e of out) if (e.jailRel === '.codex') e.envVar = 'CODEX_HOME'
+    // Codex writes inside its home before it can run (PATH aliases under
+    // tmp/arg0, app-server state, session rollouts), so the in-jail home must
+    // be a WRITABLE seed, never a read-only bind. Redirect CODEX_HOME at it;
+    // the jail applies the redirect only when it actually wraps —
+    // docker/fallback runs keep the host CODEX_HOME.
+    for (const e of out) {
+      if (e.jailRel !== '.codex') continue
+      e.mode = 'seed-writable'
+      e.only = [...CODEX_SEED_ENTRIES]
+      e.envVar = 'CODEX_HOME'
+    }
   }
   if (backendName === 'pi') {
     const writableAgentRel = `.auth-copies/${PI_AUTH_COPY_PREFIX}${randomUUID()}`
@@ -139,6 +174,72 @@ export async function copyAuthIntoJail(
     return copied
   } catch (error) {
     await removeAuthCopies(copied)
+    throw error
+  }
+}
+
+/**
+ * Seed each `seed-writable` source into the writable jail HOME at its stable
+ * path, refreshing the selected entries in place. Deliberately NOT returned
+ * for cleanup: the CLI stores its own session state (codex rollouts, claude
+ * project transcripts) beside the seed, and the next turn of the same bridge
+ * session must find that state or `resume` breaks. The jail root is operator
+ * scratch and git-ignored by `prepareJailHome`.
+ *
+ * Files are replaced via a same-directory temp + rename so a concurrent run
+ * in the same workspace can never read a half-written credential.
+ */
+export async function seedAuthIntoJail(
+  root: string,
+  sources: JailAuthSource[] | undefined,
+): Promise<void> {
+  for (const { source, jailRel, only } of sources ?? []) {
+    if (!existsSync(source)) continue
+    const dest = resolveJailRoot(jailRel, root)
+    if (only !== undefined) {
+      await mkdir(dest, { recursive: true, mode: 0o700 })
+      for (const entry of only) {
+        const entrySource = join(source, entry)
+        if (!existsSync(entrySource)) continue
+        // Containment is checked LEXICALLY on the entry name (a repo-internal
+        // constant): a previously seeded leaf may legitimately be replaced, so
+        // following an existing leaf symlink here (as resolveJailRoot would)
+        // turns a refresh into a false escape. The canonical base `dest`
+        // already went through resolveJailRoot above.
+        const entryDest = join(dest, entry)
+        const rel = relative(dest, entryDest)
+        if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+          throw new Error(`seed entry '${entry}' must stay inside its seed destination`)
+        }
+        await mkdir(dirname(entryDest), { recursive: true, mode: 0o700 })
+        await seedPath(entrySource, entryDest)
+      }
+      continue
+    }
+    await mkdir(dirname(dest), { recursive: true, mode: 0o700 })
+    await seedPath(source, dest)
+  }
+}
+
+/** Replace `dest` with a copy of `src`: atomically (temp + rename) for a
+ * file, recursively in place for a directory. Always dereferences — a
+ * dotfiles-managed source (e.g. `~/.claude/settings.json -> ~/code/dotfiles/...`)
+ * must arrive as REAL BYTES, because its symlink target is not mounted
+ * inside an fs-jail and a copied link would dangle there. */
+async function seedPath(src: string, dest: string): Promise<void> {
+  const st = await stat(src)
+  if (st.isDirectory()) {
+    await cp(src, dest, { recursive: true, force: true, dereference: true })
+    await chmod(dest, 0o700)
+    return
+  }
+  const tmp = join(dirname(dest), `.seed-${randomUUID()}`)
+  try {
+    await cp(src, tmp, { dereference: true })
+    await chmod(tmp, 0o600)
+    await rename(tmp, dest)
+  } catch (error) {
+    await rm(tmp, { force: true })
     throw error
   }
 }

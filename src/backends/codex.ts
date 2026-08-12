@@ -84,7 +84,13 @@ export class CodexBackend implements Backend {
       'codex hosted-safe requires verified --sandbox read-only audit')
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
-    const modelArg = this.extractModel(req.model)
+    // The canonical wire id is `codex/<provider>/<model>` (agent-runtime's
+    // profileBridgeWireModel). Codex config keys the two separately: the
+    // provider segment selects `model_provider` (endpoint identity, 'openai'
+    // is the builtin default) and only the remainder is the `model` id —
+    // passing the qualified form verbatim was rejected by the API as a
+    // nonexistent model, killing every profile-declared codex lead.
+    const { provider: providerArg, model: modelArg } = splitCodexModel(this.extractModel(req.model))
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
     // else `codex exec <prompt>`. --json emits JSONL events.
@@ -94,6 +100,7 @@ export class CodexBackend implements Backend {
       '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox',
     ]
+    if (providerArg) args.push('-c', `model_provider="${providerArg}"`)
     if (modelArg) args.push('-c', `model="${modelArg}"`)
     const reasoningEffort = codexReasoningEffort(
       resolveRequestedReasoningEffort(req, session) ?? undefined,
@@ -132,15 +139,18 @@ export class CodexBackend implements Backend {
     // When MCP passthrough is active, the synthetic CODEX_HOME (selected MCP config
     // + copied auth) is the source of truth. Register it as the jail's codex auth
     // source so a CONFINED run gets it surfaced inside the jail with CODEX_HOME
-    // redirected there. The jail applies this only when it actually wraps; on
-    // docker/fallback paths the host `CODEX_HOME` env below is used unchanged.
+    // redirected there. Seeded WRITABLE (the whole synthetic dir is two small
+    // files): codex must write PATH aliases, app-server state, and session
+    // rollouts inside its home before it can run at all. The jail applies this
+    // only when it actually wraps; on docker/fallback paths the host
+    // `CODEX_HOME` env below is used unchanged.
     if (req.jailSpec && codexHome) {
       req.jailSpec.authSources = [
         ...(req.jailSpec.authSources ?? []).filter((s) => s.envVar !== 'CODEX_HOME'),
         {
           source: codexHome.homePath,
           jailRel: '.codex',
-          mode: 'read-only',
+          mode: 'seed-writable',
           envVar: 'CODEX_HOME',
         },
       ]
@@ -279,6 +289,22 @@ export class CodexBackend implements Backend {
     }
     return null
   }
+}
+
+/**
+ * Split a provider-qualified codex model remainder (`openai/gpt-5.1-codex`)
+ * into its `model_provider` / `model` config pair. A remainder with no slash
+ * is a bare model id under the account's default provider. Codex model ids
+ * themselves never contain `/` (OSS variants use `:`), so the first segment
+ * is always the provider when a slash is present.
+ */
+export function splitCodexModel(
+  remainder: string | null,
+): { provider: string | null; model: string | null } {
+  if (!remainder) return { provider: null, model: null }
+  const slash = remainder.indexOf('/')
+  if (slash <= 0) return { provider: null, model: remainder }
+  return { provider: remainder.slice(0, slash), model: remainder.slice(slash + 1) }
 }
 
 export function codexReasoningEffort(effort: ChatRequest['effort']): 'minimal' | 'low' | 'medium' | 'high' | null {

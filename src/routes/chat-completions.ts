@@ -736,7 +736,28 @@ export function mountChatCompletions(
                   },
                 })
               }
-              const committed = delta.finish_reason && req.profile_materialization_receipt
+              // An error/timeout terminal is rendered on the SSE wire as a bare
+              // `{error}` event and parsed as nothing else by agent-runtime's
+              // bridge executor — a receipt folded INTO that delta never
+              // reaches the caller, which then misreads the failure as
+              // "completed without receipt" transport trouble. Acknowledge the
+              // materialization on its own buffered event FIRST (its own seq),
+              // then pass the terminal through unchanged.
+              const failedTerminal = delta.finish_reason === 'error' || delta.finish_reason === 'timeout'
+              if (
+                failedTerminal
+                && req.profile_materialization_receipt
+                && !emittedProfileMaterialization
+                && !delta.profile_materialization
+              ) {
+                const acknowledgment = {
+                  profile_materialization: req.profile_materialization_receipt,
+                } satisfies ChatDelta
+                recorder?.observe(acknowledgment)
+                emittedProfileMaterialization = true
+                yield acknowledgment
+              }
+              const committed = delta.finish_reason && !failedTerminal && req.profile_materialization_receipt
                 ? { ...delta, profile_materialization: req.profile_materialization_receipt }
                 : delta
               if (committed.profile_materialization) emittedProfileMaterialization = true
@@ -796,7 +817,13 @@ export function mountChatCompletions(
         // No-op when the stream's catch already closed the span.
         recorder?.end()
       }
-      const job = run.pump(wrap(makeSource(run)))
+      // The receipt supplier is read at FAILURE time: the backend retains the
+      // receipt on `req` during materialization (before spawn), so a thrown
+      // subprocess failure still acknowledges the profile instead of letting
+      // the caller misread the whole run as a missing-receipt transport fault.
+      const job = run.pump(wrap(makeSource(run)), {
+        terminalReceipt: () => req.profile_materialization_receipt,
+      })
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)

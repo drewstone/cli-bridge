@@ -24,6 +24,7 @@ import {
   copyAuthIntoJail,
   removeAuthCopies,
   removeStaleAuthCopies,
+  seedAuthIntoJail,
 } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
@@ -67,6 +68,9 @@ export class MacosSeatbeltJail implements JailBackend {
     const writableAuthSources = (spec.authSources ?? []).filter(
       (source) => source.mode === 'copy-writable',
     )
+    const seededAuthSources = (spec.authSources ?? []).filter(
+      (source) => source.mode === 'seed-writable',
+    )
     for (const source of writableAuthSources) {
       if (!source.envVar) {
         throw new Error('a copy-writable jail auth source requires envVar')
@@ -74,6 +78,9 @@ export class MacosSeatbeltJail implements JailBackend {
     }
     await removeStaleAuthCopies(root)
     const copiedAuth = await copyAuthIntoJail(root, stableAuthSources)
+    // Stable writable homes (codex/claude): refreshed per run, retained after
+    // exit so a later turn's `resume` finds the CLI's own session state.
+    await seedAuthIntoJail(root, seededAuthSources)
     let copiedWritableAuth: string[] = []
     try {
       if (writableAuthSources.length > 0) {

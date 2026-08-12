@@ -112,6 +112,28 @@ class MaterializationReceiptBackend extends FakeBackend {
   }
 }
 
+/** The measured codex-under-jail shape: materialization succeeds before spawn,
+ * then the subprocess dies without a single delta and the backend THROWS. */
+class MaterializesThenThrowsBackend extends FakeBackend {
+  override async *chat(req: ChatRequest): AsyncIterable<ChatDelta> {
+    req.profile_materialization_receipt = {
+      schema: 'cli-bridge.profile-materialization.v2',
+      effectiveProfileDigest: `sha256:${'b'.repeat(64)}`,
+      harness: 'receipt',
+      provider: null,
+      model: req.model,
+      reasoningEffort: { requested: null, applied: null },
+      workspacePlanDigest: `sha256:${'a'.repeat(64)}`,
+      files: [],
+      unsupported: [],
+    }
+    throw new BackendError(
+      'codex exited 1: Read-only file system (os error 30)',
+      'upstream',
+    )
+  }
+}
+
 class BlockingBackend extends FakeBackend {
   started = 0
   private releases: Array<() => void> = []
@@ -594,6 +616,49 @@ describe('POST /v1/chat/completions', () => {
     expect(text.match(/"profile_materialization"/gu)).toHaveLength(1)
     expect(text).toContain(`"workspacePlanDigest":"sha256:${'a'.repeat(64)}"`)
     expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
+  })
+
+  it('acknowledges the applied profile receipt even when the backend throws before any delta', async () => {
+    // Measured failure this locks down: a jailed codex died at spawn, the
+    // thrown error dropped the already-computed receipt from the stream, and
+    // agent-runtime's bridge executor reported "completed without
+    // cli-bridge.profile-materialization.v2 (classified transient)" instead of
+    // the real subprocess error — three paid retries against a deterministic
+    // failure. The receipt is a statement about materialization (which DID
+    // happen before spawn), so a terminal error must still carry it.
+    const appLocal = new Hono()
+    mountChatCompletions(appLocal, {
+      registry: new BackendRegistry().register(new MaterializesThenThrowsBackend('receipt')),
+      sessions,
+      runs: new RunRegistry(),
+    })
+    const requestBody = {
+      model: 'receipt/test',
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+
+    const streaming = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...requestBody, stream: true }),
+    })
+    expect(streaming.status).toBe(200)
+    const text = await streaming.text()
+    expect(text.match(/"profile_materialization"/gu)).toHaveLength(1)
+    expect(text).toContain(`"workspacePlanDigest":"sha256:${'a'.repeat(64)}"`)
+    expect(text).toContain('Read-only file system')
+    expect(text.match(/data: \[DONE\]/gu)).toHaveLength(1)
+
+    // A pre-output throw must still replace the whole NON-streaming response
+    // with a real HTTP error — the receipt never weakens that contract.
+    const nonStreaming = await appLocal.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    })
+    expect(nonStreaming.status).toBeGreaterThanOrEqual(500)
+    const body = await nonStreaming.json() as { error?: { message?: string } }
+    expect(body.error?.message).toContain('Read-only file system')
   })
 
   it('routes `claudish/google@gemini-2.0-flash` to claudish — not claude', async () => {

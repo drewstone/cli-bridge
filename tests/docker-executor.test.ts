@@ -954,6 +954,43 @@ describe('ClaudeBackend with injected spawner', () => {
     expect(stubSpawner.releaseCalls).toBe(1)
   })
 
+  it('strips the anthropic provider segment from the canonical wire model id', async () => {
+    // agent-runtime's bridge wire id is `<harness>/<provider>/<model>`; the
+    // claude CLI's --model takes the bare id, so `anthropic/` must be split
+    // off while any other provider segment passes through and fails loud.
+    const qualified = createStubSpawner([
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sq' }),
+      JSON.stringify({ type: 'result', subtype: 'success', session_id: 'sq' }),
+    ])
+    const backend = new ClaudeBackend({
+      bin: 'claude', timeoutMs: 5000, harness: 'claude-code', spawner: qualified.spawner,
+    })
+    for await (const _ of backend.chat(
+      { model: 'claude-code/anthropic/claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] },
+      null,
+      new AbortController().signal,
+    )) { /* drain */ }
+    const modelFlag = (args: string[]): string | undefined => {
+      const index = args.indexOf('--model')
+      return index === -1 ? undefined : args[index + 1]
+    }
+    expect(modelFlag(qualified.observedArgs ?? [])).toBe('claude-sonnet-4-6')
+
+    const bare = createStubSpawner([
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sb' }),
+      JSON.stringify({ type: 'result', subtype: 'success', session_id: 'sb' }),
+    ])
+    const bareBackend = new ClaudeBackend({
+      bin: 'claude', timeoutMs: 5000, harness: 'claude-code', spawner: bare.spawner,
+    })
+    for await (const _ of bareBackend.chat(
+      { model: 'claude-code/sonnet', messages: [{ role: 'user', content: 'hi' }] },
+      null,
+      new AbortController().signal,
+    )) { /* drain */ }
+    expect(modelFlag(bare.observedArgs ?? [])).toBe('sonnet')
+  })
+
   it('forwards req.session_id into spawner opts so the docker pool can route stickily', async () => {
     const stubLines = [
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sx' }),

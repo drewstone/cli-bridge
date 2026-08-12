@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -298,21 +298,32 @@ describe('auth preservation', () => {
     expect(authSourcesFor('claude-code')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('claudish')).toEqual(authSourcesFor('claude'))
     expect(authSourcesFor('kimi-code')).toEqual(authSourcesFor('kimi'))
-    for (const { source, jailRel, mode } of authSourcesFor('claude-code')) {
+    for (const { source, jailRel, mode, only } of authSourcesFor('claude-code')) {
       expect(existsSync(source), `${source} should exist`).toBe(true)
       expect(source.startsWith(homedir())).toBe(true)
       // jailRel must be a relative location strictly inside the jail root.
       expect(jailRel.startsWith('/'), `${jailRel} must be relative`).toBe(false)
       expect(jailRel.startsWith('..'), `${jailRel} must not escape the root`).toBe(false)
-      expect(mode).toBe('read-only')
+      // Claude rewrites ~/.claude.json and persists transcripts under
+      // ~/.claude on every run: a read-only home kills the jailed CLI, so
+      // its home is a small writable seed instead of a bind.
+      expect(mode).toBe('seed-writable')
+      if (jailRel === '.claude') {
+        expect(only).toEqual(['.credentials.json', 'credentials.json', 'settings.json'])
+      }
     }
-    // codex must be preserved too (no-MCP jailed codex would otherwise lose ~/.codex),
-    // and tagged so the jail redirects CODEX_HOME at the in-jail copy.
-    for (const { source, jailRel, envVar, mode } of authSourcesFor('codex')) {
+    // codex must be preserved too (no-MCP jailed codex would otherwise lose
+    // ~/.codex) and tagged so the jail redirects CODEX_HOME at the in-jail
+    // home. Seeded WRITABLE: codex writes PATH aliases + app-server state +
+    // session rollouts inside CODEX_HOME before it can run (a read-only bind
+    // measured as `codex exited 1: ... Read-only file system (os error 30)`),
+    // and `only` keeps the host's multi-GB sessions/ tree out of the copy.
+    for (const { source, jailRel, envVar, mode, only } of authSourcesFor('codex')) {
       expect(source.endsWith('.codex')).toBe(true)
       expect(jailRel).toBe('.codex')
       expect(envVar).toBe('CODEX_HOME')
-      expect(mode).toBe('read-only')
+      expect(mode).toBe('seed-writable')
+      expect(only).toEqual(['auth.json', 'config.toml'])
     }
   })
 
@@ -493,6 +504,127 @@ describe('auth preservation', () => {
     expect(existsSync(concurrentAgentDir)).toBe(true)
     await concurrentWrap.cleanup?.()
     expect(existsSync(concurrentAgentDir)).toBe(false)
+  })
+
+  it('bwrap seeds a writable codex home: selected files only, no ro-bind, CODEX_HOME redirected', async () => {
+    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexseed-'))
+    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
+    await writeFile(join(authDir, 'auth.json'), '{"token":"t1"}')
+    // No config.toml on this host: a missing `only` entry is skipped, never fatal.
+    await mkdir(join(authDir, 'sessions'), { recursive: true })
+    await writeFile(join(authDir, 'sessions', 'host-rollout.jsonl'), 'HOST SESSION — never copied')
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [{
+        source: authDir,
+        jailRel: '.codex',
+        mode: 'seed-writable',
+        only: ['auth.json', 'config.toml'],
+        envVar: 'CODEX_HOME',
+      }],
+    })
+    const expectedRoot = resolveJailRoot(root, projectDir)
+    const seededHome = join(expectedRoot, '.codex')
+    // The seed lives INSIDE the writable root: bytes present, never ro-bound,
+    // so codex can write PATH aliases / app-server state / rollouts beside it.
+    expect(await readFile(join(seededHome, 'auth.json'), 'utf8')).toBe('{"token":"t1"}')
+    expect(existsSync(join(seededHome, 'sessions'))).toBe(false)
+    expect(seqIndex(wrap.args, '--ro-bind', authDir, seededHome)).toBe(-1)
+    expect(seqIndex(wrap.args, '--setenv', 'CODEX_HOME', seededHome)).toBeGreaterThanOrEqual(0)
+    expect((await stat(join(seededHome, 'auth.json'))).mode & 0o777).toBe(0o600)
+    // Session state the CLI writes beside the seed must survive both this
+    // run's cleanup and the next run's refresh, or `codex exec resume` breaks.
+    await mkdir(join(seededHome, 'sessions'), { recursive: true })
+    await writeFile(join(seededHome, 'sessions', 'rollout.jsonl'), 'turn 1')
+    await wrap.cleanup?.()
+    expect(await readFile(join(seededHome, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('turn 1')
+    await writeFile(join(authDir, 'auth.json'), '{"token":"t2"}')
+    await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'y'], {
+      root,
+      projectDir,
+      authSources: [{
+        source: authDir,
+        jailRel: '.codex',
+        mode: 'seed-writable',
+        only: ['auth.json', 'config.toml'],
+        envVar: 'CODEX_HOME',
+      }],
+    })
+    expect(await readFile(join(seededHome, 'auth.json'), 'utf8')).toBe('{"token":"t2"}')
+    expect(await readFile(join(seededHome, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('turn 1')
+  })
+
+  it('seeds a dotfiles-managed symlink source as real bytes and survives the next turn', async () => {
+    // Measured on the second turn of a jailed claude session: settings.json
+    // was a symlink into ~/code/dotfiles, the seed copied the LINK, and the
+    // refresh followed it outside the root — "jail root '<dotfiles path>'
+    // must be a dedicated subdirectory". The link target is not mounted in an
+    // fs-jail either, so only dereferenced bytes work.
+    const dotfiles = await mkdtemp(join(homedir(), '.cli-bridge-dotfiles-'))
+    cleanups.push(() => rm(dotfiles, { recursive: true, force: true }))
+    await writeFile(join(dotfiles, 'settings.json'), '{"linked":true}')
+    const claudeDir = await mkdtemp(join(homedir(), '.cli-bridge-claudelink-'))
+    cleanups.push(() => rm(claudeDir, { recursive: true, force: true }))
+    await symlink(join(dotfiles, 'settings.json'), join(claudeDir, 'settings.json'))
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const sources = [{
+      source: claudeDir,
+      jailRel: '.claude',
+      mode: 'seed-writable' as const,
+      only: ['settings.json'],
+    }]
+    await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], { root, projectDir, authSources: sources })
+    const seeded = join(resolveJailRoot(root, projectDir), '.claude', 'settings.json')
+    expect((await lstat(seeded)).isSymbolicLink()).toBe(false)
+    expect(await readFile(seeded, 'utf8')).toBe('{"linked":true}')
+    // The second turn refreshes the same leaf; before the fix it threw here.
+    await writeFile(join(dotfiles, 'settings.json'), '{"linked":2}')
+    await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'y'], { root, projectDir, authSources: sources })
+    expect(await readFile(seeded, 'utf8')).toBe('{"linked":2}')
+  })
+
+  it('bwrap seeds the claude home surface writable so the CLI can boot and resume', async () => {
+    const fakeHome = await mkdtemp(join(homedir(), '.cli-bridge-claudeseed-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    const claudeDir = join(fakeHome, '.claude')
+    await mkdir(claudeDir, { recursive: true })
+    await writeFile(join(claudeDir, '.credentials.json'), '{"oauth":"c1"}')
+    await writeFile(join(claudeDir, 'settings.json'), '{"model":"default"}')
+    await mkdir(join(claudeDir, 'projects'), { recursive: true })
+    await writeFile(join(claudeDir, 'projects', 'host-transcript.jsonl'), 'HOST — never copied')
+    await writeFile(join(fakeHome, '.claude.json'), '{"hasCompletedOnboarding":true}')
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      authSources: [
+        {
+          source: claudeDir,
+          jailRel: '.claude',
+          mode: 'seed-writable',
+          only: ['.credentials.json', 'credentials.json', 'settings.json'],
+        },
+        { source: join(fakeHome, '.claude.json'), jailRel: '.claude.json', mode: 'seed-writable' },
+      ],
+    })
+    const expectedRoot = resolveJailRoot(root, projectDir)
+    // Both homes are writable seeds at the exact paths claude reads under the
+    // jail's HOME redirect — no env var involved, no ro-bind to hit EROFS on.
+    expect(await readFile(join(expectedRoot, '.claude', '.credentials.json'), 'utf8')).toBe('{"oauth":"c1"}')
+    expect(await readFile(join(expectedRoot, '.claude', 'settings.json'), 'utf8')).toBe('{"model":"default"}')
+    expect(await readFile(join(expectedRoot, '.claude.json'), 'utf8')).toBe('{"hasCompletedOnboarding":true}')
+    expect(existsSync(join(expectedRoot, '.claude', 'projects'))).toBe(false)
+    expect(seqIndex(wrap.args, '--ro-bind', claudeDir, join(expectedRoot, '.claude'))).toBe(-1)
+    // Transcripts the jailed claude writes must survive cleanup for --resume.
+    await mkdir(join(expectedRoot, '.claude', 'projects'), { recursive: true })
+    await writeFile(join(expectedRoot, '.claude', 'projects', 'turn1.jsonl'), 'turn 1')
+    await wrap.cleanup?.()
+    expect(await readFile(join(expectedRoot, '.claude', 'projects', 'turn1.jsonl'), 'utf8')).toBe('turn 1')
   })
 
   it('updates a stable auth copy in place without deleting files used by another run', async () => {

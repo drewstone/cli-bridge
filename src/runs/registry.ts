@@ -228,7 +228,22 @@ export class Run {
    * answered HTTP 200 with `content: ""`. Normalizing inside this loop is what
    * makes the invariant hold for backends that do not exist yet.
    */
-  pump(source: AsyncIterable<ChatDelta>): Promise<void> {
+  pump(
+    source: AsyncIterable<ChatDelta>,
+    opts?: {
+      /**
+       * The profile-materialization receipt the request's backend retained, if
+       * any, read at failure time. A backend that THROWS (subprocess exited
+       * nonzero) never reaches the stream position where the receipt is
+       * normally emitted, yet materialization already happened before spawn —
+       * so the run must still acknowledge it ahead of the synthesized terminal
+       * error. Without it, a profile-carrying caller (agent-runtime's bridge
+       * executor) classifies the whole failure as "completed without receipt"
+       * transport trouble and the real error message is masked.
+       */
+      terminalReceipt?: () => ProfileMaterializationReceipt | undefined
+    },
+  ): Promise<void> {
     if (this.settled) return this.settled
     this.settled = (async () => {
       try {
@@ -250,6 +265,15 @@ export class Run {
           // replay and reconnect. A bare `{ finish_reason: 'error' }` left the
           // caller with an empty completion whose only explanation was in this
           // process's stdout.
+          // Acknowledged on its OWN event: the SSE writer renders the error
+          // terminal as a bare `{error}` frame and the caller's parser reads
+          // nothing else from it, so the receipt must precede it in the buffer
+          // under its own seq. `setupError` was recorded above, so this extra
+          // event never turns a pre-output failure into a 200.
+          const receipt = opts?.terminalReceipt?.()
+          if (receipt && this.profileMaterialization === null) {
+            this.append({ profile_materialization: receipt })
+          }
           this.append({ finish_reason: 'error', error: describeRunFailure(error) })
           this.finish('error')
           console.error(`[cli-bridge] run ${this.id} failed:`, error)
