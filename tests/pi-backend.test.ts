@@ -1,5 +1,6 @@
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
+import { createHash } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import {
   appendFileSync,
@@ -163,6 +164,52 @@ describe('PiBackend turn retry (#125)', () => {
     model: 'pi/tangle-router/glm-5.2',
     messages: [{ role: 'user', content: 'TASK' }],
   }
+
+  it('exposes only the protected gateway origin in the materialization receipt', async () => {
+    const protectedBaseUrl = 'https://router.tangle.tools/v1/private-grant-route'
+    const token = 'protected-token'
+    const digest = `sha256:${createHash('sha256').update(token).digest('hex')}` as const
+    const baseUrlDigest = `sha256:${createHash('sha256').update(protectedBaseUrl).digest('hex')}` as const
+    const transport = testPiInferenceTransport()
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'ok' } },
+        { type: 'turn_end', message: { usage: { input: 2, output: 1 } } },
+      ]),
+      transportResolver: async (selection, signal, credential) => {
+        const resolved = await transport(selection, signal, credential)
+        return {
+          ...resolved,
+          ...(credential === undefined
+            ? {}
+            : { upstreamBaseUrl: credential.baseUrl, requestScopedEndpoint: true }),
+        }
+      },
+    })
+    const protectedRequest: ChatRequest = {
+      ...request,
+      agent_profile: {
+        name: 'protected-receipt',
+        harness: 'pi',
+        model: { provider: 'tangle-router', default: 'glm-5.2' },
+      },
+      protectedModelCredential: {
+        token,
+        digest,
+        baseUrl: protectedBaseUrl,
+        baseUrlDigest,
+      },
+    }
+
+    await collect(backend.chat(protectedRequest, null, new AbortController().signal))
+
+    expect(protectedRequest.profile_materialization_receipt?.inference?.effectiveEndpoint)
+      .toBe('https://router.tangle.tools')
+    expect(JSON.stringify(protectedRequest.profile_materialization_receipt))
+      .not.toContain('/v1/private-grant-route')
+  })
 
   it('retries a transient death that the caller never saw and delivers the recovered turn', async () => {
     // The measured shape: pi dies mid-stream before emitting anything. Four supervised runs ended

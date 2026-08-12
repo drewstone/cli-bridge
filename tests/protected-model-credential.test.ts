@@ -3,7 +3,11 @@ import { describe, expect, it } from 'vitest'
 import { BackendRegistry } from '../src/backends/registry.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { bindIncomingRequest } from '../src/http/request-source.js'
-import { PROTECTED_MODEL_CREDENTIAL_HEADER, mountChatCompletions } from '../src/routes/chat-completions.js'
+import {
+  PROTECTED_MODEL_BASE_URL_HEADER,
+  PROTECTED_MODEL_CREDENTIAL_HEADER,
+  mountChatCompletions,
+} from '../src/routes/chat-completions.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import type { SessionRecord, SessionStore } from '../src/sessions/store.js'
 
@@ -60,6 +64,7 @@ function request(
   model: string,
   options: {
     readonly token?: string
+    readonly baseUrl?: string
     readonly runId?: string
     readonly sessionId?: string
   } = {},
@@ -69,6 +74,7 @@ function request(
     headers: {
       'content-type': 'application/json',
       ...(options.token === undefined ? {} : { [PROTECTED_MODEL_CREDENTIAL_HEADER]: options.token }),
+      ...(options.baseUrl === undefined ? {} : { [PROTECTED_MODEL_BASE_URL_HEADER]: options.baseUrl }),
     },
     body: JSON.stringify({
       model,
@@ -99,27 +105,38 @@ describe('protected model credential bridge channel', () => {
       runs,
     })
     const secret = 'protected-request-secret-keep-out-of-artifacts'
+    const baseUrl = 'https://router.tangle.tools/v1/protected-route'
     const first = bind(request('pi/provider/model', {
       token: secret,
+      baseUrl,
       runId: 'protected-run',
       sessionId: 'protected-session',
     }))
 
     const response = await app.fetch(first)
     expect(response.status).toBe(200)
-    expect(await response.text()).not.toContain(secret)
+    const responseBody = await response.text()
+    expect(responseBody).not.toContain(secret)
+    expect(responseBody).not.toContain('/v1/protected-route')
     expect(requests).toHaveLength(1)
     expect(requests[0]?.protectedModelCredential?.token).toBe(secret)
+    expect(requests[0]?.protectedModelCredential?.baseUrl).toBe(baseUrl)
+    expect(requests[0]?.protectedModelCredential?.baseUrlDigest).toMatch(/^sha256:[0-9a-f]{64}$/u)
 
     const session = records.get('pi:protected-session')
-    expect(JSON.stringify(session?.metadata ?? {})).not.toContain(secret)
+    const sessionMetadata = JSON.stringify(session?.metadata ?? {})
+    expect(sessionMetadata).not.toContain(secret)
+    expect(sessionMetadata).not.toContain('/v1/protected-route')
     const snapshot = runs.get('protected-run')?.snapshot()
     expect(snapshot).toBeDefined()
-    expect(JSON.stringify(snapshot)).not.toContain(secret)
+    const snapshotBody = JSON.stringify(snapshot)
+    expect(snapshotBody).not.toContain(secret)
+    expect(snapshotBody).not.toContain('/v1/protected-route')
     expect(snapshot?.requestDigest).toMatch(/^sha256:[0-9a-f]{64}$/u)
 
     const same = bind(request('pi/provider/model', {
       token: secret,
+      baseUrl,
       runId: 'protected-run',
       sessionId: 'protected-session',
     }))
@@ -128,6 +145,7 @@ describe('protected model credential bridge channel', () => {
 
     const changed = bind(request('pi/provider/model', {
       token: 'different-protected-request-secret',
+      baseUrl,
       runId: 'protected-run',
       sessionId: 'protected-session',
     }))
@@ -136,6 +154,18 @@ describe('protected model credential bridge channel', () => {
     const conflictBody = await conflict.text()
     expect(conflictBody).not.toContain(secret)
     expect(conflictBody).not.toContain('different-protected-request-secret')
+
+    const changedUrl = bind(request('pi/provider/model', {
+      token: secret,
+      baseUrl: 'https://router.tangle.tools/v1/another-route',
+      runId: 'protected-run',
+      sessionId: 'protected-session',
+    }))
+    const urlConflict = await app.fetch(changedUrl)
+    expect(urlConflict.status).toBe(409)
+    const urlConflictBody = await urlConflict.text()
+    expect(urlConflictBody).not.toContain(baseUrl)
+    expect(urlConflictBody).not.toContain('another-route')
   })
 
   it('preserves the no-header path and rejects non-Pi or non-loopback callers', async () => {
@@ -153,16 +183,45 @@ describe('protected model credential bridge channel', () => {
     expect((await app.fetch(noHeader)).status).toBe(200)
     expect(piRequests[0]?.protectedModelCredential).toBeUndefined()
 
+    const tokenOnly = bind(request('pi/provider/model', { token: 'token-only-secret' }))
+    const tokenOnlyResponse = await app.fetch(tokenOnly)
+    expect(tokenOnlyResponse.status).toBe(400)
+    expect(await tokenOnlyResponse.text()).not.toContain('token-only-secret')
+    expect(piRequests).toHaveLength(1)
+
     const nonPi = bind(request('claude/provider/model', { token: 'non-pi-secret' }))
     const nonPiResponse = await app.fetch(nonPi)
     expect(nonPiResponse.status).toBe(400)
     expect(await nonPiResponse.text()).not.toContain('non-pi-secret')
     expect(claudeRequests).toHaveLength(0)
 
-    const remote = bind(request('pi/provider/model', { token: 'remote-secret' }), '10.20.30.40')
+    const remote = bind(request('pi/provider/model', {
+      token: 'remote-secret',
+      baseUrl: 'https://router.tangle.tools/v1',
+    }), '10.20.30.40')
     const remoteResponse = await app.fetch(remote)
     expect(remoteResponse.status).toBe(403)
     expect(await remoteResponse.text()).not.toContain('remote-secret')
     expect(piRequests).toHaveLength(1)
+  })
+
+  it('rejects non-HTTPS protected routes before Pi receives the request', async () => {
+    const { store: sessions } = memorySessions()
+    const runs = new RunRegistry()
+    const piRequests: ChatRequest[] = []
+    const app = new Hono()
+    mountChatCompletions(app, {
+      registry: new BackendRegistry().register(fakeBackend('pi', piRequests)),
+      sessions,
+      runs,
+    })
+
+    const response = await app.fetch(bind(request('pi/provider/model', {
+      token: 'route-token',
+      baseUrl: 'http://router.tangle.tools/v1',
+    })))
+    expect(response.status).toBe(400)
+    expect(await response.text()).not.toContain('router.tangle.tools')
+    expect(piRequests).toHaveLength(0)
   })
 })

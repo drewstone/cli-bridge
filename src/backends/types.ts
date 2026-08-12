@@ -26,6 +26,10 @@ export interface ProtectedModelCredential {
   token: string
   /** The token digest binds durable run identity without retaining the secret. */
   digest: `sha256:${string}`
+  /** The exact HTTPS gateway selected for this request. */
+  baseUrl: string
+  /** The gateway URL digest binds durable run identity without retaining the URL. */
+  baseUrlDigest: `sha256:${string}`
 }
 
 export type ChatContentPart =

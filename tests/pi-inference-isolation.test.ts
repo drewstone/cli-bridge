@@ -287,9 +287,18 @@ describe('Pi inference credential isolation', () => {
     const selection = { provider: 'isolated-test', model: 'credential-check' }
     const signal = new AbortController().signal
     const digest = `sha256:${createHash('sha256').update(requestToken).digest('hex')}` as const
+    const requestBaseUrl = 'https://router.tangle.tools/v1'
+    const baseUrlDigest = `sha256:${createHash('sha256').update(requestBaseUrl).digest('hex')}` as const
 
-    const overridden = await resolver(selection, signal, { token: requestToken, digest })
+    const overridden = await resolver(selection, signal, {
+      token: requestToken,
+      digest,
+      baseUrl: requestBaseUrl,
+      baseUrlDigest,
+    })
     expect(overridden.upstreamApiKey).toBe(requestToken)
+    expect(overridden.upstreamBaseUrl).toBe(requestBaseUrl)
+    expect(overridden.requestScopedEndpoint).toBe(true)
     expect(existsSync(marker)).toBe(false)
 
     const operatorResolved = await resolver(selection, signal)
@@ -316,7 +325,12 @@ describe('Pi inference credential isolation', () => {
     await expect(resolver(
       { provider: 'isolated-test', model: 'credential-check' },
       new AbortController().signal,
-      { token: 'request-secret', digest: 'sha256:wrong' },
+      {
+        token: 'request-secret',
+        digest: 'sha256:wrong',
+        baseUrl: 'https://router.tangle.tools/v1',
+        baseUrlDigest: 'sha256:wrong',
+      },
     )).rejects.toThrow(/mismatched digest/u)
   })
 
