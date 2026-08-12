@@ -25,6 +25,7 @@ export interface ChunkMeta {
  */
 export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | null {
   const hasContent = delta.content !== undefined
+  const hasIdentity = delta.model !== undefined || delta.system_fingerprint !== undefined
   const hasToolCalls = !!delta.tool_calls && delta.tool_calls.length > 0
   const hasFinish = delta.finish_reason !== undefined
   const hasUsage = !!delta.usage
@@ -35,14 +36,14 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   // comments via `deltaToSseComment` instead. `internal_session_id`-only
   // deltas are also non-OpenAI metadata (consumed by the session store)
   // and are intentionally skipped here.
-  if (!hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (!hasContent && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
   // internal_session_id-only deltas: the session id is bookkeeping for
   // the bridge's own store, not OpenAI surface area. Skip to avoid
   // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
   // some agent harnesses) reject as malformed.
-  if (hasSessionId && !hasContent && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (hasSessionId && !hasContent && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
 
@@ -59,7 +60,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
 
   // Usage/profile metadata without content/tool_calls/finish carries `choices: []`,
   // not an empty choice, so strict OpenAI clients do not parse it as output.
-  const metadataOnly = (hasUsage || hasProfileMaterialization) && !hasContent && !hasToolCalls && !hasFinish
+  const metadataOnly = (hasIdentity || hasUsage || hasProfileMaterialization) && !hasContent && !hasToolCalls && !hasFinish
   const usage = delta.usage
   const trustedCostProvenance = usage?.cost_provenance === 'provider-receipt'
     || usage?.cost_provenance === 'billing-receipt'
@@ -79,7 +80,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     id: meta.id,
     object: 'chat.completion.chunk',
     created: meta.created,
-    model: meta.model,
+    model: delta.model ?? meta.model,
     choices: metadataOnly ? [] : [
       {
         index: 0,
@@ -126,6 +127,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     ...(delta.profile_materialization
       ? { profile_materialization: delta.profile_materialization }
       : {}),
+    ...(delta.system_fingerprint ? { system_fingerprint: delta.system_fingerprint } : {}),
   }
   return `data: ${JSON.stringify(payload)}\n\n`
 }
@@ -172,12 +174,16 @@ export async function collectNonStreaming(
   let usage: CollectedUsage | undefined
   let profileMaterialization: ChatDelta['profile_materialization']
   let error: ChatDelta['error']
+  let responseModel: string | undefined
+  let systemFingerprint: string | undefined
 
   for await (const d of iter) {
     // Backend-liveness signals are transport-layer and have no place in
     // the non-streaming response body. Drop them silently.
     if (d.keepalive) continue
     if (d.content) content += d.content
+    if (d.model) responseModel = d.model
+    if (d.system_fingerprint) systemFingerprint = d.system_fingerprint
     if (d.tool_calls) toolCalls.push(...d.tool_calls)
     if (d.finish_reason) finishReason = d.finish_reason
     if (d.usage) usage = addUsage(usage, d.usage)
@@ -226,7 +232,7 @@ export async function collectNonStreaming(
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model,
+    model: responseModel ?? model,
     choices: [
       {
         index: 0,
@@ -247,6 +253,7 @@ export async function collectNonStreaming(
     ],
     ...(usageOut ? { usage: usageOut } : {}),
     ...(profileMaterialization ? { profile_materialization: profileMaterialization } : {}),
+    ...(systemFingerprint ? { system_fingerprint: systemFingerprint } : {}),
     // A run that failed says so IN the body. Dropping the reason here is what
     // made `finish_reason: 'error'` with an empty message the caller's whole
     // explanation for a bridge-side failure.

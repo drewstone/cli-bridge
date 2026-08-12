@@ -28,6 +28,7 @@ import {
   createPiInferenceTransportResolver,
   ensurePiSessionFile,
   provisionPiInferenceTransport,
+  rewriteOpenAiSseLine,
 } from '../src/backends/pi-inference-transport.js'
 import type {
   PiApiMode,
@@ -175,6 +176,21 @@ const SENTINELS = {
 } as const
 
 describe('Pi inference credential isolation', () => {
+  it('carries an OpenAI response fingerprint in the Pi response-model field', () => {
+    const line = `data: ${JSON.stringify({
+      model: 'deepseek-v4-flash',
+      system_fingerprint: 'fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+      choices: [{ delta: { content: 'ok' } }],
+    })}\n`
+    const rewritten = rewriteOpenAiSseLine(line)
+    expect(JSON.parse(rewritten.slice('data: '.length)).model).toBe(
+      'deepseek-v4-flash@fp_a18b46594c_prod0820_fp8_kvcache_20260402',
+    )
+    expect(rewriteOpenAiSseLine('data: [DONE]\n')).toBe('data: [DONE]\n')
+    expect(rewriteOpenAiSseLine('data: {"model":"deepseek-v4-flash"}\n'))
+      .toBe('data: {"model":"deepseek-v4-flash"}\n')
+  })
+
   it('lowers only the isolated model copy and refuses unprovable profile metadata', () => {
     const operatorModel = {
       id: 'credential-check',

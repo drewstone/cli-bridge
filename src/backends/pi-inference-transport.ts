@@ -722,11 +722,16 @@ async function forwardRequest(
       return
     }
     const body = Readable.fromWeb(upstream.body as never)
-    await pipeline(
-      body,
-      createCredentialRedactionStream(resolved.upstreamApiKey, scopedApiKey),
-      response,
-    )
+    const identity = resolved.apiMode === 'openai-completions'
+      && upstream.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
+      ? createOpenAiResponseIdentityStream()
+      : undefined
+    const redaction = createCredentialRedactionStream(resolved.upstreamApiKey, scopedApiKey)
+    if (identity) {
+      await pipeline(body, identity, redaction, response)
+    } else {
+      await pipeline(body, redaction, response)
+    }
   } catch (error) {
     traffic.failedRequests += 1
     if (response.headersSent) {
@@ -964,6 +969,58 @@ function createCredentialRedactionStream(secret: string, replacement: string): T
     },
     flush(callback) {
       if (pending.length > 0) this.push(pending)
+      callback()
+    },
+  })
+}
+
+/**
+ * Carry an OpenAI provider snapshot through Pi's response-model field.
+ * Pi preserves `responseModel` but drops `system_fingerprint`, so the bridge
+ * encodes the fingerprint as an opaque `model@fingerprint` identity.
+ */
+export function rewriteOpenAiSseLine(line: string): string {
+  const newline = line.endsWith('\r\n') ? '\r\n' : line.endsWith('\n') ? '\n' : ''
+  const content = newline ? line.slice(0, -newline.length) : line
+  if (!content.startsWith('data:')) return line
+  const data = content.slice('data:'.length).trimStart()
+  if (data === '[DONE]') return line
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(data)
+  } catch {
+    return line
+  }
+  if (!isRecord(parsed)) return line
+  const model = typeof parsed.model === 'string' ? parsed.model : undefined
+  const fingerprint = typeof parsed.system_fingerprint === 'string'
+    ? parsed.system_fingerprint
+    : undefined
+  if (
+    !model
+    || model.includes('@')
+    || !fingerprint
+    || !/^[A-Za-z0-9._-]{1,256}$/u.test(fingerprint)
+  ) return line
+  return `data: ${JSON.stringify({ ...parsed, model: `${model}@${fingerprint}` })}${newline}`
+}
+
+function createOpenAiResponseIdentityStream(): Transform {
+  let pending = ''
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      pending += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+      let newline = pending.indexOf('\n')
+      while (newline >= 0) {
+        const line = pending.slice(0, newline + 1)
+        pending = pending.slice(newline + 1)
+        this.push(rewriteOpenAiSseLine(line))
+        newline = pending.indexOf('\n')
+      }
+      callback()
+    },
+    flush(callback) {
+      if (pending) this.push(rewriteOpenAiSseLine(pending))
       callback()
     },
   })
