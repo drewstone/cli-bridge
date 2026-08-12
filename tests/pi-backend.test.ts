@@ -401,6 +401,8 @@ describe('PiBackend', () => {
     })
     expect(deltas.find((delta) => delta.usage)?.model).toBe(responseModel)
     expect(deltas.find((delta) => delta.profile_materialization)?.model).toBe(responseModel)
+    expect(deltas.find((delta) => delta.profile_materialization)?.system_fingerprint)
+      .toBe('fp_a18b46594c_prod0820_fp8_kvcache_20260402')
     expect(deltas.find((delta) => delta.finish_reason)?.model).toBe(responseModel)
   })
 
