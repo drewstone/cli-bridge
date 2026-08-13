@@ -403,7 +403,11 @@ export class Run {
     }
     const reason = reasonForTerminalDelta(finishReason, delta.error, 'the backend')
     if (this.failureError === undefined) {
-      this.failureError = new BackendReportedFailureError(reason.message, reason.type)
+      this.failureError = new BackendReportedFailureError(reason.message, reason.type, {
+        ...(reason.provider_dispatch === undefined
+          ? {}
+          : { providerDispatch: reason.provider_dispatch }),
+      })
     }
     return { ...delta, error: reason }
   }

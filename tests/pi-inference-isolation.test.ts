@@ -773,6 +773,50 @@ describe('Pi inference credential isolation', () => {
     }
   })
 
+  it('carries only Router’s exact pre-provider proof through the scoped proxy', async () => {
+    const upstream = createServer(async (request, response) => {
+      await readBody(request)
+      response.writeHead(429, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        error: {
+          message: 'candidate grant limit exceeded',
+          provider_dispatch: 'not_started',
+        },
+      }))
+    })
+    await listen(upstream)
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+    const transport = await provisionPiInferenceTransport(fixtureTransport({
+      upstreamBaseUrl: `http://127.0.0.1:${address.port}`,
+    }))
+    try {
+      const localConfig = JSON.parse(readFileSync(join(transport.agentDir, 'models.json'), 'utf8')) as {
+        providers: Record<string, { apiKey: string }>
+      }
+      const scopedToken = localConfig.providers['isolated-test']!.apiKey
+      const response = await fetch(`${transport.localBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'content-type': 'application/json',
+        },
+        body: '{"model":"credential-check"}',
+      })
+      expect(response.status).toBe(429)
+      const body = await response.json() as {
+        error?: { message?: string; provider_dispatch?: unknown }
+      }
+      expect(body.error?.provider_dispatch).toBe('not_started')
+      expect(body.error?.message).toMatch(/candidate grant limit exceeded/u)
+      expect(body.error?.message).toMatch(/__tangle_provider_dispatch_not_started__/u)
+    } finally {
+      await transport.cleanup()
+      await close(upstream)
+    }
+  })
+
   it('fails before opening a proxy when a provider model cannot be bound exactly', async () => {
     await expect(provisionPiInferenceTransport(fixtureTransport({
       model: 'partner/model/ambiguous-tail',

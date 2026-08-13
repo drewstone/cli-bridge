@@ -20,9 +20,20 @@ const TYPE_BY_ERROR_NAME: Record<string, string> = {
   RunReplayCursorError: 'invalid_replay_cursor',
 }
 
-export function describeRunFailure(error: unknown): { message: string; type: string } {
+export interface RunFailureDescription {
+  message: string
+  type: string
+  provider_dispatch?: 'not_started'
+}
+
+export function describeRunFailure(error: unknown): RunFailureDescription {
   const message = error instanceof Error ? error.message : String(error)
-  return { message, type: failureType(error) }
+  const providerDispatch = providerDispatchFromError(error)
+  return {
+    message,
+    type: failureType(error),
+    ...(providerDispatch === undefined ? {} : { provider_dispatch: providerDispatch }),
+  }
 }
 
 /**
@@ -38,9 +49,16 @@ export function describeRunFailure(error: unknown): { message: string; type: str
  * answered nothing.
  */
 export class BackendReportedFailureError extends Error {
-  constructor(message: string, readonly code: string) {
+  readonly providerDispatch?: 'not_started'
+
+  constructor(
+    message: string,
+    readonly code: string,
+    options?: { providerDispatch?: 'not_started' },
+  ) {
     super(message)
     this.name = 'BackendReportedFailureError'
+    this.providerDispatch = options?.providerDispatch
   }
 }
 
@@ -54,9 +72,9 @@ export class BackendReportedFailureError extends Error {
  */
 export function reasonForTerminalDelta(
   finishReason: 'error' | 'timeout',
-  existing: { message: string; type: string } | undefined,
+  existing: RunFailureDescription | undefined,
   label: string,
-): { message: string; type: string } {
+): RunFailureDescription {
   if (existing && existing.message.length > 0) return existing
   if (finishReason === 'timeout') {
     return {
@@ -79,4 +97,11 @@ function failureType(error: unknown): string {
   const name = (error as { name?: unknown }).name
   if (typeof name === 'string' && TYPE_BY_ERROR_NAME[name]) return TYPE_BY_ERROR_NAME[name]
   return 'server_error'
+}
+
+function providerDispatchFromError(error: unknown): 'not_started' | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  return (error as { providerDispatch?: unknown }).providerDispatch === 'not_started'
+    ? 'not_started'
+    : undefined
 }

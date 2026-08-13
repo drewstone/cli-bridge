@@ -332,7 +332,12 @@ export interface ChatDelta {
    * problem. Set by the run pump; backends may set it directly when they
    * terminate a stream without throwing.
    */
-  error?: { message: string; type: string }
+  error?: {
+    message: string
+    type: string
+    /** Router-owned proof that the request stopped before provider dispatch. */
+    provider_dispatch?: 'not_started'
+  }
   /**
    * Token usage. Optional; a backend may emit one metadata-only record per
    * model call. `estimated` is set when the bridge derived it from text
@@ -433,12 +438,16 @@ export function wantsJsonObject(req: ChatRequest): boolean {
 }
 
 export class BackendError extends Error {
+  readonly providerDispatch?: 'not_started'
+
   constructor(
     message: string,
     public readonly code: 'not_configured' | 'cli_missing' | 'upstream' | 'timeout' | 'aborted' | 'parse_error',
     public readonly cause?: unknown,
+    options?: { providerDispatch?: 'not_started' },
   ) {
     super(message)
     this.name = 'BackendError'
+    this.providerDispatch = options?.providerDispatch
   }
 }
