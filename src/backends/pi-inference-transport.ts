@@ -86,6 +86,8 @@ export interface ProvisionedPiInferenceTransport {
   agentDir: string
   sessionDir: string
   upstreamBaseUrl: string
+  /** Request-scoped marker used only to carry Router's typed pre-dispatch proof through Pi. */
+  providerDispatchMarker: string
   /** True when the endpoint came from a protected request header. */
   requestScopedEndpoint?: boolean
   apiMode: PiApiMode
@@ -618,6 +620,7 @@ export async function provisionPiInferenceTransport(
       agentDir,
       sessionDir,
       upstreamBaseUrl: resolved.upstreamBaseUrl,
+      providerDispatchMarker: proxy.providerDispatchMarker,
       ...(resolved.requestScopedEndpoint ? { requestScopedEndpoint: true } : {}),
       apiMode: resolved.apiMode,
       ...(applied.appliedMaxTokens === undefined
@@ -642,12 +645,64 @@ export async function provisionPiInferenceTransport(
 interface ScopedProxy {
   localBaseUrl: string
   scopedApiKey: string
+  providerDispatchMarker: string
   traffic(): PiInferenceTrafficSnapshot
   close(): Promise<void>
 }
 
+const PROVIDER_DISPATCH_MARKER_PREFIX = ' __tangle_provider_dispatch_not_started__:'
+
+function providerDispatchMarkerText(marker: string): string {
+  return `${PROVIDER_DISPATCH_MARKER_PREFIX}${marker}__`
+}
+
+/**
+ * Preserve Router's one-sided pre-dispatch fact across Pi's error-message-only API.
+ *
+ * Pi's OpenAI adapter keeps `error.message` but drops unknown error fields. The local
+ * proxy therefore appends a request-scoped marker to the message while retaining the
+ * original `provider_dispatch` field. The random marker prevents a provider-supplied
+ * message from manufacturing this proof.
+ */
+export function annotateProviderDispatchFailureBody(body: string, marker: string): string {
+  if (!marker) return body
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return body
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return body
+  const error = (parsed as { error?: unknown }).error
+  if (typeof error !== 'object' || error === null || Array.isArray(error)) return body
+  if ((error as { provider_dispatch?: unknown }).provider_dispatch !== 'not_started') return body
+  const markerText = providerDispatchMarkerText(marker)
+  const record = error as { message?: unknown }
+  const message = typeof record.message === 'string' ? record.message : ''
+  if (message.includes(markerText)) return body
+  record.message = `${message}${markerText}`
+  return JSON.stringify(parsed)
+}
+
+/** Return Router's proof only when the exact request-scoped marker is present. */
+export function providerDispatchFromPiFailure(
+  message: string,
+  marker: string | undefined,
+): 'not_started' | undefined {
+  return marker !== undefined && message.includes(providerDispatchMarkerText(marker))
+    ? 'not_started'
+    : undefined
+}
+
+/** Remove the transport marker before the bridge exposes the provider diagnostic. */
+export function stripProviderDispatchMarker(message: string, marker: string | undefined): string {
+  if (marker === undefined) return message
+  return message.replaceAll(providerDispatchMarkerText(marker), '').trim()
+}
+
 async function startScopedProxy(resolved: ResolvedPiInferenceTransport): Promise<ScopedProxy> {
   const scopedApiKey = randomBytes(32).toString('base64url')
+  const providerDispatchMarker = randomBytes(24).toString('base64url')
   const traffic: PiInferenceTrafficSnapshot = {
     requests: 0,
     generationRequests: 0,
@@ -658,7 +713,7 @@ async function startScopedProxy(resolved: ResolvedPiInferenceTransport): Promise
   }
   const server = createServer((request, response) => {
     traffic.requests += 1
-    void forwardRequest(request, response, resolved, scopedApiKey, traffic)
+    void forwardRequest(request, response, resolved, scopedApiKey, providerDispatchMarker, traffic)
   })
   server.on('clientError', (_error, socket) => socket.destroy())
 
@@ -673,6 +728,7 @@ async function startScopedProxy(resolved: ResolvedPiInferenceTransport): Promise
   return {
     localBaseUrl: `http://127.0.0.1:${address.port}`,
     scopedApiKey,
+    providerDispatchMarker,
     traffic: () => ({ ...traffic }),
     close: async () => {
       if (closed) return
@@ -688,6 +744,7 @@ async function forwardRequest(
   response: ServerResponse,
   resolved: ResolvedPiInferenceTransport,
   scopedApiKey: string,
+  providerDispatchMarker: string,
   traffic: PiInferenceTrafficSnapshot,
 ): Promise<void> {
   if (!request.socket.remoteAddress || !isLoopbackAddress(request.socket.remoteAddress)) {
@@ -784,6 +841,22 @@ async function forwardRequest(
           .join(scopedApiKey)
       }
     })
+
+    if (!upstream.ok) {
+      // Error responses are small JSON envelopes in the supported OpenAI-compatible
+      // protocols. Buffer them once so the exact Router proof survives Pi's adapter,
+      // while still redacting the upstream credential before it reaches the child.
+      const rawBody = await upstream.text()
+      const body = annotateProviderDispatchFailureBody(
+        rawBody,
+        providerDispatchMarker,
+      ).split(resolved.upstreamApiKey).join(scopedApiKey)
+      delete responseHeaders['content-length']
+      response.writeHead(upstream.status, responseHeaders)
+      response.end(body)
+      return
+    }
+
     response.writeHead(upstream.status, responseHeaders)
     if (!upstream.body) {
       response.end()

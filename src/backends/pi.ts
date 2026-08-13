@@ -86,7 +86,9 @@ import { addUsage, type CollectedUsage } from '../usage.js'
 import {
   createPiInferenceTransportResolver,
   ensurePiSessionFile,
+  providerDispatchFromPiFailure,
   provisionPiInferenceTransport,
+  stripProviderDispatchMarker,
   type PiInferenceTransportResolver,
   type ProvisionedPiInferenceTransport,
 } from './pi-inference-transport.js'
@@ -868,6 +870,12 @@ export class PiBackend implements Backend {
         && inferenceTraffic.rejectedRequests === 0
         && inferenceTraffic.failedRequests === 0
         && inferenceTraffic.inFlightRequests === 0
+      const typedPreProviderFailure = [turnFailure, sawError]
+        .filter((message): message is string => message !== null)
+        .some((message) => providerDispatchFromPiFailure(
+          message,
+          inference?.providerDispatchMarker,
+        ) === 'not_started')
       const materialization = req.profile_materialization_receipt
       if (materialization?.inference) {
         materialization.inference.observation = {
@@ -903,7 +911,7 @@ export class PiBackend implements Backend {
           profile_materialization: structuredClone(materialization),
         }
       }
-      if (this.spawner.executionEnvironment === 'host' && !accountingMatched) {
+      if (this.spawner.executionEnvironment === 'host' && !accountingMatched && !typedPreProviderFailure) {
         throw new BackendError(
           'pi inference traffic did not match its recorded usage: '
           + `${inferenceTraffic.generationRequests} generation request(s), `
@@ -942,9 +950,10 @@ export class PiBackend implements Backend {
 
       if (exitCode !== 0) {
         const detail = sawError ?? (stderr.render(300) || `exit ${exitCode ?? 'unknown'}`)
-        throw new BackendError(
+        throw piFailureError(
           `pi exit ${exitCode ?? 'unknown'}: ${detail}`,
           piFailureKind(detail),
+          inference?.providerDispatchMarker,
         )
       }
 
@@ -953,11 +962,15 @@ export class PiBackend implements Backend {
       // an empty or partial body reported as `stop` is silent data loss for any caller
       // scoring outcomes, which is exactly what agent-runtime's piExecutor refuses.
       if (turnFailure) {
-        throw new BackendError(`pi assistant turn failed: ${turnFailure}`, piFailureKind(turnFailure))
+        throw piFailureError(
+          `pi assistant turn failed: ${turnFailure}`,
+          piFailureKind(turnFailure),
+          inference?.providerDispatchMarker,
+        )
       }
 
       if (sawError && !emittedContent && !emittedToolCall) {
-        throw new BackendError(`pi error: ${sawError}`, 'upstream')
+        throw piFailureError(`pi error: ${sawError}`, 'upstream', inference?.providerDispatchMarker)
       }
 
       yield {
@@ -1136,6 +1149,21 @@ export function piAssistantFailure(message: unknown): string | null {
   const errorMessage = typeof value.errorMessage === 'string' ? value.errorMessage.trim() : ''
   if (stopReason !== 'error' && errorMessage === '') return null
   return errorMessage !== '' ? errorMessage : `stopReason=${stopReason ?? 'error'}`
+}
+
+function piFailureError(
+  message: string,
+  code: BackendError['code'],
+  providerDispatchMarker: string | undefined,
+): BackendError {
+  const providerDispatch = providerDispatchFromPiFailure(message, providerDispatchMarker)
+  const cleanMessage = stripProviderDispatchMarker(message, providerDispatchMarker)
+  return new BackendError(
+    cleanMessage || 'pi provider rejected the request before provider dispatch',
+    code,
+    undefined,
+    providerDispatch === undefined ? undefined : { providerDispatch },
+  )
 }
 
 /** Attempts per turn, counting the first. Two retries is what the measured transient window needs;

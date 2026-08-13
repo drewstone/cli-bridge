@@ -291,6 +291,27 @@ describe('a post-output failure answers with its reason, not an empty 200', () =
     expect(body).toContain('"type":"upstream"')
   })
 
+  it('preserves Router’s typed pre-provider proof on both response shapes', async () => {
+    const error = new BackendError('candidate grant limit exceeded', 'upstream', undefined, {
+      providerDispatch: 'not_started',
+    })
+    const app = chatApp(throwingBackend([{ internal_session_id: 'ses_abc' }], error))
+
+    const response = await postChat(app, {
+      model: 'opencode/zai-coding-plan/glm-5.2',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(response.status).toBe(502)
+    expect(response.json.error?.provider_dispatch).toBe('not_started')
+
+    const body = await streamChat(app, {
+      model: 'opencode/zai-coding-plan/glm-5.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    })
+    expect(body).toContain('"provider_dispatch":"not_started"')
+  })
+
   it('leaves a successful run untouched — no error field, no status change', async () => {
     const app = chatApp({
       name: 'opencode',

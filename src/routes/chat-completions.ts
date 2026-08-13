@@ -1144,11 +1144,17 @@ function errorResponse(c: Context, err: unknown): Response {
   // is a timeout. Falling through to the generic 500 below would have relabelled
   // every upstream fault as a bridge fault.
   if (err instanceof BackendReportedFailureError) {
-    return c.json({ error: { message: err.message, type: err.code } }, err.code === 'timeout' ? 504 : 502)
+    return c.json(
+      { error: { message: err.message, type: err.code, ...providerDispatchMetadata(err) } },
+      err.code === 'timeout' ? 504 : 502,
+    )
   }
   if (err instanceof BackendError) {
     if (err.code === 'parse_error') {
-      return c.json({ error: { message: err.message, type: err.code } }, 400)
+      return c.json(
+        { error: { message: err.message, type: err.code, ...providerDispatchMetadata(err) } },
+        400,
+      )
     }
     // Hono's typed status gate treats 499 as an unofficial code; collapse
     // that one to 504 and keep the rest as documented codes.
@@ -1158,10 +1164,24 @@ function errorResponse(c: Context, err: unknown): Response {
       : err.code === 'timeout' ? 504
       : err.code === 'aborted' ? 504
       : 502
-    return c.json({ error: { message: err.message, type: err.code } }, status)
+    return c.json(
+      { error: { message: err.message, type: err.code, ...providerDispatchMetadata(err) } },
+      status,
+    )
   }
   const message = err instanceof Error ? err.message : String(err)
   return c.json({ error: { message, type: 'server_error' } }, 500)
+}
+
+function providerDispatchMetadata(error: unknown): { provider_dispatch?: 'not_started' } {
+  if (
+    typeof error === 'object'
+    && error !== null
+    && (error as { providerDispatch?: unknown }).providerDispatch === 'not_started'
+  ) {
+    return { provider_dispatch: 'not_started' }
+  }
+  return {}
 }
 
 /**
