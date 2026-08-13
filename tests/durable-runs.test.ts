@@ -88,6 +88,24 @@ class ProfileReceiptReplayBackend extends TestBackend {
   }
 }
 
+class ProfileReceiptFailureBackend extends TestBackend {
+  async *chat(req: ChatRequest): AsyncIterable<ChatDelta> {
+    req.profile_materialization_receipt = {
+      schema: 'cli-bridge.profile-materialization.v2',
+      effectiveProfileDigest: `sha256:${'3'.repeat(64)}`,
+      harness: 'pi',
+      provider: 'tangle-router',
+      model: req.model,
+      reasoningEffort: { requested: 'ultracode', applied: 'xhigh' },
+      workspacePlanDigest: `sha256:${'4'.repeat(64)}`,
+      files: [],
+      unsupported: [],
+    }
+    yield { content: 'accepted answer' }
+    throw new BackendError('backend exited after accepted submission', 'upstream')
+  }
+}
+
 class ControlledBackend extends TestBackend {
   calls = 0
   private finishRun!: () => void
@@ -605,6 +623,41 @@ describe('durable run contract', () => {
           model: 'durable/tangle-router/deepseek-v4-flash',
           reasoningEffort: { requested: 'ultracode', applied: 'xhigh' },
         },
+      })
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
+  it('replays a profile receipt before a thrown terminal backend error', async () => {
+    const backend = new ProfileReceiptFailureBackend()
+    const ctx = fixture(backend)
+    const runId = 'profile-receipt-terminal-error'
+    const body = {
+      ...chatBody(runId),
+      model: 'durable/tangle-router/deepseek-v4-flash',
+    }
+    try {
+      const response = await postChat(ctx.app, body)
+      const text = await response.text()
+      const receiptAt = text.indexOf('"profile_materialization"')
+      const errorAt = text.indexOf('backend exited after accepted submission')
+
+      expect(response.status).toBe(200)
+      expect(receiptAt).toBeGreaterThan(-1)
+      expect(errorAt).toBeGreaterThan(receiptAt)
+      expect(text).toContain('data: [DONE]')
+      expect(ctx.runs.get(runId)?.snapshot()).toMatchObject({
+        status: 'error',
+        terminal: true,
+        profileMaterialization: {
+          schema: 'cli-bridge.profile-materialization.v2',
+          provider: 'tangle-router',
+          model: 'durable/tangle-router/deepseek-v4-flash',
+        },
+      })
+      expect(ctx.runs.get(runId)?.failure()).toMatchObject({
+        message: 'backend exited after accepted submission',
       })
     } finally {
       ctx.cleanup()
