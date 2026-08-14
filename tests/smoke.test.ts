@@ -1396,6 +1396,22 @@ describe('GET /v1/models', () => {
     expect(ids.has('opencode/anthropic/claude-sonnet-4-5')).toBe(false)
   })
 
+  it('keeps the current Pi model family when live discovery is unavailable', async () => {
+    const app = new Hono()
+    const registry = new BackendRegistry().register(new FakeBackend('pi'))
+    mountModels(app, { registry, piBin: '/nonexistent/pi' })
+
+    const res = await app.request('/v1/models')
+    expect(res.status).toBe(200)
+    const body = await res.json() as { data: Array<{ id: string }> }
+    const ids = new Set(body.data.map((model) => model.id))
+
+    expect(ids.has('pi/openai-codex/gpt-5.6-luna')).toBe(true)
+    expect(ids.has('pi/openai-codex/gpt-5.6-sol')).toBe(true)
+    expect(ids.has('pi/openai-codex/gpt-5.6-terra')).toBe(true)
+    expect(ids.has('pi/openai-codex/gpt-5.3-codex')).toBe(false)
+  })
+
   it('excludes models from unavailable backends', async () => {
     const app = new Hono()
     const registry = new BackendRegistry()

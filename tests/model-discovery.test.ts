@@ -39,6 +39,7 @@ describe('parsePiModels', () => {
     'anthropic              claude-3-5-sonnet           200K     8K       no        yes',
     'deepseek               deepseek-v4-pro             1M       384K     yes       no',
     'openai-codex           gpt-5.5                     272K     128K     yes       yes',
+    'openai-codex           gpt-5.6-luna                272K     128K     yes       yes',
     'zai-glm                glm-4.7                     200K     128K     yes       yes',
   ].join('\n')
 
@@ -46,6 +47,7 @@ describe('parsePiModels', () => {
     const ids = parsePiModels(table, providers)
     expect(ids).toContain('deepseek/deepseek-v4-pro')
     expect(ids).toContain('openai-codex/gpt-5.5')
+    expect(ids).toContain('openai-codex/gpt-5.6-luna')
     expect(ids).toContain('zai-glm/glm-4.7')
   })
 
