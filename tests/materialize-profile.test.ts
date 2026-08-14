@@ -16,7 +16,10 @@ import {
   materializeProfile,
   normalizeSkillMd,
 } from '@tangle-network/agent-profile-materialize'
-import { provisionProfileWorkspace } from '../src/backends/profile-support.js'
+import {
+  provisionProfileWorkspace,
+  resolveAgentProfile,
+} from '../src/backends/profile-support.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
 import type { ChatRequest } from '../src/backends/types.js'
 import { buildDockerExecArgs } from '../src/executors/docker.js'
@@ -38,6 +41,34 @@ const FULL: AgentProfile = {
 const paths = (h: HarnessId) => materializeProfile(FULL, h).files.map((f) => f.relPath).sort()
 const has = (h: HarnessId, p: string) => paths(h).includes(p)
 const unsupportedDims = (h: HarnessId) => materializeProfile(FULL, h).unsupported.map((u) => u.dimension)
+
+describe('AgentProfile intake', () => {
+  it('accepts the Runtime 0.134.4 child output limit', () => {
+    const profile = {
+      name: 'strict-screen-durable-route-child',
+      harness: 'pi',
+      model: {
+        default: 'deepseek-v4-flash',
+        provider: 'tangle-router',
+        reasoningEffort: 'high',
+        maxTotalOutputTokens: 32_000,
+        metadata: { maxTokens: 32_000 },
+      },
+    } satisfies AgentProfile
+    const req: ChatRequest = {
+      model: 'pi/tangle-router/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'work' }],
+      agent_profile: profile,
+    }
+
+    const snapshot = resolveAgentProfile(req, null)
+
+    expect(snapshot).toMatchObject(profile)
+    expect(snapshot?.model?.maxTotalOutputTokens).toBe(32_000)
+    expect(req.agent_profile).toBe(snapshot)
+    expect(Object.isFrozen(snapshot)).toBe(true)
+  })
+})
 
 describe('materializeProfile — verified per-harness routing', () => {
   it('normalizeSkillMd → name+description frontmatter, body preserved, VB fm stripped', () => {
