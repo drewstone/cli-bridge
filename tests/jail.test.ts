@@ -347,6 +347,31 @@ describe('auth preservation', () => {
     }
   })
 
+  it('seeds only OpenCode auth into a writable jailed data directory', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-opencode-home-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    const data = join(fakeHome, '.local', 'share', 'opencode')
+    await mkdir(join(fakeHome, '.config', 'opencode'), { recursive: true })
+    await mkdir(data, { recursive: true })
+    await writeFile(join(data, 'auth.json'), '{"provider":"token"}')
+    await writeFile(join(data, 'opencode.db'), 'must not be copied')
+    const previousHome = process.env.HOME
+    process.env.HOME = fakeHome
+    try {
+      const entries = authSourcesFor('opencode')
+      const dataEntry = entries.find((entry) => entry.jailRel === '.local/share/opencode')
+      expect(dataEntry).toMatchObject({
+        source: data,
+        mode: 'seed-writable',
+        only: ['auth.json'],
+      })
+      expect(entries.find((entry) => entry.jailRel === '.config/opencode')?.mode).toBe('read-only')
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+    }
+  })
+
   it('authSourcesFor(pi) preserves ~/.pi/agent so a jailed pi keeps its provider/model config', async () => {
     const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-pihome-'))
     cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))

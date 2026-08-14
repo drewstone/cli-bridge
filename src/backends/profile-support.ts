@@ -547,7 +547,6 @@ function assertExactProfileRequest(
       ? requestedModel.slice(harness.length + 1)
       : requestedModel
     const qualified = requestedProvider
-      && !providerSelectsHarness(requestedProvider, harness)
       && !modelWithoutHarness.startsWith(`${requestedProvider}/`)
       ? `${requestedProvider}/${modelWithoutHarness}`
       : modelWithoutHarness
@@ -560,7 +559,7 @@ function assertExactProfileRequest(
   } else if (requestedProvider !== undefined) {
     const slash = wireModel.indexOf('/')
     const wireProvider = slash > 0 ? wireModel.slice(0, slash) : null
-    if (!providerSelectsHarness(requestedProvider, harness) && wireProvider !== requestedProvider) {
+    if (wireProvider !== requestedProvider) {
       throw new BackendError(
         `request model ${JSON.stringify(req.model)} does not select agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
         'parse_error',
@@ -583,14 +582,10 @@ function modelWithinHarness(model: string, harness: HarnessId): string {
 
 function harnessModelPrefixes(harness: HarnessId): readonly string[] {
   return harness === 'claude-code'
-    ? ['claude-code', 'claude', 'claudish']
+    ? ['claude-code', 'claude']
     : harness === 'kimi-code'
       ? ['kimi-code', 'kimi']
       : [harness]
-}
-
-function providerSelectsHarness(provider: string, harness: HarnessId): boolean {
-  return harnessModelPrefixes(harness).includes(provider)
 }
 
 /**

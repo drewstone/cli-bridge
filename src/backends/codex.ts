@@ -307,11 +307,15 @@ export function splitCodexModel(
   return { provider: remainder.slice(0, slash), model: remainder.slice(slash + 1) }
 }
 
-export function codexReasoningEffort(effort: ChatRequest['effort']): 'minimal' | 'low' | 'medium' | 'high' | null {
+export function codexReasoningEffort(
+  effort: ChatRequest['effort'],
+): 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   if (!effort) return null
-  if (effort === 'none') return 'minimal' // codex can't disable reasoning — clamp `none` to its floor
-  if (effort === 'xhigh' || effort === 'ultracode') return 'high' // codex caps at `high`
-  return effort // minimal | low | medium | high pass straight through
+  // Codex CLI 0.147.0 enumerated none, low, medium, high, xhigh, and max.
+  // Its current default model rejects minimal, so map the shared floor to low.
+  if (effort === 'minimal') return 'low'
+  if (effort === 'ultracode') return 'max'
+  return effort
 }
 
 /**
