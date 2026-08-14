@@ -1386,6 +1386,12 @@ describe('PiBackend', () => {
       },
       { finish_reason: 'stop' },
     ])
+    // Pi's own dollar figure is a local catalog number. Neither Pi nor the proxy
+    // reports billed dollars, so no delta may present one as a receipt.
+    for (const delta of deltas) {
+      expect(delta.usage?.cost_known).not.toBe(true)
+      expect(delta.usage?.cost).toBeUndefined()
+    }
   })
 
   it('streams agent_end messages as the legacy fallback when turn receipts are absent', async () => {
