@@ -307,11 +307,14 @@ export function splitCodexModel(
   return { provider: remainder.slice(0, slash), model: remainder.slice(slash + 1) }
 }
 
-export function codexReasoningEffort(effort: ChatRequest['effort']): 'minimal' | 'low' | 'medium' | 'high' | null {
+export function codexReasoningEffort(
+  effort: ChatRequest['effort'],
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra' | null {
   if (!effort) return null
-  if (effort === 'none') return 'minimal' // codex can't disable reasoning — clamp `none` to its floor
-  if (effort === 'xhigh' || effort === 'ultracode') return 'high' // codex caps at `high`
-  return effort // minimal | low | medium | high pass straight through
+  // Codex CLI 0.147.0 accepts the canonical values directly.
+  // It also accepts ultra end-to-end although invalid-value errors omit it.
+  if (effort === 'ultracode') return 'ultra'
+  return effort
 }
 
 /**

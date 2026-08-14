@@ -143,6 +143,12 @@ Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
 - local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`, `prime`) persist the full profile and reject profile dimensions they cannot execute
+- `codex/default` selects the Codex CLI configured default without a model override.
+  Its exact profile omits `model.provider`; a harness name is not a model provider.
+- Codex reasoning maps the shared values directly and maps `ultracode` to native `ultra`.
+  Codex CLI 0.147.0 supplied the accepted values through direct probes.
+- A jailed OpenCode run seeds only `auth.json` into its writable private data directory.
+  The bridge does not expose or copy the host database and logs.
 - the dollar channel has two lanes and they never merge. `cost` travels only with `cost_known: true` and `cost_provenance: provider-receipt` or `billing-receipt`; a consumer may debit a dollar budget with it. Every other case reports `cost_known: false`, plus an optional `estimated_cost` tagged `catalog-estimate` that is never billed spend. A backend that reports no dollars sends no dollar amount, because a zero would read as a measured free turn
 - the `claude` harness reports the `total_cost_usd` Anthropic billed for the whole `claude -p` invocation. It is a provider receipt, so it carries `cost_known: true`, `provider-receipt` provenance, and `cost_scope: total` — the complete charge for the invocation, including every internal model call the harness made
 - Pi requires `pi/<provider>/<model>`. The provider and model must have an explicit `baseUrl` and API mode in Pi's `models.json`; the bridge refuses missing or ambiguous selections before Pi starts

@@ -64,6 +64,9 @@ const CODEX_SEED_ENTRIES = ['auth.json', 'config.toml'] as const
  */
 const CLAUDE_SEED_ENTRIES = ['.credentials.json', 'credentials.json', 'settings.json'] as const
 
+/** OpenCode stores credentials beside a writable database and log directory. */
+const OPENCODE_SEED_ENTRIES = ['auth.json'] as const
+
 /** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME
  * override (matches how the backends resolve config/auth at runtime). */
 function backendHome(): string {
@@ -115,6 +118,15 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
       e.mode = 'seed-writable'
       e.only = [...CODEX_SEED_ENTRIES]
       e.envVar = 'CODEX_HOME'
+    }
+  }
+  if (backendName === 'opencode') {
+    // OpenCode writes its database and logs below XDG_DATA_HOME before a turn.
+    // Seed only auth.json so the jailed data directory stays small and writable.
+    for (const entry of out) {
+      if (entry.jailRel !== '.local/share/opencode') continue
+      entry.mode = 'seed-writable'
+      entry.only = [...OPENCODE_SEED_ENTRIES]
     }
   }
   if (backendName === 'pi') {

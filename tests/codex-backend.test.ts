@@ -175,7 +175,7 @@ describe('CodexBackend model translation', () => {
     expect(observed.args).toContain('model="gpt-5.1-codex"')
   })
 
-  it('accepts the default route when the profile names Codex as its provider', async () => {
+  it('accepts an honest unqualified default route', async () => {
     const observed: { args?: string[] } = {}
     const backend = new CodexBackend({
       bin: 'codex',
@@ -189,7 +189,7 @@ describe('CodexBackend model translation', () => {
         model: 'codex/default',
         agent_profile: {
           harness: 'codex',
-          model: { provider: 'codex', default: 'default' },
+          model: { default: 'default' },
         },
       },
       null,
@@ -198,6 +198,27 @@ describe('CodexBackend model translation', () => {
 
     expect(observed.args!.some((arg) => arg.startsWith('model_provider='))).toBe(false)
     expect(observed.args!.some((arg) => arg.startsWith('model='))).toBe(false)
+  })
+
+  it('rejects a harness name presented as the model provider', async () => {
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], {}),
+    })
+
+    await expect(collect(backend.chat(
+      {
+        ...request(),
+        model: 'codex/default',
+        agent_profile: {
+          harness: 'codex',
+          model: { provider: 'codex', default: 'default' },
+        },
+      },
+      null,
+      new AbortController().signal,
+    ))).rejects.toThrow(/conflicts with agent_profile\.model/u)
   })
 
   it('splitCodexModel covers the alias/bare/qualified shapes', () => {

@@ -23,6 +23,7 @@ import { KimiBackend, thinkingFlagForEffort } from '../src/backends/kimi.js'
 import { CodexBackend, codexReasoningEffort } from '../src/backends/codex.js'
 import { OpencodeBackend, opencodeVariantForEffort } from '../src/backends/opencode.js'
 import { GeminiBackend, geminiSandboxFlag, geminiYoloFlag } from '../src/backends/gemini.js'
+import { profileExecutionIdentity } from '../src/backends/profile-support.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountSessions } from '../src/routes/sessions.js'
 import { mountHealth } from '../src/routes/health.js'
@@ -320,11 +321,14 @@ describe('reasoning effort mapping', () => {
     expect(thinkingFlagForEffort(undefined)).toBeNull()
   })
 
-  it('clamps Codex effort to its supported ceiling/floor', () => {
+  it('maps every shared effort value onto current Codex values', () => {
+    expect(codexReasoningEffort('none')).toBe('none')
+    expect(codexReasoningEffort('minimal')).toBe('minimal')
+    expect(codexReasoningEffort('low')).toBe('low')
+    expect(codexReasoningEffort('medium')).toBe('medium')
     expect(codexReasoningEffort('high')).toBe('high')
-    expect(codexReasoningEffort('xhigh')).toBe('high')
-    expect(codexReasoningEffort('ultracode')).toBe('high')
-    expect(codexReasoningEffort('none')).toBe('minimal')
+    expect(codexReasoningEffort('xhigh')).toBe('xhigh')
+    expect(codexReasoningEffort('ultracode')).toBe('ultra')
     expect(codexReasoningEffort(undefined)).toBeNull()
   })
 
@@ -347,6 +351,24 @@ describe('reasoning effort mapping', () => {
       if (oldSandbox === undefined) delete process.env.GEMINI_SANDBOX
       else process.env.GEMINI_SANDBOX = oldSandbox
     }
+  })
+})
+
+describe('exact profile route authority', () => {
+  it('does not accept the Claudish proxy as a Claude Code route alias', () => {
+    expect(() => profileExecutionIdentity(
+      {
+        model: 'claudish/sonnet',
+        messages: [{ role: 'user', content: 'test' }],
+        agent_profile: {
+          harness: 'claude-code',
+          model: { provider: 'anthropic', default: 'sonnet' },
+        },
+      },
+      null,
+      'claude-code',
+      null,
+    )).toThrow(/does not select harness/u)
   })
 })
 
