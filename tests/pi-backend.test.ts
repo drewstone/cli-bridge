@@ -415,14 +415,23 @@ describe('PiBackend', () => {
         model: {
           provider: 'tangle-router',
           default: 'fireworks/deepseek-v4-flash',
+          maxTotalOutputTokens: 131_072,
+          metadata: { maxTokens: 65_536 },
         },
       },
     }
 
-    expect(profileExecutionIdentity(request, null, 'pi', null)).toMatchObject({
+    const identity = profileExecutionIdentity(request, null, 'pi', null)
+
+    expect(identity).toMatchObject({
       provider: 'tangle-router',
       model: 'pi/tangle-router/fireworks/deepseek-v4-flash',
     })
+    expect(request.agent_profile?.model?.maxTotalOutputTokens).toBe(131_072)
+    expect(request.agent_profile?.model?.metadata?.maxTokens).toBe(65_536)
+    expect(Object.isFrozen(request.agent_profile)).toBe(true)
+    expect(Object.isFrozen(request.agent_profile?.model)).toBe(true)
+    expect(Object.isFrozen(request.agent_profile?.model?.metadata)).toBe(true)
   })
 
   it('applies one exact profile while leaving the task unchanged', async () => {
