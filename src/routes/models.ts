@@ -49,9 +49,13 @@ const PI_MODELS: ReadonlyArray<ModelSpec> = [
   { id: 'moonshot/kimi-k2.6', note: 'Moonshot Kimi K2.6 via pi' },
   { id: 'moonshot/kimi-k2-thinking', note: 'Moonshot Kimi K2 Thinking via pi' },
   { id: 'kimi-for-coding-oauth/kimi-k2.6', note: 'Kimi K2.6 via pi kimi-for-coding-oauth extension' },
-  { id: 'openai-codex/gpt-5.3-codex', note: 'GPT-5.3-codex via pi openai-codex extension' },
+  { id: 'openai-codex/gpt-5.3-codex-spark', note: 'GPT-5.3 Codex Spark via pi openai-codex extension' },
   { id: 'openai-codex/gpt-5.4', note: 'GPT-5.4 via pi openai-codex extension' },
+  { id: 'openai-codex/gpt-5.4-mini', note: 'GPT-5.4 Mini via pi openai-codex extension' },
   { id: 'openai-codex/gpt-5.5', note: 'GPT-5.5 via pi openai-codex extension' },
+  { id: 'openai-codex/gpt-5.6-luna', note: 'GPT-5.6 Luna via pi openai-codex extension' },
+  { id: 'openai-codex/gpt-5.6-sol', note: 'GPT-5.6 Sol via pi openai-codex extension' },
+  { id: 'openai-codex/gpt-5.6-terra', note: 'GPT-5.6 Terra via pi openai-codex extension' },
   { id: 'zai-coding-paas/glm-5.1', note: 'GLM 5.1 via pi zai-coding-paas extension' },
   { id: 'zai-coding-paas/glm-5-turbo', note: 'GLM 5 Turbo via pi zai-coding-paas extension' },
   { id: 'zai-coding-paas/glm-5', note: 'GLM 5 via pi zai-coding-paas extension' },
@@ -125,7 +129,9 @@ export function mountModels(
         case 'pi': {
           const models = await discoverModels('pi', {
             bin: deps.piBin ?? 'pi',
-            args: ['--list-models'],
+            // Model discovery reads Pi's local catalog. Offline mode avoids
+            // unrelated startup network checks that can exceed our timeout.
+            args: ['--offline', '--list-models'],
             providers: PI_PROVIDERS,
             parse: parsePiModels,
             fallback: PI_MODELS,
