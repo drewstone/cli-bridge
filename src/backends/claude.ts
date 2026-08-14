@@ -77,6 +77,35 @@ type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamR
 
 const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 300
 
+/**
+ * Build the usage record for a claude `result` line.
+ *
+ * `total_cost_usd` is the dollar figure Anthropic billed for the whole
+ * `claude -p` invocation, including every internal model call the harness made.
+ * It is a provider receipt, so it travels as `cost_known: true` with
+ * `provider-receipt` provenance — the lane a dollar budget may debit. It is
+ * also the complete charge for the invocation, which is what `cost_scope:
+ * 'total'` asserts.
+ *
+ * A run that reports no figure returns `cost_known: false` with no dollar
+ * amount at all. A zero here would read as a measured free turn.
+ */
+function claudeResultUsage(result: ClaudeStreamResult): NonNullable<ChatDelta['usage']> | undefined {
+  const cost = result.total_cost_usd
+  const billed = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : undefined
+  if (billed === undefined) {
+    if (!result.usage) return undefined
+    return { ...result.usage, cost_known: false }
+  }
+  return {
+    ...(result.usage ?? {}),
+    cost: billed,
+    cost_known: true,
+    cost_provenance: 'provider-receipt',
+    cost_scope: 'total',
+  }
+}
+
 function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
   const fallback = 'provider returned an error result'
   if (!detail) return fallback
@@ -359,9 +388,10 @@ export class ClaudeBackend implements Backend {
           } else {
             // tool_calls wins over stop when the model emitted at least
             // one tool_use block during this turn (native or MCP).
+            const usage = claudeResultUsage(r)
             yield {
               finish_reason: emittedAnyToolCall ? 'tool_calls' : 'stop',
-              usage: r.usage,
+              ...(usage ? { usage } : {}),
               internal_session_id: r.session_id ?? internalSessionId,
             }
           }
