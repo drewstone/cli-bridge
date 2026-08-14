@@ -323,12 +323,12 @@ describe('reasoning effort mapping', () => {
 
   it('maps every shared effort value onto current Codex values', () => {
     expect(codexReasoningEffort('none')).toBe('none')
-    expect(codexReasoningEffort('minimal')).toBe('low')
+    expect(codexReasoningEffort('minimal')).toBe('minimal')
     expect(codexReasoningEffort('low')).toBe('low')
     expect(codexReasoningEffort('medium')).toBe('medium')
     expect(codexReasoningEffort('high')).toBe('high')
     expect(codexReasoningEffort('xhigh')).toBe('xhigh')
-    expect(codexReasoningEffort('ultracode')).toBe('max')
+    expect(codexReasoningEffort('ultracode')).toBe('ultra')
     expect(codexReasoningEffort(undefined)).toBeNull()
   })
 

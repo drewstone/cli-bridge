@@ -309,12 +309,11 @@ export function splitCodexModel(
 
 export function codexReasoningEffort(
   effort: ChatRequest['effort'],
-): 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra' | null {
   if (!effort) return null
-  // Codex CLI 0.147.0 enumerated none, low, medium, high, xhigh, and max.
-  // Its current default model rejects minimal, so map the shared floor to low.
-  if (effort === 'minimal') return 'low'
-  if (effort === 'ultracode') return 'max'
+  // Codex CLI 0.147.0 accepts the canonical values directly.
+  // It also accepts ultra end-to-end although invalid-value errors omit it.
+  if (effort === 'ultracode') return 'ultra'
   return effort
 }
 
