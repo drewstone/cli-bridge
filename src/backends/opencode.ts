@@ -32,7 +32,8 @@ import {
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { registerJailReadable } from '../jail/index.js'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
@@ -111,6 +112,15 @@ export class OpencodeBackend implements Backend {
     // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
     // expose its dir read-only so the confined opencode can still read it.
     if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
+
+    // opencode installs itself under $HOME, and an fs-jail deliberately hides /home. The generic
+    // derivation in `toolchainReadPaths` reaches the install root only when the on-PATH entry
+    // realpaths INTO it; an operator whose `opencode` is a wrapper script elsewhere realpaths to
+    // the wrapper's own directory, and the jailed run then exits 127 on a binary that exists:
+    //   timeout: failed to run command '/home/<user>/.opencode/bin/opencode': No such file or directory
+    // The install root is a fixed property of this harness, so this backend declares it rather
+    // than leaving every operator to discover BRIDGE_JAIL_RO_PATHS from a 127.
+    registerJailReadable(req.jailSpec, process.env.OPENCODE_INSTALL_DIR || join(homedir(), '.opencode'))
 
     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
