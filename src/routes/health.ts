@@ -21,7 +21,8 @@
  *   2. TTL cache (`HEALTH_CACHE_MS`). Successful probes are memoized
  *      for the TTL window (default 30 s). Watchdog calls return
  *      cached results in <1 ms — the only spawn cost is once per
- *      cache-eviction. `?force=1` bypasses the cache for debugging.
+ *      cache-eviction, and concurrent cache misses share that probe.
+ *      `?force=1` bypasses the cache for debugging.
  *
  * Only `ready` verdicts are cached. A failing backend is RE-PROBED on
  * every request, because a cached failure is the worse of the two
@@ -110,6 +111,25 @@ export function mountHealth(
   const now = options.now ?? Date.now
   const probe = options.probe ?? ((b) => boundedProbe(b, probeTimeoutMs))
   const cache = new Map<string, CacheEntry>()
+  const inFlight = new Map<string, Promise<CacheEntry>>()
+
+  const probeFresh = (backend: Backend): Promise<CacheEntry> => {
+    const existing = inFlight.get(backend.name)
+    if (existing) return existing
+
+    const pending = (async () => {
+      const probedAt = now()
+      const health = await probe(backend)
+      const fresh = { probedAt, health }
+      cache.set(backend.name, fresh)
+      return fresh
+    })()
+    inFlight.set(backend.name, pending)
+    void pending.finally(() => {
+      if (inFlight.get(backend.name) === pending) inFlight.delete(backend.name)
+    }).catch(() => {})
+    return pending
+  }
 
   app.get('/health', async (c) => {
     const force = c.req.query('force') === '1'
@@ -121,6 +141,11 @@ export function mountHealth(
     const probes: ReportedHealth[] = await Promise.all(
       deps.registry.all().map(async (b) => {
         const cached = cache.get(b.name)
+        const pending = inFlight.get(b.name)
+        if (pending) {
+          const fresh = await pending
+          return { ...fresh.health, probed_at: new Date(fresh.probedAt).toISOString(), cached: false }
+        }
         // Reusable only while it says `ready`: a fault must be retried so a
         // fixed fault recovers without restarting the process.
         if (!force
@@ -130,10 +155,8 @@ export function mountHealth(
           && ts - cached.probedAt < cacheMs) {
           return { ...cached.health, probed_at: new Date(cached.probedAt).toISOString(), cached: true }
         }
-        const probedAt = now()
-        const fresh = await probe(b)
-        cache.set(b.name, { probedAt, health: fresh })
-        return { ...fresh, probed_at: new Date(probedAt).toISOString(), cached: false }
+        const fresh = await probeFresh(b)
+        return { ...fresh.health, probed_at: new Date(fresh.probedAt).toISOString(), cached: false }
       }),
     )
     const any = probes.some((p) => p.state === 'ready')
