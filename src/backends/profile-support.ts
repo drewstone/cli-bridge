@@ -149,7 +149,7 @@ export function provisionProfileWorkspace(
   try {
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
     assertWorkspacePlanSupported(plan)
-    const applied = applyWorkspacePlan(plan, workspaceCwd)
+    const applied = applyWorkspacePlan(plan, workspaceCwd, sessionAppliedPlanDigest(session, workspaceCwd))
     const receipt = retainProfileMaterializationReceipt(
       req,
       profile,
@@ -400,6 +400,28 @@ function retainProfileMaterializationReceipt(
   req.profile_materialization_receipt = receipt
   console.info(`[cli-bridge] profile materialization receipt ${JSON.stringify(receipt)}`)
   return receipt
+}
+
+/**
+ * The `workspacePlanDigest` this session already applied into its own cwd,
+ * shaped as `applyWorkspacePlan` options.
+ *
+ * A resumed session's workspace is the running agent's live state — claude-code
+ * stores session memory in CLAUDE.md — so re-application must key on what the
+ * session proved it applied, not on the current file bytes. The digest is
+ * passed only when the materialization target IS the session's recorded cwd; a
+ * caller that reuses a session id against a different directory gets a full
+ * materialization there.
+ */
+function sessionAppliedPlanDigest(
+  session: SessionRecord | null,
+  workspaceCwd: string,
+): { appliedPlanDigest?: string } {
+  if (!session || session.cwd !== workspaceCwd) return {}
+  const receipt = session.metadata?.profile_materialization
+  if (!receipt || typeof receipt !== 'object') return {}
+  const digest = (receipt as { workspacePlanDigest?: unknown }).workspacePlanDigest
+  return typeof digest === 'string' && digest.length > 0 ? { appliedPlanDigest: digest } : {}
 }
 
 const profileSnapshots = new WeakMap<ChatRequest, AgentProfile | null>()
