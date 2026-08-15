@@ -10,6 +10,7 @@
 
 import type { Context } from 'hono'
 import { Hono } from 'hono'
+import { streamSSE } from 'hono/streaming'
 import {
   AgentRunCancellationAcknowledgementSchema,
   AgentRunCancellationRequestSchema,
@@ -23,6 +24,8 @@ import {
   RunReplayCursorError,
   type RunSnapshot,
 } from '../runs/registry.js'
+import type { RetainedEventRecord } from '../sessions/store.js'
+import type { DurableRetainedRunSnapshot } from '../sessions/retained.js'
 import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
@@ -51,12 +54,26 @@ function retainCancellation(
   }
 }
 
-export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
+export function mountRuns(app: Hono, deps: {
+  runs: RunRegistry
+  /** Durable retained-run reads used after the in-memory Run has been retired. */
+  retainedRuns?: {
+    runSnapshot(runId: string): DurableRetainedRunSnapshot | null
+    assertRunReplayCursor(runId: string, afterSequence: number): void
+    runEvents(runId: string, afterSequence: number, signal: AbortSignal): AsyncIterable<RetainedEventRecord>
+  }
+}): void {
   const cancellations = new Map<string, CancellationRecord>()
 
   app.get('/v1/runs/:id', async (c) => {
-    const run = deps.runs.get(c.req.param('id'))
-    if (!run) return runNotFound(c)
+    const id = c.req.param('id')
+    const run = deps.runs.get(id)
+    if (!run) {
+      const retained = deps.retainedRuns?.runSnapshot(id)
+      if (!retained) return runNotFound(c)
+      setRetainedRunHeaders(c, retained)
+      return c.json(retained)
+    }
     const waitMs = parseWaitMs(c)
     if (!waitMs.ok) return invalidWait(c, waitMs.message)
     const snapshot = await terminalSnapshot(run, waitMs.value)
@@ -65,13 +82,24 @@ export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
   })
 
   app.get('/v1/runs/:id/events', (c) => {
-    const run = deps.runs.get(c.req.param('id'))
-    if (!run) return runNotFound(c)
     const cursor = resolveRunEventCursor(
       c.req.header('Last-Event-ID'),
       c.req.header('X-Last-Event-Id'),
     )
     if (!cursor.ok) return invalidRequest(c, cursor.message)
+    const id = c.req.param('id')
+    const run = deps.runs.get(id)
+    if (!run) {
+      const retained = deps.retainedRuns
+      if (!retained) return runNotFound(c)
+      try {
+        retained.assertRunReplayCursor(id, cursor.value)
+      } catch (error) {
+        if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
+        return retainedRunError(c, error)
+      }
+      return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))
+    }
     try {
       run.assertReplayCursor(cursor.value)
     } catch (error) {
@@ -285,6 +313,66 @@ function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
   if (snapshot.replay.expiresAt !== null) {
     c.header('X-Run-Replay-Expires-At', String(snapshot.replay.expiresAt))
   }
+}
+
+function setRetainedRunHeaders(c: Context, snapshot: DurableRetainedRunSnapshot): void {
+  c.header('X-Run-Id', snapshot.id)
+  c.header('X-Run-Request-Digest', snapshot.requestDigest)
+  c.header('X-Run-Status', snapshot.status)
+  c.header('X-Run-State', snapshot.state)
+  c.header('X-Run-Terminal', String(snapshot.terminal))
+  if ('lastSeq' in snapshot) c.header('X-Last-Event-Id', String(snapshot.lastSeq))
+}
+
+function streamRetainedRunEvents(
+  c: Context,
+  source: (signal: AbortSignal) => AsyncIterable<RetainedEventRecord>,
+): Response {
+  return streamSSE(c, async (stream) => {
+    const controller = new AbortController()
+    stream.onAbort(() => controller.abort())
+    try {
+      for await (const item of source(controller.signal)) {
+        if (controller.signal.aborted) return
+        await stream.writeSSE({
+          id: String(item.envelope.sequence),
+          event: item.envelope.event.type,
+          data: JSON.stringify(item.envelope),
+        })
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return
+      await stream.writeSSE({
+        event: 'error',
+        data: JSON.stringify({
+          error: {
+            message: error instanceof Error ? error.message : String(error),
+            type: 'server_error',
+          },
+        }),
+      })
+    }
+  })
+}
+
+function retainedRunError(c: Context, error: unknown): Response {
+  if (
+    error &&
+    typeof error === 'object' &&
+    'status' in error &&
+    'code' in error &&
+    typeof error.status === 'number' &&
+    typeof error.code === 'string'
+  ) {
+    return c.json(
+      { error: { message: error instanceof Error ? error.message : String(error), type: error.code } },
+      error.status as 400 | 404 | 409 | 500 | 501 | 502 | 503,
+    )
+  }
+  return c.json(
+    { error: { message: error instanceof Error ? error.message : String(error), type: 'server_error' } },
+    500,
+  )
 }
 
 function invalidWait(c: Context, message: string): Response {

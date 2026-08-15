@@ -124,6 +124,8 @@ Subsequent calls with the same `X-Session-Id` resume the conversation. Claude Co
 
 ## API
 
+The durable retained-session and native-interaction contract is documented in [docs/design/retained-sessions.md](docs/design/retained-sessions.md).
+
 ### `POST /v1/chat/completions`
 
 OpenAI Chat Completions.

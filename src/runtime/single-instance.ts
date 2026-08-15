@@ -25,7 +25,19 @@
  * graceful exit removes the file in `release()`.
  */
 
-import { openSync, writeSync, closeSync, readFileSync, unlinkSync, constants as fsConstants } from 'node:fs'
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -50,6 +62,24 @@ export class PortAlreadyBoundError extends Error {
     )
     this.name = 'PortAlreadyBoundError'
   }
+}
+
+/** Create one local-user-only directory for durable bridge state. */
+export function ensurePrivateDataDirectory(inputPath: string): string {
+  mkdirSync(inputPath, { recursive: true, mode: 0o700 })
+  const path = realpathSync(inputPath)
+  const metadata = lstatSync(path)
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`CLI Bridge data path ${JSON.stringify(path)} is not a real directory`)
+  }
+  if (typeof process.getuid === 'function' && metadata.uid !== process.getuid()) {
+    throw new Error(`CLI Bridge data directory ${JSON.stringify(path)} is owned by uid ${metadata.uid}`)
+  }
+  chmodSync(path, 0o700)
+  if ((statSync(path).mode & 0o777) !== 0o700) {
+    throw new Error(`CLI Bridge data directory ${JSON.stringify(path)} could not be restricted to mode 0700`)
+  }
+  return path
 }
 
 /**

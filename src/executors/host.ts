@@ -122,6 +122,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     // do NOT call child.unref() — the bridge still owns the child for
     // the lifetime of the chat() call.
     const child = spawn(jailed.bin, jailed.args, {
+      signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
       env: sanitizeHostEnv(jailed.env, opts.cwd),
