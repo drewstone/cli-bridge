@@ -649,6 +649,60 @@ describe('defect 2 — a failing backend is retried, and a cached verdict says s
     expect(probes).toBe(1)
   })
 
+  it('single-flights concurrent cold probes and retries after a failed probe', async () => {
+    const app = new Hono()
+    let mode: 'ready' | 'error' = 'ready'
+    let probes = 0
+    let active = 0
+    let maxActive = 0
+    const backend = {
+      name: 'opencode',
+      matches: () => true,
+      health: async (): Promise<BackendHealth> => {
+        probes += 1
+        active += 1
+        maxActive = Math.max(maxActive, active)
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          return mode === 'ready'
+            ? { name: 'opencode', state: 'ready', version: '1.18.9' }
+            : { name: 'opencode', state: 'error', detail: 'container gone' }
+        } finally {
+          active -= 1
+        }
+      },
+      chat: async function* () { /* unused */ },
+    } as unknown as Backend
+    const registry = new BackendRegistry().register(backend)
+    mountHealth(app, { registry }, { cacheMs: 60_000, probe: (b) => b.health() })
+
+    const cold = await Promise.all(Array.from({ length: 9 }, () => app.request('/health')))
+    expect(cold.map((response) => response.status)).toEqual(Array(9).fill(200))
+    const coldBodies = await Promise.all(cold.map(async (response) => await response.json() as HealthBody))
+    expect(probes).toBe(1)
+    expect(maxActive).toBe(1)
+    expect(new Set(coldBodies.map((body) => body.backends[0]!.probed_at)).size).toBe(1)
+    expect(coldBodies.every((body) => body.backends[0]!.cached === false)).toBe(true)
+
+    const cached = await (await app.request('/health')).json() as HealthBody
+    expect(probes).toBe(1)
+    expect(cached.backends[0]!.cached).toBe(true)
+
+    mode = 'error'
+    const failed = await Promise.all(Array.from({ length: 9 }, () => app.request('/health?force=1')))
+    expect(failed.map((response) => response.status)).toEqual(Array(9).fill(503))
+    const failedBodies = await Promise.all(failed.map(async (response) => await response.json() as HealthBody))
+    expect(probes).toBe(2)
+    expect(maxActive).toBe(1)
+    expect(failedBodies.every((body) => body.backends[0]!.cached === false)).toBe(true)
+
+    mode = 'ready'
+    const recovered = await (await app.request('/health')).json() as HealthBody
+    expect(recovered.status).toBe('ok')
+    expect(recovered.backends[0]!.cached).toBe(false)
+    expect(probes).toBe(3)
+  })
+
   it('marks a cached verdict as cached and dates it to its own probe, not to the response', async () => {
     const app = new Hono()
     let nowValue = 1_000_000
