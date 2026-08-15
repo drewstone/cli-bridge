@@ -6,12 +6,19 @@
 
 import { Hono } from 'hono'
 import type { SessionStore } from '../sessions/store.js'
+import type { RetainedSessionService } from '../sessions/retained.js'
 
-export function mountSessions(app: Hono, deps: { sessions: SessionStore }): void {
+export function mountSessions(app: Hono, deps: {
+  sessions: SessionStore
+  /** The retained API shares this resource path with legacy session mappings. */
+  retained?: Pick<RetainedSessionService, 'list'>
+}): void {
   app.get('/v1/sessions', (c) => {
     const parsed = Number.parseInt(c.req.query('limit') ?? '50', 10)
     const limit = Number.isNaN(parsed) ? 50 : Math.min(Math.max(1, parsed), 500)
-    return c.json({ data: deps.sessions.list(limit) })
+    const legacy = deps.sessions.list(limit)
+    if (!deps.retained) return c.json({ data: legacy })
+    return c.json({ object: 'list', data: [...deps.retained.list(limit), ...legacy] })
   })
 
   app.delete('/v1/sessions/:externalId', (c) => {

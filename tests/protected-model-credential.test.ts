@@ -9,10 +9,11 @@ import {
   mountChatCompletions,
 } from '../src/routes/chat-completions.js'
 import { RunRegistry } from '../src/runs/registry.js'
-import type { SessionRecord, SessionStore } from '../src/sessions/store.js'
+import { SessionIdentityConflictError, type SessionRecord, type SessionStore } from '../src/sessions/store.js'
 
 function memorySessions(): { store: SessionStore; records: Map<string, SessionRecord> } {
   const records = new Map<string, SessionRecord>()
+  const identities = new Map<string, 'legacy' | 'retained'>()
   const keyFor = (externalId: string, backend: string): string => `${backend}:${externalId}`
   const store = {
     get(externalId: string, backend: string): SessionRecord | null {
@@ -20,6 +21,15 @@ function memorySessions(): { store: SessionStore; records: Map<string, SessionRe
     },
     async acquireExecution(): Promise<{ release(): void }> {
       return { release() {} }
+    },
+    assertSessionIdentityAvailable(id: string, kind: 'legacy' | 'retained'): void {
+      const existing = identities.get(id)
+      if (existing && existing !== kind) throw new SessionIdentityConflictError(id, kind, existing)
+    },
+    claimSessionIdentity(id: string, kind: 'legacy' | 'retained'): void {
+      const existing = identities.get(id)
+      if (existing && existing !== kind) throw new SessionIdentityConflictError(id, kind, existing)
+      identities.set(id, kind)
     },
     upsert(args: {
       externalId: string

@@ -54,6 +54,7 @@ import { getHeapStatistics } from 'node:v8'
 import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { Backend, BackendHealth } from '../backends/types.js'
+import { boundedProbe } from '../backends/health.js'
 import type { AdmissionGate } from '../admission.js'
 import type { RunRegistry } from '../runs/registry.js'
 
@@ -208,41 +209,7 @@ export interface ReportedHealth extends BackendHealth {
  *
  * Exported for tests.
  */
-export async function boundedProbe(
-  backend: Backend,
-  timeoutMs: number,
-): Promise<BackendHealth> {
-  if (timeoutMs <= 0) return backend.health()
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout: Promise<BackendHealth> = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      resolve({
-        name: backend.name,
-        state: 'error',
-        detail: `health probe timed out after ${timeoutMs}ms`,
-      })
-    }, timeoutMs)
-    timer.unref?.()
-  })
-  try {
-    return await Promise.race([
-      backend.health().then((result) => {
-        if (timer) clearTimeout(timer)
-        return result
-      }, (err) => {
-        if (timer) clearTimeout(timer)
-        return {
-          name: backend.name,
-          state: 'error' as const,
-          detail: err instanceof Error ? err.message : String(err),
-        }
-      }),
-      timeout,
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
+export { boundedProbe }
 
 function resolveEnvMs(key: string, fallback: number): number {
   const raw = process.env[key]

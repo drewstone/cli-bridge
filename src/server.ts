@@ -34,6 +34,7 @@ import { mountModels } from './routes/models.js'
 import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
 import { mountRuns } from './routes/runs.js'
+import { RetainedSessionService, mountRetainedSessions } from './sessions/retained.js'
 import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
 import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
@@ -70,6 +71,7 @@ import { TraceEmitter } from './trace/emitter.js'
 import { JsonlSpanSink, nullSpanSink } from './trace/sink.js'
 import { selectJailBackend } from './jail/index.js'
 import { acquireInstanceLock, PortAlreadyBoundError } from './runtime/single-instance.js'
+import { reapStalePrivateTemporaryRoots } from './runtime/private-temporary.js'
 import { bindIncomingRequest } from './http/request-source.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
@@ -459,6 +461,18 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
 
+  // Retained sessions own one provider-native child across turns. The service
+  // is created only after every backend is registered so capability discovery
+  // and model routing use the same registry as one-shot chat.
+  const retained = new RetainedSessionService({ store: sessions, registry, runs })
+  extras.shutdownHooks.unshift(async () => {
+    try {
+      await retained.shutdown()
+    } finally {
+      await runs.shutdown()
+    }
+  })
+
   const app = new Hono()
 
   // Bearer guard — only active when BRIDGE_BEARER is set.
@@ -476,8 +490,9 @@ export async function buildApp(config: Config): Promise<{
 
   mountHealth(app, { registry, admission, runs })
   mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin })
-  mountSessions(app, { sessions })
-  mountRuns(app, { runs })
+  mountSessions(app, { sessions, retained })
+  mountRetainedSessions(app, retained, { includeSessionList: false, includeRunEvents: false })
+  mountRuns(app, { runs, retainedRuns: retained })
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
     registry,
@@ -506,8 +521,20 @@ export async function buildApp(config: Config): Promise<{
       '/v1/models',
       '/v1/chat/completions',
       '/v1/sessions',
+      '/v1/capabilities',
+      '/v1/sessions/:id/turns',
+      '/v1/sessions/:id/input',
+      '/v1/sessions/:id/events',
+      '/v1/sessions/:id/status',
+      '/v1/sessions/:id/transcript',
+      '/v1/sessions/:id/steer',
+      '/v1/sessions/:id/cancel',
+      '/v1/sessions/:id/detach',
+      '/v1/sessions/:id/close',
       '/v1/runs/:id',
+      '/v1/runs/:id/events',
       '/v1/runs/:id/cancel',
+      '/v1/runs/:runId/interactions/:interactionId/respond',
       '/cad/render',
       '/images/generate',
     ],
@@ -534,6 +561,7 @@ export async function startServer(): Promise<void> {
   let instanceLock
   try {
     instanceLock = acquireInstanceLock(config.port)
+    reapStalePrivateTemporaryRoots()
   } catch (err) {
     if (err instanceof PortAlreadyBoundError) {
       console.error(`[cli-bridge] ${err.message}`)

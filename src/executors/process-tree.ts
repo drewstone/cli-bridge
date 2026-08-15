@@ -107,6 +107,46 @@ export function terminateSpawned(spawned: SpawnResult): Promise<void> {
   return termination
 }
 
+interface CleanupRetry {
+  cleanup: () => Promise<void> | void
+  attempts: number
+  timer: NodeJS.Timeout | null
+}
+
+const cleanupRetries = new Map<() => Promise<void> | void, CleanupRetry>()
+const CLEANUP_RETRY_BASE_MS = 250
+const CLEANUP_RETRY_MAX_MS = 30_000
+
+/** Retry one failed request-owned cleanup without retaining executor capacity. */
+export function retryCleanupUntilSuccessful(cleanup: () => Promise<void> | void): void {
+  const retry = cleanupRetries.get(cleanup) ?? { cleanup, attempts: 0, timer: null }
+  cleanupRetries.set(cleanup, retry)
+  if (retry.timer) return
+  const delay = Math.min(CLEANUP_RETRY_BASE_MS * (2 ** retry.attempts), CLEANUP_RETRY_MAX_MS)
+  retry.timer = setTimeout(() => {
+    retry.timer = null
+    void retryCleanup(retry)
+  }, delay)
+  retry.timer.unref()
+}
+
+async function retryCleanup(retry: CleanupRetry): Promise<void> {
+  try {
+    await retry.cleanup()
+    cleanupRetries.delete(retry.cleanup)
+  } catch (error) {
+    retry.attempts += 1
+    if (retry.attempts === 1 || retry.attempts % 8 === 0) {
+      console.error('[cli-bridge] request cleanup retry still failing:', error)
+    }
+    retryCleanupUntilSuccessful(retry.cleanup)
+  }
+}
+
+export function pendingCleanupRetries(): number {
+  return cleanupRetries.size
+}
+
 /**
  * Synchronously kill the child group. Used in shutdown handlers where
  * we cannot await — best-effort, returns immediately. Pair with the

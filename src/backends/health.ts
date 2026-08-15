@@ -4,8 +4,104 @@ import {
   probeExecutorReadiness,
   type Spawner,
 } from '../executors/types.js'
-import type { BackendHealth } from './types.js'
+import type { Backend, BackendHealth } from './types.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 3_500
+
+/** Run one backend health probe with a bounded caller-owned wait. */
+export async function boundedProbe(
+  backend: Backend,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<BackendHealth> {
+  let active = activeBackendProbes.get(backend)
+  if (!active) {
+    const controller = new AbortController()
+    const created: ActiveBackendProbe = {
+      controller,
+      promise: undefined as unknown as Promise<BackendHealth>,
+      waiters: 0,
+      settled: false,
+    }
+    const promise = Promise.resolve()
+      .then(async () => await backend.health(controller.signal))
+      .catch((error): BackendHealth => ({
+        name: backend.name,
+        state: 'error',
+        detail: error instanceof Error ? error.message : String(error),
+      }))
+      .finally(() => {
+        created.settled = true
+        if (activeBackendProbes.get(backend) === created) activeBackendProbes.delete(backend)
+      })
+    created.promise = promise
+    active = created
+    activeBackendProbes.set(backend, created)
+  }
+
+  active.waiters += 1
+  let waiterReleased = false
+  const releaseWaiter = (): void => {
+    if (waiterReleased) return
+    waiterReleased = true
+    active!.waiters -= 1
+    if (active!.waiters === 0 && !active!.settled) {
+      if (activeBackendProbes.get(backend) === active) activeBackendProbes.delete(backend)
+      active!.controller.abort(new Error('health probe has no waiting callers'))
+    }
+  }
+
+  if (timeoutMs <= 0 && !signal) {
+    try {
+      return await active.promise
+    } finally {
+      releaseWaiter()
+    }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  let interruptedAlready = false
+  const interruption = new Promise<BackendHealth>((resolve) => {
+    const stop = (detail: string): void => {
+      if (interruptedAlready) return
+      interruptedAlready = true
+      resolve({ name: backend.name, state: 'error', detail })
+    }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => stop(`health probe timed out after ${timeoutMs}ms`), timeoutMs)
+      timer.unref?.()
+    }
+    if (signal) {
+      onAbort = () => stop('health probe aborted by caller')
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
+    }
+  })
+  try {
+    return await Promise.race([active.promise, interruption])
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (onAbort) signal?.removeEventListener('abort', onAbort)
+    releaseWaiter()
+  }
+}
+
+interface ActiveBackendProbe {
+  controller: AbortController
+  promise: Promise<BackendHealth>
+  waiters: number
+  settled: boolean
+}
+
+const activeBackendProbes = new WeakMap<Backend, ActiveBackendProbe>()
+
+export function resolveHealthProbeTimeoutMs(): number {
+  const raw = process.env.BRIDGE_HEALTH_PROBE_TIMEOUT_MS
+  if (raw === undefined) return DEFAULT_HEALTH_PROBE_TIMEOUT_MS
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_HEALTH_PROBE_TIMEOUT_MS
+}
 
 /**
  * Probe a CLI-backed agent's readiness by TAKING THE REQUEST PATH: the
@@ -54,18 +150,20 @@ export async function versionHealth(
   spawner: Spawner,
   /** Extra context for the `ready` verdict, e.g. the base URL a proxy is using. */
   readyDetail?: string,
+  signal?: AbortSignal,
 ): Promise<BackendHealth> {
   let release = (): void => {}
   try {
     // The request path, taken first: a request that cannot resolve a cwd or
     // whose slot holds no credentials fails no matter what `--version` prints,
     // so reporting `ready` on the strength of `--version` alone is the defect.
-    const readiness = await probeExecutorReadiness(spawner)
+    const readiness = await probeExecutorReadiness(spawner, signal)
     if (readiness.findings.length > 0) {
       return { name, state: 'error', detail: formatExecutorFindings(readiness.findings) }
     }
     const spawned = await spawner(bin, ['--version'], {
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...(signal ? { signal } : {}),
       // Spawn where a cwd-less REQUEST spawns. Passing no cwd is what let the
       // probe skip the executor's workspace assertion and run in the image's
       // own WORKDIR instead of the mount a request depends on.

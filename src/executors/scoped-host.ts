@@ -404,6 +404,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   let child
   try {
     child = spawn(SYSTEMD_RUN_BIN, wrapped, {
+      signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
       env: resolveScopedSpawnEnv(sanitizeHostEnv(jailed.env, opts.cwd), busTransportEnv),

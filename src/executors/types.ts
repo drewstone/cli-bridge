@@ -44,6 +44,8 @@ export class ExecutorConfigurationError extends Error {
 }
 
 export interface SpawnOpts {
+  /** Abort startup when the owning durable run is cancelled before spawn completes. */
+  signal?: AbortSignal
   /** Working directory inside the executor's filesystem. */
   cwd?: string
   /** Env to set on the child. */
@@ -208,7 +210,7 @@ export interface Spawner {
    * request can trip over beyond spawning the binary, which `versionHealth`
    * already covers.
    */
-  probeRequestPath?(): Promise<ExecutorReadiness>
+  probeRequestPath?(signal?: AbortSignal): Promise<ExecutorReadiness>
   /**
    * Isolation boundary the spawned CLI inhabits. Pi refuses an undeclared
    * executor because credential safety cannot depend on guessing its behavior.
@@ -238,10 +240,13 @@ export function resolveSpawnerCwd(spawner: Spawner, cwd: string | undefined): st
  * `cwd` is what the probe must then spawn in — the same directory a cwd-less
  * request gets — so `/health` cannot pass through a door requests never use.
  */
-export async function probeExecutorReadiness(spawner: Spawner): Promise<ExecutorReadiness> {
-  if (spawner.probeRequestPath) return await spawner.probeRequestPath()
+export async function probeExecutorReadiness(spawner: Spawner, signal?: AbortSignal): Promise<ExecutorReadiness> {
+  if (signal?.aborted) throw new Error('executor readiness probe aborted')
+  if (spawner.probeRequestPath) return await spawner.probeRequestPath(signal)
   try {
-    return { cwd: resolveSpawnerCwd(spawner, undefined), findings: [] }
+    const readiness = { cwd: resolveSpawnerCwd(spawner, undefined), findings: [] }
+    if (signal?.aborted) throw new Error('executor readiness probe aborted')
+    return readiness
   } catch (error) {
     return { cwd: undefined, findings: [cwdPolicyFinding(error)] }
   }

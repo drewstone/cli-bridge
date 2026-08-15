@@ -24,6 +24,7 @@ import {
 import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
+  SessionIdentityConflictError,
   type SessionExecutionLease,
   type SessionRecord,
   type SessionStore,
@@ -498,6 +499,16 @@ export function mountChatCompletions(
         ...(tangleSource ? { tangleSource } : {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
       },
+    }
+
+    if (req.session_id) {
+      try {
+        deps.sessions.assertSessionIdentityAvailable(req.session_id, 'legacy')
+        deps.sessions.claimSessionIdentity(req.session_id, 'legacy')
+      } catch (error) {
+        if (error instanceof SessionIdentityConflictError) return sessionIdentityConflict(c, error)
+        throw error
+      }
     }
 
     // Durable-run identity and replay cursor are exact claims. Conflicting aliases, malformed ids,
@@ -1067,6 +1078,18 @@ function runIdentityConflict(c: Context, error: RunIdentityConflictError): Respo
   )
 }
 
+function sessionIdentityConflict(c: Context, error: SessionIdentityConflictError): Response {
+  return c.json({
+    error: {
+      message: error.message,
+      type: error.code,
+      session_id: error.sessionId,
+      expected_kind: error.expectedKind,
+      existing_kind: error.existingKind,
+    },
+  }, 409)
+}
+
 function replayCursorError(c: Context, error: RunReplayCursorError): Response {
   return c.json(
     {
@@ -1122,6 +1145,7 @@ function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_
 }
 
 function errorResponse(c: Context, err: unknown): Response {
+  if (err instanceof SessionIdentityConflictError) return sessionIdentityConflict(c, err)
   if (err instanceof RunReplayCursorError) return replayCursorError(c, err)
   if (err instanceof SandboxBackendUnavailableError) {
     return c.json({ error: { message: err.message, type: err.code } }, 503)

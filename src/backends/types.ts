@@ -18,7 +18,12 @@ import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
 import type { JailSpec } from '../jail/index.js'
 import type { CallerTrace } from '../trace/ids.js'
-import type { AgentProfile, ReasoningEffort } from '@tangle-network/agent-interface'
+import type {
+  AgentEnvironmentCapabilities,
+  AgentProfile,
+  NativeContextBoundaryProof,
+  ReasoningEffort,
+} from '@tangle-network/agent-interface'
 
 /** Request-scoped model credential supplied only by the trusted local bridge caller. */
 export interface ProtectedModelCredential {
@@ -181,6 +186,8 @@ export interface ChatRequest {
    * rather than quietly run with tools enabled.
    */
   mode?: BridgeMode
+  /** Approval policy for native interaction-capable retained or one-shot turns. */
+  interaction_policy?: 'interactive' | 'unattended-deny' | 'unattended-allow'
   /**
    * OpenAI-compatible response-format hint. CLI harnesses have no
    * native JSON-schema mode, so `json_schema` is normalized at the
@@ -408,7 +415,7 @@ export interface Backend {
   matches(model: string): boolean
 
   /** Sync health check — exit-code probe on the CLI, etc. */
-  health(): Promise<BackendHealth>
+  health(signal?: AbortSignal): Promise<BackendHealth>
 
   /**
    * Stream a chat completion. Must be an async iterator of ChatDelta.
@@ -420,6 +427,43 @@ export interface Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta>
+}
+
+/**
+ * A provider-native session that remains owned across retained turns.
+ *
+ * The bridge owns routing and durable events. The provider owns this handle's
+ * process protocol and must prove every native side effect before returning.
+ */
+export interface NativeSession {
+  readonly capabilities: AgentEnvironmentCapabilities
+  isClosed(): boolean
+  onClose(listener: (reason: Error) => void): () => void
+  whenClosed(): Promise<void>
+  providerSessionId(): string | null
+  turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown>
+  steer?(prompt: string): Promise<void>
+  abort(): Promise<void>
+  respondToNativeInteraction(id: string, response: Record<string, unknown>): Promise<void>
+  contextBoundary(input: {
+    runId: string
+    environmentId: string
+    sessionId: string
+    executionId: string
+    requestDigest: string
+  }): Promise<NativeContextBoundaryProof | null>
+  close(): Promise<void>
+}
+
+/** Backend extension for exact, retained provider-native sessions. */
+export interface NativeSessionBackend extends Backend {
+  readonly nativeModes: readonly NonNullable<ChatRequest['mode']>[]
+  nativeCapabilities?(): AgentEnvironmentCapabilities
+  startNativeSession(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal?: AbortSignal,
+  ): Promise<NativeSession>
 }
 
 /**
@@ -442,7 +486,7 @@ export class BackendError extends Error {
 
   constructor(
     message: string,
-    public readonly code: 'not_configured' | 'cli_missing' | 'upstream' | 'timeout' | 'aborted' | 'parse_error',
+    public readonly code: 'not_configured' | 'cli_missing' | 'upstream' | 'timeout' | 'aborted' | 'parse_error' | 'capability_denied',
     public readonly cause?: unknown,
     options?: { providerDispatch?: 'not_started' },
   ) {

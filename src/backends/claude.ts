@@ -168,8 +168,8 @@ export class ClaudeBackend implements Backend {
     return m === this.name || m.startsWith(this.prefix)
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.bin, this.spawner, this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.bin, this.spawner, this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined, signal)
   }
 
   async *chat(

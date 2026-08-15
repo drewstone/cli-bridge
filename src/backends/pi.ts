@@ -54,7 +54,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { Backend, ChatDelta, ChatRequest, BackendHealth, NativeSessionBackend } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -92,6 +92,7 @@ import {
   type PiInferenceTransportResolver,
   type ProvisionedPiInferenceTransport,
 } from './pi-inference-transport.js'
+import { piNativeCapabilities, startPiNativeSession } from './pi-native-start.js'
 
 export interface PiBackendOptions {
   bin: string
@@ -116,7 +117,7 @@ interface PiModelSpec {
   model?: string
 }
 
-function parsePiModelId(model: string): PiModelSpec {
+export function parsePiModelId(model: string): PiModelSpec {
   const m = model.toLowerCase()
   if (m === 'pi') return {}
   if (!m.startsWith('pi/')) return {}
@@ -127,7 +128,7 @@ function parsePiModelId(model: string): PiModelSpec {
 }
 
 /** Map ReasoningEffort to pi's `--thinking` flag. */
-function thinkingFlagForEffort(effort?: string): string | null {
+export function thinkingFlagForEffort(effort?: string): string | null {
   if (!effort) return null
   // pi accepts: off | minimal | low | medium | high | xhigh
   const allowed = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
@@ -143,7 +144,7 @@ function thinkingFlagForEffort(effort?: string): string | null {
  * for direct exposure, preserving any ambient selectors without naming a
  * particular server or tool in bridge source.
  */
-function piDirectToolSelection(
+export function piDirectToolSelection(
   requestedServerNames: readonly string[],
   ambientSelection: string | undefined,
 ): string | undefined {
@@ -173,7 +174,7 @@ function piDirectToolSelection(
  * entries. Absent `load` preserves Pi's normal global extension discovery,
  * which remains necessary for existing provider packages such as pi-zai-glm.
  */
-function piExtensionArgs(
+export function piExtensionArgs(
   req: ChatRequest,
   session: SessionRecord | null,
   mcpAdapterPath: string | null,
@@ -313,7 +314,7 @@ export function piMcpAdapterAvailable(): boolean {
   return resolvePiMcpAdapterInstallPath() !== null
 }
 
-function resolvePiMcpAdapterInstallPath(): string | null {
+export function resolvePiMcpAdapterInstallPath(): string | null {
   const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')
   const installedPath = join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter')
   if (existsSync(installedPath)) return installedPath
@@ -396,9 +397,10 @@ export function piToolProcessEnvironment(
   return child
 }
 
-export class PiBackend implements Backend {
+export class PiBackend implements NativeSessionBackend {
   readonly name = 'pi'
   readonly defaultExecutionTimeoutMs: number
+  readonly nativeModes = ['byob'] as const
   private readonly spawner: Spawner
   private readonly transportResolver: PiInferenceTransportResolver
 
@@ -416,8 +418,21 @@ export class PiBackend implements Backend {
     return m === 'pi' || m.startsWith('pi/')
   }
 
-  async health(): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner)
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
+  }
+
+  nativeCapabilities() {
+    return piNativeCapabilities()
+  }
+
+  startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal) {
+    return startPiNativeSession({
+      bin: this.opts.bin,
+      timeoutMs: this.opts.timeoutMs,
+      spawner: this.spawner,
+      transportResolver: this.transportResolver,
+    }, req, session, signal)
   }
 
   /**

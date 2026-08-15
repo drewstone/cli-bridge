@@ -92,6 +92,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
         opts.binPrefixInContainer,
       )
       const child = (opts.spawnProcess ?? spawn)('docker', dockerArgs, {
+        signal: spawnOpts.signal,
         stdio: spawnOpts.stdio ?? ['ignore', 'pipe', 'pipe'],
       })
       const terminate = (): Promise<void> => {
