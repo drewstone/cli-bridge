@@ -326,6 +326,8 @@ export async function buildApp(config: Config): Promise<{
     replayRetentionMs: parseEnvPositiveInt('BRIDGE_RUN_REPLAY_RETENTION_MS', 60_000),
     identityRetentionMs: parseEnvPositiveInt('BRIDGE_RUN_IDENTITY_RETENTION_MS', 86_400_000),
     maxReplayDeltas: parseEnvPositiveInt('BRIDGE_RUN_MAX_REPLAY_DELTAS', 10_000),
+    maxReplayBytes: parseEnvPositiveInt('BRIDGE_RUN_MAX_REPLAY_BYTES', 32 * 1024 * 1024),
+    maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 21_600_000),
   })
   const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
@@ -472,7 +474,7 @@ export async function buildApp(config: Config): Promise<{
     })
   }
 
-  mountHealth(app, { registry, admission })
+  mountHealth(app, { registry, admission, runs })
   mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin })
   mountSessions(app, { sessions })
   mountRuns(app, { runs })

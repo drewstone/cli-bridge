@@ -49,10 +49,12 @@
  * `BRIDGE_HEALTH_CACHE_MS=0` disables it.
  */
 
+import { getHeapStatistics } from 'node:v8'
 import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { Backend, BackendHealth } from '../backends/types.js'
 import type { AdmissionGate } from '../admission.js'
+import type { RunRegistry } from '../runs/registry.js'
 
 const DEFAULT_HEALTH_CACHE_MS = 30_000
 const DEFAULT_PROBE_TIMEOUT_MS = 3_500
@@ -75,9 +77,32 @@ export interface MountHealthOptions {
   probe?: ProbeBackend
 }
 
+/**
+ * Heap pressure, reported so a caller can see the wall before it hits one.
+ *
+ * A bridge that dies of heap exhaustion gives an operator no warning at all —
+ * memory growth produces no log line, and the first signal is a dead port that
+ * takes every in-flight run with it. `used_pct` is what a fleet launcher checks
+ * before dispatching a wave; `runs_retained` and `run_replay_bytes` say how
+ * much of the heap the durable run registry is accountable for.
+ */
+function memorySnapshot(runs?: RunRegistry): Record<string, unknown> {
+  const usage = process.memoryUsage()
+  const limit = getHeapStatistics().heap_size_limit
+  return {
+    heap_used_bytes: usage.heapUsed,
+    heap_total_bytes: usage.heapTotal,
+    heap_limit_bytes: limit,
+    heap_used_pct: limit > 0 ? Math.round((usage.heapUsed / limit) * 1000) / 10 : null,
+    rss_bytes: usage.rss,
+    external_bytes: usage.external,
+    ...(runs ? { runs_retained: runs.size(), run_replay_bytes: runs.retainedBytes() } : {}),
+  }
+}
+
 export function mountHealth(
   app: Hono,
-  deps: { registry: BackendRegistry; admission?: AdmissionGate },
+  deps: { registry: BackendRegistry; admission?: AdmissionGate; runs?: RunRegistry },
   options: MountHealthOptions = {},
 ): void {
   const cacheMs = options.cacheMs ?? resolveEnvMs('BRIDGE_HEALTH_CACHE_MS', DEFAULT_HEALTH_CACHE_MS)
@@ -130,6 +155,7 @@ export function mountHealth(
       ...(oldestProbedAt ? { oldest_probed_at: oldestProbedAt } : {}),
       backends: probes,
       ...(deps.admission ? { admission: deps.admission.snapshot() } : {}),
+      memory: memorySnapshot(deps.runs),
       ts: new Date(ts).toISOString(),
     }, any ? 200 : 503)
   })

@@ -27,6 +27,30 @@ import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
 
+/**
+ * Cancellation acknowledgements retained for idempotent replay.
+ *
+ * One entry per distinct `operationId`, and nothing ever removed them, so a
+ * long-lived bridge accumulated one record per cancellation for the life of the
+ * process. The cap is far above any caller's in-flight retry window: a record
+ * only has to outlive the retries of the operation that created it, and the
+ * oldest entry is the one least likely to still be retried.
+ */
+const MAX_RETAINED_CANCELLATIONS = 10_000
+
+function retainCancellation(
+  cancellations: Map<string, CancellationRecord>,
+  operationId: string,
+  record: CancellationRecord,
+): void {
+  cancellations.set(operationId, record)
+  while (cancellations.size > MAX_RETAINED_CANCELLATIONS) {
+    const oldest = cancellations.keys().next()
+    if (oldest.done) break
+    cancellations.delete(oldest.value)
+  }
+}
+
 export function mountRuns(app: Hono, deps: { runs: RunRegistry }): void {
   const cancellations = new Map<string, CancellationRecord>()
 
@@ -170,7 +194,7 @@ async function exactCancellation(
       message: 'this bridge process has no record of the run',
       retryable: false,
     })
-    cancellations.set(request.operationId, {
+    retainCancellation(cancellations, request.operationId, {
       requestDigest: request.requestDigest,
       acknowledgement: unknown,
     })
@@ -200,7 +224,7 @@ async function exactCancellation(
       ? { message: 'cancellation was already requested' }
       : {}),
   })
-  cancellations.set(request.operationId, {
+  retainCancellation(cancellations, request.operationId, {
     requestDigest: request.requestDigest,
     acknowledgement,
   })
