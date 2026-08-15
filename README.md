@@ -219,8 +219,32 @@ A cursor older than the retained window returns `410 expired_replay_cursor`; the
 Replay storage is explicitly bounded per process:
 
 - At most `BRIDGE_RUN_MAX_REPLAY_DELTAS` deltas are retained per run (default `10000`).
+- At most `BRIDGE_RUN_MAX_REPLAY_BYTES` of delta payload is retained per run (default `33554432`, 32 MiB).
+  The delta count alone is not a memory bound, because one delta may carry a whole tool result.
+  The oldest deltas are dropped first; the newest delta is always kept.
 - Terminal output expires after `BRIDGE_RUN_REPLAY_RETENTION_MS` (default `60000` ms).
 - The run-id/request binding remains after output expiry for `BRIDGE_RUN_IDENTITY_RETENTION_MS` (default `86400000` ms) so a late retry cannot accidentally execute the job again.
+- A run that has not reached a terminal state within `BRIDGE_RUN_MAX_LIFETIME_MS` (default `21600000` ms, 6 hours) is cancelled and released.
+  Set `0` to disable the ceiling.
+
+The lifetime ceiling exists because every other bound above is armed when a run reaches a terminal state.
+A backend that never terminates would otherwise hold its replay buffer, its registry entry and its execution slot until the process exits.
+Raise it if a single turn legitimately runs longer than six hours; the ceiling applies to one run, not to a campaign.
+
+### Memory
+
+`GET /health` reports `memory.heap_used_bytes`, `memory.heap_limit_bytes` and `memory.heap_used_pct`, plus `memory.runs_retained` and `memory.run_replay_bytes` for the run registry's own share.
+Check `heap_used_pct` before dispatching a large wave; heap growth produces no log line, so a dead port is otherwise the first signal.
+
+For multi-agent workloads, run the bridge with `NODE_OPTIONS=--max-old-space-size=4096` or higher.
+Node's default old-space limit is well under what four concurrent large-context sessions need, and the retained replay window scales with concurrency: budget roughly `BRIDGE_RUN_MAX_REPLAY_BYTES` per concurrent run plus headroom.
+
+Two harnesses measure these bounds directly:
+
+```sh
+node --expose-gc --import tsx scripts/measure-unsettled-runs.ts   # runs that never settle
+node --expose-gc --import tsx scripts/measure-live-run-buffer.ts  # replay bytes for one run
+```
 
 Model output is not clipped by the bridge's process-diagnostic protection.
 The bridge retains at most 64 KiB of each subprocess's stderr/stdout diagnostics, preserving both the beginning and end for failures, while successful streamed content continues through the normal response and replay path.
