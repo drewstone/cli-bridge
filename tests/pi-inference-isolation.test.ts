@@ -1719,10 +1719,12 @@ describe('Pi inference credential isolation', () => {
         expect(observedBodies[0]).toMatchObject({ max_completion_tokens: 64_000 })
         expect(observedBodies[0]).not.toMatchObject({ max_completion_tokens: 128_000 })
         expect(readFileSync(join(sourceAgentDir, 'models.json'), 'utf8')).toBe(sourceModelsText)
-        expect(completedProfileReceipt(deltas)?.inference).toMatchObject({
-          appliedMaxTotalOutputTokens: 64_000,
+        const inference = completedProfileReceipt(deltas)?.inference
+        expect(inference).toMatchObject({
+          appliedMaxTokens: 64_000,
           observation: { accountingMatched: true },
         })
+        expect(inference).not.toHaveProperty('appliedMaxTotalOutputTokens')
       } finally {
         clearTimeout(timer)
         await close(upstream)
