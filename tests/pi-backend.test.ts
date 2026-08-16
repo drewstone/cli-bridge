@@ -568,6 +568,7 @@ describe('PiBackend', () => {
           provider: 'tangle-router',
           default: 'glm-5.2',
           maxTotalOutputTokens: 16_384,
+          metadata: { maxTokens: 16_384 },
         },
       },
     }
@@ -1051,6 +1052,12 @@ describe('PiBackend', () => {
 
       expect((await post('discovery-run', {
         prompt: { systemPrompt: 'PERSISTED_PROFILE_SYSTEM' },
+        model: {
+          provider: 'zai-coding-paas',
+          default: 'glm-5.2',
+          maxTotalOutputTokens: 16_384,
+          metadata: { maxTokens: 16_384 },
+        },
       })).status).toBe(200)
       expect(argv[1]).not.toContain('--no-session')
       expect(argv[1]).not.toContain('--session')
@@ -1062,6 +1069,14 @@ describe('PiBackend', () => {
       expect(sessions.get('discovery-run', 'pi')).toMatchObject({
         internalId: argValue(argv[1]!, '--session-id'),
         turns: 1,
+        metadata: {
+          agent_profile: {
+            model: {
+              maxTotalOutputTokens: 16_384,
+              metadata: { maxTokens: 16_384 },
+            },
+          },
+        },
       })
 
       expect((await post('discovery-run')).status).toBe(200)
@@ -1073,6 +1088,15 @@ describe('PiBackend', () => {
         'PERSISTED_PROFILE_SYSTEM',
         'PERSISTED_PROFILE_SYSTEM',
       ])
+
+      expect((await post('rejected-profile', {
+        model: {
+          provider: 'zai-coding-paas',
+          default: 'glm-5.2',
+          metadata: { maxTokens: 16_384 },
+        },
+      })).status).toBe(501)
+      expect(sessions.get('rejected-profile', 'pi')).toBeNull()
 
       const conflictingResume = await app.request('/v1/chat/completions', {
         method: 'POST',

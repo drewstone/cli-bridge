@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
+import { assertPiModelMetadataCompatibility } from './profile-support.js'
 import { resolvePiAuthCredential } from './pi-auth-credential.js'
 import { readPiSelectedModel, type PiCatalogModel } from './pi-catalog-rpc.js'
 import { BackendError } from './types.js'
@@ -292,16 +293,7 @@ export function applyPiModelHints(
   const unsupported: string[] = []
   if (modelHints.maxVisibleOutputTokens !== undefined) unsupported.push('maxVisibleOutputTokens')
   if (modelHints.maxReasoningTokens !== undefined) unsupported.push('maxReasoningTokens')
-  const metadata = modelHints.metadata
-  if (metadata !== undefined && (!isRecord(metadata) || Array.isArray(metadata))) {
-    throw new BackendError(
-      'backend pi cannot apply agent_profile.model.metadata because it is not an object',
-      'parse_error',
-    )
-  }
-  if (metadata !== undefined && Object.keys(metadata).length > 0) {
-    unsupported.push(...Object.keys(metadata).map(key => `metadata.${key}`))
-  }
+  assertPiModelMetadataCompatibility(modelHints)
   if (unsupported.length > 0) {
     throw new BackendError(
       `backend pi cannot enforce agent_profile.model field(s): ${unsupported.sort().join(', ')}; `

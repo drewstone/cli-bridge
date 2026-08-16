@@ -20,6 +20,7 @@ import type {
   AgentProfile,
   AgentProfileConfigValue,
   AgentProfileMcpServer,
+  AgentProfileModelHints,
   ReasoningEffort,
 } from '@tangle-network/agent-interface'
 import {
@@ -481,12 +482,7 @@ export function assertPiOutputTokenRequest(
   profile: AgentProfile | null,
 ): void {
   const model = profile?.model
-  if (model?.metadata !== undefined && Object.keys(model.metadata).length > 0) {
-    throw new BackendError(
-      'backend pi does not accept agent_profile.model.metadata as a token authority; use maxTotalOutputTokens',
-      'not_configured',
-    )
-  }
+  assertPiModelMetadataCompatibility(model)
   if (model?.maxVisibleOutputTokens !== undefined) {
     throw new BackendError(
       'backend pi cannot enforce agent_profile.model.maxVisibleOutputTokens; Pi exposes only a total completion cap',
@@ -518,6 +514,52 @@ export function assertPiOutputTokenRequest(
   if (requested !== profileMaxTokens) {
     throw new BackendError(
       `request max_tokens ${String(requested)} conflicts with agent_profile.model.maxTotalOutputTokens ${String(profileMaxTokens)}`,
+      'parse_error',
+    )
+  }
+}
+
+/**
+ * Accept one redundant legacy cap only when the canonical field already owns it.
+ *
+ * Some older profile authors emitted both fields. The legacy value never becomes
+ * authority: a missing canonical value, a conflict, or any extra key still fails.
+ */
+export function assertPiModelMetadataCompatibility(
+  model: AgentProfileModelHints | undefined,
+): void {
+  const metadata = model?.metadata
+  if (metadata === undefined) return
+  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+    throw new BackendError(
+      'backend pi cannot apply agent_profile.model.metadata because it is not an object',
+      'parse_error',
+    )
+  }
+  const keys = Reflect.ownKeys(metadata)
+  if (keys.length !== 1 || keys[0] !== 'maxTokens') {
+    throw new BackendError(
+      `backend pi cannot enforce agent_profile.model metadata field(s): ${keys.map(String).sort().join(', ') || '<empty>'}`,
+      'not_configured',
+    )
+  }
+  const legacy = metadata.maxTokens
+  const canonical = model?.maxTotalOutputTokens
+  if (!Number.isSafeInteger(legacy) || Number(legacy) <= 0) {
+    throw new BackendError(
+      'backend pi agent_profile.model.metadata.maxTokens must be a positive safe integer',
+      'parse_error',
+    )
+  }
+  if (canonical === undefined) {
+    throw new BackendError(
+      'backend pi does not accept agent_profile.model.metadata.maxTokens without maxTotalOutputTokens',
+      'not_configured',
+    )
+  }
+  if (legacy !== canonical) {
+    throw new BackendError(
+      `agent_profile.model.metadata.maxTokens ${String(legacy)} conflicts with maxTotalOutputTokens ${String(canonical)}`,
       'parse_error',
     )
   }

@@ -212,6 +212,12 @@ describe('Pi inference credential isolation', () => {
     })
     expect(operatorModel.maxTokens).toBe(128_000)
 
+    expect(applyPiModelHints(operatorModel, {
+      maxTotalOutputTokens: 64_000,
+      metadata: { maxTokens: 64_000 },
+    })).toEqual(applied)
+    expect(operatorModel.maxTokens).toBe(128_000)
+
     expect(applyPiModelHints(operatorModel, undefined)).toEqual({
       modelConfig: operatorModel,
     })
@@ -224,7 +230,25 @@ describe('Pi inference credential isolation', () => {
     expect(() => applyPiModelHints(operatorModel, { maxReasoningTokens: 64_000 }))
       .toThrow(/maxReasoningTokens/u)
     expect(() => applyPiModelHints(operatorModel, { metadata: { maxTokens: 64_000 } }))
-      .toThrow(/metadata\.maxTokens/u)
+      .toThrow(/without maxTotalOutputTokens/u)
+    expect(() => applyPiModelHints(operatorModel, {
+      maxTotalOutputTokens: 64_000,
+      metadata: { maxTokens: 32_000 },
+    })).toThrow(/conflicts with maxTotalOutputTokens/u)
+    expect(() => applyPiModelHints(operatorModel, {
+      maxTotalOutputTokens: 64_000,
+      metadata: { maxTokens: 64_000, other: 1 },
+    })).toThrow(/metadata field\(s\): maxTokens, other/u)
+    expect(() => applyPiModelHints(operatorModel, {
+      maxTotalOutputTokens: 64_000,
+      metadata: {},
+    })).toThrow(/metadata field\(s\): <empty>/u)
+    const hiddenMetadata = { maxTokens: 64_000 }
+    Object.defineProperty(hiddenMetadata, 'hidden', { value: 1 })
+    expect(() => applyPiModelHints(operatorModel, {
+      maxTotalOutputTokens: 64_000,
+      metadata: hiddenMetadata,
+    })).toThrow(/metadata field\(s\): hidden, maxTokens/u)
     expect(() => applyPiModelHints({ ...operatorModel, maxTokens: undefined }, { maxTotalOutputTokens: 64_000 }))
       .toThrow(/no valid maxTokens cap/u)
   })
