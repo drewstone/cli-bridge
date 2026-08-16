@@ -212,7 +212,7 @@ export async function startPiNativeSession(
         transport: 'scoped-loopback',
         ...(inference.appliedMaxTotalOutputTokens === undefined
           ? {}
-          : { appliedMaxTotalOutputTokens: inference.appliedMaxTotalOutputTokens }),
+          : { appliedMaxTokens: inference.appliedMaxTotalOutputTokens }),
       },
     )
     if (provisioned) args.push(...provisioned.flags)

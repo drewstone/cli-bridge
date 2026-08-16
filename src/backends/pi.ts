@@ -623,7 +623,7 @@ export class PiBackend implements NativeSessionBackend {
           transport: 'scoped-loopback',
           ...(inference.appliedMaxTotalOutputTokens === undefined
             ? {}
-            : { appliedMaxTotalOutputTokens: inference.appliedMaxTotalOutputTokens }),
+            : { appliedMaxTokens: inference.appliedMaxTotalOutputTokens }),
         },
       )
       if (provisioned) args.push(...provisioned.flags)

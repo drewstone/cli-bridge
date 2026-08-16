@@ -577,8 +577,11 @@ describe('PiBackend', () => {
       expect(resolves).toBe(1)
       expect(spawns).toBe(1)
       expect(request.profile_materialization_receipt?.inference).toMatchObject({
-        appliedMaxTotalOutputTokens: 16_384,
+        appliedMaxTokens: 16_384,
       })
+      expect(request.profile_materialization_receipt?.inference).not.toHaveProperty(
+        'appliedMaxTotalOutputTokens',
+      )
     } finally {
       rmSync(cwd, { recursive: true, force: true })
     }
