@@ -20,6 +20,8 @@ export async function commitCompletedTurn(input: {
   runId: string
   requestDigest: string
   backend: string
+  provider: string
+  environmentId: string
   run: Run
   native: NativeSession
 }): Promise<void> {
@@ -34,6 +36,8 @@ export async function commitCompletedTurn(input: {
       runId,
       sessionId,
       backend: input.backend,
+      provider: input.provider,
+      environmentId: input.environmentId,
       executionId: snapshot.executionId ?? runId,
       requestDigest: snapshot.requestDigest,
     })

@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { once } from 'node:events'
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import Database from 'better-sqlite3'
-import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { afterEach, describe, expect, it } from 'vitest'
 import type { Backend, BackendHealth, ChatDelta, ChatRequest, NativeSession, NativeSessionBackend } from '../src/backends/types.js'
 import type { SessionRecord, SessionStore } from '../src/sessions/store.js'
 import { SessionStore as SqliteSessionStore } from '../src/sessions/store.js'
@@ -18,6 +20,7 @@ import {
   agentRunCancellationRequestDigest,
   canonicalCandidateDigest,
   type InteractionBinding,
+  type InteractionAcknowledgement,
   type InteractionRequest,
   type InteractionResponse,
   type InteractionResponseCommand,
@@ -25,6 +28,15 @@ import {
   type NativeContextBoundaryProof,
 } from '@tangle-network/agent-interface'
 import { interactionResponseCommandDigest } from '@tangle-network/agent-interface'
+import {
+  createInteractionOperationSchema,
+  MAX_ACKNOWLEDGED_INTERACTION_OPERATIONS,
+  RetainedInteractionLedger,
+} from '../src/sessions/retained/interaction-store.js'
+import {
+  RETAINED_MAX_HTTP_BODY_BYTES,
+  RETAINED_MAX_TEXT_LENGTH,
+} from '../src/sessions/retained/schema.js'
 
 const capabilities: AgentEnvironmentCapabilities = {
   profile: {
@@ -65,6 +77,12 @@ const capabilities: AgentEnvironmentCapabilities = {
   placement: true,
   usage: true,
   confidential: false,
+}
+
+const conditionListeners = new Set<() => void>()
+
+function notifyConditionChanged(): void {
+  for (const listener of [...conditionListeners]) listener()
 }
 
 class FakeNative implements NativeSession {
@@ -111,11 +129,13 @@ class FakeNative implements NativeSession {
     this.closed = true
     for (const listener of [...this.closeListeners]) listener(reason)
     this.closeListeners.clear()
+    notifyConditionChanged()
   }
 
   async *turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
     this.prompts.push(prompt)
     this.count += 1
+    notifyConditionChanged()
     yield { type: 'session', id: `${this.backendName}-fake-session` }
     yield { type: 'agent_start' }
     yield { type: 'turn_start' }
@@ -195,21 +215,25 @@ class FakeNative implements NativeSession {
   steer(prompt: string): Promise<void> {
     this.steers.push(prompt)
     this.latestSteer = prompt
+    notifyConditionChanged()
     return Promise.resolve()
   }
 
   async abort(): Promise<void> {
     this.aborted = true
+    notifyConditionChanged()
     this.response?.()
   }
 
   async respondToNativeInteraction(_id: string, response: Record<string, unknown>): Promise<void> {
     this.responseCalls += 1
+    notifyConditionChanged()
     this.response?.()
   }
 
   async contextBoundary(input: {
     runId: string
+    provider: string
     environmentId: string
     sessionId: string
     executionId: string
@@ -217,7 +241,7 @@ class FakeNative implements NativeSession {
   }): Promise<NativeContextBoundaryProof | null> {
     return {
       runId: input.runId,
-      provider: this.backendName,
+      provider: input.provider,
       environmentId: input.environmentId,
       sessionId: input.sessionId,
       executionId: input.executionId,
@@ -229,6 +253,7 @@ class FakeNative implements NativeSession {
 
   close(): Promise<void> {
     this.closeCalls += 1
+    notifyConditionChanged()
     this.crash(new Error('fake native session closed'))
     return Promise.resolve()
   }
@@ -250,9 +275,83 @@ class DeferredResponseNative extends FakeNative {
 
   override async respondToNativeInteraction(): Promise<void> {
     this.responseCalls += 1
+    notifyConditionChanged()
     await this.responseReady
     this.responseCompleted = true
     this.response?.()
+  }
+}
+
+class BeforeNativeResponseFailure extends FakeNative {
+  override async respondToNativeInteraction(): Promise<void> {
+    this.responseCalls += 1
+    notifyConditionChanged()
+    this.response?.()
+    throw new Error('injected failure before native response effect')
+  }
+}
+
+class AfterNativeResponseFailure extends FakeNative {
+  effectCount = 0
+
+  override async respondToNativeInteraction(): Promise<void> {
+    this.responseCalls += 1
+    this.effectCount += 1
+    notifyConditionChanged()
+    this.response?.()
+    throw new Error('injected failure after native response effect')
+  }
+}
+
+class CrashAfterNativeStore extends SqliteSessionStore {
+  override recordInteractionEffect(
+    operationId: string,
+    requestDigest: string,
+    responseDigest: string,
+  ): ReturnType<SqliteSessionStore['recordInteractionEffect']> {
+    void operationId
+    void requestDigest
+    void responseDigest
+    throw new Error('injected crash after native response')
+  }
+
+  override markInteractionEffectUnknown(
+    operationId: string,
+    requestDigest: string,
+    responseDigest: string,
+    acknowledgement: Parameters<SqliteSessionStore['markInteractionEffectUnknown']>[3],
+  ): ReturnType<SqliteSessionStore['markInteractionEffectUnknown']> {
+    void operationId
+    void requestDigest
+    void responseDigest
+    void acknowledgement
+    throw new Error('injected process loss before unknown acknowledgement')
+  }
+}
+
+class CrashAfterResolveStore extends SqliteSessionStore {
+  override recordInteractionOperation(
+    input: Parameters<SqliteSessionStore['recordInteractionOperation']>[0],
+  ): ReturnType<SqliteSessionStore['recordInteractionOperation']> {
+    if (input.acknowledgement.status === 'accepted') {
+      throw new Error('injected crash after interaction resolve')
+    }
+    return super.recordInteractionOperation(input)
+  }
+}
+
+class CrashAfterAcknowledgementStore extends SqliteSessionStore {
+  private threw = false
+
+  override recordInteractionOperation(
+    input: Parameters<SqliteSessionStore['recordInteractionOperation']>[0],
+  ): ReturnType<SqliteSessionStore['recordInteractionOperation']> {
+    const result = super.recordInteractionOperation(input)
+    if (!this.threw && input.acknowledgement.status === 'accepted') {
+      this.threw = true
+      throw new Error('injected crash after acknowledgement persistence')
+    }
+    return result
   }
 }
 
@@ -306,6 +405,7 @@ class DeferredCloseNative extends FakeNative {
 
   override async close(): Promise<void> {
     this.closeCalls += 1
+    notifyConditionChanged()
     this.signalCloseStarted()
     await this.closeReady
     this.crash(new Error('fake native session closed'))
@@ -347,6 +447,7 @@ class CloseFailureContinuationNative extends FakeNative {
     if (!this.failedClose) {
       this.failedClose = true
       this.closeCalls += 1
+      notifyConditionChanged()
       this.signalCloseStarted()
       await this.closeFailureReady
       throw new Error('transient close failure')
@@ -412,6 +513,7 @@ class FailOnceCloseNative extends FakeNative {
   override close(): Promise<void> {
     if (this.closeCalls === 0) {
       this.closeCalls += 1
+      notifyConditionChanged()
       return Promise.reject(new Error('transient close failure'))
     }
     return super.close()
@@ -427,6 +529,7 @@ class FailOnceUnexpectedCleanupNative extends FakeNative {
 
   override whenClosed(): Promise<void> {
     this.whenClosedCalls += 1
+    notifyConditionChanged()
     if (this.whenClosedCalls === 1) return Promise.reject(new Error('unexpected-close cleanup failed'))
     return super.whenClosed()
   }
@@ -512,10 +615,12 @@ class HangingNativeBackend extends FakeNativeBackend {
   override async health(signal?: AbortSignal): Promise<BackendHealth> {
     this.starts += 1
     this.active += 1
+    notifyConditionChanged()
     return await new Promise(resolve => {
       const onAbort = (): void => {
         this.aborts += 1
         this.active -= 1
+        notifyConditionChanged()
         resolve({ name: this.name, state: 'unavailable', detail: 'cancelled' })
       }
       signal?.addEventListener('abort', onAbort, { once: true })
@@ -531,6 +636,31 @@ class OneShotBackend implements Backend {
   async *chat(): AsyncIterable<ChatDelta> { yield { content: 'ok', finish_reason: 'stop' } }
 }
 
+function watchStoreMutations(store: SessionStore): void {
+  const target = store as unknown as Record<string, (...args: never[]) => unknown>
+  const methods = [
+    'appendRetainedEvent',
+    'beginInteractionOperation',
+    'recordInteractionEffect',
+    'recordInteractionOperation',
+    'markInteractionEffectUnknown',
+    'recordRetainedControlOperation',
+    'updateRetainedControlOperation',
+    'updateRetainedRun',
+    'updateRetained',
+  ] as const
+  for (const name of methods) {
+    const original = target[name]
+    if (!original) throw new Error(`missing store mutation ${name}`)
+    const bound = original.bind(store)
+    target[name] = (...args): unknown => {
+      const result = bound(...args)
+      notifyConditionChanged()
+      return result
+    }
+  }
+}
+
 function setup(
   backend: Backend,
   existingDir?: string,
@@ -539,10 +669,27 @@ function setup(
     inputQueueTimeoutMs?: number
     healthProbeTimeoutMs?: number
   } = {},
-): { app: Hono; service: RetainedSessionService; store: SessionStore; runs: RunRegistry; dir: string } {
+  storeOverride?: SessionStore,
+): {
+  app: Hono
+  service: RetainedSessionService
+  store: SessionStore
+  runs: RunRegistry
+  dir: string
+  unwatch(): void
+} {
   const dir = existingDir ?? mkdtempSync(join(tmpdir(), 'cli-bridge-retained-'))
-  const store = new SqliteSessionStore(dir)
+  const store = storeOverride ?? new SqliteSessionStore(dir)
+  watchStoreMutations(store)
   const runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
+  const runUnsubscribes: Array<() => void> = []
+  const claim = runs.claim.bind(runs)
+  runs.claim = ((...args: Parameters<RunRegistry['claim']>) => {
+    const result = claim(...args)
+    runUnsubscribes.push(result.run.subscribeCanonical(notifyConditionChanged))
+    notifyConditionChanged()
+    return result
+  }) as RunRegistry['claim']
   const registry = new (class {
     readonly backends = [backend]
     resolve(model: string): Backend | null { return this.backends.find(item => item.matches(model)) ?? null }
@@ -550,15 +697,25 @@ function setup(
   })()
   const service = new RetainedSessionService({ store, registry: registry as never, runs, ...serviceOptions })
   const app = new Hono()
-  mountRetainedSessions(app, service)
+  mountRetainedSessions(app, service, { includeRunEvents: false })
   mountRuns(app, { runs, retainedRuns: service })
   mountChatCompletions(app, { registry: registry as never, sessions: store, runs })
-  return { app, service, store, runs, dir }
+  return {
+    app,
+    service,
+    store,
+    runs,
+    dir,
+    unwatch(): void {
+      for (const unsubscribe of runUnsubscribes.splice(0)) unsubscribe()
+    },
+  }
 }
 
 const cleanup = async (fixture: ReturnType<typeof setup>): Promise<void> => {
   await fixture.runs.shutdown(1_000)
   await fixture.service.shutdown(1_000).catch(() => {})
+  fixture.unwatch()
   fixture.store.close()
   rmSync(fixture.dir, { recursive: true, force: true })
 }
@@ -581,8 +738,8 @@ function cancellationBody(
     operationId,
       run: {
         runId,
-        provider: 'cli-bridge',
-        environmentId: 'cli-bridge',
+        provider: admission.provider,
+        environmentId: admission.environmentId,
         sessionId,
         executionId: admission.executionId,
         requestDigest: admission.requestDigest as `sha256:${string}`,
@@ -611,8 +768,8 @@ function steerRequest(
     message,
     run: {
       runId,
-      provider: 'cli-bridge',
-      environmentId: 'cli-bridge',
+      provider: admission.provider,
+      environmentId: admission.environmentId,
       sessionId,
       executionId: admission.executionId,
       requestDigest: admission.requestDigest as `sha256:${string}`,
@@ -650,13 +807,84 @@ function interactionCommand(
   }
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (predicate()) return
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  throw new Error('timed out waiting for retained run')
+async function waitFor(predicate: () => boolean): Promise<void> {
+  if (predicate()) return
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const finish = (error?: unknown): void => {
+      if (settled) return
+      settled = true
+      conditionListeners.delete(check)
+      if (error) reject(error)
+      else resolve()
+    }
+    const check = (): void => {
+      try {
+        if (predicate()) finish()
+      } catch (error) {
+        finish(error)
+      }
+    }
+    conditionListeners.add(check)
+    check()
+  })
+}
+
+async function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return
+  await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+}
+
+async function nextTimerTurn(): Promise<void> {
+  await new Promise<void>(resolve => setTimeout(resolve, 0))
+}
+
+async function waitForChildExit(child: ChildProcessWithoutNullStreams): Promise<[number | null, NodeJS.Signals | null]> {
+  if (child.exitCode !== null || child.signalCode !== null) return [child.exitCode, child.signalCode]
+  const exited = once(child, 'exit') as Promise<[number | null, NodeJS.Signals | null]>
+  if (child.exitCode !== null || child.signalCode !== null) return [child.exitCode, child.signalCode]
+  return await exited
+}
+
+async function stopChild(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): Promise<void> {
+  const exited = waitForChildExit(child)
+  if (child.exitCode === null && child.signalCode === null) child.kill(signal)
+  await exited
+}
+
+async function waitForChildOutput(child: ChildProcessWithoutNullStreams, marker: string): Promise<string> {
+  let output = ''
+  let errors = ''
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const cleanup = (): void => {
+      child.stdout.off('data', onOutput)
+      child.stderr.off('data', onErrorOutput)
+      child.off('exit', onExit)
+      child.off('error', onError)
+    }
+    const finish = (error?: Error): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve()
+    }
+    const onOutput = (chunk: Buffer): void => {
+      output += chunk.toString()
+      if (output.includes(marker)) finish()
+    }
+    const onErrorOutput = (chunk: Buffer): void => { errors += chunk.toString() }
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      finish(new Error(`child exited before ${JSON.stringify(marker)}: code=${code} signal=${signal} output=${output} error=${errors}`))
+    }
+    const onError = (error: Error): void => { finish(error) }
+    child.stdout.on('data', onOutput)
+    child.stderr.on('data', onErrorOutput)
+    child.once('exit', onExit)
+    child.once('error', onError)
+  })
+  return output
 }
 
 describe('retained Agent Interface sessions', () => {
@@ -751,7 +979,10 @@ describe('retained Agent Interface sessions', () => {
       body: JSON.stringify(request),
     })
     expect(created.status).toBe(201)
-    const expectedDigest = canonicalCandidateDigest(request)
+    const expectedDigest = canonicalCandidateDigest({
+      ...request,
+      interaction_policy: 'interactive',
+    })
     expect((await json(created)).create_request_digest).toBe(expectedDigest)
     expect(fixture.store.getRetained(request.id)?.createRequestDigest).toBe(expectedDigest)
 
@@ -783,6 +1014,171 @@ describe('retained Agent Interface sessions', () => {
     })
     expect(missingRunId.status).toBe(400)
     expect(fixture.store.getRetained('identity-required')?.runId).toBeNull()
+  })
+
+  it('admits only supported per-turn interaction kinds', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'interaction-posture', model: 'pi/test' }),
+    })
+
+    const unsupported = await fixture.app.request('/v1/sessions/interaction-posture/turns', {
+      method: 'POST',
+      body: turnBody('unsupported-interaction', {
+        message: 'must fail before spawn',
+        interactions: { plan: true },
+      }),
+    })
+    expect(unsupported.status).toBe(400)
+    expect(await json(unsupported)).toMatchObject({ error: { type: 'capability_denied' } })
+    expect(backend.natives).toEqual([])
+
+    const admitted = await fixture.app.request('/v1/sessions/interaction-posture/turns', {
+      method: 'POST',
+      body: turnBody('supported-interaction', {
+        message: 'continue',
+        interactions: { permission: true, question: false },
+      }),
+    })
+    expect(admitted.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('interaction-posture')?.turns === 1)
+    expect(backend.natives).toHaveLength(1)
+  })
+
+  it('binds the exact interaction posture into retained turn identity', async () => {
+    fixture = setup(new FakeNativeBackend())
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'interaction-identity', model: 'pi/test' }),
+    })
+    const firstBody = {
+      message: 'same prompt',
+      run_id: 'interaction-identity-run',
+      execution_id: 'interaction-identity-execution',
+      interactions: { permission: true },
+    }
+    const first = await fixture.app.request('/v1/sessions/interaction-identity/turns', {
+      method: 'POST',
+      body: JSON.stringify(firstBody),
+    })
+    expect(first.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('interaction-identity')?.turns === 1)
+
+    const replay = await fixture.app.request('/v1/sessions/interaction-identity/turns', {
+      method: 'POST',
+      body: JSON.stringify(firstBody),
+    })
+    expect(replay.status).toBe(202)
+
+    const changed = await fixture.app.request('/v1/sessions/interaction-identity/turns', {
+      method: 'POST',
+      body: JSON.stringify({ ...firstBody, interactions: { question: true } }),
+    })
+    expect(changed.status).toBe(409)
+    expect(await json(changed)).toMatchObject({ error: { type: 'run_identity_conflict' } })
+  })
+
+  it('binds public provider and environment coordinates into retained turn identity', async () => {
+    fixture = setup(new FakeNativeBackend())
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'coordinate-identity', model: 'pi/test' }),
+    })
+    const firstBody = {
+      message: 'same prompt',
+      run_id: 'coordinate-identity-run',
+      execution_id: 'coordinate-identity-execution',
+      provider: 'agent-provider-cli-bridge',
+      environment_id: 'environment-a',
+    }
+    const first = await fixture.app.request('/v1/sessions/coordinate-identity/turns', {
+      method: 'POST',
+      body: JSON.stringify(firstBody),
+    })
+    expect(first.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('coordinate-identity')?.turns === 1)
+
+    const continuation = await fixture.app.request('/v1/sessions/coordinate-identity/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...firstBody,
+        run_id: 'coordinate-identity-continuation-run',
+        execution_id: 'coordinate-identity-continuation-execution',
+      }),
+    })
+    expect(continuation.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('coordinate-identity')?.turns === 2)
+    expect(fixture.store.getRetained('coordinate-identity')?.contextBoundary).toMatchObject({
+      provider: 'agent-provider-cli-bridge',
+      environmentId: 'environment-a',
+    })
+
+    const changedProvider = await fixture.app.request('/v1/sessions/coordinate-identity/turns', {
+      method: 'POST',
+      body: JSON.stringify({ ...firstBody, provider: 'another-provider' }),
+    })
+    expect(changedProvider.status).toBe(409)
+    expect(await json(changedProvider)).toMatchObject({ error: { type: 'run_identity_conflict' } })
+
+    const changedEnvironment = await fixture.app.request('/v1/sessions/coordinate-identity/turns', {
+      method: 'POST',
+      body: JSON.stringify({ ...firstBody, environment_id: 'environment-b' }),
+    })
+    expect(changedEnvironment.status).toBe(409)
+    expect(await json(changedEnvironment)).toMatchObject({ error: { type: 'run_identity_conflict' } })
+  })
+
+  it('uses persisted non-default coordinates for steer and cancel after admission', async () => {
+    const native = new HangingNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'coordinate-control', model: 'pi/test' }),
+    })
+    const turn = await fixture.app.request('/v1/sessions/coordinate-control/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: 'hang',
+        run_id: 'coordinate-control-run',
+        execution_id: 'coordinate-control-execution',
+        provider: 'sandbox-provider',
+        environment_id: 'sandbox-environment',
+      }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('coordinate-control')?.status === 'running')
+    const admission = fixture.store.getRetainedRun('coordinate-control-run')
+    expect(admission).toMatchObject({ provider: 'sandbox-provider', environmentId: 'sandbox-environment' })
+
+    const wrongCancel = JSON.parse(cancellationBody(fixture, 'coordinate-control', 'wrong-coordinate-cancel')) as Record<string, any>
+    const wrongMaterial = {
+      operationId: wrongCancel.operationId,
+      run: { ...wrongCancel.run, provider: 'other-provider' },
+    }
+    wrongCancel.run = wrongMaterial.run
+    wrongCancel.requestDigest = agentRunCancellationRequestDigest(wrongMaterial)
+    const rejected = await fixture.app.request('/v1/sessions/coordinate-control/cancel', {
+      method: 'POST',
+      body: JSON.stringify(wrongCancel),
+    })
+    expect(rejected.status).toBe(409)
+    expect(fixture.runs.get('coordinate-control-run')?.snapshot().terminal).toBe(false)
+
+    const steer = await fixture.app.request('/v1/sessions/coordinate-control/steer', {
+      method: 'POST',
+      body: JSON.stringify(steerRequest(fixture, 'coordinate-control', 'coordinate-steer', 'continue')),
+    })
+    expect(steer.status).toBe(200)
+    expect(native.steers).toEqual(['continue'])
+
+    const cancelled = await fixture.app.request('/v1/sessions/coordinate-control/cancel?wait_ms=1000', {
+      method: 'POST',
+      body: cancellationBody(fixture, 'coordinate-control', 'coordinate-cancel'),
+    })
+    expect(cancelled.status).toBe(200)
+    expect(await json(cancelled)).toMatchObject({ status: 'accepted', effect: 'cancelled' })
   })
 
   it('rejects both API orderings when one session id crosses session types', async () => {
@@ -925,6 +1321,85 @@ describe('retained Agent Interface sessions', () => {
     }
   })
 
+  it('upgrades released interaction acknowledgements without losing retry identity', () => {
+    const dir = mkdtempSync(`${tmpdir()}/cli-bridge-released-interactions-`)
+    try {
+      const created = new SqliteSessionStore(dir)
+      created.close()
+      const requestDigest = canonicalCandidateDigest('released-response-command')
+      const binding: InteractionBinding = {
+        runId: 'released-run',
+        provider: 'cli-bridge',
+        environmentId: 'released-environment',
+        sessionId: 'released-session',
+        executionId: 'released-execution',
+        interactionId: 'released-interaction',
+        requestDigest: canonicalCandidateDigest('released-interaction'),
+      }
+      const acknowledgement = {
+        operationId: 'released-operation',
+        binding,
+        commandDigest: canonicalCandidateDigest('released-command'),
+        status: 'accepted',
+      }
+      const db = new Database(join(dir, 'sessions.sqlite'))
+      db.exec(`
+        DROP TABLE interaction_operations;
+        CREATE TABLE interaction_operations (
+          operation_id TEXT PRIMARY KEY,
+          caller_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          interaction_id TEXT NOT NULL,
+          request_digest TEXT NOT NULL,
+          acknowledgement_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+      `)
+      db.prepare(
+        `INSERT INTO interaction_operations
+         (operation_id, caller_id, run_id, session_id, interaction_id, request_digest,
+          acknowledgement_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        acknowledgement.operationId,
+        'braid',
+        binding.runId,
+        binding.sessionId,
+        binding.interactionId,
+        requestDigest,
+        JSON.stringify(acknowledgement),
+        1,
+      )
+      db.close()
+
+      const reopened = new SqliteSessionStore(dir)
+      expect(reopened.beginInteractionOperation({
+        operationId: acknowledgement.operationId,
+        callerId: 'braid',
+        runId: binding.runId,
+        sessionId: binding.sessionId,
+        interactionId: binding.interactionId,
+        requestDigest,
+        responseDigest: canonicalCandidateDigest('released-response'),
+      })).toMatchObject({
+        kind: 'replayed',
+        operation: {
+          phase: 'acknowledged',
+          effectProof: {
+            kind: 'released_acknowledgement',
+            operationRequestDigest: requestDigest,
+            recordedAt: 1,
+          },
+          acknowledgement: { status: 'accepted', binding },
+        },
+      })
+      reopened.close()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('rejects turn fields and attachments the native text channel cannot preserve', async () => {
     fixture = setup(new FakeNativeBackend())
     await fixture.app.request('/v1/sessions', {
@@ -944,6 +1419,30 @@ describe('retained Agent Interface sessions', () => {
       expect(response.status).toBe(400)
     }
     expect(fixture.store.getRetained('strict-turn')?.runId).toBeNull()
+  })
+
+  it('rejects oversized retained schema values and HTTP bodies before provider work', async () => {
+    fixture = setup(new FakeNativeBackend())
+    expect(() => fixture!.service.parseTurn({
+      message: 'x'.repeat(RETAINED_MAX_TEXT_LENGTH + 1),
+      run_id: 'oversized-message',
+    })).toThrow()
+    expect(() => fixture!.service.parseCreate({
+      id: 'oversized-model',
+      model: 'x'.repeat(513),
+    })).toThrow()
+
+    const response = await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: 'oversized-body',
+        model: 'pi/test',
+        agent_profile: { payload: 'x'.repeat(RETAINED_MAX_HTTP_BODY_BYTES) },
+      }),
+    })
+    expect(response.status).toBe(413)
+    expect(await json(response)).toMatchObject({ error: { type: 'request_too_large' } })
+    expect(fixture.store.getRetained('oversized-body')).toBeNull()
   })
 
   it('requires the durable run digest before retained cancellation', async () => {
@@ -1372,7 +1871,8 @@ describe('retained Agent Interface sessions', () => {
     await run.pumpCanonical((async function* () {
       yield { event: { type: 'status' as const, status: 'completed' as const } }
     })())
-    await waitFor(() => runs.get('expired-never-closes') === undefined)
+    await nextTimerTurn()
+    expect(runs.get('expired-never-closes')).toBeUndefined()
 
     await expect(runs.shutdown(20)).rejects.toBeInstanceOf(RunShutdownTimeoutError)
   })
@@ -1434,6 +1934,40 @@ describe('retained Agent Interface sessions', () => {
     const events = fixture.store.retainedEventsAfter('uninstrumented').map(item => item.envelope.event)
     expect(events.some(event => event.type === 'interaction')).toBe(false)
     expect(events.some(event => event.type === 'warning' && event.code === 'unsupported_interaction')).toBe(true)
+  })
+
+  it('auto-denies an unrequested supported dialog through the durable response lane', async () => {
+    const native = new FakeNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'auto-deny', model: 'pi/test' }) })
+    const turn = await fixture.app.request('/v1/sessions/auto-deny/turns', {
+      method: 'POST',
+      body: turnBody('auto-deny', { message: 'ask', interactions: { permission: false } }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('auto-deny')?.turns === 1)
+    const events = fixture.store.retainedEventsAfter('auto-deny').map(item => item.envelope.event)
+    expect(events.some(event => event.type === 'interaction')).toBe(false)
+    expect(events.some(event => event.type === 'warning' && event.code === 'interaction_not_requested')).toBe(true)
+    expect(native.responseCalls).toBe(1)
+  })
+
+  it('persists an auto-denial unknown-effect tombstone and never retries the native effect', async () => {
+    const native = new AfterNativeResponseFailure()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'auto-deny-unknown', model: 'pi/test' }) })
+    const turn = await fixture.app.request('/v1/sessions/auto-deny-unknown/turns', {
+      method: 'POST',
+      body: turnBody('auto-deny-unknown', { message: 'ask', interactions: { permission: false } }),
+    })
+    const runId = (await json(turn)).run.id as string
+    const interactionId = `${runId}:interaction:ui-1`
+    await waitFor(() => fixture!.store.findEffectUnknownInteraction(runId, 'auto-deny-unknown', interactionId) !== null)
+    expect(fixture.store.findEffectUnknownInteraction(runId, 'auto-deny-unknown', interactionId)).toMatchObject({
+      phase: 'effect_unknown',
+    })
+    expect(native.effectCount).toBe(1)
+    expect(native.responseCalls).toBe(1)
   })
 
   it('keeps detach separate from explicit cancel', async () => {
@@ -1674,7 +2208,7 @@ describe('retained Agent Interface sessions', () => {
       if (!run) throw new Error('pending startup run is missing')
 
       const shuttingDown = fixture.runs.shutdown(1_000)
-      await waitFor(() => run.signal.aborted)
+      await waitForAbort(run.signal)
       backend.allowStart()
 
       const [turned] = await Promise.all([turn, shuttingDown])
@@ -1721,7 +2255,7 @@ describe('retained Agent Interface sessions', () => {
           requestDigest: agentRunCancellationRequestDigest(cancellation),
         }),
       })
-      await waitFor(() => fixture!.runs.get(runId)?.signal.aborted === true)
+      await waitForAbort(fixture!.runs.get(runId)!.signal)
 
       backend.allowStart()
       const [turned, cancelled] = await Promise.all([turn, cancelling])
@@ -1754,7 +2288,7 @@ describe('retained Agent Interface sessions', () => {
         method: 'POST',
         body: cancellationBody(fixture, 'cancel-startup-close-failure', 'cancel-startup-close-failure-operation'),
       })
-      await waitFor(() => fixture!.runs.get(runId)?.signal.aborted === true)
+      await waitForAbort(fixture!.runs.get(runId)!.signal)
 
       backend.allowStart()
       const [turned, cancelled] = await Promise.all([turn, cancelling])
@@ -1864,7 +2398,7 @@ describe('retained Agent Interface sessions', () => {
       expect(fixture.runs.nativeSession('shutdown-transfer-gap')).toBeNull()
 
       const shuttingDown = fixture.runs.shutdown(1_000)
-      await waitFor(() => run.signal.aborted)
+      await waitForAbort(run.signal)
       releaseTransfer()
 
       const [continued] = await Promise.all([continuation, shuttingDown])
@@ -1914,7 +2448,7 @@ describe('retained Agent Interface sessions', () => {
         method: 'POST',
         body: cancellationBody(fixture, 'cancel-transfer-gap', 'cancel-transfer-gap-operation'),
       })
-      await waitFor(() => fixture!.runs.get('run-cancel-transfer-gap-second')?.signal.aborted === true)
+      await waitForAbort(fixture!.runs.get('run-cancel-transfer-gap-second')!.signal)
       releaseTransfer()
 
       const [continued, cancelled] = await Promise.all([continuation, cancelling])
@@ -2176,7 +2710,7 @@ describe('retained Agent Interface sessions', () => {
     const queued = Promise.resolve(fixture.app.request('/v1/sessions/queued/input', { method: 'POST', body: turnBody('queued-second', { message: 'second' }) }))
     let admitted = false
     void queued.then(() => { admitted = true })
-    await new Promise(resolve => setTimeout(resolve, 20))
+    await Promise.resolve()
     expect(admitted).toBe(false)
     const response = await fixture.app.request(`/v1/runs/${firstRunId}/interactions/${interaction.request.id}/respond`, {
       method: 'POST',
@@ -2204,7 +2738,7 @@ describe('retained Agent Interface sessions', () => {
     const interaction = fixture.store.retainedEventsAfter('queue-overflow').find(item => item.envelope.event.type === 'interaction')!.envelope.event
     if (interaction.type !== 'interaction') throw new Error('queue overflow interaction missing')
     const queued = fixture.app.request('/v1/sessions/queue-overflow/input', { method: 'POST', body: turnBody('queue-overflow-second', { message: 'second' }) })
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await Promise.resolve()
     const overflow = await fixture.app.request('/v1/sessions/queue-overflow/input', { method: 'POST', body: turnBody('queue-overflow-third', { message: 'third' }) })
     expect(overflow.status).toBe(429)
     expect(await json(overflow)).toMatchObject({ error: { type: 'input_queue_full' } })
@@ -2252,7 +2786,7 @@ describe('retained Agent Interface sessions', () => {
       fixture.service.parseTurn(JSON.parse(turnBody('queue-abort-second', { message: 'second' }))),
       { queue: true, signal: controller.signal },
     )
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await Promise.resolve()
     controller.abort()
     await expect(queued).rejects.toMatchObject({ code: 'input_queue_aborted', status: 408 })
     expect(fixture.store.getRetainedRun('run-queue-abort-second')).toBeNull()
@@ -2284,12 +2818,12 @@ describe('retained Agent Interface sessions', () => {
       fixture.service.parseTurn(JSON.parse(turnBody('queue-middle-third', { message: 'third' }))),
       { queue: true },
     )
-    await new Promise(resolve => setTimeout(resolve, 10))
+    await Promise.resolve()
     controller.abort()
     await expect(middle).rejects.toMatchObject({ code: 'input_queue_aborted', status: 408 })
     const premature = await Promise.race([
       last.then(() => 'resolved', () => 'rejected'),
-      new Promise<'waiting'>(resolve => setTimeout(() => resolve('waiting'), 30)),
+      Promise.resolve<'waiting'>('waiting'),
     ])
     expect(premature).toBe('waiting')
     expect(fixture.store.getRetainedRun('run-queue-middle-third')).toBeNull()
@@ -2320,11 +2854,29 @@ describe('retained Agent Interface sessions', () => {
   it('validates interaction bindings and makes the response operation idempotent', async () => {
     fixture = setup(new FakeNativeBackend())
     await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 's3', model: 'pi/test' }) })
-    const turn = await fixture.app.request('/v1/sessions/s3/turns', { method: 'POST', body: turnBody('s3-ask', { message: 'ask' }) })
+    const turn = await fixture.app.request('/v1/sessions/s3/turns', {
+      method: 'POST',
+      body: turnBody('s3-ask', {
+        message: 'ask',
+        provider: 'agent-provider-cli-bridge',
+        environment_id: 'sandbox-environment',
+      }),
+    })
     const runId = (await json(turn)).run.id as string
     await waitFor(() => fixture!.store.retainedEventsAfter('s3').some(item => item.envelope.event.type === 'interaction'))
     const interaction = fixture.store.retainedEventsAfter('s3').find(item => item.envelope.event.type === 'interaction')!.envelope.event
     if (interaction.type !== 'interaction') throw new Error('test interaction missing')
+    expect(interaction.request.binding).toEqual({
+      runId,
+      provider: 'agent-provider-cli-bridge',
+      environmentId: 'sandbox-environment',
+      sessionId: 's3',
+      executionId: 'execution-s3-ask',
+      interactionId: interaction.request.id,
+    })
+    expect(interaction.request.answerSpec.fields).toEqual([
+      expect.objectContaining({ type: 'select', name: 'grant' }),
+    ])
     const acceptedResponse = {
       id: interaction.request.id,
       outcome: 'accepted' as const,
@@ -2334,7 +2886,16 @@ describe('retained Agent Interface sessions', () => {
     const accepted = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, { method: 'POST', body: JSON.stringify(command) })
     expect(accepted.status).toBe(200)
     const acceptedBody = await json(accepted)
-    expect(acceptedBody.status).toBe('accepted')
+    expect(acceptedBody).toMatchObject({
+      status: 'accepted',
+      binding: {
+        provider: 'agent-provider-cli-bridge',
+        environmentId: 'sandbox-environment',
+        runId,
+        interactionId: interaction.request.id,
+      },
+    })
+    expect(fixture.store.getInteractionOperation(command.operationId)?.acknowledgement?.binding).toEqual(command.binding)
     const retry = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, { method: 'POST', body: JSON.stringify(command) })
     expect(retry.status).toBe(200)
     expect(await json(retry)).toEqual(acceptedBody)
@@ -2364,6 +2925,325 @@ describe('retained Agent Interface sessions', () => {
     })
     expect(wrong.status).toBe(409)
     expect((await json(wrong)).status).toBe('binding_mismatch')
+    const wrongProvider = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(interactionCommand('op-wrong-provider', interaction.request, acceptedResponse, {
+        provider: 'another-provider',
+      })),
+    })
+    expect(wrongProvider.status).toBe(409)
+    expect((await json(wrongProvider)).status).toBe('binding_mismatch')
+    const wrongEnvironment = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(interactionCommand('op-wrong-environment', interaction.request, acceptedResponse, {
+        environmentId: 'another-environment',
+      })),
+    })
+    expect(wrongEnvironment.status).toBe(409)
+    expect((await json(wrongEnvironment)).status).toBe('binding_mismatch')
+  })
+
+  it('records an unknown effect when native delivery fails before the effect', async () => {
+    const native = new BeforeNativeResponseFailure()
+    const backend = new FakeNativeBackend(() => native)
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'crash-before-native', model: 'pi/test' }) })
+    const turn = await fixture.app.request('/v1/sessions/crash-before-native/turns', {
+      method: 'POST',
+      body: turnBody('crash-before-native-ask', { message: 'ask' }),
+    })
+    const runId = (await json(turn)).run.id as string
+    await waitFor(() => fixture!.store.retainedEventsAfter('crash-before-native').some(item => item.envelope.event.type === 'interaction'))
+    const interaction = fixture.store.retainedEventsAfter('crash-before-native').find(item => item.envelope.event.type === 'interaction')!.envelope.event
+    if (interaction.type !== 'interaction') throw new Error('interaction missing')
+    const command = interactionCommand('crash-before-native-operation', interaction.request, {
+      id: interaction.request.id,
+      outcome: 'accepted',
+      data: { grant: ['allow_once'] },
+    })
+
+    const first = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(first.status).toBe(502)
+    expect(await json(first)).toMatchObject({ status: 'transport_failure', retryable: false })
+    expect(fixture.store.getInteractionOperation(command.operationId)).toMatchObject({
+      phase: 'effect_unknown',
+      acknowledgement: { status: 'transport_failure', retryable: false },
+    })
+
+    const retry = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(retry.status).toBe(502)
+    expect(await json(retry)).toMatchObject({ status: 'transport_failure', retryable: false })
+    expect(native.responseCalls).toBe(1)
+  })
+
+  it('closes an interaction after delivery throws and never repeats it for another operation', async () => {
+    const native = new AfterNativeResponseFailure()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'unknown-interaction', model: 'pi/test' }) })
+    const turn = await fixture.app.request('/v1/sessions/unknown-interaction/turns', {
+      method: 'POST',
+      body: turnBody('unknown-interaction-ask', { message: 'ask' }),
+    })
+    const runId = (await json(turn)).run.id as string
+    await waitFor(() => fixture!.store.retainedEventsAfter('unknown-interaction').some(item => item.envelope.event.type === 'interaction'))
+    const interaction = fixture.store.retainedEventsAfter('unknown-interaction').find(item => item.envelope.event.type === 'interaction')!.envelope.event
+    if (interaction.type !== 'interaction') throw new Error('interaction missing')
+    const response = {
+      id: interaction.request.id,
+      outcome: 'accepted' as const,
+      data: { grant: ['allow_once'] },
+    }
+    const firstCommand = interactionCommand('unknown-interaction-operation-a', interaction.request, response)
+    const first = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(firstCommand),
+    })
+    expect(first.status).toBe(502)
+    expect(await json(first)).toMatchObject({ status: 'transport_failure', retryable: false })
+    expect(fixture.store.findEffectUnknownInteraction(runId, 'unknown-interaction', interaction.request.id)).toMatchObject({
+      phase: 'effect_unknown',
+      operationId: firstCommand.operationId,
+    })
+
+    const secondCommand = interactionCommand('unknown-interaction-operation-b', interaction.request, response)
+    const second = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(secondCommand),
+    })
+    expect(second.status).toBe(502)
+    expect(await json(second)).toMatchObject({
+      status: 'transport_failure',
+      retryable: false,
+      message: 'response effect is unknown; this interaction is permanently closed and will not be repeated',
+    })
+    expect(native.effectCount).toBe(1)
+    expect(native.responseCalls).toBe(1)
+  })
+
+  it('reconciles an intent after a crash following native delivery without rerunning it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-crash-after-native-'))
+    const native = new FakeNative()
+    const backend = new FakeNativeBackend(() => native)
+    const original = setup(backend, dir, {}, new CrashAfterNativeStore(dir))
+    fixture = original
+    await original.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'crash-after-native', model: 'pi/test' }) })
+    const turn = await original.app.request('/v1/sessions/crash-after-native/turns', {
+      method: 'POST',
+      body: turnBody('crash-after-native-ask', { message: 'ask' }),
+    })
+    const runId = (await json(turn)).run.id as string
+    await waitFor(() => original.store.retainedEventsAfter('crash-after-native').some(item => item.envelope.event.type === 'interaction'))
+    const interaction = original.store.retainedEventsAfter('crash-after-native').find(item => item.envelope.event.type === 'interaction')!.envelope.event
+    if (interaction.type !== 'interaction') throw new Error('interaction missing')
+    const command = interactionCommand('crash-after-native-operation', interaction.request, {
+      id: interaction.request.id,
+      outcome: 'accepted',
+      data: { grant: ['allow_once'] },
+    })
+
+    const first = await original.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(first.status).toBe(502)
+    expect(await json(first)).toMatchObject({ status: 'transport_failure', retryable: false })
+    expect(original.store.getInteractionOperation(command.operationId)).toMatchObject({ phase: 'intent', acknowledgement: null })
+
+    await original.runs.shutdown(1_000)
+    original.store.close()
+    const restarted = setup(backend, dir)
+    fixture = restarted
+    const replay = await restarted.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(replay.status).toBe(502)
+    expect(await json(replay)).toMatchObject({
+      status: 'transport_failure',
+      retryable: false,
+      message: 'response delivery was interrupted before its native effect was proven; it will not be repeated',
+    })
+    expect(restarted.store.getInteractionOperation(command.operationId)).toMatchObject({ phase: 'effect_unknown' })
+    expect(native.responseCalls).toBe(1)
+  })
+
+  it('survives a real SIGKILL after native effect start without repeating the effect', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-sigkill-'))
+    const effectPath = join(dir, 'native-effects.log')
+    const operation = {
+      operationId: 'sigkill-interaction-operation',
+      callerId: 'sigkill-caller',
+      runId: 'sigkill-run',
+      sessionId: 'sigkill-session',
+      interactionId: 'sigkill-interaction',
+      requestDigest: 'sha256:' + 'a'.repeat(64),
+      responseDigest: 'sha256:' + 'b'.repeat(64),
+    }
+    const childScript = `
+      import { appendFileSync } from 'node:fs'
+      import { SessionStore as SqliteSessionStore } from './src/sessions/store.ts'
+      const [dir, effectPath] = process.argv.slice(1)
+      const store = new SqliteSessionStore(dir)
+      const operation = ${JSON.stringify(operation)}
+      store.beginInteractionOperation(operation)
+      process.stdout.write('intent\\n')
+      appendFileSync(effectPath, 'native-effect\\n', { encoding: 'utf8', mode: 0o600 })
+      process.stdout.write('effect\\n')
+      process.stdin.resume()
+    `
+    let child: ChildProcessWithoutNullStreams | null = null
+    try {
+      child = spawn(
+        process.execPath,
+        ['--import', 'tsx/esm', '--input-type=module', '-e', childScript, dir, effectPath],
+        { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] },
+      )
+      await waitForChildOutput(child, 'effect\n')
+      const exited = waitForChildExit(child)
+      child.kill('SIGKILL')
+      const [code, signal] = await exited
+      child = null
+      expect(code).toBeNull()
+      expect(signal).toBe('SIGKILL')
+      expect(readFileSync(effectPath, 'utf8').trim().split('\n')).toEqual(['native-effect'])
+
+      fixture = setup(new FakeNativeBackend(), dir)
+      expect(fixture.store.getInteractionOperation(operation.operationId)).toMatchObject({
+        phase: 'intent',
+        effectProof: null,
+        acknowledgement: null,
+      })
+      const requestDigest = operation.requestDigest as `sha256:${string}`
+      const acknowledgement: InteractionAcknowledgement = {
+        operationId: operation.operationId,
+        binding: {
+          runId: operation.runId,
+          provider: 'agent-provider-cli-bridge',
+          environmentId: 'environment-sigkill',
+          sessionId: operation.sessionId,
+          executionId: 'execution-sigkill',
+          interactionId: operation.interactionId,
+          requestDigest,
+        },
+        commandDigest: ('sha256:' + 'c'.repeat(64)) as `sha256:${string}`,
+        status: 'transport_failure',
+        message: 'the native effect became unknowable after process loss',
+        retryable: false,
+      }
+      const unknown = fixture.store.markInteractionEffectUnknown(
+        operation.operationId,
+        operation.requestDigest,
+        operation.responseDigest,
+        acknowledgement,
+      )
+      expect(unknown).toMatchObject({
+        phase: 'effect_unknown',
+        acknowledgement: { status: 'transport_failure', retryable: false },
+      })
+      const replay = fixture.store.beginInteractionOperation(operation)
+      expect(replay.kind).toBe('replayed')
+      expect(replay.operation.phase).toBe('effect_unknown')
+      expect(readFileSync(effectPath, 'utf8').trim().split('\n')).toEqual(['native-effect'])
+    } finally {
+      if (child) await stopChild(child, 'SIGKILL')
+      if (!fixture) rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('replays a proven effect when acknowledgement persistence fails after resolve', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-crash-after-resolve-'))
+    const native = new FakeNative()
+    const backend = new FakeNativeBackend(() => native)
+    const original = setup(backend, dir, {}, new CrashAfterResolveStore(dir))
+    fixture = original
+    await original.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'crash-after-resolve', model: 'pi/test' }) })
+    const turn = await original.app.request('/v1/sessions/crash-after-resolve/turns', {
+      method: 'POST',
+      body: turnBody('crash-after-resolve-ask', { message: 'ask' }),
+    })
+    const runId = (await json(turn)).run.id as string
+    await waitFor(() => original.store.retainedEventsAfter('crash-after-resolve').some(item => item.envelope.event.type === 'interaction'))
+    const interaction = original.store.retainedEventsAfter('crash-after-resolve').find(item => item.envelope.event.type === 'interaction')!.envelope.event
+    if (interaction.type !== 'interaction') throw new Error('interaction missing')
+    const command = interactionCommand('crash-after-resolve-operation', interaction.request, {
+      id: interaction.request.id,
+      outcome: 'accepted',
+      data: { grant: ['allow_once'] },
+    })
+
+    const first = await original.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(first.status).toBe(502)
+    expect(await json(first)).toMatchObject({ status: 'transport_failure', retryable: true })
+    expect(original.store.getInteractionOperation(command.operationId)).toMatchObject({ phase: 'effect_proven', acknowledgement: null })
+    expect(native.responseCalls).toBe(1)
+
+    await original.runs.shutdown(1_000)
+    original.store.close()
+    const restarted = setup(backend, dir)
+    fixture = restarted
+    const replay = await restarted.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(replay.status).toBe(200)
+    expect(await json(replay)).toMatchObject({ status: 'accepted', binding: { provider: 'cli-bridge' } })
+    expect(restarted.store.getInteractionOperation(command.operationId)).toMatchObject({
+      phase: 'acknowledged',
+      acknowledgement: { status: 'accepted' },
+    })
+    expect(native.responseCalls).toBe(1)
+  })
+
+  it('replays the durable acknowledgement when the process dies after acknowledgement persistence', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-crash-after-ack-'))
+    const native = new FakeNative()
+    const backend = new FakeNativeBackend(() => native)
+    const original = setup(backend, dir, {}, new CrashAfterAcknowledgementStore(dir))
+    fixture = original
+    await original.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'crash-after-ack', model: 'pi/test' }) })
+    const turn = await original.app.request('/v1/sessions/crash-after-ack/turns', {
+      method: 'POST',
+      body: turnBody('crash-after-ack-ask', { message: 'ask' }),
+    })
+    const runId = (await json(turn)).run.id as string
+    await waitFor(() => original.store.retainedEventsAfter('crash-after-ack').some(item => item.envelope.event.type === 'interaction'))
+    const interaction = original.store.retainedEventsAfter('crash-after-ack').find(item => item.envelope.event.type === 'interaction')!.envelope.event
+    if (interaction.type !== 'interaction') throw new Error('interaction missing')
+    const command = interactionCommand('crash-after-ack-operation', interaction.request, {
+      id: interaction.request.id,
+      outcome: 'accepted',
+      data: { grant: ['allow_once'] },
+    })
+
+    const first = await original.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(first.status).toBe(200)
+    expect(await json(first)).toMatchObject({ status: 'accepted', binding: { provider: 'cli-bridge' } })
+    expect(original.store.getInteractionOperation(command.operationId)).toMatchObject({ phase: 'acknowledged' })
+    expect(native.responseCalls).toBe(1)
+
+    await original.runs.shutdown(1_000)
+    original.store.close()
+    const restarted = setup(backend, dir)
+    fixture = restarted
+    const replay = await restarted.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(command),
+    })
+    expect(replay.status).toBe(200)
+    expect(await json(replay)).toMatchObject({ status: 'accepted', binding: { provider: 'cli-bridge' } })
+    expect(native.responseCalls).toBe(1)
   })
 
   it('allows only one distinct response operation to reach a pending interaction', async () => {
@@ -2464,8 +3344,8 @@ describe('retained Agent Interface sessions', () => {
     })
     expect(retry.status).toBe(200)
     expect(await json(retry)).toMatchObject({ status: 'accepted', effect: 'cancelled' })
-    expect(fixture.store.getInteractionOperation('race-response')?.acknowledgement.status).toBe('accepted')
-    expect(fixture.store.getInteractionOperation('race-response')?.acknowledgement.retryable).toBeUndefined()
+    expect(fixture.store.getInteractionOperation('race-response')?.acknowledgement?.status).toBe('accepted')
+    expect(fixture.store.getInteractionOperation('race-response')?.acknowledgement?.retryable).toBeUndefined()
   })
 
   it('cancels an interaction when the native run ends without an answer', async () => {
@@ -2533,7 +3413,6 @@ describe('retained Agent Interface sessions', () => {
       tags: ['one', 'two'],
       client: 'test-suite',
       mode: 'byob',
-      interaction_policy: 'interactive',
     })
 
     const unsafe = [
@@ -2852,6 +3731,123 @@ describe('retained Agent Interface sessions', () => {
     expect(replay.status).toBe(200)
     const replayBody = await replay.text()
     expect([...replayBody.matchAll(/data: (\{.*\})\r?\n/gu)].map(match => JSON.parse(match[1]!).sequence).every(sequence => sequence > events[0].sequence)).toBe(true)
+  })
+
+  it('streams an active retained run from the canonical event log without legacy DONE', async () => {
+    fixture = setup(new FakeNativeBackend(() => new HangingNative()))
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'active-run-events', model: 'pi/test' }) })
+    const turn = await fixture.app.request('/v1/sessions/active-run-events/turns', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'hang', run_id: 'active-run-events-run', execution_id: 'active-run-events-execution' }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('active-run-events')?.status === 'running')
+    const runId = (await json(turn)).run.id as string
+    const stream = await fixture.app.request(`/v1/runs/${runId}/events`)
+    expect(stream.status).toBe(200)
+    const reader = stream.body!.getReader()
+    const decoder = new TextDecoder()
+    let body = ''
+    let cancelled = false
+    while (true) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      body += decoder.decode(chunk.value, { stream: true })
+      if (!cancelled && body.includes('event: status')) {
+        cancelled = true
+        const response = await fixture.app.request(`/v1/sessions/active-run-events/cancel?wait_ms=1000`, {
+          method: 'POST',
+          body: cancellationBody(fixture, 'active-run-events', 'active-run-events-cancel'),
+        })
+        expect(response.status).toBe(200)
+      }
+    }
+    expect(cancelled).toBe(true)
+    expect(body).toContain(`"runId":"${runId}"`)
+    expect(body).toContain('event: status')
+    expect(body).not.toContain('data: [DONE]')
+  })
+
+  it('prunes acknowledged interaction records but preserves unknown-effect tombstones', () => {
+    const db = new Database(':memory:')
+    createInteractionOperationSchema(db)
+    const ledger = new RetainedInteractionLedger(db)
+    const unknownBinding: InteractionBinding = {
+      requestDigest: canonicalCandidateDigest('unknown-request'),
+      runId: 'bounded-run',
+      provider: 'provider',
+      environmentId: 'environment',
+      sessionId: 'bounded-session',
+      executionId: 'bounded-execution',
+      interactionId: 'unknown-interaction',
+    }
+    const unknownCommandDigest = interactionResponseCommandDigest({
+      binding: unknownBinding,
+      response: { id: unknownBinding.interactionId, outcome: 'cancelled' },
+    })
+    const unknownOperation = {
+      operationId: 'unknown-effect-operation',
+      callerId: 'test-caller',
+      runId: unknownBinding.runId,
+      sessionId: unknownBinding.sessionId,
+      interactionId: unknownBinding.interactionId,
+      requestDigest: canonicalCandidateDigest('unknown-operation-request'),
+      responseDigest: canonicalCandidateDigest('unknown-response'),
+    }
+    ledger.beginInteractionOperation(unknownOperation)
+    ledger.markInteractionEffectUnknown(
+      unknownOperation.operationId,
+      unknownOperation.requestDigest,
+      unknownOperation.responseDigest,
+      {
+        operationId: unknownOperation.operationId,
+        binding: unknownBinding,
+        commandDigest: unknownCommandDigest,
+        status: 'transport_failure',
+        message: 'native effect is unknown',
+        retryable: false,
+      },
+    )
+
+    for (let index = 0; index <= MAX_ACKNOWLEDGED_INTERACTION_OPERATIONS; index += 1) {
+      const binding: InteractionBinding = {
+        requestDigest: canonicalCandidateDigest({ kind: 'ack-request', index }),
+        runId: 'bounded-run',
+        provider: 'provider',
+        environmentId: 'environment',
+        sessionId: 'bounded-session',
+        executionId: 'bounded-execution',
+        interactionId: `ack-${index}`,
+      }
+      ledger.recordInteractionOperation({
+        operationId: `ack-operation-${index}`,
+        callerId: 'test-caller',
+        runId: binding.runId,
+        sessionId: binding.sessionId,
+        interactionId: binding.interactionId,
+        requestDigest: canonicalCandidateDigest({ kind: 'ack-operation', index }),
+        responseDigest: canonicalCandidateDigest({ kind: 'ack-response', index }),
+        acknowledgement: {
+          operationId: `ack-operation-${index}`,
+          binding,
+          commandDigest: canonicalCandidateDigest({ kind: 'ack-command', index }),
+          status: 'unknown_run',
+          message: 'run is unknown',
+        },
+      })
+    }
+
+    const counts = db.prepare(
+      "SELECT phase, COUNT(*) AS count FROM interaction_operations GROUP BY phase",
+    ).all() as Array<{ phase: string; count: number }>
+    const acknowledged = counts.find(row => row.phase === 'acknowledged')?.count ?? 0
+    expect(acknowledged).toBeLessThanOrEqual(MAX_ACKNOWLEDGED_INTERACTION_OPERATIONS)
+    expect(ledger.findEffectUnknownInteraction(
+      unknownBinding.runId,
+      unknownBinding.sessionId,
+      unknownBinding.interactionId,
+    )).toMatchObject({ operationId: unknownOperation.operationId, phase: 'effect_unknown' })
+    db.close()
   })
 })
 

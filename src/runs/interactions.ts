@@ -15,8 +15,10 @@ export class RunInteractionLedger {
   private readonly resolved = new Set<string>()
   private readonly resolvedDigests = new Map<string, string>()
   private readonly cancelled = new Set<string>()
+  private readonly effectUnknown = new Set<string>()
 
   register(interaction: PendingRunInteraction): void {
+    if (this.effectUnknown.has(interaction.request.id)) return
     this.pending.set(interaction.request.id, interaction)
   }
 
@@ -27,7 +29,7 @@ export class RunInteractionLedger {
   /** Claim one interaction so distinct operation ids cannot answer it twice. */
   claim(id: string): PendingRunInteraction | null {
     const pending = this.pending.get(id)
-    if (!pending || this.resolving.has(id)) return null
+    if (!pending || this.resolving.has(id) || this.effectUnknown.has(id)) return null
     this.resolving.add(id)
     return pending
   }
@@ -61,6 +63,17 @@ export class RunInteractionLedger {
 
   wasCancelled(id: string): boolean {
     return this.cancelled.has(id)
+  }
+
+  /** Permanently close an interaction whose native effect may have applied. */
+  markEffectUnknown(id: string): void {
+    this.pending.delete(id)
+    this.resolving.delete(id)
+    this.effectUnknown.add(id)
+  }
+
+  wasEffectUnknown(id: string): boolean {
+    return this.effectUnknown.has(id)
   }
 
   /**

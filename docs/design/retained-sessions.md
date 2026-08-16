@@ -52,9 +52,29 @@ Every retained turn requires caller-owned `run_id` and `execution_id` values.
 
 The bridge binds both values to the normalized request digest before native startup.
 
+Each turn can request canonical interaction kinds through its `interactions` record.
+
+The bridge admits only kinds advertised by the selected backend.
+
+The normalized interaction posture is part of the run request digest.
+
+A retry cannot widen or change that posture under the same run identity.
+
+The digest also includes the exact provider and environment coordinates accepted by the turn parser.
+
+An unrequested interaction fails closed instead of pausing an unattended run.
+
+Session metadata does not store a second interaction policy.
+
 The existing one-shot run replay and cancel routes remain in place.
 
 The retained fallback does not change the current-main behavior for a terminal unknown run.
+
+The data-directory and port lock records bind ownership to a platform process start identity as well as the pid.
+
+Linux uses `/proc`, macOS uses `ps`, and Windows uses PowerShell to read that identity.
+
+A pid-only legacy record is blocked when its process is live and reclaimed only after the liveness check proves it is dead.
 
 ## Interaction response binding
 
@@ -72,13 +92,17 @@ The binding must match all of these values:
 
 - the URL run id;
 - the URL interaction id;
-- provider `cli-bridge`;
-- environment `cli-bridge`;
+- the provider coordinate sent by the SDK;
+- the environment coordinate sent by the SDK;
 - the retained session id;
 - the admitted execution id;
 - the interaction request digest.
 
 The bridge also checks the durable retained-run admission and the live native session before forwarding the response.
+
+Pi permission requests expose one required `select` grant field and no feedback field.
+
+The response scope is the current interaction only.
 
 The same operation id and bytes replay the stored acknowledgement.
 
@@ -140,9 +164,17 @@ ACP remains a one-shot backend in this branch.
 
 It is not a retained-session backend and does not appear in retained capability discovery.
 
-The existing ACP one-shot permission behavior is unchanged because the new generic response path does not yet own ACP requests.
+ACP permission requests now fail closed because the one-shot client cannot bind a user response to a retained run.
 
 Replacing that behavior requires a published ACP-native response adapter and an end-to-end test of request, response, replay, retry, and failure states.
+
+Retained Pi responses are at-most-once across process loss.
+
+After native delivery may have applied and then throws, the durable ledger records an interaction-level `effect_unknown` tombstone.
+
+Every later operation id for that interaction returns a non-retryable transport failure without invoking the native process again.
+
+An interrupted response is never sent again unless a future provider supplies a durable effect receipt.
 
 ## Proof commands
 
@@ -150,6 +182,7 @@ The focused retained proof is:
 
 ```text
 pnpm exec vitest run tests/retained-sessions.test.ts tests/pi-native.test.ts --reporter dot
+pnpm exec vitest run tests/single-instance.test.ts --reporter dot
 ```
 
 The current-main regression proof is:

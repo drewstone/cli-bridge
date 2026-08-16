@@ -222,6 +222,14 @@ export class Run {
     return this.interactions.wasCancelled(id)
   }
 
+  markInteractionEffectUnknown(id: string): void {
+    this.interactions.markEffectUnknown(id)
+  }
+
+  interactionWasEffectUnknown(id: string): boolean {
+    return this.interactions.wasEffectUnknown(id)
+  }
+
   appendCanonical(input: CanonicalEventInput): RuntimeEventEnvelope {
     return this.canonical.append(input)
   }

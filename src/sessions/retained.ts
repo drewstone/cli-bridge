@@ -81,6 +81,7 @@ export class RetainedSessionService {
 
     this.state = new RetainedSessionState(this.store, this.runs)
     this.inputMaterial = new RetainedInputMaterialStore()
+    this.interactions = new RetainedInteractions(this.store, this.runs)
     this.turns = new RetainedTurnRunner({
       store: this.store,
       registry: this.registry,
@@ -89,10 +90,10 @@ export class RetainedSessionService {
       lanes: new TurnLanes(maxDepth, timeoutMs),
       inputMaterial: this.inputMaterial,
       isClosing: (id) => this.closures.has(id),
+      denyUnrequestedInteraction: (input) => this.interactions.denyUnrequestedInteraction(input),
     })
     this.control = new RetainedControl(this.store, this.runs, this.state)
     this.events = new RetainedEvents(this.store, this.runs, this.state)
-    this.interactions = new RetainedInteractions(this.store, this.runs)
   }
 
   parseCreate(value: unknown): RetainedCreateInput {
@@ -171,13 +172,15 @@ export class RetainedSessionService {
       ...callerMetadata,
       ...inputPresenceMetadata(material),
       mode,
-      interaction_policy: input.interaction_policy ?? 'interactive',
     }
     let created: RetainedSessionRecord
     try {
       created = this.store.createRetained({
         id,
-        createRequestDigest: canonicalCandidateDigest(input),
+        createRequestDigest: canonicalCandidateDigest({
+          ...input,
+          interaction_policy: 'interactive',
+        }),
         backend: backend.name,
         model: input.model,
         cwd: input.cwd ?? null,

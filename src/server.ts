@@ -70,7 +70,13 @@ import { RunRegistry } from './runs/registry.js'
 import { TraceEmitter } from './trace/emitter.js'
 import { JsonlSpanSink, nullSpanSink } from './trace/sink.js'
 import { selectJailBackend } from './jail/index.js'
-import { acquireInstanceLock, PortAlreadyBoundError } from './runtime/single-instance.js'
+import {
+  acquireDataDirectoryLock,
+  acquireInstanceLock,
+  InstanceLockError,
+  type DataDirectoryLock,
+  type InstanceLock,
+} from './runtime/single-instance.js'
 import { reapStalePrivateTemporaryRoots } from './runtime/private-temporary.js'
 import { bindIncomingRequest } from './http/request-source.js'
 
@@ -553,17 +559,21 @@ function constantTimeEqual(a: string, b: string): boolean {
 export async function startServer(): Promise<void> {
   const config = loadConfig()
 
-  // Single-instance guard — refuse to start a second bridge on the same
-  // BRIDGE_PORT. Acquired BEFORE buildApp opens sessions.sqlite so two
-  // instances never share that DB. A clean exit here keeps systemd happy:
-  // Type=simple + Restart=always retries, and a dead predecessor's stale
-  // lock is reclaimed automatically (see single-instance.ts).
-  let instanceLock
+  // The data-directory lock is the durable-state owner. Acquire it before
+  // buildApp opens sessions.sqlite, then retain the separate port guard for
+  // listener ownership. A clean exit releases both; a dead predecessor's
+  // proven-stale pidfiles are reclaimed by single-instance.ts.
+  let dataDirectoryLock: DataDirectoryLock | undefined
+  let instanceLock: InstanceLock | undefined
+  let runtimeConfig = config
   try {
+    dataDirectoryLock = acquireDataDirectoryLock(config.dataDir)
+    runtimeConfig = { ...config, dataDir: dataDirectoryLock.dataDir }
     instanceLock = acquireInstanceLock(config.port)
-    reapStalePrivateTemporaryRoots()
   } catch (err) {
-    if (err instanceof PortAlreadyBoundError) {
+    dataDirectoryLock?.release()
+    instanceLock?.release()
+    if (err instanceof InstanceLockError) {
       console.error(`[cli-bridge] ${err.message}`)
       process.exit(1)
     }
@@ -572,22 +582,32 @@ export async function startServer(): Promise<void> {
 
   let built
   try {
-    built = await buildApp(config)
+    reapStalePrivateTemporaryRoots()
+    built = await buildApp(runtimeConfig)
   } catch (err) {
     // A preflight failure is an operator message, not a stack trace: it already
     // contains the observation and the command that fixes it.
     if (err instanceof DockerPreflightError) {
       console.error(`[cli-bridge] FATAL: ${err.message}`)
-      instanceLock.release()
+      instanceLock?.release()
+      dataDirectoryLock?.release()
+      instanceLock = undefined
+      dataDirectoryLock = undefined
       process.exit(1)
     }
-    instanceLock.release()
+    instanceLock?.release()
+    dataDirectoryLock?.release()
+    instanceLock = undefined
+    dataDirectoryLock = undefined
     throw err
   }
   const { app, sessions, extras } = built
   // Drop the lock on hard exit too — graceful shutdown also releases, but
   // a process.exit() path (fatal error) must not strand the pidfile.
-  process.once('exit', () => instanceLock.release())
+  process.once('exit', () => {
+    instanceLock?.release()
+    dataDirectoryLock?.release()
+  })
   const server = serve({
     // @hono/node-server passes the native IncomingMessage as the second
     // callback argument. Bind it to this Request before Hono runs so routes
@@ -689,7 +709,10 @@ export async function startServer(): Promise<void> {
     }
     server.close(() => {
       sessions.close()
-      instanceLock.release()
+      instanceLock?.release()
+      dataDirectoryLock?.release()
+      instanceLock = undefined
+      dataDirectoryLock = undefined
       process.exit(0)
     })
     setTimeout(() => process.exit(1), 5000).unref()
@@ -748,7 +771,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 function isFatalServerStartupError(err: Error): boolean {
   // A second instance racing for the same port is fatal — exit cleanly so
   // the operator sees the clear message rather than a survived exception.
-  if (err instanceof PortAlreadyBoundError) return true
+  if (err instanceof InstanceLockError) return true
   const code = (err as NodeJS.ErrnoException).code
   if (code === 'EADDRINUSE' || code === 'EACCES') return true
   return /listen|address already in use|already running on port/i.test(err.message)
