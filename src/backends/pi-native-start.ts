@@ -235,7 +235,9 @@ export async function startPiNativeSession(
     }
     return new PiNativeSession(spawned, {
       capabilities: piNativeCapabilities(),
-      requestTimeoutMs: Math.max(1, Math.min(options.timeoutMs, PI_RPC_REQUEST_TIMEOUT_CAP_MS)),
+      requestTimeoutMs: options.timeoutMs > 0
+        ? Math.min(options.timeoutMs, PI_RPC_REQUEST_TIMEOUT_CAP_MS)
+        : 0,
       providerSessionId,
       cleanup: cleanupOwnedFiles,
     })

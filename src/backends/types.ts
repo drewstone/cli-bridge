@@ -23,6 +23,7 @@ import type {
   AgentProfile,
   NativeContextBoundaryProof,
   ReasoningEffort,
+  RequestedInteractions,
 } from '@tangle-network/agent-interface'
 
 /** Request-scoped model credential supplied only by the trusted local bridge caller. */
@@ -188,6 +189,8 @@ export interface ChatRequest {
   mode?: BridgeMode
   /** Approval policy for native interaction-capable retained or one-shot turns. */
   interaction_policy?: 'interactive' | 'unattended-deny' | 'unattended-allow'
+  /** Exact interaction kinds admitted for this turn. */
+  interactions?: RequestedInteractions
   /**
    * OpenAI-compatible response-format hint. CLI harnesses have no
    * native JSON-schema mode, so `json_schema` is normalized at the
@@ -447,6 +450,7 @@ export interface NativeSession {
   respondToNativeInteraction(id: string, response: Record<string, unknown>): Promise<void>
   contextBoundary(input: {
     runId: string
+    provider: string
     environmentId: string
     sessionId: string
     executionId: string

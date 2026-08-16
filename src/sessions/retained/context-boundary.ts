@@ -15,13 +15,20 @@ import {
 } from '@tangle-network/agent-interface'
 import type { NativeSession } from '../../backends/types.js'
 import type { RetainedSessionRecord } from '../store.js'
-import { ENVIRONMENT_ID, RetainedSessionError } from './types.js'
+import { RetainedSessionError } from './types.js'
 
 const NATIVE_BOUNDARY_TIMEOUT_MS = 5_000
 
 export async function observeNativeBoundary(
   native: NativeSession,
-  input: { runId: string; environmentId: string; sessionId: string; executionId: string; requestDigest: string },
+  input: {
+    runId: string
+    provider: string
+    environmentId: string
+    sessionId: string
+    executionId: string
+    requestDigest: string
+  },
 ): Promise<NativeContextBoundaryProof | null> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<null>((resolve) => {
@@ -46,7 +53,7 @@ export async function verifyRetainedBoundary(
   native: NativeSession,
   record: RetainedSessionRecord,
   runId: string,
-  current: { executionId: string; requestDigest: string },
+  current: { provider: string; environmentId: string; executionId: string; requestDigest: string },
 ): Promise<void> {
   const expected = record.contextBoundary
   const parsedExpected = expected ? NativeContextBoundaryProofSchema.safeParse(expected) : null
@@ -54,8 +61,8 @@ export async function verifyRetainedBoundary(
     !parsedExpected?.success ||
     !record.runId ||
     parsedExpected.data.runId !== record.runId ||
-    parsedExpected.data.provider !== record.backend ||
-    parsedExpected.data.environmentId !== ENVIRONMENT_ID ||
+    parsedExpected.data.provider !== current.provider ||
+    parsedExpected.data.environmentId !== current.environmentId ||
     parsedExpected.data.sessionId !== record.id
   ) {
     throw new RetainedSessionError(
@@ -66,7 +73,6 @@ export async function verifyRetainedBoundary(
   }
   const observed = await observeNativeBoundary(native, {
     runId,
-    environmentId: ENVIRONMENT_ID,
     sessionId: record.id,
     ...current,
   })
@@ -74,8 +80,8 @@ export async function verifyRetainedBoundary(
   if (
     !parsedObserved?.success ||
     parsedObserved.data.runId !== runId ||
-    parsedObserved.data.provider !== record.backend ||
-    parsedObserved.data.environmentId !== ENVIRONMENT_ID ||
+    parsedObserved.data.provider !== current.provider ||
+    parsedObserved.data.environmentId !== current.environmentId ||
     parsedObserved.data.sessionId !== record.id ||
     parsedObserved.data.executionId !== current.executionId ||
     parsedObserved.data.requestDigest !== current.requestDigest ||
@@ -92,11 +98,20 @@ export async function verifyRetainedBoundary(
 /** The boundary to persist for a completed turn; never throws. */
 export async function completedTurnBoundary(
   native: NativeSession,
-  input: { runId: string; sessionId: string; backend: string; executionId: string; requestDigest: string },
+  input: {
+    runId: string
+    sessionId: string
+    backend: string
+    provider: string
+    environmentId: string
+    executionId: string
+    requestDigest: string
+  },
 ): Promise<Record<string, unknown>> {
   const proof = await observeNativeBoundary(native, {
     runId: input.runId,
-    environmentId: ENVIRONMENT_ID,
+    provider: input.provider,
+    environmentId: input.environmentId,
     sessionId: input.sessionId,
     executionId: input.executionId,
     requestDigest: input.requestDigest,
@@ -104,8 +119,8 @@ export async function completedTurnBoundary(
   const parsed = proof ? NativeContextBoundaryProofSchema.safeParse(proof) : null
   return parsed?.success &&
     parsed.data.runId === input.runId &&
-    parsed.data.provider === input.backend &&
-    parsed.data.environmentId === ENVIRONMENT_ID &&
+    parsed.data.provider === input.provider &&
+    parsed.data.environmentId === input.environmentId &&
     parsed.data.sessionId === input.sessionId &&
     parsed.data.executionId === input.executionId &&
     parsed.data.requestDigest === input.requestDigest

@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import { spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
+import { PassThrough } from 'node:stream'
 import type { Spawner } from '../src/executors/types.js'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend } from '../src/backends/pi.js'
@@ -155,6 +157,94 @@ function makeChildSpawner(
   return spawner
 }
 
+class InMemoryPiChild extends EventEmitter {
+  readonly stdin = new PassThrough()
+  readonly stdout = new PassThrough()
+  readonly stderr = new PassThrough()
+  exitCode: number | null = null
+  signalCode: NodeJS.Signals | null = null
+  killed = false
+
+  kill(signal: NodeJS.Signals = 'SIGTERM'): boolean {
+    if (this.killed) return true
+    this.killed = true
+    this.signalCode = signal
+    this.stdin.end()
+    this.stdout.end()
+    this.stderr.end()
+    queueMicrotask(() => this.emit('close', null, signal))
+    return true
+  }
+}
+
+function makeInMemoryPiSpawner(
+  lifecycle: { children: ReturnType<typeof spawn>[]; releases: number; terminations: number },
+): Spawner {
+  const spawner: Spawner = Object.assign(async (_bin: string, args: string[]) => {
+    const child = new InMemoryPiChild()
+    const isRpc = args.includes('--mode') && args.includes('rpc')
+    if (!isRpc) {
+      setTimeout(() => {
+        child.stdout.end('pi 0.83.0-test\n')
+        child.stderr.end()
+        child.exitCode = 0
+        child.emit('close', 0, null)
+      }, 0)
+    } else {
+      lifecycle.children.push(child as never)
+      let turns = 0
+      let buffer = ''
+      child.stdin.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString()
+        let newline: number
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline)
+          buffer = buffer.slice(newline + 1)
+          if (!line) continue
+          const command = JSON.parse(line) as { id?: string; type?: string }
+          if (command.type === 'prompt') {
+            setTimeout(() => {
+              if (child.killed) return
+              turns += 1
+              const events = [
+                { id: command.id, type: 'response', command: 'prompt', success: true },
+                { type: 'session', id: 'child-pi-session' },
+                { type: 'agent_start' },
+                { type: 'turn_start' },
+                { type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: `child-reply-${turns}` } },
+                { type: 'turn_end', message: { usage: { input: 4, output: 2 } } },
+                { type: 'agent_end' },
+                { type: 'agent_settled' },
+              ]
+              for (const event of events) child.stdout.write(`${JSON.stringify(event)}\n`)
+            }, 25)
+          } else if (command.type === 'get_state') {
+            child.stdout.write(`${JSON.stringify({
+              id: command.id,
+              type: 'response',
+              command: 'get_state',
+              success: true,
+              data: { sessionId: 'child-pi-session', messageCount: turns * 2 },
+            })}\n`)
+          }
+        }
+      })
+    }
+    const closed = new Promise<void>(resolve => child.once('close', () => resolve()))
+    return {
+      child: child as never,
+      release: () => { if (isRpc) lifecycle.releases += 1 },
+      terminate: async () => {
+        if (!isRpc) return
+        lifecycle.terminations += 1
+        child.kill()
+        await closed
+      },
+    }
+  }, { executionEnvironment: 'test-double' as const })
+  return spawner
+}
+
 function interactionCommand(
   operationId: string,
   request: InteractionRequest,
@@ -279,10 +369,55 @@ describe('Pi native RPC adapter', () => {
     expect(lifecycle.terminations).toBe(1)
   })
 
+  it('keeps a retained child alive when the Pi RPC timeout is explicitly disabled', async () => {
+    dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-no-timeout-`)
+    store = new SessionStore(dir)
+    runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
+    const lifecycle = { children: [] as ReturnType<typeof spawn>[], releases: 0, terminations: 0 }
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 0,
+      spawner: makeInMemoryPiSpawner(lifecycle),
+      transportResolver: testPiInferenceTransport(),
+    })
+    const service = new RetainedSessionService({
+      store,
+      registry: new BackendRegistry().register(backend),
+      runs,
+    })
+    const app = new Hono()
+    mountRetainedSessions(app, service)
+
+    const created = await app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'no-timeout-child', model: 'pi/test/model', cwd: dir }),
+    })
+    expect(created.status).toBe(201)
+    expect((await app.request('/v1/sessions/no-timeout-child/turns', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'first', run_id: 'no-timeout-first', execution_id: 'no-timeout-first-execution' }),
+    })).status).toBe(202)
+    await waitFor(() => store!.getRetained('no-timeout-child')?.turns === 1)
+    expect(lifecycle.children).toHaveLength(1)
+    expect(lifecycle.terminations).toBe(0)
+
+    expect((await app.request('/v1/sessions/no-timeout-child/turns', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'second', run_id: 'no-timeout-second', execution_id: 'no-timeout-second-execution' }),
+    })).status).toBe(202)
+    await waitFor(() => store!.getRetained('no-timeout-child')?.turns === 2)
+    expect(lifecycle.children).toHaveLength(1)
+    expect(lifecycle.terminations).toBe(0)
+
+    await runs.shutdown(1_000)
+    expect(lifecycle.releases).toBe(1)
+    expect(lifecycle.terminations).toBe(1)
+  })
+
   it('closes the real retained child and removes private files at identity eviction', async () => {
     dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-eviction-`)
     store = new SessionStore(dir)
-    runs = new RunRegistry({ replayRetentionMs: 20, identityRetentionMs: 40 })
+    runs = new RunRegistry({ replayRetentionMs: 200, identityRetentionMs: 400 })
     const lifecycle = { children: [] as ReturnType<typeof spawn>[], releases: 0, terminations: 0 }
     const backend = new PiBackend({
       bin: 'pi',
@@ -634,6 +769,6 @@ describe('Pi native RPC adapter', () => {
     const responseBody = await readJson(response)
     expect(response.status).toBe(502)
     expect(responseBody).toMatchObject({ status: 'transport_failure', retryable: false })
-    expect(store.getInteractionOperation('silent-interaction-response')?.acknowledgement.status).toBe('transport_failure')
+    expect(store.getInteractionOperation('silent-interaction-response')?.acknowledgement?.status).toBe('transport_failure')
   })
 })

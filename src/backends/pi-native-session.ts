@@ -222,6 +222,7 @@ export class PiNativeSession implements NativeSession {
 
   async contextBoundary(input: {
     runId: string
+    provider: string
     environmentId: string
     sessionId: string
     executionId: string
@@ -242,7 +243,7 @@ export class PiNativeSession implements NativeSession {
     this.providerSession = sessionId
     return {
       runId: input.runId,
-      provider: 'pi',
+      provider: input.provider,
       environmentId: input.environmentId,
       sessionId: input.sessionId,
       executionId: input.executionId,

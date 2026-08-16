@@ -19,7 +19,7 @@ import { RunInteractionCancelledError, type Run, type RunRegistry } from '../../
 import type { SessionStore } from '../store.js'
 import { controlConflict, statusForControlAcknowledgement } from './control-acknowledgement.js'
 import type { RetainedSessionState } from './state.js'
-import { ENVIRONMENT_ID, type RetainedControlAcknowledgement } from './types.js'
+import type { RetainedControlAcknowledgement } from './types.js'
 
 type ControlResult = { acknowledgement: RetainedControlAcknowledgement; status: number }
 
@@ -48,13 +48,13 @@ export class RetainedControl {
     const runId = input.run.runId
     const admission = this.store.getRetainedRun(runId)
     if (
-      input.run.provider !== ENVIRONMENT_ID ||
-      input.run.environmentId !== ENVIRONMENT_ID ||
       input.run.sessionId !== id ||
       !admission ||
       admission.sessionId !== id ||
       admission.executionId !== input.run.executionId ||
-      admission.requestDigest !== input.run.requestDigest
+      admission.requestDigest !== input.run.requestDigest ||
+      admission.provider !== input.run.provider ||
+      admission.environmentId !== input.run.environmentId
     ) {
       return { acknowledgement: controlConflict(input.operationId, 'steer', id, runId), status: 409 }
     }
@@ -89,13 +89,13 @@ export class RetainedControl {
     const admission = runId ? this.store.getRetainedRun(runId) : null
     const liveRun = runId ? this.runs.get(runId) : null
     if (
-      request.run.provider !== ENVIRONMENT_ID ||
-      request.run.environmentId !== ENVIRONMENT_ID ||
       request.run.sessionId !== id ||
       !admission ||
       admission.executionId !== request.run.executionId ||
       admission.sessionId !== id ||
-      admission.requestDigest !== request.run.requestDigest
+      admission.requestDigest !== request.run.requestDigest ||
+      admission.provider !== request.run.provider ||
+      admission.environmentId !== request.run.environmentId
     ) {
       return {
         acknowledgement: controlConflict(
@@ -287,15 +287,15 @@ export class RetainedControl {
     const admission = this.store.getRetainedRun(ref.runId)
     return Boolean(
       record &&
-        ref.provider === ENVIRONMENT_ID &&
-        ref.environmentId === ENVIRONMENT_ID &&
         ref.sessionId === id &&
         ref.executionId &&
         ref.requestDigest &&
         admission &&
         admission.sessionId === id &&
         admission.executionId === ref.executionId &&
-        admission.requestDigest === ref.requestDigest,
+        admission.requestDigest === ref.requestDigest &&
+        admission.provider === ref.provider &&
+        admission.environmentId === ref.environmentId,
     )
   }
 

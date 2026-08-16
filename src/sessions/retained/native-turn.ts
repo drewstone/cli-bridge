@@ -18,6 +18,7 @@ import {
   type InteractionRequestMaterial,
   type InteractionResponse,
   type Part,
+  type RequestedInteractions,
   type StreamEvent,
   type ToolState,
 } from '@tangle-network/agent-interface'
@@ -25,7 +26,6 @@ import type { NativeSession } from '../../backends/types.js'
 import type { Run } from '../../runs/registry.js'
 import { piPermissionPublicTitle, piPermissionTokenFromTitle } from '../../backends/pi-interaction.js'
 import { numberValue, recordValue, stringValue } from './json-values.js'
-import { ENVIRONMENT_ID } from './types.js'
 
 export interface NativeTurnInput {
   native: NativeSession
@@ -33,6 +33,15 @@ export interface NativeTurnInput {
   sessionId: string
   prompt: string
   backendName: string
+  providerName: string
+  environmentId: string
+  interactions: RequestedInteractions
+  /** Deny provider UI that was not explicitly admitted by this turn. */
+  onUnrequestedInteraction: (input: {
+    run: Run
+    request: InteractionRequest
+    nativeId: string
+  }) => Promise<void>
   /** The provider disclosed its own session id; record it before continuing. */
   onProviderSessionId: (providerSessionId: string) => void
 }
@@ -45,6 +54,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   const toolParts = new Map<string, Part>()
   let nextContentIndex = 0
   let lastTurnFailure: string | null = null
+  const deferredDenials: Promise<void>[] = []
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
       const event = recordValue(raw)
@@ -131,8 +141,41 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
         continue
       }
       if (type === 'extension_ui_request') {
-        const interaction = interactionFromPi(run, event, sessionId, backendName)
+        const interaction = interactionFromPi(
+          run,
+          event,
+          sessionId,
+          input.providerName,
+          input.environmentId,
+        )
         if (interaction) {
+          if (
+            (input.interactions as Readonly<Record<string, boolean | undefined>>)[
+              interaction.request.kind
+            ] !== true
+          ) {
+            // Let the provider resume from its yielded UI request before
+            // writing the cancellation. Pi installs its response waiter on
+            // that resume, not while this event is being translated.
+            const denial = new Promise<void>((resolve, reject) => {
+              setImmediate(() => {
+                void input.onUnrequestedInteraction({
+                  run,
+                  request: interaction.request,
+                  nativeId: interaction.nativeId,
+                }).then(resolve, reject)
+              })
+            })
+            deferredDenials.push(denial)
+            yield {
+              event: {
+                type: 'warning',
+                code: 'interaction_not_requested',
+                message: `${interaction.request.kind} interaction was denied because this turn did not request it`,
+              },
+            }
+            continue
+          }
           run.registerInteraction({ request: interaction.request, nativeId: interaction.nativeId })
           yield { event: { type: 'interaction', request: interaction.request } }
         } else if (isFireAndForgetUi(event)) {
@@ -187,6 +230,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
       }
       yield { event: { type: 'raw', backend: backendName, event: raw } }
     }
+    await Promise.all(deferredDenials)
   } catch (error) {
     if (!run.signal.aborted)
       yield {
@@ -324,7 +368,8 @@ function interactionFromPi(
   run: Run,
   event: Record<string, unknown>,
   sessionId: string,
-  backendName: string,
+  providerName: string,
+  environmentId: string,
 ): { request: InteractionRequest; nativeId: string } | null {
   const nativeId = stringValue(event.id)
   const method = stringValue(event.method)
@@ -334,8 +379,8 @@ function interactionFromPi(
   const interactionId = boundedRuntimeId(`${run.id}:interaction:${nativeId}`)
   const binding = {
     runId: run.id,
-    provider: backendName,
-    environmentId: ENVIRONMENT_ID,
+    provider: providerName,
+    environmentId,
     sessionId,
     executionId: run.executionId ?? run.id,
     interactionId,
@@ -345,7 +390,7 @@ function interactionFromPi(
     kind: 'permission',
     title: piPermissionPublicTitle(title),
     ...(stringValue(event.message) ? { body: stringValue(event.message)! } : {}),
-    answerSpec: permissionAnswerSpec(),
+    answerSpec: permissionAnswerSpec({ allowFeedback: false }),
     responseScopes: ['interaction'],
     binding,
   }

@@ -88,9 +88,20 @@ export function mountRuns(app: Hono, deps: {
     )
     if (!cursor.ok) return invalidRequest(c, cursor.message)
     const id = c.req.param('id')
+    const retained = deps.retainedRuns
+    const retainedSnapshot = retained?.runSnapshot(id)
+    if (retained && retainedSnapshot) {
+      try {
+        retained.assertRunReplayCursor(id, cursor.value)
+      } catch (error) {
+        if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
+        return retainedRunError(c, error)
+      }
+      setRetainedRunHeaders(c, retainedSnapshot)
+      return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))
+    }
     const run = deps.runs.get(id)
     if (!run) {
-      const retained = deps.retainedRuns
       if (!retained) return runNotFound(c)
       try {
         retained.assertRunReplayCursor(id, cursor.value)

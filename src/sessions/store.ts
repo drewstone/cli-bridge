@@ -21,8 +21,26 @@ import type {
   InteractionRequest,
   RuntimeEventEnvelope,
 } from '@tangle-network/agent-interface'
-import { InteractionAcknowledgementSchema, RuntimeEventEnvelopeSchema } from '@tangle-network/agent-interface'
+import { RuntimeEventEnvelopeSchema } from '@tangle-network/agent-interface'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
+import {
+  createInteractionOperationSchema,
+  INTERACTION_OPERATION_COLUMNS,
+  RetainedInteractionLedger,
+  type BeginInteractionOperationInput,
+  type InteractionOperationClaim,
+  type RecordInteractionOperationInput,
+  type RetainedInteractionPersistence,
+  type StoredInteractionOperation,
+} from './retained/interaction-store.js'
+
+export type {
+  InteractionOperationClaim,
+  InteractionOperationPhase,
+  RetainedInteractionPersistence,
+  StoredInteractionEffectProof,
+  StoredInteractionOperation,
+} from './retained/interaction-store.js'
 
 export interface SessionRecord {
   externalId: string
@@ -66,6 +84,8 @@ export interface RetainedRunAdmission {
   sessionId: string
   executionId: string
   requestDigest: string
+  provider: string
+  environmentId: string
   snapshot: unknown
   createdAt: number
   updatedAt: number
@@ -74,16 +94,6 @@ export interface RetainedRunAdmission {
 export type RetainedRunClaim =
   | { kind: 'created' | 'replayed'; admission: RetainedRunAdmission }
   | { kind: 'conflict'; admission: RetainedRunAdmission }
-
-export interface StoredInteractionOperation {
-  operationId: string
-  callerId: string
-  runId: string
-  sessionId: string
-  interactionId: string
-  requestDigest: string
-  acknowledgement: InteractionAcknowledgement
-}
 
 export type RetainedControlOperationKind = 'steer' | 'cancel'
 
@@ -252,17 +262,10 @@ const EXPECTED_SESSION_SCHEMA: Record<string, ExpectedColumn[]> = {
     { name: 'snapshot_json', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
     { name: 'created_at', type: 'INTEGER', notnull: 1, defaultValue: null, pk: 0 },
     { name: 'updated_at', type: 'INTEGER', notnull: 1, defaultValue: null, pk: 0 },
+    { name: 'provider', type: 'TEXT', notnull: 1, defaultValue: "'cli-bridge'", pk: 0 },
+    { name: 'environment_id', type: 'TEXT', notnull: 1, defaultValue: "'cli-bridge'", pk: 0 },
   ],
-  interaction_operations: [
-    { name: 'operation_id', type: 'TEXT', notnull: 0, defaultValue: null, pk: 1 },
-    { name: 'caller_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
-    { name: 'run_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
-    { name: 'session_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
-    { name: 'interaction_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
-    { name: 'request_digest', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
-    { name: 'acknowledgement_json', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
-    { name: 'created_at', type: 'INTEGER', notnull: 1, defaultValue: null, pk: 0 },
-  ],
+  interaction_operations: INTERACTION_OPERATION_COLUMNS,
   retained_control_operations: [
     { name: 'operation_id', type: 'TEXT', notnull: 0, defaultValue: null, pk: 1 },
     { name: 'caller_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
@@ -280,32 +283,49 @@ const EXPECTED_NAMED_INDEXES: Record<string, Record<string, string[]>> = {
   retained_sessions: { idx_retained_sessions_last_used: ['last_used_at'] },
   retained_events: { idx_retained_events_session_cursor: ['session_id', 'session_sequence'] },
   retained_run_admissions: { idx_retained_run_admissions_session: ['session_id', 'created_at'] },
+  interaction_operations: {
+    idx_interaction_operations_phase_created: ['phase', 'created_at'],
+    idx_interaction_operations_interaction_phase: ['run_id', 'session_id', 'interaction_id', 'phase'],
+  },
 }
+
+const RELEASED_INTERACTION_OPERATION_COLUMNS: ExpectedColumn[] = [
+  { name: 'operation_id', type: 'TEXT', notnull: 0, defaultValue: null, pk: 1 },
+  { name: 'caller_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
+  { name: 'run_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
+  { name: 'session_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
+  { name: 'interaction_id', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
+  { name: 'request_digest', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
+  { name: 'acknowledgement_json', type: 'TEXT', notnull: 1, defaultValue: null, pk: 0 },
+  { name: 'created_at', type: 'INTEGER', notnull: 1, defaultValue: null, pk: 0 },
+]
 
 const RETAINED_SCHEMA_ERROR = 'incompatible retained-session data schema; use a fresh data directory for this unreleased format'
 
-export class SessionStore {
+export class SessionStore implements RetainedInteractionPersistence {
   private db: Database.Database
   private readonly databasePath: string
   private readonly executionLanes = new Map<string, SessionExecutionLane>()
+  private readonly interactionLedger!: RetainedInteractionLedger
 
   constructor(dataDir: string) {
     const privateDataDir = ensurePrivateDataDirectory(dataDir)
     this.databasePath = join(privateDataDir, 'sessions.sqlite')
     this.db = new Database(this.databasePath)
     try {
-    chmodSync(this.databasePath, 0o600)
-    this.db.pragma('journal_mode = WAL')
-    this.db.pragma('secure_delete = ON')
-    this.restrictDatabaseFiles()
-    const existingTables = this.db.prepare(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    ).all() as Array<{ name: string }>
-    const tableNames = existingTables.map(row => row.name)
-    const legacySessionsOnly = tableNames.length === 1 && tableNames[0] === 'sessions'
-    if (legacySessionsOnly) this.assertLegacySessionsSchema()
-    if (existingTables.length === 0 || legacySessionsOnly) this.db.transaction(() => {
-      this.db.exec(`
+      chmodSync(this.databasePath, 0o600)
+      this.db.pragma('journal_mode = WAL')
+      this.db.pragma('synchronous = FULL')
+      this.db.pragma('secure_delete = ON')
+      this.restrictDatabaseFiles()
+      const existingTables = this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      ).all() as Array<{ name: string }>
+      const tableNames = existingTables.map(row => row.name)
+      const legacySessionsOnly = tableNames.length === 1 && tableNames[0] === 'sessions'
+      if (legacySessionsOnly) this.assertLegacySessionsSchema()
+      if (existingTables.length === 0 || legacySessionsOnly) this.db.transaction(() => {
+        this.db.exec(`
       CREATE TABLE IF NOT EXISTS session_identities (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL CHECK(kind IN ('legacy', 'retained')),
@@ -363,19 +383,11 @@ export class SessionStore {
         request_digest TEXT NOT NULL,
         snapshot_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'cli-bridge',
+        environment_id TEXT NOT NULL DEFAULT 'cli-bridge'
       );
       CREATE INDEX IF NOT EXISTS idx_retained_run_admissions_session ON retained_run_admissions(session_id, created_at);
-      CREATE TABLE IF NOT EXISTS interaction_operations (
-        operation_id TEXT PRIMARY KEY,
-        caller_id TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        interaction_id TEXT NOT NULL,
-        request_digest TEXT NOT NULL,
-        acknowledgement_json TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS retained_control_operations (
         operation_id TEXT PRIMARY KEY,
         caller_id TEXT NOT NULL,
@@ -386,30 +398,94 @@ export class SessionStore {
         acknowledgement_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
-      `)
-      if (legacySessionsOnly) {
-        this.db.prepare(
-          `INSERT INTO session_identities (id, kind, created_at)
-           SELECT external_id, 'legacy', MIN(created_at)
-           FROM sessions
-           GROUP BY external_id`,
-        ).run()
+        `)
+        createInteractionOperationSchema(this.db)
+        if (legacySessionsOnly) {
+          this.db.prepare(
+            `INSERT INTO session_identities (id, kind, created_at)
+             SELECT external_id, 'legacy', MIN(created_at)
+             FROM sessions
+             GROUP BY external_id`,
+          ).run()
+        }
+      })()
+      this.migrateReleasedInteractionOperations()
+      createInteractionOperationSchema(this.db)
+      this.migrateRetainedRunCoordinates()
+      this.interactionLedger = new RetainedInteractionLedger(this.db)
+      this.assertRetainedSchema()
+      if (this.scrubLegacySessionMetadata()) {
+        // The prior JSON may contain credentials. Remove historical WAL frames
+        // and rebuild the database so the disallowed bytes are not merely
+        // unreachable through SELECT while still present on disk.
+        this.db.pragma('wal_checkpoint(TRUNCATE)')
+        this.db.exec('VACUUM')
+        this.db.pragma('wal_checkpoint(TRUNCATE)')
       }
-    })()
-    this.assertRetainedSchema()
-    if (this.scrubLegacySessionMetadata()) {
-      // The prior JSON may contain credentials. Remove historical WAL frames
-      // and rebuild the database so the disallowed bytes are not merely
-      // unreachable through SELECT while still present on disk.
-      this.db.pragma('wal_checkpoint(TRUNCATE)')
-      this.db.exec('VACUUM')
-      this.db.pragma('wal_checkpoint(TRUNCATE)')
-    }
-    this.restrictDatabaseFiles()
+      this.restrictDatabaseFiles()
     } catch (error) {
       try { if (this.db.open) this.db.close() } catch { /* preserve the startup failure */ }
       throw error
     }
+  }
+
+  private migrateReleasedInteractionOperations(): void {
+    const table = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'interaction_operations'",
+    ).get() as { name: string } | undefined
+    if (!table) return
+    const actualColumns = this.db.prepare('PRAGMA table_info(interaction_operations)').all() as Array<{
+      name: string
+      type: string
+      notnull: number
+      dflt_value: string | null
+      pk: number
+    }>
+    const isReleasedShape = actualColumns.length === RELEASED_INTERACTION_OPERATION_COLUMNS.length
+      && actualColumns.every((actual, index) => {
+        const expected = RELEASED_INTERACTION_OPERATION_COLUMNS[index]
+        return expected !== undefined
+          && actual.name === expected.name
+          && actual.type === expected.type
+          && actual.notnull === expected.notnull
+          && actual.dflt_value === expected.defaultValue
+          && actual.pk === expected.pk
+      })
+    if (!isReleasedShape) return
+
+    this.db.transaction(() => {
+      this.db.exec('ALTER TABLE interaction_operations RENAME TO interaction_operations_released')
+      createInteractionOperationSchema(this.db)
+      this.db.exec(`
+        INSERT INTO interaction_operations
+          (operation_id, caller_id, run_id, session_id, interaction_id, request_digest,
+           acknowledgement_json, response_digest, phase, effect_proof_json, created_at)
+        SELECT operation_id, caller_id, run_id, session_id, interaction_id, request_digest,
+               acknowledgement_json, request_digest, 'acknowledged',
+               '{"kind":"released_acknowledgement","operationRequestDigest":"'
+                 || request_digest || '","recordedAt":' || created_at || '}',
+               created_at
+        FROM interaction_operations_released
+      `)
+      this.db.exec('DROP TABLE interaction_operations_released')
+    })()
+  }
+
+  private migrateRetainedRunCoordinates(): void {
+    const table = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'retained_run_admissions'",
+    ).get() as { name: string } | undefined
+    if (!table) return
+    const columns = this.db.prepare('PRAGMA table_info(retained_run_admissions)').all() as Array<{ name: string }>
+    const names = new Set(columns.map(column => column.name))
+    this.db.transaction(() => {
+      if (!names.has('provider')) {
+        this.db.exec("ALTER TABLE retained_run_admissions ADD COLUMN provider TEXT NOT NULL DEFAULT 'cli-bridge'")
+      }
+      if (!names.has('environment_id')) {
+        this.db.exec("ALTER TABLE retained_run_admissions ADD COLUMN environment_id TEXT NOT NULL DEFAULT 'cli-bridge'")
+      }
+    })()
   }
 
   private assertLegacySessionsSchema(): void {
@@ -717,14 +793,16 @@ export class SessionStore {
     sessionId: string
     executionId: string
     requestDigest: string
+    provider: string
+    environmentId: string
     snapshot: unknown
   }): RetainedRunClaim {
     const claim = this.db.transaction((): RetainedRunClaim => {
       const now = Date.now()
       const inserted = this.db.prepare(
         `INSERT INTO retained_run_admissions
-         (run_id, session_id, execution_id, request_digest, snapshot_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+         (run_id, session_id, execution_id, request_digest, snapshot_json, created_at, updated_at, provider, environment_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(run_id) DO NOTHING`,
       ).run(
         input.runId,
@@ -734,6 +812,8 @@ export class SessionStore {
         JSON.stringify(input.snapshot),
         now,
         now,
+        input.provider,
+        input.environmentId,
       )
       const admission = this.getRetainedRun(input.runId)
       if (!admission) throw new Error(`retained run admission ${JSON.stringify(input.runId)} was not persisted`)
@@ -741,6 +821,8 @@ export class SessionStore {
         admission.sessionId !== input.sessionId
         || admission.executionId !== input.executionId
         || admission.requestDigest !== input.requestDigest
+        || admission.provider !== input.provider
+        || admission.environmentId !== input.environmentId
       ) {
         return { kind: 'conflict', admission }
       }
@@ -759,6 +841,8 @@ export class SessionStore {
       sessionId: row.session_id as string,
       executionId: row.execution_id as string,
       requestDigest: row.request_digest as string,
+      provider: row.provider as string,
+      environmentId: row.environment_id as string,
       snapshot: JSON.parse(row.snapshot_json as string) as unknown,
       createdAt: row.created_at as number,
       updatedAt: row.updated_at as number,
@@ -860,37 +944,42 @@ export class SessionStore {
     return row ? this.hydrateRetainedEvent(row) : null
   }
 
-  recordInteractionOperation(operation: StoredInteractionOperation): void {
-    InteractionAcknowledgementSchema.parse(operation.acknowledgement)
-    this.db.prepare(
-      `INSERT INTO interaction_operations
-       (operation_id, caller_id, run_id, session_id, interaction_id, request_digest, acknowledgement_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(operation_id) DO UPDATE SET acknowledgement_json = interaction_operations.acknowledgement_json`,
-    ).run(
-      operation.operationId,
-      operation.callerId,
-      operation.runId,
-      operation.sessionId,
-      operation.interactionId,
-      operation.requestDigest,
-      JSON.stringify(operation.acknowledgement),
-      Date.now(),
-    )
+  /** The retained interaction state machine owns policy; this facade only forwards durable ledger calls. */
+  beginInteractionOperation(input: BeginInteractionOperationInput): InteractionOperationClaim {
+    return this.interactionLedger.beginInteractionOperation(input)
+  }
+
+  recordInteractionEffect(
+    operationId: string,
+    requestDigest: string,
+    responseDigest: string,
+  ): StoredInteractionOperation {
+    return this.interactionLedger.recordInteractionEffect(operationId, requestDigest, responseDigest)
+  }
+
+  recordInteractionOperation(input: RecordInteractionOperationInput): StoredInteractionOperation {
+    return this.interactionLedger.recordInteractionOperation(input)
+  }
+
+  markInteractionEffectUnknown(
+    operationId: string,
+    requestDigest: string,
+    responseDigest: string,
+    acknowledgement: InteractionAcknowledgement,
+  ): StoredInteractionOperation {
+    return this.interactionLedger.markInteractionEffectUnknown(operationId, requestDigest, responseDigest, acknowledgement)
+  }
+
+  findEffectUnknownInteraction(
+    runId: string,
+    sessionId: string,
+    interactionId: string,
+  ): StoredInteractionOperation | null {
+    return this.interactionLedger.findEffectUnknownInteraction(runId, sessionId, interactionId)
   }
 
   getInteractionOperation(operationId: string): StoredInteractionOperation | null {
-    const row = this.db.prepare('SELECT * FROM interaction_operations WHERE operation_id = ?').get(operationId) as Record<string, unknown> | undefined
-    if (!row) return null
-    return {
-      operationId: row.operation_id as string,
-      callerId: row.caller_id as string,
-      runId: row.run_id as string,
-      sessionId: row.session_id as string,
-      interactionId: row.interaction_id as string,
-      requestDigest: row.request_digest as string,
-      acknowledgement: JSON.parse(row.acknowledgement_json as string) as InteractionAcknowledgement,
-    }
+    return this.interactionLedger.getInteractionOperation(operationId)
   }
 
   recordRetainedControlOperation(operation: StoredRetainedControlOperation): void {

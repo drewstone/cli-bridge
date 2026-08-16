@@ -10,7 +10,7 @@
  *   → session/new {cwd, mcpServers}            → { sessionId }
  *   → session/prompt {sessionId, prompt:[{type:'text',text}]}
  *   ← stream session/update {update:{content:{type:'text',text}}}  → ChatDelta.content
- *   ← session/request_permission               → auto-allow (first option)
+ *   ← session/request_permission               → fail closed (capability_denied)
  *   ← session/prompt result {stopReason}        → finish_reason
  *
  * One bin per backend instance (hermes→`hermes acp`, openclaw→`openclaw acp`).
@@ -182,10 +182,16 @@ export class AcpBackend implements Backend {
               push({ content: c.text })
             }
           } else if (m.method === 'session/request_permission' && m.id !== undefined) {
-            // auto-allow: pick the first offered option (cli-bridge runs in a trusted scope).
-            const opts = (m.params as { options?: Array<{ optionId?: string }> })?.options
-            const optionId = opts?.[0]?.optionId ?? 'allow'
-            send({ jsonrpc: '2.0', id: m.id, result: { outcome: { outcome: 'selected', optionId } } })
+            // ACP has a native permission request, but this one-shot backend has
+            // no NativeSession handle or canonical response binding. Selecting an
+            // option here would fabricate user approval and bypass the retained
+            // interaction contract. Refuse the request and stop the turn.
+            const message = `${this.name} ACP permission requests require a retained native session; cli-bridge cannot answer this request safely`
+            if (!driverError) {
+              driverError = new BackendError(message, 'capability_denied')
+              send({ jsonrpc: '2.0', id: m.id, error: { code: -32001, message } })
+              void terminateSpawned(spawned)
+            }
           } else if (m.method && m.id !== undefined) {
             // any other agent→client request (fs reads we declined in capabilities, etc.): refuse cleanly.
             send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not supported by cli-bridge ACP client' } })
@@ -207,6 +213,7 @@ export class AcpBackend implements Backend {
 
       // Yield deltas as they arrive; finish_reason ends the turn.
       while (true) {
+        if (driverError) throw driverError
         while (queue.length) {
           const d = queue.shift()!
           yield d

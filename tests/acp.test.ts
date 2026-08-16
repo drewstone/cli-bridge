@@ -77,15 +77,30 @@ describe('AcpBackend', () => {
     expect(spawner).toHaveBeenCalledWith('hermes', ['acp'], expect.objectContaining({ cwd: '/tmp' }))
   })
 
-  it('auto-allows session/request_permission (first option) mid-prompt', async () => {
+  it('fails closed on session/request_permission instead of fabricating approval', async () => {
     const { child, stdin } = mockAcpChild({ permission: true })
     const writes: string[] = []
     stdin.on('data', (d: Buffer) => writes.push(d.toString()))
     const spawner = vi.fn(async () => ({ child, release: () => {}, spawnError: () => null })) as never
     const be = new AcpBackend({ name: 'hermes', bin: 'hermes', timeoutMs: 5000, spawner })
-    const r = await drain(be, baseReq)
-    expect(r.text).toBe('Hello world')
-    expect(writes.join('')).toContain('allow-once') // responded to the permission request with the offered option
+    await expect(drain(be, baseReq)).rejects.toMatchObject({
+      code: 'capability_denied',
+      message: 'hermes ACP permission requests require a retained native session; cli-bridge cannot answer this request safely',
+    })
+    const messages = writes
+      .join('')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+    expect(messages).toContainEqual(expect.objectContaining({
+      id: 100,
+      error: { code: -32001, message: expect.stringContaining('require a retained native session') },
+    }))
+    expect(messages.some((message) => {
+      const result = message.result as { outcome?: { optionId?: string } } | undefined
+      return result?.outcome?.optionId !== undefined
+    })).toBe(false)
   })
 
   it('surfaces a spawn error as a clean BackendError', async () => {

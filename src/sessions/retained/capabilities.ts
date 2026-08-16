@@ -7,7 +7,11 @@
  * discovered mid-turn.
  */
 
-import { AgentEnvironmentCapabilitiesSchema, type AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
+import {
+  AgentEnvironmentCapabilitiesSchema,
+  type AgentEnvironmentCapabilities,
+  type RequestedInteractions,
+} from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../../backends/registry.js'
 import type { Backend, NativeSessionBackend } from '../../backends/types.js'
 import { boundedProbe } from '../../backends/health.js'
@@ -18,6 +22,29 @@ export function isNativeBackend(backend: Backend): backend is NativeSessionBacke
     'startNativeSession' in backend &&
     typeof (backend as { startNativeSession?: unknown }).startNativeSession === 'function'
   )
+}
+
+/** Resolve and validate the exact interaction posture for one retained turn. */
+export function admittedTurnInteractions(
+  capabilities: AgentEnvironmentCapabilities,
+  requested: RequestedInteractions | undefined,
+): RequestedInteractions {
+  const supported = capabilities.interactions?.kinds ?? []
+  const effective: RequestedInteractions = requested ?? Object.fromEntries(
+    supported.map((kind) => [kind, true]),
+  )
+  const enabled = Object.entries(effective)
+    .filter(([, value]) => value)
+    .map(([kind]) => kind)
+  const unsupported = enabled.filter((kind) => !supported.includes(kind))
+  if (unsupported.length > 0) {
+    throw new RetainedSessionError(
+      `retained backend does not support requested interaction kinds: ${unsupported.join(', ')}`,
+      400,
+      'capability_denied',
+    )
+  }
+  return Object.freeze({ ...effective })
 }
 
 export async function readyNativeBackend(input: {

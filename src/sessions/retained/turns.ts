@@ -9,12 +9,17 @@
  * a plausible-looking one.
  */
 
-import { canonicalCandidateDigest, normalizeInputParts } from '@tangle-network/agent-interface'
+import {
+  canonicalCandidateDigest,
+  normalizeInputParts,
+  type InteractionRequest,
+  type RequestedInteractions,
+} from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../../backends/registry.js'
 import type { ChatRequest, NativeSession } from '../../backends/types.js'
 import { RunAdmissionClosedError, RunIdentityConflictError, type RunRegistry } from '../../runs/registry.js'
 import type { RetainedSessionRecord, SessionStore } from '../store.js'
-import { isNativeBackend } from './capabilities.js'
+import { admittedTurnInteractions, isNativeBackend } from './capabilities.js'
 import { verifyRetainedBoundary } from './context-boundary.js'
 import { requiresRecordedInputs, type RetainedInputMaterialStore } from './input-material.js'
 import { canonicalTurn } from './native-turn.js'
@@ -22,7 +27,7 @@ import { retainedRunSnapshot, unknownRunSnapshot, type RetainedSessionState } fr
 import { renderTurnInput, type RetainedTurnInput } from './schema.js'
 import { commitCompletedTurn, recoverFailedTurnAdmission } from './turn-commit.js'
 import type { TurnLaneOptions, TurnLanes } from './turn-lane.js'
-import { RetainedSessionError, type RetainedTurnResult } from './types.js'
+import { ENVIRONMENT_ID, RetainedSessionError, type RetainedTurnResult } from './types.js'
 
 export interface RetainedTurnRunnerOptions {
   store: SessionStore
@@ -32,6 +37,11 @@ export interface RetainedTurnRunnerOptions {
   lanes: TurnLanes
   inputMaterial: RetainedInputMaterialStore
   isClosing: (id: string) => boolean
+  denyUnrequestedInteraction: (input: {
+    run: import('../../runs/registry.js').Run
+    request: InteractionRequest
+    nativeId: string
+  }) => Promise<void>
 }
 
 export class RetainedTurnRunner {
@@ -42,6 +52,7 @@ export class RetainedTurnRunner {
   private readonly lanes: TurnLanes
   private readonly inputMaterial: RetainedInputMaterialStore
   private readonly isClosing: (id: string) => boolean
+  private readonly denyUnrequestedInteraction: RetainedTurnRunnerOptions['denyUnrequestedInteraction']
   /** In-flight durable commits, keyed by run id. */
   private readonly finalizations = new Map<string, Promise<void>>()
 
@@ -53,6 +64,7 @@ export class RetainedTurnRunner {
     this.lanes = options.lanes
     this.inputMaterial = options.inputMaterial
     this.isClosing = options.isClosing
+    this.denyUnrequestedInteraction = options.denyUnrequestedInteraction
   }
 
   async beginTurn(id: string, input: RetainedTurnInput, options: TurnLaneOptions = {}): Promise<RetainedTurnResult> {
@@ -133,12 +145,18 @@ export class RetainedTurnRunner {
     const prompt = renderTurnInput(input)
     const runId = input.run_id!
     const executionId = input.execution_id ?? input.turn_id ?? runId
+    const interactions = admittedTurnInteractions(retained.capabilities, input.interactions)
+    const providerName = input.provider ?? ENVIRONMENT_ID
+    const environmentId = input.environment_id ?? ENVIRONMENT_ID
     const requestDigest = canonicalCandidateDigest({
       sessionId: id,
       runId,
       executionId,
+      provider: providerName,
+      environmentId,
       model: retained.model,
       input: normalizeInputParts({ message: input.message, parts: input.parts }),
+      interactions,
       turnId: input.turn_id ?? null,
     })
     if (retained.runId && this.state.hasFinalizationFailure(retained.runId)) {
@@ -148,7 +166,7 @@ export class RetainedTurnRunner {
         'unknown_session',
       )
     }
-    const replayed = this.replayedRunAdmission(retained, runId, executionId, requestDigest)
+    const replayed = this.replayedRunAdmission(retained, runId, executionId, providerName, environmentId, requestDigest)
     if (replayed) return replayed
     const existingControl = this.runs.nativeSession(id)
     if (existingControl && !existingControl.run.snapshot().terminal) {
@@ -187,7 +205,12 @@ export class RetainedTurnRunner {
     const existingNative = existingControl?.session ?? null
     if (existingControl && existingNative) {
       const inspected = await existingControl.run.inspectNativeControl(existingNative, (native) =>
-        verifyRetainedBoundary(native, retained, runId, { executionId, requestDigest }),
+        verifyRetainedBoundary(native, retained, runId, {
+          provider: providerName,
+          environmentId,
+          executionId,
+          requestDigest,
+        }),
       )
       if (!inspected) {
         throw new RetainedSessionError('native session ownership changed before continuation', 409, 'invalid_state')
@@ -198,6 +221,8 @@ export class RetainedTurnRunner {
       sessionId: id,
       executionId,
       requestDigest,
+      provider: providerName,
+      environmentId,
       snapshot: unknownRunSnapshot(runId, executionId, requestDigest, id),
     })
     if (durableClaim.kind === 'conflict') {
@@ -208,7 +233,7 @@ export class RetainedTurnRunner {
       )
     }
     if (durableClaim.kind === 'replayed') {
-      return this.replayedRunAdmission(retained, runId, executionId, requestDigest)!
+      return this.replayedRunAdmission(retained, runId, executionId, providerName, environmentId, requestDigest)!
     }
     let claim: ReturnType<RunRegistry['claim']>
     try {
@@ -256,7 +281,7 @@ export class RetainedTurnRunner {
       this.store.updateRetainedRun(runId, requestDigest, run.snapshot())
       this.store.updateRetained(id, { status: 'running', runId })
       releaseNativeAttachment = run.reserveNativeControlAttachment()
-      const request = this.requestFor(retained, prompt)
+      const request = this.requestFor(retained, prompt, interactions)
       try {
         if (!native) {
           native = await backend.startNativeSession(request, sessionRecordFor(retained), run.signal)
@@ -312,6 +337,10 @@ export class RetainedTurnRunner {
           sessionId: id,
           prompt,
           backendName: retained.backend,
+          providerName,
+          environmentId,
+          interactions,
+          onUnrequestedInteraction: (interaction) => this.denyUnrequestedInteraction(interaction),
           onProviderSessionId: (providerSessionId) => this.store.updateRetained(id, { internalId: providerSessionId }),
         }),
       )
@@ -323,6 +352,8 @@ export class RetainedTurnRunner {
             runId,
             requestDigest,
             backend: retained.backend,
+            provider: providerName,
+            environmentId,
             run,
             native: settledNative,
           }),
@@ -364,6 +395,8 @@ export class RetainedTurnRunner {
     retained: RetainedSessionRecord,
     runId: string,
     executionId: string,
+    providerName: string,
+    environmentId: string,
     requestDigest: string,
   ): RetainedTurnResult | null {
     const admission = this.store.getRetainedRun(runId)
@@ -371,7 +404,9 @@ export class RetainedTurnRunner {
     if (
       admission.sessionId !== retained.id ||
       admission.executionId !== executionId ||
-      admission.requestDigest !== requestDigest
+      admission.requestDigest !== requestDigest ||
+      admission.provider !== providerName ||
+      admission.environmentId !== environmentId
     ) {
       throw new RetainedSessionError(
         `run ${JSON.stringify(runId)} is already bound to a different request`,
@@ -405,21 +440,25 @@ export class RetainedTurnRunner {
     return { session, run: snapshot, contextBoundary: session.contextBoundary }
   }
 
-  private requestFor(record: RetainedSessionRecord, prompt: string): ChatRequest {
+  private requestFor(
+    record: RetainedSessionRecord,
+    prompt: string,
+    interactions: RequestedInteractions,
+  ): ChatRequest {
     const material = this.inputMaterial.get(record.id)
     const profile = material?.hasAgentProfile ? material.agentProfile : undefined
     const mcp = material?.hasMcp ? material.mcp : undefined
-    const policy = record.metadata.interaction_policy
     const mode = record.metadata.mode
     return {
       model: record.model,
       messages: [{ role: 'user', content: prompt }],
       session_id: record.id,
+      interaction_policy: 'interactive',
+      interactions,
       ...(record.cwd ? { cwd: record.cwd } : {}),
       ...(typeof mode === 'string' ? { mode: mode as ChatRequest['mode'] } : {}),
       ...(profile !== undefined ? { agent_profile: profile as ChatRequest['agent_profile'] } : {}),
       ...(mcp && typeof mcp === 'object' ? { mcp: mcp as ChatRequest['mcp'] } : {}),
-      ...(typeof policy === 'string' ? { interaction_policy: policy as ChatRequest['interaction_policy'] } : {}),
     }
   }
 }

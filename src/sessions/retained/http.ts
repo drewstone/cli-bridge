@@ -5,6 +5,7 @@ import type { Context, Hono } from 'hono'
 import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import { BackendError } from '../../backends/types.js'
 import { retainedCancellationAcknowledgement } from './control-acknowledgement.js'
+import { RETAINED_MAX_HTTP_BODY_BYTES } from './schema.js'
 import { RetainedSessionError } from './types.js'
 import type { RetainedSessionService } from '../retained.js'
 
@@ -27,7 +28,7 @@ export function mountRetainedSessions(
 
   app.post('/v1/sessions', async (c) => {
     try {
-      const body = await c.req.json()
+      const body = await readBoundedJson(c.req.raw)
       return c.json(await service.create(service.parseCreate(body), c.req.raw.signal), 201)
     } catch (error) {
       return retainedError(c, error)
@@ -51,7 +52,7 @@ export function mountRetainedSessions(
 
   app.post('/v1/sessions/:id/turns', async (c) => {
     try {
-      const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await c.req.json()), {
+      const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await readBoundedJson(c.req.raw)), {
         signal: c.req.raw.signal,
       })
       return c.json(
@@ -65,7 +66,7 @@ export function mountRetainedSessions(
 
   app.post('/v1/sessions/:id/input', async (c) => {
     try {
-      const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await c.req.json()), {
+      const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await readBoundedJson(c.req.raw)), {
         queue: true,
         signal: c.req.raw.signal,
       })
@@ -148,7 +149,7 @@ export function mountRetainedSessions(
 
   app.post('/v1/sessions/:id/steer', async (c) => {
     try {
-      const body = service.parseSteer(await c.req.json())
+      const body = service.parseSteer(await readBoundedJson(c.req.raw))
       const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
       const result = await service.steer(c.req.param('id'), body, caller)
       return c.json(result.acknowledgement, result.status as 200 | 400 | 404 | 409 | 501 | 502)
@@ -161,12 +162,7 @@ export function mountRetainedSessions(
     try {
       const wait = parseWaitMs(c.req.query('wait_ms'))
       if (!wait.ok) throw new RetainedSessionError(wait.message, 400, 'invalid_request_error')
-      let raw: unknown
-      try {
-        raw = await c.req.json()
-      } catch {
-        raw = undefined
-      }
+      const raw = await readBoundedJson(c.req.raw)
       const body = service.parseCancel(raw)
       const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
       const result = await service.cancel(c.req.param('id'), wait.value, body, caller)
@@ -198,22 +194,69 @@ export function mountRetainedSessions(
   app.post('/v1/runs/:runId/interactions/:interactionId/respond', async (c) => {
     let body: unknown
     try {
-      body = await c.req.json()
-    } catch {
-      return c.json({ error: { message: 'invalid JSON body', type: 'invalid_request_error' } }, 400)
+      body = await readBoundedJson(c.req.raw)
+    } catch (error) {
+      return retainedError(c, error)
     }
     const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
     const result = await service.respond(body, caller, {
       runId: c.req.param('runId'),
       interactionId: c.req.param('interactionId'),
     })
-    return c.json(result.acknowledgement, result.status as 200 | 400 | 404 | 409 | 502)
+    return c.json(result.acknowledgement, result.status as 200 | 400 | 404 | 409 | 429 | 502)
   })
 }
 
 function parseLimit(raw: string | undefined): number {
   const value = Number.parseInt(raw ?? '50', 10)
   return Number.isSafeInteger(value) ? Math.min(Math.max(value, 1), 500) : 50
+}
+
+/** Read one JSON request without allowing an unbounded body allocation. */
+export async function readBoundedJson(request: Request): Promise<unknown> {
+  const contentLength = request.headers.get('content-length')
+  if (contentLength !== null && /^\d+$/u.test(contentLength) && Number(contentLength) > RETAINED_MAX_HTTP_BODY_BYTES) {
+    throw new RetainedSessionError(
+      `request body exceeds ${RETAINED_MAX_HTTP_BODY_BYTES} bytes`,
+      413,
+      'request_too_large',
+    )
+  }
+  const body = request.body
+  if (!body) return undefined
+  const reader = body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      size += next.value.byteLength
+      if (size > RETAINED_MAX_HTTP_BODY_BYTES) {
+        await reader.cancel()
+        throw new RetainedSessionError(
+          `request body exceeds ${RETAINED_MAX_HTTP_BODY_BYTES} bytes`,
+          413,
+          'request_too_large',
+        )
+      }
+      chunks.push(next.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  if (size === 0) return undefined
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown
+  } catch {
+    throw new RetainedSessionError('request body must be valid JSON', 400, 'invalid_request_error')
+  }
 }
 
 function parseCursor(raw: string | undefined): { ok: true; value: number } | { ok: false; message: string } {
@@ -244,7 +287,7 @@ function retainedError(c: Context, error: unknown): Response {
             ? 400
             : 502
         : 500
-  return c.json({ error: body }, status as 400 | 408 | 409 | 429 | 500 | 501 | 502 | 503)
+  return c.json({ error: body }, status as 400 | 408 | 409 | 413 | 429 | 500 | 501 | 502 | 503)
 }
 
 function errorBody(error: unknown): { message: string; type: string } {
