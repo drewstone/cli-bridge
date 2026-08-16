@@ -1051,6 +1051,26 @@ describe('retained Agent Interface sessions', () => {
     expect(backend.natives).toHaveLength(1)
   })
 
+  it('rejects a false-valued unsupported interaction declaration before native startup', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'false-interaction-posture', model: 'pi/test' }),
+    })
+
+    const response = await fixture.app.request('/v1/sessions/false-interaction-posture/turns', {
+      method: 'POST',
+      body: turnBody('false-unsupported-interaction', {
+        message: 'must fail before spawn',
+        interactions: { plan: false },
+      }),
+    })
+    expect(response.status).toBe(400)
+    expect(await json(response)).toMatchObject({ error: { type: 'capability_denied' } })
+    expect(backend.natives).toEqual([])
+  })
+
   it('binds the exact interaction posture into retained turn identity', async () => {
     fixture = setup(new FakeNativeBackend())
     await fixture.app.request('/v1/sessions', {

@@ -16,6 +16,7 @@ import {
   AgentRunCancellationRequestSchema,
   type AgentRunCancellationAcknowledgement,
   type AgentRunCancellationRequest,
+  type AgentExactRunControlRef,
   type Sha256Digest,
 } from '@tangle-network/agent-interface'
 import {
@@ -265,6 +266,18 @@ async function exactCancellation(
   if (request.run.requestDigest !== run.requestDigest) {
     return invalidRequest(c, 'cancellation request digest does not match the retained run', 409)
   }
+  if (!runCoordinatesMatch(run, request.run)) {
+    return c.json(
+      {
+        error: {
+          message: 'cancellation run coordinates do not match the claimed run',
+          type: 'run_identity_conflict',
+          run_id: runId,
+        },
+      },
+      409,
+    )
+  }
 
   const waitMs = parseWaitMs(c)
   if (!waitMs.ok) return invalidWait(c, waitMs.message)
@@ -301,6 +314,16 @@ function cancellationAcknowledgement(
   value: AgentRunCancellationAcknowledgement,
 ): AgentRunCancellationAcknowledgement {
   return AgentRunCancellationAcknowledgementSchema.parse(value)
+}
+
+function runCoordinatesMatch(run: Run, reference: AgentExactRunControlRef): boolean {
+  const snapshot = run.snapshot()
+  return snapshot.id === reference.runId
+    && snapshot.requestDigest === reference.requestDigest
+    && snapshot.provider === reference.provider
+    && snapshot.environmentId === reference.environmentId
+    && snapshot.sessionId === reference.sessionId
+    && snapshot.executionId === reference.executionId
 }
 
 type WaitMsResult =

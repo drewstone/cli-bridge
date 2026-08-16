@@ -20,6 +20,8 @@ import { z } from 'zod'
 import {
   canonicalAgentProfileDigest,
   canonicalCandidateDigest,
+  RequestedInteractionsSchema,
+  type RequestedInteractions,
 } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
 import {
@@ -65,6 +67,7 @@ import {
   retainedExecutionSchema,
   retainedPublicRecordSchema,
 } from '../sessions/retained/contract.js'
+import { ENVIRONMENT_ID } from '../sessions/retained/types.js'
 
 /** Header accepted only from the local Runtime → cli-bridge transport. */
 export const PROTECTED_MODEL_CREDENTIAL_HEADER = 'x-cli-bridge-model-credential'
@@ -94,6 +97,14 @@ const durableRunIdSchema = z
 // is the implementation limit, not a product policy; omitting the field means
 // no deadline.
 const maxExecutionTimeoutMs = 2_147_483_647
+
+// cli-bridge currently uses Zod 3 while Agent Interface publishes Zod 4.
+// Validate through the shared schema instead of embedding a foreign Zod
+// object inside the route's Zod 3 object.
+const requestedInteractionsSchema = z.custom<RequestedInteractions>(
+  (value) => RequestedInteractionsSchema.safeParse(value).success,
+  { message: 'interactions must be a bounded boolean map' },
+)
 
 const chatRequestSchema = z.object({
   model: z.string().min(1),
@@ -151,6 +162,8 @@ const chatRequestSchema = z.object({
   max_tokens: z.number().optional(),
   // Mirrors the canonical ReasoningEffort ladder in @tangle-network/agent-interface.
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
+  interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
+  interactions: requestedInteractionsSchema.optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
   /**
@@ -528,6 +541,12 @@ export function mountChatCompletions(
         },
       }, 404)
     }
+    const oneShotInteractionError = oneShotInteractionCapabilityError(
+      backend.name,
+      parsed.data.interactions,
+      parsed.data.interaction_policy,
+    )
+    if (oneShotInteractionError) return errorResponse(c, oneShotInteractionError)
     if (protectedCredentialHeader !== undefined || protectedBaseUrlHeader !== undefined) {
       if (!isLoopbackRequest(c.req.raw)) {
         return c.json({
@@ -634,7 +653,13 @@ export function mountChatCompletions(
     }
     let claim: ReturnType<RunRegistry['claim']>
     try {
-      claim = deps.runs.claim(runId, requestDigest, { owner: 'one-shot' })
+      claim = deps.runs.claim(runId, requestDigest, {
+        owner: 'one-shot',
+        provider: backend.name,
+        environmentId: ENVIRONMENT_ID,
+        sessionId: req.session_id || runId,
+        executionId: runId,
+      })
     } catch (error) {
       if (error instanceof RunIdentityConflictError) return runIdentityConflict(c, error)
       throw error
@@ -1312,6 +1337,7 @@ function errorResponse(c: Context, err: unknown): Response {
     // that one to 504 and keep the rest as documented codes.
     const status: 500 | 501 | 502 | 503 | 504 =
       err.code === 'not_configured' ? 501
+      : err.code === 'capability_denied' ? 501
       : err.code === 'cli_missing' ? 503
       : err.code === 'timeout' ? 504
       : err.code === 'aborted' ? 504
@@ -1323,6 +1349,31 @@ function errorResponse(c: Context, err: unknown): Response {
   }
   const message = err instanceof Error ? err.message : String(err)
   return c.json({ error: { message, type: 'server_error' } }, 500)
+}
+
+/**
+ * One-shot chat has no response-bound native interaction channel.
+ * Parse the shared posture at the wire boundary, then refuse any declared
+ * interaction or policy before session identity, run, admission, or backend
+ * setup can be created.
+ */
+function oneShotInteractionCapabilityError(
+  backendName: string,
+  interactions: ChatRequest['interactions'] | undefined,
+  policy: ChatRequest['interaction_policy'] | undefined,
+): BackendError | null {
+  const requestedKinds = Object.keys(interactions ?? {})
+  if (requestedKinds.length === 0 && policy === undefined) return null
+  const detail = requestedKinds.length > 0
+    ? `requested interaction kinds: ${requestedKinds.join(', ')}`
+    : `interaction policy: ${policy}`
+  return new BackendError(
+    `backend ${JSON.stringify(backendName)} does not support one-shot interactions (${detail}); `
+    + 'use a retained native session',
+    'capability_denied',
+    undefined,
+    { providerDispatch: 'not_started' },
+  )
 }
 
 function providerDispatchMetadata(error: unknown): { provider_dispatch?: 'not_started' } {

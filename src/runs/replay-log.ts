@@ -140,7 +140,17 @@ export class RunReplayLog {
         receivedAt,
         event,
       }
-      RuntimeEventEnvelopeSchema.parse(envelope)
+      const parsedEnvelope = RuntimeEventEnvelopeSchema.parse(envelope)
+      if (
+        parsedEnvelope.runId !== this.options.runId
+        || parsedEnvelope.eventId !== eventId
+        || parsedEnvelope.sequence !== sequence
+      ) {
+        throw new Error(
+          `canonical commit returned an envelope with identity that does not match run ${JSON.stringify(this.options.runId)} `
+          + `sequence ${sequence}`,
+        )
+      }
     } catch (error) {
       if (this.options.commitCanonicalEvent) this.options.onCommitFailure(error)
       throw error

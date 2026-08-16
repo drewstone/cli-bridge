@@ -316,6 +316,55 @@ function sseIds(text: string): number[] {
 }
 
 describe('durable run contract', () => {
+  it('rejects one-shot interaction controls before durable admission', async () => {
+    const backend = new ReplayBackend()
+    const ctx = fixture(backend)
+    try {
+      for (const [index, control] of [
+        { interactions: { permission: true } },
+        { interaction_policy: 'interactive' },
+        { interactions: { question: false } },
+      ].entries()) {
+        const runId = `one-shot-interaction-${index}`
+        const response = await postChat(ctx.app, { ...chatBody(runId), ...control })
+        expect(response.status).toBe(501)
+        await expect(response.json()).resolves.toMatchObject({
+          error: {
+            type: 'capability_denied',
+            provider_dispatch: 'not_started',
+          },
+        })
+        expect(ctx.runs.get(runId)).toBeUndefined()
+      }
+      expect(ctx.runs.size()).toBe(0)
+      expect(backend.calls).toBe(0)
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
+  it('rejects a canonical commit envelope whose identity differs from the generated event', () => {
+    const runs = new RunRegistry({ maxLifetimeMs: 0 })
+    const run = runs.claim('canonical-envelope-identity', `sha256:${'a'.repeat(64)}`, {
+      owner: 'retained',
+      commitCanonicalEvent: () => ({
+        runId: 'foreign-run',
+        eventId: 'foreign-event',
+        sequence: 99,
+        cursor: 'foreign-cursor',
+        receivedAt: new Date(0).toISOString(),
+        event: { type: 'status', status: 'started' },
+      }),
+    }).run
+    try {
+      expect(() => run.appendCanonical({ event: { type: 'status', status: 'started' } }))
+        .toThrow('canonical commit returned an envelope with identity')
+      expect(run.snapshot().canonicalLastSeq).toBe(0)
+    } finally {
+      runs.clear()
+    }
+  })
+
   it('attaches identical racing retries to one backend job and one admission lease', async () => {
     const backend = new ControlledBackend()
     const admission = new AdmissionGate({
@@ -771,16 +820,38 @@ describe('durable run contract', () => {
       reader = response.body?.getReader()
       await reader?.read()
       const snapshotResponse = await ctx.app.request(`/v1/runs/${runId}`)
-      const snapshot = await snapshotResponse.json() as { requestDigest: `sha256:${string}` }
+      const snapshot = await snapshotResponse.json() as {
+        requestDigest: `sha256:${string}`
+        provider: string
+        environmentId: string
+        sessionId: string
+        executionId: string
+      }
       const run: AgentExactRunControlRef = {
         runId,
-        provider: 'cli-bridge',
-        environmentId: 'environment-exact-cancel',
-        sessionId: runId,
-        executionId: runId,
+        provider: snapshot.provider,
+        environmentId: snapshot.environmentId,
+        sessionId: snapshot.sessionId,
+        executionId: snapshot.executionId,
         requestDigest: snapshot.requestDigest,
       }
       const request = cancellationRequest('cancel-exact-operation', run, 'user requested stop')
+
+      const wrongCoordinates = cancellationRequest(
+        'cancel-wrong-coordinates',
+        { ...run, provider: 'foreign-provider' },
+        'user requested stop',
+      )
+      const rejectedCoordinates = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(wrongCoordinates),
+      })
+      expect(rejectedCoordinates.status).toBe(409)
+      await expect(rejectedCoordinates.json()).resolves.toMatchObject({
+        error: { type: 'run_identity_conflict' },
+      })
+      expect(backend.abortObserved).toBe(false)
 
       const accepted = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
         method: 'POST',

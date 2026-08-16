@@ -68,6 +68,12 @@ Session metadata does not store a second interaction policy.
 
 The existing one-shot run replay and cancel routes remain in place.
 
+The one-shot chat route parses the shared `interactions` and `interaction_policy` fields for wire compatibility.
+
+It rejects a non-empty interaction posture or policy before durable admission because one-shot chat has no response-bound native interaction channel.
+
+Retry-safe one-shot cancellation must repeat the exact provider, environment, session, execution, run, and request-digest coordinates returned by the run snapshot.
+
 ## Canonical retained request fields
 
 The session creation wire shape owns `id` or `session_id`, `model`, `cwd`, `mode`, `interaction_policy`, `agent_profile`, `mcp`, `metadata`, `execution`, `env`, `context`, and `provider_options`.
