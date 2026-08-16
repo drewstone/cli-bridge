@@ -33,6 +33,17 @@ import {
   type RetainedInteractionPersistence,
   type StoredInteractionOperation,
 } from './retained/interaction-store.js'
+import {
+  containsCredentialBearingKey,
+  containsSecretShapedValue,
+  parseSafeRetainedMetadata,
+  parseSafeRetainedMcp,
+  parseSafeRetainedEnv,
+  retainedPublicRecordSchema,
+  snapshotRetainedAgentProfile,
+} from './retained/contract.js'
+
+export { parseSafeRetainedMetadata } from './retained/contract.js'
 
 export type {
   InteractionOperationClaim,
@@ -111,33 +122,11 @@ export interface SessionExecutionLease {
   release(): void
 }
 
-const retainedMetadataShape = z.strictObject({
-  label: z.string().min(1).max(256).optional(),
-  description: z.string().max(2_048).optional(),
-  client: z.string().min(1).max(128).optional(),
-  tags: z.array(z.string().min(1).max(64)).max(32).optional(),
-  mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
-  interaction_policy: z.enum(['interactive']).optional(),
-  retained_input_presence: z.strictObject({
-    agent_profile: z.boolean().optional(),
-    mcp: z.boolean().optional(),
-  }).optional(),
-})
-
 const legacyModelMetadata = z.string()
   .min(1)
   .max(256)
   .regex(/^[A-Za-z0-9][A-Za-z0-9._:/+-]*$/u)
 const legacyProfileDigestMetadata = z.string().regex(/^sha256:[a-f0-9]{64}$/u)
-
-const secretShapedValue = /(?:bearer\s+\S+|(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+|(?:sk|rk|pk|ghp|xox[baprs]|AIza)[-_A-Za-z0-9]{8,}|-----BEGIN [^-]+ PRIVATE KEY-----)/iu
-
-function containsSecretShapedValue(value: unknown): boolean {
-  if (typeof value === 'string') return secretShapedValue.test(value)
-  if (Array.isArray(value)) return value.some(containsSecretShapedValue)
-  if (value && typeof value === 'object') return Object.values(value).some(containsSecretShapedValue)
-  return false
-}
 
 /** Keep only non-secret legacy resume hints; request inputs never cross this boundary. */
 export function sanitizeLegacySessionMetadata(value: unknown): Record<string, unknown> {
@@ -150,23 +139,50 @@ export function sanitizeLegacySessionMetadata(value: unknown): Record<string, un
   if (profileDigest.success) metadata.profile_digest = profileDigest.data
   for (const key of ['agent_profile', 'agent_profile_binding', 'profile_materialization'] as const) {
     const value = source[key]
-    if (value && typeof value === 'object' && !Array.isArray(value) && !containsSecretShapedValue(value)) {
+    if (key === 'agent_profile' && value !== undefined) {
+      try {
+        metadata[key] = snapshotRetainedAgentProfile(value)
+      } catch {
+        // Unsafe legacy profiles are omitted before they can be replayed.
+      }
+      continue
+    }
+    if (
+      value
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && !containsCredentialBearingKey(value)
+      && !containsSecretShapedValue(value)
+    ) {
       metadata[key] = value
     }
   }
+  for (const key of ['execution', 'env', 'mcp', 'context', 'provider_options', 'metadata', 'request_metadata'] as const) {
+    const candidate = source[key]
+    if (key === 'env' && candidate !== undefined) {
+      try {
+        metadata.env = parseSafeRetainedEnv(candidate)
+      } catch {
+        // Unsafe legacy environment values are omitted before they can be replayed.
+      }
+      continue
+    }
+    if (key === 'mcp' && candidate !== undefined) {
+      try {
+        metadata.mcp = parseSafeRetainedMcp(candidate, 'legacy MCP configuration')
+      } catch {
+        // Unsafe legacy MCP configuration is omitted before it can be replayed.
+      }
+      continue
+    }
+    const parsed = retainedPublicRecordSchema.safeParse(candidate)
+    if (
+      parsed.success
+      && !containsCredentialBearingKey(parsed.data)
+      && !containsSecretShapedValue(parsed.data)
+    ) metadata[key] = parsed.data
+  }
   return metadata
-}
-
-/** Validate the only metadata shape permitted to cross the retained DB boundary. */
-export function parseSafeRetainedMetadata(value: unknown): Record<string, unknown> {
-  const parsed = retainedMetadataShape.safeParse(value ?? {})
-  if (!parsed.success) {
-    throw new Error(`retained metadata contains unsupported keys or values: ${parsed.error.issues.map(issue => issue.message).join('; ')}`)
-  }
-  if (containsSecretShapedValue(parsed.data)) {
-    throw new Error('retained metadata contains a secret-shaped value')
-  }
-  return parsed.data as Record<string, unknown>
 }
 
 export class SessionExecutionAbortedError extends Error {
@@ -576,6 +592,14 @@ export class SessionStore implements RetainedInteractionPersistence {
     return this.hydrate(row)
   }
 
+  /** Return every durable backend binding for one legacy session id. */
+  findByExternalId(externalId: string): SessionRecord[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM sessions WHERE external_id = ? ORDER BY last_used_at DESC, backend ASC',
+    ).all(externalId) as Record<string, unknown>[]
+    return rows.map(row => this.hydrate(row))
+  }
+
   claimSessionIdentity(id: string, kind: 'legacy' | 'retained'): void {
     const existing = this.db.prepare('SELECT kind FROM session_identities WHERE id = ?').get(id) as { kind: 'legacy' | 'retained' } | undefined
     if (existing && existing.kind !== kind) {
@@ -683,6 +707,48 @@ export class SessionStore implements RetainedInteractionPersistence {
       lastUsedAt: now,
       metadata,
     }
+  }
+
+  /** Persist request authority before native or sandbox execution begins. */
+  remember(args: {
+    externalId: string
+    backend: string
+    model: string
+    internalId?: string | null
+    cwd?: string | null
+    metadata?: Record<string, unknown>
+  }): SessionRecord {
+    this.claimSessionIdentity(args.externalId, 'legacy')
+    const now = Date.now()
+    const existing = this.get(args.externalId, args.backend)
+    const metadata = sanitizeLegacySessionMetadata({
+      ...(existing?.metadata ?? {}),
+      ...(args.metadata ?? {}),
+      model: args.model,
+    })
+    const internalId = args.internalId ?? existing?.internalId ?? ''
+    const cwd = args.cwd === undefined ? existing?.cwd ?? null : args.cwd
+    const turns = existing?.turns ?? 0
+    const createdAt = existing?.createdAt ?? now
+    this.db.prepare(
+      `INSERT INTO sessions (external_id, backend, internal_id, cwd, turns, created_at, last_used_at, metadata_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(external_id, backend) DO UPDATE SET
+         internal_id = excluded.internal_id,
+         cwd = excluded.cwd,
+         last_used_at = excluded.last_used_at,
+         metadata_json = excluded.metadata_json`,
+    ).run(
+      args.externalId,
+      args.backend,
+      internalId,
+      cwd,
+      turns,
+      createdAt,
+      now,
+      JSON.stringify(metadata),
+    )
+    return this.get(args.externalId, args.backend)!
   }
 
   list(limit = 100): SessionRecord[] {

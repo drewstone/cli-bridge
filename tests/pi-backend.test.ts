@@ -416,7 +416,6 @@ describe('PiBackend', () => {
           provider: 'tangle-router',
           default: 'fireworks/deepseek-v4-flash',
           maxTotalOutputTokens: 131_072,
-          metadata: { maxTokens: 65_536 },
         },
       },
     }
@@ -428,7 +427,7 @@ describe('PiBackend', () => {
       model: 'pi/tangle-router/fireworks/deepseek-v4-flash',
     })
     expect(request.agent_profile?.model?.maxTotalOutputTokens).toBe(131_072)
-    expect(request.agent_profile?.model?.metadata?.maxTokens).toBe(65_536)
+    expect(request.agent_profile?.model?.metadata).toBeUndefined()
     expect(Object.isFrozen(request.agent_profile)).toBe(true)
     expect(Object.isFrozen(request.agent_profile?.model)).toBe(true)
     expect(Object.isFrozen(request.agent_profile?.model?.metadata)).toBe(true)
@@ -568,7 +567,7 @@ describe('PiBackend', () => {
         model: {
           provider: 'tangle-router',
           default: 'glm-5.2',
-          metadata: { maxTokens: 16_384 },
+          maxTotalOutputTokens: 16_384,
         },
       },
     }
@@ -578,7 +577,7 @@ describe('PiBackend', () => {
       expect(resolves).toBe(1)
       expect(spawns).toBe(1)
       expect(request.profile_materialization_receipt?.inference).toMatchObject({
-        appliedMaxTokens: 16_384,
+        appliedMaxTotalOutputTokens: 16_384,
       })
     } finally {
       rmSync(cwd, { recursive: true, force: true })
@@ -594,11 +593,11 @@ describe('PiBackend', () => {
         model: {
           provider: 'tangle-router',
           default: 'glm-5.2',
-          metadata: { maxTokens: 16_384 },
+          maxTotalOutputTokens: 16_384,
         },
       },
       code: 'parse_error' as const,
-      error: /request max_tokens .*conflicts with agent_profile\.model\.metadata\.maxTokens/u,
+      error: /request max_tokens .*conflicts with agent_profile\.model\.maxTotalOutputTokens/u,
     },
     {
       name: 'higher request',
@@ -608,28 +607,28 @@ describe('PiBackend', () => {
         model: {
           provider: 'tangle-router',
           default: 'glm-5.2',
-          metadata: { maxTokens: 16_384 },
+          maxTotalOutputTokens: 16_384,
         },
       },
       code: 'parse_error' as const,
-      error: /request max_tokens .*conflicts with agent_profile\.model\.metadata\.maxTokens/u,
+      error: /request max_tokens .*conflicts with agent_profile\.model\.maxTotalOutputTokens/u,
     },
     {
-      name: 'profile metadata missing',
+      name: 'profile total cap missing',
       max_tokens: 16_384,
       profile: {
         harness: 'pi' as const,
         model: { provider: 'tangle-router', default: 'glm-5.2' },
       },
       code: 'not_configured' as const,
-      error: /agent_profile\.model\.metadata\.maxTokens is absent/u,
+      error: /agent_profile\.model\.maxTotalOutputTokens is absent/u,
     },
     {
       name: 'profile missing',
       max_tokens: 16_384,
       profile: undefined,
       code: 'not_configured' as const,
-      error: /without an AgentProfile\.model\.metadata\.maxTokens authority/u,
+      error: /without an AgentProfile\.model\.maxTotalOutputTokens authority/u,
     },
   ])('refuses a $name before provider resolution or spawn', async ({
     max_tokens,

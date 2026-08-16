@@ -140,6 +140,7 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 - `mcp`: standardised MCP server passthrough (see [MCP passthrough](#mcp-passthrough))
 - `run_id`: caller-owned durable job id (also accepted as `X-Run-Id`)
 - `execution`: execution location plus an optional caller-owned `timeoutMs` process deadline
+- `interactions` and `interaction_policy`: parsed with the shared interaction contract; one-shot chat rejects a non-empty posture or policy with `501 capability_denied` before durable admission because response-bound interactions require a retained native session
 
 Behavior:
 
@@ -272,6 +273,7 @@ The endpoint returns the same conflict and expiry errors as request replay and e
 An empty cancellation body keeps the simple local API above.
 For retry-safe control, send the `AgentRunCancellationRequest` from `@tangle-network/agent-interface`.
 It contains a stable `operationId`, the complete run control reference, an optional reason, and the canonical request digest.
+For one-shot runs, use the `provider`, `environmentId`, `sessionId`, and `executionId` returned in the run snapshot; the bridge rejects a cancellation whose coordinates do not exactly match the claimed run.
 Repeating the same operation returns the stored acknowledgement.
 Changing its digest returns `409`, and a run id that differs from the URL returns `409` before replay lookup.
 

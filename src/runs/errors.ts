@@ -1,5 +1,7 @@
 /** Typed refusals a durable run raises to its callers. */
 
+import type { RunOwner } from './types.js'
+
 /** A caller attempted to reuse a durable run id for different execution bytes. */
 export class RunIdentityConflictError extends Error {
   readonly code = 'run_identity_conflict' as const
@@ -8,8 +10,14 @@ export class RunIdentityConflictError extends Error {
     readonly runId: string,
     readonly expectedRequestDigest: string,
     readonly receivedRequestDigest: string,
+    readonly existingOwner?: RunOwner,
+    readonly requestedOwner?: RunOwner,
   ) {
-    super(`run ${JSON.stringify(runId)} is already bound to a different request`)
+    super(
+      existingOwner && requestedOwner && existingOwner !== requestedOwner
+        ? `run ${JSON.stringify(runId)} is already owned by the ${existingOwner} protocol`
+        : `run ${JSON.stringify(runId)} is already bound to a different request`,
+    )
     this.name = 'RunIdentityConflictError'
   }
 }

@@ -16,14 +16,20 @@ export interface SeqCanonicalEvent {
 
 export type CanonicalEventListener = (event: SeqCanonicalEvent) => void
 
+/** Protocol that owns a run id inside this bridge process. */
+export type RunOwner = 'one-shot' | 'retained'
+
 export interface CanonicalEventInput {
   event: StreamEvent
   occurredAt?: string
 }
 
 export interface RunClaimOptions {
+  owner?: RunOwner
   sessionId?: string
   executionId?: string
+  provider?: string
+  environmentId?: string
   commitCanonicalEvent?: (input: {
     runId: string
     sequence: number
@@ -80,6 +86,8 @@ export interface RunSnapshot {
   endedAt: number | null
   /** Run-id binding survives replay expiry until this time. */
   identityExpiresAt: number | null
+  provider?: string
+  environmentId?: string
   sessionId?: string
   executionId?: string
   canonicalLastSeq: number

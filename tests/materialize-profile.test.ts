@@ -52,7 +52,6 @@ describe('AgentProfile intake', () => {
         provider: 'tangle-router',
         reasoningEffort: 'high',
         maxTotalOutputTokens: 32_000,
-        metadata: { maxTokens: 32_000 },
       },
     } satisfies AgentProfile
     const req: ChatRequest = {
@@ -65,6 +64,7 @@ describe('AgentProfile intake', () => {
 
     expect(snapshot).toMatchObject(profile)
     expect(snapshot?.model?.maxTotalOutputTokens).toBe(32_000)
+    expect(snapshot?.model?.metadata).toBeUndefined()
     expect(req.agent_profile).toBe(snapshot)
     expect(Object.isFrozen(snapshot)).toBe(true)
   })

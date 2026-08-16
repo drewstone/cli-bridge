@@ -19,6 +19,9 @@ function memorySessions(): { store: SessionStore; records: Map<string, SessionRe
     get(externalId: string, backend: string): SessionRecord | null {
       return records.get(keyFor(externalId, backend)) ?? null
     },
+    findByExternalId(externalId: string): SessionRecord[] {
+      return [...records.values()].filter(record => record.externalId === externalId)
+    },
     async acquireExecution(): Promise<{ release(): void }> {
       return { release() {} }
     },
@@ -49,6 +52,34 @@ function memorySessions(): { store: SessionStore; records: Map<string, SessionRe
         createdAt: existing?.createdAt ?? now,
         lastUsedAt: now,
         metadata: { ...(existing?.metadata ?? {}), ...(args.metadata ?? {}) },
+      }
+      records.set(keyFor(args.externalId, args.backend), record)
+      return record
+    },
+    remember(args: {
+      externalId: string
+      backend: string
+      model: string
+      internalId?: string | null
+      cwd?: string | null
+      metadata?: Record<string, unknown>
+    }): SessionRecord {
+      identities.set(args.externalId, 'legacy')
+      const now = Date.now()
+      const existing = records.get(keyFor(args.externalId, args.backend))
+      const record: SessionRecord = {
+        externalId: args.externalId,
+        backend: args.backend,
+        internalId: args.internalId ?? existing?.internalId ?? '',
+        cwd: args.cwd ?? existing?.cwd ?? null,
+        turns: existing?.turns ?? 0,
+        createdAt: existing?.createdAt ?? now,
+        lastUsedAt: now,
+        metadata: {
+          ...(existing?.metadata ?? {}),
+          ...(args.metadata ?? {}),
+          model: args.model,
+        },
       }
       records.set(keyFor(args.externalId, args.backend), record)
       return record

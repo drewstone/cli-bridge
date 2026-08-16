@@ -33,10 +33,10 @@ export function admittedTurnInteractions(
   const effective: RequestedInteractions = requested ?? Object.fromEntries(
     supported.map((kind) => [kind, true]),
   )
-  const enabled = Object.entries(effective)
-    .filter(([, value]) => value)
-    .map(([kind]) => kind)
-  const unsupported = enabled.filter((kind) => !supported.includes(kind))
+  // Runtime treats every declared key as part of capability negotiation.
+  // A false value denies that kind at emission time; it does not erase the
+  // declaration before the provider's advertised capability is checked.
+  const unsupported = Object.keys(effective).filter((kind) => !supported.includes(kind))
   if (unsupported.length > 0) {
     throw new RetainedSessionError(
       `retained backend does not support requested interaction kinds: ${unsupported.join(', ')}`,

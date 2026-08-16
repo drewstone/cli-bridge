@@ -19,22 +19,32 @@ import {
   renderInputPartsAsText,
 } from '@tangle-network/agent-interface'
 import { RetainedSessionError } from './types.js'
+import {
+  isBoundedJsonValue,
+  retainedEnvSchema,
+  retainedExecutionSchema,
+  retainedInputPartSchema,
+  retainedPublicRecordSchema,
+  RETAINED_MAX_CWD_LENGTH,
+  RETAINED_MAX_JSON_ARRAY_LENGTH,
+  RETAINED_MAX_TEXT_LENGTH,
+} from './contract.js'
+
+export {
+  RETAINED_MAX_CWD_LENGTH,
+  RETAINED_MAX_JSON_ARRAY_LENGTH,
+  RETAINED_MAX_JSON_DEPTH,
+  RETAINED_MAX_JSON_MAP_ENTRIES,
+  RETAINED_MAX_JSON_NODES,
+  RETAINED_MAX_TEXT_LENGTH,
+} from './contract.js'
 
 export const RETAINED_MAX_HTTP_BODY_BYTES = 1_048_576
-export const RETAINED_MAX_TEXT_LENGTH = 16_384
-export const RETAINED_MAX_CWD_LENGTH = 4_096
-export const RETAINED_MAX_JSON_DEPTH = 16
-export const RETAINED_MAX_JSON_NODES = 8_192
-export const RETAINED_MAX_JSON_ARRAY_LENGTH = 1_024
-export const RETAINED_MAX_JSON_MAP_ENTRIES = 256
 
 const boundedJsonSchema = z.custom<unknown>(isBoundedJsonValue, {
   message: 'value exceeds retained request bounds',
 })
-const boundedJsonRecordSchema = z.custom<Record<string, unknown>>(value =>
-  typeof value === 'object' && value !== null && !Array.isArray(value) && isBoundedJsonValue(value),
-  { message: 'object exceeds retained request bounds' },
-)
+const boundedJsonRecordSchema = retainedPublicRecordSchema
 
 // Retained resource and caller run ids use the public stable-id contract.
 // URL-safe routing is handled by the HTTP client through path escaping; the
@@ -55,22 +65,26 @@ const createSchema = z.strictObject({
   agent_profile: boundedJsonSchema.optional(),
   mcp: boundedJsonRecordSchema.optional(),
   metadata: boundedJsonRecordSchema.optional(),
-})
-
-const retainedTextPartSchema = z.strictObject({
-  type: z.literal('text'),
-  text: z.string().min(1).max(RETAINED_MAX_TEXT_LENGTH),
+  execution: retainedExecutionSchema.optional(),
+  env: retainedEnvSchema.optional(),
+  context: boundedJsonRecordSchema.optional(),
+  provider_options: boundedJsonRecordSchema.optional(),
 })
 
 const turnSchema = z.strictObject({
   message: z.string().min(1).max(RETAINED_MAX_TEXT_LENGTH).optional(),
-  parts: z.array(retainedTextPartSchema).min(1).max(RETAINED_MAX_JSON_ARRAY_LENGTH).optional(),
+  parts: z.array(retainedInputPartSchema).min(1).max(RETAINED_MAX_JSON_ARRAY_LENGTH).optional(),
   turn_id: idSchema.optional(),
   execution_id: idSchema.optional(),
   run_id: idSchema.optional(),
   provider: idSchema.optional(),
   environment_id: idSchema.optional(),
   interactions: boundedJsonSchema.optional(),
+  context: boundedJsonRecordSchema.optional(),
+  provider_options: boundedJsonRecordSchema.optional(),
+  metadata: boundedJsonRecordSchema.optional(),
+  execution: retainedExecutionSchema.optional(),
+  env: retainedEnvSchema.optional(),
 })
 
 const steerSchema = z.strictObject({
@@ -158,42 +172,4 @@ export function renderTurnInput(input: RetainedTurnInput): string {
       parts: input.parts,
     }),
   )
-}
-
-function isBoundedJsonValue(value: unknown): boolean {
-  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }]
-  const seen = new Set<object>()
-  let nodes = 0
-  while (pending.length > 0) {
-    const item = pending.pop()!
-    nodes += 1
-    if (nodes > RETAINED_MAX_JSON_NODES || item.depth > RETAINED_MAX_JSON_DEPTH) return false
-    if (item.value === null || typeof item.value === 'boolean' || typeof item.value === 'number') {
-      if (typeof item.value === 'number' && !Number.isFinite(item.value)) return false
-      continue
-    }
-    if (typeof item.value === 'string') {
-      if (item.value.length > RETAINED_MAX_TEXT_LENGTH) return false
-      continue
-    }
-    if (typeof item.value !== 'object' || seen.has(item.value)) return false
-    seen.add(item.value)
-    if (Array.isArray(item.value)) {
-      if (item.value.length > RETAINED_MAX_JSON_ARRAY_LENGTH) return false
-      for (const child of item.value) pending.push({ value: child, depth: item.depth + 1 })
-      continue
-    }
-    const entries = Object.entries(item.value)
-    if (entries.length > RETAINED_MAX_JSON_MAP_ENTRIES) return false
-    for (const [key, child] of entries) {
-      if (key.length > 512) return false
-      pending.push({ value: child, depth: item.depth + 1 })
-    }
-  }
-  try {
-    const serialized = JSON.stringify(value)
-    return serialized !== undefined && new TextEncoder().encode(serialized).byteLength <= RETAINED_MAX_HTTP_BODY_BYTES
-  } catch {
-    return false
-  }
 }

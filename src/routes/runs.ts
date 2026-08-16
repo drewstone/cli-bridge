@@ -16,6 +16,7 @@ import {
   AgentRunCancellationRequestSchema,
   type AgentRunCancellationAcknowledgement,
   type AgentRunCancellationRequest,
+  type AgentExactRunControlRef,
   type Sha256Digest,
 } from '@tangle-network/agent-interface'
 import {
@@ -26,6 +27,8 @@ import {
 } from '../runs/registry.js'
 import type { RetainedEventRecord } from '../sessions/store.js'
 import type { DurableRetainedRunSnapshot } from '../sessions/retained.js'
+import { readBoundedJson } from '../sessions/retained/http.js'
+import { RetainedSessionError } from '../sessions/retained/types.js'
 import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
@@ -59,6 +62,7 @@ export function mountRuns(app: Hono, deps: {
   /** Durable retained-run reads used after the in-memory Run has been retired. */
   retainedRuns?: {
     runSnapshot(runId: string): DurableRetainedRunSnapshot | null
+    runLastSequence(runId: string): number
     assertRunReplayCursor(runId: string, afterSequence: number): void
     runEvents(runId: string, afterSequence: number, signal: AbortSignal): AsyncIterable<RetainedEventRecord>
   }
@@ -71,7 +75,7 @@ export function mountRuns(app: Hono, deps: {
     if (!run) {
       const retained = deps.retainedRuns?.runSnapshot(id)
       if (!retained) return runNotFound(c)
-      setRetainedRunHeaders(c, retained)
+      setRetainedRunHeaders(c, retained, deps.retainedRuns?.runLastSequence(id) ?? 0)
       return c.json(retained)
     }
     const waitMs = parseWaitMs(c)
@@ -97,7 +101,7 @@ export function mountRuns(app: Hono, deps: {
         if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
         return retainedRunError(c, error)
       }
-      setRetainedRunHeaders(c, retainedSnapshot)
+      setRetainedRunHeaders(c, retainedSnapshot, retained.runLastSequence(id))
       return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))
     }
     const run = deps.runs.get(id)
@@ -126,7 +130,9 @@ export function mountRuns(app: Hono, deps: {
   app.post('/v1/runs/:id/cancel', async (c) => {
     const id = c.req.param('id')
     const parsedBody = await cancellationBody(c)
-    if (!parsedBody.ok) return invalidRequest(c, parsedBody.message)
+    if (!parsedBody.ok) {
+      return c.json({ error: { message: parsedBody.message, type: parsedBody.type } }, parsedBody.status)
+    }
     if (parsedBody.request) {
       return exactCancellation(c, deps.runs, cancellations, id, parsedBody.request)
     }
@@ -161,33 +167,51 @@ interface CancellationRecord {
 
 type CancellationBody =
   | { readonly ok: true; readonly request?: AgentRunCancellationRequest }
-  | { readonly ok: false; readonly message: string }
+  | {
+      readonly ok: false
+      readonly message: string
+      readonly status: 400 | 413
+      readonly type: 'invalid_request_error' | 'request_too_large'
+    }
 
 async function cancellationBody(c: Context): Promise<CancellationBody> {
-  const text = await c.req.text()
-  if (text.trim() === '') return { ok: true }
-  let value: unknown
   try {
-    value = JSON.parse(text)
-  } catch {
-    return { ok: false, message: 'cancellation body must be valid JSON' }
-  }
-  if (
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    Object.keys(value).length === 0
-  ) {
-    return { ok: true }
-  }
-  const request = AgentRunCancellationRequestSchema.safeParse(value)
-  if (!request.success) {
+    const value = await readBoundedJson(c.req.raw)
+    if (value === undefined) return { ok: true }
+    if (
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      Object.keys(value).length === 0
+    ) {
+      return { ok: true }
+    }
+    const request = AgentRunCancellationRequestSchema.safeParse(value)
+    if (!request.success) {
+      return {
+        ok: false,
+        message: request.error.issues[0]?.message ?? 'invalid cancellation request',
+        status: 400,
+        type: 'invalid_request_error',
+      }
+    }
+    return { ok: true, request: request.data }
+  } catch (error) {
+    if (error instanceof RetainedSessionError) {
+      return {
+        ok: false,
+        message: error.message,
+        status: error.status === 413 ? 413 : 400,
+        type: error.code === 'request_too_large' ? 'request_too_large' : 'invalid_request_error',
+      }
+    }
     return {
       ok: false,
-      message: request.error.issues[0]?.message ?? 'invalid cancellation request',
+      message: error instanceof Error ? error.message : String(error),
+      status: 400,
+      type: 'invalid_request_error',
     }
   }
-  return { ok: true, request: request.data }
 }
 
 async function exactCancellation(
@@ -242,6 +266,18 @@ async function exactCancellation(
   if (request.run.requestDigest !== run.requestDigest) {
     return invalidRequest(c, 'cancellation request digest does not match the retained run', 409)
   }
+  if (!runCoordinatesMatch(run, request.run)) {
+    return c.json(
+      {
+        error: {
+          message: 'cancellation run coordinates do not match the claimed run',
+          type: 'run_identity_conflict',
+          run_id: runId,
+        },
+      },
+      409,
+    )
+  }
 
   const waitMs = parseWaitMs(c)
   if (!waitMs.ok) return invalidWait(c, waitMs.message)
@@ -278,6 +314,16 @@ function cancellationAcknowledgement(
   value: AgentRunCancellationAcknowledgement,
 ): AgentRunCancellationAcknowledgement {
   return AgentRunCancellationAcknowledgementSchema.parse(value)
+}
+
+function runCoordinatesMatch(run: Run, reference: AgentExactRunControlRef): boolean {
+  const snapshot = run.snapshot()
+  return snapshot.id === reference.runId
+    && snapshot.requestDigest === reference.requestDigest
+    && snapshot.provider === reference.provider
+    && snapshot.environmentId === reference.environmentId
+    && snapshot.sessionId === reference.sessionId
+    && snapshot.executionId === reference.executionId
 }
 
 type WaitMsResult =
@@ -326,13 +372,13 @@ function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
   }
 }
 
-function setRetainedRunHeaders(c: Context, snapshot: DurableRetainedRunSnapshot): void {
+function setRetainedRunHeaders(c: Context, snapshot: DurableRetainedRunSnapshot, lastCanonicalSequence: number): void {
   c.header('X-Run-Id', snapshot.id)
   c.header('X-Run-Request-Digest', snapshot.requestDigest)
   c.header('X-Run-Status', snapshot.status)
   c.header('X-Run-State', snapshot.state)
   c.header('X-Run-Terminal', String(snapshot.terminal))
-  if ('lastSeq' in snapshot) c.header('X-Last-Event-Id', String(snapshot.lastSeq))
+  c.header('X-Last-Event-Id', String(lastCanonicalSequence))
 }
 
 function streamRetainedRunEvents(

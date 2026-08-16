@@ -175,6 +175,42 @@ describe('chat-completions route — mcp body field', () => {
     expect(res.status).toBe(400)
   })
 
+  it('rejects credential-bearing MCP keys before durable request handling', async () => {
+    const body = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'capture',
+        messages: [{ role: 'user', content: 'hi' }],
+        mcp: {
+          mcpServers: {
+            remote: { headers: { Authorization: 'Bearer abc' } },
+          },
+        },
+      }),
+    })
+    expect(body.status).toBe(400)
+    expect(backend.last).toBeNull()
+
+    const header = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-mcp-config': JSON.stringify({
+          mcpServers: {
+            remote: { headers: { Authorization: 'Bearer abc' } },
+          },
+        }),
+      },
+      body: JSON.stringify({
+        model: 'capture',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    })
+    expect(header.status).toBe(400)
+    expect(backend.last).toBeNull()
+  })
+
   it('rejects body MCP beside an exact agent_profile before the backend runs', async () => {
     const res = await app.request('/v1/chat/completions', {
       method: 'POST',

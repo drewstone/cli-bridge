@@ -61,7 +61,7 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   buildCanonicalMcpServers,
-  assertPiMaxTokensRequest,
+  assertPiOutputTokenRequest,
   materializeMcpServersForPi,
   profileExecutionIdentity,
   provisionPiProfile,
@@ -71,6 +71,7 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { traceContextToChildEnv } from '../trace/ids.js'
+import { parseSafeRetainedEnv } from '../sessions/retained/contract.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import {
@@ -391,8 +392,13 @@ export function piToolProcessEnvironment(
     const value = inherited[key]
     if (typeof value === 'string' && value.length > 0) child[key] = value
   }
-  for (const [key, value] of Object.entries(requestValues)) {
-    if (typeof value === 'string' && value.length > 0) child[key] = value
+  const safeRequestValues = parseSafeRetainedEnv(
+    Object.fromEntries(
+      Object.entries(requestValues).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    ),
+  )
+  for (const [key, value] of Object.entries(safeRequestValues)) {
+    child[key] = value
   }
   return child
 }
@@ -513,7 +519,7 @@ export class PiBackend implements NativeSessionBackend {
     requestedInternalSessionId?: string,
   ): AsyncIterable<ChatDelta> {
     const profile = resolveAgentProfile(req, session)
-    assertPiMaxTokensRequest(req, profile)
+    assertPiOutputTokenRequest(req, profile)
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'pi has native tools (read/bash/edit/write); hosted-safe requires a verified --no-tools enforcement path')
 
@@ -583,7 +589,7 @@ export class PiBackend implements NativeSessionBackend {
       // Only a truly anonymous call is stateless.
       args.push('--no-session')
     }
-    const modelMetadata = profile?.model?.metadata
+    const modelHints = profile?.model
     const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
     const thinking = thinkingFlagForEffort(requestedReasoningEffort ?? undefined)
     const executionIdentity = profileExecutionIdentity(req, session, 'pi', thinking)
@@ -630,9 +636,9 @@ export class PiBackend implements NativeSessionBackend {
         {
           ...(req.session_id ? { sessionId: req.session_id } : {}),
           ...(runCwd ? { projectDir: runCwd } : {}),
-          ...(modelMetadata === undefined
+          ...(modelHints === undefined
             ? {}
-            : { modelMetadata }),
+            : { modelHints }),
         },
       )
       if (req.jailSpec) {
@@ -668,9 +674,9 @@ export class PiBackend implements NativeSessionBackend {
             : inference.upstreamBaseUrl,
           apiMode: inference.apiMode,
           transport: 'scoped-loopback',
-          ...(inference.appliedMaxTokens === undefined
+          ...(inference.appliedMaxTotalOutputTokens === undefined
             ? {}
-            : { appliedMaxTokens: inference.appliedMaxTokens }),
+            : { appliedMaxTotalOutputTokens: inference.appliedMaxTotalOutputTokens }),
         },
       )
       if (provisioned) args.push(...provisioned.flags)
@@ -680,7 +686,8 @@ export class PiBackend implements NativeSessionBackend {
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
-        env: piToolProcessEnvironment(process.env, {
+        env: {
+          ...piToolProcessEnvironment(process.env, req.env ?? {}),
           PI_CODING_AGENT_DIR: inference.agentDir,
           // Request-owned, never inherited: adding TRACEPARENT to the
           // allowlist above would leak the bridge DAEMON's own ambient trace
@@ -696,7 +703,7 @@ export class PiBackend implements NativeSessionBackend {
                 ),
               }
             : {}),
-        }),
+        },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       })

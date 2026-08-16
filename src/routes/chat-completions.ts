@@ -20,6 +20,8 @@ import { z } from 'zod'
 import {
   canonicalAgentProfileDigest,
   canonicalCandidateDigest,
+  RequestedInteractionsSchema,
+  type RequestedInteractions,
 } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
 import {
@@ -56,6 +58,16 @@ import {
 } from '../backends/profile-support.js'
 import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
 import { isLoopbackRequest } from '../http/request-source.js'
+import {
+  parseSafeCallerMetadata,
+  parseSafeRetainedMcp,
+  parseSafeRetainedEnv,
+  parseSafePublicRecord,
+  retainedEnvSchema,
+  retainedExecutionSchema,
+  retainedPublicRecordSchema,
+} from '../sessions/retained/contract.js'
+import { ENVIRONMENT_ID } from '../sessions/retained/types.js'
 
 /** Header accepted only from the local Runtime → cli-bridge transport. */
 export const PROTECTED_MODEL_CREDENTIAL_HEADER = 'x-cli-bridge-model-credential'
@@ -86,6 +98,14 @@ const durableRunIdSchema = z
 // no deadline.
 const maxExecutionTimeoutMs = 2_147_483_647
 
+// cli-bridge currently uses Zod 3 while Agent Interface publishes Zod 4.
+// Validate through the shared schema instead of embedding a foreign Zod
+// object inside the route's Zod 3 object.
+const requestedInteractionsSchema = z.custom<RequestedInteractions>(
+  (value) => RequestedInteractionsSchema.safeParse(value).success,
+  { message: 'interactions must be a bounded boolean map' },
+)
+
 const chatRequestSchema = z.object({
   model: z.string().min(1),
   messages: z.array(z.object({
@@ -100,15 +120,26 @@ const chatRequestSchema = z.object({
       z.array(z.union([
         z.object({ type: z.literal('text'), text: z.string() }),
         z.object({
+          type: z.literal('file'),
+          filename: z.string().optional(),
+          mediaType: z.string().optional(),
+          url: z.string().optional(),
+          path: z.string().optional(),
+          content: z.string().optional(),
+        }).passthrough(),
+        z.object({
           type: z.union([z.literal('image_url'), z.literal('input_image')]),
           image_url: z.union([z.string(), z.object({ url: z.string() })]),
         }),
         z.object({
           type: z.literal('image'),
-          image: z.string(),
+          image: z.string().optional(),
+          filename: z.string().optional(),
           mediaType: z.string().optional(),
           mimeType: z.string().optional(),
-        }),
+          url: z.string().optional(),
+          path: z.string().optional(),
+        }).passthrough(),
       ])),
     ]),
     // Assistant messages from the model carry `tool_calls` so the
@@ -131,6 +162,8 @@ const chatRequestSchema = z.object({
   max_tokens: z.number().optional(),
   // Mirrors the canonical ReasoningEffort ladder in @tangle-network/agent-interface.
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
+  interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
+  interactions: requestedInteractionsSchema.optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
   /**
@@ -173,7 +206,10 @@ const chatRequestSchema = z.object({
     mcpServers: z.record(z.unknown()).optional(),
   }).passthrough().optional(),
   cwd: z.string().optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: retainedPublicRecordSchema.optional(),
+  env: retainedEnvSchema.optional(),
+  context: retainedPublicRecordSchema.optional(),
+  provider_options: retainedPublicRecordSchema.optional(),
   /**
    * Where the harness runs.
    *
@@ -191,45 +227,14 @@ const chatRequestSchema = z.object({
    */
   execution: z.object({
     kind: z.enum(['host', 'sandbox']),
-    /** When kind=sandbox, the repoUrl to clone into /workspace before dispatch. */
     repoUrl: z.string().optional(),
-    /** When kind=sandbox, the git ref to check out post-clone. */
     gitRef: z.string().optional(),
-    /** When kind=sandbox, the sandbox capability tier (defaults to 'base'). */
     capability: z.string().optional(),
-    /** When kind=sandbox, the sandbox TTL in seconds (default 30 min). */
     ttlSeconds: z.number().int().positive().optional(),
-    /**
-     * When kind=host, an optional per-request jail override.
-     *   mode: 'write-jail' confines WRITES to the jail root; 'fs-jail' also
-     *         confines READS to a minimal system+toolchain allowlist so the
-     *         CLI cannot read the host repo or sibling run scratch dirs. NOTE:
-     *         the operator env floor (`BRIDGE_JAIL_MODE`, or `WORKER_FS_JAIL=1`
-     *         for fs-jail) can only be RAISED by a request, never lowered — a
-     *         per-request 'off' or 'write-jail' cannot weaken a higher floor.
-     *         'off' takes effect only when no env floor is set.
-     *   root: writable jail root (default <cwd>/.agent-home), clamped
-     *         inside the request cwd.
-     * Layered over the BRIDGE_JAIL_MODE / WORKER_FS_JAIL / BRIDGE_JAIL_ROOT env defaults.
-     */
     jail: z.object({
       mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
       root: z.string().optional(),
     }).optional(),
-    /**
-     * Deny-by-default EGRESS for the worker process tree — the network sibling
-     * of `jail` above.
-     *   mode: 'net-jail' requires that the worker run with no route off its
-     *         network except an allowlist that always contains the backend's
-     *         own model endpoint. The operator floor (`BRIDGE_NET_JAIL_MODE`,
-     *         or `WORKER_NET_JAIL=1`) can only be RAISED by a request. A
-     *         request the bridge cannot enforce FAILS with 501 naming the
-     *         execution mode; it is never accepted and quietly not applied.
-     *   allow: asserts the exact `host:port` allowlist in force. It does not
-     *         change the allowlist — a pooled worker joined its network when
-     *         the bridge started — so a list that differs from the enforced one
-     *         is a failure, not a silent widening.
-     */
     netJail: z.object({
       mode: z.enum(['off', 'net-jail']).optional(),
       allow: z.array(z.string()).optional(),
@@ -342,6 +347,7 @@ export function mountChatCompletions(
   deps: {
     registry: BackendRegistry
     sessions: SessionStore
+    retainedRuns?: Pick<SessionStore, 'getRetainedRun'>
     runs: RunRegistry
     admission?: AdmissionGate
     /**
@@ -423,6 +429,10 @@ export function mountChatCompletions(
       agent_profile,
       cwd,
       execution,
+      env,
+      context,
+      provider_options,
+      metadata: bodyMetadata,
       mcp: bodyMcp,
       run_id: bodyRunId,
       session_id: _bodySessionId,
@@ -435,16 +445,108 @@ export function mountChatCompletions(
     // the only behavioral authority.
     const mcpHeader = parseMcpHeader(c.req.header('x-mcp-config'))
     const mergedMcp = mergeMcpInputs(mcpHeader, bodyMcp as ChatRequest['mcp'] | undefined)
+    const sessionId = bodySession ?? headerSession
+    let persistedSession: SessionRecord | null = null
+    if (sessionId) {
+      const candidates = deps.sessions.findByExternalId(sessionId)
+      if (candidates.length > 1) {
+        const matching = candidates.filter((candidate) => {
+          const boundModel = candidate.metadata.agent_profile_binding
+          return candidate.metadata.model === rest.model
+            || (boundModel && typeof boundModel === 'object' && 'model' in boundModel && boundModel.model === rest.model)
+        })
+        if (matching.length !== 1) {
+          return c.json({
+            error: {
+              message: `session ${JSON.stringify(sessionId)} has multiple backend bindings; use a new session id`,
+              type: 'session_identity_conflict',
+              session_id: sessionId,
+            },
+          }, 409)
+        }
+        persistedSession = matching[0]!
+      } else {
+        persistedSession = candidates[0] ?? null
+      }
+    }
+    const selectedModel = typeof persistedSession?.metadata.model === 'string'
+      ? persistedSession.metadata.model
+      : rest.model
+    const persistedProfile = persistedSession?.metadata.agent_profile
+    const effectiveProfile = agent_profile ?? (
+      persistedProfile && typeof persistedProfile === 'object' ? persistedProfile : undefined
+    )
+    const persistedExecution = persistedSession?.metadata.execution
+    let effectiveExecution = execution as ChatRequest['execution'] | undefined
+    if (effectiveExecution === undefined && persistedExecution !== undefined) {
+      const parsedExecution = retainedExecutionSchema.safeParse(persistedExecution)
+      if (!parsedExecution.success) return invalidRequest(c, 'durable session execution is invalid; start a new session')
+      effectiveExecution = parsedExecution.data as ChatRequest['execution']
+    }
+    let effectiveEnv: Record<string, string> | undefined
+    try {
+      const storedEnv = persistedSession?.metadata.env
+      effectiveEnv = env === undefined
+        ? storedEnv === undefined ? undefined : parseSafeRetainedEnv(storedEnv)
+        : parseSafeRetainedEnv(env)
+    } catch (error) {
+      return invalidRequest(c, error instanceof Error ? error.message : String(error))
+    }
+    const storedRequestMetadata = persistedSession?.metadata.request_metadata
+    let safeStoredRequestMetadata: Record<string, unknown> = {}
+    let effectiveContext: Record<string, unknown> | undefined
+    let effectiveProviderOptions: Record<string, unknown> | undefined
+    let safeMergedMcp: Record<string, unknown> | undefined
+    let persistedMcp: Record<string, unknown> | undefined
+    let safeBodyMetadata: Record<string, unknown>
+    try {
+      safeBodyMetadata = parseSafeCallerMetadata(bodyMetadata)
+      safeStoredRequestMetadata = storedRequestMetadata === undefined
+        ? {}
+        : parseSafeCallerMetadata(storedRequestMetadata)
+      safeMergedMcp = mergedMcp === undefined
+        ? undefined
+        : parseSafeRetainedMcp(mergedMcp, 'chat MCP configuration')
+      const storedContext = persistedSession?.metadata.context
+      const storedProviderOptions = persistedSession?.metadata.provider_options
+      const storedMcp = persistedSession?.metadata.mcp
+      persistedMcp = storedMcp === undefined
+        ? undefined
+        : parseSafeRetainedMcp(storedMcp, 'durable session MCP configuration')
+      const parsedStoredContext = storedContext === undefined
+        ? undefined
+        : parseSafePublicRecord(storedContext, 'durable session context')
+      const parsedStoredProviderOptions = storedProviderOptions === undefined
+        ? undefined
+        : parseSafePublicRecord(storedProviderOptions, 'durable session provider options')
+      const parsedBodyContext = context === undefined
+        ? undefined
+        : parseSafePublicRecord(context, 'chat context')
+      const parsedBodyProviderOptions = provider_options === undefined
+        ? undefined
+        : parseSafePublicRecord(provider_options, 'chat provider options')
+      effectiveContext = parsedBodyContext ?? parsedStoredContext
+      effectiveProviderOptions = parsedBodyProviderOptions ?? parsedStoredProviderOptions
+    } catch (error) {
+      return invalidRequest(c, error instanceof Error ? error.message : String(error))
+    }
+    const effectiveMcp = safeMergedMcp ?? persistedMcp
     let protectedModelCredential: ProtectedModelCredential | undefined
-    const backend = deps.registry.resolve(rest.model)
+    const backend = deps.registry.resolve(selectedModel)
     if (!backend) {
       return c.json({
         error: {
-          message: `no backend matches model "${rest.model}". Check /health for registered backends.`,
+          message: `no backend matches model "${selectedModel}". Check /health for registered backends.`,
           type: 'not_found_error',
         },
       }, 404)
     }
+    const oneShotInteractionError = oneShotInteractionCapabilityError(
+      backend.name,
+      parsed.data.interactions,
+      parsed.data.interaction_policy,
+    )
+    if (oneShotInteractionError) return errorResponse(c, oneShotInteractionError)
     if (protectedCredentialHeader !== undefined || protectedBaseUrlHeader !== undefined) {
       if (!isLoopbackRequest(c.req.raw)) {
         return c.json({
@@ -485,16 +587,21 @@ export function mountChatCompletions(
     }
     const req: ChatRequest = {
       ...rest,
-      session_id: bodySession ?? headerSession,
+      model: selectedModel,
+      session_id: sessionId,
       mode,
       ...(response_format ? { responseFormat: normalizeResponseFormat(response_format) } : {}),
-      ...(agent_profile ? { agent_profile: agent_profile as ChatRequest['agent_profile'] } : {}),
-      ...(mergedMcp ? { mcp: mergedMcp } : {}),
+      ...(effectiveProfile !== undefined ? { agent_profile: effectiveProfile as ChatRequest['agent_profile'] } : {}),
+      ...(effectiveMcp ? { mcp: effectiveMcp } : {}),
       ...(cwd ? { cwd } : {}),
-      ...(execution ? { execution: execution as ChatRequest['execution'] } : {}),
+      ...(effectiveExecution ? { execution: effectiveExecution } : {}),
+      ...(effectiveEnv ? { env: effectiveEnv } : {}),
+      ...(effectiveContext ? { context: effectiveContext } : {}),
+      ...(effectiveProviderOptions ? { providerOptions: effectiveProviderOptions } : {}),
       ...(protectedModelCredential ? { protectedModelCredential } : {}),
       metadata: {
-        ...(parsed.data.metadata ?? {}),
+        ...safeStoredRequestMetadata,
+        ...safeBodyMetadata,
         ...(tangleClient ? { tangleClient } : {}),
         ...(tangleSource ? { tangleSource } : {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
@@ -531,9 +638,28 @@ export function mountChatCompletions(
     } catch {
       return invalidRequest(c, 'chat request cannot be canonicalized as durable-run identity')
     }
+    const retainedAdmission = deps.retainedRuns?.getRetainedRun(runId) ?? null
+    if (retainedAdmission) {
+      return runIdentityConflict(
+        c,
+        new RunIdentityConflictError(
+          runId,
+          retainedAdmission.requestDigest,
+          requestDigest,
+          'retained',
+          'one-shot',
+        ),
+      )
+    }
     let claim: ReturnType<RunRegistry['claim']>
     try {
-      claim = deps.runs.claim(runId, requestDigest)
+      claim = deps.runs.claim(runId, requestDigest, {
+        owner: 'one-shot',
+        provider: backend.name,
+        environmentId: ENVIRONMENT_ID,
+        sessionId: req.session_id || runId,
+        executionId: runId,
+      })
     } catch (error) {
       if (error instanceof RunIdentityConflictError) return runIdentityConflict(c, error)
       throw error
@@ -609,7 +735,7 @@ export function mountChatCompletions(
         }
       }
 
-      const session = req.session_id
+      let session = req.session_id
         ? deps.sessions.get(req.session_id, backend.name)
         : null
       if (!req.agent_profile && session?.metadata?.agent_profile && typeof session.metadata.agent_profile === 'object') {
@@ -622,6 +748,28 @@ export function mountChatCompletions(
       const sessionProfileBinding = exactSessionProfileBinding(req, session)
       if (session) {
         assertSessionProfileBinding(session, sessionProfileBinding)
+      }
+      if (req.session_id) {
+        const remembered = deps.sessions.remember({
+          externalId: req.session_id,
+          backend: backend.name,
+          model: req.model,
+          internalId: session?.internalId ?? null,
+          cwd: req.cwd ?? session?.cwd ?? null,
+          metadata: {
+            ...(Object.keys(safeBodyMetadata).length > 0 ? { request_metadata: safeBodyMetadata } : {}),
+            ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
+            ...(sessionProfileBinding ? { agent_profile_binding: sessionProfileBinding } : {}),
+            ...(req.execution ? { execution: req.execution } : {}),
+            ...(req.env ? { env: req.env } : {}),
+            ...(req.context ? { context: req.context } : {}),
+            ...(req.providerOptions ? { provider_options: req.providerOptions } : {}),
+            ...(req.mcp ? { mcp: req.mcp } : {}),
+          },
+        })
+        // A legacy row may be durable before its first native id exists.
+        // Keep that placeholder out of backend resume state until upsert records the id.
+        session = session?.internalId ? remembered : null
       }
 
       // Deny-by-default egress, gated before any execution path is chosen so a
@@ -735,12 +883,17 @@ export function mountChatCompletions(
                   internalId: delta.internal_session_id,
                   cwd: req.cwd ?? session?.cwd ?? null,
                   metadata: {
-                    ...(req.metadata ?? {}),
+                    ...(Object.keys(safeBodyMetadata).length > 0 ? { request_metadata: safeBodyMetadata } : {}),
                     model: req.model,
                     ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
                     ...(sessionProfileBinding
                       ? { agent_profile_binding: sessionProfileBinding }
                       : {}),
+                    ...(req.execution ? { execution: req.execution } : {}),
+                    ...(req.env ? { env: req.env } : {}),
+                    ...(req.context ? { context: req.context } : {}),
+                    ...(req.providerOptions ? { provider_options: req.providerOptions } : {}),
+                    ...(req.mcp ? { mcp: req.mcp } : {}),
                     ...(req.profile_materialization_receipt
                       ? { profile_materialization: req.profile_materialization_receipt }
                       : {}),
@@ -1184,6 +1337,7 @@ function errorResponse(c: Context, err: unknown): Response {
     // that one to 504 and keep the rest as documented codes.
     const status: 500 | 501 | 502 | 503 | 504 =
       err.code === 'not_configured' ? 501
+      : err.code === 'capability_denied' ? 501
       : err.code === 'cli_missing' ? 503
       : err.code === 'timeout' ? 504
       : err.code === 'aborted' ? 504
@@ -1195,6 +1349,31 @@ function errorResponse(c: Context, err: unknown): Response {
   }
   const message = err instanceof Error ? err.message : String(err)
   return c.json({ error: { message, type: 'server_error' } }, 500)
+}
+
+/**
+ * One-shot chat has no response-bound native interaction channel.
+ * Parse the shared posture at the wire boundary, then refuse any declared
+ * interaction or policy before session identity, run, admission, or backend
+ * setup can be created.
+ */
+function oneShotInteractionCapabilityError(
+  backendName: string,
+  interactions: ChatRequest['interactions'] | undefined,
+  policy: ChatRequest['interaction_policy'] | undefined,
+): BackendError | null {
+  const requestedKinds = Object.keys(interactions ?? {})
+  if (requestedKinds.length === 0 && policy === undefined) return null
+  const detail = requestedKinds.length > 0
+    ? `requested interaction kinds: ${requestedKinds.join(', ')}`
+    : `interaction policy: ${policy}`
+  return new BackendError(
+    `backend ${JSON.stringify(backendName)} does not support one-shot interactions (${detail}); `
+    + 'use a retained native session',
+    'capability_denied',
+    undefined,
+    { providerDispatch: 'not_started' },
+  )
 }
 
 function providerDispatchMetadata(error: unknown): { provider_dispatch?: 'not_started' } {

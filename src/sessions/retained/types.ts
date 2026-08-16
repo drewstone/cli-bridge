@@ -44,6 +44,11 @@ export interface RetainedTurnResult {
   contextBoundary: Record<string, unknown> | null
 }
 
+export interface RetainedRunCoordinates {
+  provider: string
+  environmentId: string
+}
+
 export type DurableRetainedRunSnapshot =
   | RunSnapshot
   | {
@@ -54,6 +59,8 @@ export type DurableRetainedRunSnapshot =
       readonly state: 'detached'
       readonly terminal: false
       readonly sessionId: string
+      readonly provider: string
+      readonly environmentId: string
     }
 
 export interface RetainedSessionView {

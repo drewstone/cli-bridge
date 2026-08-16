@@ -471,36 +471,53 @@ export function assertProfileRequestAuthority(
 }
 
 /**
- * Treat a top-level Pi token limit as an assertion about the exact profile.
+ * Enforce the Pi limits that have a proven native lowering.
  *
- * Pi does not consume ChatRequest.max_tokens itself. A caller may repeat the
- * profile value for compatibility, but the profile metadata remains the only
- * value that reaches the isolated model catalog.
+ * Pi's catalog exposes one completion cap that includes hidden reasoning.
+ * Visible-only and reasoning-only ceilings have no independent Pi control.
  */
-export function assertPiMaxTokensRequest(
+export function assertPiOutputTokenRequest(
   req: ChatRequest,
   profile: AgentProfile | null,
 ): void {
+  const model = profile?.model
+  if (model?.metadata !== undefined && Object.keys(model.metadata).length > 0) {
+    throw new BackendError(
+      'backend pi does not accept agent_profile.model.metadata as a token authority; use maxTotalOutputTokens',
+      'not_configured',
+    )
+  }
+  if (model?.maxVisibleOutputTokens !== undefined) {
+    throw new BackendError(
+      'backend pi cannot enforce agent_profile.model.maxVisibleOutputTokens; Pi exposes only a total completion cap',
+      'not_configured',
+    )
+  }
+  if (model?.maxReasoningTokens !== undefined) {
+    throw new BackendError(
+      'backend pi cannot enforce agent_profile.model.maxReasoningTokens; reasoningEffort is not a numeric token cap',
+      'not_configured',
+    )
+  }
   const requested = req.max_tokens
   if (requested === undefined) return
   if (!profile) {
     throw new BackendError(
-      'backend pi cannot apply request max_tokens without an AgentProfile.model.metadata.maxTokens authority',
+      'backend pi cannot apply request max_tokens without an AgentProfile.model.maxTotalOutputTokens authority',
       'not_configured',
     )
   }
 
-  const metadata = profile.model?.metadata
-  if (!metadata || !Object.hasOwn(metadata, 'maxTokens')) {
+  const profileMaxTokens = profile.model?.maxTotalOutputTokens
+  if (profileMaxTokens === undefined) {
     throw new BackendError(
-      'backend pi cannot apply request max_tokens because agent_profile.model.metadata.maxTokens is absent',
+      'backend pi cannot apply request max_tokens because agent_profile.model.maxTotalOutputTokens is absent',
       'not_configured',
     )
   }
-  const profileMaxTokens = metadata.maxTokens
   if (requested !== profileMaxTokens) {
     throw new BackendError(
-      `request max_tokens ${String(requested)} conflicts with agent_profile.model.metadata.maxTokens ${String(profileMaxTokens)}`,
+      `request max_tokens ${String(requested)} conflicts with agent_profile.model.maxTotalOutputTokens ${String(profileMaxTokens)}`,
       'parse_error',
     )
   }

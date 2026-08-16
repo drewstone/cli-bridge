@@ -21,10 +21,19 @@ import { RunAdmissionClosedError, RunIdentityConflictError, type RunRegistry } f
 import type { RetainedSessionRecord, SessionStore } from '../store.js'
 import { admittedTurnInteractions, isNativeBackend } from './capabilities.js'
 import { verifyRetainedBoundary } from './context-boundary.js'
-import { requiresRecordedInputs, type RetainedInputMaterialStore } from './input-material.js'
 import { canonicalTurn } from './native-turn.js'
 import { retainedRunSnapshot, unknownRunSnapshot, type RetainedSessionState } from './state.js'
 import { renderTurnInput, type RetainedTurnInput } from './schema.js'
+import {
+  parseSafeCallerMetadata,
+  parseSafeRetainedMcp,
+  parseSafePublicRecord,
+  parseSafeRetainedEnv,
+  retainedExecutionSchema,
+  retainedPublicRecordSchema,
+  snapshotRetainedAgentProfile,
+  type RetainedExecution,
+} from './contract.js'
 import { commitCompletedTurn, recoverFailedTurnAdmission } from './turn-commit.js'
 import type { TurnLaneOptions, TurnLanes } from './turn-lane.js'
 import { ENVIRONMENT_ID, RetainedSessionError, type RetainedTurnResult } from './types.js'
@@ -35,7 +44,6 @@ export interface RetainedTurnRunnerOptions {
   runs: RunRegistry
   state: RetainedSessionState
   lanes: TurnLanes
-  inputMaterial: RetainedInputMaterialStore
   isClosing: (id: string) => boolean
   denyUnrequestedInteraction: (input: {
     run: import('../../runs/registry.js').Run
@@ -50,7 +58,6 @@ export class RetainedTurnRunner {
   private readonly runs: RunRegistry
   private readonly state: RetainedSessionState
   private readonly lanes: TurnLanes
-  private readonly inputMaterial: RetainedInputMaterialStore
   private readonly isClosing: (id: string) => boolean
   private readonly denyUnrequestedInteraction: RetainedTurnRunnerOptions['denyUnrequestedInteraction']
   /** In-flight durable commits, keyed by run id. */
@@ -62,7 +69,6 @@ export class RetainedTurnRunner {
     this.runs = options.runs
     this.state = options.state
     this.lanes = options.lanes
-    this.inputMaterial = options.inputMaterial
     this.isClosing = options.isClosing
     this.denyUnrequestedInteraction = options.denyUnrequestedInteraction
   }
@@ -143,6 +149,14 @@ export class RetainedTurnRunner {
       )
     }
     const prompt = renderTurnInput(input)
+    const config = this.requestConfig(retained, input)
+    if (config.execution?.kind === 'sandbox') {
+      throw new RetainedSessionError(
+        'retained native sessions cannot execute in a sandbox; use /v1/chat/completions for sandbox execution',
+        501,
+        'capability_denied',
+      )
+    }
     const runId = input.run_id!
     const executionId = input.execution_id ?? input.turn_id ?? runId
     const interactions = admittedTurnInteractions(retained.capabilities, input.interactions)
@@ -158,6 +172,13 @@ export class RetainedTurnRunner {
       input: normalizeInputParts({ message: input.message, parts: input.parts }),
       interactions,
       turnId: input.turn_id ?? null,
+      execution: config.execution ?? null,
+      env: config.env ?? null,
+      profile: config.profile ?? null,
+      mcp: config.mcp ?? null,
+      context: config.context ?? null,
+      providerOptions: config.providerOptions ?? null,
+      metadata: config.metadata,
     })
     if (retained.runId && this.state.hasFinalizationFailure(retained.runId)) {
       throw new RetainedSessionError(
@@ -165,6 +186,17 @@ export class RetainedTurnRunner {
         409,
         'unknown_session',
       )
+    }
+    try {
+      this.runs.assertAvailable(runId, requestDigest, 'retained')
+    } catch (error) {
+      if (error instanceof RunIdentityConflictError) {
+        throw new RetainedSessionError(error.message, 409, 'run_identity_conflict')
+      }
+      if (error instanceof RunAdmissionClosedError) {
+        throw new RetainedSessionError(error.message, 503, error.code)
+      }
+      throw error
     }
     const replayed = this.replayedRunAdmission(retained, runId, executionId, providerName, environmentId, requestDigest)
     if (replayed) return replayed
@@ -184,16 +216,6 @@ export class RetainedTurnRunner {
         'unknown_session',
       )
     }
-    const material = this.inputMaterial.get(id)
-    if (requiresRecordedInputs(retained.metadata) && !material && !existingControl) {
-      this.store.updateRetained(id, { status: 'unknown' })
-      throw new RetainedSessionError(
-        `native session ${JSON.stringify(id)} lost its exact profile inputs across bridge restart`,
-        404,
-        'unknown_session',
-      )
-    }
-
     const backend = this.registry.byName(retained.backend)
     if (!backend || !isNativeBackend(backend)) {
       throw new RetainedSessionError(
@@ -216,30 +238,14 @@ export class RetainedTurnRunner {
         throw new RetainedSessionError('native session ownership changed before continuation', 409, 'invalid_state')
       }
     }
-    const durableClaim = this.store.claimRetainedRun({
-      runId,
-      sessionId: id,
-      executionId,
-      requestDigest,
-      provider: providerName,
-      environmentId,
-      snapshot: unknownRunSnapshot(runId, executionId, requestDigest, id),
-    })
-    if (durableClaim.kind === 'conflict') {
-      throw new RetainedSessionError(
-        `run ${JSON.stringify(runId)} is already bound to a different request`,
-        409,
-        'run_identity_conflict',
-      )
-    }
-    if (durableClaim.kind === 'replayed') {
-      return this.replayedRunAdmission(retained, runId, executionId, providerName, environmentId, requestDigest)!
-    }
     let claim: ReturnType<RunRegistry['claim']>
     try {
       claim = this.runs.claim(runId, requestDigest, {
+        owner: 'retained',
         sessionId: id,
         executionId,
+        provider: providerName,
+        environmentId,
         commitCanonicalEvent: (event) =>
           this.store.appendRetainedEvent(id, {
             runId: event.runId,
@@ -262,6 +268,36 @@ export class RetainedTurnRunner {
       }
       throw error
     }
+    let durableClaim: ReturnType<SessionStore['claimRetainedRun']>
+    try {
+      durableClaim = this.store.claimRetainedRun({
+        runId,
+        sessionId: id,
+        executionId,
+        requestDigest,
+        provider: providerName,
+        environmentId,
+        snapshot: unknownRunSnapshot(runId, executionId, requestDigest, id, {
+          provider: providerName,
+          environmentId,
+        }),
+      })
+    } catch (error) {
+      if (claim.created) this.runs.releaseClaim(runId, claim.run)
+      throw error
+    }
+    if (durableClaim.kind === 'conflict') {
+      if (claim.created) this.runs.releaseClaim(runId, claim.run)
+      throw new RetainedSessionError(
+        `run ${JSON.stringify(runId)} is already bound to a different request`,
+        409,
+        'run_identity_conflict',
+      )
+    }
+    if (durableClaim.kind === 'replayed') {
+      if (claim.created) this.runs.releaseClaim(runId, claim.run)
+      return this.replayedRunAdmission(retained, runId, executionId, providerName, environmentId, requestDigest)!
+    }
     const run = claim.run
     if (!claim.created) {
       this.store.updateRetainedRun(runId, requestDigest, run.snapshot())
@@ -281,16 +317,12 @@ export class RetainedTurnRunner {
       this.store.updateRetainedRun(runId, requestDigest, run.snapshot())
       this.store.updateRetained(id, { status: 'running', runId })
       releaseNativeAttachment = run.reserveNativeControlAttachment()
-      const request = this.requestFor(retained, prompt, interactions)
+      const request = this.requestFor(retained, input, prompt, interactions, config)
       try {
         if (!native) {
           native = await backend.startNativeSession(request, sessionRecordFor(retained), run.signal)
           run.setNativeControl(native)
           nativeOwnedByRun = true
-          // The native child now owns the materialized profile/MCP state. Keep
-          // no duplicate credential-bearing input in the bridge process after
-          // the first spawn; a lost child is not eligible for silent restart.
-          this.inputMaterial.forget(id)
         } else {
           if (!existingControl) {
             throw new RetainedSessionError(
@@ -428,10 +460,18 @@ export class RetainedTurnRunner {
       const session = this.state.require(retained.id)
       return { session, run: snapshot, contextBoundary: session.contextBoundary }
     }
-    const persisted = retainedRunSnapshot(admission.snapshot, runId, admission.executionId, requestDigest, retained.id)
+    const coordinates = { provider: admission.provider, environmentId: admission.environmentId }
+    const persisted = retainedRunSnapshot(
+      admission.snapshot,
+      runId,
+      admission.executionId,
+      requestDigest,
+      retained.id,
+      coordinates,
+    )
     const snapshot = persisted.terminal
       ? persisted
-      : unknownRunSnapshot(runId, admission.executionId, requestDigest, retained.id)
+      : unknownRunSnapshot(runId, admission.executionId, requestDigest, retained.id, coordinates)
     if (!persisted.terminal) {
       this.store.updateRetainedRun(runId, requestDigest, snapshot)
       this.store.updateRetained(retained.id, { status: 'unknown', runId })
@@ -442,25 +482,165 @@ export class RetainedTurnRunner {
 
   private requestFor(
     record: RetainedSessionRecord,
+    input: RetainedTurnInput,
     prompt: string,
     interactions: RequestedInteractions,
+    config: RetainedRequestConfig,
   ): ChatRequest {
-    const material = this.inputMaterial.get(record.id)
-    const profile = material?.hasAgentProfile ? material.agentProfile : undefined
-    const mcp = material?.hasMcp ? material.mcp : undefined
     const mode = record.metadata.mode
     return {
       model: record.model,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [{
+        role: 'user',
+        content: input.parts ? normalizeInputParts({ message: input.message, parts: input.parts }) : prompt,
+      }],
       session_id: record.id,
       interaction_policy: 'interactive',
       interactions,
       ...(record.cwd ? { cwd: record.cwd } : {}),
       ...(typeof mode === 'string' ? { mode: mode as ChatRequest['mode'] } : {}),
-      ...(profile !== undefined ? { agent_profile: profile as ChatRequest['agent_profile'] } : {}),
-      ...(mcp && typeof mcp === 'object' ? { mcp: mcp as ChatRequest['mcp'] } : {}),
+      ...(config.execution ? { execution: config.execution as ChatRequest['execution'] } : {}),
+      ...(config.env ? { env: config.env } : {}),
+      ...(config.context ? { context: config.context } : {}),
+      ...(config.providerOptions ? { providerOptions: config.providerOptions } : {}),
+      ...(config.profile !== undefined ? { agent_profile: config.profile as ChatRequest['agent_profile'] } : {}),
+      ...(config.mcp ? { mcp: config.mcp as ChatRequest['mcp'] } : {}),
+      ...(Object.keys(config.metadata).length > 0 ? { metadata: config.metadata } : {}),
     }
   }
+
+  private requestConfig(record: RetainedSessionRecord, input: RetainedTurnInput): RetainedRequestConfig {
+    let profile = record.metadata.agent_profile
+    let mcp = record.metadata.mcp
+    if (record.metadata.mcp !== undefined) {
+      try {
+        mcp = parseSafeRetainedMcp(record.metadata.mcp)
+      } catch (error) {
+        throw new RetainedSessionError(
+          error instanceof Error ? error.message : String(error),
+          409,
+          'unknown_session',
+        )
+      }
+    }
+    if (record.metadata.agent_profile !== undefined) {
+      try {
+        profile = snapshotRetainedAgentProfile(record.metadata.agent_profile)
+      } catch (error) {
+        throw new RetainedSessionError(
+          error instanceof Error ? error.message : String(error),
+          409,
+          'unknown_session',
+        )
+      }
+    }
+    const execution = parseRetainedExecution(input.execution ?? record.metadata.execution)
+    let env: Record<string, string> | undefined
+    try {
+      const rawEnv = input.env ?? record.metadata.env
+      env = rawEnv === undefined ? undefined : parseSafeRetainedEnv(rawEnv)
+    } catch (error) {
+      throw new RetainedSessionError(
+        error instanceof Error ? error.message : String(error),
+        409,
+        'unknown_session',
+      )
+    }
+    let inputMetadata: Record<string, unknown>
+    let inputContext: Record<string, unknown>
+    let inputProviderOptions: Record<string, unknown>
+    try {
+      inputMetadata = parseSafeCallerMetadata(input.metadata)
+      inputContext = input.context === undefined ? {} : parseSafePublicRecord(input.context, 'retained context')
+      inputProviderOptions = input.provider_options === undefined
+        ? {}
+        : parseSafePublicRecord(input.provider_options, 'retained provider options')
+    } catch (error) {
+      throw new RetainedSessionError(
+        error instanceof Error ? error.message : String(error),
+        400,
+        'invalid_request_error',
+      )
+    }
+    const persistedMetadata = record.metadata.metadata === undefined
+      ? {}
+      : parsePersistedRecord(record.metadata.metadata, 'retained metadata')
+    const persistedContext = record.metadata.context === undefined
+      ? {}
+      : parsePersistedRecord(record.metadata.context, 'retained context')
+    const persistedProviderOptions = record.metadata.provider_options === undefined
+      ? {}
+      : parsePersistedRecord(record.metadata.provider_options, 'retained provider options')
+    const context = { ...persistedContext, ...inputContext }
+    const providerOptions = { ...persistedProviderOptions, ...inputProviderOptions }
+    const metadata = {
+      ...objectRecord(record.metadata, new Set([
+        'mode',
+        'execution',
+        'env',
+        'agent_profile',
+        'mcp',
+        'metadata',
+        'context',
+        'provider_options',
+      ])),
+      ...(persistedMetadata && typeof persistedMetadata === 'object' && !Array.isArray(persistedMetadata) ? persistedMetadata : {}),
+      ...inputMetadata,
+    }
+    return {
+      ...(execution ? { execution } : {}),
+      ...(env ? { env } : {}),
+      ...(Object.keys(context).length > 0 ? { context } : {}),
+      ...(Object.keys(providerOptions).length > 0 ? { providerOptions } : {}),
+      ...(profile !== undefined ? { profile } : {}),
+      ...(mcp && typeof mcp === 'object' ? { mcp: mcp as Record<string, unknown> } : {}),
+      metadata,
+    }
+  }
+}
+
+interface RetainedRequestConfig {
+  execution?: RetainedExecution
+  env?: Record<string, string>
+  context?: Record<string, unknown>
+  providerOptions?: Record<string, unknown>
+  profile?: unknown
+  mcp?: Record<string, unknown>
+  metadata: Record<string, unknown>
+}
+
+function parseRetainedExecution(value: unknown): RetainedExecution | undefined {
+  if (value === undefined) return undefined
+  const parsed = retainedExecutionSchema.safeParse(value)
+  if (!parsed.success) {
+    throw new RetainedSessionError(
+      'retained execution configuration is no longer supported by this bridge',
+      409,
+      'unknown_session',
+    )
+  }
+  return parsed.data
+}
+
+function parsePersistedRecord(value: unknown, label: string): Record<string, unknown> {
+  try {
+    return parseSafePublicRecord(value, label)
+  } catch (error) {
+    throw new RetainedSessionError(
+      error instanceof Error ? error.message : String(error),
+      409,
+      'unknown_session',
+    )
+  }
+}
+
+function objectRecord(value: Record<string, unknown>, excluded: Set<string>): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (excluded.has(key)) continue
+    if (retainedPublicRecordSchema.safeParse({ [key]: item }).success) result[key] = item
+  }
+  return result
 }
 
 function sessionRecordFor(record: RetainedSessionRecord): {

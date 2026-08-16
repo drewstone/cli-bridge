@@ -100,10 +100,14 @@ export class SandboxBackend implements Backend {
 
     const sandboxOpts = req.execution?.kind === 'sandbox' ? req.execution : null
     const timeoutMs = req.execution?.timeoutMs ?? this.defaultExecutionTimeoutMs
+    const requestMetadata = (req.metadata ?? {}) as Record<string, unknown>
+    const { forwardedAuthorization: _forwardedAuthorization, sandboxBackendType: _sandboxBackendType, ...publicMetadata } = requestMetadata
 
     const requestBody = {
       tasks: [{ id: taskId, message, ...(timeoutMs > 0 ? { timeoutMs } : {}) }],
       backend: { type: backendType, profile },
+      ...(req.env ? { env: req.env } : {}),
+      ...(Object.keys(publicMetadata).length > 0 ? { metadata: publicMetadata } : {}),
       ...(timeoutMs > 0 ? { timeoutMs } : {}),
       scalingMode: 'balanced' as const,
       persistent: Boolean(session),

@@ -3,9 +3,9 @@
 # must NOT become a standing bypass of that supply-chain control. Each entry is dead weight
 # once its version is older than the minimum release age.
 minimumReleaseAgeExclude:
-  - '@tangle-network/agent-profile-materialize@0.15.0'
+  - '@tangle-network/agent-profile-materialize@0.15.0 || 0.15.2'
   - '@tangle-network/agent-trace-contract@1.0.2'
-  - '@tangle-network/agent-interface@0.52.0 || 0.53.0'
+  - '@tangle-network/agent-interface@0.52.0 || 0.53.0 || 0.54.0'
 
 # Dependencies allowed to run install scripts. better-sqlite3 needs its install script to
 # obtain the native binding the session store loads; esbuild needs its platform binary.
