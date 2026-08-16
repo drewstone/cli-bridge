@@ -26,7 +26,7 @@ import { buildContainerRunArgs, ContainerPool } from '../src/executors/container
 import type { DockerCli } from '../src/executors/docker-cli.js'
 import { assertDockerWorkspaceCwd, buildDockerExecArgs, createDockerSpawner } from '../src/executors/docker.js'
 import { hostSpawner, sanitizeHostEnv } from '../src/executors/host.js'
-import { killTree } from '../src/executors/process-tree.js'
+import { killTree, killTreeSync } from '../src/executors/process-tree.js'
 import type { Spawner, SpawnResult } from '../src/executors/types.js'
 import { loadConfig } from '../src/config.js'
 import { writeStdinPayload } from '../src/backends/stdin-payload.js'
@@ -177,6 +177,76 @@ describe('killTree', () => {
       // Give the OS one scheduler tick to reap the processes.
       await new Promise<void>((resolve) => setTimeout(resolve, 100))
       expect(parent.child.exitCode !== null || parent.child.signalCode !== null).toBe(true)
+      expect(processExists(grandchildPid)).toBe(false)
+    } finally {
+      parent.release()
+    }
+  })
+
+  it.skipIf(process.platform !== 'linux')('kills descendants after the process-group leader exits first', async () => {
+    const parent = await hostSpawner('node', [
+      '-e',
+      [
+        'const { spawn } = require("node:child_process");',
+        'const g = spawn("node", ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 100)"], { stdio: "ignore" });',
+        'process.stdout.write(String(g.pid) + "\\n", () => process.exit(0));',
+      ].join(''),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] })
+    try {
+      const grandchildPid = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('grandchild pid never reported')), 5_000)
+        let buffer = ''
+        parent.child.stdout?.on('data', (chunk) => {
+          buffer += chunk.toString()
+          const match = buffer.match(/(\d+)/u)
+          if (!match) return
+          clearTimeout(timer)
+          resolve(Number(match[1]))
+        })
+      })
+      await new Promise<void>((resolve) => {
+        if (parent.child.exitCode !== null || parent.child.signalCode !== null) resolve()
+        else parent.child.once('exit', () => resolve())
+      })
+      expect(processExists(grandchildPid)).toBe(true)
+
+      await killTree(parent.child, { gracefulMs: 100 })
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      expect(processExists(grandchildPid)).toBe(false)
+    } finally {
+      parent.release()
+    }
+  })
+
+  it.skipIf(process.platform !== 'linux')('synchronously signals descendants after the process-group leader exits first', async () => {
+    const parent = await hostSpawner('node', [
+      '-e',
+      [
+        'const { spawn } = require("node:child_process");',
+        'const g = spawn("node", ["-e", "setInterval(() => {}, 100)"], { stdio: "ignore" });',
+        'process.stdout.write(String(g.pid) + "\\n", () => process.exit(0));',
+      ].join(''),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] })
+    try {
+      const grandchildPid = await new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('grandchild pid never reported')), 5_000)
+        let buffer = ''
+        parent.child.stdout?.on('data', (chunk) => {
+          buffer += chunk.toString()
+          const match = buffer.match(/(\d+)/u)
+          if (!match) return
+          clearTimeout(timer)
+          resolve(Number(match[1]))
+        })
+      })
+      await new Promise<void>((resolve) => {
+        if (parent.child.exitCode !== null || parent.child.signalCode !== null) resolve()
+        else parent.child.once('exit', () => resolve())
+      })
+      expect(processExists(grandchildPid)).toBe(true)
+
+      killTreeSync(parent.child, 'SIGKILL')
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
       expect(processExists(grandchildPid)).toBe(false)
     } finally {
       parent.release()
