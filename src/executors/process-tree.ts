@@ -61,13 +61,20 @@ export async function killTree(
   const gracefulMs = opts.gracefulMs ?? DEFAULT_GRACEFUL_TERMINATION_MS
   const pid = child.pid
   if (pid === undefined) return
-  if (child.exitCode !== null || child.signalCode !== null) return
 
-  // Send SIGTERM to the negative pgid. Node's `process.kill(-pid, sig)`
-  // dispatches the signal to every process in the group. We try the
-  // group first; if it errors (ESRCH = no such group, EPERM = not the
-  // leader) fall back to the direct child.
-  trySignal(-pid, 'SIGTERM') || trySignal(pid, 'SIGTERM')
+  // The group can outlive its leader. Always try the recorded process group
+  // before consulting the direct child's exit state.
+  if (process.platform !== 'win32' && trySignal(-pid, 'SIGTERM')) {
+    await waitForProcessGroupExitOrTimeout(pid, gracefulMs)
+    if (processGroupExists(pid)) {
+      trySignal(-pid, 'SIGKILL')
+      await waitForProcessGroupExitOrTimeout(pid, 500)
+    }
+    return
+  }
+
+  if (child.exitCode !== null || child.signalCode !== null) return
+  trySignal(pid, 'SIGTERM')
 
   // Wait for exit OR grace period. Whichever comes first.
   await waitForExitOrTimeout(child, gracefulMs)
@@ -155,8 +162,9 @@ export function pendingCleanupRetries(): number {
 export function killTreeSync(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
   const pid = child.pid
   if (pid === undefined) return
+  if (process.platform !== 'win32' && trySignal(-pid, signal)) return
   if (child.exitCode !== null || child.signalCode !== null) return
-  trySignal(-pid, signal) || trySignal(pid, signal)
+  trySignal(pid, signal)
 }
 
 function trySignal(target: number, sig: NodeJS.Signals): boolean {
@@ -185,4 +193,22 @@ function waitForExitOrTimeout(child: ChildProcess, ms: number): Promise<void> {
     child.once('exit', finish)
     child.once('close', finish)
   })
+}
+
+async function waitForProcessGroupExitOrTimeout(processGroupId: number, ms: number): Promise<void> {
+  const deadline = Date.now() + ms
+  while (processGroupExists(processGroupId) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now())))
+    })
+  }
+}
+
+function processGroupExists(processGroupId: number): boolean {
+  try {
+    process.kill(-processGroupId, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }

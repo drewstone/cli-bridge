@@ -882,22 +882,75 @@ async function forwardRequest(
     if (!response.writableEnded) abortClientRequest()
   })
 
+  const contentEncoding = normalizedContentEncoding(request.headers['content-encoding'])
+  if (contentEncoding !== undefined && contentEncoding !== 'identity' && contentEncoding !== 'zstd') {
+    traffic.rejectedRequests += 1
+    request.resume()
+    writeProxyError(response, 400, 'unsupported or malformed inference content encoding')
+    return
+  }
+  const compressed = contentEncoding === 'zstd'
+  if (compressed && compressedInspectionBudget.active >= MAX_CONCURRENT_COMPRESSED_INSPECTIONS) {
+    traffic.rejectedRequests += 1
+    request.resume()
+    writeProxyError(response, 429, 'too many compressed inference requests are being inspected')
+    return
+  }
+  if (compressed) compressedInspectionBudget.active += 1
+  let compressedBudgetHeld = compressed
+  const releaseCompressedBudget = (): void => {
+    if (!compressedBudgetHeld) return
+    compressedBudgetHeld = false
+    compressedInspectionBudget.active -= 1
+  }
+
   let requestBody: Buffer
   try {
-    requestBody = await readRequestBody(request, resolved.maxRequestBytes)
+    requestBody = await readRequestBody(
+      request,
+      compressed
+        ? Math.min(resolved.maxRequestBytes, MAX_COMPRESSED_INSPECTION_BYTES)
+        : resolved.maxRequestBytes,
+    )
   } catch (error) {
+    releaseCompressedBudget()
     traffic.rejectedRequests += 1
     request.resume()
     if (error instanceof RequestTooLargeError) {
       writeProxyError(
         response,
         413,
-        `scoped inference request exceeds the configured ${resolved.maxRequestBytes}-byte maximum`,
+        compressed
+          ? `compressed inference request exceeds the ${MAX_COMPRESSED_INSPECTION_BYTES}-byte wire limit`
+          : `scoped inference request exceeds the configured ${resolved.maxRequestBytes}-byte maximum`,
       )
     } else {
       writeProxyError(response, 400, 'could not read scoped inference request')
     }
     return
+  }
+
+  let inspectionBody: Buffer
+  try {
+    inspectionBody = await inferenceInspectionBody(
+      requestBody,
+      contentEncoding,
+      resolved.maxRequestBytes,
+    )
+  } catch (error) {
+    traffic.rejectedRequests += 1
+    if (error instanceof RequestTooLargeError) {
+      writeProxyError(
+        response,
+        413,
+        `compressed inference request expands beyond the ${MAX_COMPRESSED_INSPECTION_BYTES}-byte inspection limit`,
+      )
+    } else {
+      writeProxyError(response, 400, 'unsupported or malformed inference content encoding')
+    }
+    return
+  } finally {
+    releaseCompressedBudget()
   }
 
   let upstreamApiKey: string
@@ -947,29 +1000,6 @@ async function forwardRequest(
     scopedApiKey,
     upstreamApiKey,
   )
-  let inspectionBody: Buffer
-  try {
-    inspectionBody = await inferenceInspectionBody(
-      requestBody,
-      request.headers['content-encoding'],
-      resolved.maxRequestBytes,
-      compressedInspectionBudget,
-    )
-  } catch (error) {
-    traffic.rejectedRequests += 1
-    if (error instanceof RequestTooLargeError) {
-      writeProxyError(
-        response,
-        413,
-        `compressed inference request expands beyond the ${MAX_COMPRESSED_INSPECTION_BYTES}-byte inspection limit`,
-      )
-    } else if (error instanceof CompressedInspectionBusyError) {
-      writeProxyError(response, 429, 'too many compressed inference requests are being inspected')
-    } else {
-      writeProxyError(response, 400, 'unsupported or malformed inference content encoding')
-    }
-    return
-  }
   if (!requestTargetsSelectedModel(
     resolved.apiMode,
     requestUrl.pathname,
@@ -1069,24 +1099,12 @@ async function forwardRequest(
 
 async function inferenceInspectionBody(
   body: Buffer,
-  contentEncoding: string | string[] | undefined,
+  contentEncoding: string | undefined,
   maxBytes: number,
-  budget: CompressedInspectionBudget,
 ): Promise<Buffer> {
-  const encoding = Array.isArray(contentEncoding)
-    ? contentEncoding.join(',').trim().toLowerCase()
-    : contentEncoding?.trim().toLowerCase()
-  if (encoding === undefined || encoding === '' || encoding === 'identity') return body
-  if (encoding !== 'zstd') throw new Error('unsupported inference content encoding')
-  if (budget.active >= MAX_CONCURRENT_COMPRESSED_INSPECTIONS) {
-    throw new CompressedInspectionBusyError()
-  }
-  budget.active += 1
-  try {
-    return await decompressZstd(body, Math.min(maxBytes, MAX_COMPRESSED_INSPECTION_BYTES))
-  } finally {
-    budget.active -= 1
-  }
+  if (contentEncoding === undefined || contentEncoding === 'identity') return body
+  if (contentEncoding !== 'zstd') throw new Error('unsupported inference content encoding')
+  return await decompressZstd(body, Math.min(maxBytes, MAX_COMPRESSED_INSPECTION_BYTES))
 }
 
 function decompressZstd(body: Buffer, maxOutputLength: number): Promise<Buffer> {
@@ -1105,7 +1123,12 @@ function decompressZstd(body: Buffer, maxOutputLength: number): Promise<Buffer> 
   })
 }
 
-class CompressedInspectionBusyError extends Error {}
+function normalizedContentEncoding(value: string | string[] | undefined): string | undefined {
+  const encoding = Array.isArray(value)
+    ? value.join(',').trim().toLowerCase()
+    : value?.trim().toLowerCase()
+  return encoding === '' ? undefined : encoding
+}
 
 function scopedInferenceCredential(apiMode: PiApiMode): string {
   if (apiMode !== 'openai-codex-responses') return randomBytes(32).toString('base64url')

@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   createServer,
   request as httpRequest,
@@ -562,6 +562,21 @@ describe('Pi inference credential isolation', () => {
         body: zstdCompressSync(Buffer.alloc(33 * 1024 * 1024)),
       })
       expect(expansionBomb.status).toBe(413)
+
+      const oversizedWireBody = zstdCompressSync(randomBytes(33 * 1024 * 1024))
+      expect(oversizedWireBody.length).toBeGreaterThan(32 * 1024 * 1024)
+      const oversizedWire = await fetch(`${transport.localBaseUrl}/codex/responses`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'chatgpt-account-id': scopedAccountId!,
+          'content-encoding': 'zstd',
+          'content-type': 'application/json',
+        },
+        body: oversizedWireBody,
+      })
+      expect(oversizedWire.status).toBe(413)
+      expect(await oversizedWire.text()).toContain('wire limit')
       expect(seen).toHaveLength(1)
     } finally {
       await transport?.cleanup()
@@ -936,6 +951,81 @@ describe('Pi inference credential isolation', () => {
         inFlightRequests: 0,
       })
     } finally {
+      await transport.cleanup()
+      await close(upstream)
+    }
+  })
+
+  it('bounds compressed request buffering before reading request bodies', async () => {
+    let upstreamRequests = 0
+    const upstream = createServer(async (request, response) => {
+      upstreamRequests += 1
+      await readRawBody(request)
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end('{}')
+    })
+    await listen(upstream)
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+    const transport = await provisionPiInferenceTransport(fixtureTransport({
+      upstreamBaseUrl: `http://127.0.0.1:${address.port}`,
+    }))
+    const heldRequests: ReturnType<typeof httpRequest>[] = []
+    try {
+      const localConfig = JSON.parse(readFileSync(join(transport.agentDir, 'models.json'), 'utf8')) as {
+        providers: Record<string, { apiKey: string }>
+      }
+      const scopedToken = localConfig.providers['isolated-test']!.apiKey
+      for (let index = 0; index < 2; index += 1) {
+        const request = httpRequest(`${transport.localBaseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${scopedToken}`,
+            'content-encoding': 'zstd',
+            'content-type': 'application/json',
+          },
+        })
+        request.on('error', () => {})
+        request.write(Buffer.from([0x28, 0xb5, 0x2f, 0xfd]))
+        heldRequests.push(request)
+      }
+      await waitFor(() => transport.traffic().requests === 2)
+
+      const saturated = await fetch(`${transport.localBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'content-encoding': 'zstd',
+          'content-type': 'application/json',
+        },
+        body: zstdCompressSync(Buffer.from(JSON.stringify({
+          model: 'credential-check',
+          messages: [],
+        }))),
+      })
+      expect(saturated.status).toBe(429)
+      expect(upstreamRequests).toBe(0)
+
+      for (const request of heldRequests) request.destroy()
+      await waitFor(() => transport.traffic().rejectedRequests === 3)
+
+      const recovered = await fetch(`${transport.localBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'content-encoding': 'zstd',
+          'content-type': 'application/json',
+        },
+        body: zstdCompressSync(Buffer.from(JSON.stringify({
+          model: 'credential-check',
+          messages: [],
+        }))),
+      })
+      expect(recovered.status).toBe(200)
+      expect(upstreamRequests).toBe(1)
+    } finally {
+      for (const request of heldRequests) request.destroy()
       await transport.cleanup()
       await close(upstream)
     }
