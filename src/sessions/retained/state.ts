@@ -13,7 +13,12 @@ import type { Run, RunRegistry } from '../../runs/registry.js'
 import type { RunSnapshot } from '../../runs/registry.js'
 import type { RetainedSessionRecord, RetainedSessionStatus, SessionStore } from '../store.js'
 import { recordValue } from './json-values.js'
-import { type DurableRetainedRunSnapshot, type RetainedSessionView, RetainedSessionError } from './types.js'
+import {
+  type DurableRetainedRunSnapshot,
+  type RetainedRunCoordinates,
+  type RetainedSessionView,
+  RetainedSessionError,
+} from './types.js'
 
 export class RetainedSessionState {
   /** Runs whose terminal outcome was never durably committed. */
@@ -103,10 +108,17 @@ export class RetainedSessionState {
       admission.executionId,
       admission.requestDigest,
       admission.sessionId,
+      { provider: admission.provider, environmentId: admission.environmentId },
     )
     return persisted.terminal
       ? persisted
-      : unknownRunSnapshot(admission.runId, admission.executionId, admission.requestDigest, admission.sessionId)
+      : unknownRunSnapshot(
+          admission.runId,
+          admission.executionId,
+          admission.requestDigest,
+          admission.sessionId,
+          { provider: admission.provider, environmentId: admission.environmentId },
+        )
   }
 
   /**
@@ -187,6 +199,7 @@ export function unknownRunSnapshot(
   executionId: string,
   requestDigest: string,
   sessionId: string,
+  coordinates: RetainedRunCoordinates,
 ): DurableRetainedRunSnapshot {
   return {
     id: runId,
@@ -196,6 +209,8 @@ export function unknownRunSnapshot(
     state: 'detached',
     terminal: false,
     sessionId,
+    provider: coordinates.provider,
+    environmentId: coordinates.environmentId,
   }
 }
 
@@ -205,6 +220,7 @@ export function retainedRunSnapshot(
   executionId: string,
   requestDigest: string,
   sessionId: string,
+  coordinates: RetainedRunCoordinates,
 ): DurableRetainedRunSnapshot {
   const value = recordValue(input)
   if (
@@ -213,6 +229,8 @@ export function retainedRunSnapshot(
     value.executionId !== executionId ||
     value.requestDigest !== requestDigest ||
     value.sessionId !== sessionId ||
+    (value.provider !== undefined && value.provider !== coordinates.provider) ||
+    (value.environmentId !== undefined && value.environmentId !== coordinates.environmentId) ||
     !['running', 'done', 'error', 'cancelled', 'unknown'].includes(String(value.status)) ||
     typeof value.terminal !== 'boolean'
   ) {
@@ -223,7 +241,11 @@ export function retainedRunSnapshot(
     )
   }
   if (value.status === 'unknown') {
-    return unknownRunSnapshot(runId, executionId, requestDigest, sessionId)
+    return unknownRunSnapshot(runId, executionId, requestDigest, sessionId, coordinates)
   }
-  return structuredClone(value) as unknown as RunSnapshot
+  return {
+    ...structuredClone(value),
+    provider: coordinates.provider,
+    environmentId: coordinates.environmentId,
+  } as unknown as RunSnapshot
 }

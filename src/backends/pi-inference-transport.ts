@@ -21,6 +21,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
+import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
 import { BackendError } from './types.js'
 
 const execFileAsync = promisify(execFile)
@@ -92,7 +93,7 @@ export interface ProvisionedPiInferenceTransport {
   requestScopedEndpoint?: boolean
   apiMode: PiApiMode
   /** Exact profile cap applied to this run's isolated model catalog, when requested. */
-  appliedMaxTokens?: number
+  appliedMaxTotalOutputTokens?: number
   localBaseUrl: string
   traffic(): PiInferenceTrafficSnapshot
   cleanup(): Promise<void>
@@ -261,67 +262,76 @@ const SAFE_MODEL_FIELDS = [
   'compat',
 ] as const
 
-const SUPPORTED_PROFILE_MODEL_METADATA = new Set(['maxTokens'])
-
-export interface AppliedPiModelMetadata {
+export interface AppliedPiModelHints {
   modelConfig: Record<string, unknown>
-  appliedMaxTokens?: number
+  appliedMaxTotalOutputTokens?: number
 }
 
 /**
  * Apply only model controls that Pi can prove through its isolated models.json.
  *
- * The operator catalog remains the upper bound. A profile may lower that bound
- * for one run, but the source model object is never mutated and unknown metadata
- * is refused instead of being retained as if Pi had applied it.
+ * Pi's native maxTokens includes hidden reasoning. The operator catalog remains
+ * the upper bound, and the source model object is never mutated.
  */
-export function applyPiModelMetadata(
+export function applyPiModelHints(
   modelConfig: Record<string, unknown>,
-  metadata: Record<string, unknown> | undefined,
-): AppliedPiModelMetadata {
+  modelHints: AgentProfileModelHints | undefined,
+): AppliedPiModelHints {
   const isolatedModelConfig = structuredClone(modelConfig)
-  if (metadata === undefined) return { modelConfig: isolatedModelConfig }
-  if (!isRecord(metadata) || Array.isArray(metadata)) {
+  if (modelHints === undefined) return { modelConfig: isolatedModelConfig }
+  if (!isRecord(modelHints) || Array.isArray(modelHints)) {
+    throw new BackendError(
+      'backend pi cannot apply agent_profile.model because it is not an object',
+      'parse_error',
+    )
+  }
+
+  const unsupported: string[] = []
+  if (modelHints.maxVisibleOutputTokens !== undefined) unsupported.push('maxVisibleOutputTokens')
+  if (modelHints.maxReasoningTokens !== undefined) unsupported.push('maxReasoningTokens')
+  const metadata = modelHints.metadata
+  if (metadata !== undefined && (!isRecord(metadata) || Array.isArray(metadata))) {
     throw new BackendError(
       'backend pi cannot apply agent_profile.model.metadata because it is not an object',
       'parse_error',
     )
   }
-
-  const unsupported = Object.keys(metadata).filter((key) => !SUPPORTED_PROFILE_MODEL_METADATA.has(key))
+  if (metadata !== undefined && Object.keys(metadata).length > 0) {
+    unsupported.push(...Object.keys(metadata).map(key => `metadata.${key}`))
+  }
   if (unsupported.length > 0) {
     throw new BackendError(
-      `backend pi cannot apply agent_profile.model.metadata field(s): ${unsupported.sort().join(', ')}; `
-      + 'the selected Pi model has no proven native lowering for them',
+      `backend pi cannot enforce agent_profile.model field(s): ${unsupported.sort().join(', ')}; `
+      + 'the selected Pi runner exposes only maxTotalOutputTokens as a numeric completion cap',
       'not_configured',
     )
   }
 
-  if (!Object.hasOwn(metadata, 'maxTokens')) return { modelConfig: isolatedModelConfig }
-  const requested = metadata.maxTokens
+  const requested = modelHints.maxTotalOutputTokens
+  if (requested === undefined) return { modelConfig: isolatedModelConfig }
   if (!isPositiveSafeInteger(requested)) {
     throw new BackendError(
-      'backend pi agent_profile.model.metadata.maxTokens must be a positive safe integer',
+      'backend pi agent_profile.model.maxTotalOutputTokens must be a positive safe integer',
       'parse_error',
     )
   }
   const operatorMaxTokens = isolatedModelConfig.maxTokens
   if (!isPositiveSafeInteger(operatorMaxTokens)) {
     throw new BackendError(
-      'backend pi cannot apply agent_profile.model.metadata.maxTokens because the operator model '
+      'backend pi cannot apply agent_profile.model.maxTotalOutputTokens because the operator model '
       + 'has no valid maxTokens cap to lower',
       'not_configured',
     )
   }
   if (requested > operatorMaxTokens) {
     throw new BackendError(
-      `backend pi agent_profile.model.metadata.maxTokens ${requested} exceeds the operator model cap ${operatorMaxTokens}`,
+      `backend pi agent_profile.model.maxTotalOutputTokens ${requested} exceeds the operator model cap ${operatorMaxTokens}`,
       'parse_error',
     )
   }
 
   isolatedModelConfig.maxTokens = requested
-  return { modelConfig: isolatedModelConfig, appliedMaxTokens: requested }
+  return { modelConfig: isolatedModelConfig, appliedMaxTotalOutputTokens: requested }
 }
 
 /**
@@ -579,12 +589,12 @@ export async function provisionPiInferenceTransport(
     sessionId?: string
     /** Workspace Pi can read. Persistent session storage must remain outside it. */
     projectDir?: string
-    /** Model metadata from the exact AgentProfile selected for this run. */
-    modelMetadata?: Record<string, unknown>
+    /** Model hints from the exact AgentProfile selected for this run. */
+    modelHints?: AgentProfileModelHints
   } = {},
 ): Promise<ProvisionedPiInferenceTransport> {
   assertExactModelBinding(resolved)
-  const applied = applyPiModelMetadata(resolved.modelConfig, options.modelMetadata)
+  const applied = applyPiModelHints(resolved.modelConfig, options.modelHints)
   const proxy = await startScopedProxy(resolved)
   let agentDir: string | null = null
   try {
@@ -623,9 +633,9 @@ export async function provisionPiInferenceTransport(
       providerDispatchMarker: proxy.providerDispatchMarker,
       ...(resolved.requestScopedEndpoint ? { requestScopedEndpoint: true } : {}),
       apiMode: resolved.apiMode,
-      ...(applied.appliedMaxTokens === undefined
+      ...(applied.appliedMaxTotalOutputTokens === undefined
         ? {}
-        : { appliedMaxTokens: applied.appliedMaxTokens }),
+        : { appliedMaxTotalOutputTokens: applied.appliedMaxTotalOutputTokens }),
       localBaseUrl: proxy.localBaseUrl,
       traffic: () => proxy.traffic(),
       cleanup: async () => {

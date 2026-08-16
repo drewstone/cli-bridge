@@ -89,6 +89,12 @@ export class RetainedEvents {
     }
   }
 
+  runLastSequence(runId: string): number {
+    const durable = this.store.retainedRun(runId)
+    if (durable) return durable.lastSequence
+    return this.runs.get(runId)?.snapshot().canonicalLastSeq ?? 0
+  }
+
   async *runEvents(runId: string, afterSequence: number, signal: AbortSignal): AsyncIterable<RetainedEventRecord> {
     this.assertRunCursor(runId, afterSequence)
     const control = this.runs.get(runId)

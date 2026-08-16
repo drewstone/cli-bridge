@@ -17,7 +17,7 @@ import type { NativeSession } from '../backends/types.js'
 import { RunAdmission } from './admission.js'
 import { RunIdentityConflictError, RunShutdownTimeoutError } from './errors.js'
 import { Run } from './run.js'
-import type { RunClaimOptions, RunRetention } from './types.js'
+import type { RunClaimOptions, RunOwner, RunRetention } from './types.js'
 
 export { RunAdmissionClosedError } from './admission.js'
 export { Run } from './run.js'
@@ -37,6 +37,7 @@ export type {
   RunReplayWindow,
   RunRetention,
   RunSnapshot,
+  RunOwner,
   RunState,
   RunStatus,
   SeqCanonicalEvent,
@@ -102,6 +103,16 @@ export class RunRegistry {
     return this.runs.get(id)
   }
 
+  /** Refuse a cross-protocol or request-digest collision before durable admission. */
+  assertAvailable(id: string, requestDigest: string, owner: RunOwner = 'one-shot'): void {
+    this.admission.assertOpen()
+    const existing = this.runs.get(id)
+    if (!existing) return
+    if (existing.owner !== owner || existing.requestDigest !== requestDigest) {
+      throw new RunIdentityConflictError(id, existing.requestDigest, requestDigest, existing.owner, owner)
+    }
+  }
+
   /** Refuse every later claim before shutdown snapshots owned work. */
   closeAdmission(): void {
     this.admission.close()
@@ -116,26 +127,32 @@ export class RunRegistry {
     requestDigest: string,
     options: RunClaimOptions = {},
   ): { readonly run: Run; readonly created: boolean } {
-    this.admission.assertOpen()
+    const owner = options.owner ?? 'one-shot'
+    this.assertAvailable(id, requestDigest, owner)
     const existing = this.runs.get(id)
-    if (existing) {
-      if (existing.requestDigest !== requestDigest) {
-        throw new RunIdentityConflictError(id, existing.requestDigest, requestDigest)
-      }
-      return { run: existing, created: false }
-    }
+    if (existing) return { run: existing, created: false }
     const run = new Run(
       id,
       requestDigest,
       (runId, expected) => this.forget(runId, expected),
       this.retention,
+      owner,
       options.sessionId,
       options.executionId,
+      options.provider,
+      options.environmentId,
       options.commitCanonicalEvent,
       options.onNativeControlLost,
     )
     this.runs.set(id, run)
     return { run, created: true }
+  }
+
+  /** Release a retained claim that failed before native startup. */
+  releaseClaim(id: string, run: Run): void {
+    if (this.runs.get(id) !== run) return
+    this.runs.delete(id)
+    this.retire(run)
   }
 
   /** Request cancellation once. False means unknown, terminal, or already cancelling. */

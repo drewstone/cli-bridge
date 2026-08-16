@@ -14,7 +14,7 @@ Call `GET /v1/capabilities?model=pi/<provider>/<model>` before creating a retain
 
 The bridge runs the backend health check through the real executor path.
 
-The backend must publish valid Agent Interface 0.53 capabilities.
+The backend must publish valid Agent Interface 0.54 capabilities.
 
 The bridge advertises retained sessions only when the backend proves all of these properties:
 
@@ -68,13 +68,61 @@ Session metadata does not store a second interaction policy.
 
 The existing one-shot run replay and cancel routes remain in place.
 
+## Canonical retained request fields
+
+The session creation wire shape owns `id` or `session_id`, `model`, `cwd`, `mode`, `interaction_policy`, `agent_profile`, `mcp`, `metadata`, `execution`, `env`, `context`, and `provider_options`.
+
+The retained turn wire shape owns `message` or `parts`, `turn_id`, `execution_id`, `run_id`, `provider`, `environment_id`, `interactions`, `context`, `provider_options`, `metadata`, `execution`, and `env`.
+
+The `parts` union accepts strict `text`, `file`, and `image` records with bounded `filename`, `mediaType`, `url`, `path`, and `content` fields where the part type permits them.
+
+The SDK `CliBridgeProviderOptions.defaultExecution` field maps to the retained `execution` field.
+
+The retained contract rejects the literal `defaultExecution` field because it is not a canonical Bridge field.
+
+The SDK `environmentInput.metadata`, `turn.context`, and `turn.providerOptions` values map to the canonical `metadata`, `context`, and `provider_options` fields.
+
+The legacy `/v1/chat/completions` session record persists the exact selected `model`, `agent_profile`, `execution`, `env`, `mcp`, `context`, `provider_options`, and `request_metadata` values.
+
+The selected `model` must already be the exact Bridge model coordinate such as `pi/<provider>/<model>`.
+
+The Bridge does not infer a model from an AgentProfile after restart.
+
+Unsupported retained fields fail closed instead of being silently dropped.
+
+Retained open records reject credential-bearing keys recursively, including nested metadata, context, provider options, and MCP metadata.
+
+Typed AgentProfile configuration and typed MCP environment or header values use the Agent Interface parser.
+
+Typed secret references survive durable storage and restart, while raw credential-like values fail closed.
+
+Retained request environment rejects credential-bearing names and Bridge-owned process controls before child-process injection.
+
 The retained fallback does not change the current-main behavior for a terminal unknown run.
 
 The data-directory and port lock records bind ownership to a platform process start identity as well as the pid.
 
 Linux uses `/proc`, macOS uses `ps`, and Windows uses PowerShell to read that identity.
 
+macOS currently uses `ps -o lstart=` because this package has no libproc binding or native FFI dependency.
+
+Node's standard library exposes no `proc_pidinfo` call, so this repository has no safe native path to that value.
+
+That output has one-second granularity, so every start in one half-open one-second interval has the same identity.
+
+The residual false-live case therefore requires PID reuse within that interval, which this implementation cannot distinguish.
+
+Decoding `sysctl -b kern.proc.pid.<pid>` is intentionally not used because its `kinfo_proc` bytes are not the public `proc_bsdinfo` layout.
+
 A pid-only legacy record is blocked when its process is live and reclaimed only after the liveness check proves it is dead.
+
+The released Agent Interface dependency provides `isCredentialBearingProfileConfigName` from `profile-schema` and `isRuntimeProcessControlEnvironmentName` from `profile-security`.
+
+These exports are provided by `@tangle-network/agent-interface` 0.54.0 from PR #184.
+
+Bridge pins the released Interface dependency at 0.54.0 before release.
+
+The Bridge keeps only its five Pi-owned child-process control names locally because Agent Interface does not own Pi environment injection.
 
 ## Interaction response binding
 
@@ -144,6 +192,14 @@ Docker Pi retained sessions remain unavailable because the bridge-owned loopback
 
 The bridge does not fall back to mounted provider credentials.
 
+Pi maps only `AgentProfile.model.maxTotalOutputTokens` to the native catalog `maxTokens` cap.
+
+Pi rejects `maxVisibleOutputTokens` and `maxReasoningTokens` because its selected runner cannot enforce those ceilings independently.
+
+`reasoningEffort` remains a quality control and never acts as a numeric reasoning-token limit.
+
+`AgentProfile.model.metadata` is not a Pi token authority, and `metadata.maxTokens` is rejected.
+
 ## MCP and ACP boundary
 
 The generic MCP implementation belongs to `@tangle-network/sdk-provider-cli-base`.
@@ -154,9 +210,9 @@ The bridge does not copy those classes or define replacement interaction contrac
 
 The live npm registry returned `404` for `@tangle-network/sdk-provider-cli-base` on 2026-08-15.
 
-The inspected ADC source declares Interface 0.53, while the currently published profile-materialize package declares an Interface peer range below 0.53.
+The currently published profile-materialize package 0.15.2 declares an Interface peer range below 0.54.0.
 
-This branch therefore adds no unavailable dependency and no local package link.
+The bridge uses the released Interface 0.54.0 package without a local package link.
 
 Generic MCP interaction capability stays unadvertised until ADC publishes a compatible release and the bridge composes it through the existing profile and MCP materialization path.
 

@@ -17,6 +17,7 @@ import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountRuns } from '../src/routes/runs.js'
 import { RunRegistry, type RunRegistryOptions } from '../src/runs/registry.js'
 import { SessionStore, type SessionRecord } from '../src/sessions/store.js'
+import { RETAINED_MAX_HTTP_BODY_BYTES } from '../src/sessions/retained/schema.js'
 
 const CHAT_PATH = '/v1/chat/completions'
 
@@ -497,6 +498,7 @@ describe('durable run contract', () => {
       const successor = await postChat(ctx.app, {
         ...chatBody('session-after-setup-failure'),
         session_id: sessionId,
+        execution: { kind: 'host' },
       })
       const successorText = successor.text()
       await waitFor(() => backend.calls === 1)
@@ -902,6 +904,25 @@ describe('durable run contract', () => {
       )
       expect(nonStreamingZero.status).toBe(400)
       expect(backend.calls).toBe(0)
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
+  it('bounds legacy cancellation bodies at the retained request limit', async () => {
+    const ctx = fixture(new ReplayBackend())
+    try {
+      const body = JSON.stringify({ padding: 'x'.repeat(RETAINED_MAX_HTTP_BODY_BYTES) })
+      const response = await ctx.app.request('/v1/runs/unknown/cancel', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(body)),
+        },
+        body,
+      })
+      expect(response.status).toBe(413)
+      await expect(response.json()).resolves.toMatchObject({ error: { type: 'request_too_large' } })
     } finally {
       ctx.cleanup()
     }

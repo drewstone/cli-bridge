@@ -503,6 +503,7 @@ export async function buildApp(config: Config): Promise<{
   mountChatCompletions(app, {
     registry,
     sessions,
+    retainedRuns: sessions,
     runs,
     admission,
     admissionReservedClients: config.admissionReservedClients,

@@ -77,6 +77,26 @@ describe('execution-router', () => {
     } finally { cleanup() }
   })
 
+  it('keeps the one-shot OpenAI-compatible schema permissive for standard extensions', async () => {
+    const claude = new StubBackend('claude-code')
+    const { app, cleanup } = buildApp([claude])
+    try {
+      const res = await postChat(app, {
+        model: 'claude-code/sonnet',
+        messages: [{
+          role: 'user',
+          content: [{ type: 'file', path: '/workspace/input.txt', vendor_field: 'preserve-compatible' }],
+        }],
+        response_format: { type: 'json_object', vendor_field: 'accepted' },
+        execution: { kind: 'host', vendor_field: 'accepted' },
+      })
+      expect(res.status).toBe(200)
+      expect(claude.received[0]!.req.messages[0]!.content).toEqual([
+        { type: 'file', path: '/workspace/input.txt', vendor_field: 'preserve-compatible' },
+      ])
+    } finally { cleanup() }
+  })
+
   it('execution: sandbox on a host harness delegates to SandboxBackend with mapped backend type', async () => {
     const claude = new StubBackend('claude-code')
     const sandbox = new StubBackend('sandbox')
@@ -100,6 +120,94 @@ describe('execution-router', () => {
         gitRef: 'develop',
       })
     } finally { cleanup() }
+  })
+
+  it('reapplies sandbox coordinates, public env, profile binding, metadata, and input parts after restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-router-restart-'))
+    const profile = {
+      harness: 'claude-code',
+      model: { provider: 'anthropic', default: 'sonnet' },
+      prompt: { instructions: ['persist this profile'] },
+    }
+    const firstHost = new StubBackend('claude-code')
+    const firstSandbox = new StubBackend('sandbox')
+    const firstRegistry = new BackendRegistry().register(firstHost).register(firstSandbox)
+    const firstSessions = new SessionStore(dir)
+    const firstApp = new Hono()
+    mountChatCompletions(firstApp, { registry: firstRegistry, sessions: firstSessions, runs: new RunRegistry() })
+    try {
+      const first = await postChat(firstApp, {
+        model: 'claude-code/anthropic/sonnet',
+        session_id: 'sdk-restart-session',
+        agent_profile: profile,
+        execution: {
+          kind: 'sandbox',
+          repoUrl: 'https://example.test/repo.git',
+          gitRef: 'release-1',
+        },
+        env: { BRIDGE_PUBLIC_VALUE: 'persisted' },
+        context: { session_context: 'default' },
+        provider_options: { session_option: { temperature: 0.1 } },
+        metadata: { caller_marker: 'persisted' },
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'inspect input' },
+            { type: 'file', filename: 'input.txt', path: '/workspace/input.txt' },
+            { type: 'image', filename: 'diagram.png', url: 'https://example.test/diagram.png' },
+          ],
+        }],
+      })
+      expect(first.status).toBe(200)
+      expect(firstSandbox.received[0]!.req).toMatchObject({
+        execution: { kind: 'sandbox', repoUrl: 'https://example.test/repo.git', gitRef: 'release-1' },
+        env: { BRIDGE_PUBLIC_VALUE: 'persisted' },
+        context: { session_context: 'default' },
+        providerOptions: { session_option: { temperature: 0.1 } },
+        agent_profile: profile,
+        metadata: { caller_marker: 'persisted' },
+      })
+      expect(firstSandbox.received[0]!.req.messages[0]!.content).toEqual([
+        { type: 'text', text: 'inspect input' },
+        { type: 'file', filename: 'input.txt', path: '/workspace/input.txt' },
+        { type: 'image', filename: 'diagram.png', url: 'https://example.test/diagram.png' },
+      ])
+    } finally {
+      firstSessions.close()
+    }
+
+    const secondHost = new StubBackend('claude-code')
+    const secondSandbox = new StubBackend('sandbox')
+    const secondRegistry = new BackendRegistry().register(secondHost).register(secondSandbox)
+    const secondSessions = new SessionStore(dir)
+    const secondApp = new Hono()
+    mountChatCompletions(secondApp, { registry: secondRegistry, sessions: secondSessions, runs: new RunRegistry() })
+    try {
+      const second = await postChat(secondApp, {
+        // This is the provider default a restarted SDK instance would infer.
+        // The durable session binding must select the stored exact model.
+        model: 'claude-code/sonnet',
+        session_id: 'sdk-restart-session',
+        messages: [{ role: 'user', content: 'continue' }],
+      })
+      expect(second.status).toBe(200)
+      expect(secondHost.received).toHaveLength(0)
+      expect(secondSandbox.received).toHaveLength(1)
+      expect(secondSandbox.received[0]!.req).toMatchObject({
+        model: 'claude-code/anthropic/sonnet',
+        execution: { kind: 'sandbox', repoUrl: 'https://example.test/repo.git', gitRef: 'release-1' },
+        env: { BRIDGE_PUBLIC_VALUE: 'persisted' },
+        context: { session_context: 'default' },
+        providerOptions: { session_option: { temperature: 0.1 } },
+        agent_profile: profile,
+        metadata: { caller_marker: 'persisted' },
+      })
+      expect(secondSandbox.received[0]!.req.metadata).not.toHaveProperty('session_context')
+      expect(secondSandbox.received[0]!.req.metadata).not.toHaveProperty('session_option')
+    } finally {
+      secondSessions.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('factory harness maps to factory-droids in-container type', async () => {

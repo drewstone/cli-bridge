@@ -62,6 +62,12 @@ export function contentToText(content: ChatMessageContent): string {
   if (typeof content === 'string') return content
   return content.map((part) => {
     if (part.type === 'text') return part.text
+    if (part.type === 'file') {
+      return `[File attachment: ${part.path ?? part.filename ?? part.url ?? 'file attachment'}]`
+    }
+    if (part.type === 'image' && part.image === undefined) {
+      return `[Image attachment: ${part.path ?? part.filename ?? part.url ?? imagePartMediaType(part)}]`
+    }
     return `[Image attachment: ${imagePartMediaType(part)}]`
   }).filter(Boolean).join('\n')
 }
@@ -106,7 +112,7 @@ function imagePartValue(part: ChatContentPart): string | undefined {
   if (part.type === 'image_url' || part.type === 'input_image') {
     return typeof part.image_url === 'string' ? part.image_url : part.image_url.url
   }
-  if (part.type === 'image') return part.image
+  if (part.type === 'image') return part.image ?? part.url
   return undefined
 }
 

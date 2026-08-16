@@ -19,6 +19,7 @@ import {
 import {
   agentRunCancellationRequestDigest,
   canonicalCandidateDigest,
+  defineAgentProfileSecretRef,
   type InteractionBinding,
   type InteractionAcknowledgement,
   type InteractionRequest,
@@ -37,6 +38,7 @@ import {
   RETAINED_MAX_HTTP_BODY_BYTES,
   RETAINED_MAX_TEXT_LENGTH,
 } from '../src/sessions/retained/schema.js'
+import { parseSafePublicRecord } from '../src/sessions/retained/contract.js'
 
 const capabilities: AgentEnvironmentCapabilities = {
   profile: {
@@ -552,6 +554,7 @@ class UnverifiedNative extends FakeNative {
 class FakeNativeBackend implements NativeSessionBackend {
   readonly nativeModes = ['byob'] as const
   readonly natives: FakeNative[] = []
+  readonly requests: ChatRequest[] = []
   constructor(
     private readonly makeNative: () => FakeNative = () => new FakeNative(),
     readonly name = 'pi',
@@ -571,6 +574,7 @@ class FakeNativeBackend implements NativeSessionBackend {
       files: [],
       unsupported: [],
     }
+    this.requests.push(structuredClone(req))
     const native = this.makeNative()
     this.natives.push(native)
     return native
@@ -699,7 +703,7 @@ function setup(
   const app = new Hono()
   mountRetainedSessions(app, service, { includeRunEvents: false })
   mountRuns(app, { runs, retainedRuns: service })
-  mountChatCompletions(app, { registry: registry as never, sessions: store, runs })
+  mountChatCompletions(app, { registry: registry as never, sessions: store, retainedRuns: store, runs })
   return {
     app,
     service,
@@ -1130,6 +1134,120 @@ describe('retained Agent Interface sessions', () => {
     expect(await json(changedEnvironment)).toMatchObject({ error: { type: 'run_identity_conflict' } })
   })
 
+  it('shares run ownership across protocols without leaving a replayable collision admission', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    const oneShotRunId = 'cross-protocol-one-shot-first'
+    const oneShot = await fixture.app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'pi/test',
+        messages: [{ role: 'user', content: 'one-shot first' }],
+        run_id: oneShotRunId,
+        stream: true,
+      }),
+    })
+    expect(oneShot.status).toBe(200)
+    await oneShot.text()
+
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'cross-protocol-retained-second', model: 'pi/test' }),
+    })
+    const retainedCollision = await fixture.app.request('/v1/sessions/cross-protocol-retained-second/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: 'retained collision',
+        run_id: oneShotRunId,
+        execution_id: 'cross-protocol-retained-second-execution',
+      }),
+    })
+    expect(retainedCollision.status).toBe(409)
+    expect(await json(retainedCollision)).toMatchObject({ error: { type: 'run_identity_conflict' } })
+    expect(fixture.store.getRetainedRun(oneShotRunId)).toBeNull()
+
+    const replayedCollision = await fixture.app.request('/v1/sessions/cross-protocol-retained-second/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: 'retained collision',
+        run_id: oneShotRunId,
+        execution_id: 'cross-protocol-retained-second-execution',
+      }),
+    })
+    expect(replayedCollision.status).toBe(409)
+    expect(await json(replayedCollision)).toMatchObject({ error: { type: 'run_identity_conflict' } })
+    expect(backend.natives).toHaveLength(0)
+
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'cross-protocol-retained-first', model: 'pi/test' }),
+    })
+    const retainedFirst = await fixture.app.request('/v1/sessions/cross-protocol-retained-first/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: 'retained first',
+        run_id: 'cross-protocol-retained-first-run',
+        execution_id: 'cross-protocol-retained-first-execution',
+      }),
+    })
+    expect(retainedFirst.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('cross-protocol-retained-first')?.turns === 1)
+
+    const oneShotCollision = await fixture.app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'pi/test',
+        messages: [{ role: 'user', content: 'one-shot collision' }],
+        run_id: 'cross-protocol-retained-first-run',
+        stream: true,
+      }),
+    })
+    expect(oneShotCollision.status).toBe(409)
+    expect(await json(oneShotCollision)).toMatchObject({ error: { type: 'run_identity_conflict' } })
+    expect(fixture.store.getRetainedRun('cross-protocol-retained-first-run')).not.toBeNull()
+  })
+
+  it('publishes retained run coordinates in live and durable run snapshots', async () => {
+    fixture = setup(new FakeNativeBackend())
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'public-run-coordinates', model: 'pi/test' }),
+    })
+    const turn = await fixture.app.request('/v1/sessions/public-run-coordinates/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: 'coordinates',
+        run_id: 'public-run-coordinates-run',
+        execution_id: 'public-run-coordinates-execution',
+        provider: 'provider-exact',
+        environment_id: 'environment-exact',
+      }),
+    })
+    expect(turn.status).toBe(202)
+    const turnBody = await json(turn)
+    expect(turnBody.run).toMatchObject({ provider: 'provider-exact', environmentId: 'environment-exact' })
+    await waitFor(() => fixture!.store.getRetained('public-run-coordinates')?.turns === 1)
+
+    const live = await fixture.app.request('/v1/runs/public-run-coordinates-run')
+    expect(live.status).toBe(200)
+    expect(await json(live)).toMatchObject({
+      id: 'public-run-coordinates-run',
+      provider: 'provider-exact',
+      environmentId: 'environment-exact',
+    })
+
+    fixture.runs.clear()
+    const durable = await fixture.app.request('/v1/runs/public-run-coordinates-run')
+    expect(durable.status).toBe(200)
+    expect(await json(durable)).toMatchObject({
+      id: 'public-run-coordinates-run',
+      provider: 'provider-exact',
+      environmentId: 'environment-exact',
+    })
+  })
+
   it('uses persisted non-default coordinates for steer and cancel after admission', async () => {
     const native = new HangingNative()
     fixture = setup(new FakeNativeBackend(() => native))
@@ -1400,25 +1518,110 @@ describe('retained Agent Interface sessions', () => {
     }
   })
 
-  it('rejects turn fields and attachments the native text channel cannot preserve', async () => {
-    fixture = setup(new FakeNativeBackend())
+  it('preserves canonical context and structured attachments instead of stripping them', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
     await fixture.app.request('/v1/sessions', {
       method: 'POST',
       body: JSON.stringify({ id: 'strict-turn', model: 'pi/test' }),
     })
-    for (const body of [
-      { message: 'model override', model: 'pi/other', run_id: 'strict-model' },
-      { message: 'context', context: { trace: true }, run_id: 'strict-context' },
-      { parts: [{ type: 'image', url: 'https://example.test/image.png' }], run_id: 'strict-image' },
-      { parts: [{ type: 'file', content: 'secret bytes' }], run_id: 'strict-file' },
-    ]) {
-      const response = await fixture.app.request('/v1/sessions/strict-turn/turns', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
-      expect(response.status).toBe(400)
-    }
-    expect(fixture.store.getRetained('strict-turn')?.runId).toBeNull()
+    const unsupported = await fixture.app.request('/v1/sessions/strict-turn/turns', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'model override', model: 'pi/other', run_id: 'strict-model' }),
+    })
+    expect(unsupported.status).toBe(400)
+
+    const response = await fixture.app.request('/v1/sessions/strict-turn/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        parts: [
+          { type: 'text', text: 'context' },
+          { type: 'image', url: 'https://example.test/image.png' },
+          { type: 'file', content: 'public bytes', filename: 'notes.txt' },
+        ],
+        context: { trace: true },
+        provider_options: { temperature: 0.1 },
+        run_id: 'strict-context',
+      }),
+    })
+    expect(response.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('strict-turn')?.turns === 1)
+    expect(backend.requests[0]?.messages[0]?.content).toEqual([
+      { type: 'text', text: 'context' },
+      { type: 'image', url: 'https://example.test/image.png' },
+      { type: 'file', content: 'public bytes', filename: 'notes.txt' },
+    ])
+    expect(backend.requests[0]?.metadata).toBeUndefined()
+    expect(backend.requests[0]?.context).toEqual({ trace: true })
+    expect(backend.requests[0]?.providerOptions).toEqual({ temperature: 0.1 })
+  })
+
+  it('keeps retained metadata, context, and provider options separate with deterministic precedence and digesting', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    const created = await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: 'separate-request-channels',
+        model: 'pi/test',
+        metadata: { collision: 'session-metadata', metadataOnly: true },
+        context: { collision: 'session-context', contextOnly: true },
+        provider_options: { collision: 'session-provider', providerOnly: true },
+      }),
+    })
+    expect(created.status).toBe(201)
+
+    const first = await fixture.app.request('/v1/sessions/separate-request-channels/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: 'channel one',
+        run_id: 'separate-request-channels-one',
+        execution_id: 'separate-request-channels-execution-one',
+        metadata: { collision: 'turn-metadata', turnMetadataOnly: true },
+        context: { collision: 'turn-context', turnContextOnly: true },
+        provider_options: { collision: 'turn-provider', turnProviderOnly: true },
+      }),
+    })
+    expect(first.status).toBe(202)
+    const firstBody = await json(first)
+    await waitFor(() => fixture!.store.getRetained('separate-request-channels')?.turns === 1)
+    expect(backend.requests[0]).toMatchObject({
+      metadata: {
+        collision: 'turn-metadata',
+        metadataOnly: true,
+        turnMetadataOnly: true,
+      },
+      context: {
+        collision: 'turn-context',
+        contextOnly: true,
+        turnContextOnly: true,
+      },
+      providerOptions: {
+        collision: 'turn-provider',
+        providerOnly: true,
+        turnProviderOnly: true,
+      },
+    })
+    expect(backend.requests[0]?.metadata).not.toHaveProperty('contextOnly')
+    expect(backend.requests[0]?.metadata).not.toHaveProperty('providerOnly')
+    expect(backend.requests[0]?.context).not.toHaveProperty('metadataOnly')
+    expect(backend.requests[0]?.providerOptions).not.toHaveProperty('metadataOnly')
+
+    const second = await fixture.app.request('/v1/sessions/separate-request-channels/turns', {
+      method: 'POST',
+      body: JSON.stringify({
+        message: 'channel two',
+        run_id: 'separate-request-channels-two',
+        execution_id: 'separate-request-channels-execution-two',
+        metadata: { collision: 'turn-metadata', turnMetadataOnly: true },
+        context: { collision: 'changed-context', turnContextOnly: true },
+        provider_options: { collision: 'turn-provider', turnProviderOnly: true },
+      }),
+    })
+    expect(second.status).toBe(202)
+    const secondBody = await json(second)
+    expect(secondBody.run.requestDigest).not.toBe(firstBody.run.requestDigest)
+    await waitFor(() => fixture!.store.getRetained('separate-request-channels')?.turns === 2)
   })
 
   it('rejects oversized retained schema values and HTTP bodies before provider work', async () => {
@@ -1584,8 +1787,7 @@ describe('retained Agent Interface sessions', () => {
       atomicBoundary: true,
       requestIdempotency: true,
     })
-    expect(fixture.store.getRetained('s1')?.metadata.agent_profile).toBeUndefined()
-    expect(fixture.store.getRetained('s1')?.metadata.retained_input_presence).toEqual({ agent_profile: true })
+    expect(fixture.store.getRetained('s1')?.metadata.agent_profile).toEqual(profile)
     const listed = await fixture.app.request('/v1/sessions')
     expect(listed.status).toBe(200)
     expect((await json(listed)).data.map((item: { id: string }) => item.id)).toContain('s1')
@@ -1617,6 +1819,116 @@ describe('retained Agent Interface sessions', () => {
     const replayEnvelopes = [...replayText.matchAll(/data: (\{.*\})\r?\n/gu)].map(match => JSON.parse(match[1]!))
     expect(replayEnvelopes.every(item => item.cursor > firstCursor)).toBe(true)
     expect(new Set(replayEnvelopes.map(item => item.eventId)).size).toBe(replayEnvelopes.length)
+  })
+
+  it('reapplies the exact retained profile and execution contract after restart', async () => {
+    const original = setup(new FakeNativeBackend())
+    fixture = original
+    const profile = {
+      harness: 'pi',
+      model: { provider: 'isolated-test', default: 'restart-model' },
+      prompt: { instructions: ['retain this profile'] },
+    }
+    const created = await original.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: 'restart-contract',
+        model: 'pi/isolated-test/restart-model',
+        agent_profile: profile,
+        execution: { kind: 'host', timeoutMs: 777 },
+        env: { BRIDGE_PUBLIC_VALUE: 'retained' },
+        context: { session_context: 'default' },
+        provider_options: { session_option: { temperature: 0.1 } },
+        metadata: { caller_marker: 'durable' },
+      }),
+    })
+    expect(created.status).toBe(201)
+    expect(original.store.getRetained('restart-contract')).toMatchObject({
+      model: 'pi/isolated-test/restart-model',
+      metadata: {
+        agent_profile: profile,
+        execution: { kind: 'host', timeoutMs: 777 },
+        env: { BRIDGE_PUBLIC_VALUE: 'retained' },
+        context: { session_context: 'default' },
+        provider_options: { session_option: { temperature: 0.1 } },
+        caller_marker: 'durable',
+      },
+    })
+
+    const dir = original.dir
+    await original.runs.shutdown(1_000)
+    await original.service.shutdown(1_000)
+    original.unwatch()
+    original.store.close()
+    const restartedBackend = new FakeNativeBackend()
+    fixture = setup(restartedBackend, dir)
+
+    const first = await fixture.app.request('/v1/sessions/restart-contract/turns', {
+      method: 'POST',
+      body: turnBody('restart-interaction', { message: 'ask' }),
+    })
+    expect(first.status).toBe(202)
+    await waitFor(() => fixture!.store.retainedEventsAfter('restart-contract').some(item => item.envelope.event.type === 'interaction'))
+    expect(restartedBackend.requests[0]).toMatchObject({
+      model: 'pi/isolated-test/restart-model',
+      execution: { kind: 'host', timeoutMs: 777 },
+      env: { BRIDGE_PUBLIC_VALUE: 'retained' },
+      metadata: { caller_marker: 'durable' },
+      context: { session_context: 'default' },
+      providerOptions: { session_option: { temperature: 0.1 } },
+      agent_profile: profile,
+    })
+    expect(restartedBackend.requests[0]?.metadata).not.toHaveProperty('session_context')
+    expect(restartedBackend.requests[0]?.metadata).not.toHaveProperty('session_option')
+    const interaction = fixture.store.retainedEventsAfter('restart-contract').find(item => item.envelope.event.type === 'interaction')!.envelope.event
+    if (interaction.type !== 'interaction') throw new Error('restart interaction missing')
+    const runId = interaction.request.binding.runId
+    const response = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(interactionCommand('restart-answer', interaction.request, {
+        id: interaction.request.id,
+        outcome: 'accepted',
+        data: { grant: ['allow_once'] },
+      })),
+    })
+    expect(response.status).toBe(200)
+    await waitFor(() => fixture!.store.getRetained('restart-contract')?.turns === 1)
+
+    const second = await fixture.app.request('/v1/sessions/restart-contract/turns', {
+      method: 'POST',
+      body: turnBody('restart-parts', {
+        parts: [
+          { type: 'text', text: 'read these' },
+          { type: 'file', filename: 'README.md', path: '/workspace/README.md' },
+          { type: 'image', filename: 'diagram.png', url: 'https://example.test/diagram.png' },
+        ],
+      }),
+    })
+    expect(second.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('restart-contract')?.turns === 2)
+    expect(restartedBackend.natives[0]?.prompts[1]).toContain('[File: /workspace/README.md]')
+    expect(restartedBackend.natives[0]?.prompts[1]).toContain('[Image: diagram.png]')
+  })
+
+  it('rejects retained sandbox coordinates before native Pi can start', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    const response = await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: 'retained-sandbox',
+        model: 'pi',
+        execution: {
+          kind: 'sandbox',
+          repoUrl: 'https://example.test/repo.git',
+          gitRef: 'main',
+        },
+      }),
+    })
+    expect(response.status).toBe(501)
+    expect(await json(response)).toMatchObject({ error: { type: 'capability_denied' } })
+    expect(backend.natives).toHaveLength(0)
+    expect(fixture.store.getRetained('retained-sandbox')).toBeNull()
   })
 
   it('marks an idle retained session unknown when its native child exits', async () => {
@@ -3376,6 +3688,152 @@ describe('retained Agent Interface sessions', () => {
     expect(backend.natives[0]!.responseCalls).toBe(0)
   })
 
+  it('preserves typed profile secret references across restart without storing credential material', async () => {
+    const original = setup(new FakeNativeBackend())
+    fixture = original
+    const secretRef = defineAgentProfileSecretRef('provider-credential', 'bearer')
+    const profile = {
+      harness: 'pi',
+      prompt: { instructions: ['The harmless API_KEY=abc example is documentation, not credential material.'] },
+      mcp: {
+        local: {
+          command: 'echo',
+          env: { FOO_TOKEN: secretRef },
+        },
+        remote: {
+          transport: 'http',
+          url: 'https://example.test/mcp',
+          headers: { Authorization: secretRef },
+        },
+      },
+    }
+    const created = await original.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'secret-ref-profile', model: 'pi/test', agent_profile: profile }),
+    })
+    expect(created.status).toBe(201)
+    const stored = original.store.getRetained('secret-ref-profile')?.metadata.agent_profile
+    expect(stored).toEqual(profile)
+    expect(JSON.stringify(stored)).toContain('"kind":"secret-ref"')
+    expect(JSON.stringify(stored)).not.toContain('super-secret')
+
+    const dir = original.dir
+    await original.runs.shutdown(1_000)
+    await original.service.shutdown(1_000)
+    original.unwatch()
+    original.store.close()
+    fixture = setup(new FakeNativeBackend(), dir)
+
+    const restored = fixture.store.getRetained('secret-ref-profile')?.metadata.agent_profile
+    expect(restored).toEqual(profile)
+    expect(JSON.stringify(restored)).toContain('"kind":"secret-ref"')
+    expect(JSON.stringify(restored)).not.toContain('super-secret')
+  })
+
+  it('preserves typed retained MCP secret references through restart without generic key rejection', async () => {
+    const original = setup(new FakeNativeBackend())
+    fixture = original
+    const secretRef = defineAgentProfileSecretRef('mcp-runtime-credential', 'bearer')
+    const mcp = {
+      mcpServers: {
+        remote: {
+          type: 'http',
+          url: 'https://example.test/mcp',
+          headers: { Authorization: secretRef },
+        },
+      },
+    }
+    const created = await original.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'secret-ref-mcp', model: 'pi/test', mcp }),
+    })
+    expect(created.status).toBe(201)
+
+    const dir = original.dir
+    await original.runs.shutdown(1_000)
+    await original.service.shutdown(1_000)
+    original.unwatch()
+    original.store.close()
+    const restartedBackend = new FakeNativeBackend()
+    fixture = setup(restartedBackend, dir)
+
+    const turn = await fixture.app.request('/v1/sessions/secret-ref-mcp/turns', {
+      method: 'POST',
+      body: turnBody('secret-ref-mcp-turn', { message: 'use the retained MCP config' }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('secret-ref-mcp')?.turns === 1)
+    expect(restartedBackend.requests[0]?.mcp).toEqual(mcp)
+    expect(JSON.stringify(restartedBackend.requests[0]?.mcp)).toContain('mcp-runtime-credential')
+    expect(JSON.stringify(restartedBackend.requests[0]?.mcp)).not.toContain('super-secret')
+  })
+
+  it('rejects raw credential keys in open Agent Profile surfaces', async () => {
+    fixture = setup(new FakeNativeBackend())
+    const unsafeProfiles: unknown[] = [
+      { metadata: { apiKey: 'abc' } },
+      { model: { metadata: { apiKey: 'abc' } } },
+      { subagents: { helper: { metadata: { apiKey: 'abc' } } } },
+      { modes: { review: { metadata: { apiKey: 'abc' } } } },
+      {
+        mcp: {
+          remote: {
+            transport: 'http',
+            url: 'https://example.test/mcp',
+            metadata: { Authorization: 'abc' },
+          },
+        },
+      },
+      {
+        mcp: {
+          local: {
+            command: 'echo',
+            env: { API_KEY: { kind: 'public', value: 'abc' } },
+          },
+        },
+      },
+      {
+        mcp: {
+          local: {
+            command: 'echo',
+            env: { FOO_TOKEN: 'abc' },
+          },
+        },
+      },
+      {
+        mcp: {
+          remote: {
+            transport: 'http',
+            url: 'https://example.test/mcp',
+            headers: { Authorization: { kind: 'public', value: 'Bearer abc' } },
+          },
+        },
+      },
+      {
+        mcp: {
+          remote: {
+            transport: 'http',
+            url: 'https://example.test/mcp',
+            headers: { Authorization: 'Bearer abc' },
+          },
+        },
+      },
+      { metadata: { note: 'Bearer abc' } },
+      { extensions: { provider: { note: 'token=abc' } } },
+      { extensions: { provider: { apiKey: 'abc' } } },
+    ]
+
+    for (const [index, agentProfile] of unsafeProfiles.entries()) {
+      const id = `unsafe-profile-open-${index}`
+      const response = await fixture.app.request('/v1/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ id, model: 'pi/test', agent_profile: agentProfile }),
+      })
+      expect(response.status).toBe(400)
+      expect(fixture.store.getRetained(id)).toBeNull()
+    }
+  })
+
   it('reports restart loss as unknown and denies non-native one-shot backends', async () => {
     const backend = new FakeNativeBackend(() => new HangingNative())
     fixture = setup(backend)
@@ -3420,6 +3878,12 @@ describe('retained Agent Interface sessions', () => {
       { mcp: { mcpServers: { secret: { command: 'cat' } } } },
       { credentials: { token: 'raw' } },
       { api_key: 'raw' },
+      { apiKey: 'abc' },
+      { nested: { apiKey: 'abc' } },
+      { nested: { Authorization: 'abc' } },
+      { context: { apiKey: 'abc' } },
+      { provider_options: { token: 'abc' } },
+      { mcp: { mcpServers: { server: { headers: { Authorization: 'abc' } } } } },
       { label: 'Bearer should-not-persist' },
       { label: 'token=raw-secret' },
     ]
@@ -3431,6 +3895,33 @@ describe('retained Agent Interface sessions', () => {
       expect(response.status).toBe(400)
       expect(fixture.store.getRetained(`unsafe-${index}`)).toBeNull()
     }
+    for (const [label, value] of [
+      ['context', { trace: { apiKey: 'abc' } }],
+      ['provider_options', { nested: { token: 'abc' } }],
+      ['mcp', { mcpServers: { server: { headers: { Authorization: 'abc' } } } }],
+    ] as const) {
+      expect(() => parseSafePublicRecord(value, `retained ${label}`)).toThrow()
+    }
+    const unsafeDurableFields = [
+      ['context', { trace: { apiKey: 'abc' } }],
+      ['provider_options', { nested: { token: 'abc' } }],
+      ['mcp', { mcpServers: { server: { headers: { Authorization: 'abc' } } } }],
+    ] as const
+    for (const [index, [field, value]] of unsafeDurableFields.entries()) {
+      const response = await fixture.app.request('/v1/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ id: `unsafe-durable-${index}`, model: 'pi/test', [field]: value }),
+      })
+      expect(response.status).toBe(400)
+      expect(fixture.store.getRetained(`unsafe-durable-${index}`)).toBeNull()
+    }
+    const legacy = fixture.store.remember({
+      externalId: 'legacy-unsafe-env',
+      backend: 'pi',
+      model: 'pi/test',
+      metadata: { env: { API_KEY: 'abc', PATH: '/tmp/attacker' } },
+    })
+    expect(legacy.metadata.env).toBeUndefined()
   })
 
   it('labels retained synthetic events with the actual backend identity', async () => {
@@ -3727,6 +4218,7 @@ describe('retained Agent Interface sessions', () => {
     expect(events.length).toBeGreaterThan(0)
     expect(events.every(event => event.runId === runId)).toBe(true)
     expect(events.map(event => event.sequence)).toEqual([...events].map(event => event.sequence).sort((a, b) => a - b))
+    expect(response.headers.get('x-last-event-id')).toBe(String(Math.max(...events.map(event => event.sequence))))
     const replay = await fixture.app.request(`/v1/runs/${runId}/events`, { headers: { 'Last-Event-ID': String(events[0].sequence) } })
     expect(replay.status).toBe(200)
     const replayBody = await replay.text()

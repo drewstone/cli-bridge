@@ -9,7 +9,7 @@ import type { NativeSession, ChatRequest } from './types.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import {
-  assertPiMaxTokensRequest,
+  assertPiOutputTokenRequest,
   buildCanonicalMcpServers,
   materializeMcpServersForPi,
   profileExecutionIdentity,
@@ -117,7 +117,7 @@ export async function startPiNativeSession(
   }
 
   const profile = resolveAgentProfile(req, session)
-  assertPiMaxTokensRequest(req, profile)
+  assertPiOutputTokenRequest(req, profile)
   const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
   const thinking = thinkingFlagForEffort(requestedReasoningEffort ?? undefined)
   const executionIdentity = profileExecutionIdentity(req, session, 'pi', thinking)
@@ -174,7 +174,7 @@ export async function startPiNativeSession(
     inference = await provisionPiInferenceTransport(resolvedInference, {
       sessionId: req.session_id,
       ...(runCwd ? { projectDir: runCwd } : {}),
-      ...(profile?.model?.metadata === undefined ? {} : { modelMetadata: profile.model.metadata }),
+      ...(profile?.model === undefined ? {} : { modelHints: profile.model }),
     })
     if (req.jailSpec) {
       req.jailSpec.extraWritablePaths = [
@@ -210,7 +210,9 @@ export async function startPiNativeSession(
           : inference.upstreamBaseUrl,
         apiMode: inference.apiMode,
         transport: 'scoped-loopback',
-        ...(inference.appliedMaxTokens === undefined ? {} : { appliedMaxTokens: inference.appliedMaxTokens }),
+        ...(inference.appliedMaxTotalOutputTokens === undefined
+          ? {}
+          : { appliedMaxTotalOutputTokens: inference.appliedMaxTotalOutputTokens }),
       },
     )
     if (provisioned) args.push(...provisioned.flags)
@@ -219,14 +221,15 @@ export async function startPiNativeSession(
       signal,
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: runCwd,
-      env: piToolProcessEnvironment(process.env, {
+      env: {
+        ...piToolProcessEnvironment(process.env, req.env ?? {}),
         PI_CODING_AGENT_DIR: inference.agentDir,
         ...traceContextToChildEnv(req.childTrace),
         ...(provisioned?.env ?? {}),
         ...(requestedMcpNames.length > 0
           ? { MCP_DIRECT_TOOLS: piDirectToolSelection(requestedMcpNames, process.env.MCP_DIRECT_TOOLS) }
           : {}),
-      }),
+      },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
     })

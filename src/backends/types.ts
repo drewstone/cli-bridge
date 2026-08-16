@@ -40,8 +40,24 @@ export interface ProtectedModelCredential {
 
 export type ChatContentPart =
   | { type: 'text'; text: string }
+  | {
+      type: 'file'
+      filename?: string
+      mediaType?: string
+      url?: string
+      path?: string
+      content?: string
+    }
+  | {
+      type: 'image'
+      image?: string
+      filename?: string
+      mediaType?: string
+      mimeType?: string
+      url?: string
+      path?: string
+    }
   | { type: 'image_url' | 'input_image'; image_url: string | { url: string } }
-  | { type: 'image'; image: string; mediaType?: string; mimeType?: string }
 
 export type ChatMessageContent = string | ChatContentPart[] | null
 
@@ -125,7 +141,7 @@ export interface ProfileMaterializationReceipt {
     /** Authentication stayed in a request-scoped loopback forwarder. */
     transport: 'scoped-loopback'
     /** Exact completion-token cap lowered from the AgentProfile into this run's model catalog. */
-    appliedMaxTokens?: number
+    appliedMaxTotalOutputTokens?: number
     /** Filled after Pi exits; absent while materialization is still in progress. */
     observation?: {
       requests: number
@@ -222,6 +238,12 @@ export interface ChatRequest {
   mcp?: McpRequestConfig
   /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */
   cwd?: string
+  /** Public, non-secret environment entries requested for this execution. */
+  env?: Record<string, string>
+  /** Canonical portable context defaults and per-turn overrides. */
+  context?: Record<string, unknown>
+  /** Canonical provider options preserved across retained-session restart. */
+  providerOptions?: Record<string, unknown>
   /**
    * Where the harness runs. Default `{ kind: 'host' }`. When
    * `{ kind: 'sandbox', repoUrl, ... }` cli-bridge provisions a Tangle
@@ -239,7 +261,7 @@ export interface ChatRequest {
          * on. `root` is clamped inside the request cwd. Resolved to a
          * {@link JailSpec} on `jailSpec` by the chat route.
          */
-        jail?: { mode?: 'off' | 'write-jail'; root?: string }
+        jail?: { mode?: 'off' | 'write-jail' | 'fs-jail'; root?: string }
         netJail?: NetJailRequest
         /** Caller-owned process deadline. Omit to allow the operator fallback, if configured. */
         timeoutMs?: number

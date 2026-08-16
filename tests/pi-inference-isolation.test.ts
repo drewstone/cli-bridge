@@ -25,7 +25,7 @@ import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
 import { PiBackend, piToolProcessEnvironment } from '../src/backends/pi.js'
 import {
-  applyPiModelMetadata,
+  applyPiModelHints,
   createPiInferenceTransportResolver,
   ensurePiSessionFile,
   provisionPiInferenceTransport,
@@ -39,6 +39,7 @@ import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { Spawner } from '../src/executors/types.js'
 import { scopedHostSpawner } from '../src/executors/scoped-host.js'
 import type { SessionRecord } from '../src/sessions/store.js'
+import { parseSafeRetainedEnv } from '../src/sessions/retained/contract.js'
 
 const tempDirs: string[] = []
 
@@ -192,7 +193,7 @@ describe('Pi inference credential isolation', () => {
       .toBe('data: {"model":"deepseek-v4-flash"}\n')
   })
 
-  it('lowers only the isolated model copy and refuses unprovable profile metadata', () => {
+  it('lowers only the isolated model copy from the total output cap', () => {
     const operatorModel = {
       id: 'credential-check',
       api: 'openai-completions',
@@ -200,26 +201,30 @@ describe('Pi inference credential isolation', () => {
       compat: { maxTokensField: 'max_completion_tokens' },
     }
 
-    const applied = applyPiModelMetadata(operatorModel, { maxTokens: 64_000 })
+    const applied = applyPiModelHints(operatorModel, { maxTotalOutputTokens: 64_000 })
     expect(applied).toEqual({
       modelConfig: {
         ...operatorModel,
         maxTokens: 64_000,
       },
-      appliedMaxTokens: 64_000,
+      appliedMaxTotalOutputTokens: 64_000,
     })
     expect(operatorModel.maxTokens).toBe(128_000)
 
-    expect(applyPiModelMetadata(operatorModel, undefined)).toEqual({
+    expect(applyPiModelHints(operatorModel, undefined)).toEqual({
       modelConfig: operatorModel,
     })
-    expect(() => applyPiModelMetadata(operatorModel, { maxTokens: 0 }))
+    expect(() => applyPiModelHints(operatorModel, { maxTotalOutputTokens: 0 }))
       .toThrow(/positive safe integer/u)
-    expect(() => applyPiModelMetadata(operatorModel, { maxTokens: 128_001 }))
+    expect(() => applyPiModelHints(operatorModel, { maxTotalOutputTokens: 128_001 }))
       .toThrow(/exceeds the operator model cap 128000/u)
-    expect(() => applyPiModelMetadata(operatorModel, { maxTokens: 64_000, temperature: 0 }))
-      .toThrow(/no proven native lowering/u)
-    expect(() => applyPiModelMetadata({ ...operatorModel, maxTokens: undefined }, { maxTokens: 64_000 }))
+    expect(() => applyPiModelHints(operatorModel, { maxVisibleOutputTokens: 64_000 }))
+      .toThrow(/maxVisibleOutputTokens/u)
+    expect(() => applyPiModelHints(operatorModel, { maxReasoningTokens: 64_000 }))
+      .toThrow(/maxReasoningTokens/u)
+    expect(() => applyPiModelHints(operatorModel, { metadata: { maxTokens: 64_000 } }))
+      .toThrow(/metadata\.maxTokens/u)
+    expect(() => applyPiModelHints({ ...operatorModel, maxTokens: undefined }, { maxTotalOutputTokens: 64_000 }))
       .toThrow(/no valid maxTokens cap/u)
   })
 
@@ -230,10 +235,7 @@ describe('Pi inference credential isolation', () => {
       ...SENTINELS,
       DEEPSEEK_API_KEY: 'daemon-deepseek-sentinel-113',
       FUTURE_PROVIDER_SECRET: 'daemon-future-sentinel-113',
-    }, {
-      PI_CODING_AGENT_DIR: '/tmp/request-pi',
-      PI_CODING_AGENT_SESSION_DIR: '/tmp/request-pi-sessions',
-    })
+    }, { BRIDGE_PUBLIC_VALUE: 'request-owned' })
 
     const output = execFileSync('/bin/bash', [
       '-lc',
@@ -248,7 +250,26 @@ describe('Pi inference credential isolation', () => {
     for (const value of ['daemon-deepseek-sentinel-113', 'daemon-future-sentinel-113']) {
       expect(output).not.toContain(value)
     }
-    expect(childEnv.PI_CODING_AGENT_DIR).toBe('/tmp/request-pi')
+    expect(childEnv.BRIDGE_PUBLIC_VALUE).toBe('request-owned')
+  })
+
+  it('rejects short credential names and process controls at persistence and child injection', () => {
+    for (const name of [
+      'API_KEY',
+      'apiKey',
+      'ACCESS_TOKEN',
+      'PATH',
+      'HOME',
+      'NODE_OPTIONS',
+      'LD_PRELOAD',
+      'HTTPS_PROXY',
+      'NODE_TLS_REJECT_UNAUTHORIZED',
+      'PI_CODING_AGENT_DIR',
+    ]) {
+      expect(() => parseSafeRetainedEnv({ [name]: 'abc' })).toThrow()
+      expect(() => piToolProcessEnvironment({}, { [name]: 'abc' })).toThrow()
+    }
+    expect(parseSafeRetainedEnv({ BRIDGE_PUBLIC_VALUE: 'abc' })).toEqual({ BRIDGE_PUBLIC_VALUE: 'abc' })
   })
 
   it('uses a request credential override without invoking pi auth, while preserving the old no-header path', async () => {
@@ -1235,7 +1256,7 @@ describe('Pi inference credential isolation', () => {
             model: {
               provider: 'isolated-test',
               default: 'credential-check',
-              metadata: { maxTokens: 64_000 },
+              maxTotalOutputTokens: 64_000,
             },
             extensions: { pi: { load: [] } },
           },
@@ -1248,7 +1269,7 @@ describe('Pi inference credential isolation', () => {
         expect(observedBodies[0]).not.toMatchObject({ max_completion_tokens: 128_000 })
         expect(readFileSync(join(sourceAgentDir, 'models.json'), 'utf8')).toBe(sourceModelsText)
         expect(completedProfileReceipt(deltas)?.inference).toMatchObject({
-          appliedMaxTokens: 64_000,
+          appliedMaxTotalOutputTokens: 64_000,
           observation: { accountingMatched: true },
         })
       } finally {

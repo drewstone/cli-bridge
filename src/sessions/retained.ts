@@ -17,12 +17,10 @@ import { boundedProbe, resolveHealthProbeTimeoutMs } from '../backends/health.js
 import {
   type RetainedSessionRecord,
   type RetainedSessionStatus,
-  parseSafeRetainedMetadata,
   SessionIdentityConflictError,
   type SessionStore,
 } from './store.js'
 import { readyNativeBackend } from './retained/capabilities.js'
-import { describeInputMaterial, inputPresenceMetadata, RetainedInputMaterialStore } from './retained/input-material.js'
 import { RetainedSessionState } from './retained/state.js'
 import {
   parseCancel,
@@ -32,6 +30,13 @@ import {
   type RetainedCreateInput,
   type RetainedTurnInput,
 } from './retained/schema.js'
+import {
+  parseSafeCallerMetadata,
+  parseSafeRetainedMcp,
+  parseSafeRetainedEnv,
+  parseSafePublicRecord,
+  snapshotRetainedAgentProfile,
+} from './retained/contract.js'
 import { RetainedControl } from './retained/control.js'
 import { RetainedEvents } from './retained/events.js'
 import { RetainedInteractions } from './retained/interactions.js'
@@ -55,7 +60,6 @@ export class RetainedSessionService {
   private readonly runs: RetainedSessionServiceOptions['runs']
   private readonly healthProbeTimeoutMs: number
   private readonly state: RetainedSessionState
-  private readonly inputMaterial: RetainedInputMaterialStore
   private readonly turns: RetainedTurnRunner
   private readonly control: RetainedControl
   private readonly events: RetainedEvents
@@ -80,7 +84,6 @@ export class RetainedSessionService {
     }
 
     this.state = new RetainedSessionState(this.store, this.runs)
-    this.inputMaterial = new RetainedInputMaterialStore()
     this.interactions = new RetainedInteractions(this.store, this.runs)
     this.turns = new RetainedTurnRunner({
       store: this.store,
@@ -88,7 +91,6 @@ export class RetainedSessionService {
       runs: this.runs,
       state: this.state,
       lanes: new TurnLanes(maxDepth, timeoutMs),
-      inputMaterial: this.inputMaterial,
       isClosing: (id) => this.closures.has(id),
       denyUnrequestedInteraction: (input) => this.interactions.denyUnrequestedInteraction(input),
     })
@@ -134,9 +136,37 @@ export class RetainedSessionService {
         'invalid_request_error',
       )
     }
+    if (input.execution?.kind === 'sandbox') {
+      throw new RetainedSessionError(
+        'retained native sessions cannot execute in a sandbox; use /v1/chat/completions for sandbox execution',
+        501,
+        'capability_denied',
+      )
+    }
+    let profile: ReturnType<typeof snapshotRetainedAgentProfile> | null = null
+    let env: Record<string, string> | undefined
+    let mcp: Record<string, unknown> | undefined
+    let context: Record<string, unknown> | undefined
+    let providerOptions: Record<string, unknown> | undefined
+    try {
+      profile = input.agent_profile === undefined ? null : snapshotRetainedAgentProfile(input.agent_profile)
+      env = input.env === undefined ? undefined : parseSafeRetainedEnv(input.env)
+      mcp = input.mcp === undefined ? undefined : parseSafeRetainedMcp(input.mcp)
+      context = input.context === undefined ? undefined : parseSafePublicRecord(input.context, 'retained context')
+      providerOptions = input.provider_options === undefined
+        ? undefined
+        : parseSafePublicRecord(input.provider_options, 'retained provider options')
+    } catch (error) {
+      throw new RetainedSessionError(
+        error instanceof Error ? error.message : String(error),
+        400,
+        'invalid_request_error',
+      )
+    }
+    const selectedModel = input.model
     const { backend, capabilities } = await readyNativeBackend({
       registry: this.registry,
-      model: input.model,
+      model: selectedModel,
       healthProbeTimeoutMs: this.healthProbeTimeoutMs,
       signal,
     })
@@ -157,10 +187,9 @@ export class RetainedSessionService {
     }
 
     const id = input.id ?? input.session_id!
-    const material = describeInputMaterial(input)
     let callerMetadata: Record<string, unknown>
     try {
-      callerMetadata = parseSafeRetainedMetadata(input.metadata)
+      callerMetadata = parseSafeCallerMetadata(input.metadata)
     } catch (error) {
       throw new RetainedSessionError(
         error instanceof Error ? error.message : String(error),
@@ -170,8 +199,13 @@ export class RetainedSessionService {
     }
     const metadata: Record<string, unknown> = {
       ...callerMetadata,
-      ...inputPresenceMetadata(material),
       mode,
+      ...(input.execution ? { execution: input.execution } : {}),
+      ...(env ? { env } : {}),
+      ...(mcp ? { mcp } : {}),
+      ...(context ? { context } : {}),
+      ...(providerOptions ? { provider_options: providerOptions } : {}),
+      ...(profile ? { agent_profile: profile } : {}),
     }
     let created: RetainedSessionRecord
     try {
@@ -179,10 +213,14 @@ export class RetainedSessionService {
         id,
         createRequestDigest: canonicalCandidateDigest({
           ...input,
+          model: selectedModel,
+          ...(profile ? { agent_profile: profile } : {}),
+          ...(env ? { env } : {}),
+          ...(mcp ? { mcp } : {}),
           interaction_policy: 'interactive',
         }),
         backend: backend.name,
-        model: input.model,
+        model: selectedModel,
         cwd: input.cwd ?? null,
         metadata,
         capabilities,
@@ -198,7 +236,6 @@ export class RetainedSessionService {
       }
       throw error
     }
-    this.inputMaterial.record(id, material)
     return this.state.view(created)
   }
 
@@ -287,7 +324,6 @@ export class RetainedSessionService {
         }
       }
       if (this.state.require(id).status !== 'closed') this.store.updateRetained(id, { status: 'closed' })
-      this.inputMaterial.forget(id)
       return this.get(id)
     } finally {
       this.closures.delete(id)
@@ -324,6 +360,10 @@ export class RetainedSessionService {
 
   runSnapshot(runId: string): DurableRetainedRunSnapshot | null {
     return this.state.runSnapshot(runId)
+  }
+
+  runLastSequence(runId: string): number {
+    return this.events.runLastSequence(runId)
   }
 
   respond(
