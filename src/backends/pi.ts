@@ -71,7 +71,6 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { traceContextToChildEnv } from '../trace/ids.js'
-import { parseSafeRetainedEnv } from '../sessions/retained/contract.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import {
@@ -84,6 +83,7 @@ import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { addUsage, type CollectedUsage } from '../usage.js'
+import { piToolProcessEnvironment } from './pi-process-environment.js'
 import {
   createPiInferenceTransportResolver,
   ensurePiSessionFile,
@@ -93,6 +93,7 @@ import {
   type PiInferenceTransportResolver,
   type ProvisionedPiInferenceTransport,
 } from './pi-inference-transport.js'
+export { piToolProcessEnvironment } from './pi-process-environment.js'
 import { piNativeCapabilities, startPiNativeSession } from './pi-native-start.js'
 
 export interface PiBackendOptions {
@@ -347,60 +348,6 @@ export function resolvePiMcpAdapterInstallPath(): string | null {
     // unreadable/absent settings — fall through to "not detected"
   }
   return null
-}
-
-const PI_INHERITED_ENV_KEYS = [
-  'HOME',
-  'PATH',
-  'SHELL',
-  'TMPDIR',
-  'TEMP',
-  'TMP',
-  'USER',
-  'LOGNAME',
-  'LANG',
-  'LC_ALL',
-  'PWD',
-  'DBUS_SESSION_BUS_ADDRESS',
-  'XDG_CONFIG_HOME',
-  'XDG_CACHE_HOME',
-  'XDG_DATA_HOME',
-  'XDG_RUNTIME_DIR',
-  'NVM_DIR',
-  'PNPM_HOME',
-  'NODE_PATH',
-  'TERM',
-  'COLORTERM',
-  'NO_COLOR',
-  'FORCE_COLOR',
-  'PI_PACKAGE_DIR',
-  'PI_OFFLINE',
-  'PI_TELEMETRY',
-] as const
-
-/**
- * Build Pi's environment from a neutral allowlist plus request-owned values.
- * Starting from `process.env` and deleting known keys is deliberately forbidden:
- * the next provider alias would recreate the credential leak.
- */
-export function piToolProcessEnvironment(
-  inherited: NodeJS.ProcessEnv,
-  requestValues: Record<string, string | undefined>,
-): NodeJS.ProcessEnv {
-  const child: NodeJS.ProcessEnv = {}
-  for (const key of PI_INHERITED_ENV_KEYS) {
-    const value = inherited[key]
-    if (typeof value === 'string' && value.length > 0) child[key] = value
-  }
-  const safeRequestValues = parseSafeRetainedEnv(
-    Object.fromEntries(
-      Object.entries(requestValues).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-    ),
-  )
-  for (const [key, value] of Object.entries(safeRequestValues)) {
-    child[key] = value
-  }
-  return child
 }
 
 export class PiBackend implements NativeSessionBackend {
