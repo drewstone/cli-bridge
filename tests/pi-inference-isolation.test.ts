@@ -21,9 +21,10 @@ import {
 import { homedir, tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { Readable } from 'node:stream'
-import { gzipSync } from 'node:zlib'
+import { gzipSync, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
 import { PiBackend, piToolProcessEnvironment } from '../src/backends/pi.js'
+import { resolvePiAuthCredential } from '../src/backends/pi-auth-credential.js'
 import {
   applyPiModelHints,
   createPiInferenceTransportResolver,
@@ -325,6 +326,244 @@ describe('Pi inference credential isolation', () => {
     const operatorResolved = await resolver(selection, signal)
     expect(operatorResolved.upstreamApiKey).toBe(operatorToken)
     expect(readFileSync(marker, 'utf8')).toBe('invoked')
+  })
+
+  it('reads built-in model metadata from Pi and uses subscription bearer auth', async () => {
+    const sourceAgentDir = tempDir('cli-bridge-pi-built-in-catalog-')
+    const sourceSessionDir = tempDir('cli-bridge-pi-built-in-sessions-')
+    const marker = join(tempDir('cli-bridge-pi-built-in-marker-'), 'calls')
+    const fakePi = join(tempDir('cli-bridge-pi-built-in-bin-'), 'pi')
+    writeFileSync(fakePi, [
+      '#!/bin/sh',
+      'set -eu',
+      'if [ "$1" = "--mode" ]; then',
+      '  test -z "${SENTINEL_PROVIDER_TOKEN:-}"',
+      '  trap "" TERM',
+      `  printf '%s\n%s\n' "$$" "$*" > ${JSON.stringify(marker)}`,
+      '  IFS= read -r request',
+      '  test "$request" = \'{"type":"get_state"}\'',
+      '  printf \'%s\\n\' \'{"type":"response","command":"get_state","success":true,"data":{"model":{"id":"gpt-5.6-luna","name":"GPT-5.6 Luna","api":"openai-codex-responses","provider":"openai-codex","baseUrl":"https://chatgpt.com/backend-api","reasoning":true,"input":["text","image"],"contextWindow":272000,"maxTokens":128000}}}\'',
+      '  while :; do sleep 1; done',
+      'fi',
+      'test "$1" = auth',
+      'test "$2" = print-bearer-token',
+      'test "$3" = --provider',
+      'test "$4" = openai-codex',
+      'test "$5" = --model',
+      'test "$6" = gpt-5.6-luna',
+      'test "$7" = --min-expiry',
+      'test "$8" = 5m',
+      'printf subscription-bearer-token',
+    ].join('\n'))
+    chmodSync(fakePi, 0o700)
+
+    const resolver = createPiInferenceTransportResolver({
+      bin: fakePi,
+      agentDir: sourceAgentDir,
+      sessionDir: sourceSessionDir,
+      env: {
+        HOME: tempDir('cli-bridge-pi-built-in-home-'),
+        PATH: process.env.PATH,
+        SENTINEL_PROVIDER_TOKEN: 'must-not-reach-catalog-rpc',
+      },
+    })
+    const resolved = await resolver(
+      { provider: 'openai-codex', model: 'gpt-5.6-luna' },
+      new AbortController().signal,
+    )
+
+    expect(resolved).toMatchObject({
+      provider: 'openai-codex',
+      model: 'gpt-5.6-luna',
+      upstreamBaseUrl: 'https://chatgpt.com/backend-api',
+      apiMode: 'openai-codex-responses',
+      upstreamApiKey: 'subscription-bearer-token',
+      modelConfig: {
+        id: 'gpt-5.6-luna',
+        api: 'openai-codex-responses',
+        contextWindow: 272_000,
+        maxTokens: 128_000,
+      },
+    })
+    expect(resolved.resolveUpstreamApiKey).toBeTypeOf('function')
+    const catalogMarker = readFileSync(marker, 'utf8')
+    const catalogPid = Number(catalogMarker.split('\n')[0])
+    expect(catalogMarker).toContain('--no-extensions')
+    expect(catalogMarker).toContain('--no-context-files')
+    expect(catalogMarker).toContain('--offline')
+    expect(() => process.kill(catalogPid, 0)).toThrow()
+  })
+
+  it('does not combine dynamic model metadata with custom provider auth controls', async () => {
+    const sourceAgentDir = tempDir('cli-bridge-pi-custom-auth-catalog-')
+    const marker = join(tempDir('cli-bridge-pi-custom-auth-marker-'), 'invoked')
+    const fakePi = join(tempDir('cli-bridge-pi-custom-auth-bin-'), 'pi')
+    writeFileSync(fakePi, [
+      '#!/bin/sh',
+      `printf invoked > ${JSON.stringify(marker)}`,
+      'exit 1',
+    ].join('\n'))
+    chmodSync(fakePi, 0o700)
+    writeFileSync(join(sourceAgentDir, 'models.json'), JSON.stringify({
+      providers: {
+        custom: {
+          baseUrl: 'https://custom.example.invalid/v1',
+          api: 'openai-completions',
+          authHeader: true,
+          compat: { maxTokensField: 'max_completion_tokens' },
+          models: [{ id: 'another-model', maxTokens: 1024 }],
+        },
+      },
+    }))
+
+    const resolver = createPiInferenceTransportResolver({
+      bin: fakePi,
+      agentDir: sourceAgentDir,
+      sessionDir: tempDir('cli-bridge-pi-custom-auth-sessions-'),
+      env: { HOME: tempDir('cli-bridge-pi-custom-auth-home-'), PATH: process.env.PATH },
+    })
+
+    await expect(resolver(
+      { provider: 'custom', model: 'missing-model' },
+      new AbortController().signal,
+    )).rejects.toThrow(/refuses to combine dynamic model metadata with custom provider auth controls/u)
+    expect(existsSync(marker)).toBe(false)
+  })
+
+  it('keeps one bearer refresh alive when one concurrent request disconnects', async () => {
+    const marker = join(tempDir('cli-bridge-pi-auth-refresh-marker-'), 'calls')
+    const fakePi = join(tempDir('cli-bridge-pi-auth-refresh-bin-'), 'pi')
+    const expiredToken = testJwt('refresh-account', Math.floor(Date.now() / 1_000) + 1)
+    writeFileSync(fakePi, [
+      '#!/bin/sh',
+      'set -eu',
+      `printf 'call\\n' >> ${JSON.stringify(marker)}`,
+      'sleep 0.1',
+      `printf %s ${JSON.stringify(expiredToken)}`,
+    ].join('\n'))
+    chmodSync(fakePi, 0o700)
+
+    const credential = await resolvePiAuthCredential({
+      bin: fakePi,
+      provider: 'openai-codex',
+      model: 'gpt-5.6-luna',
+      apiMode: 'openai-codex-responses',
+      env: { HOME: tempDir('cli-bridge-pi-auth-refresh-home-'), PATH: process.env.PATH },
+      signal: new AbortController().signal,
+    })
+    const firstController = new AbortController()
+    const secondController = new AbortController()
+    const first = credential.resolve(firstController.signal)
+    const second = credential.resolve(secondController.signal)
+    firstController.abort()
+
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(second).resolves.toBe(expiredToken)
+    expect(readFileSync(marker, 'utf8').trim().split('\n')).toHaveLength(2)
+  })
+
+  it('keeps Codex bearer identity outside Pi while accepting its compressed request', async () => {
+    const realAccountId = 'real-account-123'
+    const realToken = testJwt(realAccountId)
+    const seen: Array<{ authorization: string; accountId: string; model: string }> = []
+    const upstream = createServer(async (request, response) => {
+      const compressed = await readRawBody(request)
+      const parsed = JSON.parse(zstdDecompressSync(compressed).toString('utf8')) as { model: string }
+      seen.push({
+        authorization: request.headers.authorization ?? '',
+        accountId: String(request.headers['chatgpt-account-id'] ?? ''),
+        model: parsed.model,
+      })
+      response.writeHead(200, {
+        'content-type': 'application/json',
+        'x-account-reflection': realAccountId,
+      })
+      response.end(JSON.stringify({ token: realToken, accountId: realAccountId }))
+    })
+    await listen(upstream)
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('fake Codex upstream did not listen')
+
+    let transport: Awaited<ReturnType<typeof provisionPiInferenceTransport>> | null = null
+    try {
+      transport = await provisionPiInferenceTransport(fixtureTransport({
+        provider: 'openai-codex',
+        model: 'gpt-5.6-luna',
+        upstreamBaseUrl: `http://127.0.0.1:${address.port}/backend-api`,
+        apiMode: 'openai-codex-responses',
+        upstreamApiKey: realToken,
+        providerConfig: { api: 'openai-codex-responses' },
+        modelConfig: {
+          id: 'gpt-5.6-luna',
+          api: 'openai-codex-responses',
+          contextWindow: 272_000,
+          maxTokens: 128_000,
+        },
+      }))
+      const isolated = JSON.parse(readFileSync(join(transport.agentDir, 'models.json'), 'utf8')) as {
+        providers: Record<string, { apiKey: string }>
+      }
+      const scopedToken = isolated.providers['openai-codex']?.apiKey
+      expect(scopedToken).toBeTruthy()
+      expect(scopedToken).not.toBe(realToken)
+      const scopedAccountId = jwtAccountId(scopedToken!)
+      expect(scopedAccountId).toMatch(/^scoped-/u)
+
+      const requestBody = zstdCompressSync(Buffer.from(JSON.stringify({
+        model: 'gpt-5.6-luna',
+        input: [],
+      })))
+      const response = await fetch(`${transport.localBaseUrl}/codex/responses`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'chatgpt-account-id': scopedAccountId!,
+          'content-encoding': 'zstd',
+          'content-type': 'application/json',
+        },
+        body: requestBody,
+      })
+
+      expect(response.status).toBe(200)
+      expect(seen).toEqual([{
+        authorization: `Bearer ${realToken}`,
+        accountId: realAccountId,
+        model: 'gpt-5.6-luna',
+      }])
+      expect(response.headers.get('x-account-reflection')).toBe(scopedAccountId)
+      expect(await response.json()).toEqual({ token: scopedToken, accountId: scopedAccountId })
+
+      const wrongModel = await fetch(`${transport.localBaseUrl}/codex/responses`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'chatgpt-account-id': scopedAccountId!,
+          'content-encoding': 'zstd',
+          'content-type': 'application/json',
+        },
+        body: zstdCompressSync(Buffer.from(JSON.stringify({
+          model: 'gpt-5.6-luna-other',
+          input: [],
+        }))),
+      })
+      expect(wrongModel.status).toBe(403)
+
+      const expansionBomb = await fetch(`${transport.localBaseUrl}/codex/responses`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'chatgpt-account-id': scopedAccountId!,
+          'content-encoding': 'zstd',
+          'content-type': 'application/json',
+        },
+        body: zstdCompressSync(Buffer.alloc(33 * 1024 * 1024)),
+      })
+      expect(expansionBomb.status).toBe(413)
+      expect(seen).toHaveLength(1)
+    } finally {
+      await transport?.cleanup()
+      await close(upstream)
+    }
   })
 
   it('rejects a request credential whose identity digest does not match its token', async () => {
@@ -743,6 +982,60 @@ describe('Pi inference credential isolation', () => {
         auxiliaryRequests: 0,
         rejectedRequests: 1,
         failedRequests: 0,
+        inFlightRequests: 0,
+      })
+    } finally {
+      await transport.cleanup()
+      await close(upstream)
+    }
+  })
+
+  it('cancels upstream inference when the client disconnects after sending its full body', async () => {
+    let upstreamStarted = false
+    let upstreamCancelled = false
+    const upstream = createServer(async (request, response) => {
+      await readBody(request)
+      upstreamStarted = true
+      response.once('close', () => {
+        if (!response.writableEnded) upstreamCancelled = true
+      })
+    })
+    await listen(upstream)
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+    const transport = await provisionPiInferenceTransport(fixtureTransport({
+      upstreamBaseUrl: `http://127.0.0.1:${address.port}`,
+    }))
+    try {
+      const localConfig = JSON.parse(readFileSync(join(transport.agentDir, 'models.json'), 'utf8')) as {
+        providers: Record<string, { apiKey: string }>
+      }
+      const scopedToken = localConfig.providers['isolated-test']!.apiKey
+      const body = JSON.stringify({ model: 'credential-check', messages: [] })
+      const request = httpRequest(`${transport.localBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${scopedToken}`,
+          'content-length': Buffer.byteLength(body),
+          'content-type': 'application/json',
+        },
+      })
+      const requestClosed = new Promise<void>((resolvePromise) => {
+        request.once('error', () => resolvePromise())
+        request.once('close', () => resolvePromise())
+      })
+      request.end(body)
+      await waitFor(() => upstreamStarted)
+      request.destroy()
+      await requestClosed
+      await waitFor(() => upstreamCancelled)
+      await waitFor(() => transport.traffic().inFlightRequests === 0)
+
+      expect(transport.traffic()).toMatchObject({
+        requests: 1,
+        generationRequests: 1,
+        failedRequests: 1,
         inFlightRequests: 0,
       })
     } finally {
@@ -2232,9 +2525,39 @@ function sendChunk(response: ServerResponse, value: unknown): void {
 }
 
 async function readBody(request: IncomingMessage): Promise<string> {
+  return (await readRawBody(request)).toString('utf8')
+}
+
+async function readRawBody(request: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = []
   for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-  return Buffer.concat(chunks).toString('utf8')
+  return Buffer.concat(chunks)
+}
+
+function testJwt(
+  accountId: string,
+  expiresAtSeconds = Math.floor(Date.now() / 1_000) + 60 * 60,
+): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url')
+  const payload = Buffer.from(JSON.stringify({
+    exp: expiresAtSeconds,
+    'https://api.openai.com/auth': { chatgpt_account_id: accountId },
+  })).toString('base64url')
+  return `${header}.${payload}.test-signature`
+}
+
+function jwtAccountId(token: string): string | null {
+  try {
+    const payload = token.split('.')[1]
+    if (!payload) return null
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
+      'https://api.openai.com/auth'?: { chatgpt_account_id?: unknown }
+    }
+    const accountId = parsed['https://api.openai.com/auth']?.chatgpt_account_id
+    return typeof accountId === 'string' ? accountId : null
+  } catch {
+    return null
+  }
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {

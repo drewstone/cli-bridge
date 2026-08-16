@@ -118,7 +118,7 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
     }
     expect(viewBody.context_boundary?.boundary?.kind).toBe('revision')
     expect(viewBody.profile_materialization_receipt).toMatchObject({
-      schema: 'cli-bridge.profile-materialization.v1',
+      schema: 'cli-bridge.profile-materialization.v2',
       harness: 'pi',
     })
 

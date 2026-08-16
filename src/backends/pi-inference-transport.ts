@@ -1,11 +1,10 @@
-import { execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { promisify } from 'node:util'
+import { zstdDecompress } from 'node:zlib'
 import {
   chmodSync,
   closeSync,
@@ -22,9 +21,9 @@ import {
   writeFileSync,
 } from 'node:fs'
 import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
+import { resolvePiAuthCredential } from './pi-auth-credential.js'
+import { readPiSelectedModel, type PiCatalogModel } from './pi-catalog-rpc.js'
 import { BackendError } from './types.js'
-
-const execFileAsync = promisify(execFile)
 
 export const PI_API_MODES = [
   'anthropic-messages',
@@ -43,6 +42,8 @@ export type PiApiMode = typeof PI_API_MODES[number]
 /** High enough for large image/tool contexts; operators can raise it explicitly. */
 export const DEFAULT_PI_INFERENCE_MAX_REQUEST_BYTES = 256 * 1024 * 1024
 const MAX_PROTECTED_CREDENTIAL_LENGTH = 16 * 1024
+const MAX_COMPRESSED_INSPECTION_BYTES = 32 * 1024 * 1024
+const MAX_CONCURRENT_COMPRESSED_INSPECTIONS = 2
 
 export interface PiInferenceSelection {
   provider: string
@@ -66,6 +67,8 @@ export interface ResolvedPiInferenceTransport {
   upstreamBaseUrl: string
   apiMode: PiApiMode
   upstreamApiKey: string
+  /** Refresh an expiring subscription credential without exposing refresh auth to Pi. */
+  resolveUpstreamApiKey?: (signal: AbortSignal) => Promise<string>
   /** True when the endpoint came from a protected request header. */
   requestScopedEndpoint?: boolean
   /** Finite per-request memory boundary for the model-binding JSON inspection. */
@@ -361,6 +364,13 @@ export function createPiInferenceTransportResolver(options: {
 
   return async (selection, signal, credential) => {
     const config = readConfiguredTransport(sourceAgentDir, selection)
+      ?? await readCatalogTransport({
+        bin: options.bin,
+        sourceAgentDir,
+        selection,
+        env: trustedEnv,
+        signal,
+      })
     if (credential !== undefined) {
       const expectedDigest = `sha256:${createHash('sha256').update(credential.token).digest('hex')}` as const
       const expectedBaseUrlDigest = `sha256:${createHash('sha256').update(credential.baseUrl).digest('hex')}` as const
@@ -387,43 +397,30 @@ export function createPiInferenceTransportResolver(options: {
         sourceSessionDir,
       }
     }
-    let stdout: string
+    let resolvedCredential: Awaited<ReturnType<typeof resolvePiAuthCredential>>
     try {
-      const result = await execFileAsync(
-        options.bin,
-        [
-          'auth',
-          'print-api-key',
-          '--provider', selection.provider,
-          '--model', selection.model,
-        ],
-        {
-          env: trustedEnv,
-          encoding: 'utf8',
-          signal,
-          maxBuffer: 1024 * 1024,
-        },
-      )
-      stdout = result.stdout
+      resolvedCredential = await resolvePiAuthCredential({
+        bin: options.bin,
+        provider: selection.provider,
+        model: selection.model,
+        apiMode: config.apiMode,
+        env: trustedEnv,
+        signal,
+      })
     } catch (error) {
       throw new BackendError(
         `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model}`,
         'not_configured',
-      )
-    }
-
-    const upstreamApiKey = stdout.trim()
-    if (!upstreamApiKey || /[\r\n\0]/u.test(upstreamApiKey)) {
-      throw new BackendError(
-        `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model}: `
-        + 'pi auth returned no single-line credential',
-        'not_configured',
+        error,
       )
     }
 
     return {
       ...config,
-      upstreamApiKey,
+      upstreamApiKey: resolvedCredential.token,
+      ...(resolvedCredential.refreshable
+        ? { resolveUpstreamApiKey: resolvedCredential.resolve }
+        : {}),
       maxRequestBytes,
       sourceAgentDir,
       sourceSessionDir,
@@ -464,28 +461,31 @@ function readConfiguredTransport(
   selection: PiInferenceSelection,
 ): Omit<
   ResolvedPiInferenceTransport,
-  'upstreamApiKey' | 'maxRequestBytes' | 'sourceAgentDir' | 'sourceSessionDir'
-> {
+  | 'upstreamApiKey'
+  | 'resolveUpstreamApiKey'
+  | 'maxRequestBytes'
+  | 'sourceAgentDir'
+  | 'sourceSessionDir'
+> | null {
   const modelsPath = join(sourceAgentDir, 'models.json')
   let parsed: ModelsFile
   try {
     parsed = JSON.parse(readFileSync(modelsPath, 'utf8')) as ModelsFile
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw new BackendError(
-      `backend pi requires ${modelsPath} to pin the selected provider endpoint and API mode before spawn`,
+      `backend pi cannot read ${modelsPath} before isolated inference starts`,
       'not_configured',
       error,
     )
   }
 
   const rawProvider = parsed.providers?.[selection.provider]
-  if (!isRecord(rawProvider)) {
-    throw new BackendError(
-      `backend pi provider ${selection.provider} has no explicit entry in ${modelsPath}; `
-      + 'define its baseUrl, api, and model there so isolated forwarding cannot guess',
-      'not_configured',
-    )
-  }
+  if (rawProvider === undefined) return null
+  if (!isRecord(rawProvider)) throw new BackendError(
+    `backend pi provider ${selection.provider} has malformed configuration in ${modelsPath}`,
+    'not_configured',
+  )
   const provider = rawProvider as ProviderRecord
   if (isRecord(provider.headers) && Object.keys(provider.headers).length > 0) {
     throw new BackendError(
@@ -499,13 +499,17 @@ function readConfiguredTransport(
   const rawModel = rawModels.find((candidate) =>
     isRecord(candidate) && candidate.id === selection.model,
   )
-  if (!isRecord(rawModel)) {
+  if (rawModel === undefined) {
     throw new BackendError(
       `backend pi model ${selection.provider}/${selection.model} has no explicit entry in ${modelsPath}; `
-      + 'the bridge refuses to infer model controls from a different catalog',
+      + 'the bridge refuses to combine dynamic model metadata with custom provider auth controls',
       'not_configured',
     )
   }
+  if (!isRecord(rawModel)) throw new BackendError(
+    `backend pi model ${selection.provider}/${selection.model} has malformed configuration in ${modelsPath}`,
+    'not_configured',
+  )
   if (isRecord(rawModel.headers) && Object.keys(rawModel.headers).length > 0) {
     throw new BackendError(
       `backend pi model ${selection.provider}/${selection.model} uses custom request headers that `
@@ -551,6 +555,75 @@ function readConfiguredTransport(
     upstreamBaseUrl,
     apiMode: api as PiApiMode,
     providerConfig,
+    modelConfig,
+  }
+}
+
+async function readCatalogTransport(options: {
+  bin: string
+  sourceAgentDir: string
+  selection: PiInferenceSelection
+  env: NodeJS.ProcessEnv
+  signal: AbortSignal
+}): Promise<Omit<
+  ResolvedPiInferenceTransport,
+  | 'upstreamApiKey'
+  | 'resolveUpstreamApiKey'
+  | 'maxRequestBytes'
+  | 'sourceAgentDir'
+  | 'sourceSessionDir'
+>> {
+  let model: PiCatalogModel
+  try {
+    model = await readPiSelectedModel({
+      bin: options.bin,
+      provider: options.selection.provider,
+      model: options.selection.model,
+      agentDir: options.sourceAgentDir,
+      env: options.env,
+      signal: options.signal,
+    })
+  } catch (error) {
+    throw new BackendError(
+      `backend pi cannot read canonical model metadata for ${options.selection.provider}/${options.selection.model}`,
+      'not_configured',
+      error,
+    )
+  }
+  if (model.provider !== options.selection.provider || model.id !== options.selection.model) {
+    throw new BackendError(
+      `backend pi returned model metadata for ${model.provider}/${model.id} instead of `
+      + `${options.selection.provider}/${options.selection.model}`,
+      'not_configured',
+    )
+  }
+  if (isRecord(model.headers) && Object.keys(model.headers).length > 0) {
+    throw new BackendError(
+      `backend pi model ${model.provider}/${model.id} uses custom request headers that `
+      + 'pi auth cannot resolve for the trusted forwarding process',
+      'not_configured',
+    )
+  }
+  const api = model.api.trim()
+  if (!(PI_API_MODES as readonly string[]).includes(api)) {
+    throw new BackendError(
+      `backend pi provider ${model.provider}/${model.id} has unsupported or missing api mode "${api}"`,
+      'not_configured',
+    )
+  }
+  const modelConfig: Record<string, unknown> = {}
+  for (const field of SAFE_MODEL_FIELDS) {
+    if (model[field] !== undefined) modelConfig[field] = structuredClone(model[field])
+  }
+  modelConfig.id = options.selection.model
+  modelConfig.api = api
+
+  return {
+    provider: options.selection.provider,
+    model: options.selection.model,
+    upstreamBaseUrl: validateUpstreamBaseUrl(model.baseUrl.trim(), options.selection),
+    apiMode: api as PiApiMode,
+    providerConfig: { api },
     modelConfig,
   }
 }
@@ -660,6 +733,10 @@ interface ScopedProxy {
   close(): Promise<void>
 }
 
+interface CompressedInspectionBudget {
+  active: number
+}
+
 const PROVIDER_DISPATCH_MARKER_PREFIX = ' __tangle_provider_dispatch_not_started__:'
 
 function providerDispatchMarkerText(marker: string): string {
@@ -711,7 +788,7 @@ export function stripProviderDispatchMarker(message: string, marker: string | un
 }
 
 async function startScopedProxy(resolved: ResolvedPiInferenceTransport): Promise<ScopedProxy> {
-  const scopedApiKey = randomBytes(32).toString('base64url')
+  const scopedApiKey = scopedInferenceCredential(resolved.apiMode)
   const providerDispatchMarker = randomBytes(24).toString('base64url')
   const traffic: PiInferenceTrafficSnapshot = {
     requests: 0,
@@ -721,9 +798,18 @@ async function startScopedProxy(resolved: ResolvedPiInferenceTransport): Promise
     failedRequests: 0,
     inFlightRequests: 0,
   }
+  const compressedInspectionBudget: CompressedInspectionBudget = { active: 0 }
   const server = createServer((request, response) => {
     traffic.requests += 1
-    void forwardRequest(request, response, resolved, scopedApiKey, providerDispatchMarker, traffic)
+    void forwardRequest(
+      request,
+      response,
+      resolved,
+      scopedApiKey,
+      providerDispatchMarker,
+      traffic,
+      compressedInspectionBudget,
+    )
   })
   server.on('clientError', (_error, socket) => socket.destroy())
 
@@ -756,6 +842,7 @@ async function forwardRequest(
   scopedApiKey: string,
   providerDispatchMarker: string,
   traffic: PiInferenceTrafficSnapshot,
+  compressedInspectionBudget: CompressedInspectionBudget,
 ): Promise<void> {
   if (!request.socket.remoteAddress || !isLoopbackAddress(request.socket.remoteAddress)) {
     traffic.rejectedRequests += 1
@@ -764,32 +851,20 @@ async function forwardRequest(
   }
 
   const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
-  const headers = new Headers()
   let authenticated = requestUrl.search.includes(scopedApiKey)
   for (const [name, raw] of Object.entries(request.headers)) {
     if (raw === undefined || isHopByHopHeader(name) || name.toLowerCase() === 'accept-encoding') continue
     const values = Array.isArray(raw) ? raw : [raw]
     for (const value of values) {
       if (value.includes(scopedApiKey)) authenticated = true
-      headers.append(name, value.split(scopedApiKey).join(resolved.upstreamApiKey))
     }
   }
-  // Node's fetch transparently decompresses upstream bodies. Asking for the
-  // identity representation avoids a second compression boundary, and the
-  // response path below still strips content-encoding if an upstream ignores it.
-  headers.set('accept-encoding', 'identity')
   if (!authenticated) {
     traffic.rejectedRequests += 1
     writeProxyError(response, 401, 'invalid scoped inference credential')
     return
   }
 
-  const upstreamUrl = appendPath(
-    resolved.upstreamBaseUrl,
-    requestUrl,
-    scopedApiKey,
-    resolved.upstreamApiKey,
-  )
   const method = request.method ?? 'POST'
   const requestKind = inferenceRequestKind(resolved.apiMode, method, requestUrl.pathname)
   if (!requestKind) {
@@ -797,6 +872,13 @@ async function forwardRequest(
     writeProxyError(response, 404, 'scoped inference route not found')
     return
   }
+
+  const abort = new AbortController()
+  const abortClientRequest = (): void => abort.abort()
+  request.once('aborted', abortClientRequest)
+  response.once('close', () => {
+    if (!response.writableEnded) abortClientRequest()
+  })
 
   let requestBody: Buffer
   try {
@@ -815,23 +897,98 @@ async function forwardRequest(
     }
     return
   }
+
+  let upstreamApiKey: string
+  try {
+    upstreamApiKey = resolved.resolveUpstreamApiKey
+      ? await resolved.resolveUpstreamApiKey(abort.signal)
+      : resolved.upstreamApiKey
+    if (
+      upstreamApiKey.length === 0
+      || upstreamApiKey.length > MAX_PROTECTED_CREDENTIAL_LENGTH
+      || /[\r\n\0]/u.test(upstreamApiKey)
+    ) {
+      throw new Error('refreshed inference credential is malformed')
+    }
+  } catch {
+    traffic.failedRequests += 1
+    writeProxyError(response, 502, 'upstream authentication refresh failed')
+    return
+  }
+
+  const scopedAccountId = resolved.apiMode === 'openai-codex-responses'
+    ? openAiCodexAccountId(scopedApiKey)
+    : null
+  const upstreamAccountId = resolved.apiMode === 'openai-codex-responses'
+    ? openAiCodexAccountId(upstreamApiKey)
+    : null
+
+  const headers = new Headers()
+  for (const [name, raw] of Object.entries(request.headers)) {
+    if (raw === undefined || isHopByHopHeader(name) || name.toLowerCase() === 'accept-encoding') continue
+    const values = Array.isArray(raw) ? raw : [raw]
+    for (const value of values) {
+      if (resolved.apiMode === 'openai-codex-responses' && name.toLowerCase() === 'chatgpt-account-id') {
+        if (upstreamAccountId !== null) headers.append(name, upstreamAccountId)
+        continue
+      }
+      headers.append(name, value.split(scopedApiKey).join(upstreamApiKey))
+    }
+  }
+  // Node's fetch transparently decompresses upstream bodies. Asking for the
+  // identity representation avoids a second compression boundary, and the
+  // response path below still strips content-encoding if an upstream ignores it.
+  headers.set('accept-encoding', 'identity')
+  const upstreamUrl = appendPath(
+    resolved.upstreamBaseUrl,
+    requestUrl,
+    scopedApiKey,
+    upstreamApiKey,
+  )
+  let inspectionBody: Buffer
+  try {
+    inspectionBody = await inferenceInspectionBody(
+      requestBody,
+      request.headers['content-encoding'],
+      resolved.maxRequestBytes,
+      compressedInspectionBudget,
+    )
+  } catch (error) {
+    traffic.rejectedRequests += 1
+    if (error instanceof RequestTooLargeError) {
+      writeProxyError(
+        response,
+        413,
+        `compressed inference request expands beyond the ${MAX_COMPRESSED_INSPECTION_BYTES}-byte inspection limit`,
+      )
+    } else if (error instanceof CompressedInspectionBusyError) {
+      writeProxyError(response, 429, 'too many compressed inference requests are being inspected')
+    } else {
+      writeProxyError(response, 400, 'unsupported or malformed inference content encoding')
+    }
+    return
+  }
   if (!requestTargetsSelectedModel(
     resolved.apiMode,
     requestUrl.pathname,
     upstreamUrl.pathname,
-    requestBody,
+    inspectionBody,
     resolved.model,
   )) {
     traffic.rejectedRequests += 1
-    writeProxyError(response, 403, 'scoped inference credential cannot access that model')
+    const observedModel = requestBodyModel(inspectionBody)
+    writeProxyError(
+      response,
+      403,
+      `scoped inference credential for "${resolved.model}" cannot access `
+      + `${observedModel === null ? 'a request with no model' : `model "${observedModel}"`}`,
+    )
     return
   }
 
   if (requestKind === 'generation') traffic.generationRequests += 1
   else traffic.auxiliaryRequests += 1
   traffic.inFlightRequests += 1
-  const abort = new AbortController()
-  request.once('aborted', () => abort.abort())
 
   try {
     const hasBody = method !== 'GET' && method !== 'HEAD'
@@ -847,8 +1004,13 @@ async function forwardRequest(
     upstream.headers.forEach((value, name) => {
       if (!isHopByHopHeader(name) && name.toLowerCase() !== 'content-encoding') {
         responseHeaders[name] = value
-          .split(resolved.upstreamApiKey)
+          .split(upstreamApiKey)
           .join(scopedApiKey)
+        if (upstreamAccountId !== null && scopedAccountId !== null) {
+          responseHeaders[name] = responseHeaders[name]
+            .split(upstreamAccountId)
+            .join(scopedAccountId)
+        }
       }
     })
 
@@ -860,10 +1022,13 @@ async function forwardRequest(
       const body = annotateProviderDispatchFailureBody(
         rawBody,
         providerDispatchMarker,
-      ).split(resolved.upstreamApiKey).join(scopedApiKey)
+      ).split(upstreamApiKey).join(scopedApiKey)
+      const redactedBody = upstreamAccountId !== null && scopedAccountId !== null
+        ? body.split(upstreamAccountId).join(scopedAccountId)
+        : body
       delete responseHeaders['content-length']
       response.writeHead(upstream.status, responseHeaders)
-      response.end(body)
+      response.end(redactedBody)
       return
     }
 
@@ -877,11 +1042,16 @@ async function forwardRequest(
       && upstream.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
       ? createOpenAiResponseIdentityStream()
       : undefined
-    const redaction = createCredentialRedactionStream(resolved.upstreamApiKey, scopedApiKey)
+    const redaction = createCredentialRedactionStream(upstreamApiKey, scopedApiKey)
+    const accountRedaction = upstreamAccountId !== null && scopedAccountId !== null
+      ? createCredentialRedactionStream(upstreamAccountId, scopedAccountId)
+      : undefined
     if (identity) {
-      await pipeline(body, identity, redaction, response)
+      if (accountRedaction) await pipeline(body, identity, redaction, accountRedaction, response)
+      else await pipeline(body, identity, redaction, response)
     } else {
-      await pipeline(body, redaction, response)
+      if (accountRedaction) await pipeline(body, redaction, accountRedaction, response)
+      else await pipeline(body, redaction, response)
     }
   } catch (error) {
     traffic.failedRequests += 1
@@ -892,6 +1062,80 @@ async function forwardRequest(
     writeProxyError(response, 502, 'upstream request failed')
   } finally {
     traffic.inFlightRequests -= 1
+  }
+}
+
+async function inferenceInspectionBody(
+  body: Buffer,
+  contentEncoding: string | string[] | undefined,
+  maxBytes: number,
+  budget: CompressedInspectionBudget,
+): Promise<Buffer> {
+  const encoding = Array.isArray(contentEncoding)
+    ? contentEncoding.join(',').trim().toLowerCase()
+    : contentEncoding?.trim().toLowerCase()
+  if (encoding === undefined || encoding === '' || encoding === 'identity') return body
+  if (encoding !== 'zstd') throw new Error('unsupported inference content encoding')
+  if (budget.active >= MAX_CONCURRENT_COMPRESSED_INSPECTIONS) {
+    throw new CompressedInspectionBusyError()
+  }
+  budget.active += 1
+  try {
+    return await decompressZstd(body, Math.min(maxBytes, MAX_COMPRESSED_INSPECTION_BYTES))
+  } finally {
+    budget.active -= 1
+  }
+}
+
+function decompressZstd(body: Buffer, maxOutputLength: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    zstdDecompress(body, { maxOutputLength }, (error, result) => {
+      if (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') {
+          reject(new RequestTooLargeError())
+        } else {
+          reject(error)
+        }
+        return
+      }
+      resolve(result)
+    })
+  })
+}
+
+class CompressedInspectionBusyError extends Error {}
+
+function scopedInferenceCredential(apiMode: PiApiMode): string {
+  if (apiMode !== 'openai-codex-responses') return randomBytes(32).toString('base64url')
+  const accountId = `scoped-${randomBytes(16).toString('base64url')}`
+  const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url')
+  const payload = Buffer.from(JSON.stringify({
+    exp: Math.floor(Date.now() / 1_000) + 24 * 60 * 60,
+    'https://api.openai.com/auth': {
+      chatgpt_account_id: accountId,
+      chatgpt_plan_type: 'pro',
+    },
+  })).toString('base64url')
+  return `${header}.${payload}.${randomBytes(24).toString('base64url')}`
+}
+
+function openAiCodexAccountId(token: string): string | null {
+  const payload = token.split('.')[1]
+  if (!payload) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as unknown
+    if (!isRecord(parsed)) return null
+    const auth = parsed['https://api.openai.com/auth']
+    if (!isRecord(auth) || typeof auth.chatgpt_account_id !== 'string') return null
+    const accountId = auth.chatgpt_account_id.trim()
+    if (
+      accountId.length === 0
+      || accountId.length > 512
+      || /[\r\n\0]/u.test(accountId)
+    ) return null
+    return accountId
+  } catch {
+    return null
   }
 }
 
@@ -1305,6 +1549,7 @@ function isHopByHopHeader(name: string): boolean {
 }
 
 function writeProxyError(response: ServerResponse, status: number, message: string): void {
+  if (response.destroyed || response.writableEnded) return
   response.writeHead(status, { 'content-type': 'application/json' })
   response.end(JSON.stringify({ error: { message } }))
 }
