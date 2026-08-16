@@ -52,6 +52,7 @@ import { BackendReportedFailureError } from '../runs/error-shape.js'
 import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
 import {
+  assertPiOutputTokenRequest,
   assertProfileRequestAuthority,
   resolveAgentProfile,
   resolveRequestedReasoningEffort,
@@ -744,7 +745,8 @@ export function mountChatCompletions(
       if (!req.cwd && session?.cwd) {
         req.cwd = session.cwd
       }
-      assertProfileRequestAuthority(req, session)
+      const profile = assertProfileRequestAuthority(req, session)
+      if (backend.name === 'pi') assertPiOutputTokenRequest(req, profile)
       const sessionProfileBinding = exactSessionProfileBinding(req, session)
       if (session) {
         assertSessionProfileBinding(session, sessionProfileBinding)
