@@ -366,7 +366,6 @@ export function createPiInferenceTransportResolver(options: {
     const config = readConfiguredTransport(sourceAgentDir, selection)
       ?? await readCatalogTransport({
         bin: options.bin,
-        sourceAgentDir,
         selection,
         env: trustedEnv,
         signal,
@@ -561,7 +560,6 @@ function readConfiguredTransport(
 
 async function readCatalogTransport(options: {
   bin: string
-  sourceAgentDir: string
   selection: PiInferenceSelection
   env: NodeJS.ProcessEnv
   signal: AbortSignal
@@ -574,12 +572,14 @@ async function readCatalogTransport(options: {
   | 'sourceSessionDir'
 >> {
   let model: PiCatalogModel
+  const catalogAgentDir = mkdtempSync(join(tmpdir(), '.cli-bridge-pi-catalog-'))
+  chmodSync(catalogAgentDir, 0o700)
   try {
     model = await readPiSelectedModel({
       bin: options.bin,
       provider: options.selection.provider,
       model: options.selection.model,
-      agentDir: options.sourceAgentDir,
+      agentDir: catalogAgentDir,
       env: options.env,
       signal: options.signal,
     })
@@ -589,6 +589,8 @@ async function readCatalogTransport(options: {
       'not_configured',
       error,
     )
+  } finally {
+    rmSync(catalogAgentDir, { recursive: true, force: true })
   }
   if (model.provider !== options.selection.provider || model.id !== options.selection.model) {
     throw new BackendError(

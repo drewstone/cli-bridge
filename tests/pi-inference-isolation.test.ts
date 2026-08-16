@@ -333,11 +333,14 @@ describe('Pi inference credential isolation', () => {
     const sourceSessionDir = tempDir('cli-bridge-pi-built-in-sessions-')
     const marker = join(tempDir('cli-bridge-pi-built-in-marker-'), 'calls')
     const fakePi = join(tempDir('cli-bridge-pi-built-in-bin-'), 'pi')
+    writeFileSync(join(sourceAgentDir, 'auth.json'), 'source-agent-secret-must-stay-unreadable')
     writeFileSync(fakePi, [
       '#!/bin/sh',
       'set -eu',
       'if [ "$1" = "--mode" ]; then',
       '  test -z "${SENTINEL_PROVIDER_TOKEN:-}"',
+      `  test "$PI_CODING_AGENT_DIR" != ${JSON.stringify(sourceAgentDir)}`,
+      '  test ! -e "$PI_CODING_AGENT_DIR/auth.json"',
       '  trap "" TERM',
       `  printf '%s\n%s\n' "$$" "$*" > ${JSON.stringify(marker)}`,
       '  IFS= read -r request',
