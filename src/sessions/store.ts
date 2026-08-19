@@ -106,7 +106,7 @@ export type RetainedRunClaim =
   | { kind: 'created' | 'replayed'; admission: RetainedRunAdmission }
   | { kind: 'conflict'; admission: RetainedRunAdmission }
 
-export type RetainedControlOperationKind = 'steer' | 'cancel'
+export type RetainedControlOperationKind = 'steer' | 'cancel' | 'native_continuation'
 
 export interface StoredRetainedControlOperation {
   operationId: string
@@ -1048,8 +1048,8 @@ export class SessionStore implements RetainedInteractionPersistence {
     return this.interactionLedger.getInteractionOperation(operationId)
   }
 
-  recordRetainedControlOperation(operation: StoredRetainedControlOperation): void {
-    this.db.prepare(
+  recordRetainedControlOperation(operation: StoredRetainedControlOperation): boolean {
+    const inserted = this.db.prepare(
       `INSERT INTO retained_control_operations
        (operation_id, caller_id, kind, run_id, session_id, request_digest, acknowledgement_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1064,19 +1064,21 @@ export class SessionStore implements RetainedInteractionPersistence {
       JSON.stringify(operation.acknowledgement),
       Date.now(),
     )
+    return inserted.changes === 1
   }
 
   updateRetainedControlOperation(
     operationId: string,
     requestDigest: string,
     acknowledgement: Record<string, unknown>,
-  ): void {
-    this.db.prepare(
+  ): boolean {
+    const updated = this.db.prepare(
       `UPDATE retained_control_operations
        SET acknowledgement_json = ?
        WHERE operation_id = ? AND request_digest = ?
          AND json_extract(acknowledgement_json, '$.status') = 'pending'`,
     ).run(JSON.stringify(acknowledgement), operationId, requestDigest)
+    return updated.changes === 1
   }
 
   getRetainedControlOperation(operationId: string): StoredRetainedControlOperation | null {

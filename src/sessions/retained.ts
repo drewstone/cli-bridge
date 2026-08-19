@@ -43,6 +43,12 @@ import { RetainedInteractions } from './retained/interactions.js'
 import { TurnLanes } from './retained/turn-lane.js'
 import { RetainedTurnRunner } from './retained/turns.js'
 import {
+  parseNativeContinuation,
+  RetainedNativeContinuation,
+  type NativeContinuationResult,
+  type ParsedNativeContinuation,
+} from './retained/native-continuation.js'
+import {
   RetainedSessionError,
   type DurableRetainedRunSnapshot,
   type RetainedControlAcknowledgement,
@@ -64,6 +70,7 @@ export class RetainedSessionService {
   private readonly control: RetainedControl
   private readonly events: RetainedEvents
   private readonly interactions: RetainedInteractions
+  private readonly nativeContinuation: RetainedNativeContinuation
   private readonly closures = new Set<string>()
 
   constructor(options: RetainedSessionServiceOptions) {
@@ -96,6 +103,12 @@ export class RetainedSessionService {
     })
     this.control = new RetainedControl(this.store, this.runs, this.state)
     this.events = new RetainedEvents(this.store, this.runs, this.state)
+    this.nativeContinuation = new RetainedNativeContinuation({
+      store: this.store,
+      runs: this.runs,
+      state: this.state,
+      turns: this.turns,
+    })
   }
 
   parseCreate(value: unknown): RetainedCreateInput {
@@ -116,6 +129,10 @@ export class RetainedSessionService {
 
   parseCancel(value: unknown): Parameters<RetainedControl['cancel']>[2] {
     return parseCancel(value)
+  }
+
+  parseNativeContinuation(value: unknown): ParsedNativeContinuation {
+    return parseNativeContinuation(value)
   }
 
   async capabilities(model: string, signal?: AbortSignal): Promise<AgentEnvironmentCapabilities> {
@@ -253,6 +270,14 @@ export class RetainedSessionService {
     options: { queue?: boolean; signal?: AbortSignal } = {},
   ): Promise<RetainedTurnResult> {
     return this.turns.beginTurn(id, input, options)
+  }
+
+  continueNative(
+    id: string,
+    input: ParsedNativeContinuation,
+    options: { signal?: AbortSignal; callerId?: string } = {},
+  ): Promise<NativeContinuationResult> {
+    return this.nativeContinuation.continue(id, input.request, input.turn, options)
   }
 
   steer(

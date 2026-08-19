@@ -38,6 +38,7 @@ The retained routes are:
 - `GET /v1/sessions` lists retained and legacy sessions.
 - `GET /v1/sessions/:id` reads the durable session view.
 - `POST /v1/sessions/:id/turns` starts one idempotent turn.
+- `POST /v1/sessions/:id/continue` performs one Agent Interface native continuation.
 - `GET /v1/sessions/:id/events` replays normalized session events.
 - `GET /v1/sessions/:id/transcript` reads the normalized transcript.
 - `GET /v1/sessions/:id/status` reads the current status.
@@ -51,6 +52,38 @@ The retained routes are:
 Every retained turn requires caller-owned `run_id` and `execution_id` values.
 
 The bridge binds both values to the normalized request digest before native startup.
+
+The durable session view's `context_boundary` field returns the exact stored `NativeContextBoundaryProof`.
+
+## Native continuation
+
+The continuation route accepts `{ request, turn }` using the Agent Interface 1.3.0 schemas.
+
+The bridge validates the turn digest and request digest before it admits the operation.
+
+The request's `run` and `expectedBoundary` must identify the current stored run exactly.
+
+The route records a pending operation before dispatch and uses the existing per-session turn lane.
+
+The internal continuation run id is a fixed-size digest of the operation id, so the maximum valid operation id cannot overflow Agent Interface limits.
+
+That lane repeats the boundary comparison before provider startup and observes the native source boundary while the handoff lock is held.
+
+An accepted acknowledgement reports that fresh observation with the source run coordinates.
+
+The bridge never reports the caller's expected proof as if it were a new provider observation.
+
+The acknowledgement includes the exact `AgentTurnResult` and `AgentExactRunControlRef` produced by the retained run.
+
+The same caller, operation id, and request digest replay the stored result without another native turn.
+
+A changed request, different caller, session binding, run binding, or digest returns `conflict` without dispatch.
+
+The route returns `boundary_mismatch`, `unverified`, `unknown_session`, and `transport_failure` as typed Agent Interface acknowledgements.
+
+If the bridge restarts with a pending operation and no durable terminal run, it records `unknown_session` and never repeats the turn.
+
+The pending record stores the fresh source boundary before native run claim, so a durable terminal run can replay successfully after a settle-window crash.
 
 Each turn can request canonical interaction kinds through its `interactions` record.
 
@@ -124,9 +157,9 @@ A pid-only legacy record is blocked when its process is live and reclaimed only 
 
 The released Agent Interface dependency provides `isCredentialBearingProfileConfigName` from `profile-schema` and `isRuntimeProcessControlEnvironmentName` from `profile-security`.
 
-These exports are provided by `@tangle-network/agent-interface` 0.54.0 from PR #184.
+These exports are provided by `@tangle-network/agent-interface` 1.3.0.
 
-Bridge pins the released Interface dependency at 0.54.0 before release.
+Bridge pins `@tangle-network/agent-interface` 1.3.0 and `@tangle-network/agent-profile-materialize` 0.16.0 before release.
 
 The Bridge keeps only its five Pi-owned child-process control names locally because Agent Interface does not own Pi environment injection.
 
@@ -216,9 +249,9 @@ The bridge does not copy those classes or define replacement interaction contrac
 
 The live npm registry returned `404` for `@tangle-network/sdk-provider-cli-base` on 2026-08-15.
 
-The currently published profile-materialize package 0.15.2 declares an Interface peer range below 0.54.0.
+The currently published profile-materialize package 0.16.0 declares an Interface peer range of `^1.0.0`.
 
-The bridge uses the released Interface 0.54.0 package without a local package link.
+The bridge uses the released Interface 1.3.0 package without a local package link.
 
 Generic MCP interaction capability stays unadvertised until ADC publishes a compatible release and the bridge composes it through the existing profile and MCP materialization path.
 
@@ -243,6 +276,7 @@ An interrupted response is never sent again unless a future provider supplies a 
 The focused retained proof is:
 
 ```text
+pnpm exec vitest run tests/retained-sessions.test.ts -t 'native continuation|native boundary|completed native continuation|pending native continuation'
 pnpm exec vitest run tests/retained-sessions.test.ts tests/pi-native.test.ts --reporter dot
 pnpm exec vitest run tests/single-instance.test.ts --reporter dot
 ```
