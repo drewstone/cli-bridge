@@ -19,6 +19,22 @@ import { RetainedSessionError } from './types.js'
 
 const NATIVE_BOUNDARY_TIMEOUT_MS = 5_000
 
+export type RetainedBoundaryFailure = 'unverified' | 'boundary_mismatch'
+
+/** Carries the observed proof without changing the legacy HTTP error shape. */
+export class RetainedBoundaryError extends RetainedSessionError {
+  constructor(
+    message: string,
+    status: number,
+    code: string,
+    readonly failure: RetainedBoundaryFailure,
+    readonly actualBoundary?: NativeContextBoundaryProof,
+  ) {
+    super(message, status, code)
+    this.name = 'RetainedBoundaryError'
+  }
+}
+
 export async function observeNativeBoundary(
   native: NativeSession,
   input: {
@@ -54,7 +70,7 @@ export async function verifyRetainedBoundary(
   record: RetainedSessionRecord,
   runId: string,
   current: { provider: string; environmentId: string; executionId: string; requestDigest: string },
-): Promise<void> {
+): Promise<NativeContextBoundaryProof> {
   const expected = record.contextBoundary
   const parsedExpected = expected ? NativeContextBoundaryProofSchema.safeParse(expected) : null
   if (
@@ -65,10 +81,11 @@ export async function verifyRetainedBoundary(
     parsedExpected.data.environmentId !== current.environmentId ||
     parsedExpected.data.sessionId !== record.id
   ) {
-    throw new RetainedSessionError(
+    throw new RetainedBoundaryError(
       'retained turn is unverified; the provider boundary must be proven before another turn',
       501,
       'capability_denied',
+      'unverified',
     )
   }
   const observed = await observeNativeBoundary(native, {
@@ -87,12 +104,52 @@ export async function verifyRetainedBoundary(
     parsedObserved.data.requestDigest !== current.requestDigest ||
     canonicalCandidateJson(parsedObserved.data.boundary) !== canonicalCandidateJson(parsedExpected.data.boundary)
   ) {
-    throw new RetainedSessionError(
+    throw new RetainedBoundaryError(
       'retained turn boundary changed or could not be verified',
       409,
       'context_boundary_mismatch',
+      parsedObserved?.success ? 'boundary_mismatch' : 'unverified',
+      parsedObserved?.success ? parsedObserved.data : undefined,
     )
   }
+  return parsedObserved.data
+}
+
+/** Compare caller-supplied state with the durable proof inside the turn lane. */
+export function assertRetainedBoundaryMatches(
+  record: RetainedSessionRecord,
+  expected: NativeContextBoundaryProof,
+): NativeContextBoundaryProof {
+  const parsed = record.contextBoundary
+    ? NativeContextBoundaryProofSchema.safeParse(record.contextBoundary)
+    : null
+  if (
+    !parsed?.success ||
+    !record.runId ||
+    parsed.data.runId !== record.runId ||
+    parsed.data.provider !== expected.provider ||
+    parsed.data.environmentId !== expected.environmentId ||
+    parsed.data.sessionId !== record.id ||
+    parsed.data.executionId !== expected.executionId ||
+    parsed.data.requestDigest !== expected.requestDigest
+  ) {
+    throw new RetainedBoundaryError(
+      'retained turn is unverified; the durable provider boundary is not valid',
+      501,
+      'capability_denied',
+      'unverified',
+    )
+  }
+  if (canonicalCandidateJson(parsed.data) !== canonicalCandidateJson(expected)) {
+    throw new RetainedBoundaryError(
+      'native continuation expected a stale context boundary',
+      409,
+      'context_boundary_mismatch',
+      'boundary_mismatch',
+      parsed.data,
+    )
+  }
+  return parsed.data
 }
 
 /** The boundary to persist for a completed turn; never throws. */

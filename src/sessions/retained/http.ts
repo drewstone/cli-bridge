@@ -64,6 +64,20 @@ export function mountRetainedSessions(
     }
   })
 
+  app.post('/v1/sessions/:id/continue', async (c) => {
+    try {
+      const input = service.parseNativeContinuation(await readBoundedJson(c.req.raw))
+      const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
+      const result = await service.continueNative(c.req.param('id'), input, {
+        signal: c.req.raw.signal,
+        callerId: caller,
+      })
+      return c.json(result.outcome, result.status)
+    } catch (error) {
+      return retainedError(c, error)
+    }
+  })
+
   app.post('/v1/sessions/:id/input', async (c) => {
     try {
       const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await readBoundedJson(c.req.raw)), {

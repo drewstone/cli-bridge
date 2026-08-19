@@ -18,6 +18,8 @@ import {
 } from '../src/sessions/retained.js'
 import {
   agentRunCancellationRequestDigest,
+  AgentNativeContextContinuationResultSchema,
+  agentNativeContextContinuationResultMatchesRequest,
   canonicalCandidateDigest,
   defineAgentProfileSecretRef,
   type InteractionBinding,
@@ -27,8 +29,13 @@ import {
   type InteractionResponseCommand,
   type AgentEnvironmentCapabilities,
   type NativeContextBoundaryProof,
+  type NativeContextContinuationRequest,
 } from '@tangle-network/agent-interface'
-import { interactionResponseCommandDigest } from '@tangle-network/agent-interface'
+import {
+  interactionResponseCommandDigest,
+  nativeContextContinuationRequestDigest,
+  nativeContextContinuationTurnDigest,
+} from '@tangle-network/agent-interface'
 import {
   createInteractionOperationSchema,
   MAX_ACKNOWLEDGED_INTERACTION_OPERATIONS,
@@ -357,6 +364,22 @@ class CrashAfterAcknowledgementStore extends SqliteSessionStore {
   }
 }
 
+class CrashBeforeNativeContinuationSettleStore extends SqliteSessionStore {
+  private crashed = false
+
+  override updateRetainedControlOperation(
+    operationId: string,
+    requestDigest: string,
+    acknowledgement: Record<string, unknown>,
+  ): ReturnType<SqliteSessionStore['updateRetainedControlOperation']> {
+    if (!this.crashed && acknowledgement.status === 'completed') {
+      this.crashed = true
+      throw new Error('injected crash before native continuation settle')
+    }
+    return super.updateRetainedControlOperation(operationId, requestDigest, acknowledgement)
+  }
+}
+
 class DeferredBoundaryNative extends FakeNative {
   private releaseBoundary!: () => void
   private signalBoundaryStarted!: () => void
@@ -549,6 +572,22 @@ class PrematureNative extends FakeNative {
 
 class UnverifiedNative extends FakeNative {
   override contextBoundary(): Promise<null> { return Promise.resolve(null) }
+}
+
+class FreshBoundaryNative extends FakeNative {
+  private boundaryObservations = 0
+
+  override async contextBoundary(
+    input: Parameters<NativeSession['contextBoundary']>[0],
+  ): Promise<NativeContextBoundaryProof | null> {
+    const proof = await super.contextBoundary(input)
+    if (!proof) return null
+    this.boundaryObservations += 1
+    return {
+      ...proof,
+      observedAt: new Date(Date.parse(proof.observedAt) + this.boundaryObservations).toISOString(),
+    }
+  }
 }
 
 class FakeNativeBackend implements NativeSessionBackend {
@@ -790,6 +829,59 @@ function turnBody(
     run_id: `run-${identity}`,
     execution_id: `execution-${identity}`,
   })
+}
+
+function nativeContinuationRequest(
+  fixture: ReturnType<typeof setup>,
+  sessionId: string,
+  operationId: string,
+  prompt: string,
+  expectedBoundary?: NativeContextBoundaryProof,
+  sourceRun?: NativeContextContinuationRequest['run'],
+): { request: NativeContextContinuationRequest; turn: { prompt: string } } {
+  const record = fixture.store.getRetained(sessionId)
+  if (!record?.runId) throw new Error(`session ${sessionId} has no retained run`)
+  const admission = fixture.store.getRetainedRun(record.runId)
+  if (!admission) throw new Error(`run ${record.runId} has no durable admission`)
+  const boundary = expectedBoundary ?? record.contextBoundary as NativeContextBoundaryProof
+  const run = sourceRun ?? {
+    runId: admission.runId,
+    provider: admission.provider,
+    environmentId: admission.environmentId,
+    sessionId,
+    executionId: admission.executionId,
+    requestDigest: admission.requestDigest as `sha256:${string}`,
+  }
+  const turn = { prompt }
+  const material = {
+    operationId,
+    turnDigest: nativeContextContinuationTurnDigest(turn),
+    run,
+    expectedBoundary: boundary,
+  }
+  const request = {
+    ...material,
+    requestDigest: nativeContextContinuationRequestDigest(material),
+  }
+  return {
+    request,
+    turn,
+  }
+}
+
+function nativeContinuationRunId(operationId: string): string {
+  return `native-continuation:${canonicalCandidateDigest({ operationId })}`
+}
+
+function nativeContinuationBody(input: ReturnType<typeof nativeContinuationRequest>): string {
+  return JSON.stringify(input)
+}
+
+function successfulNativeOutcome(
+  value: ReturnType<typeof AgentNativeContextContinuationResultSchema.parse>,
+): Extract<ReturnType<typeof AgentNativeContextContinuationResultSchema.parse>, { result: unknown }> {
+  if (!('result' in value) || !('controlRef' in value)) throw new Error('expected an accepted native continuation')
+  return value
 }
 
 function interactionCommand(
@@ -3972,6 +4064,364 @@ describe('retained Agent Interface sessions', () => {
     const second = await fixture.app.request('/v1/sessions/unverified/turns', { method: 'POST', body: turnBody('unverified-second', { message: 'second' }) })
     expect(second.status).toBe(501)
     expect((await json(second)).error.type).toBe('capability_denied')
+  })
+
+  it('accepts native continuation with the exact boundary and supports sequential native continuation turns', async () => {
+    const backend = new FakeNativeBackend(() => new FreshBoundaryNative())
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'native-accepted', model: 'pi/test' }) })
+    await fixture.app.request('/v1/sessions/native-accepted/turns', {
+      method: 'POST',
+      body: turnBody('native-accepted-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('native-accepted')?.turns === 1)
+    const expectedBoundary = fixture.store.getRetained('native-accepted')?.contextBoundary as NativeContextBoundaryProof
+    const input = nativeContinuationRequest(
+      fixture,
+      'native-accepted',
+      'o'.repeat(512),
+      'second',
+      expectedBoundary,
+    )
+    const response = await fixture.app.request('/v1/sessions/native-accepted/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(response.status).toBe(200)
+    const outcome = successfulNativeOutcome(AgentNativeContextContinuationResultSchema.parse(await json(response)))
+    const actualBoundary = outcome.acknowledgement.actualBoundary
+    if (!actualBoundary) throw new Error('accepted continuation did not report its observed source boundary')
+    expect(outcome.acknowledgement).toMatchObject({
+      operationId: input.request.operationId,
+      requestDigest: input.request.requestDigest,
+      status: 'accepted',
+      historyMessagesSent: 0,
+    })
+    expect(actualBoundary).toMatchObject({
+      ...input.request.run,
+      boundary: expectedBoundary.boundary,
+    })
+    expect(Date.parse(actualBoundary.observedAt)).toBeGreaterThan(Date.parse(expectedBoundary.observedAt))
+    expect(outcome.result).toMatchObject({ text: 'reply-2', success: true, sessionId: 'native-accepted' })
+    expect(outcome.result.usage).toMatchObject({ inputTokens: 3, outputTokens: 2 })
+    expect(outcome.controlRef).toMatchObject({
+      runId: nativeContinuationRunId(input.request.operationId),
+      provider: expectedBoundary.provider,
+      environmentId: expectedBoundary.environmentId,
+      sessionId: 'native-accepted',
+    })
+    expect(outcome.controlRef.runId.length).toBeLessThanOrEqual(512)
+    expect(agentNativeContextContinuationResultMatchesRequest(input.request, outcome)).toBe(true)
+    expect(fixture.store.getRetained('native-accepted')?.contextBoundary).not.toEqual(expectedBoundary)
+
+    const nextBoundary = fixture.store.getRetained('native-accepted')?.contextBoundary as NativeContextBoundaryProof
+    const secondInput = nativeContinuationRequest(
+      fixture,
+      'native-accepted',
+      'native-accepted-second-operation',
+      'third',
+      nextBoundary,
+      outcome.controlRef,
+    )
+    const secondResponse = await fixture.app.request('/v1/sessions/native-accepted/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(secondInput),
+    })
+    expect(secondResponse.status).toBe(200)
+    const secondOutcome = successfulNativeOutcome(
+      AgentNativeContextContinuationResultSchema.parse(await json(secondResponse)),
+    )
+    expect(secondOutcome.acknowledgement.status).toBe('accepted')
+    expect(secondOutcome.result).toMatchObject({ text: 'reply-3', success: true, sessionId: 'native-accepted' })
+    expect(secondOutcome.controlRef.runId).toBe(nativeContinuationRunId(secondInput.request.operationId))
+    expect(agentNativeContextContinuationResultMatchesRequest(secondInput.request, secondOutcome)).toBe(true)
+    expect(backend.natives[0]!.prompts).toEqual(['first', 'second', 'third'])
+  })
+
+  it('replays an accepted native continuation and conflicts on changed operation bytes', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'native-replay', model: 'pi/test' }) })
+    await fixture.app.request('/v1/sessions/native-replay/turns', {
+      method: 'POST',
+      body: turnBody('native-replay-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('native-replay')?.turns === 1)
+    const expectedBoundary = fixture.store.getRetained('native-replay')?.contextBoundary as NativeContextBoundaryProof
+    const input = nativeContinuationRequest(fixture, 'native-replay', 'native-replay-operation', 'second', expectedBoundary)
+    const first = await fixture.app.request('/v1/sessions/native-replay/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    const replay = await fixture.app.request('/v1/sessions/native-replay/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(first.status).toBe(200)
+    expect(replay.status).toBe(200)
+    const firstOutcome = successfulNativeOutcome(AgentNativeContextContinuationResultSchema.parse(await json(first)))
+    const replayOutcome = successfulNativeOutcome(AgentNativeContextContinuationResultSchema.parse(await json(replay)))
+    expect(replayOutcome.acknowledgement.status).toBe('replayed')
+    expect(replayOutcome.result).toEqual(firstOutcome.result)
+    expect(replayOutcome.controlRef).toEqual(firstOutcome.controlRef)
+
+    const otherCaller = await fixture.app.request('/v1/sessions/native-replay/continue', {
+      method: 'POST',
+      headers: { authorization: 'other-caller' },
+      body: nativeContinuationBody(input),
+    })
+    expect(otherCaller.status).toBe(409)
+    expect(await json(otherCaller)).toMatchObject({ acknowledgement: { status: 'conflict' } })
+
+    const changed = nativeContinuationRequest(
+      fixture,
+      'native-replay',
+      'native-replay-operation',
+      'changed',
+      expectedBoundary,
+      input.request.run,
+    )
+    const conflict = await fixture.app.request('/v1/sessions/native-replay/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(changed),
+    })
+    expect(conflict.status).toBe(409)
+    expect(await json(conflict)).toMatchObject({
+      acknowledgement: {
+        operationId: input.request.operationId,
+        requestDigest: changed.request.requestDigest,
+        status: 'conflict',
+        existingRequestDigest: input.request.requestDigest,
+      },
+    })
+    expect(backend.natives[0]!.prompts).toEqual(['first', 'second'])
+  })
+
+  it('rejects a stale native boundary before dispatching another native turn', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'native-stale', model: 'pi/test' }) })
+    await fixture.app.request('/v1/sessions/native-stale/turns', {
+      method: 'POST',
+      body: turnBody('native-stale-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('native-stale')?.turns === 1)
+    const current = fixture.store.getRetained('native-stale')?.contextBoundary as NativeContextBoundaryProof
+    const stale = {
+      ...current,
+      boundary: { kind: 'revision' as const, revision: 'stale-boundary' },
+    }
+    const input = nativeContinuationRequest(fixture, 'native-stale', 'native-stale-operation', 'second', stale)
+    const response = await fixture.app.request('/v1/sessions/native-stale/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(response.status).toBe(409)
+    expect(await json(response)).toMatchObject({
+      acknowledgement: {
+        status: 'boundary_mismatch',
+        actualBoundary: current,
+      },
+    })
+    expect(backend.natives[0]!.prompts).toEqual(['first'])
+  })
+
+  it('returns unverified when the retained proof cannot be verified', async () => {
+    const backend = new FakeNativeBackend(() => new UnverifiedNative())
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'native-unverified', model: 'pi/test' }) })
+    await fixture.app.request('/v1/sessions/native-unverified/turns', {
+      method: 'POST',
+      body: turnBody('native-unverified-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('native-unverified')?.turns === 1)
+    const record = fixture.store.getRetained('native-unverified')!
+    const admission = fixture.store.getRetainedRun(record.runId!)!
+    const candidateProof: NativeContextBoundaryProof = {
+      runId: admission.runId,
+      provider: admission.provider,
+      environmentId: admission.environmentId,
+      sessionId: record.id,
+      executionId: admission.executionId,
+      requestDigest: admission.requestDigest as `sha256:${string}`,
+      boundary: { kind: 'revision', revision: 'candidate' },
+      observedAt: new Date().toISOString(),
+    }
+    const input = nativeContinuationRequest(
+      fixture,
+      'native-unverified',
+      'native-unverified-operation',
+      'second',
+      candidateProof,
+    )
+    const response = await fixture.app.request('/v1/sessions/native-unverified/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(response.status).toBe(501)
+    expect(await json(response)).toMatchObject({ acknowledgement: { status: 'unverified' } })
+    expect(backend.natives[0]!.prompts).toEqual(['first'])
+  })
+
+  it('rejects a native continuation whose run belongs to another session', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    for (const id of ['native-binding-a', 'native-binding-b']) {
+      await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id, model: 'pi/test' }) })
+      await fixture.app.request(`/v1/sessions/${id}/turns`, {
+        method: 'POST',
+        body: turnBody(`${id}-first`, { message: 'first' }),
+      })
+      await waitFor(() => fixture!.store.getRetained(id)?.turns === 1)
+    }
+    const input = nativeContinuationRequest(fixture, 'native-binding-b', 'native-binding-operation', 'second')
+    const response = await fixture.app.request('/v1/sessions/native-binding-a/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(response.status).toBe(409)
+    expect(await json(response)).toMatchObject({ acknowledgement: { status: 'conflict' } })
+    expect(backend.natives.map(native => native.prompts)).toEqual([['first'], ['first']])
+  })
+
+  it('replays a completed native continuation after reopening the durable store', async () => {
+    const original = setup(new FakeNativeBackend())
+    fixture = original
+    await original.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'native-restart', model: 'pi/test' }) })
+    await original.app.request('/v1/sessions/native-restart/turns', {
+      method: 'POST',
+      body: turnBody('native-restart-first', { message: 'first' }),
+    })
+    await waitFor(() => original.store.getRetained('native-restart')?.turns === 1)
+    const expectedBoundary = original.store.getRetained('native-restart')?.contextBoundary as NativeContextBoundaryProof
+    const input = nativeContinuationRequest(original, 'native-restart', 'native-restart-operation', 'second', expectedBoundary)
+    const accepted = await original.app.request('/v1/sessions/native-restart/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(accepted.status).toBe(200)
+    const acceptedOutcome = successfulNativeOutcome(AgentNativeContextContinuationResultSchema.parse(await json(accepted)))
+    const dir = original.dir
+    await original.runs.shutdown(1_000)
+    await original.service.shutdown(1_000)
+    original.unwatch()
+    original.store.close()
+
+    const restartedBackend = new FakeNativeBackend()
+    fixture = setup(restartedBackend, dir)
+    const replay = await fixture.app.request('/v1/sessions/native-restart/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(replay.status).toBe(200)
+    const replayOutcome = successfulNativeOutcome(AgentNativeContextContinuationResultSchema.parse(await json(replay)))
+    expect(replayOutcome.acknowledgement.status).toBe('replayed')
+    expect(replayOutcome.result).toEqual(acceptedOutcome.result)
+    expect(replayOutcome.controlRef).toEqual(acceptedOutcome.controlRef)
+    expect(restartedBackend.natives).toEqual([])
+  })
+
+  it('settles a pending native continuation after restart without dispatching it again', async () => {
+    const original = setup(new FakeNativeBackend())
+    fixture = original
+    await original.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'native-pending', model: 'pi/test' }) })
+    await original.app.request('/v1/sessions/native-pending/turns', {
+      method: 'POST',
+      body: turnBody('native-pending-first', { message: 'first' }),
+    })
+    await waitFor(() => original.store.getRetained('native-pending')?.turns === 1)
+    const expectedBoundary = original.store.getRetained('native-pending')?.contextBoundary as NativeContextBoundaryProof
+    const input = nativeContinuationRequest(original, 'native-pending', 'native-pending-operation', 'second', expectedBoundary)
+    expect(original.store.recordRetainedControlOperation({
+      operationId: input.request.operationId,
+      callerId: canonicalCandidateDigest('loopback'),
+      kind: 'native_continuation',
+      runId: nativeContinuationRunId(input.request.operationId),
+      sessionId: 'native-pending',
+      requestDigest: input.request.requestDigest,
+      acknowledgement: { status: 'pending' },
+    })).toBe(true)
+
+    const dir = original.dir
+    await original.runs.shutdown(1_000)
+    await original.service.shutdown(1_000)
+    original.unwatch()
+    original.store.close()
+
+    const restartedBackend = new FakeNativeBackend()
+    fixture = setup(restartedBackend, dir)
+    const response = await fixture.app.request('/v1/sessions/native-pending/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(response.status).toBe(404)
+    expect(await json(response)).toMatchObject({ acknowledgement: { status: 'unknown_session' } })
+    expect(fixture.store.getRetainedControlOperation(input.request.operationId)?.acknowledgement).toMatchObject({
+      status: 'completed',
+      outcome: { acknowledgement: { status: 'unknown_session' } },
+    })
+    expect(restartedBackend.natives).toEqual([])
+  })
+
+  it('reconstructs a terminal native continuation after a settle-window crash', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-native-crash-window-'))
+    const store = new CrashBeforeNativeContinuationSettleStore(dir)
+    const original = setup(new FakeNativeBackend(), dir, {}, store)
+    fixture = original
+    await original.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'native-crash-window', model: 'pi/test' }) })
+    await original.app.request('/v1/sessions/native-crash-window/turns', {
+      method: 'POST',
+      body: turnBody('native-crash-window-first', { message: 'first' }),
+    })
+    await waitFor(() => original.store.getRetained('native-crash-window')?.turns === 1)
+    const expectedBoundary = original.store.getRetained('native-crash-window')?.contextBoundary as NativeContextBoundaryProof
+    const input = nativeContinuationRequest(
+      original,
+      'native-crash-window',
+      'native-crash-window-operation',
+      'second',
+      expectedBoundary,
+    )
+    const failed = await original.app.request('/v1/sessions/native-crash-window/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(failed.status).toBe(502)
+    expect(await json(failed)).toMatchObject({ acknowledgement: { status: 'transport_failure' } })
+    const pending = original.store.getRetainedControlOperation(input.request.operationId)
+    expect(pending?.acknowledgement).toMatchObject({
+      status: 'pending',
+      actualBoundary: {
+        ...input.request.run,
+        boundary: expectedBoundary.boundary,
+      },
+    })
+    expect(original.store.getRetainedRun(nativeContinuationRunId(input.request.operationId))?.snapshot).toMatchObject({
+      terminal: true,
+      status: 'done',
+    })
+
+    const restartDir = original.dir
+    await original.runs.shutdown(1_000)
+    await original.service.shutdown(1_000)
+    original.unwatch()
+    original.store.close()
+
+    const restartedBackend = new FakeNativeBackend()
+    fixture = setup(restartedBackend, restartDir)
+    const replay = await fixture.app.request('/v1/sessions/native-crash-window/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(replay.status).toBe(200)
+    const replayOutcome = successfulNativeOutcome(AgentNativeContextContinuationResultSchema.parse(await json(replay)))
+    expect(replayOutcome.acknowledgement.status).toBe('replayed')
+    expect(replayOutcome.result).toMatchObject({ text: 'reply-2', success: true })
+    expect(fixture.store.getRetainedControlOperation(input.request.operationId)?.acknowledgement).toMatchObject({
+      status: 'completed',
+      outcome: { acknowledgement: { status: 'accepted' } },
+    })
+    expect(restartedBackend.natives).toEqual([])
   })
 
   it('retries steer and cancel by durable operation id without repeating native effects', async () => {

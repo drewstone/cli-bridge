@@ -12,6 +12,7 @@
 import {
   canonicalCandidateDigest,
   normalizeInputParts,
+  type NativeContextBoundaryProof,
   type InteractionRequest,
   type RequestedInteractions,
 } from '@tangle-network/agent-interface'
@@ -20,7 +21,7 @@ import type { ChatRequest, NativeSession } from '../../backends/types.js'
 import { RunAdmissionClosedError, RunIdentityConflictError, type RunRegistry } from '../../runs/registry.js'
 import type { RetainedSessionRecord, SessionStore } from '../store.js'
 import { admittedTurnInteractions, isNativeBackend } from './capabilities.js'
-import { verifyRetainedBoundary } from './context-boundary.js'
+import { assertRetainedBoundaryMatches, verifyRetainedBoundary } from './context-boundary.js'
 import { canonicalTurn } from './native-turn.js'
 import { retainedRunSnapshot, unknownRunSnapshot, type RetainedSessionState } from './state.js'
 import { renderTurnInput, type RetainedTurnInput } from './schema.js'
@@ -52,6 +53,13 @@ export interface RetainedTurnRunnerOptions {
   }) => Promise<void>
 }
 
+export interface RetainedBeginTurnOptions extends TurnLaneOptions {
+  /** Native continuation callers must compare this inside the turn owner. */
+  expectedContextBoundary?: NativeContextBoundaryProof
+  /** Report the source proof observed during the same native handoff check. */
+  onBoundaryVerified?: (proof: NativeContextBoundaryProof) => void
+}
+
 export class RetainedTurnRunner {
   private readonly store: SessionStore
   private readonly registry: BackendRegistry
@@ -73,7 +81,7 @@ export class RetainedTurnRunner {
     this.denyUnrequestedInteraction = options.denyUnrequestedInteraction
   }
 
-  async beginTurn(id: string, input: RetainedTurnInput, options: TurnLaneOptions = {}): Promise<RetainedTurnResult> {
+  async beginTurn(id: string, input: RetainedTurnInput, options: RetainedBeginTurnOptions = {}): Promise<RetainedTurnResult> {
     if (!input.run_id) {
       throw new RetainedSessionError('retained turns require a stable run_id', 400, 'invalid_request_error')
     }
@@ -97,7 +105,7 @@ export class RetainedTurnRunner {
       }
       this.state.beginAdmission(id)
       admitted = true
-      const result = await this.beginTurnNow(id, input)
+      const result = await this.beginTurnNow(id, input, options)
       const run = this.runs.get(result.run.id)
       if (!run) {
         ticket.release()
@@ -115,6 +123,14 @@ export class RetainedTurnRunner {
     } finally {
       if (admitted) this.state.endAdmission(id)
     }
+  }
+
+  /** Wait for the owned native turn and its durable session finalization. */
+  async waitForRun(runId: string): Promise<void> {
+    const run = this.runs.get(runId)
+    if (!run) throw new RetainedSessionError(`retained run ${JSON.stringify(runId)} is unknown`, 404, 'unknown_session')
+    await run.whenTerminal()
+    await (this.finalizations.get(runId) ?? Promise.resolve())
   }
 
   /** Wait for every in-flight durable commit, or report which ones hung. */
@@ -139,7 +155,11 @@ export class RetainedTurnRunner {
     }
   }
 
-  private async beginTurnNow(id: string, input: RetainedTurnInput): Promise<RetainedTurnResult> {
+  private async beginTurnNow(
+    id: string,
+    input: RetainedTurnInput,
+    options: RetainedBeginTurnOptions,
+  ): Promise<RetainedTurnResult> {
     const retained = this.state.require(id)
     if (retained.status === 'closed' || retained.status === 'cancelled') {
       throw new RetainedSessionError(
@@ -148,6 +168,7 @@ export class RetainedTurnRunner {
         'invalid_state',
       )
     }
+    if (options.expectedContextBoundary) assertRetainedBoundaryMatches(retained, options.expectedContextBoundary)
     const prompt = renderTurnInput(input)
     const config = this.requestConfig(retained, input)
     if (config.execution?.kind === 'sandbox') {
@@ -226,14 +247,15 @@ export class RetainedTurnRunner {
     }
     const existingNative = existingControl?.session ?? null
     if (existingControl && existingNative) {
-      const inspected = await existingControl.run.inspectNativeControl(existingNative, (native) =>
-        verifyRetainedBoundary(native, retained, runId, {
+      const inspected = await existingControl.run.inspectNativeControl(existingNative, async (native) => {
+        const proof = await verifyRetainedBoundary(native, retained, runId, {
           provider: providerName,
           environmentId,
           executionId,
           requestDigest,
-        }),
-      )
+        })
+        options.onBoundaryVerified?.(proof)
+      })
       if (!inspected) {
         throw new RetainedSessionError('native session ownership changed before continuation', 409, 'invalid_state')
       }
