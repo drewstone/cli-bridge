@@ -22,6 +22,8 @@ export interface DeltaStreamHost {
   setFailure(error: unknown): void
   /** A failure before any output — the only kind that can replace the body. */
   setSetupError(error: unknown): void
+  /** Mark the run unknown when replay persistence cannot commit an event. */
+  markDurabilityUnknown(error: unknown): void
   finish(status: Exclude<RunStatus, 'running'>): void
 }
 
@@ -66,10 +68,16 @@ export class DeltaRunStream {
         // replay and reconnect. A bare `{ finish_reason: 'error' }` left the
         // caller with an empty completion whose only explanation was in this
         // process's stdout.
-        const receipt = options.terminalReceipt?.()
-        if (receipt) this.log.append({ profile_materialization: receipt })
-        this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
-        this.host.finish('error')
+        try {
+          const receipt = options.terminalReceipt?.()
+          if (receipt) this.log.append({ profile_materialization: receipt })
+          this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
+          this.host.finish('error')
+        } catch (persistenceError) {
+          this.host.setFailure(persistenceError)
+          this.host.markDurabilityUnknown(persistenceError)
+          this.host.finish('unknown')
+        }
         console.error(`[cli-bridge] run ${this.host.runId} failed:`, error)
       }
     }

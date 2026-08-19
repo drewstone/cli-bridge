@@ -19,6 +19,7 @@ import {
   renderInputPartsAsText,
 } from '@tangle-network/agent-interface'
 import { RetainedSessionError } from './types.js'
+import { wireIdentifierSchema } from '../../runs/identifiers.js'
 import {
   isBoundedJsonValue,
   retainedEnvSchema,
@@ -46,14 +47,8 @@ const boundedJsonSchema = z.custom<unknown>(isBoundedJsonValue, {
 })
 const boundedJsonRecordSchema = retainedPublicRecordSchema
 
-// Retained resource and caller run ids use the public stable-id contract.
-// URL-safe routing is handled by the HTTP client through path escaping; the
-// contract itself does not add a private ASCII-only restriction.
-const idSchema = z
-  .string()
-  .min(1)
-  .max(512)
-  .refine((value) => value.trim() === value, 'identifier cannot have outer whitespace')
+// Retained resource and caller run ids use one Agent Interface wire contract.
+const idSchema = wireIdentifierSchema
 
 const createSchema = z.strictObject({
   id: idSchema.optional(),

@@ -18,7 +18,6 @@ import type { Context, Hono } from 'hono'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import {
-  AgentRunControlRefSchema,
   canonicalAgentProfileDigest,
   canonicalCandidateDigest,
   RequestedInteractionsSchema,
@@ -31,6 +30,7 @@ import {
   type SessionExecutionLease,
   type SessionRecord,
   type SessionStore,
+  type RetainedRunAdmission,
 } from '../sessions/store.js'
 import type { Backend, ChatDelta, ChatRequest, ProtectedModelCredential } from '../backends/types.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
@@ -58,7 +58,7 @@ import {
   resolveAgentProfile,
   resolveRequestedReasoningEffort,
 } from '../backends/profile-support.js'
-import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
+import { resolveRunEventCursor, streamChatDeltaEvents, streamRunEvents } from './run-events.js'
 import { setRunIdentityHeaders } from '../runs/headers.js'
 import { isLoopbackRequest } from '../http/request-source.js'
 import {
@@ -71,6 +71,9 @@ import {
   retainedPublicRecordSchema,
 } from '../sessions/retained/contract.js'
 import { ENVIRONMENT_ID } from '../sessions/retained/types.js'
+import { wireIdentifierSchema } from '../runs/identifiers.js'
+import { retainedRunSnapshot, unknownRunSnapshot } from '../sessions/retained/state.js'
+import type { RetainedEventRecord } from '../sessions/store.js'
 
 /** Header accepted only from the local Runtime → cli-bridge transport. */
 export const PROTECTED_MODEL_CREDENTIAL_HEADER = 'x-cli-bridge-model-credential'
@@ -86,36 +89,6 @@ class SandboxBackendUnavailableError extends Error {
     this.name = 'SandboxBackendUnavailableError'
   }
 }
-
-const durableRunIdSchema = z
-  .string()
-  .min(1)
-  .max(128)
-  .regex(
-    /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u,
-    'run id must be URL-safe: letters, digits, dot, underscore, colon, or hyphen',
-  )
-
-// Agent Interface uses one bounded identifier contract for these coordinates.
-// Keep each field tied to its source schema while rejecting control bytes before
-// values are copied into response headers.
-type SourceCoordinateSchema = {
-  safeParse: (value: unknown) => { success: boolean }
-}
-
-function exactCoordinateSchema(source: SourceCoordinateSchema, field: string) {
-  return z.custom<string>(
-    (value) => typeof value === 'string'
-      && source.safeParse(value).success
-      && !/[\r\n\0]/u.test(value),
-    { message: `${field} must be a safe identifier` },
-  )
-}
-
-const exactProviderSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.provider, 'provider')
-const exactEnvironmentIdSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.environmentId, 'environment_id')
-const exactSessionIdSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.sessionId, 'session_id')
-const exactExecutionIdSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.executionId, 'execution_id')
 
 // Node timers above this value overflow to an almost-immediate callback. This
 // is the implementation limit, not a product policy; omitting the field means
@@ -191,11 +164,11 @@ const chatRequestSchema = z.object({
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
   /** Exact durable-run provider coordinate. Must be paired with the other exact coordinates. */
-  provider: exactProviderSchema.optional(),
+  provider: z.string().optional(),
   /** Exact durable-run environment coordinate. Must be paired with the other exact coordinates. */
-  environment_id: exactEnvironmentIdSchema.optional(),
+  environment_id: z.string().optional(),
   /** Exact durable-run execution coordinate. Must be paired with the other exact coordinates. */
-  execution_id: exactExecutionIdSchema.optional(),
+  execution_id: z.string().optional(),
   /**
    * Durable-run id. Decouples the JOB from this HTTP connection. A
    * client disconnect never kills the run; a reconnect/retry that reuses
@@ -208,7 +181,7 @@ const chatRequestSchema = z.object({
    * Reconnect replay: send `Last-Event-ID: <seq>` (or `X-Last-Event-Id`)
    * with the same run_id to replay only the deltas missed since `seq`.
    */
-  run_id: durableRunIdSchema.optional(),
+  run_id: z.string().optional(),
   mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
   // OpenAI-compatible shape — wire is snake_case, TS is camelCase. We
   // translate to responseFormat when we build the ChatRequest below.
@@ -377,7 +350,7 @@ export function mountChatCompletions(
   deps: {
     registry: BackendRegistry
     sessions: SessionStore
-    retainedRuns?: Pick<SessionStore, 'getRetainedRun'>
+    retainedRuns?: Pick<SessionStore, 'getRetainedRun' | 'claimRetainedRun' | 'updateRetainedRun' | 'appendRetainedDelta' | 'retainedEventsAfterRun'>
     runs: RunRegistry
     admission?: AdmissionGate
     /**
@@ -679,32 +652,91 @@ export function mountChatCompletions(
       return invalidRequest(c, 'chat request cannot be canonicalized as durable-run identity')
     }
     const retainedAdmission = deps.retainedRuns?.getRetainedRun(runId) ?? null
-    if (retainedAdmission) {
-      return runIdentityConflict(
-        c,
-        new RunIdentityConflictError(
-          runId,
-          retainedAdmission.requestDigest,
-          requestDigest,
-          'retained',
-          'one-shot',
-        ),
-      )
+    const liveRun = deps.runs.get(runId)
+    if (retainedAdmission && !liveRun) {
+      if (
+        retainedAdmission.owner !== 'one-shot'
+        || retainedAdmission.requestDigest !== requestDigest
+        || retainedAdmission.provider !== (exactCoordinates.value?.provider ?? backend.name)
+        || retainedAdmission.environmentId !== (exactCoordinates.value?.environmentId ?? ENVIRONMENT_ID)
+        || retainedAdmission.sessionId !== (exactCoordinates.value?.sessionId ?? req.session_id ?? runId)
+        || retainedAdmission.executionId !== (exactCoordinates.value?.executionId ?? runId)
+      ) {
+        return runIdentityConflict(
+          c,
+          new RunIdentityConflictError(
+            runId,
+            retainedAdmission.requestDigest,
+            requestDigest,
+            retainedAdmission.owner,
+            'one-shot',
+          ),
+        )
+      }
+      return respondFromPersistedRun(c, retainedAdmission, req, afterSeq, deps.retainedRuns!)
     }
     let claim: ReturnType<RunRegistry['claim']>
     try {
+      const runSessionId = exactCoordinates.value?.sessionId ?? req.session_id ?? runId
+      const runExecutionId = exactCoordinates.value?.executionId ?? runId
+      const runProvider = exactCoordinates.value?.provider ?? backend.name
+      const runEnvironmentId = exactCoordinates.value?.environmentId ?? ENVIRONMENT_ID
       claim = deps.runs.claim(runId, requestDigest, {
         owner: 'one-shot',
-        provider: exactCoordinates.value?.provider ?? backend.name,
-        environmentId: exactCoordinates.value?.environmentId ?? ENVIRONMENT_ID,
-        sessionId: exactCoordinates.value?.sessionId ?? req.session_id ?? runId,
-        executionId: exactCoordinates.value?.executionId ?? runId,
+        provider: runProvider,
+        environmentId: runEnvironmentId,
+        sessionId: runSessionId,
+        executionId: runExecutionId,
+        ...(deps.retainedRuns ? {
+          commitDelta: (input) => {
+            deps.retainedRuns!.appendRetainedDelta(runSessionId, input)
+          },
+          commitSnapshot: (snapshot) => {
+            deps.retainedRuns!.updateRetainedRun(runId, requestDigest, snapshot)
+          },
+        } : {}),
       })
     } catch (error) {
       if (error instanceof RunIdentityConflictError) return runIdentityConflict(c, error)
       throw error
     }
     const run = claim.run
+
+    if (claim.created && deps.retainedRuns) {
+      let durableClaim
+      try {
+        durableClaim = deps.retainedRuns.claimRetainedRun({
+          owner: 'one-shot',
+          runId,
+          sessionId: run.sessionId ?? runId,
+          executionId: run.executionId ?? runId,
+          requestDigest,
+          provider: run.provider ?? backend.name,
+          environmentId: run.environmentId ?? ENVIRONMENT_ID,
+          snapshot: run.snapshot(),
+        })
+      } catch (error) {
+        deps.runs.releaseClaim(runId, run)
+        throw error
+      }
+      if (durableClaim.kind === 'conflict') {
+        deps.runs.releaseClaim(runId, run)
+        return runIdentityConflict(
+          c,
+          new RunIdentityConflictError(
+            runId,
+            durableClaim.admission.requestDigest,
+            requestDigest,
+            durableClaim.admission.owner,
+            'one-shot',
+          ),
+        )
+      }
+      if (durableClaim.kind === 'replayed') {
+        deps.runs.releaseClaim(runId, run)
+        return respondFromPersistedRun(c, durableClaim.admission, req, afterSeq, deps.retainedRuns)
+      }
+    }
 
     // Atomic claim happens BEFORE admission or backend setup. An identical racing request attaches
     // to this run and cannot acquire a second slot; a different request under the same id was
@@ -1127,6 +1159,128 @@ async function respondFromRun(
   return streamRunEvents(c, run, req.model, afterSeq)
 }
 
+/** Replay a one-shot run from SQLite after the bridge process has restarted. */
+async function respondFromPersistedRun(
+  c: Context,
+  admission: RetainedRunAdmission,
+  req: ChatRequest,
+  afterSeq: number,
+  store: Pick<SessionStore, 'retainedEventsAfterRun'>,
+): Promise<Response> {
+  const snapshot = persistedOneShotSnapshot(admission)
+  try {
+    assertPersistedReplayCursor(admission, afterSeq)
+  } catch (error) {
+    if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
+    throw error
+  }
+  c.header('X-Bridge-Mode', req.mode ?? 'byob')
+  setRunIdentityHeaders(c, snapshot)
+  const source = persistedChatDeltas(
+    admission,
+    store,
+    afterSeq,
+    'lastSeq' in snapshot ? snapshot.lastSeq : undefined,
+  )
+  if (req.stream === true) return streamChatDeltaEvents(c, () => source, req.model)
+  try {
+    const body = await collectNonStreaming(mapSeq(source), req.model)
+    return c.json(body)
+  } catch (error) {
+    return errorResponse(c, error)
+  }
+}
+
+function persistedOneShotSnapshot(admission: RetainedRunAdmission) {
+  const persisted = retainedRunSnapshot(
+    admission.snapshot,
+    admission.runId,
+    admission.executionId,
+    admission.requestDigest,
+    admission.sessionId,
+    { provider: admission.provider, environmentId: admission.environmentId },
+  )
+  return persisted.terminal
+    ? persisted
+    : unknownRunSnapshot(
+        admission.runId,
+        admission.executionId,
+        admission.requestDigest,
+        admission.sessionId,
+        { provider: admission.provider, environmentId: admission.environmentId },
+      )
+}
+
+function assertPersistedReplayCursor(
+  admission: RetainedRunAdmission,
+  afterSeq: number,
+): void {
+  const persisted = retainedRunSnapshot(
+    admission.snapshot,
+    admission.runId,
+    admission.executionId,
+    admission.requestDigest,
+    admission.sessionId,
+    { provider: admission.provider, environmentId: admission.environmentId },
+  )
+  const lastSeq = 'lastSeq' in persisted ? persisted.lastSeq : 0
+  const replay = 'replay' in persisted ? persisted.replay : undefined
+  const firstAvailableSeq = replay?.firstAvailableSeq ?? 1
+  if (afterSeq > lastSeq) {
+    throw new RunReplayCursorError(admission.runId, afterSeq, firstAvailableSeq, lastSeq, 'ahead')
+  }
+  if (
+    replay?.expired
+    || (replay?.expiresAt !== null && replay?.expiresAt !== undefined && replay.expiresAt <= Date.now())
+    || afterSeq < firstAvailableSeq - 1
+  ) {
+    throw new RunReplayCursorError(admission.runId, afterSeq, firstAvailableSeq, lastSeq, 'expired')
+  }
+}
+
+function persistedChatDeltas(
+  admission: RetainedRunAdmission,
+  store: Pick<SessionStore, 'retainedEventsAfterRun'>,
+  afterSeq: number,
+  expectedLastSeq: number | undefined,
+): AsyncIterable<{ seq: number; delta: ChatDelta }> {
+  return {
+    async *[Symbol.asyncIterator](): AsyncIterator<{ seq: number; delta: ChatDelta }> {
+      const events = store.retainedEventsAfterRun(admission.sessionId, admission.runId, afterSeq)
+      let nextSequence = afterSeq + 1
+      for (const record of events) {
+        if (record.envelope.sequence !== nextSequence) {
+          throw new Error(
+            `persisted run ${JSON.stringify(admission.runId)} has a replay gap at sequence ${nextSequence}`,
+          )
+        }
+        const delta = chatDeltaFromRetainedEvent(record)
+        if (!delta) {
+          throw new Error(
+            `persisted run ${JSON.stringify(admission.runId)} contains a non-chat event at sequence ${record.envelope.sequence}`,
+          )
+        }
+        yield { seq: record.envelope.sequence, delta }
+        nextSequence += 1
+      }
+      if (expectedLastSeq !== undefined && nextSequence - 1 !== expectedLastSeq) {
+        throw new Error(
+          `persisted run ${JSON.stringify(admission.runId)} ends at sequence ${nextSequence - 1}, expected ${expectedLastSeq}`,
+        )
+      }
+    },
+  }
+}
+
+function chatDeltaFromRetainedEvent(record: RetainedEventRecord): ChatDelta | null {
+  const event = record.envelope.event
+  if (event.type !== 'raw' || event.backend !== 'cli-bridge.chat') return null
+  if (!event.event || typeof event.event !== 'object' || Array.isArray(event.event)) {
+    throw new Error(`persisted chat event ${JSON.stringify(record.envelope.eventId)} is invalid`)
+  }
+  return event.event as ChatDelta
+}
+
 /** Unwrap SeqDelta → ChatDelta for the non-streaming collector. */
 async function* mapSeq(iter: AsyncIterable<{ delta: ChatDelta }>): AsyncIterable<ChatDelta> {
   for await (const { delta } of iter) yield delta
@@ -1144,7 +1298,7 @@ function resolveRunId(
     return { ok: false, message: 'run_id and X-Run-Id must match when both are provided' }
   }
   const candidate = bodyValue ?? headerValue ?? crypto.randomUUID()
-  const parsed = durableRunIdSchema.safeParse(candidate)
+  const parsed = wireIdentifierSchema.safeParse(candidate)
   if (!parsed.success) {
     return { ok: false, message: parsed.error.issues[0]?.message ?? 'invalid run id' }
   }
@@ -1170,7 +1324,7 @@ function resolveSessionId(input: {
     return { ok: false, message: 'session id must be non-empty when provided' }
   }
   for (const [name, value] of present) {
-    const parsed = exactSessionIdSchema.safeParse(value)
+    const parsed = wireIdentifierSchema.safeParse(value)
     if (!parsed.success) return { ok: false, message: `${name} must be a safe identifier` }
   }
   const first = present[0]?.[1]
@@ -1194,9 +1348,19 @@ function resolveExactRunCoordinates(input: {
   sessionId?: string
   hasExplicitRunId: boolean
 }): ParsedHeader<ExactRunCoordinates | null> {
-  const provided = [input.provider, input.environmentId, input.executionId]
-    .filter((value): value is string => value !== undefined)
+  const coordinateValues = [
+    ['provider', input.provider],
+    ['environment_id', input.environmentId],
+    ['execution_id', input.executionId],
+  ] as const
+  const provided = coordinateValues.filter(([, value]) => value !== undefined)
   if (provided.length === 0) return { ok: true, value: null }
+  const parsed = new Map<string, string>()
+  for (const [name, value] of provided) {
+    const result = wireIdentifierSchema.safeParse(value)
+    if (!result.success) return { ok: false, message: `${name} must be a safe identifier` }
+    parsed.set(name, result.data)
+  }
   if (provided.length !== 3) {
     return {
       ok: false,
@@ -1209,17 +1373,13 @@ function resolveExactRunCoordinates(input: {
   if (input.sessionId === undefined) {
     return { ok: false, message: 'exact run coordinates require session_id or a session header' }
   }
-  const sessionId = exactSessionIdSchema.safeParse(input.sessionId)
-  if (!sessionId.success) {
-    return { ok: false, message: 'exact run session_id must be a safe identifier' }
-  }
   return {
     ok: true,
     value: {
-      provider: input.provider!,
-      environmentId: input.environmentId!,
-      sessionId: sessionId.data,
-      executionId: input.executionId!,
+      provider: parsed.get('provider')!,
+      environmentId: parsed.get('environment_id')!,
+      sessionId: input.sessionId,
+      executionId: parsed.get('execution_id')!,
     },
   }
 }

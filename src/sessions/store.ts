@@ -21,7 +21,9 @@ import type {
   InteractionRequest,
   RuntimeEventEnvelope,
 } from '@tangle-network/agent-interface'
-import { RuntimeEventEnvelopeSchema } from '@tangle-network/agent-interface'
+import { canonicalCandidateDigest, RuntimeEventEnvelopeSchema } from '@tangle-network/agent-interface'
+import type { ChatDelta } from '../backends/types.js'
+import type { RunOwner } from '../runs/types.js'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
 import {
   createInteractionOperationSchema,
@@ -92,6 +94,7 @@ export interface RetainedEventRecord {
 
 export interface RetainedRunAdmission {
   runId: string
+  owner: RunOwner
   sessionId: string
   executionId: string
   requestDigest: string
@@ -280,6 +283,7 @@ const EXPECTED_SESSION_SCHEMA: Record<string, ExpectedColumn[]> = {
     { name: 'updated_at', type: 'INTEGER', notnull: 1, defaultValue: null, pk: 0 },
     { name: 'provider', type: 'TEXT', notnull: 1, defaultValue: "'cli-bridge'", pk: 0 },
     { name: 'environment_id', type: 'TEXT', notnull: 1, defaultValue: "'cli-bridge'", pk: 0 },
+    { name: 'owner', type: 'TEXT', notnull: 1, defaultValue: "'retained'", pk: 0 },
   ],
   interaction_operations: INTERACTION_OPERATION_COLUMNS,
   retained_control_operations: [
@@ -401,7 +405,8 @@ export class SessionStore implements RetainedInteractionPersistence {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         provider TEXT NOT NULL DEFAULT 'cli-bridge',
-        environment_id TEXT NOT NULL DEFAULT 'cli-bridge'
+        environment_id TEXT NOT NULL DEFAULT 'cli-bridge',
+        owner TEXT NOT NULL DEFAULT 'retained'
       );
       CREATE INDEX IF NOT EXISTS idx_retained_run_admissions_session ON retained_run_admissions(session_id, created_at);
       CREATE TABLE IF NOT EXISTS retained_control_operations (
@@ -500,6 +505,9 @@ export class SessionStore implements RetainedInteractionPersistence {
       }
       if (!names.has('environment_id')) {
         this.db.exec("ALTER TABLE retained_run_admissions ADD COLUMN environment_id TEXT NOT NULL DEFAULT 'cli-bridge'")
+      }
+      if (!names.has('owner')) {
+        this.db.exec("ALTER TABLE retained_run_admissions ADD COLUMN owner TEXT NOT NULL DEFAULT 'retained'")
       }
     })()
   }
@@ -856,6 +864,7 @@ export class SessionStore implements RetainedInteractionPersistence {
 
   claimRetainedRun(input: {
     runId: string
+    owner?: RunOwner
     sessionId: string
     executionId: string
     requestDigest: string
@@ -864,11 +873,12 @@ export class SessionStore implements RetainedInteractionPersistence {
     snapshot: unknown
   }): RetainedRunClaim {
     const claim = this.db.transaction((): RetainedRunClaim => {
+      const owner = input.owner ?? 'retained'
       const now = Date.now()
       const inserted = this.db.prepare(
         `INSERT INTO retained_run_admissions
-         (run_id, session_id, execution_id, request_digest, snapshot_json, created_at, updated_at, provider, environment_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (run_id, session_id, execution_id, request_digest, snapshot_json, created_at, updated_at, provider, environment_id, owner)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(run_id) DO NOTHING`,
       ).run(
         input.runId,
@@ -880,6 +890,7 @@ export class SessionStore implements RetainedInteractionPersistence {
         now,
         input.provider,
         input.environmentId,
+        owner,
       )
       const admission = this.getRetainedRun(input.runId)
       if (!admission) throw new Error(`retained run admission ${JSON.stringify(input.runId)} was not persisted`)
@@ -889,6 +900,7 @@ export class SessionStore implements RetainedInteractionPersistence {
         || admission.requestDigest !== input.requestDigest
         || admission.provider !== input.provider
         || admission.environmentId !== input.environmentId
+        || admission.owner !== owner
       ) {
         return { kind: 'conflict', admission }
       }
@@ -904,6 +916,7 @@ export class SessionStore implements RetainedInteractionPersistence {
     if (!row) return null
     return {
       runId: row.run_id as string,
+      owner: row.owner as RunOwner,
       sessionId: row.session_id as string,
       executionId: row.execution_id as string,
       requestDigest: row.request_digest as string,
@@ -971,6 +984,26 @@ export class SessionStore implements RetainedInteractionPersistence {
       return { sessionId, sessionSequence, envelope }
     })
     return append(input)
+  }
+
+  /** Persist one OpenAI delta in the existing canonical retained event log. */
+  appendRetainedDelta(sessionId: string, input: {
+    runId: string
+    sequence: number
+    delta: ChatDelta
+  }): RetainedEventRecord {
+    const event = JSON.parse(JSON.stringify(input.delta)) as unknown
+    return this.appendRetainedEvent(sessionId, {
+      runId: input.runId,
+      eventId: retainedDeltaEventId(input.runId, input.sequence),
+      sequence: input.sequence,
+      receivedAt: new Date().toISOString(),
+      event: {
+        type: 'raw',
+        backend: 'cli-bridge.chat',
+        event,
+      },
+    })
   }
 
   retainedEventsAfter(sessionId: string, afterCursor = 0): RetainedEventRecord[] {
@@ -1076,7 +1109,10 @@ export class SessionStore implements RetainedInteractionPersistence {
       `UPDATE retained_control_operations
        SET acknowledgement_json = ?
        WHERE operation_id = ? AND request_digest = ?
-         AND json_extract(acknowledgement_json, '$.status') = 'pending'`,
+         AND (
+           json_extract(acknowledgement_json, '$.status') = 'pending'
+           OR json_extract(acknowledgement_json, '$.phase') = 'pending'
+         )`,
     ).run(JSON.stringify(acknowledgement), operationId, requestDigest)
     return updated.changes === 1
   }
@@ -1230,4 +1266,11 @@ export class SessionStore implements RetainedInteractionPersistence {
       },
     }
   }
+}
+
+function retainedDeltaEventId(runId: string, sequence: number): string {
+  const candidate = `chat:${runId}:${sequence}`
+  return candidate.length <= 512
+    ? candidate
+    : `chat:${canonicalCandidateDigest({ runId, sequence }).slice('sha256:'.length)}`
 }

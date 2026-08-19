@@ -4,9 +4,11 @@
  * sequence-numbered for replay, and only explicit cancellation aborts the
  * backend job.
  *
- * This is deliberately process-local. A bridge restart loses active jobs
- * and their identity records, so a caller that sees 404 after reconnect
- * must treat the old job as unknown rather than proven stopped.
+ * Active executors and their abort signals are process-local. The production
+ * routes persist run admissions, output, and control records in SessionStore,
+ * so a restart loses execution ownership but not the run's durable identity.
+ * A caller that sees an active run after reconnect must treat its effect as
+ * unknown unless the persisted record proves a terminal outcome.
  *
  * The run itself, its replay log, its native-control lane, and its
  * interaction ledger live in siblings of this module; this file owns the
@@ -141,6 +143,8 @@ export class RunRegistry {
       options.executionId,
       options.provider,
       options.environmentId,
+      options.commitDelta,
+      options.commitSnapshot,
       options.commitCanonicalEvent,
       options.onNativeControlLost,
     )

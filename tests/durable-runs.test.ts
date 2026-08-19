@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Hono } from 'hono'
 import { describe, expect, it } from 'vitest'
 import {
@@ -18,6 +19,7 @@ import { mountRuns } from '../src/routes/runs.js'
 import { RunRegistry, type RunRegistryOptions } from '../src/runs/registry.js'
 import { SessionStore, type SessionRecord } from '../src/sessions/store.js'
 import { RETAINED_MAX_HTTP_BODY_BYTES } from '../src/sessions/retained/schema.js'
+import { RetainedSessionService } from '../src/sessions/retained.js'
 
 const CHAT_PATH = '/v1/chat/completions'
 
@@ -267,6 +269,7 @@ interface Fixture {
   app: Hono
   runs: RunRegistry
   sessions: SessionStore
+  dir: string
   cleanup: () => void
 }
 
@@ -280,12 +283,13 @@ function fixture(
   const runs = new RunRegistry(opts)
   const registry = new BackendRegistry().register(backend)
   const app = new Hono()
-  mountChatCompletions(app, { registry, sessions, runs, ...(admission ? { admission } : {}) })
-  mountRuns(app, { runs })
+  mountChatCompletions(app, { registry, sessions, retainedRuns: sessions, runs, ...(admission ? { admission } : {}) })
+  mountRuns(app, { runs, retainedStore: sessions })
   return {
     app,
     runs,
     sessions,
+    dir,
     cleanup: () => {
       runs.clear()
       sessions.close()
@@ -409,6 +413,200 @@ describe('durable run contract', () => {
     }
   })
 
+  it('recovers a completed generic run and exact cancellation across store/process restart', async () => {
+    const backend = new ReplayBackend(0)
+    const first = fixture(backend)
+    const runId = 'generic-restart-run'
+    const exact = {
+      provider: 'restart-provider',
+      environment_id: 'restart-environment',
+      session_id: 'restart-session',
+      execution_id: 'restart-execution',
+    }
+    let restartedStore: SessionStore | null = null
+    let restartedRuns: RunRegistry | null = null
+    try {
+      const body = { ...chatBody(runId, 'restart me', 'durable/test'), ...exact }
+      const initial = await postChat(first.app, body)
+      expect(initial.status).toBe(200)
+      await initial.text()
+      const requestDigest = initial.headers.get('x-run-request-digest')
+      expect(requestDigest).toMatch(/^sha256:/u)
+      expect(first.sessions.getRetainedRun(runId)).toMatchObject({
+        owner: 'one-shot',
+        requestDigest,
+        snapshot: { status: 'done', terminal: true, lastSeq: 3 },
+      })
+      const persistedSnapshot = first.sessions.getRetainedRun(runId)!.snapshot as {
+        requestDigest: `sha256:${string}`
+        provider: string
+        environmentId: string
+        sessionId: string
+        executionId: string
+      }
+      expect(first.sessions.retainedEventsAfterRun(exact.session_id, runId)).toHaveLength(3)
+
+      first.runs.clear()
+      first.sessions.close()
+
+      restartedStore = new SessionStore(first.dir)
+      restartedRuns = new RunRegistry()
+      const restartedRegistry = new BackendRegistry().register(new ReplayBackend(0))
+      const restartedService = new RetainedSessionService({
+        store: restartedStore,
+        registry: restartedRegistry,
+        runs: restartedRuns,
+      })
+      const restarted = new Hono()
+      mountChatCompletions(restarted, {
+        registry: restartedRegistry,
+        sessions: restartedStore,
+        retainedRuns: restartedStore,
+        runs: restartedRuns,
+      })
+      mountRuns(restarted, {
+        runs: restartedRuns,
+        retainedRuns: restartedService,
+        retainedStore: restartedStore,
+      })
+
+      const replayed = await postChat(restarted, body)
+      expect(replayed.status).toBe(200)
+      expect(replayed.headers.get('x-run-id')).toBe(runId)
+      expect(replayed.headers.get('x-run-request-digest')).toBe(requestDigest)
+      expect(replayed.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(replayed.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(replayed.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(replayed.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      const replayedText = await replayed.text()
+      expect(replayedText).toContain('one')
+      expect(replayedText).toContain('two')
+      expect(restartedRuns.get(runId)).toBeUndefined()
+
+      const status = await restarted.request(`/v1/runs/${runId}`)
+      expect(status.status).toBe(200)
+      expect(status.headers.get('x-run-request-digest')).toBe(requestDigest)
+      await expect(status.json()).resolves.toMatchObject({ status: 'done', terminal: true })
+
+      const events = await restarted.request(`/v1/runs/${runId}/events`, {
+        headers: { 'Last-Event-ID': '0' },
+      })
+      expect(events.status).toBe(200)
+      expect(await events.text()).toContain('cli-bridge.chat')
+
+      const cancellation = cancellationRequest(
+        'restart-cancellation',
+        {
+          runId,
+          requestDigest: persistedSnapshot.requestDigest,
+          provider: persistedSnapshot.provider,
+          environmentId: persistedSnapshot.environmentId,
+          sessionId: persistedSnapshot.sessionId,
+          executionId: persistedSnapshot.executionId,
+        },
+        'reconcile after restart',
+      )
+      const cancelled = await restarted.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(cancellation),
+      })
+      expect(cancelled.status).toBe(200)
+      expect(cancelled.headers.get('x-run-id')).toBe(runId)
+      expect(cancelled.headers.get('x-run-request-digest')).toBe(persistedSnapshot.requestDigest)
+      expect(cancelled.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(cancelled.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(cancelled.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(cancelled.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      await expect(cancelled.json()).resolves.toMatchObject({ status: 'accepted', effect: 'not_live' })
+
+      const replayedCancellation = await restarted.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(cancellation),
+      })
+      expect(replayedCancellation.status).toBe(200)
+      expect(replayedCancellation.headers.get('x-run-id')).toBe(runId)
+      expect(replayedCancellation.headers.get('x-run-request-digest')).toBe(persistedSnapshot.requestDigest)
+      expect(replayedCancellation.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(replayedCancellation.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(replayedCancellation.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(replayedCancellation.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      await expect(replayedCancellation.json()).resolves.toMatchObject({ status: 'replayed', effect: 'not_live' })
+    } finally {
+      if (restartedRuns) restartedRuns.clear()
+      if (restartedStore) restartedStore.close()
+      rmSync(first.dir, { recursive: true, force: true })
+    }
+  })
+
+  it('recovers a completed generic run across an actual server process restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-actual-restart-'))
+    const runId = 'actual-process-restart-run'
+    const exact = {
+      provider: 'process-provider',
+      environment_id: 'process-environment',
+      session_id: 'process-session',
+      execution_id: 'process-execution',
+    }
+    const body = { ...chatBody(runId, 'survive the process', 'durable/test'), ...exact, stream: false }
+    let first: ChildServer | null = null
+    let second: ChildServer | null = null
+    try {
+      first = await startChildServer(dir)
+      const initial = await fetchChildChat(first.port, body)
+      expect(initial.status).toBe(200)
+      const requestDigest = initial.headers.get('x-run-request-digest')
+      expect(requestDigest).toMatch(/^sha256:/u)
+      await initial.text()
+      await first.stop()
+      first = null
+
+      second = await startChildServer(dir)
+      const replayed = await fetchChildChat(second.port, body)
+      expect(replayed.status).toBe(200)
+      expect(replayed.headers.get('x-run-request-digest')).toBe(requestDigest)
+      expect(await replayed.text()).toContain('one')
+      expect(await fetchChildStatus(second.port, runId)).toMatchObject({ status: 'done', terminal: true })
+
+      const cancellation = cancellationRequest(
+        'actual-process-restart-cancellation',
+        {
+          runId,
+          requestDigest: requestDigest as `sha256:${string}`,
+          provider: exact.provider,
+          environmentId: exact.environment_id,
+          sessionId: exact.session_id,
+          executionId: exact.execution_id,
+        },
+        'reconcile after actual restart',
+      )
+      const cancelled = await fetchChildCancellation(second.port, runId, cancellation)
+      expect(cancelled.status).toBe(200)
+      expect(cancelled.headers.get('x-run-id')).toBe(runId)
+      expect(cancelled.headers.get('x-run-request-digest')).toBe(requestDigest)
+      expect(cancelled.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(cancelled.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(cancelled.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(cancelled.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      await expect(cancelled.json()).resolves.toMatchObject({ status: 'accepted', effect: 'not_live' })
+
+      const replayedCancellation = await fetchChildCancellation(second.port, runId, cancellation)
+      expect(replayedCancellation.status).toBe(200)
+      expect(replayedCancellation.headers.get('x-run-id')).toBe(runId)
+      expect(replayedCancellation.headers.get('x-run-request-digest')).toBe(requestDigest)
+      expect(replayedCancellation.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(replayedCancellation.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(replayedCancellation.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(replayedCancellation.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      await expect(replayedCancellation.json()).resolves.toMatchObject({ status: 'replayed', effect: 'not_live' })
+    } finally {
+      if (second) await second.stop()
+      if (first) await first.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 30_000)
+
   it('preserves a 227-character provider-owned environment id through admission and status headers', async () => {
     const backend = new ReplayBackend(0, 'opencode')
     const ctx = fixture(backend)
@@ -431,6 +629,47 @@ describe('durable run contract', () => {
       expect(status.status).toBe(200)
       expect(status.headers.get('x-run-environment-id')).toBe(environmentId)
       await expect(status.json()).resolves.toMatchObject({ environmentId })
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
+  it('preserves the Agent Interface 512-character run id and rejects every unsafe control byte', async () => {
+    const backend = new ReplayBackend(0)
+    const ctx = fixture(backend)
+    const longRunId = `r${'x'.repeat(511)}`
+    try {
+      const dispatch = await postChat(ctx.app, { ...chatBody(longRunId), stream: false })
+      expect(dispatch.status).toBe(200)
+      expect(dispatch.headers.get('x-run-id')).toBe(longRunId)
+      await dispatch.text()
+
+      const status = await ctx.app.request(`/v1/runs/${encodeURIComponent(longRunId)}`)
+      expect(status.status).toBe(200)
+      expect(status.headers.get('x-run-id')).toBe(longRunId)
+
+      for (const [field, value] of [
+        ['run_id', `unsafe\u0001run`],
+        ['session_id', `unsafe\u001frun`],
+        ['provider', `unsafe\u007frun`],
+        ['environment_id', `unsafe\u0085run`],
+        ['execution_id', `unsafe\u0000run`],
+      ] as const) {
+        const response = await postChat(ctx.app, {
+          ...chatBody(`unsafe-${field}`),
+          ...(field !== 'run_id' ? {
+            provider: 'safe-provider',
+            environment_id: 'safe-environment',
+            session_id: 'safe-session',
+            execution_id: 'safe-execution',
+          } : {}),
+          [field]: value,
+        })
+        expect(response.status, field).toBe(400)
+        expect(ctx.runs.get(`unsafe-${field}`)).toBeUndefined()
+        expect(ctx.sessions.getRetainedRun(`unsafe-${field}`)).toBeNull()
+      }
+      expect(backend.calls).toBe(1)
     } finally {
       ctx.cleanup()
     }
@@ -995,6 +1234,19 @@ describe('durable run contract', () => {
       }
       const request = cancellationRequest('cancel-exact-operation', run, 'user requested stop')
 
+      const unsafeCancellation = cancellationRequest(
+        'cancel-unsafe-operation',
+        { ...run, provider: 'unsafe\nprovider' },
+        'must be rejected before headers',
+      )
+      const unsafe = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(unsafeCancellation),
+      })
+      expect(unsafe.status).toBe(400)
+      expect(ctx.sessions.getRetainedControlOperation(unsafeCancellation.operationId)).toBeNull()
+
       const wrongCoordinates = cancellationRequest(
         'cancel-wrong-coordinates',
         { ...run, provider: 'foreign-provider' },
@@ -1178,4 +1430,89 @@ function cancellationRequest(
 ): AgentRunCancellationRequest {
   const material = { operationId, run, reason }
   return { ...material, requestDigest: agentRunCancellationRequestDigest(material) }
+}
+
+interface ChildServer {
+  port: number
+  stop: () => Promise<void>
+}
+
+async function startChildServer(dataDir: string): Promise<ChildServer> {
+  const entry = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'durable-run-server.ts')
+  const child = spawn(
+    process.execPath,
+    ['--import', 'tsx/esm', entry],
+    {
+      cwd: join(dirname(entry), '..', '..'),
+      env: {
+        ...process.env,
+        CLI_BRIDGE_TEST_DATA_DIR: dataDir,
+        CLI_BRIDGE_TEST_PORT: '0',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  )
+  let output = ''
+  const ready = new Promise<number>((resolve, reject) => {
+    const onOutput = (chunk: Buffer): void => {
+      output += chunk.toString()
+      const match = output.match(/READY:(\d+)/u)
+      if (match?.[1]) resolve(Number(match[1]))
+    }
+    child.stdout?.on('data', onOutput)
+    child.stderr?.on('data', (chunk: Buffer) => { output += chunk.toString() })
+    child.once('error', reject)
+    child.once('exit', (code, signal) => {
+      reject(new Error(`durable test server exited before READY (${code ?? signal}): ${output}`))
+    })
+  })
+  const port = await ready
+  return {
+    port,
+    stop: () => stopChildServer(child),
+  }
+}
+
+async function stopChildServer(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null) return
+  child.kill('SIGTERM')
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error('timed out stopping durable test server'))
+    }, 5_000)
+    child.once('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.once('exit', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+async function fetchChildChat(port: number, body: object): Promise<Response> {
+  return await fetch(`http://127.0.0.1:${port}${CHAT_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+async function fetchChildStatus(port: number, runId: string): Promise<Record<string, unknown>> {
+  const response = await fetch(`http://127.0.0.1:${port}/v1/runs/${encodeURIComponent(runId)}`)
+  return await response.json() as Record<string, unknown>
+}
+
+async function fetchChildCancellation(
+  port: number,
+  runId: string,
+  request: AgentRunCancellationRequest,
+): Promise<Response> {
+  return await fetch(`http://127.0.0.1:${port}/v1/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  })
 }

@@ -9,10 +9,7 @@
 
 import {
   AgentEnvironmentCapabilitiesSchema,
-  harnessSystemPromptIntents,
-  harnessTypeSchema,
   type AgentEnvironmentCapabilities,
-  type HarnessType,
   type RequestedInteractions,
 } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../../backends/registry.js'
@@ -88,38 +85,38 @@ export async function readyBackendCapabilities(input: {
     : { backend, capabilities: genericCliBridgeCapabilities(backend.name) }
 }
 
-/** The one generic capability document for ready non-native Bridge routes. */
-export function genericCliBridgeCapabilities(backendName?: string): AgentEnvironmentCapabilities {
+/**
+ * The conservative capability document for a ready non-native backend.
+ *
+ * A generic backend proves only one-shot streaming and the bridge's durable
+ * run protocol. It does not prove provider continuation, profile materializers,
+ * tools, MCP, subagents, detach, or usage receipts.
+ */
+export function genericCliBridgeCapabilities(_backendName?: string): AgentEnvironmentCapabilities {
   const candidate: AgentEnvironmentCapabilities = {
     profile: {
       namedProfiles: false,
-      systemPrompt: harnessSystemPromptIntents(harnessForBackend(backendName)),
-      instructions: true,
-      tools: true,
-      permissions: true,
-      mcp: true,
-      subagents: true,
+      systemPrompt: { replace: false, append: false },
+      instructions: false,
+      tools: false,
+      permissions: false,
+      mcp: false,
+      subagents: false,
       resources: {
-        files: true,
-        instructions: true,
-        tools: true,
-        skills: true,
-        agents: true,
-        commands: true,
+        files: false,
+        instructions: false,
+        tools: false,
+        skills: false,
+        agents: false,
+        commands: false,
       },
       hooks: false,
-      modes: true,
+      modes: false,
       runtimeUpdate: false,
       validation: false,
     },
-    streaming: { live: true, replay: true, detach: true, turnIdempotency: true },
-    sessions: { continue: true, list: false, messages: false },
-    retainedControl: {
-      exactRunIdentity: true,
-      resultIdentity: true,
-      eventIdentity: true,
-      cancellationIdempotency: true,
-    },
+    streaming: { live: true, replay: true, detach: false, turnIdempotency: true },
+    sessions: { continue: false, list: false, messages: false },
     workspace: {
       read: false,
       write: false,
@@ -129,17 +126,17 @@ export function genericCliBridgeCapabilities(backendName?: string): AgentEnviron
       download: false,
     },
     branching: { checkpoint: false, fork: false },
-    placement: true,
-    usage: true,
+    placement: false,
+    usage: false,
     confidential: false,
     observation: {
       identity: true,
       lifecycle: true,
       endpoint: true,
-      placement: true,
+      placement: false,
       resources: false,
       resourceUse: false,
-      modelUsage: true,
+      modelUsage: false,
       computeBilling: false,
       accountUsage: false,
     },
@@ -182,20 +179,6 @@ function validatedNativeCapabilities(backend: NativeSessionBackend): AgentEnviro
   const capabilities = validated.data as AgentEnvironmentCapabilities
   assertRetainedCapabilities(capabilities, backend.name)
   return capabilities
-}
-
-function harnessForBackend(backendName: string | undefined): HarnessType | undefined {
-  const alias = backendName === 'claude' || backendName === 'claudish'
-    ? 'claude-code'
-    : backendName === 'kimi'
-      ? 'kimi-code'
-      : backendName === 'factory'
-        ? 'factory-droids'
-        : backendName === 'passthrough'
-          ? 'cli-base'
-          : backendName
-  const parsed = harnessTypeSchema.safeParse(alias)
-  return parsed.success ? parsed.data : undefined
 }
 
 function nativeCapabilities(backend: NativeSessionBackend): AgentEnvironmentCapabilities {

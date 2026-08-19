@@ -36,6 +36,9 @@ export interface RunReplayLogOptions {
   isClosed: () => boolean
   /** The run-id binding expired — the registry may forget this run. */
   onIdentityExpired: () => void
+  /** Persist the run checkpoint after the delta is in the local replay log. */
+  onDeltaCommitted?: () => void
+  commitDelta?: RunClaimOptions['commitDelta']
   commitCanonicalEvent?: RunClaimOptions['commitCanonicalEvent']
   /** A canonical commit failed; the owning run records the outcome as unknown. */
   onCommitFailure: (error: unknown) => void
@@ -107,14 +110,22 @@ export class RunReplayLog {
       }
       this.profileMaterialization = structuredClone(committed.profile_materialization)
     }
-    this.seq += 1
-    this.deltas.push({ seq: this.seq, delta: committed })
+    const sequence = this.seq + 1
+    try {
+      this.options.commitDelta?.({ runId: this.options.runId, sequence, delta: committed })
+    } catch (error) {
+      if (this.options.commitDelta) this.options.onCommitFailure(error)
+      throw error
+    }
+    this.seq = sequence
+    this.deltas.push({ seq: sequence, delta: committed })
     this.deltaBytes += approximateDeltaBytes(committed)
     while (this.deltas.length > this.options.retention.maxReplayDeltas) this.evictOldestDelta()
     while (this.deltas.length > 1 && this.deltaBytes > this.options.retention.maxReplayBytes) {
       this.evictOldestDelta()
     }
     this.wakeAll()
+    this.options.onDeltaCommitted?.()
   }
 
   appendCanonical(input: CanonicalEventInput): RuntimeEventEnvelope {

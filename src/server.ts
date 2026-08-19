@@ -498,7 +498,7 @@ export async function buildApp(config: Config): Promise<{
   mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin })
   mountSessions(app, { sessions, retained })
   mountRetainedSessions(app, retained, { includeSessionList: false, includeRunEvents: false })
-  mountRuns(app, { runs, retainedRuns: retained })
+  mountRuns(app, { runs, retainedRuns: retained, retainedStore: sessions })
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
     registry,

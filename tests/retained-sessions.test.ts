@@ -741,7 +741,7 @@ function setup(
   const service = new RetainedSessionService({ store, registry: registry as never, runs, ...serviceOptions })
   const app = new Hono()
   mountRetainedSessions(app, service, { includeRunEvents: false })
-  mountRuns(app, { runs, retainedRuns: service })
+  mountRuns(app, { runs, retainedRuns: service, retainedStore: store })
   mountChatCompletions(app, { registry: registry as never, sessions: store, retainedRuns: store, runs })
   return {
     app,
@@ -1015,41 +1015,35 @@ describe('retained Agent Interface sessions', () => {
     expect(capabilities).toMatchObject({
       profile: {
         namedProfiles: false,
-        instructions: true,
-        tools: true,
-        permissions: true,
-        mcp: true,
-        subagents: true,
+        instructions: false,
+        tools: false,
+        permissions: false,
+        mcp: false,
+        subagents: false,
         resources: {
-          files: true,
-          instructions: true,
-          tools: true,
-          skills: true,
-          agents: true,
-          commands: true,
+          files: false,
+          instructions: false,
+          tools: false,
+          skills: false,
+          agents: false,
+          commands: false,
         },
         validation: false,
       },
-      streaming: { live: true, replay: true, detach: true, turnIdempotency: true },
-      sessions: { continue: true, list: false, messages: false },
-      retainedControl: {
-        exactRunIdentity: true,
-        resultIdentity: true,
-        eventIdentity: true,
-        cancellationIdempotency: true,
-      },
+      streaming: { live: true, replay: true, detach: false, turnIdempotency: true },
+      sessions: { continue: false, list: false, messages: false },
       workspace: { read: false, write: false, exec: false, git: false, upload: false, download: false },
       branching: { checkpoint: false, fork: false },
-      placement: true,
-      usage: true,
+      placement: false,
+      usage: false,
       observation: {
         identity: true,
         lifecycle: true,
         endpoint: true,
-        placement: true,
+        placement: false,
         resources: false,
         resourceUse: false,
-        modelUsage: true,
+        modelUsage: false,
         computeBilling: false,
         accountUsage: false,
       },
@@ -1297,7 +1291,7 @@ describe('retained Agent Interface sessions', () => {
     expect(await json(changedEnvironment)).toMatchObject({ error: { type: 'run_identity_conflict' } })
   })
 
-  it('shares run ownership across protocols without leaving a replayable collision admission', async () => {
+  it('shares run ownership across protocols with a durable one-shot collision admission', async () => {
     const backend = new FakeNativeBackend()
     fixture = setup(backend)
     const oneShotRunId = 'cross-protocol-one-shot-first'
@@ -1328,7 +1322,7 @@ describe('retained Agent Interface sessions', () => {
     })
     expect(retainedCollision.status).toBe(409)
     expect(await json(retainedCollision)).toMatchObject({ error: { type: 'run_identity_conflict' } })
-    expect(fixture.store.getRetainedRun(oneShotRunId)).toBeNull()
+    expect(fixture.store.getRetainedRun(oneShotRunId)).toMatchObject({ owner: 'one-shot' })
 
     const replayedCollision = await fixture.app.request('/v1/sessions/cross-protocol-retained-second/turns', {
       method: 'POST',
