@@ -1,6 +1,6 @@
 # Retained sessions and native interactions
 
-Status: implemented for the Pi native backend.
+Status: implemented for the Pi native backend, with the generic one-shot durable contract exposed for ready non-native routes.
 
 This surface keeps one native CLI process behind a durable bridge session.
 
@@ -10,7 +10,7 @@ The caller can disconnect and reconnect without starting a second native process
 
 ## Capability admission
 
-Call `GET /v1/capabilities?model=pi/<provider>/<model>` before creating a retained session.
+Call `GET /v1/capabilities?model=<exact-model>` before choosing a retained or one-shot durable route.
 
 The bridge runs the backend health check through the real executor path.
 
@@ -26,9 +26,35 @@ The bridge advertises retained sessions only when the backend proves all of thes
 - request idempotency at that boundary;
 - replayable interactions and response idempotency.
 
-An ordinary one-shot backend does not satisfy this contract.
+Native retained sessions remain limited to backends that prove the complete contract above.
 
-The bridge returns `501 capability_denied` for that backend instead of starting an untracked process.
+For a ready non-native backend, the bridge returns one canonical generic capability document.
+
+That document describes the durable one-shot chat protocol: live output, replay, detach, reconnect, session continuation through the legacy session store, exact run identity, result and event identity, cancellation idempotency, profile forwarding, usage, placement, and lifecycle observation.
+
+It does not claim native continuation or native interactions, and `POST /v1/sessions` still returns `501 capability_denied` for that backend.
+
+The bridge returns `501 capability_denied` for an unready native-session request instead of starting an untracked process.
+
+## Generic one-shot durable coordinates
+
+The one-shot `POST /v1/chat/completions` route accepts optional exact coordinate fields: `provider`, `environment_id`, `session_id`, `execution_id`, and `run_id`.
+
+The three provider fields are all-or-none.
+
+Provider, environment, session, and execution coordinates use the Agent Interface identifier limit of 512 characters.
+
+The durable `run_id` remains a separate HTTP route identifier limited to 128 characters.
+
+An exact request must also carry an explicit run id and session id through the body or accepted headers.
+
+Conflicting body and header aliases fail with `400` before session or run admission.
+
+When exact coordinates are supplied, the bridge persists them unchanged instead of substituting the backend name, `ENVIRONMENT_ID`, or generated run values.
+
+Every run snapshot and control or replay response exposes the same six fields: run id, request digest, provider, environment id, session id, and execution id.
+
+The response headers are `X-Run-Id`, `X-Run-Request-Digest`, `X-Run-Provider`, `X-Run-Environment-Id`, `X-Run-Session-Id`, and `X-Run-Execution-Id`.
 
 ## Session and run surface
 

@@ -51,6 +51,15 @@ export function streamRunEvents(
   model: string,
   afterSeq: number,
 ): Response {
+  return streamChatDeltaEvents(c, (signal) => run.attach(afterSeq, signal), model)
+}
+
+/** Render any sequence-numbered ChatDelta source with one OpenAI SSE path. */
+export function streamChatDeltaEvents(
+  c: Context,
+  source: (signal: AbortSignal) => AsyncIterable<{ seq: number; delta: import('../backends/types.js').ChatDelta }>,
+  model: string,
+): Response {
   return streamSSE(c, async (stream) => {
     const meta = makeChunkMeta(model)
     let clientGone = false
@@ -87,7 +96,7 @@ export function streamRunEvents(
 
     try {
       if (!await writeRaw(': connected\n\n')) return
-      for await (const { seq, delta } of run.attach(afterSeq, readerController.signal)) {
+      for await (const { seq, delta } of source(readerController.signal)) {
         if (clientGone) break
         if ((delta.finish_reason === 'error' || delta.finish_reason === 'timeout') && delta.error) {
           await writeSse(JSON.stringify({ error: delta.error }), seq)

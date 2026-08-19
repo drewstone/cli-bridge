@@ -17,7 +17,6 @@ import {
   type AgentRunCancellationAcknowledgement,
   type AgentRunCancellationRequest,
   type AgentExactRunControlRef,
-  type Sha256Digest,
 } from '@tangle-network/agent-interface'
 import {
   type Run,
@@ -25,38 +24,21 @@ import {
   RunReplayCursorError,
   type RunSnapshot,
 } from '../runs/registry.js'
-import type { RetainedEventRecord } from '../sessions/store.js'
+import type { RetainedEventRecord, SessionStore } from '../sessions/store.js'
 import type { DurableRetainedRunSnapshot } from '../sessions/retained.js'
 import { readBoundedJson } from '../sessions/retained/http.js'
 import { RetainedSessionError } from '../sessions/retained/types.js'
 import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
+import { setExactRunIdentityHeaders, setRunIdentityHeaders } from '../runs/headers.js'
+import { isSafeWireIdentifier } from '../runs/identifiers.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
 
 /**
- * Cancellation acknowledgements retained for idempotent replay.
+ * Exact cancellation idempotency is persisted by SessionStore.
  *
- * One entry per distinct `operationId`, and nothing ever removed them, so a
- * long-lived bridge accumulated one record per cancellation for the life of the
- * process. The cap is far above any caller's in-flight retry window: a record
- * only has to outlive the retries of the operation that created it, and the
- * oldest entry is the one least likely to still be retried.
+ * The store is the only authority across bridge process restarts.
  */
-const MAX_RETAINED_CANCELLATIONS = 10_000
-
-function retainCancellation(
-  cancellations: Map<string, CancellationRecord>,
-  operationId: string,
-  record: CancellationRecord,
-): void {
-  cancellations.set(operationId, record)
-  while (cancellations.size > MAX_RETAINED_CANCELLATIONS) {
-    const oldest = cancellations.keys().next()
-    if (oldest.done) break
-    cancellations.delete(oldest.value)
-  }
-}
-
 export function mountRuns(app: Hono, deps: {
   runs: RunRegistry
   /** Durable retained-run reads used after the in-memory Run has been retired. */
@@ -66,8 +48,9 @@ export function mountRuns(app: Hono, deps: {
     assertRunReplayCursor(runId: string, afterSequence: number): void
     runEvents(runId: string, afterSequence: number, signal: AbortSignal): AsyncIterable<RetainedEventRecord>
   }
+  /** The existing SQLite store owns exact cancellation idempotency. */
+  retainedStore?: Pick<SessionStore, 'recordRetainedControlOperation' | 'updateRetainedControlOperation' | 'getRetainedControlOperation' | 'getRetainedRun'>
 }): void {
-  const cancellations = new Map<string, CancellationRecord>()
 
   app.get('/v1/runs/:id', async (c) => {
     const id = c.req.param('id')
@@ -134,7 +117,7 @@ export function mountRuns(app: Hono, deps: {
       return c.json({ error: { message: parsedBody.message, type: parsedBody.type } }, parsedBody.status)
     }
     if (parsedBody.request) {
-      return exactCancellation(c, deps.runs, cancellations, id, parsedBody.request)
+      return exactCancellation(c, deps.runs, deps.retainedStore, id, parsedBody.request)
     }
     const run = deps.runs.get(id)
     // Unknown is not proof that a process is gone. Return 404 so a cleanup caller cannot
@@ -158,11 +141,6 @@ export function mountRuns(app: Hono, deps: {
     }
     return c.json(body)
   })
-}
-
-interface CancellationRecord {
-  readonly requestDigest: Sha256Digest
-  readonly acknowledgement: AgentRunCancellationAcknowledgement
 }
 
 type CancellationBody =
@@ -195,6 +173,14 @@ async function cancellationBody(c: Context): Promise<CancellationBody> {
         type: 'invalid_request_error',
       }
     }
+    if (!exactCancellationIdentifiersAreSafe(request.data)) {
+      return {
+        ok: false,
+        message: 'cancellation identifiers must be bounded values without control characters',
+        status: 400,
+        type: 'invalid_request_error',
+      }
+    }
     return { ok: true, request: request.data }
   } catch (error) {
     if (error instanceof RetainedSessionError) {
@@ -217,51 +203,77 @@ async function cancellationBody(c: Context): Promise<CancellationBody> {
 async function exactCancellation(
   c: Context,
   runs: RunRegistry,
-  cancellations: Map<string, CancellationRecord>,
+  store: Pick<SessionStore, 'recordRetainedControlOperation' | 'updateRetainedControlOperation' | 'getRetainedControlOperation' | 'getRetainedRun'> | undefined,
   runId: string,
   request: AgentRunCancellationRequest,
 ): Promise<Response> {
+  setExactRunIdentityHeaders(c, request.run)
   if (request.run.runId !== runId) {
     return invalidRequest(c, 'cancellation run id does not match the request path', 409)
   }
-  const existing = cancellations.get(request.operationId)
+  if (!store) {
+    return c.json(
+      { error: { message: 'exact cancellation requires the canonical persisted run store', type: 'server_error' } },
+      503,
+    )
+  }
+
+  const existing = store.getRetainedControlOperation(request.operationId)
   if (existing) {
-    if (existing.requestDigest !== request.requestDigest) {
-      const conflict = cancellationAcknowledgement({
-        operationId: request.operationId,
-        requestDigest: request.requestDigest,
-        run: request.run,
-        status: 'conflict',
-        effect: 'unknown',
-        existingRequestDigest: existing.requestDigest,
-      })
-      return c.json(conflict, 409)
+    if (
+      existing.kind !== 'cancel'
+      || existing.requestDigest !== request.requestDigest
+      || existing.runId !== request.run.runId
+      || existing.sessionId !== request.run.sessionId
+    ) return exactCancellationConflict(c, request, existing.requestDigest)
+    const settled = storedExactAcknowledgement(existing)
+    if (settled) {
+      const replayed = settled.status === 'unknown'
+        ? settled
+        : cancellationAcknowledgement({ ...settled, status: 'replayed' })
+      return c.json(replayed, replayed.effect === 'cancel_requested' ? 202 : 200)
     }
-    const replayed = existing.acknowledgement.status === 'unknown'
-      ? existing.acknowledgement
-      : cancellationAcknowledgement({
-          ...existing.acknowledgement,
-          status: 'replayed',
-        })
-    return c.json(replayed, replayed.effect === 'cancel_requested' ? 202 : 200)
   }
 
   const run = runs.get(runId)
   if (!run) {
-    const unknown = cancellationAcknowledgement({
-      operationId: request.operationId,
-      requestDigest: request.requestDigest,
-      run: request.run,
-      status: 'unknown',
-      effect: 'unknown',
-      message: 'this bridge process has no record of the run',
-      retryable: false,
-    })
-    retainCancellation(cancellations, request.operationId, {
-      requestDigest: request.requestDigest,
-      acknowledgement: unknown,
-    })
-    return c.json(unknown)
+    const admission = store.getRetainedRun(runId)
+    if (!admission) {
+      const unknown = cancellationAcknowledgement({
+        operationId: request.operationId,
+        requestDigest: request.requestDigest,
+        run: request.run,
+        status: 'unknown',
+        effect: 'unknown',
+        message: 'the canonical run store has no record of the run',
+        retryable: false,
+      })
+      persistExactAcknowledgement(store, request, unknown)
+      return c.json(unknown)
+    }
+    if (!admissionMatchesRequest(admission, request)) {
+      return exactCancellationConflict(c, request, admission.requestDigest)
+    }
+    const durableSnapshot = recordSnapshot(admission.snapshot)
+    const acknowledgement = durableSnapshot?.terminal
+      ? cancellationAcknowledgement({
+          operationId: request.operationId,
+          requestDigest: request.requestDigest,
+          run: request.run,
+          status: 'accepted',
+          effect: durableSnapshot.status === 'cancelled' ? 'cancelled' : 'not_live',
+        })
+      : cancellationAcknowledgement({
+          operationId: request.operationId,
+          requestDigest: request.requestDigest,
+          run: request.run,
+          status: 'unknown',
+          effect: 'unknown',
+          message: 'the run was not live after bridge restart; its cancellation effect is unknown',
+          retryable: false,
+        })
+    persistExactAcknowledgement(store, request, acknowledgement)
+    return c.json(acknowledgement)
   }
   if (request.run.requestDigest !== run.requestDigest) {
     return invalidRequest(c, 'cancellation request digest does not match the retained run', 409)
@@ -281,6 +293,7 @@ async function exactCancellation(
 
   const waitMs = parseWaitMs(c)
   if (!waitMs.ok) return invalidWait(c, waitMs.message)
+  if (!existing) persistExactPending(store, request)
   const cancelRequested = runs.cancel(runId)
   const snapshot = await terminalSnapshot(run, waitMs.value)
   setRunHeaders(c, snapshot)
@@ -299,15 +312,104 @@ async function exactCancellation(
       ? { message: 'cancellation was already requested' }
       : {}),
   })
-  retainCancellation(cancellations, request.operationId, {
-    requestDigest: request.requestDigest,
-    acknowledgement,
-  })
+  persistExactAcknowledgement(store, request, acknowledgement)
   if (effect === 'cancel_requested') {
     c.header('Retry-After', '1')
     return c.json(acknowledgement, 202)
   }
   return c.json(acknowledgement)
+}
+
+function exactCancellationIdentifiersAreSafe(request: AgentRunCancellationRequest): boolean {
+  return [
+    request.operationId,
+    request.run.runId,
+    request.run.provider,
+    request.run.environmentId,
+    request.run.sessionId,
+    request.run.executionId,
+  ].every(isSafeWireIdentifier)
+}
+
+function exactCancellationConflict(
+  c: Context,
+  request: AgentRunCancellationRequest,
+  existingRequestDigest: string,
+): Response {
+  const conflict = cancellationAcknowledgement({
+    operationId: request.operationId,
+    requestDigest: request.requestDigest,
+    run: request.run,
+    status: 'conflict',
+    effect: 'unknown',
+    existingRequestDigest: existingRequestDigest as `sha256:${string}`,
+  })
+  return c.json(conflict, 409)
+}
+
+function storedExactAcknowledgement(
+  operation: { acknowledgement: Record<string, unknown> },
+): AgentRunCancellationAcknowledgement | null {
+  if (operation.acknowledgement.phase === 'pending') return null
+  return cancellationAcknowledgement(operation.acknowledgement as unknown as AgentRunCancellationAcknowledgement)
+}
+
+function persistExactPending(
+  store: Pick<SessionStore, 'recordRetainedControlOperation'>,
+  request: AgentRunCancellationRequest,
+): void {
+  store.recordRetainedControlOperation({
+    operationId: request.operationId,
+    callerId: 'cli-bridge.exact-cancellation',
+    kind: 'cancel',
+    runId: request.run.runId,
+    sessionId: request.run.sessionId,
+    requestDigest: request.requestDigest,
+    acknowledgement: { phase: 'pending' },
+  })
+}
+
+function persistExactAcknowledgement(
+  store: Pick<SessionStore, 'recordRetainedControlOperation' | 'updateRetainedControlOperation'>,
+  request: AgentRunCancellationRequest,
+  acknowledgement: AgentRunCancellationAcknowledgement,
+): void {
+  const inserted = store.recordRetainedControlOperation({
+    operationId: request.operationId,
+    callerId: 'cli-bridge.exact-cancellation',
+    kind: 'cancel',
+    runId: request.run.runId,
+    sessionId: request.run.sessionId,
+    requestDigest: request.requestDigest,
+    acknowledgement: JSON.parse(JSON.stringify(acknowledgement)) as Record<string, unknown>,
+  })
+  if (!inserted) {
+    store.updateRetainedControlOperation(
+      request.operationId,
+      request.requestDigest,
+      JSON.parse(JSON.stringify(acknowledgement)) as Record<string, unknown>,
+    )
+  }
+}
+
+function admissionMatchesRequest(
+  admission: NonNullable<ReturnType<SessionStore['getRetainedRun']>>,
+  request: AgentRunCancellationRequest,
+): boolean {
+  return admission.runId === request.run.runId
+    && admission.requestDigest === request.run.requestDigest
+    && admission.provider === request.run.provider
+    && admission.environmentId === request.run.environmentId
+    && admission.sessionId === request.run.sessionId
+    && admission.executionId === request.run.executionId
+}
+
+function recordSnapshot(value: unknown): { terminal: boolean; status: string } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const candidate = value as { terminal?: unknown; status?: unknown }
+  return typeof candidate.terminal === 'boolean' && typeof candidate.status === 'string'
+    ? { terminal: candidate.terminal, status: candidate.status }
+    : null
 }
 
 function cancellationAcknowledgement(
@@ -361,8 +463,7 @@ async function terminalSnapshot(run: Run, waitMs: number): Promise<RunSnapshot> 
 }
 
 function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
-  c.header('X-Run-Id', snapshot.id)
-  c.header('X-Run-Request-Digest', snapshot.requestDigest)
+  setRunIdentityHeaders(c, snapshot)
   c.header('X-Run-Status', snapshot.status)
   c.header('X-Run-State', snapshot.state)
   c.header('X-Run-Terminal', String(snapshot.terminal))
@@ -373,8 +474,7 @@ function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
 }
 
 function setRetainedRunHeaders(c: Context, snapshot: DurableRetainedRunSnapshot, lastCanonicalSequence: number): void {
-  c.header('X-Run-Id', snapshot.id)
-  c.header('X-Run-Request-Digest', snapshot.requestDigest)
+  setRunIdentityHeaders(c, snapshot)
   c.header('X-Run-Status', snapshot.status)
   c.header('X-Run-State', snapshot.state)
   c.header('X-Run-Terminal', String(snapshot.terminal))

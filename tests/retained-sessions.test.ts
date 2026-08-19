@@ -673,8 +673,8 @@ class HangingNativeBackend extends FakeNativeBackend {
 }
 
 class OneShotBackend implements Backend {
-  readonly name = 'one-shot'
-  matches(model: string): boolean { return model === this.name }
+  constructor(readonly name = 'one-shot') {}
+  matches(model: string): boolean { return model === this.name || model.startsWith(`${this.name}/`) }
   health(): Promise<BackendHealth> { return Promise.resolve({ name: this.name, state: 'ready' }) }
   async *chat(): AsyncIterable<ChatDelta> { yield { content: 'ok', finish_reason: 'stop' } }
 }
@@ -741,7 +741,7 @@ function setup(
   const service = new RetainedSessionService({ store, registry: registry as never, runs, ...serviceOptions })
   const app = new Hono()
   mountRetainedSessions(app, service, { includeRunEvents: false })
-  mountRuns(app, { runs, retainedRuns: service })
+  mountRuns(app, { runs, retainedRuns: service, retainedStore: store })
   mountChatCompletions(app, { registry: registry as never, sessions: store, retainedRuns: store, runs })
   return {
     app,
@@ -1007,6 +1007,51 @@ describe('retained Agent Interface sessions', () => {
     expect(missing.status).toBe(400)
   })
 
+  it.each(['opencode', 'claude-code', 'codex', 'kimi-code'])('reports the generic durable capability contract for ready %s routes', async (backendName) => {
+    fixture = setup(new OneShotBackend(backendName))
+    const response = await fixture.app.request(`/v1/capabilities?model=${encodeURIComponent(`${backendName}/test`)}`)
+    expect(response.status).toBe(200)
+    const capabilities = await json(response)
+    expect(capabilities).toMatchObject({
+      profile: {
+        namedProfiles: false,
+        instructions: false,
+        tools: false,
+        permissions: false,
+        mcp: false,
+        subagents: false,
+        resources: {
+          files: false,
+          instructions: false,
+          tools: false,
+          skills: false,
+          agents: false,
+          commands: false,
+        },
+        validation: false,
+      },
+      streaming: { live: true, replay: true, detach: false, turnIdempotency: true },
+      sessions: { continue: false, list: false, messages: false },
+      workspace: { read: false, write: false, exec: false, git: false, upload: false, download: false },
+      branching: { checkpoint: false, fork: false },
+      placement: false,
+      usage: false,
+      observation: {
+        identity: true,
+        lifecycle: true,
+        endpoint: true,
+        placement: false,
+        resources: false,
+        resourceUse: false,
+        modelUsage: false,
+        computeBilling: false,
+        accountUsage: false,
+      },
+    })
+    expect(capabilities).not.toHaveProperty('nativeContinuation')
+    expect(capabilities).not.toHaveProperty('interactions')
+  })
+
   it('refuses retained capability discovery and creation until native health is ready', async () => {
     fixture = setup(new NotReadyNativeBackend())
     const capabilitiesResponse = await fixture.app.request('/v1/capabilities?model=pi%2Ftest')
@@ -1246,7 +1291,7 @@ describe('retained Agent Interface sessions', () => {
     expect(await json(changedEnvironment)).toMatchObject({ error: { type: 'run_identity_conflict' } })
   })
 
-  it('shares run ownership across protocols without leaving a replayable collision admission', async () => {
+  it('shares run ownership across protocols with a durable one-shot collision admission', async () => {
     const backend = new FakeNativeBackend()
     fixture = setup(backend)
     const oneShotRunId = 'cross-protocol-one-shot-first'
@@ -1277,7 +1322,7 @@ describe('retained Agent Interface sessions', () => {
     })
     expect(retainedCollision.status).toBe(409)
     expect(await json(retainedCollision)).toMatchObject({ error: { type: 'run_identity_conflict' } })
-    expect(fixture.store.getRetainedRun(oneShotRunId)).toBeNull()
+    expect(fixture.store.getRetainedRun(oneShotRunId)).toMatchObject({ owner: 'one-shot' })
 
     const replayedCollision = await fixture.app.request('/v1/sessions/cross-protocol-retained-second/turns', {
       method: 'POST',

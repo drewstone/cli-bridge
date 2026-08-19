@@ -53,10 +53,7 @@ export async function readyNativeBackend(input: {
   healthProbeTimeoutMs: number
   signal?: AbortSignal
 }): Promise<{ backend: NativeSessionBackend; capabilities: AgentEnvironmentCapabilities }> {
-  const backend = input.registry.resolve(input.model)
-  if (!backend) {
-    throw new RetainedSessionError(`no backend matches model ${JSON.stringify(input.model)}`, 404, 'not_found_error')
-  }
+  const backend = resolveBackend(input.registry, input.model)
   if (!isNativeBackend(backend)) {
     throw new RetainedSessionError(
       `backend ${JSON.stringify(backend.name)} does not prove native retained-session support`,
@@ -64,10 +61,106 @@ export async function readyNativeBackend(input: {
       'capability_denied',
     )
   }
+  await assertReady(backend, input.healthProbeTimeoutMs, input.signal)
+  return { backend, capabilities: validatedNativeCapabilities(backend) }
+}
+
+/**
+ * Admit either a native retained backend or a ready one-shot backend.
+ *
+ * Non-native routes use the same durable chat protocol for streaming, replay,
+ * reconnect, status, and exact cancellation. They do not claim native session
+ * continuation or native interaction controls.
+ */
+export async function readyBackendCapabilities(input: {
+  registry: BackendRegistry
+  model: string
+  healthProbeTimeoutMs: number
+  signal?: AbortSignal
+}): Promise<{ backend: Backend; capabilities: AgentEnvironmentCapabilities }> {
+  const backend = resolveBackend(input.registry, input.model)
+  await assertReady(backend, input.healthProbeTimeoutMs, input.signal)
+  return isNativeBackend(backend)
+    ? { backend, capabilities: validatedNativeCapabilities(backend) }
+    : { backend, capabilities: genericCliBridgeCapabilities(backend.name) }
+}
+
+/**
+ * The conservative capability document for a ready non-native backend.
+ *
+ * A generic backend proves only one-shot streaming and the bridge's durable
+ * run protocol. It does not prove provider continuation, profile materializers,
+ * tools, MCP, subagents, detach, or usage receipts.
+ */
+export function genericCliBridgeCapabilities(_backendName?: string): AgentEnvironmentCapabilities {
+  const candidate: AgentEnvironmentCapabilities = {
+    profile: {
+      namedProfiles: false,
+      systemPrompt: { replace: false, append: false },
+      instructions: false,
+      tools: false,
+      permissions: false,
+      mcp: false,
+      subagents: false,
+      resources: {
+        files: false,
+        instructions: false,
+        tools: false,
+        skills: false,
+        agents: false,
+        commands: false,
+      },
+      hooks: false,
+      modes: false,
+      runtimeUpdate: false,
+      validation: false,
+    },
+    streaming: { live: true, replay: true, detach: false, turnIdempotency: true },
+    sessions: { continue: false, list: false, messages: false },
+    workspace: {
+      read: false,
+      write: false,
+      exec: false,
+      git: false,
+      upload: false,
+      download: false,
+    },
+    branching: { checkpoint: false, fork: false },
+    placement: false,
+    usage: false,
+    confidential: false,
+    observation: {
+      identity: true,
+      lifecycle: true,
+      endpoint: true,
+      placement: false,
+      resources: false,
+      resourceUse: false,
+      modelUsage: false,
+      computeBilling: false,
+      accountUsage: false,
+    },
+  }
+  const validated = AgentEnvironmentCapabilitiesSchema.safeParse(candidate)
+  if (!validated.success) {
+    throw new RetainedSessionError('Bridge generic capabilities are invalid', 500, 'server_error')
+  }
+  return validated.data as AgentEnvironmentCapabilities
+}
+
+function resolveBackend(registry: BackendRegistry, model: string): Backend {
+  const backend = registry.resolve(model)
+  if (!backend) {
+    throw new RetainedSessionError(`no backend matches model ${JSON.stringify(model)}`, 404, 'not_found_error')
+  }
+  return backend
+}
+
+async function assertReady(backend: Backend, healthProbeTimeoutMs: number, signal?: AbortSignal): Promise<void> {
   const health: Awaited<ReturnType<Backend['health']>> = await boundedProbe(
     backend,
-    input.healthProbeTimeoutMs,
-    input.signal,
+    healthProbeTimeoutMs,
+    signal,
   )
   if (health.state !== 'ready') {
     throw new RetainedSessionError(
@@ -76,13 +169,16 @@ export async function readyNativeBackend(input: {
       'backend_not_ready',
     )
   }
+}
+
+function validatedNativeCapabilities(backend: NativeSessionBackend): AgentEnvironmentCapabilities {
   const validated = AgentEnvironmentCapabilitiesSchema.safeParse(nativeCapabilities(backend))
   if (!validated.success) {
     throw new RetainedSessionError('backend advertised invalid Agent Interface capabilities', 500, 'server_error')
   }
   const capabilities = validated.data as AgentEnvironmentCapabilities
   assertRetainedCapabilities(capabilities, backend.name)
-  return { backend, capabilities }
+  return capabilities
 }
 
 function nativeCapabilities(backend: NativeSessionBackend): AgentEnvironmentCapabilities {

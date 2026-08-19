@@ -71,6 +71,8 @@ export class Run {
     readonly executionId?: string,
     readonly provider?: string,
     readonly environmentId?: string,
+    private readonly commitDelta?: RunClaimOptions['commitDelta'],
+    private readonly commitSnapshot?: RunClaimOptions['commitSnapshot'],
     private readonly commitCanonicalEvent?: RunClaimOptions['commitCanonicalEvent'],
     private readonly onNativeControlLost?: RunClaimOptions['onNativeControlLost'],
   ) {
@@ -79,6 +81,8 @@ export class Run {
       retention,
       isClosed: () => this.isTerminal() || this.disposed,
       onIdentityExpired: () => onForget(id, this),
+      ...(commitSnapshot ? { onDeltaCommitted: () => this.persistSnapshot(false) } : {}),
+      ...(commitDelta ? { commitDelta } : {}),
       ...(commitCanonicalEvent ? { commitCanonicalEvent } : {}),
       onCommitFailure: (error) => this.canonical.markDurabilityUnknown(error),
     })
@@ -105,6 +109,9 @@ export class Run {
       },
       setSetupError: (error) => {
         this.setupError = error
+      },
+      markDurabilityUnknown: (error) => {
+        this.canonical.markDurabilityUnknown(error)
       },
       finish: (status) => this.finish(status),
     })
@@ -450,6 +457,24 @@ export class Run {
         console.error(`[cli-bridge] run ${this.id} finalization proof failed:`, error)
       })
     this.log.scheduleRetention(this.endedAt)
+    this.persistSnapshot(true)
+  }
+
+  private persistSnapshot(terminal: boolean): void {
+    if (!this.commitSnapshot) return
+    try {
+      this.commitSnapshot(this.snapshot())
+    } catch (error) {
+      this.failureError ??= error
+      this.canonical.markDurabilityUnknown(error)
+      if (!terminal) throw error
+      this.status = 'unknown'
+      try {
+        this.commitSnapshot(this.snapshot())
+      } catch {
+        // The admission remains at its last durable snapshot.
+      }
+    }
   }
 
   private expireLifetime(): void {
