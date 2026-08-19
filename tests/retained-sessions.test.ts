@@ -4138,6 +4138,37 @@ describe('retained Agent Interface sessions', () => {
     expect(backend.natives[0]!.prompts).toEqual(['first', 'second', 'third'])
   })
 
+  it('rejects an empty native continuation before dispatch', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'native-empty', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/native-empty/turns', {
+      method: 'POST',
+      body: turnBody('native-empty-first', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('native-empty')?.turns === 1)
+    const boundary = fixture.store.getRetained('native-empty')?.contextBoundary as NativeContextBoundaryProof
+    const input = nativeContinuationRequest(
+      fixture,
+      'native-empty',
+      'native-empty-operation',
+      '',
+      boundary,
+    )
+
+    const response = await fixture.app.request('/v1/sessions/native-empty/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+
+    expect(response.status).toBe(400)
+    expect(await json(response)).toMatchObject({ error: { type: 'invalid_request_error' } })
+    expect(backend.natives[0]!.prompts).toEqual(['first'])
+  })
+
   it('replays an accepted native continuation and conflicts on changed operation bytes', async () => {
     const backend = new FakeNativeBackend()
     fixture = setup(backend)

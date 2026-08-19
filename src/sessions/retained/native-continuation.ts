@@ -82,7 +82,7 @@ export function parseNativeContinuation(value: unknown): ParsedNativeContinuatio
       'invalid_request_error',
     )
   }
-  if (turn.data.prompt === undefined && (!turn.data.parts || turn.data.parts.length === 0)) {
+  if (!turn.data.prompt && (!turn.data.parts || turn.data.parts.length === 0)) {
     throw new RetainedSessionError(
       'native continuation turn requires a non-empty prompt or parts',
       400,
