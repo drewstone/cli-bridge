@@ -259,7 +259,17 @@ export class OpencodeBackend implements Backend {
           else fallbackUsage = eventUsage
         }
         if (type === 'error' || ev.error) {
-          sawError = String(ev.message ?? (ev.error as Record<string, unknown> | undefined)?.message ?? 'opencode error')
+          // When the event carries no message field, surface the raw event instead of the
+          // constant string 'opencode error'. That constant reached run ledgers verbatim:
+          // measured 2026-08-19 in discovery-lab, four director rounds died across two lines
+          // with 'bridgeExecutor: bridge stream error: opencode: opencode error' as their
+          // ONLY recorded cause, and the retry ladder burned ~48 minutes per round against a
+          // failure nobody could read. An error the operator cannot see is one nobody fixes.
+          sawError = String(
+            ev.message ??
+              (ev.error as Record<string, unknown> | undefined)?.message ??
+              `opencode error event without a message: ${JSON.stringify(ev).slice(0, 400)}`,
+          )
           continue
         }
 
