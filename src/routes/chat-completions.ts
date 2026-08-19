@@ -74,6 +74,7 @@ import { ENVIRONMENT_ID } from '../sessions/retained/types.js'
 import { wireIdentifierSchema } from '../runs/identifiers.js'
 import { retainedRunSnapshot, unknownRunSnapshot } from '../sessions/retained/state.js'
 import type { RetainedEventRecord } from '../sessions/store.js'
+import { chatDeltaFromRetainedEvent } from '../runs/persisted-chat-event.js'
 
 /** Header accepted only from the local Runtime → cli-bridge transport. */
 export const PROTECTED_MODEL_CREDENTIAL_HEADER = 'x-cli-bridge-model-credential'
@@ -1270,15 +1271,6 @@ function persistedChatDeltas(
       }
     },
   }
-}
-
-function chatDeltaFromRetainedEvent(record: RetainedEventRecord): ChatDelta | null {
-  const event = record.envelope.event
-  if (event.type !== 'raw' || event.backend !== 'cli-bridge.chat') return null
-  if (!event.event || typeof event.event !== 'object' || Array.isArray(event.event)) {
-    throw new Error(`persisted chat event ${JSON.stringify(record.envelope.eventId)} is invalid`)
-  }
-  return event.event as ChatDelta
 }
 
 /** Unwrap SeqDelta → ChatDelta for the non-streaming collector. */
