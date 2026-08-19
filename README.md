@@ -207,11 +207,15 @@ An explicit request value always wins over that fallback and is also forwarded t
 Supply `run_id` in the body or `X-Run-Id` in the header to make dispatch idempotent.
 If both are present they must match.
 Ids are 1–128 characters, begin with an ASCII letter or digit, and may then contain letters, digits, `.`, `_`, `:`, or `-`.
+Agent Interface provider, environment, session, and execution coordinates accept up to 512 characters under their shared identifier contract.
 The bridge binds the id atomically to the normalized execution request before admission or backend setup:
 
 - An identical retry attaches to the existing job and never acquires a second process slot.
 - A different request under the same id returns `409 run_identity_conflict` with both request digests.
-- The response carries `X-Run-Id` and `X-Run-Request-Digest`; retain both with the trace.
+- The response carries the complete run identity: `X-Run-Id`, `X-Run-Request-Digest`, `X-Run-Provider`, `X-Run-Environment-Id`, `X-Run-Session-Id`, and `X-Run-Execution-Id`.
+- Supply `provider`, `environment_id`, `session_id`, `execution_id`, and `run_id` when another system owns the coordinates.
+- Exact coordinate fields are all-or-none and must agree with the body and header run/session aliases.
+- `GET /v1/runs/:id`, replay, cancellation, and chat responses expose the same six fields so control retries never reconstruct identity from backend defaults.
 
 For `stream: true`, every output delta has a monotonically increasing SSE `id`.
 Reconnect with the same request and `Last-Event-ID: N` to receive only events after `N`.

@@ -30,6 +30,7 @@ import type { DurableRetainedRunSnapshot } from '../sessions/retained.js'
 import { readBoundedJson } from '../sessions/retained/http.js'
 import { RetainedSessionError } from '../sessions/retained/types.js'
 import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
+import { setRunIdentityHeaders } from '../runs/headers.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
 
@@ -361,8 +362,7 @@ async function terminalSnapshot(run: Run, waitMs: number): Promise<RunSnapshot> 
 }
 
 function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
-  c.header('X-Run-Id', snapshot.id)
-  c.header('X-Run-Request-Digest', snapshot.requestDigest)
+  setRunIdentityHeaders(c, snapshot)
   c.header('X-Run-Status', snapshot.status)
   c.header('X-Run-State', snapshot.state)
   c.header('X-Run-Terminal', String(snapshot.terminal))
@@ -373,8 +373,7 @@ function setRunHeaders(c: Context, snapshot: RunSnapshot): void {
 }
 
 function setRetainedRunHeaders(c: Context, snapshot: DurableRetainedRunSnapshot, lastCanonicalSequence: number): void {
-  c.header('X-Run-Id', snapshot.id)
-  c.header('X-Run-Request-Digest', snapshot.requestDigest)
+  setRunIdentityHeaders(c, snapshot)
   c.header('X-Run-Status', snapshot.status)
   c.header('X-Run-State', snapshot.state)
   c.header('X-Run-Terminal', String(snapshot.terminal))

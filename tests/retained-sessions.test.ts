@@ -673,8 +673,8 @@ class HangingNativeBackend extends FakeNativeBackend {
 }
 
 class OneShotBackend implements Backend {
-  readonly name = 'one-shot'
-  matches(model: string): boolean { return model === this.name }
+  constructor(readonly name = 'one-shot') {}
+  matches(model: string): boolean { return model === this.name || model.startsWith(`${this.name}/`) }
   health(): Promise<BackendHealth> { return Promise.resolve({ name: this.name, state: 'ready' }) }
   async *chat(): AsyncIterable<ChatDelta> { yield { content: 'ok', finish_reason: 'stop' } }
 }
@@ -1005,6 +1005,57 @@ describe('retained Agent Interface sessions', () => {
 
     const missing = await fixture.app.request('/v1/capabilities')
     expect(missing.status).toBe(400)
+  })
+
+  it.each(['opencode', 'claude-code', 'codex', 'kimi-code'])('reports the generic durable capability contract for ready %s routes', async (backendName) => {
+    fixture = setup(new OneShotBackend(backendName))
+    const response = await fixture.app.request(`/v1/capabilities?model=${encodeURIComponent(`${backendName}/test`)}`)
+    expect(response.status).toBe(200)
+    const capabilities = await json(response)
+    expect(capabilities).toMatchObject({
+      profile: {
+        namedProfiles: false,
+        instructions: true,
+        tools: true,
+        permissions: true,
+        mcp: true,
+        subagents: true,
+        resources: {
+          files: true,
+          instructions: true,
+          tools: true,
+          skills: true,
+          agents: true,
+          commands: true,
+        },
+        validation: false,
+      },
+      streaming: { live: true, replay: true, detach: true, turnIdempotency: true },
+      sessions: { continue: true, list: false, messages: false },
+      retainedControl: {
+        exactRunIdentity: true,
+        resultIdentity: true,
+        eventIdentity: true,
+        cancellationIdempotency: true,
+      },
+      workspace: { read: false, write: false, exec: false, git: false, upload: false, download: false },
+      branching: { checkpoint: false, fork: false },
+      placement: true,
+      usage: true,
+      observation: {
+        identity: true,
+        lifecycle: true,
+        endpoint: true,
+        placement: true,
+        resources: false,
+        resourceUse: false,
+        modelUsage: true,
+        computeBilling: false,
+        accountUsage: false,
+      },
+    })
+    expect(capabilities).not.toHaveProperty('nativeContinuation')
+    expect(capabilities).not.toHaveProperty('interactions')
   })
 
   it('refuses retained capability discovery and creation until native health is ready', async () => {

@@ -41,7 +41,7 @@ abstract class TestBackend implements Backend {
 
 class ReplayBackend extends TestBackend {
   calls = 0
-  constructor(private readonly delayMs = 0) { super() }
+  constructor(private readonly delayMs = 0, name = 'durable') { super(name) }
 
   async *chat(): AsyncIterable<ChatDelta> {
     this.calls += 1
@@ -294,9 +294,9 @@ function fixture(
   }
 }
 
-function chatBody(runId: string, content = 'hello'): Record<string, unknown> {
+function chatBody(runId: string, content = 'hello', model = 'durable/test'): Record<string, unknown> {
   return {
-    model: 'durable/test',
+    model,
     messages: [{ role: 'user', content }],
     stream: true,
     run_id: runId,
@@ -316,6 +316,164 @@ function sseIds(text: string): number[] {
 }
 
 describe('durable run contract', () => {
+  it.each([
+    ['opencode', 'opencode/test'],
+    ['claude-code', 'claude-code/test'],
+    ['codex', 'codex/test'],
+    ['kimi-code', 'kimi-code/test'],
+  ])('retains exact coordinates through %s dispatch, status, replay, and cancel', async (backendName, model) => {
+    const backend = new ReplayBackend(0, backendName)
+    const ctx = fixture(backend)
+    const runId = `exact-${backendName}-run`
+    const exact = {
+      provider: 'caller-provider',
+      environment_id: `caller-environment-${backendName}`,
+      session_id: `caller-session-${backendName}`,
+      execution_id: `caller-execution-${backendName}`,
+    }
+    try {
+      const dispatch = await postChat(ctx.app, { ...chatBody(runId, 'exact coordinates', model), ...exact })
+      expect(dispatch.status).toBe(200)
+      await dispatch.text()
+      expect(dispatch.headers.get('x-run-id')).toBe(runId)
+      expect(dispatch.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(dispatch.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(dispatch.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(dispatch.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      const requestDigest = dispatch.headers.get('x-run-request-digest')
+      expect(requestDigest).toMatch(/^sha256:/u)
+
+      const status = await ctx.app.request(`/v1/runs/${runId}`)
+      expect(status.status).toBe(200)
+      expect(status.headers.get('x-run-request-digest')).toBe(requestDigest)
+      expect(status.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(status.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(status.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(status.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      const snapshot = await status.json() as {
+        requestDigest: `sha256:${string}`
+        provider: string
+        environmentId: string
+        sessionId: string
+        executionId: string
+      }
+      expect(snapshot).toMatchObject({
+        requestDigest,
+        provider: exact.provider,
+        environmentId: exact.environment_id,
+        sessionId: exact.session_id,
+        executionId: exact.execution_id,
+      })
+
+      const replay = await ctx.app.request(`/v1/runs/${runId}/events`, {
+        headers: { 'Last-Event-ID': '0' },
+      })
+      expect(replay.status).toBe(200)
+      expect(replay.headers.get('x-run-id')).toBe(runId)
+      expect(replay.headers.get('x-run-provider')).toBe(exact.provider)
+      expect(replay.headers.get('x-run-environment-id')).toBe(exact.environment_id)
+      expect(replay.headers.get('x-run-session-id')).toBe(exact.session_id)
+      expect(replay.headers.get('x-run-execution-id')).toBe(exact.execution_id)
+      expect(await replay.text()).toContain('one')
+
+      const run: AgentExactRunControlRef = {
+        runId,
+        provider: snapshot.provider,
+        environmentId: snapshot.environmentId,
+        sessionId: snapshot.sessionId,
+        executionId: snapshot.executionId,
+        requestDigest: snapshot.requestDigest,
+      }
+      const cancellation = cancellationRequest(`cancel-${backendName}`, run, 'test exact cancellation')
+      const cancelled = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(cancellation),
+      })
+      expect(cancelled.status).toBe(200)
+      expect(cancelled.headers.get('x-run-provider')).toBe(exact.provider)
+      await expect(cancelled.json()).resolves.toMatchObject({
+        status: 'accepted',
+        effect: 'not_live',
+        run,
+      })
+      const replayedCancel = await ctx.app.request(`/v1/runs/${runId}/cancel`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(cancellation),
+      })
+      expect(replayedCancel.status).toBe(200)
+      await expect(replayedCancel.json()).resolves.toMatchObject({ status: 'replayed', effect: 'not_live' })
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
+  it('preserves a 227-character provider-owned environment id through admission and status headers', async () => {
+    const backend = new ReplayBackend(0, 'opencode')
+    const ctx = fixture(backend)
+    const runId = 'long-environment-run'
+    const environmentId = `cb1.${'e'.repeat(223)}`
+    expect(environmentId).toHaveLength(227)
+    try {
+      const dispatch = await postChat(ctx.app, {
+        ...chatBody(runId, 'long environment id', 'opencode/test'),
+        provider: 'cli-bridge',
+        environment_id: environmentId,
+        session_id: 'long-environment-session',
+        execution_id: 'long-environment-execution',
+      })
+      expect(dispatch.status).toBe(200)
+      await dispatch.text()
+      expect(dispatch.headers.get('x-run-environment-id')).toBe(environmentId)
+
+      const status = await ctx.app.request(`/v1/runs/${runId}`)
+      expect(status.status).toBe(200)
+      expect(status.headers.get('x-run-environment-id')).toBe(environmentId)
+      await expect(status.json()).resolves.toMatchObject({ environmentId })
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
+  it('rejects partial or unbound exact coordinates before durable admission', async () => {
+    const backend = new ReplayBackend()
+    const ctx = fixture(backend)
+    try {
+      const partial = await postChat(ctx.app, { ...chatBody('partial-coordinate'), provider: 'caller-provider' })
+      expect(partial.status).toBe(400)
+      expect(ctx.runs.size()).toBe(0)
+
+      const noRunId = await postChat(ctx.app, {
+        model: 'durable/test',
+        messages: [{ role: 'user', content: 'missing run id' }],
+        stream: true,
+        session_id: 'caller-session',
+        provider: 'caller-provider',
+        environment_id: 'caller-environment',
+        execution_id: 'caller-execution',
+      })
+      expect(noRunId.status).toBe(400)
+      expect(ctx.runs.size()).toBe(0)
+
+      const conflictingSession = await postChat(
+        ctx.app,
+        {
+          ...chatBody('conflicting-session'),
+          session_id: 'body-session',
+          provider: 'caller-provider',
+          environment_id: 'caller-environment',
+          execution_id: 'caller-execution',
+        },
+        { 'X-Session-Id': 'header-session' },
+      )
+      expect(conflictingSession.status).toBe(400)
+      expect(ctx.runs.size()).toBe(0)
+    } finally {
+      ctx.cleanup()
+    }
+  })
+
   it('rejects one-shot interaction controls before durable admission', async () => {
     const backend = new ReplayBackend()
     const ctx = fixture(backend)

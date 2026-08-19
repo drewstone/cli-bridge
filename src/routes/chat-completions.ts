@@ -18,6 +18,7 @@ import type { Context, Hono } from 'hono'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import {
+  AgentRunControlRefSchema,
   canonicalAgentProfileDigest,
   canonicalCandidateDigest,
   RequestedInteractionsSchema,
@@ -58,6 +59,7 @@ import {
   resolveRequestedReasoningEffort,
 } from '../backends/profile-support.js'
 import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
+import { setRunIdentityHeaders } from '../runs/headers.js'
 import { isLoopbackRequest } from '../http/request-source.js'
 import {
   parseSafeCallerMetadata,
@@ -93,6 +95,27 @@ const durableRunIdSchema = z
     /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u,
     'run id must be URL-safe: letters, digits, dot, underscore, colon, or hyphen',
   )
+
+// Agent Interface uses one bounded identifier contract for these coordinates.
+// Keep each field tied to its source schema while rejecting control bytes before
+// values are copied into response headers.
+type SourceCoordinateSchema = {
+  safeParse: (value: unknown) => { success: boolean }
+}
+
+function exactCoordinateSchema(source: SourceCoordinateSchema, field: string) {
+  return z.custom<string>(
+    (value) => typeof value === 'string'
+      && source.safeParse(value).success
+      && !/[\r\n\0]/u.test(value),
+    { message: `${field} must be a safe identifier` },
+  )
+}
+
+const exactProviderSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.provider, 'provider')
+const exactEnvironmentIdSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.environmentId, 'environment_id')
+const exactSessionIdSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.sessionId, 'session_id')
+const exactExecutionIdSchema = exactCoordinateSchema(AgentRunControlRefSchema.shape.executionId, 'execution_id')
 
 // Node timers above this value overflow to an almost-immediate callback. This
 // is the implementation limit, not a product policy; omitting the field means
@@ -167,6 +190,12 @@ const chatRequestSchema = z.object({
   interactions: requestedInteractionsSchema.optional(),
   session_id: z.string().optional(),
   resume_id: z.string().optional(), // alias for session_id
+  /** Exact durable-run provider coordinate. Must be paired with the other exact coordinates. */
+  provider: exactProviderSchema.optional(),
+  /** Exact durable-run environment coordinate. Must be paired with the other exact coordinates. */
+  environment_id: exactEnvironmentIdSchema.optional(),
+  /** Exact durable-run execution coordinate. Must be paired with the other exact coordinates. */
+  execution_id: exactExecutionIdSchema.optional(),
   /**
    * Durable-run id. Decouples the JOB from this HTTP connection. A
    * client disconnect never kills the run; a reconnect/retry that reuses
@@ -381,20 +410,6 @@ export function mountChatCompletions(
       }, 400)
     }
 
-    // Session id resolution — accept several aliases so clients with
-    // different conventions all work:
-    //   body.session_id                (canonical)
-    //   body.resume_id                 (alias)
-    //   header X-Session-Id            (canonical)
-    //   header X-Resume                (alias — ergonomic single-word form)
-    //   header X-Conversation-Id       (alias — matches OpenAI Assistants vocab)
-    const headerSession =
-      c.req.header('x-session-id')
-      ?? c.req.header('x-resume')
-      ?? c.req.header('x-conversation-id')
-      ?? undefined
-    const bodySession = parsed.data.session_id ?? parsed.data.resume_id
-
     let mode
     try {
       mode = parseMode({
@@ -438,15 +453,37 @@ export function mountChatCompletions(
       run_id: bodyRunId,
       session_id: _bodySessionId,
       resume_id: _bodyResumeId,
+      provider,
+      environment_id,
+      execution_id,
       ...rest
     } = parsed.data
+    const sessionResult = resolveSessionId({
+      bodySessionId: parsed.data.session_id,
+      bodyResumeId: parsed.data.resume_id,
+      headerSessionId: c.req.header('x-session-id'),
+      headerResumeId: c.req.header('x-resume'),
+      headerConversationId: c.req.header('x-conversation-id'),
+    })
+    if (!sessionResult.ok) return invalidRequest(c, sessionResult.message)
+    const sessionId = sessionResult.value
+    const runIdResult = resolveRunId(bodyRunId, c.req.header('x-run-id'))
+    if (!runIdResult.ok) return invalidRequest(c, runIdResult.message)
+    const runId = runIdResult.value
+    const exactCoordinates = resolveExactRunCoordinates({
+      provider,
+      environmentId: environment_id,
+      executionId: execution_id,
+      sessionId,
+      hasExplicitRunId: bodyRunId !== undefined || c.req.header('x-run-id') !== undefined,
+    })
+    if (!exactCoordinates.ok) return invalidRequest(c, exactCoordinates.message)
     // Without an exact AgentProfile, MCP can arrive in the body OR the
     // `X-Mcp-Config` header and the body wins on conflict. When a profile is
     // present, any body/header MCP is refused before execution; the profile is
     // the only behavioral authority.
     const mcpHeader = parseMcpHeader(c.req.header('x-mcp-config'))
     const mergedMcp = mergeMcpInputs(mcpHeader, bodyMcp as ChatRequest['mcp'] | undefined)
-    const sessionId = bodySession ?? headerSession
     let persistedSession: SessionRecord | null = null
     if (sessionId) {
       const candidates = deps.sessions.findByExternalId(sessionId)
@@ -590,6 +627,11 @@ export function mountChatCompletions(
       ...rest,
       model: selectedModel,
       session_id: sessionId,
+      ...(exactCoordinates.value ? {
+        provider: exactCoordinates.value.provider,
+        environment_id: exactCoordinates.value.environmentId,
+        execution_id: exactCoordinates.value.executionId,
+      } : {}),
       mode,
       ...(response_format ? { responseFormat: normalizeResponseFormat(response_format) } : {}),
       ...(effectiveProfile !== undefined ? { agent_profile: effectiveProfile as ChatRequest['agent_profile'] } : {}),
@@ -621,9 +663,6 @@ export function mountChatCompletions(
 
     // Durable-run identity and replay cursor are exact claims. Conflicting aliases, malformed ids,
     // and invalid cursors fail closed instead of silently selecting one value or replaying from 0.
-    const runIdResult = resolveRunId(bodyRunId, c.req.header('x-run-id'))
-    if (!runIdResult.ok) return invalidRequest(c, runIdResult.message)
-    const runId = runIdResult.value
     const standardCursor = c.req.header('last-event-id')
     const aliasCursor = c.req.header('x-last-event-id')
     const cursorResult = resolveRunEventCursor(standardCursor, aliasCursor)
@@ -656,10 +695,10 @@ export function mountChatCompletions(
     try {
       claim = deps.runs.claim(runId, requestDigest, {
         owner: 'one-shot',
-        provider: backend.name,
-        environmentId: ENVIRONMENT_ID,
-        sessionId: req.session_id || runId,
-        executionId: runId,
+        provider: exactCoordinates.value?.provider ?? backend.name,
+        environmentId: exactCoordinates.value?.environmentId ?? ENVIRONMENT_ID,
+        sessionId: exactCoordinates.value?.sessionId ?? req.session_id ?? runId,
+        executionId: exactCoordinates.value?.executionId ?? runId,
       })
     } catch (error) {
       if (error instanceof RunIdentityConflictError) return runIdentityConflict(c, error)
@@ -671,7 +710,7 @@ export function mountChatCompletions(
     // to this run and cannot acquire a second slot; a different request under the same id was
     // refused above. The creator alone owns setup and pump.
     if (!claim.created) {
-      return respondFromRun(c, run, req, runId, afterSeq)
+      return respondFromRun(c, run, req, afterSeq)
     }
 
     // Execution router: when the caller asks for `execution: 'sandbox'`
@@ -1009,7 +1048,7 @@ export function mountChatCompletions(
       return errorResponse(c, error)
     }
 
-    return respondFromRun(c, run, req, runId, afterSeq)
+    return respondFromRun(c, run, req, afterSeq)
   })
 }
 
@@ -1035,7 +1074,6 @@ async function respondFromRun(
   c: Context,
   run: Run,
   req: ChatRequest,
-  runId: string,
   afterSeq: number,
 ): Promise<Response> {
   try {
@@ -1046,8 +1084,7 @@ async function respondFromRun(
   }
   // Surface mode + run id so clients can reconnect/cancel by run id.
   c.header('X-Bridge-Mode', req.mode ?? 'byob')
-  c.header('X-Run-Id', runId)
-  c.header('X-Run-Request-Digest', run.requestDigest)
+  setRunIdentityHeaders(c, run.snapshot())
 
   // OpenAI's /v1/chat/completions defaults `stream: false` when the field
   // is omitted. Only stream when the caller asked for it (`stream: true`);
@@ -1112,6 +1149,79 @@ function resolveRunId(
     return { ok: false, message: parsed.error.issues[0]?.message ?? 'invalid run id' }
   }
   return { ok: true, value: parsed.data }
+}
+
+function resolveSessionId(input: {
+  bodySessionId?: string
+  bodyResumeId?: string
+  headerSessionId?: string
+  headerResumeId?: string
+  headerConversationId?: string
+}): ParsedHeader<string | undefined> {
+  const values = [
+    ['session_id', input.bodySessionId],
+    ['resume_id', input.bodyResumeId],
+    ['X-Session-Id', input.headerSessionId],
+    ['X-Resume', input.headerResumeId],
+    ['X-Conversation-Id', input.headerConversationId],
+  ] as const
+  const present = values.filter(([, value]) => value !== undefined)
+  if (present.some(([, value]) => value === '')) {
+    return { ok: false, message: 'session id must be non-empty when provided' }
+  }
+  for (const [name, value] of present) {
+    const parsed = exactSessionIdSchema.safeParse(value)
+    if (!parsed.success) return { ok: false, message: `${name} must be a safe identifier` }
+  }
+  const first = present[0]?.[1]
+  if (first !== undefined && present.some(([, value]) => value !== first)) {
+    return { ok: false, message: 'session_id, resume_id, and session headers must match when provided' }
+  }
+  return { ok: true, value: first }
+}
+
+type ExactRunCoordinates = {
+  provider: string
+  environmentId: string
+  sessionId: string
+  executionId: string
+}
+
+function resolveExactRunCoordinates(input: {
+  provider?: string
+  environmentId?: string
+  executionId?: string
+  sessionId?: string
+  hasExplicitRunId: boolean
+}): ParsedHeader<ExactRunCoordinates | null> {
+  const provided = [input.provider, input.environmentId, input.executionId]
+    .filter((value): value is string => value !== undefined)
+  if (provided.length === 0) return { ok: true, value: null }
+  if (provided.length !== 3) {
+    return {
+      ok: false,
+      message: 'provider, environment_id, and execution_id must be provided together',
+    }
+  }
+  if (!input.hasExplicitRunId) {
+    return { ok: false, message: 'exact run coordinates require run_id or X-Run-Id' }
+  }
+  if (input.sessionId === undefined) {
+    return { ok: false, message: 'exact run coordinates require session_id or a session header' }
+  }
+  const sessionId = exactSessionIdSchema.safeParse(input.sessionId)
+  if (!sessionId.success) {
+    return { ok: false, message: 'exact run session_id must be a safe identifier' }
+  }
+  return {
+    ok: true,
+    value: {
+      provider: input.provider!,
+      environmentId: input.environmentId!,
+      sessionId: sessionId.data,
+      executionId: input.executionId!,
+    },
+  }
 }
 
 /** Bind a run id to execution semantics, not response representation. `stream` and runtime-owned

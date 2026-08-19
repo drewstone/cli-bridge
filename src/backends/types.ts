@@ -195,6 +195,12 @@ export interface ChatRequest {
   effort?: ReasoningEffort
   /** External stable session id. If unset, the backend starts fresh. */
   session_id?: string
+  /** Caller-supplied provider coordinate for an exact durable run reference. */
+  provider?: string
+  /** Caller-supplied environment coordinate for an exact durable run reference. */
+  environment_id?: string
+  /** Caller-supplied execution coordinate for an exact durable run reference. */
+  execution_id?: string
   /**
    * Execution mode. If unset, the backend picks its default (byob). In
    * `hosted-safe` mode the backend MUST disable every tool that can

@@ -20,7 +20,7 @@ import {
   SessionIdentityConflictError,
   type SessionStore,
 } from './store.js'
-import { readyNativeBackend } from './retained/capabilities.js'
+import { readyBackendCapabilities, readyNativeBackend } from './retained/capabilities.js'
 import { RetainedSessionState } from './retained/state.js'
 import {
   parseCancel,
@@ -136,7 +136,7 @@ export class RetainedSessionService {
   }
 
   async capabilities(model: string, signal?: AbortSignal): Promise<AgentEnvironmentCapabilities> {
-    const { capabilities } = await readyNativeBackend({
+    const { capabilities } = await readyBackendCapabilities({
       registry: this.registry,
       model,
       healthProbeTimeoutMs: this.healthProbeTimeoutMs,
