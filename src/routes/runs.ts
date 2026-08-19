@@ -28,9 +28,10 @@ import type { RetainedEventRecord, SessionStore } from '../sessions/store.js'
 import type { DurableRetainedRunSnapshot } from '../sessions/retained.js'
 import { readBoundedJson } from '../sessions/retained/http.js'
 import { RetainedSessionError } from '../sessions/retained/types.js'
-import { resolveRunEventCursor, streamRunEvents } from './run-events.js'
+import { resolveRunEventCursor, streamChatDeltaEvents, streamRunEvents } from './run-events.js'
 import { setExactRunIdentityHeaders, setRunIdentityHeaders } from '../runs/headers.js'
 import { isSafeWireIdentifier } from '../runs/identifiers.js'
+import { retainedChatDeltas } from '../runs/persisted-chat-event.js'
 
 const MAX_TERMINAL_WAIT_MS = 30_000
 
@@ -85,6 +86,13 @@ export function mountRuns(app: Hono, deps: {
         return retainedRunError(c, error)
       }
       setRetainedRunHeaders(c, retainedSnapshot, retained.runLastSequence(id))
+      if (deps.retainedStore?.getRetainedRun(id)?.owner === 'one-shot') {
+        return streamChatDeltaEvents(
+          c,
+          (signal) => retainedChatDeltas(retained.runEvents(id, cursor.value, signal)),
+          'cli-bridge',
+        )
+      }
       return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))
     }
     const run = deps.runs.get(id)
@@ -95,6 +103,13 @@ export function mountRuns(app: Hono, deps: {
       } catch (error) {
         if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
         return retainedRunError(c, error)
+      }
+      if (deps.retainedStore?.getRetainedRun(id)?.owner === 'one-shot') {
+        return streamChatDeltaEvents(
+          c,
+          (signal) => retainedChatDeltas(retained.runEvents(id, cursor.value, signal)),
+          'cli-bridge',
+        )
       }
       return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))
     }

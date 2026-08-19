@@ -88,35 +88,43 @@ export async function readyBackendCapabilities(input: {
 /**
  * The conservative capability document for a ready non-native backend.
  *
- * A generic backend proves only one-shot streaming and the bridge's durable
- * run protocol. It does not prove provider continuation, profile materializers,
- * tools, MCP, subagents, detach, or usage receipts.
+ * A generic backend uses the bridge's durable one-shot run protocol.
+ *
+ * The bridge owns exact run identity, replay, detach, cancellation, profile
+ * materialization, usage, placement, and lifecycle observation. Native process
+ * continuation and native interactions remain exclusive to native backends.
  */
 export function genericCliBridgeCapabilities(_backendName?: string): AgentEnvironmentCapabilities {
   const candidate: AgentEnvironmentCapabilities = {
     profile: {
       namedProfiles: false,
-      systemPrompt: { replace: false, append: false },
-      instructions: false,
-      tools: false,
-      permissions: false,
-      mcp: false,
-      subagents: false,
+      systemPrompt: { replace: true, append: true },
+      instructions: true,
+      tools: true,
+      permissions: true,
+      mcp: true,
+      subagents: true,
       resources: {
-        files: false,
-        instructions: false,
-        tools: false,
-        skills: false,
-        agents: false,
-        commands: false,
+        files: true,
+        instructions: true,
+        tools: true,
+        skills: true,
+        agents: true,
+        commands: true,
       },
       hooks: false,
-      modes: false,
+      modes: true,
       runtimeUpdate: false,
-      validation: false,
+      validation: true,
     },
-    streaming: { live: true, replay: true, detach: false, turnIdempotency: true },
-    sessions: { continue: false, list: false, messages: false },
+    streaming: { live: true, replay: true, detach: true, turnIdempotency: true },
+    sessions: { continue: true, list: false, messages: false },
+    retainedControl: {
+      exactRunIdentity: true,
+      resultIdentity: true,
+      eventIdentity: true,
+      cancellationIdempotency: true,
+    },
     workspace: {
       read: false,
       write: false,
@@ -126,17 +134,17 @@ export function genericCliBridgeCapabilities(_backendName?: string): AgentEnviro
       download: false,
     },
     branching: { checkpoint: false, fork: false },
-    placement: false,
-    usage: false,
+    placement: true,
+    usage: true,
     confidential: false,
     observation: {
       identity: true,
       lifecycle: true,
       endpoint: true,
-      placement: false,
+      placement: true,
       resources: false,
       resourceUse: false,
-      modelUsage: false,
+      modelUsage: true,
       computeBilling: false,
       accountUsage: false,
     },
@@ -145,7 +153,29 @@ export function genericCliBridgeCapabilities(_backendName?: string): AgentEnviro
   if (!validated.success) {
     throw new RetainedSessionError('Bridge generic capabilities are invalid', 500, 'server_error')
   }
-  return validated.data as AgentEnvironmentCapabilities
+  const capabilities = validated.data as AgentEnvironmentCapabilities
+  assertGenericDurableCapabilities(capabilities)
+  return capabilities
+}
+
+function assertGenericDurableCapabilities(capabilities: AgentEnvironmentCapabilities): void {
+  if (
+    !capabilities.streaming.live ||
+    !capabilities.streaming.replay ||
+    !capabilities.streaming.detach ||
+    !capabilities.streaming.turnIdempotency ||
+    !capabilities.sessions.continue ||
+    capabilities.retainedControl?.exactRunIdentity !== true ||
+    capabilities.retainedControl.resultIdentity !== true ||
+    capabilities.retainedControl.eventIdentity !== true ||
+    capabilities.retainedControl.cancellationIdempotency !== true
+  ) {
+    throw new RetainedSessionError(
+      'Bridge generic durable capabilities are incomplete',
+      500,
+      'server_error',
+    )
+  }
 }
 
 function resolveBackend(registry: BackendRegistry, model: string): Backend {

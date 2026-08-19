@@ -492,7 +492,10 @@ describe('durable run contract', () => {
         headers: { 'Last-Event-ID': '0' },
       })
       expect(events.status).toBe(200)
-      expect(await events.text()).toContain('cli-bridge.chat')
+      const eventsText = await events.text()
+      expect(eventsText).toContain('one')
+      expect(eventsText).toContain('data: [DONE]')
+      expect(eventsText).not.toContain('event: raw')
 
       const cancellation = cancellationRequest(
         'restart-cancellation',
