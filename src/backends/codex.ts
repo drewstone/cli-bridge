@@ -45,6 +45,7 @@ import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/t
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { nativeReasoningControl } from '@tangle-network/agent-interface'
 
 export interface CodexBackendOptions {
   bin: string
@@ -102,8 +103,9 @@ export class CodexBackend implements Backend {
     ]
     if (providerArg) args.push('-c', `model_provider="${providerArg}"`)
     if (modelArg) args.push('-c', `model="${modelArg}"`)
-    const reasoningEffort = codexReasoningEffort(
-      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    const reasoningEffort = nativeReasoningControl(
+      'codex',
+      resolveRequestedReasoningEffort(req, session),
     )
     if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`)
 
@@ -307,15 +309,6 @@ export function splitCodexModel(
   return { provider: remainder.slice(0, slash), model: remainder.slice(slash + 1) }
 }
 
-export function codexReasoningEffort(
-  effort: ChatRequest['effort'],
-): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra' | null {
-  if (!effort) return null
-  // Codex CLI 0.147.0 accepts the canonical values directly.
-  // It also accepts ultra end-to-end although invalid-value errors omit it.
-  if (effort === 'ultracode') return 'ultra'
-  return effort
-}
 
 /**
  * Path to the user's persistent codex auth.json. cli-bridge points

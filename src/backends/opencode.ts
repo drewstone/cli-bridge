@@ -42,6 +42,7 @@ import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { addUsage as collectUsage, type CollectedUsage } from '../usage.js'
+import { nativeReasoningControl } from '@tangle-network/agent-interface'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
 
@@ -84,8 +85,9 @@ export class OpencodeBackend implements Backend {
 
     // Reject unsupported profile plans before writing a request-scoped
     // opencode.json that may contain MCP credentials.
-    const variant = opencodeVariantForEffort(
-      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    const variant = nativeReasoningControl(
+      'opencode',
+      resolveRequestedReasoningEffort(req, session),
     )
     const provisioned = provisionProfileWorkspace(
       req,
@@ -341,9 +343,6 @@ export class OpencodeBackend implements Backend {
   }
 }
 
-export function opencodeVariantForEffort(effort: ChatRequest['effort']): string | null {
-  return effort ?? null
-}
 
 function pickSessionId(ev: Record<string, unknown>): string | null {
   for (const k of ['session_id', 'sessionId', 'sessionID', 'session']) {
