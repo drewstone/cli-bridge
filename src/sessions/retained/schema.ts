@@ -59,6 +59,7 @@ const createSchema = z.strictObject({
   interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
   agent_profile: boundedJsonSchema.optional(),
   mcp: boundedJsonRecordSchema.optional(),
+  runtime_attachments: z.strictObject({ mcp: boundedJsonRecordSchema }).optional(),
   metadata: boundedJsonRecordSchema.optional(),
   execution: retainedExecutionSchema.optional(),
   env: retainedEnvSchema.optional(),
@@ -80,6 +81,7 @@ const turnSchema = z.strictObject({
   metadata: boundedJsonRecordSchema.optional(),
   execution: retainedExecutionSchema.optional(),
   env: retainedEnvSchema.optional(),
+  runtime_attachments: z.strictObject({ mcp: boundedJsonRecordSchema }).optional(),
 })
 
 const steerSchema = z.strictObject({

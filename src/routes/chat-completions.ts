@@ -209,6 +209,15 @@ const chatRequestSchema = z.object({
   mcp: z.object({
     mcpServers: z.record(z.unknown()).optional(),
   }).passthrough().optional(),
+  /**
+   * Runtime-owned MCP attachments mounted OUTSIDE the session-bound
+   * AgentProfile. Allowed beside `agent_profile`; excluded from the
+   * session profile binding, from receipt digests, and from durable-run
+   * identity. See ChatRequest.runtime_attachments.
+   */
+  runtime_attachments: z.strictObject({
+    mcp: z.record(z.unknown()),
+  }).optional(),
   cwd: z.string().optional(),
   metadata: retainedPublicRecordSchema.optional(),
   env: retainedEnvSchema.optional(),
@@ -424,6 +433,7 @@ export function mountChatCompletions(
       provider_options,
       metadata: bodyMetadata,
       mcp: bodyMcp,
+      runtime_attachments: bodyRuntimeAttachments,
       run_id: bodyRunId,
       session_id: _bodySessionId,
       resume_id: _bodyResumeId,
@@ -610,6 +620,11 @@ export function mountChatCompletions(
       ...(response_format ? { responseFormat: normalizeResponseFormat(response_format) } : {}),
       ...(effectiveProfile !== undefined ? { agent_profile: effectiveProfile as ChatRequest['agent_profile'] } : {}),
       ...(effectiveMcp ? { mcp: effectiveMcp } : {}),
+      // Attachments are process-ephemeral: applied to this request only,
+      // never folded from or into durable session metadata.
+      ...(bodyRuntimeAttachments
+        ? { runtime_attachments: bodyRuntimeAttachments as ChatRequest['runtime_attachments'] }
+        : {}),
       ...(cwd ? { cwd } : {}),
       ...(effectiveExecution ? { execution: effectiveExecution } : {}),
       ...(effectiveEnv ? { env: effectiveEnv } : {}),
@@ -1383,6 +1398,10 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
     stream: _stream,
     jailSpec: _jailSpec,
     profile_materialization_receipt: _materialization,
+    // Runtime attachments are process-ephemeral platform endpoints. A
+    // dispatcher that restarts re-issues the same job from a new port, and
+    // that reconnect must re-attach to the in-flight run, not conflict.
+    runtime_attachments: _runtimeAttachments,
     protectedModelCredential,
     ...executionRequest
   } = req

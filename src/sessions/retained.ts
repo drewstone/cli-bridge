@@ -163,12 +163,19 @@ export class RetainedSessionService {
     let profile: ReturnType<typeof snapshotRetainedAgentProfile> | null = null
     let env: Record<string, string> | undefined
     let mcp: Record<string, unknown> | undefined
+    let runtimeAttachments: Record<string, unknown> | undefined
     let context: Record<string, unknown> | undefined
     let providerOptions: Record<string, unknown> | undefined
     try {
       profile = input.agent_profile === undefined ? null : snapshotRetainedAgentProfile(input.agent_profile)
       env = input.env === undefined ? undefined : parseSafeRetainedEnv(input.env)
       mcp = input.mcp === undefined ? undefined : parseSafeRetainedMcp(input.mcp)
+      runtimeAttachments = input.runtime_attachments === undefined
+        ? undefined
+        : parseSafeRetainedMcp(
+            { mcpServers: input.runtime_attachments.mcp },
+            'runtime attachment MCP configuration',
+          ).mcpServers as Record<string, unknown>
       context = input.context === undefined ? undefined : parseSafePublicRecord(input.context, 'retained context')
       providerOptions = input.provider_options === undefined
         ? undefined
@@ -220,16 +227,20 @@ export class RetainedSessionService {
       ...(input.execution ? { execution: input.execution } : {}),
       ...(env ? { env } : {}),
       ...(mcp ? { mcp } : {}),
+      ...(runtimeAttachments ? { runtime_attachments: { mcp: runtimeAttachments } } : {}),
       ...(context ? { context } : {}),
       ...(providerOptions ? { provider_options: providerOptions } : {}),
       ...(profile ? { agent_profile: profile } : {}),
     }
+    // Attachment endpoints are process-ephemeral; a re-create from a
+    // restarted dispatcher must match the original create identity.
+    const { runtime_attachments: _createAttachments, ...createIdentity } = input
     let created: RetainedSessionRecord
     try {
       created = this.store.createRetained({
         id,
         createRequestDigest: canonicalCandidateDigest({
-          ...input,
+          ...createIdentity,
           model: selectedModel,
           ...(profile ? { agent_profile: profile } : {}),
           ...(env ? { env } : {}),

@@ -138,6 +138,7 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 - `cwd`: persist a working directory for the session and run future resumed turns there
 - `agent_profile`: full `AgentProfile` object
 - `mcp`: standardised MCP server passthrough (see [MCP passthrough](#mcp-passthrough))
+- `runtime_attachments`: platform MCP endpoints mounted outside the bound profile (see [Runtime attachments](#runtime-attachments))
 - `run_id`: caller-owned durable job id (also accepted as `X-Run-Id`)
 - `execution`: execution location plus an optional caller-owned `timeoutMs` process deadline
 - `interactions` and `interaction_policy`: parsed with the shared interaction contract; one-shot chat rejects a non-empty posture or policy with `501 capability_denied` before durable admission because response-bound interactions require a retained native session
@@ -473,6 +474,48 @@ Per-server fields:
 `agent_profile.mcp` is the sole MCP authority for an exact profile.
 Without a profile, callers may use body/header `mcp.mcpServers`.
 Sending both is refused before the harness starts.
+
+### Runtime attachments
+
+A dispatching runtime mounts its own MCP endpoints with
+`runtime_attachments.mcp`. Each entry uses the `agent_profile.mcp` server
+schema and merges into the same materialized config the harness loads.
+
+```jsonc
+{
+  "model": "claude/sonnet",
+  "messages": [{ "role": "user", "content": "drive the run" }],
+  "agent_profile": { "name": "supervised-manager" },
+  "runtime_attachments": {
+    "mcp": {
+      "coordination": { "transport": "http", "url": "http://127.0.0.1:36827/mcp" }
+    }
+  }
+}
+```
+
+This channel is accepted beside `agent_profile`, and it is the only channel
+that is. It exists because an attachment endpoint is process-ephemeral: a
+runtime that restarts serves the same coordination server on a new port. So
+an attachment is excluded from:
+
+- the exact session AgentProfile binding, which keeps one durable session
+  usable across a restart that rebinds the port;
+- every profile materialization receipt digest;
+- durable-run request identity, so a reconnect re-attaches to the in-flight
+  run instead of conflicting;
+- durable session state, which is why the caller sends the attachment on
+  every request that needs the mount.
+
+Refused before the harness starts: an alias already declared by the profile
+or the request `mcp` channel, an `enabled: false` entry, and a value that is
+not a typed MCP server. `runtime_attachments` is also accepted on
+`POST /v1/sessions` and `POST /v1/sessions/:id/turns`, where a turn value
+replaces the created value for the spawn that turn starts.
+
+Clients discover the channel from `capabilities.runtimeAttachments.mcp` in
+the root document (`GET /`), and must refuse rather than fold the endpoint
+into the profile when the flag is absent.
 
 ### Per-backend support matrix
 

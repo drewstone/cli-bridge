@@ -21,6 +21,7 @@ import type { CallerTrace } from '../trace/ids.js'
 import type {
   AgentEnvironmentCapabilities,
   AgentProfile,
+  AgentProfileMcpServer,
   NativeContextBoundaryProof,
   ReasoningEffort,
   RequestedInteractions,
@@ -110,6 +111,27 @@ export interface McpServerSpec {
  */
 export interface McpRequestConfig {
   mcpServers?: Record<string, McpServerSpec>
+}
+
+/**
+ * Platform-owned attachments a dispatching runtime mounts into a run
+ * WITHOUT changing the authored AgentProfile.
+ *
+ * Each `mcp` entry uses the same canonical server schema as
+ * `agent_profile.mcp` and merges into MCP materialization for the run.
+ * The channel exists because attachment endpoints are process-ephemeral:
+ * a runtime that restarts rebinds its coordination server on a new port,
+ * and that new URL must not move any stable identity. So attachments are
+ * excluded from the session AgentProfile binding, from every profile
+ * materialization receipt digest, and from durable-run request identity.
+ * They are also never persisted into durable session state — the caller
+ * supplies them on every request that needs the mount.
+ *
+ * An attachment alias that collides with a server declared by the
+ * authored profile or the request `mcp` channel is refused before spawn.
+ */
+export interface RuntimeAttachments {
+  mcp: Record<string, AgentProfileMcpServer>
 }
 
 /** Safe proof of the exact AgentProfile workspace plan applied before spawn. */
@@ -231,7 +253,9 @@ export interface ChatRequest {
    *
    * This channel is available only when `agent_profile` is absent. With an
    * exact profile, declare every MCP server in `agent_profile.mcp`; a second
-   * body/header MCP channel is refused before spawn.
+   * body/header MCP channel is refused before spawn. A platform that must
+   * mount its own endpoint beside an exact profile uses
+   * `runtime_attachments.mcp`, which never enters the profile identity.
    *
    * Also accepted via the `X-Mcp-Config` request header (JSON-encoded
    * same shape) for callers that cannot extend the body.
@@ -242,6 +266,15 @@ export interface ChatRequest {
    * by the backend materializer — fail loud, no silent fallback.
    */
   mcp?: McpRequestConfig
+  /**
+   * Runtime-owned MCP attachments carried OUTSIDE the session-bound
+   * profile. Unlike `mcp`, this channel is allowed beside
+   * `agent_profile`: it does not author behavior, it mounts the
+   * dispatching platform's own endpoints (for example a coordination
+   * MCP server on an ephemeral port). See {@link RuntimeAttachments}
+   * for the identity-exclusion contract.
+   */
+  runtime_attachments?: RuntimeAttachments
   /** Optional working directory for the first turn of a session. Persisted into SessionStore when session_id is present. */
   cwd?: string
   /** Public, non-secret environment entries requested for this execution. */
