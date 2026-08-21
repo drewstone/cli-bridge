@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import {
   type AgentEnvironmentCapabilities,
+  nativeReasoningControl,
 } from '@tangle-network/agent-interface'
 import type { SessionRecord } from '../sessions/store.js'
 import type { NativeSession, ChatRequest } from './types.js'
@@ -25,7 +26,6 @@ import {
   piMcpAdapterAvailable,
   piToolProcessEnvironment,
   resolvePiMcpAdapterInstallPath,
-  thinkingFlagForEffort,
 } from './pi.js'
 import { piInteractionExtension } from './pi-interaction.js'
 import { PiNativeSession } from './pi-native-session.js'
@@ -119,7 +119,7 @@ export async function startPiNativeSession(
   const profile = resolveAgentProfile(req, session)
   assertPiOutputTokenRequest(req, profile)
   const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
-  const thinking = thinkingFlagForEffort(requestedReasoningEffort ?? undefined)
+  const thinking = nativeReasoningControl('pi', requestedReasoningEffort)
   const executionIdentity = profileExecutionIdentity(req, session, 'pi', thinking)
   const mcpSpecs = resolveMcpServers(req, session)
   const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []

@@ -32,7 +32,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import type { AgentProfile } from '@tangle-network/agent-interface'
+import { type AgentProfile, nativeReasoningControl } from '@tangle-network/agent-interface'
 import { registerJailReadable } from '../jail/index.js'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
@@ -106,8 +106,9 @@ export class KimiBackend implements Backend {
 
     // Reject unsupported profile plans before creating either temporary
     // Kimi config. Both files can contain provider or MCP credentials.
-    const thinkingFlag = thinkingFlagForEffort(
-      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    const thinkingFlag = nativeReasoningControl(
+      'kimi-code',
+      resolveRequestedReasoningEffort(req, session),
     )
     const provisioned = provisionProfileWorkspace(
       req,
@@ -457,11 +458,6 @@ function ensureK2DefaultConfig(config: string): string {
   return next
 }
 
-export function thinkingFlagForEffort(effort: ChatRequest['effort']): '--thinking' | '--no-thinking' | null {
-  if (!effort || effort === 'medium') return null
-  if (effort === 'none' || effort === 'minimal' || effort === 'low') return '--no-thinking'
-  return '--thinking' // high | xhigh | ultracode → kimi's "on"
-}
 
 async function cleanupConfigFile(file: string): Promise<void> {
   await rm(file, { force: true }).catch(() => undefined)

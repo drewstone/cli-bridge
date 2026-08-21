@@ -44,6 +44,7 @@ import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { nativeReasoningControl } from '@tangle-network/agent-interface'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -215,8 +216,9 @@ export class ClaudeBackend implements Backend {
     // stdin against a smaller block than buildArgs will emit lets the two
     // disagree at the cap, and the disagreement drops the system content from
     // BOTH transports rather than degrading it into the user message.
-    const appliedReasoningEffort = claudeEffort(
-      resolveRequestedReasoningEffort(req, session) ?? undefined,
+    const appliedReasoningEffort = nativeReasoningControl(
+      'claude-code',
+      resolveRequestedReasoningEffort(req, session),
     )
     const provisioned = provisionProfileWorkspace(
       req,
@@ -455,7 +457,7 @@ export class ClaudeBackend implements Backend {
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
       : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
-    const effort = claudeEffort(resolveRequestedReasoningEffort(req, session) ?? undefined)
+    const effort = nativeReasoningControl('claude-code', resolveRequestedReasoningEffort(req, session))
     if (effort) args.push('--effort', effort)
 
     // agent_profile.prompt.systemPrompt REPLACES claude-code's own system
@@ -664,16 +666,3 @@ export class ClaudeBackend implements Backend {
   }
 }
 
-/**
- * Map the shared effort ladder onto Claude Code's exact CLI values.
- * Claude cannot disable effort or express `minimal`, so both clamp to its
- * lowest supported level. `ultracode` maps to Claude's explicit maximum.
- */
-export function claudeEffort(
-  effort: ChatRequest['effort'],
-): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
-  if (!effort) return null
-  if (effort === 'none' || effort === 'minimal') return 'low'
-  if (effort === 'ultracode') return 'max'
-  return effort
-}

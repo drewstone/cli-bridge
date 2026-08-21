@@ -58,6 +58,7 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth, NativeSessionBacke
 import { versionHealth } from './health.js'
 import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
+import { nativeReasoningControl } from '@tangle-network/agent-interface'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   buildCanonicalMcpServers,
@@ -129,15 +130,6 @@ export function parsePiModelId(model: string): PiModelSpec {
   return { provider: rest.slice(0, slash), model: rest.slice(slash + 1) }
 }
 
-/** Map ReasoningEffort to pi's `--thinking` flag. */
-export function thinkingFlagForEffort(effort?: string): string | null {
-  if (!effort) return null
-  // pi accepts: off | minimal | low | medium | high | xhigh
-  const allowed = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
-  // Canonical ladder → pi's: none → off, ultracode → xhigh (pi's ceiling); the rest pass through.
-  const e = effort === 'none' ? 'off' : effort === 'ultracode' ? 'xhigh' : effort
-  return allowed.has(e) ? e : null
-}
 
 /**
  * Pi's MCP adapter keeps its compact proxy by default. A request profile,
@@ -538,7 +530,7 @@ export class PiBackend implements NativeSessionBackend {
     }
     const modelHints = profile?.model
     const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
-    const thinking = thinkingFlagForEffort(requestedReasoningEffort ?? undefined)
+    const thinking = nativeReasoningControl('pi', requestedReasoningEffort)
     const executionIdentity = profileExecutionIdentity(req, session, 'pi', thinking)
     if (thinking) args.push('--thinking', thinking)
 

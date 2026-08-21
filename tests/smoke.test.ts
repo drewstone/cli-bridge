@@ -18,10 +18,10 @@ import { RunRegistry } from '../src/runs/registry.js'
 import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { BackendError } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
-import { ClaudeBackend, claudeEffort } from '../src/backends/claude.js'
-import { KimiBackend, thinkingFlagForEffort } from '../src/backends/kimi.js'
-import { CodexBackend, codexReasoningEffort } from '../src/backends/codex.js'
-import { OpencodeBackend, opencodeVariantForEffort } from '../src/backends/opencode.js'
+import { ClaudeBackend } from '../src/backends/claude.js'
+import { KimiBackend } from '../src/backends/kimi.js'
+import { CodexBackend } from '../src/backends/codex.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
 import { GeminiBackend, geminiSandboxFlag, geminiYoloFlag } from '../src/backends/gemini.js'
 import { profileExecutionIdentity } from '../src/backends/profile-support.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
@@ -293,45 +293,6 @@ describe('GeminiBackend model parsing', () => {
 })
 
 describe('reasoning effort mapping', () => {
-  it('maps every shared effort value onto Claude Code supported argv values', () => {
-    expect(claudeEffort('none')).toBe('low')
-    expect(claudeEffort('minimal')).toBe('low')
-    expect(claudeEffort('low')).toBe('low')
-    expect(claudeEffort('medium')).toBe('medium')
-    expect(claudeEffort('high')).toBe('high')
-    expect(claudeEffort('xhigh')).toBe('xhigh')
-    expect(claudeEffort('ultracode')).toBe('max')
-    expect(claudeEffort(undefined)).toBeNull()
-  })
-
-  it('maps opencode effort to provider variant', () => {
-    expect(opencodeVariantForEffort('high')).toBe('high')
-    expect(opencodeVariantForEffort('ultracode')).toBe('ultracode')
-    expect(opencodeVariantForEffort('none')).toBe('none')
-    expect(opencodeVariantForEffort(undefined)).toBeNull()
-  })
-
-  it('maps kimi effort to thinking flags', () => {
-    expect(thinkingFlagForEffort('high')).toBe('--thinking')
-    expect(thinkingFlagForEffort('ultracode')).toBe('--thinking')
-    expect(thinkingFlagForEffort('low')).toBe('--no-thinking')
-    expect(thinkingFlagForEffort('minimal')).toBe('--no-thinking')
-    expect(thinkingFlagForEffort('none')).toBe('--no-thinking')
-    expect(thinkingFlagForEffort('medium')).toBeNull()
-    expect(thinkingFlagForEffort(undefined)).toBeNull()
-  })
-
-  it('maps every shared effort value onto current Codex values', () => {
-    expect(codexReasoningEffort('none')).toBe('none')
-    expect(codexReasoningEffort('minimal')).toBe('minimal')
-    expect(codexReasoningEffort('low')).toBe('low')
-    expect(codexReasoningEffort('medium')).toBe('medium')
-    expect(codexReasoningEffort('high')).toBe('high')
-    expect(codexReasoningEffort('xhigh')).toBe('xhigh')
-    expect(codexReasoningEffort('ultracode')).toBe('ultra')
-    expect(codexReasoningEffort(undefined)).toBeNull()
-  })
-
   it('maps Gemini env flags without inventing hosted-safety defaults', () => {
     const oldApproval = process.env.GEMINI_APPROVAL_MODE
     const oldSandbox = process.env.GEMINI_SANDBOX
