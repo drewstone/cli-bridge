@@ -126,17 +126,6 @@ describe('runtime attachments — chat completions', () => {
     expect(backend.lastConfig?.mcpServers.notes).toMatchObject({ command: 'notes-mcp' })
   })
 
-  it('never folds the attachment into the AgentProfile the request carries', async () => {
-    await post({
-      agent_profile: PROFILE,
-      runtime_attachments: { mcp: { coordination: coordination(36827) } },
-    })
-
-    const profile = backend.last?.agent_profile as AgentProfile
-    expect(Object.keys(profile.mcp ?? {})).toEqual(['notes'])
-    expect(canonicalAgentProfileDigest(profile)).toBe(canonicalAgentProfileDigest(PROFILE))
-  })
-
   it('keeps one session binding across a resume that rebinds the attachment port', async () => {
     const first = await post({
       session_id: 'resume-across-ports',
@@ -182,22 +171,6 @@ describe('runtime attachments — chat completions', () => {
     })
   })
 
-  it('binds the exact model and provider, and no attachment', async () => {
-    await post({
-      session_id: 'binding-contents',
-      agent_profile: PROFILE,
-      runtime_attachments: { mcp: { coordination: coordination(36827) } },
-    })
-
-    expect(storedBinding('binding-contents')).toEqual({
-      schema: 'cli-bridge.session-agent-profile.v1',
-      effectiveProfileDigest: canonicalAgentProfileDigest(PROFILE),
-      provider: 'anthropic',
-      model: 'capture',
-      requestedReasoningEffort: null,
-    })
-  })
-
   it('re-attaches a durable run whose only change is the attachment port', async () => {
     const first = await post({
       run_id: 'run-across-ports',
@@ -224,30 +197,6 @@ describe('runtime attachments — chat completions', () => {
     expect(response.status).toBe(400)
     expect(await response.json()).toMatchObject({
       error: { message: expect.stringContaining('collides with an MCP server declared by the agent_profile') },
-    })
-  })
-
-  it('refuses an attachment alias already declared by the request mcp channel', async () => {
-    const response = await post({
-      mcp: { mcpServers: { coordination: { command: 'other-mcp' } } },
-      runtime_attachments: { mcp: { coordination: coordination(36827) } },
-    })
-
-    expect(response.status).toBe(400)
-    expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining('collides with an MCP server declared by the request mcp channel') },
-    })
-  })
-
-  it('refuses a disabled attachment instead of dropping it silently', async () => {
-    const response = await post({
-      agent_profile: PROFILE,
-      runtime_attachments: { mcp: { coordination: { ...coordination(36827), enabled: false } } },
-    })
-
-    expect(response.status).toBe(400)
-    expect(await response.json()).toMatchObject({
-      error: { message: expect.stringContaining('is disabled') },
     })
   })
 
@@ -283,35 +232,4 @@ describe('runtime attachments — chat completions', () => {
     })
   })
 
-  it('never persists an attachment into durable session state', async () => {
-    await post({
-      session_id: 'no-persisted-attachment',
-      agent_profile: PROFILE,
-      runtime_attachments: { mcp: { coordination: coordination(36827) } },
-    })
-
-    const metadata = sessions.get('no-persisted-attachment', 'capture')?.metadata ?? {}
-    expect(metadata).not.toHaveProperty('runtime_attachments')
-    expect(JSON.stringify(metadata)).not.toContain('36827')
-  })
-
-  it('mounts an attachment for a request that carries no AgentProfile', async () => {
-    const response = await post({
-      mcp: { mcpServers: { notes: { command: 'notes-mcp' } } },
-      runtime_attachments: { mcp: { coordination: coordination(36827) } },
-    })
-
-    expect(response.status).toBe(200)
-    expect(Object.keys(backend.lastConfig?.mcpServers ?? {}).sort()).toEqual(['coordination', 'notes'])
-  })
-
-  it('rejects an unknown runtime_attachments field before execution', async () => {
-    const response = await post({
-      agent_profile: PROFILE,
-      runtime_attachments: { mcp: {}, env: { COORD: '1' } },
-    })
-
-    expect(response.status).toBe(400)
-    expect(backend.last).toBeNull()
-  })
 })

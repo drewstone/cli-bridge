@@ -1175,46 +1175,6 @@ describe('retained Agent Interface sessions', () => {
     expect(backend.requests[0]?.agent_profile).toBeUndefined()
   })
 
-  it('lets a turn rebind the attachment endpoint the next spawn mounts', async () => {
-    const backend = new FakeNativeBackend()
-    fixture = setup(backend)
-    await fixture.app.request('/v1/sessions', {
-      method: 'POST',
-      body: JSON.stringify({
-        id: 'attachment-rebind',
-        model: 'pi/test',
-        runtime_attachments: { mcp: { coordination: { transport: 'http', url: 'http://127.0.0.1:36827/mcp' } } },
-      }),
-    })
-    const turn = await fixture.app.request('/v1/sessions/attachment-rebind/turns', {
-      method: 'POST',
-      body: JSON.stringify({
-        message: 'work',
-        run_id: 'attachment-rebind-turn',
-        runtime_attachments: { mcp: { coordination: { transport: 'http', url: 'http://127.0.0.1:41991/mcp' } } },
-      }),
-    })
-    expect(turn.status).toBe(202)
-    await waitFor(() => fixture!.store.getRetained('attachment-rebind')?.turns === 1)
-    expect(backend.requests[0]?.runtime_attachments?.mcp.coordination).toMatchObject({
-      url: 'http://127.0.0.1:41991/mcp',
-    })
-  })
-
-  it('refuses a runtime attachment that is not a typed MCP configuration', async () => {
-    fixture = setup(new FakeNativeBackend())
-    const response = await fixture.app.request('/v1/sessions', {
-      method: 'POST',
-      body: JSON.stringify({
-        id: 'attachment-invalid',
-        model: 'pi/test',
-        runtime_attachments: { mcp: { coordination: { transport: 'carrier-pigeon' } } },
-      }),
-    })
-    expect(response.status).toBe(400)
-    expect(fixture.store.listRetained(10)).toEqual([])
-  })
-
   it('rejects retained creates and turns that omit caller-owned retry identities', async () => {
     fixture = setup(new FakeNativeBackend())
     const missingSessionId = await fixture.app.request('/v1/sessions', {

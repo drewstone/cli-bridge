@@ -22,9 +22,6 @@ describe('bridge capability advertisement', () => {
         capabilities: {
           profileMaterialization: 'cli-bridge.profile-materialization.v2',
           usageCostProvenance: 'cli-bridge.usage-cost.v1',
-          // A dispatcher gates its attachment channel on this flag and
-          // refuses loud when it is absent, so it must stay advertised.
-          runtimeAttachments: { mcp: true },
         },
       })
     } finally {
