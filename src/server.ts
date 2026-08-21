@@ -516,11 +516,14 @@ export async function buildApp(config: Config): Promise<{
 
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
-    version: '0.2.0',
+    version: '0.3.0',
     scheme: 'bridge/<harness>/<model>',
     capabilities: {
       profileMaterialization: 'cli-bridge.profile-materialization.v2',
       usageCostProvenance: 'cli-bridge.usage-cost.v1',
+      // Platform attachments carried outside the session-bound profile;
+      // dispatchers gate on this flag and refuse loud when it is absent.
+      runtimeAttachments: { mcp: true },
     },
     backends: registry.all().map(b => b.name),
     endpoints: [

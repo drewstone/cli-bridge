@@ -1145,6 +1145,36 @@ describe('retained Agent Interface sessions', () => {
     expect((await json(recovered)).create_request_digest).toBe(expectedDigest)
   })
 
+  it('carries a runtime attachment into the native spawn and keeps it out of create identity', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    const created = await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: 'attachment-create',
+        model: 'pi/test',
+        runtime_attachments: { mcp: { coordination: { transport: 'http', url: 'http://127.0.0.1:36827/mcp' } } },
+      }),
+    })
+    expect(created.status).toBe(201)
+    expect((await json(created)).create_request_digest).toBe(canonicalCandidateDigest({
+      id: 'attachment-create',
+      model: 'pi/test',
+      interaction_policy: 'interactive',
+    }))
+
+    const turn = await fixture.app.request('/v1/sessions/attachment-create/turns', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'work', run_id: 'attachment-turn' }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('attachment-create')?.turns === 1)
+    expect(backend.requests[0]?.runtime_attachments).toEqual({
+      mcp: { coordination: { transport: 'http', url: 'http://127.0.0.1:36827/mcp' } },
+    })
+    expect(backend.requests[0]?.agent_profile).toBeUndefined()
+  })
+
   it('rejects retained creates and turns that omit caller-owned retry identities', async () => {
     fixture = setup(new FakeNativeBackend())
     const missingSessionId = await fixture.app.request('/v1/sessions', {

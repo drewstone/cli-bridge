@@ -713,6 +713,36 @@ export function resolveMcpServers(
     }
   }
 
+  // Runtime attachments mount platform endpoints beside the authored
+  // sources without entering any identity digest. A collision would let an
+  // attachment shadow an authored server (or the reverse) invisibly to the
+  // session binding, so it is refused instead of resolved by precedence.
+  const attachments = req.runtime_attachments?.mcp
+  if (attachments && typeof attachments === 'object') {
+    for (const [name, raw] of Object.entries(attachments)) {
+      if (!name || !raw || typeof raw !== 'object') {
+        throw new BackendError(
+          `runtime_attachments.mcp[${JSON.stringify(name)}] is not an MCP server object`,
+          'parse_error',
+        )
+      }
+      if (merged[name] !== undefined) {
+        throw new BackendError(
+          `runtime attachment ${JSON.stringify(name)} collides with an MCP server declared by the ` +
+            `${profile ? 'agent_profile' : 'request mcp channel'}; attachments must use a reserved alias`,
+          'parse_error',
+        )
+      }
+      if ((raw as { enabled?: unknown }).enabled === false) {
+        throw new BackendError(
+          `runtime attachment ${JSON.stringify(name)} is disabled; an attachment mounts by presence — omit the entry instead`,
+          'parse_error',
+        )
+      }
+      merged[name] = profileMcpToSpec(raw, name, `runtime_attachments.mcp[${JSON.stringify(name)}]`)
+    }
+  }
+
   return Object.keys(merged).length > 0 ? merged : null
 }
 
@@ -773,10 +803,13 @@ function publicMcpConfigRecord(
   return out
 }
 
-function profileMcpToSpec(raw: AgentProfileMcpServer, name: string): McpServerSpec {
+function profileMcpToSpec(
+  raw: AgentProfileMcpServer,
+  name: string,
+  where = `mcp[${JSON.stringify(name)}]`,
+): McpServerSpec {
   // AgentProfileMcpServer uses `transport`; McpServerSpec uses `type`.
   // Rename and forward only the fields we model.
-  const where = `mcp[${JSON.stringify(name)}]`
   const out: McpServerSpec = {}
   if (raw.transport) out.type = raw.transport
   if (typeof raw.command === 'string') out.command = raw.command

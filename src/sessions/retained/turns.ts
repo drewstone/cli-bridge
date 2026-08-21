@@ -527,6 +527,9 @@ export class RetainedTurnRunner {
       ...(config.providerOptions ? { providerOptions: config.providerOptions } : {}),
       ...(config.profile !== undefined ? { agent_profile: config.profile as ChatRequest['agent_profile'] } : {}),
       ...(config.mcp ? { mcp: config.mcp as ChatRequest['mcp'] } : {}),
+      ...(config.runtimeAttachments
+        ? { runtime_attachments: { mcp: config.runtimeAttachments } as ChatRequest['runtime_attachments'] }
+        : {}),
       ...(Object.keys(config.metadata).length > 0 ? { metadata: config.metadata } : {}),
     }
   }
@@ -555,6 +558,25 @@ export class RetainedTurnRunner {
           'unknown_session',
         )
       }
+    }
+    // Attachments matter at native spawn only; like env, a turn value wins
+    // over the persisted create value for the spawn this turn may trigger.
+    let runtimeAttachments: Record<string, unknown> | undefined
+    try {
+      const rawAttachments = input.runtime_attachments?.mcp
+        ?? (record.metadata.runtime_attachments as { mcp?: unknown } | undefined)?.mcp
+      runtimeAttachments = rawAttachments === undefined
+        ? undefined
+        : parseSafeRetainedMcp(
+            { mcpServers: rawAttachments },
+            'runtime attachment MCP configuration',
+          ).mcpServers as Record<string, unknown>
+    } catch (error) {
+      throw new RetainedSessionError(
+        error instanceof Error ? error.message : String(error),
+        input.runtime_attachments === undefined ? 409 : 400,
+        input.runtime_attachments === undefined ? 'unknown_session' : 'invalid_request_error',
+      )
     }
     const execution = parseRetainedExecution(input.execution ?? record.metadata.execution)
     let env: Record<string, string> | undefined
@@ -602,6 +624,7 @@ export class RetainedTurnRunner {
         'env',
         'agent_profile',
         'mcp',
+        'runtime_attachments',
         'metadata',
         'context',
         'provider_options',
@@ -616,6 +639,7 @@ export class RetainedTurnRunner {
       ...(Object.keys(providerOptions).length > 0 ? { providerOptions } : {}),
       ...(profile !== undefined ? { profile } : {}),
       ...(mcp && typeof mcp === 'object' ? { mcp: mcp as Record<string, unknown> } : {}),
+      ...(runtimeAttachments ? { runtimeAttachments } : {}),
       metadata,
     }
   }
@@ -628,6 +652,8 @@ interface RetainedRequestConfig {
   providerOptions?: Record<string, unknown>
   profile?: unknown
   mcp?: Record<string, unknown>
+  /** Runtime-owned MCP attachments; excluded from every identity digest. */
+  runtimeAttachments?: Record<string, unknown>
   metadata: Record<string, unknown>
 }
 
