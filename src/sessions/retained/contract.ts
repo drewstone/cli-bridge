@@ -74,6 +74,8 @@ const hostExecutionSchema = z.strictObject({
   }).optional(),
   netJail: netJailSchema.optional(),
   timeoutMs: z.number().int().positive().max(RETAINED_MAX_EXECUTION_TIMEOUT_MS).optional(),
+  /** Executor-slot wait for a resumed turn. Capped again by the executor. */
+  acquireTimeoutMs: z.number().int().positive().max(RETAINED_MAX_EXECUTION_TIMEOUT_MS).optional(),
 })
 
 const sandboxExecutionSchema = z.strictObject({

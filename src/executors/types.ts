@@ -43,6 +43,46 @@ export class ExecutorConfigurationError extends Error {
   }
 }
 
+/**
+ * Every executor holds a counting semaphore that protects the box, and a
+ * refusal by that semaphore is a CAPACITY answer, not a failure of the work.
+ *
+ * The refusal happens before the child exists, so provider dispatch provably
+ * never started and the request is retry-safe with zero work lost. That fact
+ * has to travel as a field. Measured 2026-08-22: two of six worker spawns died
+ * on `acquire timeout after 60000ms (in_flight=4/4)`, the slots freed seconds
+ * later, and the only machine-readable form of "safe to retry" was a regular
+ * expression over that prose.
+ */
+export class ExecutorSaturatedError extends Error {
+  readonly code = 'executor_saturated' as const
+  /** The refusal happened before spawn, so no model call was made. */
+  readonly providerDispatch = 'not_started' as const
+  /** Capacity refusal, in the same field name the host admission gate uses. */
+  readonly capacity = true as const
+  /** Status a caller should treat this as, including on the SSE error frame. */
+  readonly httpStatus = 429 as const
+
+  constructor(
+    /** Which semaphore refused: `host`, `scoped-host`, or `container-pool`. */
+    readonly executor: string,
+    readonly snapshot: ExecutorSaturationSnapshot,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'ExecutorSaturatedError'
+  }
+}
+
+/** The counts behind one saturation refusal, as the caller sees them. */
+export interface ExecutorSaturationSnapshot {
+  in_flight: number
+  max: number
+  queued: number
+  /** The acquire deadline this request actually waited out. */
+  deadline_ms: number
+}
+
 export interface SpawnOpts {
   /** Abort startup when the owning durable run is cancelled before spawn completes. */
   signal?: AbortSignal
@@ -69,6 +109,14 @@ export interface SpawnOpts {
    * cleared host admission is not starved again at the executor.
    */
   admissionClass?: 'reserved' | 'bulk'
+  /**
+   * How long this spawn may wait for an executor slot, in ms.
+   *
+   * Absent = the executor's own env default. The chat route resolves and CAPS
+   * a caller's `execution.acquireTimeoutMs` before it reaches here, so an
+   * executor never has to trust a request value.
+   */
+  acquireDeadlineMs?: number
 }
 
 export interface SpawnResult {

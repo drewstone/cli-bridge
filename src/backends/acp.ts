@@ -127,6 +127,7 @@ export class AcpBackend implements Backend {
       env: process.env,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
     })
     const child = spawned.child
     const release = spawned.release

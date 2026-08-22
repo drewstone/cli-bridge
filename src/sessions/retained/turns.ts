@@ -19,6 +19,7 @@ import {
 import type { BackendRegistry } from '../../backends/registry.js'
 import type { ChatRequest, NativeSession } from '../../backends/types.js'
 import { RunAdmissionClosedError, RunIdentityConflictError, type RunRegistry } from '../../runs/registry.js'
+import { resolveHostAcquireDeadlineMs } from '../../executors/host.js'
 import type { RetainedSessionRecord, SessionStore } from '../store.js'
 import { admittedTurnInteractions, isNativeBackend } from './capabilities.js'
 import { assertRetainedBoundaryMatches, verifyRetainedBoundary } from './context-boundary.js'
@@ -522,6 +523,13 @@ export class RetainedTurnRunner {
       ...(record.cwd ? { cwd: record.cwd } : {}),
       ...(typeof mode === 'string' ? { mode: mode as ChatRequest['mode'] } : {}),
       ...(config.execution ? { execution: config.execution as ChatRequest['execution'] } : {}),
+      // The slot wait is resolved here for the same reason the chat route
+      // resolves it: a retained backend holds its slot for the whole live
+      // session, so a caller queueing behind one needs its own deadline to
+      // reach the spawn seam rather than the executor's 60-second default.
+      ...(config.execution?.kind === 'host' && config.execution.acquireTimeoutMs !== undefined
+        ? { acquireDeadlineMs: resolveHostAcquireDeadlineMs(config.execution.acquireTimeoutMs) }
+        : {}),
       ...(config.env ? { env: config.env } : {}),
       ...(config.context ? { context: config.context } : {}),
       ...(config.providerOptions ? { providerOptions: config.providerOptions } : {}),

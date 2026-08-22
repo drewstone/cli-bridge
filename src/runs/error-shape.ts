@@ -24,6 +24,18 @@ export interface RunFailureDescription {
   message: string
   type: string
   provider_dispatch?: 'not_started'
+  /** Status the same failure would carry as an HTTP response. */
+  status?: number
+  /** Capacity refusal: the bridge never started the model. */
+  capacity?: true
+  /** Executor semaphore counts behind a capacity refusal. */
+  executor?: {
+    name: string
+    in_flight: number
+    max: number
+    queued: number
+    deadline_ms: number
+  }
 }
 
 export function describeRunFailure(error: unknown): RunFailureDescription {
@@ -33,6 +45,7 @@ export function describeRunFailure(error: unknown): RunFailureDescription {
     message,
     type: failureType(error),
     ...(providerDispatch === undefined ? {} : { provider_dispatch: providerDispatch }),
+    ...capacityFromError(error),
   }
 }
 
@@ -97,6 +110,49 @@ function failureType(error: unknown): string {
   const name = (error as { name?: unknown }).name
   if (typeof name === 'string' && TYPE_BY_ERROR_NAME[name]) return TYPE_BY_ERROR_NAME[name]
   return 'server_error'
+}
+
+/**
+ * Lift a capacity refusal's own fields onto the reported failure.
+ *
+ * Structural, like `failureType`: an executor error declares `httpStatus`,
+ * `capacity` and a snapshot, and this file stays free of executor imports. A
+ * frame without these fields forced clients to sniff the message text to tell
+ * "queue was full, nothing ran, retry costs nothing" from a mid-stream fault.
+ */
+function capacityFromError(error: unknown): Pick<RunFailureDescription, 'status' | 'capacity' | 'executor'> {
+  if (typeof error !== 'object' || error === null) return {}
+  const candidate = error as {
+    httpStatus?: unknown
+    capacity?: unknown
+    executor?: unknown
+    snapshot?: unknown
+  }
+  if (candidate.capacity !== true) return {}
+  const snapshot = candidate.snapshot
+  const counts = typeof snapshot === 'object' && snapshot !== null
+    ? snapshot as { in_flight?: unknown; max?: unknown; queued?: unknown; deadline_ms?: unknown }
+    : null
+  return {
+    ...(typeof candidate.httpStatus === 'number' ? { status: candidate.httpStatus } : {}),
+    capacity: true,
+    ...(counts
+      && typeof candidate.executor === 'string'
+      && typeof counts.in_flight === 'number'
+      && typeof counts.max === 'number'
+      && typeof counts.queued === 'number'
+      && typeof counts.deadline_ms === 'number'
+      ? {
+          executor: {
+            name: candidate.executor,
+            in_flight: counts.in_flight,
+            max: counts.max,
+            queued: counts.queued,
+            deadline_ms: counts.deadline_ms,
+          },
+        }
+      : {}),
+  }
 }
 
 function providerDispatchFromError(error: unknown): 'not_started' | undefined {

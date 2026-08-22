@@ -55,7 +55,7 @@ import { writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { posix } from 'node:path'
 import { promisify } from 'node:util'
-import { hostSpawner, sanitizeHostEnv } from './host.js'
+import { executorSaturatedError, hostSpawner, sanitizeHostEnv } from './host.js'
 import { applyJail } from './jail-support.js'
 import type { Spawner, SpawnResult } from './types.js'
 
@@ -64,6 +64,7 @@ const DEFAULT_SCOPE_TASKS_MAX = 128
 const DEFAULT_SCOPE_MEMORY_MAX = '3G'
 const DEFAULT_SCOPE_MAX_CONCURRENCY = 4
 const DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS = 60_000
+const DEFAULT_SCOPE_MAX_ACQUIRE_DEADLINE_MS = 900_000
 const SYSTEMD_RUN_BIN = existsSync('/usr/bin/systemd-run') ? '/usr/bin/systemd-run' : '/bin/systemd-run'
 const SYSTEMCTL_BIN = existsSync('/usr/bin/systemctl') ? '/usr/bin/systemctl' : '/bin/systemctl'
 const execFileAsync = promisify(execFile)
@@ -84,6 +85,7 @@ class ScopedSemaphore {
   constructor(
     private readonly max: number,
     private readonly acquireDeadlineMs: number,
+    private readonly maxAcquireDeadlineMs: number,
     /**
      * Slots inside `max` that only `reserved` callers may occupy. Mirrors the
      * host admission lane: reserving at admission alone is not enough, because
@@ -110,8 +112,9 @@ class ScopedSemaphore {
     if (admissionClass === 'bulk') this.bulkInFlight += 1
   }
 
-  async acquire(admissionClass: 'reserved' | 'bulk' = 'bulk'): Promise<void> {
+  async acquire(admissionClass: 'reserved' | 'bulk' = 'bulk', requestedDeadlineMs?: number): Promise<void> {
     this.acquires += 1
+    const deadlineMs = this.resolveDeadline(requestedDeadlineMs)
     if (this.canAdmit(admissionClass)) {
       this.take(admissionClass)
       return
@@ -122,17 +125,24 @@ class ScopedSemaphore {
         const idx = queue.findIndex((w) => w.timer === timer)
         if (idx >= 0) queue.splice(idx, 1)
         this.timeouts += 1
-        reject(
-          new Error(
-            `scoped-host-executor: acquire timeout after ${this.acquireDeadlineMs}ms ` +
-              `(lane=${admissionClass}, in_flight=${this.inFlight}/${this.max}, ` +
-              `bulk=${this.bulkInFlight}/${this.max - this.reserved}, queued=${queue.length}). ` +
-              `Reduce parallel callers or raise CLI_BRIDGE_SCOPE_MAX_CONCURRENCY.`,
-          ),
-        )
-      }, this.acquireDeadlineMs).unref()
+        reject(executorSaturatedError(
+          'scoped-host',
+          'scoped-host-executor',
+          this.inFlight,
+          this.max,
+          queue.length,
+          deadlineMs,
+          `lane=${admissionClass}, bulk=${this.bulkInFlight}/${this.max - this.reserved}`,
+        ))
+      }, deadlineMs).unref()
       queue.push({ resolve, reject, timer })
     })
+  }
+
+  /** A request may shorten or lengthen the wait, never past the server cap. */
+  resolveDeadline(requestedDeadlineMs?: number): number {
+    if (requestedDeadlineMs === undefined) return this.acquireDeadlineMs
+    return Math.max(1, Math.min(requestedDeadlineMs, this.maxAcquireDeadlineMs))
   }
 
   release(admissionClass: 'reserved' | 'bulk' = 'bulk'): void {
@@ -155,6 +165,8 @@ class ScopedSemaphore {
     in_flight: number
     max: number
     queued: number
+    acquire_deadline_ms: number
+    max_acquire_deadline_ms: number
     acquires: number
     timeouts: number
     reserved: number
@@ -167,6 +179,8 @@ class ScopedSemaphore {
       in_flight: this.inFlight,
       max: this.max,
       queued: this.waiters.reserved.length + this.waiters.bulk.length,
+      acquire_deadline_ms: this.acquireDeadlineMs,
+      max_acquire_deadline_ms: this.maxAcquireDeadlineMs,
       acquires: this.acquires,
       timeouts: this.timeouts,
       reserved: this.reserved,
@@ -183,6 +197,7 @@ const scopeMaxConcurrency = positiveIntEnv('CLI_BRIDGE_SCOPE_MAX_CONCURRENCY', D
 const scopedSemaphore = new ScopedSemaphore(
   scopeMaxConcurrency,
   positiveIntEnv('CLI_BRIDGE_SCOPE_ACQUIRE_DEADLINE_MS', DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS),
+  positiveIntEnv('CLI_BRIDGE_SCOPE_MAX_ACQUIRE_DEADLINE_MS', DEFAULT_SCOPE_MAX_ACQUIRE_DEADLINE_MS),
   nonNegativeIntEnv('CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY', Math.min(2, scopeMaxConcurrency - 1)),
 )
 
@@ -344,7 +359,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   }
 
   const admissionClass = opts.admissionClass ?? 'bulk'
-  await scopedSemaphore.acquire(admissionClass)
+  await scopedSemaphore.acquire(admissionClass, opts.acquireDeadlineMs)
   let semaphoreReleased = false
   const releaseSemaphore = (): void => {
     if (semaphoreReleased) return
@@ -456,11 +471,13 @@ export function scopedHostConcurrencyLimits(): { max: number; reserved: number }
   return { max: snap.max, reserved: snap.reserved }
 }
 
-/** Diagnostics for /metrics. */
+/** Diagnostics for /metrics and /health. */
 export function scopedHostExecutorSnapshot(): {
   in_flight: number
   max: number
   queued: number
+  acquire_deadline_ms: number
+  max_acquire_deadline_ms: number
   acquires: number
   timeouts: number
   reserved: number

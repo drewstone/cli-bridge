@@ -195,6 +195,53 @@ export class SessionExecutionAbortedError extends Error {
   }
 }
 
+/**
+ * The exact AgentProfile/model a session is bound to.
+ *
+ * Persisted verbatim in session metadata under `agent_profile_binding` and
+ * reported verbatim on a refusal, so the body a caller reads and the record the
+ * bridge holds are the same bytes.
+ */
+export interface SessionProfileBinding {
+  schema: 'cli-bridge.session-agent-profile.v1'
+  effectiveProfileDigest: `sha256:${string}`
+  provider: string | null
+  model: string
+  requestedReasoningEffort: string | null
+}
+
+/**
+ * A caller presented an existing session id under a different exact binding.
+ *
+ * The bridge never rebinds a session: the external id is the harness
+ * conversation key (`claude --resume`, `opencode -s <id>`), so adopting it
+ * under a new profile would attribute one conversation to two profiles. Only
+ * the caller can tell an intentional resume from an accidental id collision,
+ * and it does that by never deriving one session id for two logical runs.
+ *
+ * Both bindings ride on the error because the refusal alone cannot be acted on:
+ * without the digest pair a caller cannot separate "my profile drifted" from "I
+ * reused a dead run's id". Measured 2026-08-22: that ambiguity, reported as a
+ * bare 400 `parse_error`, cost a debugging session and masked a second failure
+ * class in the same batch.
+ */
+export class SessionProfileBindingConflictError extends Error {
+  readonly code = 'session_binding_conflict' as const
+
+  constructor(
+    readonly sessionId: string,
+    readonly storedBinding: SessionProfileBinding | null,
+    readonly receivedBinding: SessionProfileBinding | null,
+  ) {
+    super(
+      storedBinding === null
+        ? `session ${JSON.stringify(sessionId)} predates exact AgentProfile binding; use a new session id`
+        : `session ${JSON.stringify(sessionId)} is bound to a different AgentProfile/model`,
+    )
+    this.name = 'SessionProfileBindingConflictError'
+  }
+}
+
 export class SessionIdentityConflictError extends Error {
   readonly code = 'session_identity_conflict' as const
 

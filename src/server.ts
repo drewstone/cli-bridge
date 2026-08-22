@@ -212,6 +212,7 @@ async function buildExecutorForBackend(
   const cpus = process.env.BRIDGE_POOL_CPUS || '2'
   const maxQueueDepth = parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4)
   const acquireDeadlineMs = parseEnvPositiveInt('BRIDGE_POOL_ACQUIRE_DEADLINE_MS', 60_000)
+  const maxAcquireDeadlineMs = parseEnvPositiveInt('BRIDGE_POOL_MAX_ACQUIRE_DEADLINE_MS', 900_000)
   const slotMaxHoldMs = parseEnvNonNegativeInt('BRIDGE_SLOT_MAX_HOLD_MS', 0)
   const pool = await ContainerPool.create({
     size: cfg.poolSize,
@@ -222,6 +223,7 @@ async function buildExecutorForBackend(
     cpus,
     maxQueueDepth,
     acquireDeadlineMs,
+    maxAcquireDeadlineMs,
     slotMaxHoldMs,
     ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
     ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),

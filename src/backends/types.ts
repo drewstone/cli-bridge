@@ -304,6 +304,14 @@ export interface ChatRequest {
         netJail?: NetJailRequest
         /** Caller-owned process deadline. Omit to allow the operator fallback, if configured. */
         timeoutMs?: number
+        /**
+         * How long this turn may WAIT for an executor slot before the bridge
+         * answers 429. Capped by `BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS`; omit
+         * to take the executor's own default. A caller that already grants a
+         * worker a settle grace can spend that grace queueing instead of
+         * losing the spawn to a fixed 60-second refusal.
+         */
+        acquireTimeoutMs?: number
       }
     | {
         kind: 'sandbox'
@@ -346,6 +354,13 @@ export interface ChatRequest {
    * starvation instead of removing it.
    */
   admissionClass?: 'reserved' | 'bulk'
+  /**
+   * How long this turn may wait for an executor slot, in ms, already capped by
+   * the server maximum. NOT part of the wire schema — the wire field is
+   * `execution.acquireTimeoutMs`, resolved by the chat route the way `jailSpec`
+   * is. Absent = the executor's own env default.
+   */
+  acquireDeadlineMs?: number
   /** Extra backend-specific options — opaque passthrough. */
   metadata?: Record<string, unknown>
   /**
@@ -416,6 +431,29 @@ export interface ChatDelta {
     type: string
     /** Router-owned proof that the request stopped before provider dispatch. */
     provider_dispatch?: 'not_started'
+    /**
+     * The HTTP status this failure would carry if it had refused the request
+     * before the response was committed.
+     *
+     * A streaming request commits to 200 + SSE the moment the run is claimed,
+     * so a capacity refusal that happens at the spawn seam can only reach the
+     * caller as an error FRAME. Clients classify a transport failure by status
+     * — 408/429/5xx retryable, other 4xx terminal — and a frame with no status
+     * falls into "unknown, assume a bad moment", which retried a permanently
+     * malformed request to its ceiling. Carrying the status makes the frame and
+     * the non-streaming response say the same thing.
+     */
+    status?: number
+    /** Capacity refusal: the bridge never started the model. */
+    capacity?: true
+    /** Which executor semaphore refused, with the counts behind the refusal. */
+    executor?: {
+      name: string
+      in_flight: number
+      max: number
+      queued: number
+      deadline_ms: number
+    }
   }
   /**
    * Token usage. Optional; a backend may emit one metadata-only record per

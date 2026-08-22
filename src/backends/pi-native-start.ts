@@ -232,6 +232,7 @@ export async function startPiNativeSession(
       },
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
     })
     if (!spawned.child.stdin || !spawned.child.stdout) {
       throw new BackendError('pi RPC subprocess has no stdin/stdout pipes', 'upstream')

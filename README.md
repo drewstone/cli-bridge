@@ -312,9 +312,60 @@ gate reclaims those slots on its next reconcile pass:
 curl -s http://127.0.0.1:3344/health | jq '.admission | {active, live, stale, reclaimed}'
 ```
 
+The report also carries an `executor` object: the executor semaphore's own counts, so a launcher can check occupancy before it spawns.
+
+| Field | Meaning |
+| --- | --- |
+| `in_flight` | Slots held by a live spawned process. |
+| `max` | `BRIDGE_HOST_MAX_CONCURRENCY`. |
+| `queued` | Callers waiting for a slot right now. |
+| `acquire_deadline_ms` | Default wait a request with no `execution.acquireTimeoutMs` gets. |
+| `max_acquire_deadline_ms` | Ceiling applied to a request-supplied acquire deadline. |
+| `acquires` / `timeouts` | Cumulative since start. `timeouts` counts saturation refusals. |
+| `scoped_host` | The same counts for the systemd-scoped executor on Linux. |
+
+```bash
+curl -s http://127.0.0.1:3344/health | jq '.executor | {in_flight, max, queued}'
+```
+
 ### `GET /v1/sessions` · `DELETE /v1/sessions/:id`
 
 Inspect / clear external-to-internal session mappings.
+
+### Session profile binding
+
+A session external id is the harness conversation key (`claude --resume`, `opencode -s <id>`), so the bridge binds it to the exact AgentProfile, provider, model, and reasoning effort of its first turn.
+
+- The same binding is the RESUME path. The turn continues the same conversation.
+- A different binding returns `409 session_binding_conflict`. The bridge never rebinds an existing session, because adopting one conversation under a second profile would break the record of which profile produced which output.
+
+The client contract is one line: a session external id must be unique per logical run.
+The bridge cannot tell an intentional resume from an accidental id collision; only the caller can, by never deriving the same session id for two distinct runs.
+If a caller derives session ids from a digest, the digest must include an attempt-scoped or run-scoped term.
+
+The refusal body carries both bindings, so a caller can tell a drifted profile from a reused id:
+
+```json
+{
+  "error": {
+    "type": "session_binding_conflict",
+    "session_id": "supervised-worker-<hex64>",
+    "message": "session \"supervised-worker-<hex64>\" is bound to a different AgentProfile/model",
+    "stored_binding": {
+      "schema": "cli-bridge.session-agent-profile.v1",
+      "effectiveProfileDigest": "sha256:<64 hex>",
+      "provider": "anthropic",
+      "model": "claude/sonnet",
+      "requestedReasoningEffort": null
+    },
+    "received_binding": { "…": "same shape, the binding this request carried" },
+    "provider_dispatch": "not_started"
+  }
+}
+```
+
+`stored_binding: null` means the session predates exact binding; use a new session id.
+`provider_dispatch: "not_started"` is the bridge's proof that the refusal happened before any model call, so the turn cost nothing.
 
 ### `POST /cad/render`
 
@@ -560,6 +611,62 @@ Now every `claudish/<model>` call spawns Claude Code with `ANTHROPIC_BASE_URL=ht
 **Agent Builder dev** — `BYOK_CLI_ENDPOINT=http://host.docker.internal:3344` in `.dev.vars`. Forge drives your Claude Code subscription locally during development. Never ship that to production.
 
 **PR reviews & automations** — any bash cron / GitHub Action can hit `POST /v1/chat/completions` with a stable `X-Session-Id`.
+
+## Executor concurrency
+
+Every host spawn takes a slot from one process-wide semaphore before the CLI starts.
+The semaphore is the box-protection layer: each `claude --print` is 500 MB to 2 GB resident, so unchecked spawns exhaust a 32 GB box and sshd can no longer fork a login shell.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `BRIDGE_HOST_MAX_CONCURRENCY` | `4` | Concurrent host spawns. |
+| `BRIDGE_HOST_ACQUIRE_DEADLINE_MS` | `60000` | Default wait for a slot before the bridge answers 429. |
+| `BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS` | `900000` | Ceiling on a request-supplied acquire deadline. |
+| `CLI_BRIDGE_SCOPE_MAX_CONCURRENCY` | `4` | The same cap for the systemd-scoped executor on Linux. |
+| `CLI_BRIDGE_SCOPE_ACQUIRE_DEADLINE_MS` | `60000` | Its default wait. |
+| `CLI_BRIDGE_SCOPE_MAX_ACQUIRE_DEADLINE_MS` | `900000` | Its ceiling on a request value. |
+| `BRIDGE_POOL_ACQUIRE_DEADLINE_MS` | `60000` | Default wait for a Docker pool slot. |
+| `BRIDGE_POOL_MAX_ACQUIRE_DEADLINE_MS` | `900000` | Its ceiling on a request value. |
+
+**A slot is held per live SESSION on a retained backend, not per turn.**
+For `pi`, the RPC child holds its slot from spawn to session termination, including the idle time between turns.
+Size `BRIDGE_HOST_MAX_CONCURRENCY` against peak concurrent live sessions — leads plus workers — not against peak concurrent turns.
+A fleet of one lead and three workers holds four slots for the whole run, so the default cap of 4 is already full and a fifth session waits.
+One-shot backends (`claude`, `codex`, `opencode`, `kimi-code`, `gemini`) hold a slot only for the turn.
+
+### Waiting for a slot, and being refused
+
+A request can buy itself a longer queue with `execution.acquireTimeoutMs`, capped by `BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS`:
+
+```json
+{ "model": "pi/anthropic/claude-sonnet-4-5", "execution": { "kind": "host", "acquireTimeoutMs": 900000 } }
+```
+
+A supervisor that already grants a worker a 15-minute settle grace can spend that grace queueing instead of losing the spawn to the fixed 60-second default.
+
+When the wait runs out, the bridge answers `429` with `Retry-After: 5`:
+
+```json
+{
+  "error": {
+    "type": "executor_saturated",
+    "capacity": true,
+    "provider_dispatch": "not_started",
+    "status": 429,
+    "executor": "host",
+    "in_flight": 4,
+    "max": 4,
+    "queued": 1,
+    "deadline_ms": 60000,
+    "retry_after_ms": 5000,
+    "message": "host-executor: acquire timeout after 60000ms (in_flight=4/4, queued=1)"
+  }
+}
+```
+
+`capacity: true` and `provider_dispatch: "not_started"` are the two facts a caller retries on: the refusal happened before the child existed, so no model call was made and a retry loses nothing.
+A streaming request has already committed to `200` plus SSE by the time the spawn seam refuses, so the same fields ride on the terminal error frame, including `status: 429`.
+The counts are the retry signal: `in_flight` still equal to `max` means wait, not fail.
 
 ## Parallel mode (Docker pool)
 

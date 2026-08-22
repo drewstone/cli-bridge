@@ -12,17 +12,31 @@
  *      500MB-2GB resident, so 16 unchecked spawns OOM a 32GB box and
  *      sshd can't fork a login shell. This is the box-protection layer.
  *
+ * A slot is held for the lifetime of the SPAWNED PROCESS, which for a retained
+ * backend (pi) is the whole live SESSION — spawn to session termination,
+ * including the idle time between turns. Size the cap at peak live sessions,
+ * not at peak concurrent turns.
+ *
  * Tunables:
  *   BRIDGE_HOST_MAX_CONCURRENCY (default 4)
  *   BRIDGE_HOST_ACQUIRE_DEADLINE_MS (default 60_000)
+ *   BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS (default 900_000) — ceiling on the
+ *   per-request `execution.acquireTimeoutMs`.
  */
 
 import { spawn } from 'node:child_process'
 import { applyJail } from './jail-support.js'
-import type { SpawnOpts, SpawnResult, Spawner } from './types.js'
+import { ExecutorSaturatedError, type SpawnOpts, type SpawnResult, type Spawner } from './types.js'
 
 const DEFAULT_MAX = 4
 const DEFAULT_ACQUIRE_DEADLINE_MS = 60_000
+/**
+ * Ceiling on a caller-supplied acquire deadline. 15 minutes is the settle grace
+ * a supervisor already grants a worker child, and a caller that is willing to
+ * spend it waiting for a slot loses nothing by waiting: the slot frees or the
+ * caller learns the box is full, and neither outcome costs a model call.
+ */
+const DEFAULT_MAX_ACQUIRE_DEADLINE_MS = 900_000
 
 interface Waiter {
   resolve: () => void
@@ -40,10 +54,18 @@ class HostSemaphore {
   constructor(
     private readonly max: number,
     private readonly acquireDeadlineMs: number,
+    private readonly maxAcquireDeadlineMs: number,
   ) {}
 
-  async acquire(): Promise<void> {
+  /**
+   * Wait for a slot, up to `requestedDeadlineMs` capped by the server maximum.
+   *
+   * The refusal is a typed capacity answer, not a spawn failure: it happens
+   * before the child exists, so the caller can retry it with nothing lost.
+   */
+  async acquire(requestedDeadlineMs?: number): Promise<void> {
     this.acquires += 1
+    const deadlineMs = this.resolveDeadline(requestedDeadlineMs)
     if (this.inFlight < this.max) {
       this.inFlight += 1
       return
@@ -53,16 +75,16 @@ class HostSemaphore {
         const idx = this.waiters.findIndex((w) => w.timer === timer)
         if (idx >= 0) this.waiters.splice(idx, 1)
         this.timeouts += 1
-        reject(
-          new Error(
-            `host-executor: acquire timeout after ${this.acquireDeadlineMs}ms ` +
-              `(in_flight=${this.inFlight}/${this.max}, queued=${this.waiters.length}). ` +
-              `Reduce parallel callers or raise BRIDGE_HOST_MAX_CONCURRENCY.`,
-          ),
-        )
-      }, this.acquireDeadlineMs).unref()
+        reject(saturated('host', 'host-executor', this.inFlight, this.max, this.waiters.length, deadlineMs))
+      }, deadlineMs).unref()
       this.waiters.push({ resolve, reject, timer })
     })
+  }
+
+  /** A request may shorten or lengthen the wait, never past the server cap. */
+  resolveDeadline(requestedDeadlineMs?: number): number {
+    if (requestedDeadlineMs === undefined) return this.acquireDeadlineMs
+    return Math.max(1, Math.min(requestedDeadlineMs, this.maxAcquireDeadlineMs))
   }
 
   release(): void {
@@ -75,16 +97,63 @@ class HostSemaphore {
     this.inFlight -= 1
   }
 
-  snapshot(): { in_flight: number; max: number; queued: number; acquires: number; timeouts: number } {
+  snapshot(): HostExecutorSnapshot {
     return {
       in_flight: this.inFlight,
       max: this.max,
       queued: this.waiters.length,
+      acquire_deadline_ms: this.acquireDeadlineMs,
+      max_acquire_deadline_ms: this.maxAcquireDeadlineMs,
       acquires: this.acquires,
       timeouts: this.timeouts,
     }
   }
 }
+
+/**
+ * One saturation refusal, worded so the existing prose signature survives.
+ *
+ * Callers built retry loops on the exact shape
+ * `(?:host-executor|scoped-host-executor|container-pool): acquire timeout after \d+ms`
+ * before the typed fields existed, and those loops are still running, so
+ * nothing may come between the executor name and that phrase. The
+ * remedy sentence is gone on purpose: "reduce parallel callers" describes the
+ * one-shot backends, and it is wrong for a retained backend whose slot is one
+ * live session. The counts now say the same thing without asserting a cause,
+ * and the body stays inside the 300-byte window a client reads it through.
+ */
+function saturated(
+  executor: string,
+  label: string,
+  inFlight: number,
+  max: number,
+  queued: number,
+  deadlineMs: number,
+  /** Extra counts, appended INSIDE the parentheses so the prefix is unchanged. */
+  detail?: string,
+): ExecutorSaturatedError {
+  const counts = `${detail ? `${detail}, ` : ''}in_flight=${inFlight}/${max}, queued=${queued}`
+  return new ExecutorSaturatedError(
+    executor,
+    { in_flight: inFlight, max, queued, deadline_ms: deadlineMs },
+    `${label}: acquire timeout after ${deadlineMs}ms (${counts})`,
+  )
+}
+
+export interface HostExecutorSnapshot {
+  in_flight: number
+  max: number
+  queued: number
+  /** Default wait a request with no `execution.acquireTimeoutMs` gets. */
+  acquire_deadline_ms: number
+  /** Ceiling this executor applies to a request-supplied acquire deadline. */
+  max_acquire_deadline_ms: number
+  acquires: number
+  timeouts: number
+}
+
+/** Shared by the scoped-host executor, whose refusal is the same condition. */
+export { saturated as executorSaturatedError }
 
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -96,10 +165,11 @@ function readEnvInt(name: string, fallback: number): number {
 const hostSemaphore = new HostSemaphore(
   readEnvInt('BRIDGE_HOST_MAX_CONCURRENCY', DEFAULT_MAX),
   readEnvInt('BRIDGE_HOST_ACQUIRE_DEADLINE_MS', DEFAULT_ACQUIRE_DEADLINE_MS),
+  readEnvInt('BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS', DEFAULT_MAX_ACQUIRE_DEADLINE_MS),
 )
 
 export const hostSpawner: Spawner = async (bin, args, opts) => {
-  await hostSemaphore.acquire()
+  await hostSemaphore.acquire(opts.acquireDeadlineMs)
   let released = false
   let jailCleanup: (() => Promise<void> | void) | undefined
   const release = (): void => {
@@ -151,15 +221,20 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
 }
 hostSpawner.executionEnvironment = 'host'
 
-/** Diagnostics for /metrics. */
-export function hostExecutorSnapshot(): {
-  in_flight: number
-  max: number
-  queued: number
-  acquires: number
-  timeouts: number
-} {
+/** Diagnostics for /metrics and /health. */
+export function hostExecutorSnapshot(): HostExecutorSnapshot {
   return hostSemaphore.snapshot()
+}
+
+/**
+ * The wait this executor would grant for a requested acquire deadline.
+ *
+ * The chat route calls this to CAP a caller's `execution.acquireTimeoutMs`
+ * once, at the wire boundary, so the resolved number is what the response and
+ * the executor agree on.
+ */
+export function resolveHostAcquireDeadlineMs(requestedDeadlineMs?: number): number {
+  return hostSemaphore.resolveDeadline(requestedDeadlineMs)
 }
 
 export function sanitizeHostEnv(env: NodeJS.ProcessEnv | undefined, cwd?: string): NodeJS.ProcessEnv | undefined {
