@@ -386,6 +386,14 @@ export function terminalOutcome(
 export interface ChatDelta {
   /** Incremental text appended to the assistant message. */
   content?: string
+  /**
+   * Incremental model reasoning ("thinking") text, streamed ahead of the
+   * content it produced. Never part of the assistant message: SSE carries it
+   * as `choices[0].delta.reasoning` (the field OpenRouter and pi already use)
+   * and `collectNonStreaming` keeps it out of `message.content`. Absent when
+   * the backend or model does not produce reasoning.
+   */
+  reasoning?: string
   /** Provider-reported response model. This is distinct from the requested route model. */
   model?: string
   /** Provider response fingerprint, when the upstream protocol exposes one. */

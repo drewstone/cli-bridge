@@ -960,7 +960,10 @@ export function mountChatCompletions(
               recorder?.observe(delta)
               if (delta.usage) sawUsage = true
               if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') failed = true
+              // Reasoning is billed as output tokens, so it counts toward the
+              // estimate a usage-less backend gets.
               completionChars += (delta.content?.length ?? 0)
+                + (delta.reasoning?.length ?? 0)
                 + (delta.tool_calls?.reduce(
                   (s, tc) => s + (tc.id?.length ?? 0) + (tc.name?.length ?? 0) + (tc.arguments?.length ?? 0),
                   0,

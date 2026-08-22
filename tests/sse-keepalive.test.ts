@@ -49,6 +49,24 @@ describe('deltaToOpenAIChunk', () => {
     expect(payload.choices[0].delta.content).toBe('hi')
   })
 
+  it('carries reasoning deltas as choices[0].delta.reasoning, never as content', () => {
+    const out = deltaToOpenAIChunk({ reasoning: 'weighing both branches' }, meta)
+    expect(out).not.toBeNull()
+    const payload = JSON.parse(out!.slice('data: '.length).replace(/\n\n$/, ''))
+    expect(payload.choices[0].delta.reasoning).toBe('weighing both branches')
+    expect(payload.choices[0].delta.content).toBeUndefined()
+  })
+
+  it('does not demote a reasoning delta with provider identity to a metadata-only chunk', () => {
+    // Pi attaches the observed model identity to every delta, so a
+    // reasoning delta usually carries `model` too. It must still produce a
+    // real choice, not `choices: []`.
+    const out = deltaToOpenAIChunk({ model: 'stealth/ox-alpha', reasoning: 'still thinking' }, meta)
+    const payload = JSON.parse(out!.slice('data: '.length).replace(/\n\n$/, ''))
+    expect(payload.choices).toHaveLength(1)
+    expect(payload.choices[0].delta.reasoning).toBe('still thinking')
+  })
+
   it('emits a chat.completion.chunk for tool_calls deltas', () => {
     const out = deltaToOpenAIChunk(
       { tool_calls: [{ id: 'a', name: 'lookup', arguments: '{"q":"x"}' }] },
@@ -109,6 +127,19 @@ describe('collectNonStreaming', () => {
     expect(body.choices[0]?.message.tool_calls).toBeUndefined()
     expect(body.usage?.prompt_tokens).toBe(3)
     expect(body.usage?.completion_tokens).toBe(2)
+  })
+
+  it('keeps reasoning out of the non-streaming message content', async () => {
+    async function* deltas(): AsyncIterable<ChatDelta> {
+      yield { reasoning: 'the model thinking out loud' }
+      yield { content: 'the answer' }
+      yield { finish_reason: 'stop' }
+    }
+    const body = (await collectNonStreaming(deltas(), 'test')) as {
+      choices: Array<{ message: Record<string, unknown> }>
+    }
+    expect(body.choices[0]?.message.content).toBe('the answer')
+    expect(body.choices[0]?.message).not.toHaveProperty('reasoning')
   })
 
   it('returns the observed provider identity instead of the requested model', async () => {

@@ -351,6 +351,9 @@ const DELTA_OVERHEAD_BYTES = 128
 function approximateDeltaBytes(delta: ChatDelta): number {
   let bytes = DELTA_OVERHEAD_BYTES
   if (delta.content) bytes += delta.content.length
+  // Reasoning outweighs visible text ~17:1 on reasoning models, so leaving it
+  // out of the retention accounting would let a run blow past its byte budget.
+  if (delta.reasoning) bytes += delta.reasoning.length
   if (delta.model) bytes += delta.model.length
   if (delta.system_fingerprint) bytes += delta.system_fingerprint.length
   if (delta.error) bytes += delta.error.message.length + delta.error.type.length
