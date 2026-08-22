@@ -1113,7 +1113,24 @@ describe('PiBackend', () => {
           },
         }),
       })
-      expect(conflictingResume.status).toBe(400)
+      // A well-formed request under a bound session id is a CONFLICT, not a
+      // malformed request: the body names both bindings so the caller can tell
+      // a drifted profile from a reused session id.
+      expect(conflictingResume.status).toBe(409)
+      const conflictBody = await conflictingResume.json() as {
+        error: {
+          type: string
+          session_id: string
+          stored_binding: { effectiveProfileDigest: string }
+          received_binding: { effectiveProfileDigest: string }
+        }
+      }
+      expect(conflictBody.error.type).toBe('session_binding_conflict')
+      expect(conflictBody.error.session_id).toBe('discovery-run')
+      // The model stays the session's own; the authored profile is what drifted,
+      // and the digest pair is what tells the caller so.
+      expect(conflictBody.error.stored_binding.effectiveProfileDigest)
+        .not.toBe(conflictBody.error.received_binding.effectiveProfileDigest)
       expect(argv).toHaveLength(3)
       expect(sessions.get('discovery-run', 'pi')?.metadata.agent_profile).toMatchObject({
         prompt: { systemPrompt: 'PERSISTED_PROFILE_SYSTEM' },

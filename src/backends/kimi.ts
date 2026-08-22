@@ -155,6 +155,7 @@ export class KimiBackend implements Backend {
         env: { ...process.env, ...provisioned.env },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
     } catch (error) {

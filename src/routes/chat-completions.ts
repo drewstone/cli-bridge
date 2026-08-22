@@ -27,13 +27,16 @@ import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
   SessionIdentityConflictError,
+  SessionProfileBindingConflictError,
   type SessionExecutionLease,
+  type SessionProfileBinding,
   type SessionRecord,
   type SessionStore,
   type RetainedRunAdmission,
 } from '../sessions/store.js'
 import type { Backend, ChatDelta, ChatRequest, ProtectedModelCredential } from '../backends/types.js'
-import { ExecutorConfigurationError } from '../executors/types.js'
+import { ExecutorConfigurationError, ExecutorSaturatedError } from '../executors/types.js'
+import { resolveHostAcquireDeadlineMs } from '../executors/host.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming } from '../streaming/sse.js'
@@ -253,6 +256,12 @@ const chatRequestSchema = z.object({
       allow: z.array(z.string()).optional(),
     }).optional(),
     timeoutMs: z.number().int().positive().max(maxExecutionTimeoutMs).optional(),
+    /**
+     * How long this turn may WAIT for an executor slot before the bridge
+     * answers 429. The executor caps it at its own maximum, so a caller can ask
+     * for a long queue without being able to pin a slot request open.
+     */
+    acquireTimeoutMs: z.number().int().positive().max(maxExecutionTimeoutMs).optional(),
   }).optional(),
 })
 
@@ -505,6 +514,12 @@ export function mountChatCompletions(
       if (!parsedExecution.success) return invalidRequest(c, 'durable session execution is invalid; start a new session')
       effectiveExecution = parsedExecution.data as ChatRequest['execution']
     }
+    // The executor-slot wait is caller-owned within a server ceiling. The wire
+    // schema and the retained-session schema both refuse a non-positive value,
+    // so what reaches here is either absent or a positive integer to cap.
+    const requestedAcquireTimeoutMs = effectiveExecution?.kind === 'sandbox'
+      ? undefined
+      : effectiveExecution?.acquireTimeoutMs
     let effectiveEnv: Record<string, string> | undefined
     try {
       const storedEnv = persistedSession?.metadata.env
@@ -924,6 +939,12 @@ export function mountChatCompletions(
         // same reservation. Set even when this bridge has no admission gate:
         // the executor semaphore exists either way.
         req.admissionClass = admissionClassFor(req, deps.admissionReservedClients)
+        // Resolved once, at the wire boundary, so the number the caller asked
+        // for and the number the executor waits are the same. Each executor
+        // clamps again with its own ceiling, so the tighter bound always wins.
+        if (requestedAcquireTimeoutMs !== undefined) {
+          req.acquireDeadlineMs = resolveHostAcquireDeadlineMs(requestedAcquireTimeoutMs)
+        }
         if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
           // Admission is owned by the job. Explicit cancellation can remove
           // a queued job before it ever acquires a process slot. The slot is
@@ -1449,14 +1470,6 @@ function canonicalProtectedModelBaseUrl(value: string): string | undefined {
   return target.toString().replace(/\/$/u, '')
 }
 
-interface SessionProfileBinding {
-  schema: 'cli-bridge.session-agent-profile.v1'
-  effectiveProfileDigest: `sha256:${string}`
-  provider: string | null
-  model: string
-  requestedReasoningEffort: string | null
-}
-
 function exactSessionProfileBinding(
   req: ChatRequest,
   session: SessionRecord | null,
@@ -1476,6 +1489,16 @@ function exactSessionProfileBinding(
   }
 }
 
+/**
+ * Refuse a session presented under a binding that is not the one it holds.
+ *
+ * The guard itself is unchanged and intentional: matching binding IS the resume
+ * path, and the bridge never rebinds. What changed is the answer. It used to be
+ * a `parse_error`, which HTTP-maps to 400 `invalid_request_error` and reads as
+ * "your request is malformed" for a request that is perfectly well formed — and
+ * it carried neither digest, so a caller could not tell a drifted profile from a
+ * reused session id.
+ */
 function assertSessionProfileBinding(
   session: SessionRecord,
   received: SessionProfileBinding | null,
@@ -1483,17 +1506,15 @@ function assertSessionProfileBinding(
   const stored = session.metadata.agent_profile_binding
   if (!stored || typeof stored !== 'object') {
     if (received) {
-      throw new BackendError(
-        `session ${JSON.stringify(session.externalId)} predates exact AgentProfile binding; start a new session`,
-        'parse_error',
-      )
+      throw new SessionProfileBindingConflictError(session.externalId, null, received)
     }
     return
   }
   if (!received || JSON.stringify(stored) !== JSON.stringify(received)) {
-    throw new BackendError(
-      `session ${JSON.stringify(session.externalId)} is bound to a different AgentProfile/model`,
-      'parse_error',
+    throw new SessionProfileBindingConflictError(
+      session.externalId,
+      stored as SessionProfileBinding,
+      received,
     )
   }
 }
@@ -1516,6 +1537,63 @@ function runIdentityConflict(c: Context, error: RunIdentityConflictError): Respo
     409,
   )
 }
+
+/**
+ * 409, with both bindings, because the caller has to be able to DIAGNOSE it.
+ *
+ * `type` leads the body on purpose: a client reads this through a 300-byte
+ * slice of the response text, and the discriminator has to survive the slice
+ * even when two 71-character digests do not.
+ */
+function sessionProfileBindingConflict(c: Context, error: SessionProfileBindingConflictError): Response {
+  return c.json({
+    error: {
+      type: error.code,
+      session_id: error.sessionId,
+      message: error.message,
+      stored_binding: error.storedBinding,
+      received_binding: error.receivedBinding,
+      /** The refusal happens before any spawn, so nothing was executed. */
+      provider_dispatch: 'not_started',
+    },
+  }, 409)
+}
+
+/**
+ * 429, because a full box is a capacity answer and the work never started.
+ *
+ * `Retry-After` matches the admission gate's own advice. The counts are the
+ * caller's admission signal for the retry: a queue that is still full at
+ * `in_flight === max` says wait longer, not fail.
+ */
+function executorSaturated(c: Context, error: ExecutorSaturatedError): Response {
+  console.warn(
+    `[cli-bridge] executor saturated: executor=${error.executor} ` +
+    `in_flight=${error.snapshot.in_flight}/${error.snapshot.max} queued=${error.snapshot.queued} ` +
+    `deadline_ms=${error.snapshot.deadline_ms}`,
+  )
+  c.header('Retry-After', String(EXECUTOR_RETRY_AFTER_SECONDS))
+  return c.json({
+    error: {
+      type: error.code,
+      capacity: true,
+      provider_dispatch: 'not_started',
+      status: error.httpStatus,
+      executor: error.executor,
+      ...error.snapshot,
+      retry_after_ms: EXECUTOR_RETRY_AFTER_SECONDS * 1000,
+      message: error.message,
+    },
+  }, 429)
+}
+
+/**
+ * Seconds a saturated caller is told to wait, matching the admission gate.
+ *
+ * A slot frees when a live session ends, which the bridge cannot predict, so
+ * this is deliberately a short fixed backoff rather than a fabricated estimate.
+ */
+const EXECUTOR_RETRY_AFTER_SECONDS = 5
 
 function sessionIdentityConflict(c: Context, error: SessionIdentityConflictError): Response {
   return c.json({
@@ -1585,6 +1663,8 @@ function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_
 
 function errorResponse(c: Context, err: unknown): Response {
   if (err instanceof SessionIdentityConflictError) return sessionIdentityConflict(c, err)
+  if (err instanceof SessionProfileBindingConflictError) return sessionProfileBindingConflict(c, err)
+  if (err instanceof ExecutorSaturatedError) return executorSaturated(c, err)
   if (err instanceof RunReplayCursorError) return replayCursorError(c, err)
   if (err instanceof SandboxBackendUnavailableError) {
     return c.json({ error: { message: err.message, type: err.code } }, 503)

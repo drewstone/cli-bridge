@@ -57,6 +57,8 @@ import type { Backend, BackendHealth } from '../backends/types.js'
 import { boundedProbe } from '../backends/health.js'
 import type { AdmissionGate } from '../admission.js'
 import type { RunRegistry } from '../runs/registry.js'
+import { hostExecutorSnapshot } from '../executors/host.js'
+import { scopedHostExecutorSnapshot } from '../executors/scoped-host.js'
 
 const DEFAULT_HEALTH_CACHE_MS = 30_000
 const DEFAULT_PROBE_TIMEOUT_MS = 3_500
@@ -88,6 +90,25 @@ export interface MountHealthOptions {
  * before dispatching a wave; `runs_retained` and `run_replay_bytes` say how
  * much of the heap the durable run registry is accountable for.
  */
+/**
+ * Executor-slot occupancy, so a launcher can gate admission BEFORE it spawns.
+ *
+ * The counts were only on `/metrics`, and a fleet launcher that watches
+ * `/health` therefore dispatched into a full box and lost the spawn to an
+ * acquire timeout. `in_flight`/`max` is the number to gate on; `queued` says
+ * how many callers are already waiting for the same slots.
+ *
+ * A slot is held for the life of the spawned PROCESS. For a retained backend
+ * (pi) that is one live SESSION, idle turns included — so `max` is a ceiling on
+ * concurrent live sessions, not on concurrent turns.
+ */
+function executorSnapshot(): Record<string, unknown> {
+  return {
+    ...hostExecutorSnapshot(),
+    scoped_host: scopedHostExecutorSnapshot(),
+  }
+}
+
 function memorySnapshot(runs?: RunRegistry): Record<string, unknown> {
   const usage = process.memoryUsage()
   const limit = getHeapStatistics().heap_size_limit
@@ -179,6 +200,7 @@ export function mountHealth(
       ...(oldestProbedAt ? { oldest_probed_at: oldestProbedAt } : {}),
       backends: probes,
       ...(deps.admission ? { admission: deps.admission.snapshot() } : {}),
+      executor: executorSnapshot(),
       memory: memorySnapshot(deps.runs),
       ts: new Date(ts).toISOString(),
     }, any ? 200 : 503)

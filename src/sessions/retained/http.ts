@@ -4,6 +4,7 @@ import { streamSSE } from 'hono/streaming'
 import type { Context, Hono } from 'hono'
 import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import { BackendError } from '../../backends/types.js'
+import { ExecutorSaturatedError } from '../../executors/types.js'
 import { retainedCancellationAcknowledgement } from './control-acknowledgement.js'
 import { RETAINED_MAX_HTTP_BODY_BYTES } from './schema.js'
 import { RetainedSessionError } from './types.js'
@@ -290,6 +291,25 @@ function parseWaitMs(raw: string | undefined): { ok: true; value: number } | { o
 }
 
 function retainedError(c: Context, error: unknown): Response {
+  // A full executor is a capacity answer on this surface too. A retained turn
+  // that never got a slot made no model call, so it must not wear a 500: a
+  // caller reads 5xx as "the bridge broke" and stops, where the correct action
+  // is to wait for a live session to end and try the same turn again.
+  if (error instanceof ExecutorSaturatedError) {
+    c.header('Retry-After', String(RETAINED_EXECUTOR_RETRY_AFTER_SECONDS))
+    return c.json({
+      error: {
+        type: error.code,
+        capacity: true,
+        provider_dispatch: 'not_started',
+        status: error.httpStatus,
+        executor: error.executor,
+        ...error.snapshot,
+        retry_after_ms: RETAINED_EXECUTOR_RETRY_AFTER_SECONDS * 1000,
+        message: error.message,
+      },
+    }, 429)
+  }
   const body = errorBody(error)
   const status =
     error instanceof RetainedSessionError
@@ -303,6 +323,9 @@ function retainedError(c: Context, error: unknown): Response {
         : 500
   return c.json({ error: body }, status as 400 | 408 | 409 | 413 | 429 | 500 | 501 | 502 | 503)
 }
+
+/** Same fixed backoff the chat surface and the admission gate advertise. */
+const RETAINED_EXECUTOR_RETRY_AFTER_SECONDS = 5
 
 function errorBody(error: unknown): { message: string; type: string } {
   if (error instanceof RetainedSessionError) return { message: error.message, type: error.code }

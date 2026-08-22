@@ -64,6 +64,7 @@ import { promisify } from 'node:util'
 import { assertDockerNetworkName } from './docker-network.js'
 import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
 import { buildCommandFor, isInside } from './docker-preflight.js'
+import { ExecutorSaturatedError } from './types.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -112,6 +113,8 @@ export interface ContainerPoolOptions {
   maxQueueDepth?: number
   /** Per-acquire deadline in ms. Default 60_000. */
   acquireDeadlineMs?: number
+  /** Ceiling on a request-supplied acquire deadline in ms. Default 900_000. */
+  maxAcquireDeadlineMs?: number
   /** Optional operator safety cap for one slot hold. Zero disables it (default). */
   slotMaxHoldMs?: number
   /** Consecutive provision failures that take a slot permanently out. Default 3. */
@@ -192,6 +195,7 @@ interface SlotState {
 
 const DEFAULTS = {
   ACQUIRE_DEADLINE_MS: 60_000,
+  MAX_ACQUIRE_DEADLINE_MS: 900_000,
   SLOT_MAX_HOLD_MS: 0,
   MAX_CONSECUTIVE_FAILURES: 3,
   LIVENESS_TTL_MS: 30_000,
@@ -210,6 +214,7 @@ export class ContainerPool {
   private readonly opts: ContainerPoolOptions
   private readonly maxQueueDepth: number
   private readonly acquireDeadlineMs: number
+  private readonly maxAcquireDeadlineMs: number
   private readonly slotMaxHoldMs: number
   private readonly maxConsecutiveFailures: number
   private readonly livenessTtlMs: number
@@ -237,6 +242,7 @@ export class ContainerPool {
     this.opts = opts
     this.maxQueueDepth = opts.maxQueueDepth ?? slots.length * 4
     this.acquireDeadlineMs = opts.acquireDeadlineMs ?? DEFAULTS.ACQUIRE_DEADLINE_MS
+    this.maxAcquireDeadlineMs = opts.maxAcquireDeadlineMs ?? DEFAULTS.MAX_ACQUIRE_DEADLINE_MS
     this.slotMaxHoldMs = opts.slotMaxHoldMs ?? DEFAULTS.SLOT_MAX_HOLD_MS
     this.maxConsecutiveFailures = opts.maxConsecutiveFailures ?? DEFAULTS.MAX_CONSECUTIVE_FAILURES
     // A pool whose slots carry start-scoped state cannot cache liveness. The TTL
@@ -298,9 +304,15 @@ export class ContainerPool {
     }
   }
 
-  async acquire(sessionId?: string): Promise<AcquiredSlot> {
+  /**
+   * Take a slot, waiting up to `requestedDeadlineMs` capped by the pool ceiling.
+   */
+  async acquire(sessionId?: string, requestedDeadlineMs?: number): Promise<AcquiredSlot> {
     if (this.destroyed) throw new Error('container pool destroyed')
     this.counters.acquires += 1
+    const deadlineMs = requestedDeadlineMs === undefined
+      ? this.acquireDeadlineMs
+      : Math.max(1, Math.min(requestedDeadlineMs, this.maxAcquireDeadlineMs))
 
     // Sticky preference: prefer a free, non-dead slot that last served
     // this session.
@@ -323,10 +335,16 @@ export class ContainerPool {
 
     if (this.waiters.length >= this.maxQueueDepth) {
       this.counters.queue_full_rejects += 1
-      throw new Error(
+      throw new ExecutorSaturatedError(
+        'container-pool',
+        {
+          in_flight: this.slots.filter((s) => s.busy).length,
+          max: aliveCount,
+          queued: this.waiters.length,
+          deadline_ms: 0,
+        },
         `container-pool: queue full (depth=${this.waiters.length}/${this.maxQueueDepth}, ` +
-          `in_flight=${this.slots.filter((s) => s.busy).length}/${aliveCount}). ` +
-          `Reduce parallel callers or raise BRIDGE_POOL_MAX_QUEUE.`,
+          `in_flight=${this.slots.filter((s) => s.busy).length}/${aliveCount})`,
       )
     }
 
@@ -336,13 +354,20 @@ export class ContainerPool {
         if (idx >= 0) this.waiters.splice(idx, 1)
         this.counters.acquire_timeouts += 1
         reject(
-          new Error(
-            `container-pool: acquire timeout after ${this.acquireDeadlineMs}ms ` +
+          new ExecutorSaturatedError(
+            'container-pool',
+            {
+              in_flight: this.slots.filter((s) => s.busy).length,
+              max: aliveCount,
+              queued: this.waiters.length,
+              deadline_ms: deadlineMs,
+            },
+            `container-pool: acquire timeout after ${deadlineMs}ms ` +
               `(in_flight=${this.slots.filter((s) => s.busy).length}/${aliveCount}, ` +
-              `queued=${this.waiters.length}).`,
+              `queued=${this.waiters.length})`,
           ),
         )
-      }, this.acquireDeadlineMs).unref()
+      }, deadlineMs).unref()
       this.waiters.push({
         sessionId,
         resolve: (slot) => {

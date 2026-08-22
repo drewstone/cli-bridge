@@ -165,9 +165,14 @@ describe('runtime attachments — chat completions', () => {
       runtime_attachments: { mcp: { coordination: coordination(36827) } },
     })
 
-    expect(changed.status).toBe(400)
+    expect(changed.status).toBe(409)
     expect(await changed.json()).toMatchObject({
-      error: { message: expect.stringContaining('bound to a different AgentProfile/model') },
+      error: {
+        type: 'session_binding_conflict',
+        session_id: 'changed-profile',
+        message: expect.stringContaining('bound to a different AgentProfile/model'),
+        stored_binding: { effectiveProfileDigest: canonicalAgentProfileDigest(PROFILE) },
+      },
     })
   })
 
