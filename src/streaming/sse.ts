@@ -25,6 +25,7 @@ export interface ChunkMeta {
  */
 export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | null {
   const hasContent = delta.content !== undefined
+  const hasReasoning = delta.reasoning !== undefined
   const hasIdentity = delta.model !== undefined || delta.system_fingerprint !== undefined
   const hasToolCalls = !!delta.tool_calls && delta.tool_calls.length > 0
   const hasFinish = delta.finish_reason !== undefined
@@ -36,19 +37,22 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   // comments via `deltaToSseComment` instead. `internal_session_id`-only
   // deltas are also non-OpenAI metadata (consumed by the session store)
   // and are intentionally skipped here.
-  if (!hasContent && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (!hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
   // internal_session_id-only deltas: the session id is bookkeeping for
   // the bridge's own store, not OpenAI surface area. Skip to avoid
   // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
   // some agent harnesses) reject as malformed.
-  if (hasSessionId && !hasContent && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (hasSessionId && !hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
 
   const choiceDelta: Record<string, unknown> = {}
   if (hasContent) choiceDelta.content = delta.content
+  // `delta.reasoning` is the field OpenRouter and pi already use for
+  // streamed reasoning, so pass it through under the same name.
+  if (hasReasoning) choiceDelta.reasoning = delta.reasoning
   if (hasToolCalls) {
     choiceDelta.tool_calls = delta.tool_calls!.map((tc, i) => ({
       index: i,
@@ -58,9 +62,10 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     }))
   }
 
-  // Usage/profile metadata without content/tool_calls/finish carries `choices: []`,
-  // not an empty choice, so strict OpenAI clients do not parse it as output.
-  const metadataOnly = (hasIdentity || hasUsage || hasProfileMaterialization) && !hasContent && !hasToolCalls && !hasFinish
+  // Usage/profile metadata without content/reasoning/tool_calls/finish carries
+  // `choices: []`, not an empty choice, so strict OpenAI clients do not parse
+  // it as output.
+  const metadataOnly = (hasIdentity || hasUsage || hasProfileMaterialization) && !hasContent && !hasReasoning && !hasToolCalls && !hasFinish
   const usage = delta.usage
   const trustedCostProvenance = usage?.cost_provenance === 'provider-receipt'
     || usage?.cost_provenance === 'billing-receipt'
@@ -181,6 +186,8 @@ export async function collectNonStreaming(
     // Backend-liveness signals are transport-layer and have no place in
     // the non-streaming response body. Drop them silently.
     if (d.keepalive) continue
+    // Reasoning deltas never fold into `message.content` — the non-streaming
+    // body keeps the plain OpenAI shape and drops them.
     if (d.content) content += d.content
     if (d.model) responseModel = d.model
     if (d.system_fingerprint) systemFingerprint = d.system_fingerprint

@@ -44,10 +44,13 @@
  *   {"type":"turn_end","message":{"usage":{...}}}
  *   {"type":"agent_end","messages":[...]}
  *
- * We surface text_delta as ChatDelta.content and pi tool-call lifecycle events
- * as OpenAI-shaped tool_calls so downstream trace consumers can observe native
- * pi tool activity. thinking_delta is dropped (matches how the kimi backend
- * handles its `think` blocks for non-thinking-aware callers).
+ * We surface text_delta as ChatDelta.content, pi tool-call lifecycle events
+ * as OpenAI-shaped tool_calls, and thinking_delta as ChatDelta.reasoning, so
+ * downstream consumers (SSE, retained_events, traces) keep both the visible
+ * output and the model's reasoning. Reasoning deltas are coalesced — see
+ * REASONING_FLUSH_CHARS / REASONING_FLUSH_MS below. thinking_start and
+ * thinking_end are boundary markers and are dropped; a reasoning block ends
+ * when the next non-reasoning delta arrives.
  */
 
 import { existsSync, readFileSync } from 'node:fs'
@@ -96,6 +99,19 @@ import {
 } from './pi-inference-transport.js'
 export { piToolProcessEnvironment } from './pi-process-environment.js'
 import { piNativeCapabilities, startPiNativeSession } from './pi-native-start.js'
+
+/**
+ * thinking_delta coalescing bounds. Pi emits one thinking_delta per provider
+ * chunk (a few characters), and on reasoning models the reasoning outweighs
+ * the visible text ~17:1 by characters, so yielding each chunk would multiply
+ * the retained-event row rate ~18x. Buffered reasoning flushes as one
+ * ChatDelta when it reaches this many characters, when the buffer is older
+ * than this many milliseconds at the next thinking_delta, or before any
+ * non-thinking yield so ordering against content/tool_calls stays exact.
+ * A live reader still sees reasoning within a quarter second.
+ */
+const REASONING_FLUSH_CHARS = 256
+const REASONING_FLUSH_MS = 250
 
 export interface PiBackendOptions {
   bin: string
@@ -685,6 +701,14 @@ export class PiBackend implements NativeSessionBackend {
       let observedUsage: CollectedUsage | undefined
       const piToolCalls = new PiToolCallTracker()
       let responseIdentity: PiResponseIdentity | undefined
+      let reasoningBuffer = ''
+      let reasoningBufferedAt = 0
+      const takeReasoning = (): ChatDelta | null => {
+        if (!reasoningBuffer) return null
+        const reasoning = reasoningBuffer
+        reasoningBuffer = ''
+        return { ...piResponseIdentityDelta(responseIdentity), reasoning }
+      }
 
       child.stderr?.on('data', (b) => { stderr.append(b) })
 
@@ -696,6 +720,9 @@ export class PiBackend implements NativeSessionBackend {
 
       for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (next.kind === 'progress') {
+          // A long provider silence still delivers what the model already thought.
+          const pendingOnProgress = takeReasoning()
+          if (pendingOnProgress) yield pendingOnProgress
           yield { keepalive: { source: 'pi', elapsedMs: next.elapsedMs } }
           continue
         }
@@ -712,6 +739,30 @@ export class PiBackend implements NativeSessionBackend {
         const type = String(ev.type ?? '')
         const eventIdentity = piResponseIdentityFromEvent(ev)
         if (eventIdentity) responseIdentity = mergePiResponseIdentity(responseIdentity, eventIdentity)
+
+        const assistantEvent = type === 'message_update'
+          ? ev.assistantMessageEvent as Record<string, unknown> | undefined
+          : undefined
+        const assistantEventType = assistantEvent ? String(assistantEvent.type ?? '') : ''
+        if (assistantEvent && assistantEventType === 'thinking_delta') {
+          const delta = typeof assistantEvent.delta === 'string' ? assistantEvent.delta : ''
+          if (delta) {
+            if (!reasoningBuffer) reasoningBufferedAt = Date.now()
+            reasoningBuffer += delta
+            const flushDue = reasoningBuffer.length >= REASONING_FLUSH_CHARS
+              || Date.now() - reasoningBufferedAt >= REASONING_FLUSH_MS
+            if (flushDue) yield takeReasoning()!
+          }
+          continue
+        }
+        // thinking_start / thinking_end are boundary markers with no text; a
+        // reasoning block ends when the next non-reasoning delta arrives.
+        if (assistantEventType === 'thinking_start' || assistantEventType === 'thinking_end') continue
+        // Every other event flushes buffered reasoning first, so the yielded
+        // order of reasoning against content/tool_calls/usage stays exactly
+        // the order pi produced.
+        const pendingReasoning = takeReasoning()
+        if (pendingReasoning) yield pendingReasoning
 
         // Session id is on the first `session` event.
         if (type === 'session' && typeof ev.id === 'string' && !internalSessionId) {
@@ -768,28 +819,24 @@ export class PiBackend implements NativeSessionBackend {
         // assistantMessageEvent.type === 'text_delta' (or 'text_start',
         // 'text_end' boundary markers we can ignore).
         if (type === 'message_update') {
-          const ame = ev.assistantMessageEvent as Record<string, unknown> | undefined
-          if (!ame) continue
-          const ameType = String(ame.type ?? '')
-          if (ameType === 'text_delta') {
+          if (!assistantEvent) continue
+          if (assistantEventType === 'text_delta') {
             // Use the incremental delta only — text_start carries the
             // initial fragment in `partial.content[].text` and is followed
             // immediately by text_delta events that already include it.
             // Emitting both yields doubled output.
-            const delta = typeof ame.delta === 'string' ? ame.delta : ''
+            const delta = typeof assistantEvent.delta === 'string' ? assistantEvent.delta : ''
             if (delta) {
               emittedContent = true
               yield { ...piResponseIdentityDelta(responseIdentity), content: delta }
             }
           }
-          const toolCall = piToolCalls.observe(ame, ameType)
+          const toolCall = piToolCalls.observe(assistantEvent, assistantEventType)
           if (toolCall) {
             emittedToolCall = true
             yield { ...piResponseIdentityDelta(responseIdentity), tool_calls: [toolCall] }
           }
-          // thinking_*, message_start, message_end — drop for now.
-          // Future enhancement: surface thinking as a separate ChatDelta
-          // variant once the OpenAI o1-style schema lands.
+          // message_start, message_end — boundary markers, drop.
           continue
         }
 
@@ -807,6 +854,11 @@ export class PiBackend implements NativeSessionBackend {
         // Unknown event types — drop silently. Pi's NDJSON schema may
         // gain new event types; we don't want to break on additions.
       }
+
+      // A stream that ended mid-thinking (cancellation, upstream close) still
+      // delivers the reasoning the model already produced.
+      const trailingReasoning = takeReasoning()
+      if (trailingReasoning) yield trailingReasoning
 
       const exitCode = await waitForProcessClose(child)
       signal.removeEventListener('abort', onAbort)

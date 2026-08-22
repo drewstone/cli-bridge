@@ -1282,7 +1282,7 @@ describe('PiBackend', () => {
     }
   })
 
-  it('emits only text deltas and streams turn usage separately from completion', async () => {
+  it('yields thinking as a reasoning delta before the text it produced, never as content', async () => {
     const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
@@ -1323,9 +1323,77 @@ describe('PiBackend', () => {
 
     expect(deltas).toEqual([
       { internal_session_id: 'pi-session-1' },
+      { reasoning: 'hidden reasoning must not become assistant text' },
       { content: 'pi' },
       { content: '-ok' },
       { usage: { input_tokens: 8417, fresh_input_tokens: 8417, output_tokens: 30 } },
+      { finish_reason: 'stop' },
+    ])
+  })
+
+  it('coalesces thinking deltas and flushes before the next non-thinking yield', async () => {
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-session-1' },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_start' } },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'first ' } },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'thought' } },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_end' } },
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'answer' } },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'second thought' } },
+        { type: 'turn_end', message: { usage: { input: 4, output: 2 } } },
+        { type: 'agent_end' },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/moonshot/kimi-k2.6',
+      messages: [{ role: 'user', content: 'work' }],
+    }, null, new AbortController().signal))
+
+    // One reasoning delta per buffered run, flushed before the next
+    // non-thinking yield so ordering against content and usage is exact.
+    expect(deltas).toEqual([
+      { internal_session_id: 'pi-session-1' },
+      { reasoning: 'first thought' },
+      { content: 'answer' },
+      { reasoning: 'second thought' },
+      { usage: { input_tokens: 4, fresh_input_tokens: 4, output_tokens: 2 } },
+      { finish_reason: 'stop' },
+    ])
+  })
+
+  it('flushes buffered reasoning at the size bound instead of growing one giant delta', async () => {
+    const chunk = 'r'.repeat(200)
+    const backend = newTestPiBackend({
+      bin: 'pi',
+      timeoutMs: 1000,
+      spawner: piSpawner([
+        { type: 'session', id: 'pi-session-1' },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: chunk } },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: chunk } },
+        { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'tail' } },
+        { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'done' } },
+        { type: 'turn_end', message: { usage: { input: 4, output: 2 } } },
+        { type: 'agent_end' },
+      ]),
+    })
+
+    const deltas = await collect(backend.chat({
+      model: 'pi/moonshot/kimi-k2.6',
+      messages: [{ role: 'user', content: 'work' }],
+    }, null, new AbortController().signal))
+
+    // 200 + 200 chars crosses the 256-char bound and flushes as one delta;
+    // the remainder flushes when the text delta arrives.
+    expect(deltas).toEqual([
+      { internal_session_id: 'pi-session-1' },
+      { reasoning: chunk + chunk },
+      { reasoning: 'tail' },
+      { content: 'done' },
+      { usage: { input_tokens: 4, fresh_input_tokens: 4, output_tokens: 2 } },
       { finish_reason: 'stop' },
     ])
   })

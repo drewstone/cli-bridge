@@ -4927,6 +4927,51 @@ describe('retained Agent Interface sessions', () => {
   })
 })
 
+describe('retained chat deltas', () => {
+  it('keeps ChatDelta.reasoning on the persisted retained_events row', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-reasoning-'))
+    try {
+      const store = new SqliteSessionStore(dir)
+      store.createRetained({
+        id: 'reasoning-session',
+        createRequestDigest: 'sha256:reasoning-create',
+        backend: 'pi',
+        model: 'pi/tangle-router/openrouter/stealth/ox-alpha',
+        capabilities,
+      })
+      store.appendRetainedDelta('reasoning-session', {
+        runId: 'bridge-run-reasoning',
+        sequence: 1,
+        delta: { model: 'stealth/ox-alpha', reasoning: 'the model thinking out loud' },
+      })
+      store.appendRetainedDelta('reasoning-session', {
+        runId: 'bridge-run-reasoning',
+        sequence: 2,
+        delta: { content: 'the answer' },
+      })
+
+      // Re-open from disk: the JSON round trip through event_json must keep
+      // the reasoning key, interleaved before the content row.
+      const reopened = new SqliteSessionStore(dir)
+      const events = reopened.retainedEventsAfter('reasoning-session').map(item => item.envelope.event)
+      expect(events).toEqual([
+        {
+          type: 'raw',
+          backend: 'cli-bridge.chat',
+          event: { model: 'stealth/ox-alpha', reasoning: 'the model thinking out loud' },
+        },
+        {
+          type: 'raw',
+          backend: 'cli-bridge.chat',
+          event: { content: 'the answer' },
+        },
+      ])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 function isUsageRawEvent(value: unknown): boolean {
   return value !== null
     && typeof value === 'object'
