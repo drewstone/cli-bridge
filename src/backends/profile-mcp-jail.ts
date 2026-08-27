@@ -5,7 +5,6 @@ import {
   fchmodSync,
   fstatSync,
   lstatSync,
-  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
@@ -18,6 +17,7 @@ import { join } from 'node:path'
 import type { McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
 import { processMatchesOwner, processStartIdentity } from '../runtime/private-temporary.js'
+import { assertNoSymlinkComponents, ensureDirectoryNoSymlinks } from '../jail/path-policy.js'
 import { type MaterializedMcpConfig, writeFileNoFollow } from './profile-core.js'
 
 export function mountCwdNativeMcp(
@@ -42,8 +42,9 @@ export function mountCwdNativeMcp(
 
   let createdDir = false
   try {
+    assertNoSymlinkComponents(cwd, `${backendName} MCP workspace`, false)
     createdDir = !existsSync(piDir)
-    mkdirSync(piDir, { recursive: true })
+    ensureDirectoryNoSymlinks(piDir, `${backendName} MCP directory`)
     // `writeFileNoFollow` only guards the FINAL path component; a
     // workspace that pre-created `.pi` as a symlink to a host directory
     // would still redirect every write under it. lstat does not follow —

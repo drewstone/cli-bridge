@@ -42,78 +42,17 @@ import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
-
-interface ClaudeStreamInit {
-  type: 'system'
-  subtype: 'init'
-  session_id: string
-  model?: string
-}
-interface ClaudeStreamAssistant {
-  type: 'assistant'
-  message: {
-    id: string
-    content: Array<
-      | { type: 'text'; text: string }
-      | { type: 'tool_use'; id: string; name: string; input: unknown }
-    >
-    stop_reason?: string | null
-    usage?: { input_tokens?: number; output_tokens?: number }
-  }
-  session_id?: string
-}
-interface ClaudeStreamResult {
-  type: 'result'
-  subtype: string
-  session_id: string
-  is_error?: boolean
-  result?: string
-  usage?: { input_tokens?: number; output_tokens?: number }
-  total_cost_usd?: number
-}
-type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamResult | { type: string }
-
-const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 300
-
-function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
-  const fallback = 'provider returned an error result'
-  if (!detail) return fallback
-
-  // Provider messages are useful diagnostics, but they are untrusted output:
-  // keep one bounded printable line and remove common credential shapes.
-  const sanitized = detail
-    // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\x00-\x1f\x7f-\x9f]+/gu, ' ')
-    .replace(/\b(Bearer\s+)[^\s,;]+/giu, '$1<redacted>')
-    .replace(/\bsk-(?:ant-)?[A-Za-z0-9_-]{8,}\b/gu, '<redacted>')
-    .replace(/\s+/gu, ' ')
-    .trim()
-
-  return (sanitized || fallback).slice(0, MAX_UPSTREAM_ERROR_DETAIL_CHARS)
-}
-
-export interface ClaudeBackendOptions {
-  bin: string
-  timeoutMs: number
-  /** Harness name that claims the <harness>/* prefix. Default 'claude'. */
-  harness?: string
-  /**
-   * If set, the Claude Code subprocess is spawned with
-   * ANTHROPIC_BASE_URL=<this value>. Used by the `claudish` harness to
-   * aim Claude Code at a local claudish proxy so the workflow runs over
-   * a different model backend.
-   */
-  anthropicBaseUrl?: string | null
-  /**
-   * Subprocess spawner. Defaults to host node spawn. Pass a
-   * docker-pooled spawner to run claude inside isolated containers
-   * (per-call FS isolation; safe parallelism). See
-   * `src/executors/docker.ts` + `container-pool.ts`.
-   */
-  spawner?: Spawner
-}
+import {
+  claudeEffort,
+  sanitizeUpstreamErrorDetail,
+  type ClaudeStreamAssistant,
+  type ClaudeStreamInit,
+  type ClaudeStreamLine,
+  type ClaudeStreamResult,
+  type ClaudeBackendOptions,
+} from './claude-protocol.js'
+import { composeClaudeStdinInput } from './claude-input.js'
+export type { ClaudeBackendOptions } from './claude-protocol.js'
 
 export class ClaudeBackend implements Backend {
   readonly name: string
@@ -516,11 +455,6 @@ export class ClaudeBackend implements Backend {
     return args
   }
 
-  private flattenPrompt(messages: ChatRequest['messages']): string {
-    if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
-    return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
-  }
-
   /**
    * Compose the stdin payload for `--input-format stream-json`.
    *
@@ -542,40 +476,8 @@ export class ClaudeBackend implements Backend {
    * element with `[role]` tags so tool-result content (role: 'tool')
    * stays identifiable to the model.
    */
-  composeStdinInput(
-    req: ChatRequest,
-    session: SessionRecord | null,
-  ): { messages: Array<{ role: 'user'; content: string }> } {
-    const systemMessages = (req.messages ?? [])
-      .filter((m) => m.role === 'system')
-      .map((m) => contentToText(m.content))
-      .filter((s) => s.length > 0)
-    const systemBlocks = [
-      ...systemMessages,
-      renderLocalHarnessProfilePreamble(resolveAgentProfile(req, session)),
-      wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
-    ].filter((value): value is string => Boolean(value))
-
-    // Flatten only the non-system messages. `[role]` tags on user /
-    // assistant / tool messages are fine (claude-code-cli expects
-    // some conversation structure); only `[system]` tags trip the
-    // injection heuristic, and we route those to argv above.
-    const nonSystemMessages = (req.messages ?? []).filter((m) => m.role !== 'system')
-    const userText = this.flattenPrompt(nonSystemMessages)
-
-    // Mirror of `buildArgs`'s decision: if system content fits the
-    // argv cap, it lives in --append-system-prompt and stdin gets
-    // ONLY userText. Otherwise wrap (fallback). Keep the threshold
-    // in lock-step with `APPEND_LIMIT` in buildArgs.
-    const APPEND_LIMIT = 120 * 1024
-    const systemMerged = systemBlocks.join('\n\n')
-    const systemFitsInArgv = systemBlocks.length === 0
-      || Buffer.byteLength(systemMerged, 'utf8') <= APPEND_LIMIT
-    const content = systemFitsInArgv
-      ? userText
-      : `[SYSTEM INSTRUCTIONS]\n${systemMerged}\n\n[USER]\n${userText}`
-
-    return { messages: [{ role: 'user', content }] }
+  composeStdinInput(req: ChatRequest, session: SessionRecord | null): { messages: Array<{ role: 'user'; content: string }> } {
+    return composeClaudeStdinInput(req, session)
   }
 
   /**
@@ -593,16 +495,4 @@ export class ClaudeBackend implements Backend {
   }
 }
 
-/**
- * Map the shared effort ladder onto Claude Code's exact CLI values.
- * Claude cannot disable effort or express `minimal`, so both clamp to its
- * lowest supported level. `ultracode` maps to Claude's explicit maximum.
- */
-export function claudeEffort(
-  effort: ChatRequest['effort'],
-): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
-  if (!effort) return null
-  if (effort === 'none' || effort === 'minimal') return 'low'
-  if (effort === 'ultracode') return 'max'
-  return effort
-}
+export { claudeEffort }

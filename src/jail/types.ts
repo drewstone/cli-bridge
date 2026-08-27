@@ -12,9 +12,10 @@
  * else the NoopJail passes argv through unchanged.
  */
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { assertNoSymlinkComponents, ensureDirectoryNoSymlinks } from './path-policy.js'
 
 export interface JailSpec {
   /** Writable scratch root; becomes HOME inside the jail. Must resolve
@@ -38,11 +39,11 @@ export interface JailSpec {
    * noop backends confine writes only and ignore this flag.
    */
   readConfine?: boolean
-  /** Host auth/config sources made available inside the jail (read-only bind
-   * on Linux, copy on macOS) so a confined run still authenticates as the
-   * operator. Each carries an explicit jail-relative target so a source OUTSIDE
-   * the operator HOME (e.g. a custom `CODEX_HOME`) still lands at the location
-   * the confined CLI reads. Populated per backend by {@link authSourcesFor}. */
+  /** Host auth/config sources made available inside the jail so a confined run
+   * still authenticates as the operator. Each source explicitly declares
+   * whether Linux may read-only bind it or must make an ephemeral writable
+   * copy for a CLI that locks its own settings. Populated per backend by
+   * {@link authSourcesFor}. */
   authSources?: JailAuthSource[]
   /** Backend state paths redirected into writable jail storage even when no
    * host config/auth source exists. */
@@ -52,6 +53,9 @@ export interface JailSpec {
    * has proved a jail backend is available. Fallback and Docker paths retain
    * the original argument. */
   argumentRewrites?: JailArgumentRewrite[]
+  /** Child environment overrides that apply only when confinement is active.
+   * The explicit warn fallback must retain the ordinary host environment. */
+  environment?: Record<string, string>
 }
 
 /** One exact command argument and the value visible inside an active jail. */
@@ -75,10 +79,16 @@ export interface JailWritableEnvironment {
 export interface JailAuthSource {
   /** Absolute host path holding the backend CLI's auth/config. */
   source: string
-  /** Path relative to the jail root (== jail HOME) where `source` must appear,
-   * so the confined CLI finds it at the same logical location. Always inside
-   * the root, even when `source` lives outside the operator HOME. */
+  /** Path relative to the jail root (== jail HOME) where `source` must appear.
+   * Read-only sources normally retain their logical HOME location; writable
+   * copies use a unique request path and redirect the CLI through `envVar`.
+   * Always inside the root, even when `source` lives outside operator HOME. */
   jailRel: string
+  /** `read-only` preserves the host path through a Linux bind mount.
+   * `copy-writable` copies it inside the writable jail HOME and removes that
+   * copy when the process exits. macOS must copy either mode because
+   * sandbox-exec cannot bind mount. */
+  mode: 'read-only' | 'copy-writable'
   /** Optional env var the jail must point at this source's IN-JAIL location
    * (`<root>/<jailRel>`). Set ONLY by the jail backend when it actually wraps,
    * so e.g. codex's `CODEX_HOME` is redirected into the jail for confined runs
@@ -96,6 +106,8 @@ export interface JailWrap {
   env?: Record<string, string>
   /** Tear down any backend-owned temp state (e.g. an SBPL profile file). */
   cleanup?: () => Promise<void> | void
+  /** Recheck every bind source and destination immediately before spawn. */
+  verify?: () => void
 }
 
 export interface JailBackend {
@@ -117,6 +129,11 @@ export interface JailBackend {
  */
 export function resolveJailRoot(root: string, base: string): string {
   if (!root) throw new Error('jail root must be a non-empty path')
+  // Resolution remains pure for callers that only need the policy object;
+  // wrap-time validation rejects a missing or replaced project immediately
+  // before spawn.
+  assertNoSymlinkComponents(resolve(base), 'jail project directory', true)
+  assertNoSymlinkComponents(isAbsolute(root) ? resolve(root) : resolve(base, root), 'jail root', true)
   // Canonicalize BOTH paths (resolve symlinks on the existing prefix) before
   // comparing, so a repo-local symlink (e.g. scratch -> /tmp) cannot look
   // in-base lexically while physically pointing outside it.
@@ -130,6 +147,27 @@ export function resolveJailRoot(root: string, base: string): string {
     throw new Error(`jail root '${resolvedRoot}' must be a dedicated subdirectory inside '${resolvedBase}'`)
   }
   return resolvedRoot
+}
+
+/** Resolve a path relative to a prepared jail root without accepting an escape. */
+export function resolveJailChild(root: string, jailRel: string): string {
+  if (!jailRel || isAbsolute(jailRel)) throw new Error(`jail path must be a non-empty relative path: ${jailRel}`)
+  const resolved = resolve(root, jailRel)
+  const rel = relative(resolve(root), resolved)
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`jail path escapes its root: ${jailRel}`)
+  }
+  assertNoSymlinkComponents(resolved, 'jail path', true)
+  return resolved
+}
+
+/** Parent mount that hides sibling run roots while preserving this run's root. */
+export function peerIsolationRoot(root: string, projectDir: string): string | null {
+  const parent = dirname(resolve(root))
+  const project = resolve(projectDir)
+  const rel = relative(project, parent)
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null
+  return parent
 }
 
 /** Resolve symlinks on the deepest EXISTING ancestor of `p`, then re-append the
@@ -222,18 +260,22 @@ function findGitDir(start: string): { gitDir: string; repoRoot: string } | null 
 export async function prepareJailHome(root: string): Promise<void> {
   // Mirror the XDG layout produced by jailEnv() so a CLI finds the dirs ready.
   const relDirs = ['.tmp', '.config', '.cache', join('.local', 'share'), join('.local', 'state'), '.runtime']
-  await mkdir(root, { recursive: true, mode: 0o700 })
+  ensureDirectoryNoSymlinks(root, 'jail root')
   chmodSync(root, 0o700)
   // The jail root sits inside the project (default <cwd>/.agent-home) and holds
   // scratch + (on macOS) copied credentials. Ignore the whole tree so neither
   // work artifacts nor copied secrets can ever be committed. Never clobber an
   // existing .gitignore.
   const gitignore = join(root, '.gitignore')
-  if (!existsSync(gitignore)) await writeFile(gitignore, '*\n', { mode: 0o600 })
-  else chmodSync(gitignore, 0o600)
+  if (!existsSync(gitignore)) await writeFile(gitignore, '*\n', { mode: 0o600, flag: 'wx' })
+  else {
+    const stat = lstatSync(gitignore)
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`jail .gitignore is not a regular file: ${gitignore}`)
+    chmodSync(gitignore, 0o600)
+  }
   for (const rel of relDirs) {
     const path = join(root, rel)
-    await mkdir(path, { recursive: true, mode: 0o700 })
+    ensureDirectoryNoSymlinks(path, 'jail state directory')
     chmodSync(path, 0o700)
   }
 }

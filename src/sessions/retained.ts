@@ -22,6 +22,10 @@ import {
   type SessionStore,
 } from './store.js'
 import { readyNativeBackend } from './retained/capabilities.js'
+import { authSourcesFor } from '../jail/auth-preserve.js'
+import { writableEnvironmentFor } from '../jail/backend-state.js'
+import { namespaceJailSpec, resolveJailSpec, type RetainedJailPolicy } from '../jail/resolve-spec.js'
+import { resolveJailChild } from '../jail/types.js'
 import { describeInputMaterial, inputPresenceMetadata, RetainedInputMaterialStore } from './retained/input-material.js'
 import { RetainedSessionState } from './retained/state.js'
 import {
@@ -156,6 +160,39 @@ export class RetainedSessionService {
     }
 
     const id = input.id ?? input.session_id!
+    let jailPolicy: RetainedJailPolicy | null = null
+    try {
+      const resolved = resolveJailSpec({
+        execMode: input.execution?.kind === 'host' ? input.execution.jail?.mode : undefined,
+        execRoot: input.execution?.kind === 'host' ? input.execution.jail?.root : undefined,
+        cwd: input.cwd ?? process.cwd(),
+        env: process.env,
+      })
+      if (resolved) {
+        const namespaced = namespaceJailSpec(resolved, id)
+        const authSources = authSourcesFor(backend.name, { projectDir: namespaced.projectDir })
+        const writableEnvironment = writableEnvironmentFor(backend.name)
+        const environment: Record<string, string> = {}
+        for (const source of authSources) {
+          if (source.envVar) environment[source.envVar] = resolveJailChild(namespaced.root, source.jailRel)
+        }
+        for (const target of writableEnvironment) {
+          environment[target.envVar] = resolveJailChild(namespaced.root, target.jailRel)
+        }
+        jailPolicy = {
+          ...namespaced,
+          authSources,
+          writableEnvironment,
+          environment,
+        }
+      }
+    } catch (error) {
+      throw new RetainedSessionError(
+        `invalid retained jail policy: ${error instanceof Error ? error.message : String(error)}`,
+        400,
+        'invalid_request_error',
+      )
+    }
     const material = describeInputMaterial(input)
     let callerMetadata: Record<string, unknown>
     try {
@@ -183,6 +220,7 @@ export class RetainedSessionService {
         cwd: input.cwd ?? null,
         metadata,
         capabilities,
+        jailPolicy,
       })
     } catch (error) {
       if (
@@ -250,7 +288,11 @@ export class RetainedSessionService {
     }
     this.closures.add(id)
     try {
-      const control = this.runs.nativeSession(id)
+      // A child whose process has closed can still own executor/private-file
+      // cleanup after whenClosed() failed. Keep that pointer reachable so this
+      // endpoint retries the cleanup instead of closing the durable session
+      // around an orphaned native handle.
+      const control = this.runs.nativeSession(id) ?? this.runs.nativeCleanupSession(id)
       if (control && !control.run.snapshot().terminal) {
         throw new RetainedSessionError(
           'active retained runs must be cancelled before the session can close',
@@ -265,7 +307,7 @@ export class RetainedSessionService {
           }
         } catch (error) {
           if (error instanceof RetainedSessionError) throw error
-          const latestControl = this.runs.nativeSession(id)
+          const latestControl = this.runs.nativeCleanupSession(id)
           const latest = this.store.getRetained(id)
           if (
             latestControl?.run === control.run &&

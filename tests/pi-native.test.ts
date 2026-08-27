@@ -399,7 +399,7 @@ describe('Pi native RPC adapter', () => {
     mkdirSync(root, { mode: 0o700 })
 
     await expect(native.close()).rejects.toThrow(/replaced temporary root/u)
-    expect(lifecycle).toMatchObject({ releases: 1, terminations: 1 })
+    expect(lifecycle).toMatchObject({ releases: 0, terminations: 1 })
 
     rmSync(root, { recursive: true, force: true })
     renameSync(original, root)

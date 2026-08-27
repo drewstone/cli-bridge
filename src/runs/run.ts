@@ -148,6 +148,11 @@ export class Run {
     return this.native.live()
   }
 
+  /** Return the owned child for cleanup retry, even after its process closed. */
+  nativeCleanupSession(): NativeSession | null {
+    return this.native.current()
+  }
+
   /** Keep disposal pending while an asynchronous start or handoff may return a child. */
   reserveNativeControlAttachment(): () => void {
     return this.native.reserveAttachment()

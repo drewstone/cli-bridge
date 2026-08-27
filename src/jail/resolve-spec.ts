@@ -19,7 +19,8 @@
  * own working tree. `readConfine` is set when the effective mode is 'fs-jail'.
  */
 
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { createHash } from 'node:crypto'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { resolveJailRoot } from './types.js'
 import type { JailSpec } from './types.js'
 
@@ -38,6 +39,12 @@ export interface ResolveJailSpecInput {
 
 /** Default writable root, relative to `cwd`, when a jail is on and no root is given. */
 export const DEFAULT_JAIL_ROOT = '.agent-home'
+
+/** Stable jail fields retained sessions carry across every native turn. */
+export type RetainedJailPolicy = Pick<
+  JailSpec,
+  'root' | 'projectDir' | 'readConfine' | 'authSources' | 'writableEnvironment' | 'environment'
+>
 
 /** Confinement ordering: a higher rank is strictly more confined. Used to take
  * the max of the operator floor and the per-request mode (a request may raise
@@ -69,6 +76,15 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
     root = resolveJailRoot(DEFAULT_JAIL_ROOT, projectDir)
   }
   return { root, projectDir, ...(mode === 'fs-jail' ? { readConfine: true } : {}) }
+}
+
+/** Put a request or retained session in a deterministic private child root. */
+export function namespaceJailSpec(spec: JailSpec, namespace: string): JailSpec {
+  const suffix = createHash('sha256').update(namespace).digest('hex').slice(0, 32)
+  return {
+    ...spec,
+    root: resolveJailRoot(join(spec.root, '.sessions', suffix), spec.projectDir),
+  }
 }
 
 /** Return whichever of the two modes is more confined. */

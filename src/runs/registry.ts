@@ -132,6 +132,17 @@ export class RunRegistry {
     return null
   }
 
+  /** The latest owned child, including one retained only for cleanup retry. */
+  nativeCleanupSession(sessionId: string): { run: Run; session: NativeSession } | null {
+    const runs = [...this.runs.values()].reverse()
+    for (const run of runs) {
+      if (run.sessionId !== sessionId) continue
+      const session = run.nativeCleanupSession()
+      if (session) return { run, session }
+    }
+    return null
+  }
+
   /** Test/shutdown aid — cancel and forget every run. */
   clear(): void {
     for (const run of this.runs.values()) this.retire(run)

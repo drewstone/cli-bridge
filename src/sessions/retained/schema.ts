@@ -34,6 +34,13 @@ const createSchema = z.strictObject({
   cwd: z.string().optional(),
   mode: z.enum(['byob', 'hosted-safe', 'hosted-sandboxed']).optional(),
   interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
+  execution: z.strictObject({
+    kind: z.literal('host'),
+    jail: z.strictObject({
+      mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
+      root: z.string().optional(),
+    }).optional(),
+  }).optional(),
   agent_profile: z.unknown().optional(),
   mcp: z.unknown().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),

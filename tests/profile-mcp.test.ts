@@ -14,7 +14,8 @@
 
 import { describe, expect, it } from 'vitest'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
@@ -315,6 +316,44 @@ describe('resolveMcpServers', () => {
       } as never,
     )
     expect(merged).toBeNull()
+  })
+
+  it('rejects MCP paths outside the allowed roots and records stable paths for the jail', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cb-mcp-path-policy-'))
+    const command = join(cwd, 'mcp-server.js')
+    const link = join(cwd, 'mcp-link.js')
+    const jailSpec: NonNullable<ChatRequest['jailSpec']> = { root: join(cwd, '.agent-home'), projectDir: cwd }
+    try {
+      writeFileSync(command, '#!/usr/bin/env node\n')
+      symlinkSync(command, link)
+      const merged = resolveMcpServers(req({
+        cwd,
+        jailSpec,
+        mcp: { mcpServers: { local: { command, args: [command] } } },
+      }), null)
+      expect(merged?.local?.command).toBe(command)
+      expect(jailSpec.extraReadablePaths).toEqual([command])
+
+      expect(() => resolveMcpServers(req({
+        cwd,
+        mcp: { mcpServers: { host: { command: '/etc/hosts' } } },
+      }), null)).toThrow(/outside the allowed roots/u)
+      expect(() => resolveMcpServers(req({
+        cwd,
+        mcp: { mcpServers: { broad: { command: 'node', args: ['/'] } } },
+      }), null)).toThrow(/too broad|expose/u)
+      expect(() => resolveMcpServers(req({
+        cwd,
+        mcp: { mcpServers: { linked: { command: link } } },
+      }), null)).toThrow(/symlink/u)
+      expect(() => resolveMcpServers(req({
+        cwd,
+        jailSpec,
+        mcp: { mcpServers: { missing: { command: 'node', args: [join(cwd, 'missing-argv-path')] } } },
+      }), null)).toThrow(/does not exist/u)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
   })
 })
 
@@ -682,7 +721,9 @@ describe('materializeMcpServersForPi', () => {
 
   it('hardens Pi stdio children with an env -i boundary and rejects secret-shaped vars', () => {
     const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-pi-mcp-'))
+    const homeOverride = join(cwd, 'home-override')
     try {
+      fs.mkdirSync(homeOverride)
       const m = materializeMcpServersForPi({ safe: { command: 'node', args: ['server.js'], env: { MODE: 'test' } } }, cwd, { isolateChildren: true })
       expect(m).not.toBeNull()
       const server = JSON.parse(readFileSync(m!.configPath, 'utf8')).mcpServers.safe
@@ -695,7 +736,7 @@ describe('materializeMcpServersForPi', () => {
       expect(server.args.some((arg: string) => arg.includes('API_KEY') || arg.includes('TOKEN'))).toBe(false)
       m!.cleanup()
       expect(() => materializeMcpServersForPi({ unsafe: { command: 'node', env: { API_TOKEN: 'secret' } } }, cwd, { isolateChildren: true })).toThrow(/secret-shaped/u)
-      expect(() => materializeMcpServersForPi({ unsafe: { command: 'node', env: { HOME: '/home/drew' } } }, cwd, { isolateChildren: true })).toThrow(/cannot override isolated environment key.*HOME/u)
+      expect(() => materializeMcpServersForPi({ unsafe: { command: 'node', env: { HOME: homeOverride } } }, cwd, { isolateChildren: true })).toThrow(/cannot override isolated environment key.*HOME/u)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }

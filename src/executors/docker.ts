@@ -1,21 +1,7 @@
-/**
- * Docker spawner — runs the CLI inside a container slot acquired from a
- * pool. Each call:
- *
- *   1. ContainerPool.acquire(sessionId)        — sticky on session id
- *   2. spawn('docker', ['exec', '-i', ...args]) — stream stdio over the
- *      docker-exec attached pipes
- *   3. when the child closes → release the slot
- *
- * This gives the CLI subprocess full filesystem isolation (per-container
- * /tmp, /home/user, etc.) while keeping the OAuth state mountable from
- * the host. K parallel chat() calls can run on K different containers
- * without stomping on each other's working directories or ~/.tmp scratch.
- */
+/** Docker-backed executor: acquire one exclusive container slot per request. */
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { realpathSync, statSync } from 'node:fs'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { isAbsolute, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import type { ContainerPool } from './container-pool.js'
 import { dockerCli, type DockerCli } from './docker-cli.js'
@@ -29,50 +15,28 @@ import {
   throwIfExecutorAborted,
   type ExecutorFinding,
   type ExecutorReadiness,
-  type SpawnOpts,
   type SpawnResult,
   type Spawner,
 } from './types.js'
+import { assertDockerWorkspaceCwd, buildDockerExecArgs, type WorkspaceCwdContext } from './docker-paths.js'
+
+export { assertDockerWorkspaceCwd, buildDockerExecArgs, type WorkspaceCwdContext } from './docker-paths.js'
 
 const execFileAsync = promisify(execFile)
 
 export interface DockerSpawnerOptions {
   pool: ContainerPool
-  /**
-   * If the CLI binary lives at a non-standard path inside the
-   * container, set this prefix. Most images install /usr/local/bin/...
-   * so the default is empty.
-   */
   binPrefixInContainer?: string
-  /** PATH used after an exact environment replaces the image environment. */
   pathInContainer?: string
-  /** HOME used after an exact environment replaces the image environment. */
   homeInContainer?: string
-  /** Numeric identity configured for commands inside the container. */
   containerUser?: string
-  /** Host workspace root mounted into each slot at the same path. */
   workspaceRoot?: string
-  /** Host paths that are explicitly visible at the matching container paths. */
   pathMappings?: Array<{ host: string; container: string }>
-  /** Backend name, quoted in configuration errors: 'opencode', 'claude', … */
   backend?: string
-  /** Env-var prefix named in remedies: 'OPENCODE', 'CLAUDE', … */
   envPrefix?: string
-  /** Test-only replacement for the real `docker restart` operation. */
   restartContainer?: (containerId: string) => Promise<void>
-  /** Test-only replacement for spawning the local Docker attach client. */
   spawnProcess?: typeof spawn
-  /** Injectable docker command runner used by exec-failure diagnosis. */
   cli?: DockerCli
-  /**
-   * The probe configuration for one slot, derived from the SAME values the pool
-   * received. Supplied as a function of the slot index because per-slot
-   * credential volumes are not identical between slots — probing slot 0's for
-   * every slot was evidence about one slot while traffic went to all of them.
-   *
-   * Without it, `probeRequestPath` still exercises the cwd policy but cannot
-   * inspect mounts, so it is required for a complete readiness verdict.
-   */
   preflightTarget?: (slotIndex: number) => DockerPreflightTarget
 }
 
@@ -85,22 +49,17 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
   const pathMappings = [
     ...(opts.pathMappings ?? []),
     ...(opts.workspaceRoot ? [{ host: opts.workspaceRoot, container: opts.workspaceRoot }] : []),
-  ].map(mapping => ({
-    host: resolve(mapping.host),
-    container: resolve(mapping.container),
-  })).sort((a, b) => b.host.length - a.host.length)
+  ].map(mapping => ({ host: resolvePath(mapping.host), container: resolvePath(mapping.container) }))
+    .sort((a, b) => b.host.length - a.host.length)
   const mapPath = (value: string): string => {
-    if (!isAbsolute(value)) return value
-    const host = resolve(value)
+    if (!isAbsolutePath(value)) return value
+    const host = resolvePath(value)
     const mapping = pathMappings.find(candidate => host === candidate.host || host.startsWith(`${candidate.host}/`))
-    if (!mapping) {
-      throw new ExecutorConfigurationError(
-        `${naming.backend ?? 'Docker'} cannot expose host-only path ${value} inside the container. ` +
-        `Add it to the backend's explicit credential/workspace mounts or set ${naming.envPrefix ?? '<BACKEND>'}_EXECUTOR=host.`,
-      )
-    }
-    const suffix = host.slice(mapping.host.length)
-    return `${mapping.container}${suffix}`
+    if (!mapping) throw new ExecutorConfigurationError(
+      `${naming.backend ?? 'Docker'} cannot expose host-only path ${value} inside the container. ` +
+      `Add it to the backend's explicit credential/workspace mounts or set ${naming.envPrefix ?? '<BACKEND>'}_EXECUTOR=host.`,
+    )
+    return `${mapping.container}${host.slice(mapping.host.length)}`
   }
   const spawner: Spawner = async (bin, args, spawnOpts) => {
     const cwd = assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd, naming)
@@ -108,80 +67,30 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
     let released = false
     let terminationFinished = false
     let terminationPromise: Promise<void> | null = null
-    const releaseNow = (): void => {
-      if (released) return
-      released = true
-      slot.release()
-    }
+    const releaseNow = (): void => { if (!released) { released = true; slot.release() } }
     try {
       throwIfExecutorAborted(spawnOpts.signal)
-      const dockerArgs = buildDockerExecArgs(
-        slot.containerId,
-        bin,
-        args,
-        { ...spawnOpts, ...(cwd ? { cwd } : {}) },
-        opts.binPrefixInContainer,
-        opts.pathInContainer,
-        opts.homeInContainer,
-        mapPath,
-      )
-      const child = (opts.spawnProcess ?? spawn)('docker', dockerArgs, {
-        stdio: spawnOpts.stdio ?? ['ignore', 'pipe', 'pipe'],
-      })
+      const dockerArgs = buildDockerExecArgs(slot.containerId, bin, args, { ...spawnOpts, ...(cwd ? { cwd } : {}) }, opts.binPrefixInContainer, opts.pathInContainer, opts.homeInContainer, mapPath)
+      const child = (opts.spawnProcess ?? spawn)('docker', dockerArgs, { stdio: spawnOpts.stdio ?? ['ignore', 'pipe', 'pipe'] })
       let onAbort: (() => void) | undefined
       const terminate = (): Promise<void> => {
         if (terminationPromise) return terminationPromise
-        terminationPromise = terminateDockerExecution(
-          child,
-          slot.containerId,
-          opts.restartContainer ?? restartDockerContainer,
-          cli,
-        ).then(() => {
-          terminationFinished = true
-          if (onAbort) spawnOpts.signal?.removeEventListener('abort', onAbort)
-        }).catch((error) => {
-          terminationPromise = null
-          throw error
-        })
+        terminationPromise = terminateDockerExecution(child, slot.containerId, opts.restartContainer ?? restartDockerContainer, cli)
+          .then(() => { terminationFinished = true; if (onAbort) spawnOpts.signal?.removeEventListener('abort', onAbort) })
+          .catch(error => { terminationPromise = null; throw error })
         return terminationPromise
       }
       const release = (): void => {
         if (released) return
-        if (terminationFinished) {
-          releaseNow()
-          return
-        }
-        // A local `docker exec` close is not proof that the command inside
-        // the container stopped. Delay slot reuse until executor-owned
-        // termination has completed.
-        void terminate().then(releaseNow).catch((terminationError) => {
-          // Termination genuinely failed, so the container may still be running
-          // work and must not be reused. Recycling replaces it, which is both
-          // safer than reuse and — unlike the old behaviour of leaving the slot
-          // busy for the pool watchdog — does not strand the slot for ten
-          // minutes. Measured: a swept container made `docker restart` fail
-          // here, so the slot was never returned and /health could not recover
-          // even though the pool knew how to rebuild it.
+        if (terminationFinished) { releaseNow(); return }
+        void terminate().then(releaseNow).catch(terminationError => {
           void opts.pool.recycleHeldSlot(slot.containerId).then(
             () => { released = true },
-            recycleError => {
-              // The pool has quarantined the slot. Do not invoke slot.release:
-              // doing so would make a stale container id routable again.
-              console.error('[cli-bridge] Docker termination and replacement both failed:', {
-                terminationError,
-                recycleError,
-              })
-            },
+            recycleError => console.error('[cli-bridge] Docker termination and replacement both failed:', { terminationError, recycleError }),
           )
         })
       }
-      // A local docker-exec close starts termination, but explicit release from
-      // the backend remains the authority that returns the slot after its own
-      // request files are cleaned. Forgotten releases remain bounded by the
-      // pool's hold watchdog and are never silently reused.
-      const startTermination = (): void => {
-        void terminate().catch(() => {})
-      }
+      const startTermination = (): void => { void terminate().catch(() => {}) }
       child.once('close', startTermination)
       child.once('error', startTermination)
       onAbort = (): void => { void terminate() }
@@ -191,195 +100,72 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
         child,
         terminate,
         release,
-        /**
-         * Name the real cause of an ambiguous `docker exec` status before the
-         * backend turns it into a message. Returns null when the status came
-         * from the CLI itself, so callers keep their own wording for genuine
-         * CLI failures.
-         */
         diagnoseExit: async (exitCode, stderr) => {
           if (!isAmbiguousDockerExit(exitCode, stderr)) return null
           const diagnosis = await diagnoseDockerExecFailure({
-            containerId: slot.containerId,
-            bin,
-            ...(cwd ? { workdir: cwd } : {}),
-            exitCode,
-            stderr,
+            containerId: slot.containerId, bin, ...(cwd ? { workdir: cwd } : {}), exitCode, stderr,
             ...(opts.envPrefix ? { envPrefix: opts.envPrefix } : {}),
           }, cli)
           if (!diagnosis) return null
-          // A vanished or stopped container is repairable: tell the pool so the
-          // next request or /health probe gets a fresh container instead of the
-          // same dead id for the rest of the process lifetime.
-          if (diagnosis.cause === 'container-missing' || diagnosis.cause === 'container-not-running') {
-            await opts.pool.reportContainerUnusable(slot.containerId).catch(() => {})
-          }
+          if (diagnosis.cause === 'container-missing' || diagnosis.cause === 'container-not-running') await opts.pool.reportContainerUnusable(slot.containerId).catch(() => {})
           return diagnosis.message
         },
       }
       return result
-    } catch (err) {
+    } catch (error) {
       releaseNow()
-      throw err
+      throw error
     }
   }
   spawner.mapPath = mapPath
-  spawner.preparePrivatePath = async (path): Promise<string> => {
+  spawner.preparePrivatePath = async path => {
     const runtimePath = mapPath(path)
     const uid = opts.containerUser ? Number(opts.containerUser.split(':')[0]) : null
     if (uid !== null) await grantPrivateTreeToUid(path, uid)
     return runtimePath
   }
-  spawner.prepareWorkspacePath = async (path) => {
+  spawner.prepareWorkspacePath = async path => {
     const runtimePath = mapPath(path)
     const uid = opts.containerUser ? Number(opts.containerUser.split(':')[0]) : null
-    const access = uid === null
-      ? { cleanup: async () => {} }
-      : await grantTemporaryTreeToUid(path, uid)
+    const access = uid === null ? { cleanup: async () => {} } : await grantTemporaryTreeToUid(path, uid)
     return { path: runtimePath, cleanup: access.cleanup }
   }
-  // A caller that named no directory gets the container-visible workspace, not
-  // the bridge's own working directory. Measured before this existed: the
-  // backend pre-filled `process.cwd()`, so a cwd-less request was refused with
-  // "this request asks to run in /home/drew/code/cli-bridge-preflight" — the
-  // bridge's directory — and the remedy it offered ("send it without a cwd")
-  // was already what the caller had done. With no workspace mounted the answer
-  // is `undefined`: no `--workdir`, so the CLI runs in the image's own WORKDIR.
-  spawner.resolveCwd = (cwd) => cwd === undefined
-    ? opts.workspaceRoot
-    : assertDockerWorkspaceCwd(opts.workspaceRoot, cwd, naming)
-
-  /**
-   * Readiness by taking the request path.
-   *
-   * A request resolves its cwd through `resolveCwd`, gets a slot from this pool,
-   * and then depends on that slot's credential mounts and workspace bind. So the
-   * cwd policy runs here — its refusal is the verdict — and then every live
-   * container is probed for what a request depends on.
-   *
-   * EVERY container, and without acquiring, for two reasons that pull the same
-   * way. Acquiring would make /health queue behind real traffic, so a busy pool
-   * would look unhealthy and the probe could time out on a bridge that is
-   * working perfectly. And probing the ONE slot a request happens to get would
-   * repeat the defect the startup preflight already had to fix — evidence about
-   * one slot while traffic is routed to all of them. The request path's slot
-   * SELECTION is still exercised, immediately after this, by the `<bin>
-   * --version` spawn `versionHealth` runs through this very spawner.
-   */
+  spawner.resolveCwd = cwd => cwd === undefined ? opts.workspaceRoot : assertDockerWorkspaceCwd(opts.workspaceRoot, cwd, naming)
   spawner.probeRequestPath = async (signal?: AbortSignal): Promise<ExecutorReadiness> => {
     throwIfExecutorAborted(signal)
     let cwd: string | undefined
-    try {
-      cwd = spawner.resolveCwd!(undefined)
-    } catch (error) {
-      // The executor refuses cwd-less requests as configured. There is no point
-      // probing a container to confirm it; the refusal already names the setting.
-      return { cwd: undefined, findings: [cwdPolicyFinding(error)] }
-    }
+    try { cwd = spawner.resolveCwd!(undefined) }
+    catch (error) { return { cwd: undefined, findings: [cwdPolicyFinding(error)] } }
     const preflightTarget = opts.preflightTarget
     if (!preflightTarget) return { cwd, findings: [] }
     const liveContainers = opts.pool.liveContainerIds()
-    if (liveContainers.length === 0) {
-      return {
-        cwd,
-        findings: [{
-          check: 'pool-slots',
-          detail: `the ${naming.backend ?? 'docker'} container pool has no live slot, so every request would fail to acquire one`,
-          remedy: 'check the Docker daemon and the bridge log for the pool\'s recreate attempts',
-        }],
-      }
+    if (liveContainers.length === 0) return {
+      cwd,
+      findings: [{ check: 'pool-slots', detail: `the ${naming.backend ?? 'docker'} container pool has no live slot, so every request would fail to acquire one`, remedy: 'check the Docker daemon and the bridge log for the pool recreate attempts' }],
     }
-    // In parallel: a serial sweep of N slots × M mounts would spend more than
-    // the /health probe ceiling on a healthy pool.
-    const perSlot = await Promise.all(liveContainers.map(async ({ containerId, slotIndex }) =>
-      await preflightDockerSlot(
-        preflightTarget(slotIndex),
-        containerId,
-        cli,
-        [],
-        { scope: 'request-path', signal },
-      )))
+    const perSlot = await Promise.all(liveContainers.map(({ containerId, slotIndex }) => preflightDockerSlot(preflightTarget(slotIndex), containerId, cli, [], { scope: 'request-path', signal })))
     throwIfExecutorAborted(signal)
-    const findings: ExecutorFinding[] = perSlot.flat()
-    return { cwd, findings }
+    return { cwd, findings: perSlot.flat() }
   }
   return spawner
 }
 
-/**
- * Stop one Docker-backed request with container-level certainty.
- *
- * The local child is only the attached `docker exec` client. Sending it a
- * signal closes the pipes but leaves the actual CLI and its descendants alive
- * inside the container. Each pool slot is exclusive to one request, so an
- * awaited zero-timeout restart is the smallest reliable unit that kills every
- * descendant, including children that created their own process group. Docker
- * restart preserves the container filesystem and mounted authentication data.
- *
- * It does NOT preserve the container's namespaces: Docker recreates them empty,
- * so anything the pool installed into them — the net-jail's egress filter — is
- * gone when the container comes back. A worker reaches this path by exiting
- * non-zero, so this is a worker-triggerable un-jailing, and it leaked 339,598
- * bytes of github.com from a real pool slot before it was closed. What makes the
- * restart safe is the pool, not this function: the slot stays held until
- * termination completes, and `ContainerPool` re-runs `afterCreate` on any
- * container whose `StartedAt` has moved before the next request can be
- * dispatched into it. Do not release a slot before this resolves.
- */
 export async function terminateDockerExecution(
   child: ChildProcess,
   containerId: string,
   restartContainer: (containerId: string) => Promise<void> = restartDockerContainer,
   cli: DockerCli = dockerCli,
 ): Promise<void> {
-  // A clean `docker exec` client exit proves only that the requested process
-  // closed its stdio. It says nothing about grandchildren that daemonized or
-  // created a new process group inside the container. Restart every exclusive
-  // request slot before reuse so success and failure have the same process-tree
-  // proof.
-  try {
-    await restartContainer(containerId)
-  } catch (error) {
-    // A container that no longer exists has nothing left to terminate, so
-    // treat it as terminated. Reporting failure here made the caller hold the
-    // slot: `docker restart` cannot succeed against a removed container, and
-    // the removal is precisely the case the pool must recover from.
-    //
-    // The wording is checked first because it is free, then CONFIRMED with the
-    // daemon, because the wording set was incomplete: a removal in flight says
-    // "container is marked for removal and cannot be started", which matched
-    // nothing, so a swept container was reported to the caller as a failure to
-    // terminate. Asking whether the container is still there does not depend on
-    // Docker's phrasing staying the same.
-    if (!isMissingContainerError(error) && await containerStillExists(containerId, cli)) throw error
-  }
-  // Reap the local attach client too. After restart it normally exits on its
-  // own; killTree is the bounded fallback and waits for the close event.
+  try { await restartContainer(containerId) }
+  catch (error) { if (!isMissingContainerError(error) && await containerStillExists(containerId, cli)) throw error }
   await killTree(child)
 }
 
-/**
- * Docker's wording for "that container is not here or is on its way out",
- * across `restart`/`exec`/`inspect`. A fast path only — `terminateDockerExecution`
- * confirms with the daemon when the wording is unfamiliar, because this set was
- * missing the in-flight-removal phrasing and a swept container was therefore
- * reported to the caller as a failure to terminate.
- */
 function isMissingContainerError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
   return /No such container|no such object|is not running|marked for removal|is being removed|removal of container/i.test(message)
 }
 
-/**
- * Ask the daemon whether the container is still present.
- *
- * Fail CLOSED: only a daemon that positively answers "no such object" proves the
- * container is gone. `docker inspect` also fails when the daemon is unreachable
- * or the call times out, and reading that as "gone" would swallow a genuine
- * termination failure — a container that may still be running the caller's work
- * would be silently reused. Unknown therefore means "still exists", so the real
- * error is reported and the slot is recycled.
- */
 async function containerStillExists(containerId: string, cli: DockerCli): Promise<boolean> {
   const state = await cli(['inspect', '-f', '{{.State.Status}}', containerId])
   if (state.code === 0) return !/^(removing|dead)$/u.test(state.stdout.trim())
@@ -389,187 +175,16 @@ async function containerStillExists(containerId: string, cli: DockerCli): Promis
 
 async function restartDockerContainer(containerId: string): Promise<void> {
   try {
-    await execFileAsync('docker', ['restart', '--time', '0', containerId], {
-      timeout: 30_000,
-      killSignal: 'SIGKILL',
-      maxBuffer: 1024 * 1024,
-    })
+    await execFileAsync('docker', ['restart', '--time', '0', containerId], { timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 })
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-    throw new Error(`docker executor could not terminate container ${containerId}: ${detail}`)
+    throw new Error(`docker executor could not terminate container ${containerId}: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
-export interface WorkspaceCwdContext {
-  backend?: string
-  envPrefix?: string
+function resolvePath(value: string): string {
+  return resolve(value)
 }
 
-/**
- * Fail before acquiring a slot when a resolved cwd is not a path the container
- * can actually enter. A cwd-less call resolves through `resolveCwd` first, so by
- * the time this runs the directory is one the executor itself chose or the
- * caller supplied.
- *
- * Two rejections, both of which used to surface as `<cli> exited 127`:
- *
- *   - No workspace is mounted at all, but a cwd reached the executor. It would
- *     pass `--workdir <host path>` to a container that has never heard of it;
- *     Docker fails with 127 — byte-identical to "command not found" — and the
- *     caller reads it as a broken CLI install. Worse, if the host path happens
- *     to exist inside the image (/tmp, /root), the CLI runs against the
- *     container's throwaway filesystem and the caller's files are silently
- *     discarded. Both outcomes are worse than refusing.
- *   - The cwd resolves outside the configured workspace root, so it is not
- *     inside the bind mount even though a mount exists.
- *
- * Both messages state WHERE the directory came from and offer only remedies the
- * reader can carry out. Measured on this host, the no-workspace message used to
- * say "this request asks to run in /home/drew/code/cli-bridge-preflight" — the
- * bridge's OWN working directory, which the backend had pre-filled — and then
- * advised "send requests without a cwd", which the caller had already done and
- * the HTTP API could not express. It blamed the caller for the bridge's
- * injection and prescribed the impossible. So: no accusation, and no remedy that
- * lives outside the operator's reach. `<PREFIX>_EXECUTOR=host` is named because
- * it is the second thing an operator can always actually do.
- */
-export function assertDockerWorkspaceCwd(
-  workspaceRoot: string | undefined,
-  cwd: string | undefined,
-  ctx: WorkspaceCwdContext = {},
-): string | undefined {
-  if (!cwd) return cwd
-  if (!workspaceRoot) {
-    const backend = ctx.backend ?? 'this backend'
-    const prefix = ctx.envPrefix ?? '<BACKEND>'
-    const envKey = `${prefix}_DOCKER_WORKSPACE_ROOT`
-    throw new ExecutorConfigurationError(
-      `${backend} runs on a Docker executor with NO workspace bind, and the run resolved to ${cwd}. ` +
-        `That directory does not exist inside the container, so the CLI would never start. It is the executor's ` +
-        `resolved working directory, not necessarily one the caller named, so there is nothing for a caller to ` +
-        `change. Set ${envKey} to an absolute host directory containing ${cwd} — the pool bind-mounts it into ` +
-        `every container at the identical path — or set ${prefix}_EXECUTOR=host to run the CLI directly on this host.`,
-    )
-  }
-  if (!isAbsolute(cwd)) {
-    throw new ExecutorConfigurationError(`Docker executor cwd must be absolute when workspace root is configured: ${cwd}`)
-  }
-  let canonicalCwd: string
-  try {
-    canonicalCwd = realpathSync(cwd)
-  } catch {
-    throw new ExecutorConfigurationError(`Docker executor cwd does not exist: ${cwd}`)
-  }
-  if (!statSync(canonicalCwd).isDirectory()) {
-    throw new ExecutorConfigurationError(`Docker executor cwd is not a directory: ${cwd}`)
-  }
-  const rel = relative(workspaceRoot, canonicalCwd)
-  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    const prefix = ctx.envPrefix ?? '<BACKEND>'
-    const envKey = `${prefix}_DOCKER_WORKSPACE_ROOT`
-    throw new ExecutorConfigurationError(
-      `Docker executor cwd ${cwd} is outside configured workspace root ${workspaceRoot}, so it is not inside the ` +
-        `bind mount the container can see. Set ${envKey} to a host directory containing ${cwd} — it is bind-mounted ` +
-        `at the identical path in every pool container — or set ${prefix}_EXECUTOR=host to run the CLI directly on ` +
-        `this host. A request that names no cwd runs in ${workspaceRoot} and is unaffected.`,
-    )
-  }
-  return canonicalCwd
+function isAbsolutePath(value: string): boolean {
+  return isAbsolute(value)
 }
-
-/**
- * Compose argv for `docker exec`. Exposed so tests can verify flag
- * composition without a real Docker daemon.
- */
-export function buildDockerExecArgs(
-  containerId: string,
-  bin: string,
-  args: string[],
-  spawnOpts: SpawnOpts,
-  binPrefix = '',
-  pathInContainer?: string,
-  homeInContainer?: string,
-  mapPath?: (path: string) => string,
-): string[] {
-  const out: string[] = ['exec', '-i']
-  if (spawnOpts.cwd) {
-    out.push('--workdir', spawnOpts.cwd)
-  }
-  if (spawnOpts.env && !spawnOpts.exactEnv) {
-    for (const [key, value] of Object.entries(spawnOpts.env)) {
-      if (typeof value !== 'string' || value.length === 0) continue
-      // Filter out obviously-host-only keys that would break things in
-      // the container (PATH, HOME, NODE_*). Preserve domain env we
-      // actually need passed through.
-      if (
-        PROXIED_ENV_KEYS.has(key)
-        || key.startsWith('ANTHROPIC_')
-        || key.startsWith('CLAUDE_')
-        || key.startsWith('CODEX_')
-        || key.startsWith('KIMI_')
-        || key.startsWith('OPENCODE_')
-      ) {
-        out.push('-e', `${key}=${value}`)
-      }
-    }
-  }
-  out.push(containerId)
-  if (spawnOpts.exactEnv) {
-    // `docker exec -e` only adds variables to the container's existing
-    // environment.  Run through `env -i` so an exact child environment stays
-    // exact even when the pool image has operator credentials baked in.
-    out.push('env', '-i')
-    for (const [key, value] of Object.entries(spawnOpts.env ?? {})) {
-      if (typeof value !== 'string' || value.length === 0) continue
-      // The exact environment is assembled on the host, but PATH and HOME are
-      // consumed inside the image. Never hand container code a host path that
-      // hides the installed CLI or makes mounted credentials unreachable.
-      const containerValue = key === 'PATH' && pathInContainer
-        ? pathInContainer
-        : key === 'HOME' && homeInContainer
-          ? homeInContainer
-          : isTemporaryEnvironmentKey(key) && isAbsolute(value)
-            ? '/tmp'
-          : isPathEnvironmentKey(key) && isAbsolute(value) && mapPath
-            ? mapPath(value)
-            : value
-      out.push(`${key}=${containerValue}`)
-    }
-  }
-  out.push(binPrefix ? `${binPrefix}${bin}` : bin, ...args)
-  return out
-}
-
-function isPathEnvironmentKey(key: string): boolean {
-  return key === 'PWD'
-    || key === 'TMPDIR'
-    || key === 'TEMP'
-    || key === 'TMP'
-    || key === 'XDG_CONFIG_HOME'
-    || key === 'XDG_CACHE_HOME'
-    || key === 'XDG_DATA_HOME'
-    || key === 'XDG_RUNTIME_DIR'
-    || key === 'NVM_DIR'
-    || key === 'PNPM_HOME'
-    || key === 'PI_CODING_AGENT_DIR'
-    || key === 'PI_CODING_AGENT_SESSION_DIR'
-    || key === 'PI_PACKAGE_DIR'
-}
-
-function isTemporaryEnvironmentKey(key: string): boolean {
-  return key === 'TMPDIR' || key === 'TEMP' || key === 'TMP'
-}
-
-const PROXIED_ENV_KEYS = new Set([
-  'ANTHROPIC_API_KEY',
-  // pi-mcp-adapter reads MCP_DIRECT_TOOLS to register MCP verbs as native pi tools. Without it the
-  // container falls back to the config-file route, which does NOT await adapter init (adapter
-  // 2.17.0 index.ts:360-370), so a one-shot worker can start its only turn before the tools are
-  // registered. Host already proxies this key; docker omitting it made the two diverge silently.
-  'MCP_DIRECT_TOOLS',
-  'ANTHROPIC_BASE_URL',
-  'GEMINI_SYSTEM_MD',
-  'OPENAI_API_KEY',
-  'OPENAI_BASE_URL',
-  'MOONSHOT_API_KEY',
-])

@@ -15,8 +15,18 @@
 
 import { selectJailBackend } from '../jail/index.js'
 import type { JailBackend } from '../jail/index.js'
+import { existsSync } from 'node:fs'
 import { BackendError } from '../backends/types.js'
 import type { SpawnOpts } from './types.js'
+import {
+  assertNoSymlinkComponents,
+  expandUserPath,
+  isWithin,
+  JAIL_STATE_ENV_VARS,
+  scrubJailStateEnvironment,
+  validateStablePath,
+} from '../jail/path-policy.js'
+import { resolveJailRoot } from '../jail/types.js'
 
 export interface JailedCommand {
   bin: string
@@ -24,6 +34,8 @@ export interface JailedCommand {
   env: NodeJS.ProcessEnv | undefined
   /** Tear-down for backend-owned jail temp state; run once in release(). */
   cleanup?: () => Promise<void> | void
+  /** Recheck all path identities immediately before the OS spawn. */
+  verify?: () => void
 }
 
 const ENABLE_HINT =
@@ -67,13 +79,62 @@ export async function applyJail(
   // Only the executor knows that the jail will actually run. Apply backend-
   // declared path translations here, after availability is proven; the
   // explicit warn fallback above must preserve the normal host/Docker argv.
+  validateJailEnvironment(opts.jail)
   const rewrittenArgs = rewriteJailArguments(args, opts.jail.argumentRewrites, backend.name)
   const wrap = await backend.wrap(bin, rewrittenArgs, opts.jail)
   // Merge any jail-supplied env onto the child env. The merged result
   // still flows through sanitizeHostEnv at the spawn site, so the host
   // env allowlist continues to apply.
-  const env = wrap.env ? { ...(opts.env ?? {}), ...wrap.env } : opts.env
-  return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup }
+  const jailOverrides = { ...(opts.jail.environment ?? {}), ...(wrap.env ?? {}) }
+  // An omitted `env` means the normal child would inherit process.env. Make
+  // that inheritance explicit for an active jail so host state roots cannot
+  // survive merely because a backend supplied no override for one of them.
+  const env = {
+    ...(scrubJailStateEnvironment(opts.env ?? process.env) ?? {}),
+    ...jailOverrides,
+  }
+  return {
+    bin: wrap.bin,
+    args: wrap.args,
+    env,
+    cleanup: wrap.cleanup,
+    verify: () => {
+      // The environment was admitted before wrap construction. Recheck it at
+      // the final spawn boundary as well, so a replacement or symlink planted
+      // during materialization cannot change the state path the child sees.
+      validateJailEnvironment(opts.jail!)
+      wrap.verify?.()
+    },
+  }
+}
+
+/**
+ * State-path overrides are trusted only when they point at this run's jail or
+ * at one exact path the backend registered for read-only exposure.
+ *
+ * The ordinary child environment is scrubbed below, but an internal caller can
+ * also provide `jail.environment` (retained Pi does). Rejecting a host path at
+ * this boundary prevents that control-plane value from undoing the scrub.
+ */
+function validateJailEnvironment(spec: NonNullable<SpawnOpts['jail']>): void {
+  const root = resolveJailRoot(spec.root, spec.projectDir)
+  const readableFiles = new Set((spec.extraReadablePaths ?? []).map((path) => expandUserPath(path)))
+  for (const [name, rawValue] of Object.entries(spec.environment ?? {})) {
+    if (!JAIL_STATE_ENV_VARS.includes(name as (typeof JAIL_STATE_ENV_VARS)[number])) continue
+    const value = expandUserPath(rawValue)
+    if (value !== rawValue) spec.environment![name] = value
+    const insideJail = isWithin(root, value)
+    const explicitlyReadable = readableFiles.has(value)
+    if (!insideJail && !explicitlyReadable) {
+      throw new BackendError(`jail environment ${name} points outside the run jail: ${rawValue}`, 'not_configured')
+    }
+    if (insideJail) {
+      if (existsSync(value)) validateStablePath(value, { label: `jail environment ${name}`, projectDir: spec.projectDir })
+      else assertNoSymlinkComponents(value, `jail environment ${name}`, true)
+    } else {
+      validateStablePath(value, { label: `jail environment ${name}`, kind: 'file-or-directory' })
+    }
+  }
 }
 
 export function rewriteJailArguments(

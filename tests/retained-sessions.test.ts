@@ -65,6 +65,7 @@ class FakeNative implements NativeSession {
   protected response: (() => void) | null = null
   private aborted = false
   responseCalls = 0
+  abortCalls = 0
   closeCalls = 0
   readonly steers: string[] = []
   readonly prompts: string[] = []
@@ -190,6 +191,7 @@ class FakeNative implements NativeSession {
   }
 
   async abort(): Promise<void> {
+    this.abortCalls += 1
     this.aborted = true
     this.response?.()
   }
@@ -453,6 +455,15 @@ class FakeNativeBackend implements NativeSessionBackend {
   }
   async *chat(_req: ChatRequest, _session: SessionRecord | null, _signal: AbortSignal): AsyncIterable<ChatDelta> {
     yield { content: 'one-shot', finish_reason: 'stop' }
+  }
+}
+
+class CapturingJailBackend extends FakeNativeBackend {
+  readonly startRequests: Array<ChatRequest['jailSpec']> = []
+
+  override async startNativeSession(req: ChatRequest): Promise<NativeSession> {
+    this.startRequests.push(req.jailSpec ? structuredClone(req.jailSpec) : null)
+    return await super.startNativeSession(req)
   }
 }
 
@@ -723,6 +734,65 @@ describe('retained Agent Interface sessions', () => {
     const recovered = await fixture.app.request(`/v1/sessions/${request.id}`)
     expect(recovered.status).toBe(200)
     expect((await json(recovered)).create_request_digest).toBe(expectedDigest)
+  })
+
+  it('namespaces retained jail state per session and carries the exact policy into native start', async () => {
+    const backend = new CapturingJailBackend()
+    fixture = setup(backend)
+    const cwd = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-jail-'))
+    try {
+      for (const id of ['jail-alpha', 'jail-beta']) {
+        const created = await fixture.app.request('/v1/sessions', {
+          method: 'POST',
+          body: JSON.stringify({
+            id,
+            model: 'pi/test',
+            cwd,
+            execution: { kind: 'host', jail: { mode: 'fs-jail' } },
+          }),
+        })
+        expect(created.status).toBe(201)
+      }
+
+      const alphaPolicy = fixture.store.getRetained('jail-alpha')?.jailPolicy
+      const betaPolicy = fixture.store.getRetained('jail-beta')?.jailPolicy
+      expect(alphaPolicy).not.toBeNull()
+      expect(betaPolicy).not.toBeNull()
+      expect(alphaPolicy?.root).not.toBe(betaPolicy?.root)
+      expect(alphaPolicy?.root).toContain(`${cwd}/.agent-home/.sessions/`)
+      expect(betaPolicy?.root).toContain(`${cwd}/.agent-home/.sessions/`)
+      expect(alphaPolicy?.readConfine).toBe(true)
+      expect(alphaPolicy?.projectDir).toBe(cwd)
+
+      for (const id of ['jail-alpha', 'jail-beta']) {
+        const turn = await fixture.app.request(`/v1/sessions/${id}/turns`, {
+          method: 'POST',
+          body: turnBody(`${id}-run`, { message: 'first' }),
+        })
+        expect(turn.status).toBe(202)
+        await waitFor(() => fixture!.store.getRetained(id)?.turns === 1)
+      }
+
+      expect(backend.startRequests).toHaveLength(2)
+      expect(backend.startRequests[0]).toEqual(alphaPolicy)
+      expect(backend.startRequests[1]).toEqual(betaPolicy)
+      expect(backend.startRequests[0]?.environment?.PI_CODING_AGENT_SESSION_DIR)
+        .toBe(`${alphaPolicy?.root}/.pi/sessions`)
+      expect(backend.startRequests[1]?.environment?.PI_CODING_AGENT_SESSION_DIR)
+        .toBe(`${betaPolicy?.root}/.pi/sessions`)
+
+      const continuation = await fixture.app.request('/v1/sessions/jail-alpha/turns', {
+        method: 'POST',
+        body: turnBody('jail-alpha-second-run', { message: 'second' }),
+      })
+      expect(continuation.status).toBe(202)
+      await waitFor(() => fixture!.store.getRetained('jail-alpha')?.turns === 2)
+      // A continuation reuses the one native child; it cannot silently start
+      // a new child with host-default jail state.
+      expect(backend.startRequests).toHaveLength(2)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
   })
 
   it('rejects retained creates and turns that omit caller-owned retry identities', async () => {
@@ -1100,6 +1170,33 @@ describe('retained Agent Interface sessions', () => {
     expect(next.status).toBe(404)
     expect(await json(next)).toMatchObject({ error: { type: 'unknown_session' } })
     expect(backend.natives).toHaveLength(1)
+  })
+
+  it('retries session close when an unexpected child cleanup acknowledgement failed', async () => {
+    const backend = new FakeNativeBackend(() => new FailOnceUnexpectedCleanupNative())
+    fixture = setup(backend)
+    await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'close-after-when-closed-failure', model: 'pi/test' }),
+    })
+    await fixture.app.request('/v1/sessions/close-after-when-closed-failure/turns', {
+      method: 'POST',
+      body: turnBody('close-after-when-closed-failure-turn', { message: 'first' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('close-after-when-closed-failure')?.turns === 1)
+
+    const native = backend.natives[0]! as FailOnceUnexpectedCleanupNative
+    native.crash(new Error('child exited before cleanup was acknowledged'))
+    await waitFor(() => native.whenClosedCalls === 1)
+    await waitFor(() => fixture!.store.getRetained('close-after-when-closed-failure')?.status === 'unknown')
+    expect(fixture.runs.nativeSession('close-after-when-closed-failure')).toBeNull()
+    expect(fixture.runs.nativeCleanupSession('close-after-when-closed-failure')?.session).toBe(native)
+
+    const closed = await fixture.app.request('/v1/sessions/close-after-when-closed-failure/close', { method: 'POST' })
+    expect(closed.status).toBe(200)
+    expect((await json(closed)).session.status).toBe('closed')
+    expect(native.closeCalls).toBe(1)
+    expect(fixture.runs.nativeCleanupSession('close-after-when-closed-failure')).toBeNull()
   })
 
   it('surfaces finalization persistence failure as unknown and refuses continuation', async () => {
@@ -1914,17 +2011,19 @@ describe('retained Agent Interface sessions', () => {
       const continued = await fixture.app.request('/v1/sessions/close-failure-continuation/turns', {
         method: 'POST', body: turnBody('close-failure-second', { message: 'second' }),
       })
-      expect(continued.status).toBe(202)
-      await native.secondTurnStarted
-      expect(fixture.store.getRetained('close-failure-continuation')).toMatchObject({
-        status: 'running',
-        runId: 'run-close-failure-second',
-      })
+      expect(continued.status).toBe(409)
+      expect((await json(continued)).error.type).toBe('invalid_state')
 
-      native.allowSecondTurn()
-      await waitFor(() => fixture!.store.getRetained('close-failure-continuation')?.turns === 2)
-      expect(fixture.store.getRetained('close-failure-continuation')?.status).toBe('idle')
-      expect(native.prompts).toEqual(['first', 'second'])
+      const retriedClose = await fixture.app.request('/v1/sessions/close-failure-continuation/close', { method: 'POST' })
+      expect(retriedClose.status).toBe(200)
+
+      const retriedContinuation = await fixture.app.request('/v1/sessions/close-failure-continuation/turns', {
+        method: 'POST', body: turnBody('close-failure-second', { message: 'second' }),
+      })
+      expect(retriedContinuation.status).toBe(409)
+      expect((await json(retriedContinuation)).error.type).toBe('invalid_state')
+      expect(fixture.store.getRetained('close-failure-continuation')?.status).toBe('closed')
+      expect(native.prompts).toEqual(['first'])
     } finally {
       native.allowCloseFailure()
       native.allowSecondTurn()
@@ -2310,6 +2409,54 @@ describe('retained Agent Interface sessions', () => {
     expect((await json(wrong)).status).toBe('binding_mismatch')
   })
 
+  it('does not repeat a native interaction response after its acknowledgement write crashes', async () => {
+    const native = new FakeNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'interaction-ack-crash', model: 'pi/test' }) })
+    const turn = await fixture.app.request('/v1/sessions/interaction-ack-crash/turns', {
+      method: 'POST',
+      body: turnBody('interaction-ack-crash-run', { message: 'ask' }),
+    })
+    const runId = (await json(turn)).run.id as string
+    await waitFor(() => fixture!.store.retainedEventsAfter('interaction-ack-crash').some(item => item.envelope.event.type === 'interaction'))
+    const interaction = fixture.store.retainedEventsAfter('interaction-ack-crash').find(item => item.envelope.event.type === 'interaction')!.envelope.event
+    if (interaction.type !== 'interaction') throw new Error('test interaction missing')
+    const body = {
+      operationId: 'interaction-ack-crash-operation',
+      binding: { runId, environmentId: 'cli-bridge', sessionId: 'interaction-ack-crash', interactionId: interaction.request.id },
+      response: { id: interaction.request.id, outcome: 'accepted', data: { grant: ['allow_once'] } },
+    }
+    const originalRecord = fixture.store.recordInteractionOperation
+    fixture.store.recordInteractionOperation = () => {
+      throw new Error('injected acknowledgement write crash')
+    }
+    let failed: Response
+    try {
+      failed = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+    } finally {
+      fixture.store.recordInteractionOperation = originalRecord
+    }
+    expect(failed.status).toBe(500)
+    expect(native.responseCalls).toBe(1)
+    expect(fixture.store.getInteractionOperation(body.operationId)).toMatchObject({ phase: 'pending' })
+
+    const replay = await fixture.app.request(`/v1/runs/${runId}/interactions/${interaction.request.id}/respond`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    expect(replay.status).toBe(502)
+    expect(await json(replay)).toMatchObject({
+      operationId: body.operationId,
+      status: 'transport_failure',
+      retryable: false,
+    })
+    expect(native.responseCalls).toBe(1)
+    expect(fixture.store.getInteractionOperation(body.operationId)).toMatchObject({ phase: 'settled' })
+  })
+
   it('allows only one distinct response operation to reach a pending interaction', async () => {
     const native = new DeferredResponseNative()
     const backend = new FakeNativeBackend(() => native)
@@ -2546,6 +2693,44 @@ describe('retained Agent Interface sessions', () => {
     expect(retried.status).toBe(200)
     expect(await json(retried)).toEqual(await json(cancelled))
     expect(backend.natives[0]!.closeCalls).toBe(1)
+  })
+
+  it('does not repeat a native abort after its acknowledgement write crashes', async () => {
+    const native = new HangingNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    await fixture.app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({ id: 'cancel-ack-crash', model: 'pi/test' }) })
+    await fixture.app.request('/v1/sessions/cancel-ack-crash/turns', {
+      method: 'POST',
+      body: turnBody('cancel-ack-crash-run', { message: 'hang' }),
+    })
+    await waitFor(() => fixture!.store.getRetained('cancel-ack-crash')?.status === 'running')
+    const body = cancellationBody(fixture, 'cancel-ack-crash', 'cancel-ack-crash-operation')
+    const operation = JSON.parse(body) as { operationId: string }
+    const originalUpdate = fixture.store.updateRetainedControlOperation
+    fixture.store.updateRetainedControlOperation = () => {
+      throw new Error('injected cancellation acknowledgement write crash')
+    }
+    let failed: Response
+    try {
+      failed = await fixture.app.request('/v1/sessions/cancel-ack-crash/cancel?wait_ms=1000', {
+        method: 'POST',
+        body,
+      })
+    } finally {
+      fixture.store.updateRetainedControlOperation = originalUpdate
+    }
+    expect(failed.status).toBe(500)
+    expect(native.abortCalls).toBe(1)
+    expect(fixture.store.getRetainedControlOperation(operation.operationId)?.acknowledgement).toMatchObject({ status: 'pending' })
+
+    const replay = await fixture.app.request('/v1/sessions/cancel-ack-crash/cancel?wait_ms=1000', {
+      method: 'POST',
+      body,
+    })
+    expect(replay.status).toBe(200)
+    expect(await json(replay)).toMatchObject({ status: 'accepted', effect: 'cancelled' })
+    expect(native.abortCalls).toBe(1)
+    expect(fixture.store.getRetainedControlOperation(operation.operationId)?.acknowledgement).toMatchObject({ status: 'cancelled' })
   })
 
   it('recovers a lost turn response after service restart without dispatching the run twice', async () => {

@@ -18,12 +18,14 @@ import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtim
 import {
   mapPrivateTreeArgs,
   mapPrivateTreeEnv,
+  configurePiJail,
   parsePiModelId,
   piChildEnv,
   piDirectToolSelection,
   piExtensionArgs,
   piMcpAdapterAvailable,
   resolvePiModelSpec,
+  resolvePiMaterializationRoot,
   resolveReasoningEffort,
   thinkingFlagForEffort,
   piNativeCapabilities,
@@ -61,6 +63,8 @@ export async function startPiNativeSession(
   const spec = resolvePiModelSpec(parsePiModelId(req.model))
   const profile = resolveAgentProfile(req, session)
   const runCwd = resolveSpawnerCwd(options.spawner, req.cwd ?? session?.cwd ?? undefined)
+  configurePiJail(req.jailSpec)
+  const materializationRoot = resolvePiMaterializationRoot(req, runCwd)
   const mcpSpecs = resolveMcpServers(req, session)
   const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []
   if (requestedMcpNames.length > 0 && !piMcpAdapterAvailable()) {
@@ -105,7 +109,7 @@ export async function startPiNativeSession(
     // Pi's extension UI is the native approval transport. This adapter is
     // deliberately tiny: it asks Pi to display its own dialog and only
     // translates the resulting JSONL request/response at the bridge edge.
-    adapterRoot = createPrivateTemporaryRoot(runCwd ?? process.cwd(), '.cli-bridge-pi-rpc-')
+    adapterRoot = createPrivateTemporaryRoot(materializationRoot, '.cli-bridge-pi-rpc-')
     const interactionExtension = join(adapterRoot.path, 'interaction-gate.mjs')
     const interactionNonce = randomUUID().replaceAll('-', '')
     writeFileSync(interactionExtension, piInteractionExtension(false, interactionNonce), {
@@ -116,14 +120,14 @@ export async function startPiNativeSession(
     const runtimeAdapterRoot = await prepareSpawnerPrivatePath(options.spawner, adapterRoot.path)
     args.push('--extension', join(runtimeAdapterRoot, 'interaction-gate.mjs'))
 
-    provisioned = provisionPiProfile(req, session, runCwd)
+    provisioned = provisionPiProfile(req, session, materializationRoot)
     if (provisioned) {
       const runtimeProfileRoot = await prepareSpawnerPrivatePath(options.spawner, provisioned.rootPath)
       args.push(...mapPrivateTreeArgs(provisioned.flags, provisioned.rootPath, runtimeProfileRoot))
       runtimeProvisionedEnv = mapPrivateTreeEnv(provisioned.env, provisioned.rootPath, runtimeProfileRoot)
     }
     if (requestedMcpNames.length > 0) {
-      const mounted = materializeMcpServersForPi(mcpSpecs, runCwd, { isolateChildren: true })
+      const mounted = materializeMcpServersForPi(mcpSpecs, materializationRoot, { isolateChildren: true })
       if (!mounted)
         throw new BackendError('backend pi could not materialize the requested MCP servers', 'not_configured')
       mcpMounted = mounted

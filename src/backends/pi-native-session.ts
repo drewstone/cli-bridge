@@ -10,6 +10,7 @@ import type { Spawner } from '../executors/types.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { retryCleanupUntilSuccessful, terminateSpawned } from '../executors/process-tree.js'
 import { piPermissionMarker, piPermissionTokenFromTitle, piSelectedValue } from './pi-interaction.js'
+import { boundedPiId, record } from './pi-native-values.js'
 
 export interface PiNativeSessionOptions {
   capabilities: AgentEnvironmentCapabilities
@@ -71,6 +72,7 @@ export class PiNativeSession implements NativeSession {
   private childError: Error | null = null
   private abortInFlight: Promise<void> | null = null
   private terminationInFlight: Promise<void> | null = null
+  private released = false
 
   constructor(spawned: Awaited<ReturnType<Spawner>>, options: PiNativeSessionOptions) {
     this.capabilities = options.capabilities
@@ -451,16 +453,31 @@ export class PiNativeSession implements NativeSession {
     const attempt = (async () => {
       await this.terminate()
       const failures: unknown[] = []
+      const releaseAfterCleanup = (): void => {
+        if (this.released) return
+        this.release()
+        this.released = true
+      }
+      const retry = async (): Promise<void> => {
+        this.cleanup()
+        releaseAfterCleanup()
+      }
       try {
         this.cleanup()
       } catch (error) {
         failures.push(error)
-        retryCleanupUntilSuccessful(this.cleanup)
+        // Keep the executor lease until both private-file cleanup and release
+        // are proven. The retry owns the same session and can be observed by
+        // a later whenClosed/close call without handing a tainted child away.
+        retryCleanupUntilSuccessful(retry)
       }
-      try {
-        this.release()
-      } catch (error) {
-        failures.push(error)
+      if (failures.length === 0) {
+        try {
+          releaseAfterCleanup()
+        } catch (error) {
+          failures.push(error)
+          retryCleanupUntilSuccessful(retry)
+        }
       }
       if (failures.length === 1) throw failures[0]
       if (failures.length > 1) throw new AggregateError(failures, 'pi native session cleanup failed')
@@ -471,16 +488,4 @@ export class PiNativeSession implements NativeSession {
     })
     return attempt
   }
-}
-
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined
-}
-
-function boundedPiId(candidate: string): string {
-  const trimmed = candidate.trim()
-  if (trimmed.length > 0 && trimmed.length <= 512) return trimmed
-  return `id:${canonicalCandidateDigest(candidate).slice('sha256:'.length)}`
 }

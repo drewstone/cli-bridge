@@ -11,7 +11,7 @@ import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendError } from '../backends/types.js'
 import { parseMode } from '../modes.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
-import { resolveJailSpec } from '../jail/resolve-spec.js'
+import { namespaceJailSpec, resolveJailSpec } from '../jail/resolve-spec.js'
 import { resolveNetJailSpec } from '../jail/resolve-net-spec.js'
 import { assertNetJailEnforced, type NetJailRegistry } from '../jail/enforce-net-jail.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
@@ -338,16 +338,19 @@ export function mountChatCompletions(
         // session.cwd above; backends fall back to process.cwd()). The
         // resolved spec rides on req.jailSpec down to the spawn seam; null
         // means no jail and the spawn is unchanged.
-        req.jailSpec = resolveJailSpec({
+        const resolvedJail = resolveJailSpec({
           execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
           execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
           cwd: req.cwd ?? process.cwd(),
           env: process.env,
         })
+        req.jailSpec = resolvedJail
+          ? namespaceJailSpec(resolvedJail, req.session_id ?? runId)
+          : null
         // Preserve this backend's host credentials inside the jail so the
         // confined CLI still authenticates as the operator.
         if (req.jailSpec) {
-          req.jailSpec.authSources = authSourcesFor(backend.name)
+          req.jailSpec.authSources = authSourcesFor(backend.name, { projectDir: req.jailSpec.projectDir })
           req.jailSpec.writableEnvironment = writableEnvironmentFor(backend.name)
         }
         if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {

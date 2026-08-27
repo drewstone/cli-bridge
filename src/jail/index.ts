@@ -61,6 +61,14 @@ export function registerJailReadable(spec: JailSpec | null | undefined, ...paths
   spec.extraReadablePaths = [...merged]
 }
 
+/** Register a path whose identity must be checked again immediately before spawn. */
+export function registerJailStablePath(spec: JailSpec | null | undefined, ...paths: string[]): void {
+  if (!spec) return
+  const merged = new Set(spec.extraReadablePaths ?? [])
+  for (const path of paths) if (path) merged.add(path)
+  spec.extraReadablePaths = [...merged]
+}
+
 /**
  * Register one exact argv translation that applies only when a jail really
  * wraps the command. This keeps the ordinary host/Docker argv valid when a
@@ -92,6 +100,21 @@ export function registerJailArgumentRewrite(
 function sameBackends(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
   if (left === undefined || right === undefined) return left === right
   return left.length === right.length && left.every((name, index) => name === right[index])
+}
+
+/** Register one child environment override that applies only when a jail is
+ * available and actually wraps the command. */
+export function registerJailEnvironment(
+  spec: JailSpec | null | undefined,
+  name: string,
+  value: string,
+): void {
+  if (!spec) return
+  const existing = spec.environment?.[name]
+  if (existing !== undefined && existing !== value) {
+    throw new Error(`conflicting jail environment override for ${name}`)
+  }
+  spec.environment = { ...(spec.environment ?? {}), [name]: value }
 }
 
 export function selectJailBackend(platform: NodeJS.Platform = process.platform): JailBackend {

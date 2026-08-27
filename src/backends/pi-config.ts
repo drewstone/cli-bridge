@@ -1,13 +1,21 @@
 /** Pi model, profile, extension, capability, and child-environment policy. */
 
 import { existsSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
 import { canonicalCandidateDigest, type AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
 import type { ChatRequest } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { Spawner } from '../executors/types.js'
-import { registerJailArgumentRewrite, registerJailReadable } from '../jail/index.js'
+import {
+  registerJailArgumentRewrite,
+  registerJailEnvironment,
+  registerJailStablePath,
+} from '../jail/index.js'
+import { writableEnvironmentFor } from '../jail/backend-state.js'
+import { resolveJailChild, resolveJailRoot } from '../jail/types.js'
+import { ensureDirectoryNoSymlinks, trustedTemporaryRoot, validateStablePath, validateStableTree } from '../jail/path-policy.js'
 import { resolvePiAgentDir } from '../runtime/pi-paths.js'
 import { resolveAgentProfile } from './profile-support.js'
 
@@ -115,7 +123,9 @@ export function piExtensionArgs(
   const hostNpmRoot = join(hostAgentDir, 'npm', 'node_modules')
   const runtimeAgentDir = spawner.mapPath?.(hostAgentDir) ?? (configuredAgentDir ? hostAgentDir : '~/.pi/agent')
   const runtimeNpmRoot = join(runtimeAgentDir, 'npm', 'node_modules')
-  const jailedNpmRoot = req.jailSpec ? join(req.jailSpec.root, '.pi', 'agent', 'npm', 'node_modules') : runtimeNpmRoot
+  const jailedNpmRoot = req.jailSpec
+    ? join(confinedPiAgentDir(req.jailSpec), 'npm', 'node_modules')
+    : runtimeNpmRoot
   const entries = new Set(
     (load as string[]).map((spec) => {
       const normalizedSpec = spec.trim()
@@ -125,14 +135,46 @@ export function piExtensionArgs(
         hostNpmRoot,
         runtimeNpmRoot,
         (path) => spawner.mapPath?.(path) ?? path,
+        [req.cwd ?? session?.cwd ?? process.cwd(), hostAgentDir, req.jailSpec ? trustedTemporaryRoot() : tmpdir()],
+        req.jailSpec?.projectDir ?? req.cwd ?? session?.cwd ?? process.cwd(),
       )
-      if (isAbsolute(localSpec)) registerJailReadable(req.jailSpec, localSpec)
+      if (isAbsolute(localSpec)) registerJailStablePath(req.jailSpec, localSpec)
       const jailedPath = resolvePiExtensionPath(normalizedSpec, hostNpmRoot, jailedNpmRoot)
-      registerJailArgumentRewrite(req.jailSpec, runtimePath, jailedPath, '--extension', ['bwrap'])
+      registerJailArgumentRewrite(req.jailSpec, runtimePath, jailedPath, '--extension', ['bwrap', 'seatbelt'])
       return runtimePath
     }),
   )
   return ['--no-extensions', ...[...entries].flatMap((entry) => ['--extension', entry])]
+}
+
+/** Keep Pi's retained session journal inside the active write-jail. */
+export function configurePiJail(spec: ChatRequest['jailSpec']): void {
+  if (!spec) return
+  const configured = new Set((spec.writableEnvironment ?? []).map((target) => target.envVar))
+  const targets = [
+    ...(spec.writableEnvironment ?? []),
+    ...writableEnvironmentFor('pi').filter((target) => !configured.has(target.envVar)),
+  ]
+  spec.writableEnvironment = targets
+  const root = resolveJailRoot(spec.root, spec.projectDir)
+  for (const target of targets) {
+    registerJailEnvironment(spec, target.envVar, resolveJailChild(root, target.jailRel))
+  }
+}
+
+/** Put generated Pi profile/MCP/interaction files under this run's jail root. */
+export function resolvePiMaterializationRoot(req: ChatRequest, cwd: string | undefined): string {
+  if (!req.jailSpec) return cwd ?? process.cwd()
+  const root = resolveJailRoot(req.jailSpec.root, req.jailSpec.projectDir)
+  return ensureDirectoryNoSymlinks(root, 'Pi jail materialization root')
+}
+
+function confinedPiAgentDir(spec: NonNullable<ChatRequest['jailSpec']>): string {
+  const root = resolveJailRoot(spec.root, spec.projectDir)
+  const source = spec.authSources?.find((entry) => entry.envVar === 'PI_CODING_AGENT_DIR')
+  return source
+    ? resolveJailChild(root, source.jailRel)
+    : resolveJailChild(root, '.pi/agent')
 }
 
 function resolvePiExtensionPath(
@@ -140,10 +182,27 @@ function resolvePiExtensionPath(
   hostNpmRoot: string,
   runtimeNpmRoot: string,
   mapAbsolute: (path: string) => string = (path) => path,
+  allowedRoots: readonly string[] = [],
+  projectDir?: string,
 ): string {
   const normalized = spec.startsWith('npm:') ? spec.slice(4) : spec
   if (isAbsolute(normalized)) {
-    if (existsSync(normalized)) return mapAbsolute(normalized)
+    if (existsSync(normalized)) {
+      const identity = validateStablePath(normalized, {
+        label: `Pi extension ${spec}`,
+        kind: 'file-or-directory',
+        ...(projectDir ? { projectDir } : {}),
+        ...(allowedRoots.length > 0 ? { allowedRoots } : {}),
+      })
+      if (identity.kind === 'directory') {
+        validateStableTree(normalized, {
+          label: `Pi extension ${spec}`,
+          ...(projectDir ? { projectDir } : {}),
+          ...(allowedRoots.length > 0 ? { allowedRoots } : {}),
+        })
+      }
+      return mapAbsolute(normalized)
+    }
     throw new BackendError(`backend pi cannot load extension "${spec}": ${normalized} does not exist`, 'not_configured')
   }
   if (!/^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+$/u.test(normalized)) {
@@ -156,6 +215,11 @@ function resolvePiExtensionPath(
   if (!existsSync(hostPath)) {
     throw new BackendError(`backend pi cannot load extension "${spec}": ${hostPath} does not exist`, 'not_configured')
   }
+  validateStableTree(hostPath, {
+    label: `Pi extension package ${spec}`,
+    ...(projectDir ? { projectDir } : {}),
+    ...(allowedRoots.length > 0 ? { allowedRoots } : {}),
+  })
   return join(runtimeNpmRoot, normalized)
 }
 

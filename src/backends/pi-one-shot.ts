@@ -22,11 +22,13 @@ import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtim
 import {
   mapPrivateTreeArgs,
   mapPrivateTreeEnv,
+  configurePiJail,
   parsePiModelId,
   piChildEnv,
   piDirectToolSelection,
   piExtensionArgs,
   piMcpAdapterAvailable,
+  resolvePiMaterializationRoot,
   resolvePiModelSpec,
   resolveReasoningEffort,
   thinkingFlagForEffort,
@@ -87,6 +89,8 @@ export async function* chatPi(
   if (!unattendedAllow) args.push('--no-tools')
 
   const runCwd = resolveSpawnerCwd(options.spawner, req.cwd ?? session?.cwd ?? undefined)
+  configurePiJail(req.jailSpec)
+  const materializationRoot = resolvePiMaterializationRoot(req, runCwd)
 
   // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
   // `agent_profile.mcp`) reach pi-mcp-adapter through its per-process
@@ -114,20 +118,22 @@ export async function* chatPi(
   let interactionRoot: PrivateTemporaryRoot | null = null
   let spawned: Awaited<ReturnType<Spawner>>
   try {
-    provisioned = provisionPiProfile(req, session, runCwd)
+    provisioned = provisionPiProfile(req, session, materializationRoot)
     if (provisioned) {
       const runtimeProfileRoot = await prepareSpawnerPrivatePath(options.spawner, provisioned.rootPath)
       args.push(...mapPrivateTreeArgs(provisioned.flags, provisioned.rootPath, runtimeProfileRoot))
       runtimeProvisionedEnv = mapPrivateTreeEnv(provisioned.env, provisioned.rootPath, runtimeProfileRoot)
     }
     mcpMounted =
-      requestedMcpNames.length > 0 ? materializeMcpServersForPi(mcpSpecs, runCwd, { isolateChildren: true }) : null
+      requestedMcpNames.length > 0
+        ? materializeMcpServersForPi(mcpSpecs, materializationRoot, { isolateChildren: true })
+        : null
     if (mcpMounted) {
       const runtimeMcpRoot = await prepareSpawnerPrivatePath(options.spawner, dirname(mcpMounted.configPath))
       args.push('--mcp-config', join(runtimeMcpRoot, basename(mcpMounted.configPath)))
     }
     if (unattendedAllow) {
-      interactionRoot = createPrivateTemporaryRoot(runCwd ?? process.cwd(), '.cli-bridge-pi-interaction-')
+      interactionRoot = createPrivateTemporaryRoot(materializationRoot, '.cli-bridge-pi-interaction-')
       const interactionExtension = join(interactionRoot.path, 'interaction-gate.mjs')
       writeFileSync(interactionExtension, piInteractionExtension(true), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
       const runtimeInteractionRoot = await prepareSpawnerPrivatePath(options.spawner, interactionRoot.path)

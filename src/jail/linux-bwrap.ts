@@ -26,11 +26,32 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, realpathSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { accessSync, closeSync, constants, existsSync, lstatSync, openSync } from 'node:fs'
+import { delimiter } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import {
+  authSourceRoots,
+  copyAuthIntoJail,
+  removeAuthCopies,
+  removeStaleAuthCopies,
+} from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { ignoreJailRoot, jailEnv, peerIsolationRoot, prepareJailHome, resolveJailChild, resolveJailRoot } from './types.js'
+import {
+  JAIL_STATE_ENV_VARS,
+  assertNoSymlinkComponents,
+  ensureDirectoryNoSymlinks,
+  expandUserPath,
+  validateStablePath,
+  validateStableTree,
+  verifyStablePath,
+  verifyStableTree,
+  trustedTemporaryRoot,
+  type StablePath,
+} from './path-policy.js'
+import { toolchainReadPaths } from './linux-bwrap-toolchain.js'
+
+export { toolchainReadPaths } from './linux-bwrap-toolchain.js'
 
 const BWRAP_BIN = 'bwrap'
 
@@ -62,7 +83,6 @@ const SYSTEM_RO_PATHS: readonly string[] = [
   '/lib32',
   '/libx32',
   '/etc',
-  '/opt',
   '/run/systemd/resolve',
 ]
 
@@ -76,12 +96,109 @@ export class LinuxBwrapJail implements JailBackend {
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     const root = resolveJailRoot(spec.root, spec.projectDir)
+    const temporaryRoot = trustedTemporaryRoot()
     await prepareJailHome(root)
     ignoreJailRoot(spec.projectDir, root)
+    const identities: Array<{ identity: StablePath; label: string; tree?: boolean }> = []
+    const copiedWritableAuth: string[] = []
+    const copiedWritableAuthOwnership = new Map<string, StablePath>()
+    const missingToolchainReadPaths = new Set<string>()
+    try {
+      const rootIdentity = validateStablePath(root, { label: 'jail root', kind: 'directory' })
+      const projectIdentity = validateStablePath(spec.projectDir, { label: 'jail project directory', kind: 'directory' })
+      identities.push(
+        { identity: rootIdentity, label: 'jail root' },
+        { identity: projectIdentity, label: 'jail project directory' },
+      )
+      const availableAuthSources = (spec.authSources ?? []).map((source) => {
+        if (!existsSync(source.source)) throw new Error(`jail auth source disappeared before validation: ${source.source}`)
+        return source
+      })
+      const writableAuthSources = availableAuthSources.filter((source) => source.mode === 'copy-writable')
+      const resolvedAuthSources = availableAuthSources.map((source) => {
+        const sourceIdentity = validateExistingAuthSource(source.source, spec.projectDir, root)
+        identities.push({ identity: sourceIdentity, label: `jail auth source ${source.source}`, tree: sourceIdentity.kind === 'directory' })
+        if (source.mode === 'copy-writable' && !source.envVar) {
+          throw new Error('a copy-writable jail auth source requires envVar')
+        }
+        const destination = resolveJailChild(root, source.jailRel)
+        return { source, destination, sourceIdentity }
+      })
+      const extraReadableRoots = readableRoots(spec, resolvedAuthSources.map(({ source }) => source.source), temporaryRoot)
+      const extraWritableRoots = writableRoots(spec, temporaryRoot)
+      for (const path of spec.extraReadablePaths ?? []) {
+        const identity = validateStablePath(path, {
+          label: 'jail extra readable path',
+          projectDir: spec.projectDir,
+          allowedRoots: extraReadableRoots,
+        })
+        rejectPeerPath(path, root, spec.projectDir, 'jail extra readable path')
+        const stableIdentity = identity.kind === 'directory'
+          ? validateStableTree(path, {
+              label: 'jail extra readable path',
+              projectDir: spec.projectDir,
+              allowedRoots: extraReadableRoots,
+            })
+          : identity
+        identities.push({ identity: stableIdentity, label: `jail extra readable path ${path}`, tree: stableIdentity.kind === 'directory' })
+      }
+      for (const path of spec.extraWritablePaths ?? []) {
+        const identity = validateStablePath(path, {
+          label: 'jail extra writable path',
+          projectDir: spec.projectDir,
+          allowedRoots: extraWritableRoots,
+        })
+        rejectPeerPath(path, root, spec.projectDir, 'jail extra writable path')
+        const stableIdentity = identity.kind === 'directory'
+          ? validateStableTree(path, {
+              label: 'jail extra writable path',
+              projectDir: spec.projectDir,
+              allowedRoots: extraWritableRoots,
+            })
+          : identity
+        identities.push({ identity: stableIdentity, label: `jail extra writable path ${path}`, tree: stableIdentity.kind === 'directory' })
+      }
+      await removeStaleAuthCopies(root)
+      const expectedAuthSources = new Map(resolvedAuthSources.map(({ source, sourceIdentity }) => [source.source, sourceIdentity]))
+      const copied = await copyAuthIntoJail(root, writableAuthSources, {
+        replace: false,
+        expectedSources: expectedAuthSources,
+        ownership: copiedWritableAuthOwnership,
+      })
+      copiedWritableAuth.push(...copied)
+      for (const path of copied) {
+        const identity = validateStablePath(path, { label: `copied jail auth ${path}`, kind: 'file-or-directory' })
+        const stableIdentity = identity.kind === 'directory'
+          ? validateStableTree(path, { label: `copied jail auth ${path}` })
+          : identity
+        identities.push({ identity: stableIdentity, label: `copied jail auth ${path}`, tree: stableIdentity.kind === 'directory' })
+      }
+      for (const { source, destination, sourceIdentity } of resolvedAuthSources) {
+        if (source.mode !== 'read-only') continue
+        const identity = prepareReadOnlyAuthDestination(destination, sourceIdentity)
+        identities.push({
+          identity,
+          label: `jail auth destination ${source.source}`,
+          tree: identity.kind === 'directory',
+        })
+      }
+      for (const target of spec.writableEnvironment ?? []) {
+        const destination = resolveJailChild(root, target.jailRel)
+        ensureDirectoryNoSymlinks(destination, `jail environment ${target.envVar}`)
+        const identity = validateStableTree(destination, { label: `jail environment ${target.envVar}` })
+        identities.push({ identity, label: `jail environment ${target.envVar}` })
+      }
 
-    const bwrapArgs = ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--share-net']
+      const bwrapArgs = ['--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--share-net']
+      for (const variable of JAIL_STATE_ENV_VARS) bwrapArgs.push('--unsetenv', variable)
+      for (const [name, value] of Object.entries(spec.environment ?? {})) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) || value.includes('\u0000')) {
+          throw new Error(`invalid jail environment variable ${name}`)
+        }
+        bwrapArgs.push('--setenv', name, value)
+      }
 
-    if (spec.readConfine) {
+      if (spec.readConfine) {
       // fs-jail: ALLOWLIST reads. Bind only the minimal system + toolchain
       // paths the CLI and its runtimes need; the host repo, sibling run
       // scratch dirs, and the host /tmp are simply never mounted, so a jailed
@@ -93,6 +210,22 @@ export class LinuxBwrapJail implements JailBackend {
       for (const path of SYSTEM_RO_PATHS) bwrapArgs.push('--ro-bind-try', path, path)
       bwrapArgs.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp')
       for (const path of toolchainReadPaths(bin, spec.projectDir)) {
+        if (SYSTEM_RO_PATHS.includes(path)) continue
+        if (!existsSync(path)) {
+          assertNoSymlinkComponents(path, 'jail toolchain read path', true)
+          missingToolchainReadPaths.add(path)
+          bwrapArgs.push('--ro-bind-try', path, path)
+          continue
+        }
+        const identity = validateStablePath(path, {
+          label: 'jail toolchain read path',
+          kind: 'file-or-directory',
+          projectDir: spec.projectDir,
+        })
+        identities.push({
+          identity,
+          label: `jail toolchain read path ${path}`,
+        })
         bwrapArgs.push('--ro-bind-try', path, path)
       }
       bwrapArgs.push('--bind', spec.projectDir, spec.projectDir)
@@ -105,141 +238,138 @@ export class LinuxBwrapJail implements JailBackend {
       // the CLI's own temp WRITES are redirected to TMPDIR=<root>/.tmp (jailEnv).
       bwrapArgs.push('--ro-bind', '/', '/', '--dev', '/dev', '--ro-bind', spec.projectDir, spec.projectDir)
     }
+      const peers = peerIsolationRoot(root, spec.projectDir)
+      if (peers) bwrapArgs.push('--tmpfs', peers)
 
-    for (const path of spec.extraReadablePaths ?? []) {
+      for (const path of spec.extraReadablePaths ?? []) {
       // In an fs-jail these carry the materialized runtime config the backend
       // wrote under the host /tmp (now hidden by the tmpfs above); `-try` keeps
       // a since-removed path non-fatal. Bound after the tmpfs so they win.
       bwrapArgs.push('--ro-bind-try', path, path)
     }
-    for (const path of spec.extraWritablePaths ?? []) {
-      bwrapArgs.push('--bind', path, path)
-    }
-    // Writable root last so it wins over any read-only mount above it.
-    bwrapArgs.push('--bind', root, root)
+      for (const path of spec.extraWritablePaths ?? []) {
+        bwrapArgs.push('--bind', path, path)
+      }
+      // Writable root last so it wins over any read-only mount above it.
+      bwrapArgs.push('--bind', root, root)
 
-    // Make the backend's host auth readable inside the jail (read-only),
-    // bound AFTER the writable root so these specific subpaths stay read-only.
-    // HOME is the jail root, so ~/.claude etc. resolve to these binds.
-    for (const { source, jailRel, envVar } of spec.authSources ?? []) {
-      if (!existsSync(source)) continue
-      const dest = join(root, jailRel)
-      bwrapArgs.push('--ro-bind', source, dest)
+    // Make backend config available at its stable path inside the jail.
+    // Read-only sources are bound after the writable root so they stay
+    // read-only. Sources whose CLI takes settings locks were copied into the
+    // writable root above and therefore need only their env redirect here.
+      for (const { source: authSource, destination } of resolvedAuthSources) {
+        const { source, envVar, mode } = authSource
+        if (mode === 'read-only') bwrapArgs.push('--ro-bind', source, destination)
       // Point the backend's env var (e.g. CODEX_HOME) at the in-jail copy. Done
       // here, where the jail truly applies, so non-jailed paths are untouched.
-      if (envVar) bwrapArgs.push('--setenv', envVar, dest)
-    }
-    for (const target of spec.writableEnvironment ?? []) {
-      bwrapArgs.push('--setenv', target.envVar, join(root, target.jailRel))
-    }
-
+        if (envVar) bwrapArgs.push('--setenv', envVar, destination)
+      }
+      for (const target of spec.writableEnvironment ?? []) {
+        bwrapArgs.push('--setenv', target.envVar, resolveJailChild(root, target.jailRel))
+      }
     // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.
-    for (const [key, value] of Object.entries(jailEnv(root))) {
-      bwrapArgs.push('--setenv', key, value)
-    }
+      for (const [key, value] of Object.entries(jailEnv(root))) {
+        bwrapArgs.push('--setenv', key, value)
+      }
 
-    bwrapArgs.push('--chdir', spec.projectDir, '--die-with-parent', bin, ...args)
+      bwrapArgs.push('--chdir', spec.projectDir, '--die-with-parent', bin, ...args)
+      identities.push({ identity: validateStableTree(root, { label: 'jail root' }), label: 'jail root', tree: true })
 
-    return { bin: BWRAP_BIN, args: bwrapArgs }
-  }
-}
-
-/**
- * Read-only paths for the language + CLI toolchain that must be visible inside
- * an fs-jail, derived at wrap time so no host layout is hard-coded:
- *
- *   - the Node install prefix (from the bridge's own interpreter), covering
- *     node/npm/pnpm and any globally-installed CLI under its lib/node_modules;
- *   - the wrapped CLI's own location — both its on-PATH entry dir (so a bare
- *     `bin` name resolves) and its realpath install root (so a bundled runtime
- *     a level up, e.g. `~/.opencode`, is readable);
- *   - the operator's `~/.cache` (tokenizer / model caches some CLIs read);
- *   - any extra dirs an operator lists in `BRIDGE_JAIL_RO_PATHS` (a PATH-style
- *     list) for a runtime whose location auto-derivation misses.
- *
- * Every candidate passes through {@link isSafeReadPath}: `/`, `/home`, the
- * operator HOME itself, and any ANCESTOR of the workspace are refused, so a
- * mis-derivation can never re-open the whole home tree or the sibling run
- * scratch dirs the jail exists to hide.
- */
-export function toolchainReadPaths(bin: string, projectDir: string): string[] {
-  const home = homedir()
-  const candidates: string[] = []
-
-  // Node install prefix: <prefix>/bin/node → <prefix>. Also covers npm/pnpm and
-  // globally npm-installed CLIs (which live under <prefix>/lib/node_modules).
-  const nodeReal = tryRealpath(process.execPath)
-  if (nodeReal) candidates.push(dirname(dirname(nodeReal)))
-
-  // The wrapped CLI itself: its on-PATH entry dir (resolves a bare name and a
-  // symlink such as ~/.local/bin/opencode) plus its realpath install root.
-  const onPathEntry = whichPath(bin)
-  if (onPathEntry) {
-    candidates.push(dirname(onPathEntry))
-    const real = tryRealpath(onPathEntry)
-    if (real) {
-      const realDir = dirname(real)
-      candidates.push(basename(realDir) === 'bin' ? dirname(realDir) : realDir)
+      return {
+        bin: BWRAP_BIN,
+        args: bwrapArgs,
+        ...(copiedWritableAuth.length > 0
+          ? { cleanup: () => removeAuthCopies(copiedWritableAuth, copiedWritableAuthOwnership) }
+          : {}),
+        verify: () => {
+          for (const path of missingToolchainReadPaths) {
+            if (existsSync(path)) throw new Error(`jail toolchain read path appeared after validation: ${path}`)
+            assertNoSymlinkComponents(path, 'jail toolchain read path', true)
+          }
+          for (const entry of identities) {
+            if (entry.tree) verifyStableTree(entry.identity, entry.label)
+            else verifyStablePath(entry.identity, entry.label)
+          }
+        },
+      }
+    } catch (error) {
+      if (copiedWritableAuth.length > 0) {
+        try {
+          await removeAuthCopies(copiedWritableAuth, copiedWritableAuthOwnership)
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], 'jail preparation and auth rollback failed')
+        }
+      }
+      throw error
     }
   }
-
-  candidates.push(join(home, '.cache'))
-
-  for (const p of (process.env.BRIDGE_JAIL_RO_PATHS ?? '').split(delimiter)) {
-    if (p.trim()) candidates.push(resolve(p.trim()))
-  }
-
-  const base = resolve(projectDir)
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const c of candidates) {
-    const p = resolve(c)
-    if (seen.has(p)) continue
-    seen.add(p)
-    if (isSafeReadPath(p, home, base)) out.push(p)
-  }
-  return out
 }
 
-/**
- * Reject a toolchain read-bind that would defeat the jail: the filesystem root,
- * the shared `/home`, the operator HOME itself, or any path that is the
- * workspace or an ANCESTOR of it. The ancestor check is the load-bearing one —
- * binding an ancestor read-only (e.g. `/tmp` when the workspace is a
- * `/tmp/vb-live-<id>/ws` scratch dir) would re-expose the workspace's siblings,
- * which is exactly the leak the fs-jail closes.
- */
-function isSafeReadPath(p: string, home: string, base: string): boolean {
-  if (!isAbsolute(p) || p === '/' || p === '/home' || p === home) return false
-  const relToBase = relative(p, base)
-  const isBaseOrAncestor =
-    relToBase === '' || (!relToBase.startsWith(`..${sep}`) && relToBase !== '..' && !isAbsolute(relToBase))
-  return !isBaseOrAncestor
-}
-
-/** Absolute on-PATH location of `bin` (or `bin` itself if absolute), else null. */
-function whichPath(bin: string): string | null {
-  if (isAbsolute(bin)) return existsSync(bin) ? bin : null
-  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
-    if (!dir) continue
-    const full = join(dir, bin)
-    try {
-      accessSync(full, constants.X_OK)
-      return full
-    } catch {
-      // not in this dir; keep scanning
-    }
+function rejectPeerPath(path: string, root: string, projectDir: string, label: string): void {
+  const peers = peerIsolationRoot(root, projectDir)
+  if (!peers) return
+  const candidate = resolve(path)
+  const ownRoot = resolve(root)
+  if (relative(peers, candidate) === '' || (isWithinPath(peers, candidate) && !isWithinPath(ownRoot, candidate))) {
+    throw new Error(`${label} would expose a sibling jail root: ${path}`)
   }
-  return null
 }
 
-/** realpathSync that returns null instead of throwing on a missing path. */
-function tryRealpath(p: string): string | null {
+function isWithinPath(base: string, candidate: string): boolean {
+  const rel = relative(resolve(base), resolve(candidate))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+}
+
+function validateExistingAuthSource(path: string, projectDir: string, root: string): StablePath {
+  const stat = validateStablePath(path, {
+    label: 'jail auth source',
+    kind: 'file-or-directory',
+    projectDir,
+    allowedRoots: authSourceRoots(),
+  })
+  rejectPeerPath(path, root, projectDir, 'jail auth source')
+  if (isWithinPath(projectDir, path)) throw new Error(`jail auth source is inside the project: ${path}`)
+  if (stat.kind === 'directory') {
+    return validateStableTree(path, { label: 'jail auth source', projectDir, allowedRoots: authSourceRoots() })
+  }
+  return stat
+}
+
+function prepareReadOnlyAuthDestination(destination: string, source: StablePath): StablePath {
+  if (source.kind === 'directory') {
+    ensureDirectoryNoSymlinks(destination, 'jail auth destination')
+    return validateStableTree(destination, { label: 'jail auth destination' })
+  }
+  ensureDirectoryNoSymlinks(dirname(destination), 'jail auth destination parent')
   try {
-    return realpathSync(p)
-  } catch {
-    return null
+    const stat = lstatSync(destination)
+    if (stat.isSymbolicLink()) throw new Error(`jail auth destination is a symlink: ${destination}`)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    const fd = openSync(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600)
+    closeSync(fd)
   }
+  return validateStablePath(destination, { label: 'jail auth destination', kind: 'file' })
+}
+
+function readableRoots(spec: JailSpec, authSources: readonly string[], temporaryRoot: string): string[] {
+  return existingRoots([
+    spec.projectDir,
+    temporaryRoot,
+    '/bin',
+    '/usr/bin',
+    '/usr/local/bin',
+    dirname(process.execPath),
+    ...authSources,
+  ])
+}
+
+function writableRoots(spec: JailSpec, temporaryRoot: string): string[] {
+  return existingRoots([spec.projectDir, temporaryRoot])
+}
+
+function existingRoots(paths: readonly string[]): string[] {
+  return [...new Set(paths.filter((path) => existsSync(path)).map((path) => resolve(path)))]
 }
 
 function onPath(bin: string): boolean {

@@ -155,6 +155,7 @@ export function createHostSpawner(
       const jailed = await dependencies.applyJailFn(bin, args, opts)
       jailCleanup = jailed.cleanup
       throwIfExecutorAborted(opts.signal)
+      jailed.verify?.()
       // detached: true → child is the leader of a new process group whose
       // pgid equals its pid. kill(-pid, sig) reaches every descendant. We
       // do NOT call child.unref() — the bridge still owns the child for

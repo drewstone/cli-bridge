@@ -14,6 +14,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { assertNoSymlinkComponents, isBroadDirectory, trustedTemporaryRoot } from '../jail/path-policy.js'
 
 const PRIVATE_PREFIX = /^\.?cli-bridge-[a-z0-9-]+-$/u
 const PRIVATE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
@@ -44,8 +45,15 @@ export interface PrivateTemporaryRoot {
  */
 export function createPrivateTemporaryRoot(parent: string, prefix: string): PrivateTemporaryRoot {
   if (!isAbsolute(parent)) throw new Error(`temporary parent must be absolute: ${parent}`)
+  const absoluteParent = resolve(parent)
+  const trustedTemp = resolve(tmpdir())
+  if (absoluteParent === trustedTemp) trustedTemporaryRoot()
+  assertNoSymlinkComponents(absoluteParent, 'temporary parent', false)
+  if (isBroadDirectory(absoluteParent) && absoluteParent !== trustedTemp) {
+    throw new Error(`temporary parent is too broad to own private state: ${absoluteParent}`)
+  }
   if (!PRIVATE_PREFIX.test(prefix)) throw new Error(`invalid private temporary prefix: ${prefix}`)
-  const canonicalParent = realpathSync(resolve(parent))
+  const canonicalParent = realpathSync(absoluteParent)
   const parentStat = lstatSync(canonicalParent)
   if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
     throw new Error(`temporary parent is not a real directory: ${canonicalParent}`)
@@ -140,7 +148,7 @@ export function reapStalePrivateTemporaryRoots(): number {
 
 function privateTemporaryRegistryDir(): string {
   const owner = typeof process.getuid === 'function' ? process.getuid() : 'user'
-  const registry = join(tmpdir(), `cli-bridge-private-temp-registry-${owner}`)
+  const registry = join(trustedTemporaryRoot(), `cli-bridge-private-temp-registry-${owner}`)
   // This directory is shared by every bridge process for the same uid. Keep it
   // after the last manifest is removed: deleting an observed-empty directory
   // races with another process between its mkdir and manifest write.

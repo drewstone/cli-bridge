@@ -114,7 +114,13 @@ export class NativeRunControl {
    * be called on the lane.
    */
   releaseForHandoff(control: NativeSession): boolean {
-    if (this.control !== control || this.pendingFinalization || control.isClosed()) return false
+    if (
+      this.control !== control
+      || this.pendingFinalization
+      || this.cleanupFailure !== null
+      || this.unexpectedClose === control
+      || control.isClosed()
+    ) return false
     this.closeUnsubscribe?.()
     this.closeUnsubscribe = null
     this.control = null
@@ -148,20 +154,19 @@ export class NativeRunControl {
       try {
         await control.close()
       } catch (error) {
+        this.cleanupFailure = error
         if (!control.isClosed()) {
           this.closeUnsubscribe = control.onClose((reason) => {
             this.handleClosed(control, reason)
           })
-          if (control.isClosed()) {
-            this.handleClosed(control, new Error('native session closed while close retry ownership was restored'))
-          }
-          throw error
         }
-        // The provider reported an error after completing the close. The
-        // observable effect won, so do not turn a successful close into an
-        // unretryable unknown state.
+        // Even if the provider reports that its child is already closed, the
+        // failed cleanup may still own executor slots or private files. Keep
+        // the native handle until a later close/whenClosed attempt succeeds.
+        throw error
       }
       if (this.control === control) this.control = null
+      this.cleanupFailure = null
       return true
     })
   }
@@ -224,6 +229,7 @@ export class NativeRunControl {
       this.cleanupFailure = null
       return
     }
+    this.cleanupFailure = closeFailure ?? abortFailure ?? new Error(`run ${this.host.runId} native close did not complete`)
     if (abortFailure !== undefined && closeFailure !== undefined) {
       throw new AggregateError(
         [abortFailure, closeFailure],

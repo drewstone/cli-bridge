@@ -140,6 +140,7 @@ export class RetainedTurnRunner {
       model: retained.model,
       input: normalizeInputParts({ message: input.message, parts: input.parts }),
       turnId: input.turn_id ?? null,
+      jailPolicy: retained.jailPolicy,
     })
     if (retained.runId && this.state.hasFinalizationFailure(retained.runId)) {
       throw new RetainedSessionError(
@@ -411,6 +412,7 @@ export class RetainedTurnRunner {
     const mcp = material?.hasMcp ? material.mcp : undefined
     const policy = record.metadata.interaction_policy
     const mode = record.metadata.mode
+    const jailSpec = record.jailPolicy ? structuredClone(record.jailPolicy) : null
     return {
       model: record.model,
       messages: [{ role: 'user', content: prompt }],
@@ -420,6 +422,7 @@ export class RetainedTurnRunner {
       ...(profile !== undefined ? { agent_profile: profile as ChatRequest['agent_profile'] } : {}),
       ...(mcp && typeof mcp === 'object' ? { mcp: mcp as ChatRequest['mcp'] } : {}),
       ...(typeof policy === 'string' ? { interaction_policy: policy as ChatRequest['interaction_policy'] } : {}),
+      ...(jailSpec ? { jailSpec } : {}),
     }
   }
 }

@@ -91,6 +91,8 @@ export class RetainedControl {
       request.run.provider !== ENVIRONMENT_ID ||
       request.run.environmentId !== ENVIRONMENT_ID ||
       request.run.sessionId !== id ||
+      !request.run.executionId ||
+      !request.run.requestDigest ||
       !admission ||
       admission.executionId !== request.run.executionId ||
       admission.sessionId !== id ||
@@ -98,9 +100,20 @@ export class RetainedControl {
     ) {
       return { acknowledgement: controlConflict(operationId, 'cancel', id, runId), status: 409 }
     }
+    const executionId = request.run.executionId
+    const runRequestDigest = request.run.requestDigest
     const requestDigest = canonicalCandidateDigest({ callerId, kind: 'cancel', request })
     return this.once(operationId, requestDigest, 'cancel', id, runId, () =>
-      this.executeCancel({ id, operationId, callerId, runId, requestDigest, waitMs }),
+      this.executeCancel({
+        id,
+        operationId,
+        callerId,
+        runId,
+        executionId,
+        runRequestDigest,
+        requestDigest,
+        waitMs,
+      }),
     )
   }
 
@@ -203,7 +216,7 @@ export class RetainedControl {
       runId: input.runRef.runId,
       status: 'pending',
     }
-    this.store.recordRetainedControlOperation({
+    const inserted = this.store.recordRetainedControlOperation({
       operationId: input.operationId,
       callerId: input.callerId,
       kind: 'steer',
@@ -212,6 +225,12 @@ export class RetainedControl {
       requestDigest: input.requestDigest,
       acknowledgement: pending,
     })
+    if (!inserted) {
+      const existing = this.store.getRetainedControlOperation(input.operationId)
+      if (!existing) throw new Error(`retained control operation ${JSON.stringify(input.operationId)} disappeared after durable claim`)
+      const acknowledgement = existing.acknowledgement as RetainedControlAcknowledgement
+      return { acknowledgement, status: statusForControlAcknowledgement(acknowledgement) }
+    }
     const control = this.exactSteerControl(input.id, input.runRef)
     if (!control) {
       const acknowledgement: RetainedControlAcknowledgement = {
@@ -291,6 +310,8 @@ export class RetainedControl {
     operationId: string
     callerId: string
     runId: string
+    executionId: string
+    runRequestDigest: string
     requestDigest: string
     waitMs: number
   }): Promise<ControlResult> {
@@ -301,7 +322,7 @@ export class RetainedControl {
       runId: input.runId,
       status: 'pending',
     }
-    this.store.recordRetainedControlOperation({
+    const inserted = this.store.recordRetainedControlOperation({
       operationId: input.operationId,
       callerId: input.callerId,
       kind: 'cancel',
@@ -310,11 +331,29 @@ export class RetainedControl {
       requestDigest: input.requestDigest,
       acknowledgement: pending,
     })
+    if (!inserted) {
+      const existing = this.store.getRetainedControlOperation(input.operationId)
+      if (!existing) throw new Error(`retained control operation ${JSON.stringify(input.operationId)} disappeared after durable claim`)
+      const acknowledgement = existing.acknowledgement as RetainedControlAcknowledgement
+      return { acknowledgement, status: statusForControlAcknowledgement(acknowledgement) }
+    }
     const retained = this.store.getRetained(input.id)
+    const admission = this.store.getRetainedRun(input.runId)
     const control = this.runs.nativeSession(input.id)
-    const ownsCurrentRun = retained?.runId === input.runId && retained.status !== 'closed'
+    const ownsCurrentRun = Boolean(
+      retained?.runId === input.runId &&
+        retained.status !== 'closed' &&
+        admission?.sessionId === input.id &&
+        admission.executionId === input.executionId &&
+        admission.requestDigest === input.runRequestDigest,
+    )
     const run = ownsCurrentRun ? (control?.run.id === input.runId ? control.run : this.runs.get(input.runId)) : null
-    if (!run || run.sessionId !== input.id) {
+    if (
+      !run ||
+      run.sessionId !== input.id ||
+      run.executionId !== input.executionId ||
+      run.requestDigest !== input.runRequestDigest
+    ) {
       return this.cancelWithoutLiveRun(input, pending)
     }
     const cancellation = run.requestNativeCancellation()

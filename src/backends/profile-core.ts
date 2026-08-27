@@ -1,11 +1,14 @@
 import { closeSync, constants as fsConstants, fchmodSync, ftruncateSync, openSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import type { AgentProfile, AgentProfileConfigValue, AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import type { ChatRequest, McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { createPrivateTemporaryRoot } from '../runtime/private-temporary.js'
+import { existsSync } from 'node:fs'
+import { trustedTemporaryRoot, validateStablePath, validateStableTree } from '../jail/path-policy.js'
+import { registerJailStablePath } from '../jail/index.js'
 
 export function resolveAgentProfile(req: ChatRequest, _session: SessionRecord | null): AgentProfile | null {
   if (req.agent_profile && typeof req.agent_profile === 'object') return req.agent_profile
@@ -57,7 +60,11 @@ export function resolveMcpServers(
     }
   }
 
-  return Object.keys(merged).length > 0 ? merged : null
+  if (Object.keys(merged).length > 0) {
+    assertSafeMcpServerPaths(merged, req.cwd ?? session?.cwd ?? process.cwd(), req.jailSpec)
+    return merged
+  }
+  return null
 }
 
 /**
@@ -252,6 +259,7 @@ export function materializeMcpConfig(profile: AgentProfile | null): Materialized
 export function buildCanonicalMcpServers(
   specs: Record<string, McpServerSpec>,
 ): Record<string, Record<string, unknown>> {
+  assertSafeMcpServerPaths(specs)
   const mcpServers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs)) {
     if (spec.enabled === false) continue
@@ -275,6 +283,74 @@ export function buildCanonicalMcpServers(
     // unknown transport / missing required fields → drop silently
   }
   return mcpServers
+}
+
+/** Reject local MCP launch paths that could widen a jail or race into another tree. */
+export function assertSafeMcpServerPaths(
+  specs: Record<string, McpServerSpec>,
+  baseDir = process.cwd(),
+  jailSpec?: ChatRequest['jailSpec'],
+): void {
+  const dataRoots = [resolve(baseDir), resolve(jailSpec ? trustedTemporaryRoot() : tmpdir())]
+  const executableRoots = [
+    ...dataRoots,
+    '/bin',
+    '/usr/bin',
+    '/usr/local/bin',
+    dirname(process.execPath),
+  ]
+  for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false || !isStdioMcpSpec(spec)) continue
+    if (spec.command && isAbsolute(spec.command)) {
+      validateMcpPath(spec.command, `MCP server ${name} command`, 'file', executableRoots, jailSpec)
+    } else if (spec.command && baseDir && spec.command.includes('/')) {
+      validateMcpPath(resolve(baseDir, spec.command), `MCP server ${name} command`, 'file', [baseDir], jailSpec)
+    }
+    for (const [index, arg] of (spec.args ?? []).entries()) {
+      // Absolute argv values are not necessarily paths: servers commonly use
+      // them as opaque identifiers or data. When an absolute value names a
+      // host object, however, it is a path-bearing argument and must obey the
+      // same identity checks as the command. Under an active jail, a missing
+      // absolute value is rejected too: it could be created after admission
+      // and widen the read set at spawn time.
+      if (isAbsolute(arg) && (existsSync(arg) || jailSpec)) {
+        validateMcpPath(
+          arg,
+          `MCP server ${name} argument ${index}`,
+          'file-or-directory',
+          dataRoots,
+          jailSpec,
+        )
+      }
+    }
+    for (const [key, value] of Object.entries(spec.env ?? {})) {
+      if (isAbsolute(value) && (existsSync(value) || jailSpec)) {
+        validateMcpPath(
+          value,
+          `MCP server ${name} environment ${key}`,
+          'file-or-directory',
+          dataRoots,
+          jailSpec,
+        )
+      }
+    }
+  }
+}
+
+function validateMcpPath(
+  path: string,
+  label: string,
+  kind: 'file' | 'file-or-directory',
+  allowedRoots: readonly string[],
+  jailSpec: ChatRequest['jailSpec'] | undefined,
+): void {
+  const identity = validateStablePath(path, { label, kind, allowedRoots })
+  if (identity.kind === 'directory') {
+    // The jail walks this tree again immediately before spawn; walking it now
+    // rejects an already-planted symlink before config materialization.
+    validateStableTree(path, { label, allowedRoots })
+  }
+  registerJailStablePath(jailSpec, identity.path)
 }
 
 export function writeMcpConfigFile(

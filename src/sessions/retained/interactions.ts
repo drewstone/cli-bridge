@@ -63,11 +63,30 @@ export class RetainedInteractions {
         status: 409,
       }
     }
-    const requestDigest = canonicalCandidateDigest({ callerId, command })
+    // Include the admitted run request (which includes the exact jail policy)
+    // in the durable operation identity. A response cannot be replayed onto a
+    // run that merely reuses the same interaction-shaped fields.
+    const runAdmission = this.store.getRetainedRun(command.binding.runId)
+    const requestDigest = canonicalCandidateDigest({
+      callerId,
+      command,
+      runRequestDigest: runAdmission?.requestDigest ?? null,
+    })
     const existing = this.store.getInteractionOperation(command.operationId)
     if (existing) {
-      if (existing.requestDigest === requestDigest)
+      if (existing.requestDigest === requestDigest) {
+        if (existing.phase === 'pending') {
+          const unknown: InteractionAcknowledgement = {
+            ...existing.acknowledgement,
+            status: 'transport_failure',
+            message: 'the server restarted after applying an unrepeatable response; its effect is unknown and will not be repeated',
+            retryable: false,
+          }
+          this.store.recordInteractionOperation({ ...existing, acknowledgement: unknown })
+          return { acknowledgement: unknown, status: statusForAcknowledgement(unknown) }
+        }
         return { acknowledgement: existing.acknowledgement, status: statusForAcknowledgement(existing.acknowledgement) }
+      }
       const conflict: InteractionAcknowledgement = {
         operationId: command.operationId,
         binding: command.binding,
@@ -107,6 +126,7 @@ export class RetainedInteractions {
     requestDigest: string,
   ): Promise<InteractionResult> {
     const binding = command.binding
+    const runAdmission = this.store.getRetainedRun(binding.runId)
     const run = this.runs.get(binding.runId)
     const record = binding.sessionId
       ? this.store.getRetained(binding.sessionId)
@@ -118,7 +138,10 @@ export class RetainedInteractions {
       binding.environmentId !== ENVIRONMENT_ID ||
       (binding.sessionId !== undefined && binding.sessionId !== record.id) ||
       !run ||
-      run.sessionId !== record.id
+      run.sessionId !== record.id ||
+      !runAdmission ||
+      run.requestDigest !== runAdmission.requestDigest ||
+      runAdmission.sessionId !== record.id
     ) {
       const acknowledgement: InteractionAcknowledgement = {
         operationId: command.operationId,
@@ -175,7 +198,32 @@ export class RetainedInteractions {
       this.record(command, callerId, record.id, requestDigest, acknowledgement)
       return { acknowledgement, status: 409 }
     }
+    const pendingAcknowledgement: InteractionAcknowledgement = {
+      operationId: command.operationId,
+      binding,
+      status: 'transport_failure',
+      message: 'response effect is pending; it will not be repeated after process loss',
+      retryable: false,
+    }
     try {
+      const inserted = this.store.recordPendingInteractionOperation({
+        operationId: command.operationId,
+        callerId,
+        runId: binding.runId,
+        sessionId: record.id,
+        interactionId: binding.interactionId,
+        requestDigest,
+        acknowledgement: pendingAcknowledgement,
+      })
+      if (!inserted) {
+        run.releaseInteractionClaim(binding.interactionId)
+        const existing = this.store.getInteractionOperation(command.operationId)
+        if (!existing) throw new Error(`interaction operation ${JSON.stringify(command.operationId)} disappeared after durable claim`)
+        return {
+          acknowledgement: existing.acknowledgement,
+          status: statusForAcknowledgement(existing.acknowledgement),
+        }
+      }
       await run.withNativeControl(async (native) => {
         await native.respondToNativeInteraction(claimed.nativeId, nativeResponseFor(claimed.request, command.response))
         run.resolveInteraction(binding.interactionId, canonicalCandidateDigest(command.response))
