@@ -11,15 +11,13 @@ import {
   type ContainerNetworkAddress,
 } from './net-jail-egress.js'
 import { verifyNetJail, firstLine } from './net-jail-probe.js'
+import { NetJailProvisionError } from './net-jail-errors.js'
 import { canonicalAllowList, type NetJailAllowEntry } from '../jail/net-allowlist.js'
 
 const RELAY_SOURCE_PATH = fileURLToPath(new URL('../jail/net-relay.mjs', import.meta.url))
 const RELAY_CONTAINER_PATH = '/opt/cli-bridge-net-relay.mjs'
 
-export class NetJailProvisionError extends Error {
-  readonly code = 'net_jail_unenforceable' as const
-  constructor(message: string) { super(message); this.name = 'NetJailProvisionError' }
-}
+export { NetJailProvisionError } from './net-jail-errors.js'
 
 export interface NetJailProvision {
   backend: string

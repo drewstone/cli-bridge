@@ -182,7 +182,13 @@ export function ensureDirectoryNoSymlinks(path: string, label = 'directory'): st
       }
       continue
     }
-    mkdirSync(current, { mode: 0o700 })
+    try {
+      mkdirSync(current, { mode: 0o700 })
+    } catch (error) {
+      // Another contender may have created this component after the existence check.
+      // Revalidate that exact object below; every other mkdir failure remains fatal.
+      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
+    }
     const stat = lstatSync(current)
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       throw new Error(`${label} was replaced while being created: ${current}`)

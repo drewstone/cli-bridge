@@ -5,7 +5,7 @@ import { containerShell, type DockerCli } from './docker-cli.js'
 import { grantPrivateTreeToUid } from './private-path-access.js'
 import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import { runDockerCli, compact, firstLine, shellQuote } from './docker-preflight-utils.js'
-import type { DockerPreflightMount, DockerPreflightTarget, PreflightFinding } from './docker-preflight.js'
+import type { DockerPreflightMount, DockerPreflightTarget, PreflightFinding } from './docker-preflight-types.js'
 
 export function checkWorkspaceRootSource(target: DockerPreflightTarget): PreflightFinding[] {
   const root = target.workspaceRoot!

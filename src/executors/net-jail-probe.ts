@@ -6,7 +6,7 @@ import {
 } from './net-jail-egress.js'
 import type { DockerCli } from './docker-cli.js'
 import { dockerOwnerLabels, removeOwnedDockerResource } from './docker-resource-owner.js'
-import { NetJailProvisionError } from './net-jail-network.js'
+import { NetJailProvisionError } from './net-jail-errors.js'
 
 const CANARY_HOSTS = ['github.com', 'example.com', 'www.iana.org']
 

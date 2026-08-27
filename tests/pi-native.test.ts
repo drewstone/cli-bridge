@@ -128,7 +128,6 @@ function makeChildSpawner(
     if (isRpc) lifecycle?.children.push(child)
     let released = false
     let terminated = false
-    const closed = new Promise<void>(resolve => child.once('close', () => resolve()))
     return {
       child,
       release: () => {
@@ -140,8 +139,8 @@ function makeChildSpawner(
         if (terminated) return
         terminated = true
         if (isRpc && lifecycle) lifecycle.terminations += 1
-        if (!child.killed) child.kill('SIGTERM')
-        await Promise.race([closed, new Promise<void>(resolve => setTimeout(resolve, 1_000))])
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+        await waitForChildExit(child)
       },
     }
   }
@@ -153,11 +152,46 @@ async function readJson(response: Response): Promise<Record<string, any>> {
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
+  while (true) {
     if (predicate()) return
-    await new Promise(resolve => setTimeout(resolve, 5))
+    if (Date.now() >= deadline) {
+      if (predicate()) return
+      throw new Error('timed out waiting for native child turn')
+    }
+    await new Promise<void>(resolve => setImmediate(resolve))
   }
-  throw new Error('timed out waiting for native child turn')
+}
+
+async function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs = 5_000): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout>
+    const cleanup = () => {
+      clearTimeout(timer)
+      child.removeListener('error', onError)
+      child.removeListener('exit', onExit)
+    }
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve()
+    }
+    const onError = (error: Error) => finish(error)
+    const onExit = () => finish()
+    timer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) finish()
+      else finish(new Error(
+        `native child ${child.pid ?? 'unknown'} did not exit; ` +
+          `state=${child.exitCode ?? child.signalCode ?? 'running'}`,
+      ))
+    }, timeoutMs)
+    child.once('error', onError)
+    child.once('exit', onExit)
+    if (child.exitCode !== null || child.signalCode !== null) onExit()
+  })
 }
 
 function privateRootCount(dir: string): number {

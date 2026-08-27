@@ -2,13 +2,64 @@
 
 import { streamSSE } from 'hono/streaming'
 import type { Context, Hono } from 'hono'
-import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
+import {
+  canonicalCandidateDigest,
+  type AgentRunCancellationRequest,
+  type AgentRunControlRef,
+  type AgentEnvironmentCapabilities,
+} from '@tangle-network/agent-interface'
 import { BackendError } from '../../backends/types.js'
+import type { RetainedEventRecord } from '../store.js'
 import { retainedCancellationAcknowledgement } from './control-acknowledgement.js'
-import { RetainedSessionError } from './types.js'
-import type { RetainedSessionService } from '../retained.js'
+import {
+  RetainedSessionError,
+  type RetainedControlAcknowledgement,
+  type RetainedSessionView,
+  type RetainedTurnResult,
+} from './types.js'
+import type { RetainedCreateInput, RetainedTurnInput } from './schema.js'
 
-export function mountRetainedSessions(app: Hono, service: RetainedSessionService): void {
+/** The HTTP layer depends on the service contract, not the facade that composes it. */
+export interface RetainedSessionHttpService {
+  capabilities(model: string, signal?: AbortSignal): Promise<AgentEnvironmentCapabilities>
+  parseCreate(value: unknown): RetainedCreateInput
+  create(input: RetainedCreateInput, signal?: AbortSignal): Promise<RetainedSessionView>
+  list(limit: number): RetainedSessionView[]
+  get(id: string): RetainedSessionView
+  parseTurn(value: unknown): RetainedTurnInput
+  beginTurn(
+    id: string,
+    input: RetainedTurnInput,
+    options?: { queue?: boolean; signal?: AbortSignal },
+  ): Promise<RetainedTurnResult>
+  assertReplayCursor(id: string, afterCursor: number): void
+  eventsForSession(id: string, afterCursor: number, signal: AbortSignal): AsyncIterable<RetainedEventRecord>
+  assertRunReplayCursor(runId: string, afterSequence: number): void
+  runEvents(runId: string, afterSequence: number, signal: AbortSignal): AsyncIterable<RetainedEventRecord>
+  transcript(id: string): Record<string, unknown>
+  parseSteer(value: unknown): { operationId: string; message: string; run: AgentRunControlRef }
+  steer(
+    id: string,
+    input: { operationId: string; message: string; run: AgentRunControlRef },
+    callerId: string,
+  ): Promise<{ acknowledgement: RetainedControlAcknowledgement; status: number }>
+  parseCancel(value: unknown): AgentRunCancellationRequest
+  cancel(
+    id: string,
+    waitMs: number,
+    request: AgentRunCancellationRequest,
+    callerId: string,
+  ): Promise<{ acknowledgement: RetainedControlAcknowledgement; status: number }>
+  detach(id: string): RetainedSessionView
+  close(id: string): Promise<RetainedSessionView>
+  respond(
+    value: unknown,
+    callerId: string,
+    routeBinding?: { runId: string; interactionId: string },
+  ): Promise<{ acknowledgement: unknown; status: number }>
+}
+
+export function mountRetainedSessions(app: Hono, service: RetainedSessionHttpService): void {
   app.get('/v1/capabilities', async (c) => {
     const model = c.req.query('model')
     if (!model) {

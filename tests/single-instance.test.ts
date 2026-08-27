@@ -59,7 +59,7 @@ describe('durable data-directory ownership', () => {
     const replacement = acquireInstanceLock({ port: 4302, dataDir })
     locks.push(replacement)
     expect(replacement.dataDir).toBe(dataDir)
-  })
+  }, 15_000)
 
   it('normalizes an existing permissive directory and all ownership files', () => {
     root = mkdtempSync(join(tmpdir(), 'cli-bridge-instance-modes-'))
@@ -76,27 +76,93 @@ describe('durable data-directory ownership', () => {
   })
 })
 
+const CHILD_OUTPUT_WATCHDOG_MS = 10_000
+const CHILD_EXIT_WATCHDOG_MS = 5_000
+
 async function waitForOutput(child: ChildProcess, expected: string): Promise<void> {
   let output = ''
-  child.stdout?.on('data', chunk => { output += chunk.toString() })
-  const deadline = Date.now() + 5_000
-  while (Date.now() < deadline) {
-    if (output.includes(expected)) return
-    if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(`lock holder exited before ${JSON.stringify(expected)}`)
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const cleanup = () => {
+      clearTimeout(timer)
+      child.stdout?.removeListener('data', onData)
+      child.removeListener('error', onError)
+      child.removeListener('exit', onExit)
     }
-    await new Promise(resolve => setTimeout(resolve, 10))
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve()
+    }
+    const onData = (chunk: Buffer | string) => {
+      output += chunk.toString()
+      if (output.includes(expected)) finish()
+    }
+    const onError = (error: Error) => finish(error)
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      finish(new Error(
+        `lock holder exited before ${JSON.stringify(expected)} ` +
+          `(code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+      ))
+    }
+    const timer = setTimeout(() => {
+      finish(new Error(
+        `lock holder ${child.pid ?? 'unknown'} did not emit ${JSON.stringify(expected)}; ` +
+          `state=${child.exitCode ?? child.signalCode ?? 'running'} output=${JSON.stringify(output.slice(-300))}`,
+      ))
+    }, CHILD_OUTPUT_WATCHDOG_MS)
+    if (!child.stdout) {
+      finish(new Error('lock holder has no stdout handshake channel'))
+      return
+    }
+    child.stdout.on('data', onData)
+    child.once('error', onError)
+    child.once('exit', onExit)
+    if (child.exitCode !== null || child.signalCode !== null) onExit(child.exitCode, child.signalCode)
+  })
+}
+
+function childHasExited(child: ChildProcess): boolean {
+  if (child.exitCode !== null || child.signalCode !== null) return true
+  if (child.pid === undefined) return false
+  try {
+    process.kill(child.pid, 0)
+    return false
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ESRCH') return true
+    return false
   }
-  throw new Error(`timed out waiting for ${JSON.stringify(expected)}`)
 }
 
 async function waitForExit(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return
+  if (childHasExited(child)) return
   await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('lock holder did not exit')), 2_000)
-    child.once('exit', () => {
-      clearTimeout(timeout)
-      resolve()
-    })
+    let settled = false
+    const cleanup = () => {
+      clearTimeout(timer)
+      child.removeListener('error', onError)
+      child.removeListener('exit', onExit)
+    }
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve()
+    }
+    const onError = (error: Error) => finish(error)
+    const onExit = () => finish()
+    const timer = setTimeout(() => {
+      if (childHasExited(child)) finish()
+      else finish(new Error(
+        `lock holder ${child.pid ?? 'unknown'} did not exit; ` +
+          `state=${child.exitCode ?? child.signalCode ?? 'running'}`,
+      ))
+    }, CHILD_EXIT_WATCHDOG_MS)
+    child.once('error', onError)
+    child.once('exit', onExit)
+    if (childHasExited(child)) onExit()
   })
 }

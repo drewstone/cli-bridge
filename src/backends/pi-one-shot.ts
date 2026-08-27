@@ -20,11 +20,8 @@ import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { finalizeSpawned, terminateSpawned } from '../executors/process-tree.js'
 import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import {
-  mapPrivateTreeArgs,
-  mapPrivateTreeEnv,
   configurePiJail,
   parsePiModelId,
-  piChildEnv,
   piDirectToolSelection,
   piExtensionArgs,
   piMcpAdapterAvailable,
@@ -33,6 +30,7 @@ import {
   resolveReasoningEffort,
   thinkingFlagForEffort,
 } from './pi-config.js'
+import { mapPrivateTreeArgs, mapPrivateTreeEnv, piChildEnv } from './pi-child-env.js'
 import { PI_PERMISSION_MARKER_PREFIX } from './pi-interaction.js'
 import { PiToolCallTracker } from './pi-tool-calls.js'
 import {

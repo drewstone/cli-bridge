@@ -1,7 +1,7 @@
 /** Live checks for the Docker image, mounts, and a real pool slot. */
 
 import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
-import { throwIfExecutorAborted, type ExecutorFinding } from './types.js'
+import { throwIfExecutorAborted } from './types.js'
 import {
   checkBindSource,
   checkCredentialMounts,
@@ -11,26 +11,13 @@ import {
   isInside,
 } from './docker-preflight-mounts.js'
 import { runDockerCli, compact, firstLine, shellQuote } from './docker-preflight-utils.js'
-
-export interface DockerPreflightMount {
-  source: string
-  target: string
-  kind: 'bind' | 'volume'
-  credentialFile?: string
-}
-export interface DockerPreflightTarget {
-  backend: string
-  envPrefix: string
-  image: string
-  bin: string
-  containerUser?: string | undefined
-  containerHome: string
-  mounts: DockerPreflightMount[]
-  workspaceRoot?: string | undefined
-  buildCommand: string
-}
-export type PreflightFinding = ExecutorFinding
-export type PreflightScope = 'full' | 'credentials' | 'request-path'
+export type {
+  DockerPreflightMount,
+  DockerPreflightTarget,
+  PreflightFinding,
+  PreflightScope,
+} from './docker-preflight-types.js'
+import type { DockerPreflightTarget, PreflightFinding, PreflightScope } from './docker-preflight-types.js'
 
 export class DockerPreflightError extends Error {
   constructor(readonly backend: string, readonly findings: PreflightFinding[]) {

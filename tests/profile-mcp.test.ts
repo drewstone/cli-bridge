@@ -54,6 +54,54 @@ async function childResult(child: ReturnType<typeof spawn>): Promise<{ code: num
   return { code, stdout, stderr }
 }
 
+const CHILD_HANDSHAKE_WATCHDOG_MS = 10_000
+
+/** Wait for a child-owned state transition; the timer is only a diagnostic watchdog. */
+async function waitForChildOutput(child: ReturnType<typeof spawn>, expected: string): Promise<void> {
+  let output = ''
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      finish(new Error(
+        `child ${child.pid ?? 'unknown'} did not emit ${JSON.stringify(expected)}; ` +
+          `state=${child.exitCode ?? child.signalCode ?? 'running'} output=${JSON.stringify(output.slice(-300))}`,
+      ))
+    }, CHILD_HANDSHAKE_WATCHDOG_MS)
+    const cleanup = () => {
+      clearTimeout(timer)
+      child.stdout?.removeListener('data', onData)
+      child.removeListener('error', onError)
+      child.removeListener('exit', onExit)
+    }
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve()
+    }
+    const onData = (chunk: Buffer | string) => {
+      output += chunk.toString()
+      if (output.includes(expected)) finish()
+    }
+    const onError = (error: Error) => finish(error)
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      finish(new Error(
+        `child ${child.pid ?? 'unknown'} exited before ${JSON.stringify(expected)} ` +
+          `(code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+      ))
+    }
+    if (!child.stdout) {
+      finish(new Error(`child ${child.pid ?? 'unknown'} has no stdout handshake channel`))
+      return
+    }
+    child.stdout.on('data', onData)
+    child.once('error', onError)
+    child.once('exit', onExit)
+    if (child.exitCode !== null || child.signalCode !== null) onExit(child.exitCode, child.signalCode)
+  })
+}
+
 describe('materializeMcpConfig', () => {
   it('returns null when the profile has no mcp section', () => {
     expect(materializeMcpConfig(null)).toBeNull()
@@ -530,17 +578,17 @@ describe('private temporary ownership records', () => {
       `void (async () => {`,
       `const root = createPrivateTemporaryRoot(${JSON.stringify(parent)}, '.cli-bridge-test-')`,
       `writeFileSync(${JSON.stringify(marker)}, root.path)`,
+      `process.stdout.write('ready\\n')`,
       `await new Promise(() => {})`,
       `})().catch(error => { console.error(error); process.exitCode = 1 })`,
     ].join(';')
     const owner = spawn(process.execPath, [tsx, '-e', source], {
       cwd: process.cwd(),
       env: isolatedEnv,
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     try {
-      const deadline = Date.now() + 5_000
-      while (!fs.existsSync(marker) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      await waitForChildOutput(owner, 'ready')
       expect(fs.existsSync(marker)).toBe(true)
       const root = fs.readFileSync(marker, 'utf8')
       const registry = registryPath(isolatedTmp)
@@ -779,59 +827,58 @@ describe('cwd-native MCP lock ownership', () => {
 
   it('admits exactly one of two simultaneous first mounts', async () => {
     const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-race-'))
-    const barrier = join(cwd, 'go')
+    let first: ReturnType<typeof spawn> | null = null
+    let second: ReturnType<typeof spawn> | null = null
     try {
       const source = [
-        `import { existsSync, writeFileSync } from 'node:fs'`,
         `import { materializeMcpServersForFactory } from ${JSON.stringify(moduleUrl)}`,
         `void (async () => {`,
-        `writeFileSync(${JSON.stringify(join(cwd, 'ready-'))} + process.pid, '')`,
-        `while (!existsSync(${JSON.stringify(barrier)})) await new Promise(resolve => setTimeout(resolve, 5))`,
+        `const go = new Promise(resolve => { process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => { if (chunk.includes('go')) resolve(undefined) }) })`,
+        `process.stdout.write('ready\\n')`,
+        `await go`,
+        `process.stdin.destroy()`,
         `try { const mounted = materializeMcpServersForFactory({ echo: { command: 'echo' } }, ${JSON.stringify(cwd)}); process.stdout.write('acquired'); await new Promise(resolve => setTimeout(resolve, 300)); mounted?.cleanup() } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 2 }`,
         `})().catch(error => { console.error(error); process.exitCode = 1 })`,
       ].join(';')
-      const first = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] })
-      const second = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] })
-      const deadline = Date.now() + 5_000
-      while (fs.readdirSync(cwd).filter(name => name.startsWith('ready-')).length < 2 && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 10))
-      }
-      expect(fs.readdirSync(cwd).filter(name => name.startsWith('ready-'))).toHaveLength(2)
-      fs.writeFileSync(barrier, '')
+      first = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] })
+      second = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] })
+      await Promise.all([waitForChildOutput(first, 'ready'), waitForChildOutput(second, 'ready')])
+      first.stdin?.write('go\n')
+      second.stdin?.write('go\n')
       const results = await Promise.all([childResult(first), childResult(second)])
       expect(results.filter(result => result.code === 0)).toHaveLength(1)
       expect(results.filter(result => result.code === 2)).toHaveLength(1)
       expect(results.find(result => result.code === 2)?.stderr).toMatch(/another run.*holds the mount/u)
     } finally {
+      for (const child of [first, second]) {
+        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+        if (child) await childResult(child).catch(() => {})
+      }
       fs.rmSync(cwd, { recursive: true, force: true })
     }
-  })
+  }, 15_000)
 
   it('recovers the exact original config after a lock owner is SIGKILLed', async () => {
     const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-crash-'))
     const factoryDir = join(cwd, '.factory')
     const configPath = join(factoryDir, 'mcp.json')
-    const ready = join(cwd, 'ready')
-    const crash = join(cwd, 'crash')
     fs.mkdirSync(factoryDir)
     fs.writeFileSync(configPath, '{"keep":true}\n', { mode: 0o640 })
     try {
       const source = [
-        `import { existsSync, writeFileSync } from 'node:fs'`,
         `import { materializeMcpServersForFactory } from ${JSON.stringify(moduleUrl)}`,
         `void (async () => {`,
         `const mounted = materializeMcpServersForFactory({ crash: { command: 'crash-cmd' } }, ${JSON.stringify(cwd)})`,
         `if (!mounted) throw new Error('fixture did not mount')`,
-        `writeFileSync(${JSON.stringify(ready)}, '')`,
-        `while (!existsSync(${JSON.stringify(crash)})) await new Promise(resolve => setTimeout(resolve, 5))`,
+        `const crash = new Promise(resolve => { process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => { if (chunk.includes('crash')) resolve(undefined) }) })`,
+        `process.stdout.write('ready\\n')`,
+        `await crash`,
         `process.kill(process.pid, 'SIGKILL')`,
         `})().catch(error => { console.error(error); process.exitCode = 1 })`,
       ].join(';')
-      const owner = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] })
-      const deadline = Date.now() + 5_000
-      while (!fs.existsSync(ready) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
-      expect(fs.existsSync(ready)).toBe(true)
-      fs.writeFileSync(crash, '')
+      const owner = spawn(process.execPath, [tsx, '-e', source], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] })
+      await waitForChildOutput(owner, 'ready')
+      owner.stdin?.write('crash\n')
       await childResult(owner)
 
       const recovered = materializeMcpServersForFactory({ recovered: { command: 'ok' } }, cwd)
@@ -887,27 +934,23 @@ describe('cwd-native MCP lock ownership', () => {
     const cwd = fs.mkdtempSync(join(os.tmpdir(), 'cb-cwd-lock-stale-replaced-'))
     const factoryDir = join(cwd, '.factory')
     const configPath = join(factoryDir, 'mcp.json')
-    const ready = join(cwd, 'ready')
-    const crash = join(cwd, 'crash')
     try {
       const source = [
-        `import { existsSync, writeFileSync } from 'node:fs'`,
         `import { materializeMcpServersForFactory } from ${JSON.stringify(moduleUrl)}`,
         `void (async () => {`,
         `materializeMcpServersForFactory({ crash: { command: 'crash-cmd' } }, ${JSON.stringify(cwd)})`,
-        `writeFileSync(${JSON.stringify(ready)}, '')`,
-        `while (!existsSync(${JSON.stringify(crash)})) await new Promise(resolve => setTimeout(resolve, 5))`,
+        `const crash = new Promise(resolve => { process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => { if (chunk.includes('crash')) resolve(undefined) }) })`,
+        `process.stdout.write('ready\\n')`,
+        `await crash`,
         `process.kill(process.pid, 'SIGKILL')`,
         `})().catch(error => { console.error(error); process.exitCode = 1 })`,
       ].join(';')
       const owner = spawn(process.execPath, [tsx, '-e', source], {
         cwd: process.cwd(),
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       })
-      const deadline = Date.now() + 5_000
-      while (!fs.existsSync(ready) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
-      expect(fs.existsSync(ready)).toBe(true)
-      fs.writeFileSync(crash, '')
+      await waitForChildOutput(owner, 'ready')
+      owner.stdin?.write('crash\n')
       await childResult(owner)
 
       fs.rmSync(configPath)

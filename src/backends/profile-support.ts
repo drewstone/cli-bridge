@@ -4,11 +4,11 @@ export type { ProvisionedPiProfile } from './profile-workspace.js'
 export {
   resolveAgentProfile,
   resolveMcpServers,
-  isStdioMcpSpec,
   materializeMcpConfig,
   buildCanonicalMcpServers,
   writeMcpConfigFile,
 } from './profile-core.js'
+export { isStdioMcpSpec } from './profile-mcp-paths.js'
 export type { MaterializedMcpConfig } from './profile-core.js'
 
 export { materializeMcpServersForPi, reapStalePiMcpConfigs } from './profile-mcp-pi.js'

@@ -16,11 +16,8 @@ import { prepareSpawnerPrivatePath, resolveSpawnerCwd, type Spawner } from '../e
 import { finalizeSpawned } from '../executors/process-tree.js'
 import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import {
-  mapPrivateTreeArgs,
-  mapPrivateTreeEnv,
   configurePiJail,
   parsePiModelId,
-  piChildEnv,
   piDirectToolSelection,
   piExtensionArgs,
   piMcpAdapterAvailable,
@@ -30,6 +27,7 @@ import {
   thinkingFlagForEffort,
   piNativeCapabilities,
 } from './pi-config.js'
+import { mapPrivateTreeArgs, mapPrivateTreeEnv, piChildEnv } from './pi-child-env.js'
 import { piInteractionExtension } from './pi-one-shot.js'
 import { PiNativeSession } from './pi-native-session.js'
 
