@@ -262,6 +262,15 @@ describe('the readiness probe traverses the request path', () => {
     expect(spawner.calls.map((c) => c.cwd)).toContain('/workspace/opencode')
   })
 
+  it('reads a successful version probe that writes only to stderr', async () => {
+    const spawner = (async () => ({
+      child: childExiting(0, '', '0.7.0\n'),
+      release: () => {},
+    })) as Spawner
+    const health = await versionHealth('prime', 'prime-agent', spawner)
+    expect(health).toMatchObject({ state: 'ready', version: '0.7.0' })
+  })
+
   it('reports an executor readiness finding instead of ready', async () => {
     const spawner = recordingSpawner({
       probeRequestPath: async () => ({
