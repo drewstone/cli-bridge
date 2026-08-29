@@ -4,7 +4,7 @@
  * Why this module exists:
  *
  *   CLI harnesses we drive (`opencode run`, `claude --print`, `kimi
- *   --print`) frequently fork their OWN subprocesses — model API
+ *   --prompt`) frequently fork their OWN subprocesses — model API
  *   clients, MCP servers, tool runners. When the bridge sends
  *   SIGTERM to the harness, only the direct child gets the signal.
  *   Grand-children (ripgrep, MCP servers, the model HTTP client)

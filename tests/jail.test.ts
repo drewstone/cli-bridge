@@ -327,6 +327,34 @@ describe('auth preservation', () => {
     }
   })
 
+  it('authSourcesFor seeds current and legacy Kimi homes', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-kimi-home-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    await mkdir(join(fakeHome, '.kimi-code'), { recursive: true })
+    await mkdir(join(fakeHome, '.kimi'), { recursive: true })
+    const previousHome = process.env.HOME
+    process.env.HOME = fakeHome
+    try {
+      expect(authSourcesFor('kimi-code')).toEqual([
+        {
+          source: join(fakeHome, '.kimi-code'),
+          jailRel: '.kimi-code',
+          mode: 'seed-writable',
+          only: ['config.toml', 'credentials', 'device_id'],
+        },
+        {
+          source: join(fakeHome, '.kimi'),
+          jailRel: '.kimi',
+          mode: 'seed-writable',
+          only: ['config.toml', 'credentials', 'device_id'],
+        },
+      ])
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+    }
+  })
+
   it('authSourcesFor(codex) honors a custom CODEX_HOME outside HOME, mapped to the jail ~/.codex', async () => {
     const ext = await mkdtemp(join(tmpdir(), 'cli-bridge-codexhome-'))
     cleanups.push(() => rm(ext, { recursive: true, force: true }))

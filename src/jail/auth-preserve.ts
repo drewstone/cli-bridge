@@ -25,15 +25,16 @@ const PI_AUTH_COPY_PREFIX = `pi-${process.pid}-`
 /**
  * $HOME-relative auth/config paths per REGISTERED backend name. Aliases that
  * share the same on-disk credentials are listed explicitly (claude-code /
- * claudish / claude all read ~/.claude; kimi-code / kimi read ~/.kimi) rather
- * than fuzzy-matched, so the credential mapping is exact and auditable.
+ * claudish / claude all read ~/.claude; Kimi Code reads ~/.kimi-code and the
+ * legacy Kimi CLI reads ~/.kimi) rather than fuzzy-matched, so the credential
+ * mapping is exact and auditable.
  */
 const AUTH_PATHS: Record<string, readonly string[]> = {
   'claude-code': ['.claude', '.claude.json'],
   claudish: ['.claude', '.claude.json'],
   claude: ['.claude', '.claude.json'],
-  'kimi-code': ['.kimi'],
-  kimi: ['.kimi'],
+  'kimi-code': ['.kimi-code', '.kimi'],
+  kimi: ['.kimi-code', '.kimi'],
   opencode: ['.config/opencode', '.local/share/opencode'],
   gemini: ['.gemini'],
   // codex.ts only synthesizes a CODEX_HOME (with copied auth) when MCP passthrough
@@ -45,6 +46,9 @@ const AUTH_PATHS: Record<string, readonly string[]> = {
   // run starts from an empty HOME and loses every persisted provider/default.
   pi: ['.pi/agent'],
 }
+
+/** Kimi Code needs these seed entries, then writes sessions and logs in-jail. */
+const KIMI_SEED_ENTRIES = ['config.toml', 'credentials', 'device_id'] as const
 
 /**
  * Codex must WRITE inside `$CODEX_HOME` before it can execute at all: PATH
@@ -127,6 +131,16 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
       if (entry.jailRel !== '.local/share/opencode') continue
       entry.mode = 'seed-writable'
       entry.only = [...OPENCODE_SEED_ENTRIES]
+    }
+  }
+  if (backendName === 'kimi-code' || backendName === 'kimi') {
+    // Kimi Code resolves its home to ~/.kimi-code and writes sessions,
+    // logs, and indexes below it. Seed only the stable model/auth surface;
+    // copying the multi-gigabyte session index would defeat the jail.
+    for (const entry of out) {
+      if (entry.jailRel !== '.kimi-code' && entry.jailRel !== '.kimi') continue
+      entry.mode = 'seed-writable'
+      entry.only = [...KIMI_SEED_ENTRIES]
     }
   }
   if (backendName === 'pi') {

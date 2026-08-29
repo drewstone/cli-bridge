@@ -4,7 +4,7 @@
  *
  * Why this exists:
  *
- *   Claude Code, Kimi, and other coding CLIs accept `--input-format
+ *   Claude Code and other coding CLIs accept `--input-format
  *   stream-json` which reads NDJSON messages from stdin (one JSON
  *   object per line). The previous code path packed the entire prompt
  *   into a single `--prompt <text>` argv argument, which collides
@@ -49,8 +49,7 @@ export type WriteStdinResult =
  *  - 'claude'  → NDJSON, `{"type":"user","message":{"role":"user","content":"…"}}`
  *                (Claude Code CLI; the original, wrapped, envelope).
  *  - 'flat'    → NDJSON, `{"role":"user","content":"…"}`
- *                (Kimi CLI 1.44.0; parses ONLY the flat shape, silently
- *                 emits zero output if handed claude's wrapped envelope.)
+ *                (for CLIs that expose a flat structured-input mode).
  *  - 'raw'     → Concatenated message contents, no JSON envelope, no
  *                per-message framing — just `m.content` joined with
  *                blank lines. Used by `opencode run`, which reads stdin
