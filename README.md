@@ -741,6 +741,16 @@ unset to retain Docker's default networking behavior.
 where it can CONNECT: the worker's process tree gets no egress at all except to
 an allowlist that always contains the backend's own model endpoint.
 
+`BRIDGE_JAIL_RO_PATHS` / `BRIDGE_JAIL_RW_PATHS` add operator binds to every jailed worker: comma-
+or colon-separated absolute paths, bound read-only (fs-jail only) or writable (both modes). They
+exist for a harness whose install or state lives under the operator home, which an fs-jail hides
+by design — a Python venv (`hermes`), an isolated node prefix (`prime-agent`), an agent's own
+config dir. The bridge refuses to boot on a relative path, `/`, `/home`, or the home itself, and
+refuses a request whose bind sits at or above its working directory. Writable extras are bound
+before read-only ones, so `BRIDGE_JAIL_RW_PATHS=$HOME/.hermes` with
+`BRIDGE_JAIL_RO_PATHS=$HOME/.hermes/hermes-agent` keeps the agent's state writable and its code
+read-only.
+
 ```bash
 OPENCODE_EXECUTOR=docker
 WORKER_NET_JAIL=1

@@ -19,6 +19,7 @@
  * own working tree. `readConfine` is set when the effective mode is 'fs-jail'.
  */
 
+import { homedir } from 'node:os'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { resolveJailRoot } from './types.js'
 import type { JailSpec } from './types.js'
@@ -39,6 +40,38 @@ export interface ResolveJailSpecInput {
 /** Default writable root, relative to `cwd`, when a jail is on and no root is given. */
 export const DEFAULT_JAIL_ROOT = '.agent-home'
 
+/** Operator env lists of extra binds: comma- or colon-separated absolute paths. RO binds matter
+ *  only under fs-jail (a write-jail already reads the whole host); RW binds apply to both modes.
+ *  They exist for harnesses whose install or state lives under the operator home — a Python
+ *  venv, a node prefix, an agent's own config dir — which the fs-jail hides by design. */
+export const JAIL_RO_PATHS_ENV = 'BRIDGE_JAIL_RO_PATHS'
+export const JAIL_RW_PATHS_ENV = 'BRIDGE_JAIL_RW_PATHS'
+
+/**
+ * Parse one env list into unique absolute paths. Refuses, loudly, the paths that would undo the
+ * jail: a relative path, `/`, `/home`, or the operator home itself. A subdirectory of the home
+ * is allowed — that is the whole use case.
+ */
+export function parseJailPathList(value: string | undefined, name: string, home: string = homedir()): string[] {
+  const out: string[] = []
+  for (const raw of (value ?? '').split(/[,:]/u)) {
+    const p = raw.trim()
+    if (!p) continue
+    if (!isAbsolute(p)) throw new Error(`${name}: "${p}" is not an absolute path`)
+    const norm = resolve(p)
+    if (norm === sep || norm === resolve('/home') || norm === resolve(home)) {
+      throw new Error(`${name}: "${p}" would re-open the home tree the fs-jail exists to hide`)
+    }
+    if (!out.includes(norm)) out.push(norm)
+  }
+  return out
+}
+
+/** The operator floor: `BRIDGE_JAIL_MODE`, raised to fs-jail by `WORKER_FS_JAIL=1`. */
+export function jailFloor(env: NodeJS.ProcessEnv = process.env): JailMode {
+  return maxMode(normalizeMode(env.BRIDGE_JAIL_MODE), isTruthy(env.WORKER_FS_JAIL) ? 'fs-jail' : 'off')
+}
+
 /** Confinement ordering: a higher rank is strictly more confined. Used to take
  * the max of the operator floor and the per-request mode (a request may raise
  * confinement, never lower it below the floor). */
@@ -49,7 +82,7 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   // The operator env floor: BRIDGE_JAIL_MODE, plus WORKER_FS_JAIL=1 as a
   // shorthand that raises the floor to fs-jail. The effective mode is the MAX
   // of the floor and the per-request mode — a request can only add confinement.
-  const floor = maxMode(normalizeMode(env.BRIDGE_JAIL_MODE), isTruthy(env.WORKER_FS_JAIL) ? 'fs-jail' : 'off')
+  const floor = jailFloor(env)
   const mode = maxMode(floor, normalizeMode(input.execMode))
   if (mode === 'off') return null
 
@@ -68,7 +101,22 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   } catch {
     root = resolveJailRoot(DEFAULT_JAIL_ROOT, projectDir)
   }
-  return { root, projectDir, ...(mode === 'fs-jail' ? { readConfine: true } : {}) }
+  // Operator extras. A bind at or above the working directory would re-open the sibling run
+  // scratch dirs the jail hides, so it is refused per request, not merely dropped.
+  const readable = mode === 'fs-jail' ? parseJailPathList(env[JAIL_RO_PATHS_ENV], JAIL_RO_PATHS_ENV) : []
+  const writable = parseJailPathList(env[JAIL_RW_PATHS_ENV], JAIL_RW_PATHS_ENV)
+  for (const p of [...readable, ...writable]) {
+    if (isWithin(p, projectDir)) {
+      throw new Error(`jail bind ${p} is the working directory or an ancestor of it — refusing to re-open sibling run scratch dirs`)
+    }
+  }
+  return {
+    root,
+    projectDir,
+    ...(mode === 'fs-jail' ? { readConfine: true } : {}),
+    ...(readable.length ? { extraReadablePaths: readable } : {}),
+    ...(writable.length ? { extraWritablePaths: writable } : {}),
+  }
 }
 
 /** Return whichever of the two modes is more confined. */
