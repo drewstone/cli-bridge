@@ -96,6 +96,8 @@ The internal continuation run id is a fixed-size digest of the operation id, so 
 
 The `return=admission` mode returns `202` only after the boundary and new run identity are durable.
 
+The Bridge advertises `nativeContinuation.admissionControl` only when it guarantees this response.
+
 Its response contains `phase: admitted`, the observed source boundary, and the exact new control reference.
 
 The caller can use that reference for status, event replay, interaction response, or cancellation while output is active.

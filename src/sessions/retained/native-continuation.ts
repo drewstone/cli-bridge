@@ -8,15 +8,18 @@
 
 import {
   AgentExactRunControlRefSchema,
+  AgentNativeContextContinuationAdmissionSchema,
   AgentNativeContextContinuationResultSchema,
   AgentTurnResultSchema,
   NativeContextBoundaryProofSchema,
   NativeContextContinuationRequestSchema,
   NativeContextContinuationTurnSchema,
+  agentNativeContextContinuationAdmissionMatchesRequest,
   agentNativeContextContinuationResultMatchesRequest,
   canonicalCandidateDigest,
   nativeContextContinuationTurnDigest,
   type AgentEnvironmentEvent,
+  type AgentNativeContextContinuationAdmission,
   type AgentNativeContextContinuationResult,
   type AgentTurnResult,
   type NativeContextBoundaryProof,
@@ -45,16 +48,7 @@ export interface NativeContinuationResult {
 
 /** Exact continued-run identity returned after durable admission, before terminal output. */
 export interface NativeContinuationAdmissionResult {
-  outcome: {
-    phase: 'admitted'
-    acknowledgement: {
-      operationId: string
-      requestDigest: NativeContextContinuationRequest['requestDigest']
-      historyMessagesSent: 0
-      actualBoundary: NativeContextBoundaryProof
-    }
-    controlRef: ReturnType<typeof AgentExactRunControlRefSchema.parse>
-  }
+  outcome: AgentNativeContextContinuationAdmission
   status: 202
 }
 
@@ -326,8 +320,25 @@ export class RetainedNativeContinuation {
     stored: Record<string, unknown>,
   ): NativeContinuationAdmissionResult | null {
     const decoded = decodeStoredContinuation(stored)
-    if (!decoded || decoded.status !== 'pending' || !decoded.actualBoundary) return null
-    return this.admissionResult(request, sessionId, runId, decoded.actualBoundary)
+    if (!decoded) return null
+    if (decoded.status === 'pending') {
+      if (!decoded.actualBoundary) return null
+      return this.admissionResult(request, sessionId, runId, decoded.actualBoundary)
+    }
+    if (
+      decoded.outcome.acknowledgement.status !== 'accepted' &&
+      decoded.outcome.acknowledgement.status !== 'replayed'
+    ) {
+      return null
+    }
+    const actualBoundary = decoded.outcome.acknowledgement.actualBoundary
+    if (!actualBoundary) return null
+    return this.admissionResult(
+      request,
+      sessionId,
+      runId,
+      actualBoundary,
+    )
   }
 
   private admissionResult(
@@ -348,19 +359,20 @@ export class RetainedNativeContinuation {
       executionId: admission.executionId,
       requestDigest: admission.requestDigest,
     })
-    return {
-      status: 202,
-      outcome: {
-        phase: 'admitted',
-        acknowledgement: {
-          operationId: request.operationId,
-          requestDigest: request.requestDigest,
-          historyMessagesSent: 0,
-          actualBoundary,
-        },
-        controlRef,
+    const outcome = AgentNativeContextContinuationAdmissionSchema.parse({
+      phase: 'admitted',
+      acknowledgement: {
+        operationId: request.operationId,
+        requestDigest: request.requestDigest,
+        historyMessagesSent: 0,
+        actualBoundary,
       },
+      controlRef,
+    })
+    if (!agentNativeContextContinuationAdmissionMatchesRequest(request, outcome)) {
+      throw new Error('native continuation admission failed its exact Agent Interface binding')
     }
+    return { status: 202, outcome }
   }
 
   private preflight(

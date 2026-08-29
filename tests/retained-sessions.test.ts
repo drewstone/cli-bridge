@@ -70,6 +70,7 @@ const capabilities: AgentEnvironmentCapabilities = {
   nativeContinuation: {
     atomicBoundary: true,
     requestIdempotency: true,
+    admissionControl: true,
   },
   sessions: { continue: true, list: true, messages: true },
   interactions: {
@@ -1981,6 +1982,7 @@ describe('retained Agent Interface sessions', () => {
     expect(createdBody.capabilities.nativeContinuation).toMatchObject({
       atomicBoundary: true,
       requestIdempotency: true,
+      admissionControl: true,
     })
     expect(fixture.store.getRetained('s1')?.metadata.agent_profile).toEqual(profile)
     const listed = await fixture.app.request('/v1/sessions')
@@ -4311,6 +4313,13 @@ describe('retained Agent Interface sessions', () => {
       terminal: true,
       status: 'cancelled',
     })
+
+    const recoveredAdmissionResponse = await fixture.app.request(
+      '/v1/sessions/native-admission/continue?return=admission',
+      { method: 'POST', body: nativeContinuationBody(input) },
+    )
+    expect(recoveredAdmissionResponse.status).toBe(202)
+    expect(await json(recoveredAdmissionResponse)).toEqual(admitted)
   })
 
   it('rejects an empty native continuation before dispatch', async () => {

@@ -289,6 +289,7 @@ const PI_NATIVE_CAPABILITIES: AgentEnvironmentCapabilities = {
   nativeContinuation: {
     atomicBoundary: true,
     requestIdempotency: true,
+    admissionControl: true,
   },
   sessions: { continue: true, list: true, messages: true },
   interactions: {

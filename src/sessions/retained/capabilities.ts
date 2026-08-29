@@ -236,6 +236,7 @@ function assertRetainedCapabilities(capabilities: AgentEnvironmentCapabilities, 
     !capabilities.sessions.messages ||
     capabilities.nativeContinuation?.atomicBoundary !== true ||
     capabilities.nativeContinuation.requestIdempotency !== true ||
+    capabilities.nativeContinuation.admissionControl !== true ||
     !capabilities.interactions ||
     !capabilities.interactions.replay ||
     !capabilities.interactions.responseIdempotency
