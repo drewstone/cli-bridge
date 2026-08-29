@@ -45,7 +45,7 @@ import { RetainedTurnRunner } from './retained/turns.js'
 import {
   parseNativeContinuation,
   RetainedNativeContinuation,
-  type NativeContinuationResult,
+  type NativeContinuationResponse,
   type ParsedNativeContinuation,
 } from './retained/native-continuation.js'
 import {
@@ -286,8 +286,8 @@ export class RetainedSessionService {
   continueNative(
     id: string,
     input: ParsedNativeContinuation,
-    options: { signal?: AbortSignal; callerId?: string } = {},
-  ): Promise<NativeContinuationResult> {
+    options: { signal?: AbortSignal; callerId?: string; returnOnAdmission?: boolean } = {},
+  ): Promise<NativeContinuationResponse> {
     return this.nativeContinuation.continue(id, input.request, input.turn, options)
   }
 

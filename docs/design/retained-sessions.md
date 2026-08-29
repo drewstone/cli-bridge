@@ -65,6 +65,7 @@ The retained routes are:
 - `GET /v1/sessions/:id` reads the durable session view.
 - `POST /v1/sessions/:id/turns` starts one idempotent turn.
 - `POST /v1/sessions/:id/continue` performs one Agent Interface native continuation.
+- `POST /v1/sessions/:id/continue?return=admission` returns exact control after durable admission.
 - `GET /v1/sessions/:id/events` replays normalized session events.
 - `GET /v1/sessions/:id/transcript` reads the normalized transcript.
 - `GET /v1/sessions/:id/status` reads the current status.
@@ -83,7 +84,7 @@ The durable session view's `context_boundary` field returns the exact stored `Na
 
 ## Native continuation
 
-The continuation route accepts `{ request, turn }` using the Agent Interface 1.3.0 schemas.
+The continuation route accepts `{ request, turn }` using the pinned Agent Interface schemas.
 
 The bridge validates the turn digest and request digest before it admits the operation.
 
@@ -92,6 +93,16 @@ The request's `run` and `expectedBoundary` must identify the current stored run 
 The route records a pending operation before dispatch and uses the existing per-session turn lane.
 
 The internal continuation run id is a fixed-size digest of the operation id, so the maximum valid operation id cannot overflow Agent Interface limits.
+
+The `return=admission` mode returns `202` only after the boundary and new run identity are durable.
+
+Its response contains `phase: admitted`, the observed source boundary, and the exact new control reference.
+
+The caller can use that reference for status, event replay, interaction response, or cancellation while output is active.
+
+Repeating the same continuation without `return=admission` waits for the original terminal result.
+
+Repeating the admission request returns the same identity and does not dispatch another turn.
 
 That lane repeats the boundary comparison before provider startup and observes the native source boundary while the handoff lock is held.
 
