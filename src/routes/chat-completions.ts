@@ -198,7 +198,7 @@ const chatRequestSchema = z.object({
    * Standardised MCP passthrough. Shape mirrors Claude Code's
    * `mcp-config.json` so the same JSON can be forwarded to every
    * backend that supports MCP natively (claude `--mcp-config`, codex
-   * `CODEX_HOME/config.toml`, kimi `--mcp-config-file`, opencode
+   * `CODEX_HOME/config.toml`, kimi project-local `.kimi-code/mcp.json`, opencode
    * `OPENCODE_CONFIG`). Validation is permissive (`z.unknown()` for
    * each spec) so callers can pass backend-specific fields without
    * cli-bridge silently stripping them — the per-backend

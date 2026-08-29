@@ -13,7 +13,8 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   defineAgentProfilePublicConfig as pub,
@@ -28,6 +29,7 @@ import {
   materializeMcpServersForCodex,
   materializeMcpServersForOpencode,
   materializeMcpServersForPi,
+  materializeMcpServersForKimi,
   materializeOpencodeMcpConfig,
   resolveMcpServers,
 } from '../src/backends/profile-support.js'
@@ -448,6 +450,51 @@ describe('materializeMcpServersForPi', () => {
       expect(fs.readdirSync(cwd)).toEqual([])
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('materializeMcpServersForKimi', () => {
+  it('mounts project-local MCP and restores the original file', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cb-kimi-mcp-'))
+    const configDir = join(cwd, '.kimi-code')
+    const configPath = join(configDir, 'mcp.json')
+    const original = JSON.stringify({
+      settings: { source: 'project' },
+      mcpServers: { project: { command: 'project-cmd' } },
+    })
+    try {
+      mkdirSync(configDir)
+      writeFileSync(configPath, original)
+      const mounted = materializeMcpServersForKimi(
+        { request: { command: 'request-cmd', args: ['--check'] } },
+        cwd,
+      )
+      expect(mounted).not.toBeNull()
+      if (!mounted) return
+      expect(mounted.configPath).toBe(configPath)
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
+        settings: { source: 'project' },
+        mcpServers: {
+          project: { command: 'project-cmd' },
+          request: { command: 'request-cmd', args: ['--check'] },
+        },
+      })
+      mounted.cleanup()
+      expect(readFileSync(configPath, 'utf8')).toBe(original)
+      expect(existsSync(`${configPath}.lock`)).toBe(false)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null without creating project config for an empty map', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cb-kimi-mcp-'))
+    try {
+      expect(materializeMcpServersForKimi({ disabled: { command: 'x', enabled: false } }, cwd)).toBeNull()
+      expect(existsSync(join(cwd, '.kimi-code'))).toBe(false)
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
     }
   })
 })

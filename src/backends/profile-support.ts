@@ -1329,6 +1329,28 @@ function mountCwdNativeMcp(
 }
 
 /**
+ * Materialize MCP servers for Kimi Code's project-local loader.
+ *
+ * Kimi Code 0.36 reads `<cwd>/.kimi-code/mcp.json` and has no
+ * per-invocation `--mcp-config-file` option. Reuse the locked mount
+ * so request servers never leak into the next run or overwrite the
+ * user's project config after cleanup.
+ */
+export function materializeMcpServersForKimi(
+  specs: Record<string, McpServerSpec> | null,
+  cwd: string | undefined,
+): MaterializedMcpConfig | null {
+  if (!specs) return null
+  const target = requireMaterializationCwd(cwd, 'kimi MCP passthrough')
+  return mountCwdNativeMcp(target, {
+    subdir: '.kimi-code',
+    filename: 'mcp.json',
+    backendName: 'kimi-code',
+    mcpServers: buildCanonicalMcpServers(specs),
+  })
+}
+
+/**
  * Build the Gemini CLI `mcpServers` object from a normalized spec map.
  * Gemini's settings.json uses a DIFFERENT remote key than the canonical
  * shape: HTTP endpoints go under `httpUrl` (not `url`), SSE endpoints

@@ -245,8 +245,8 @@ describe('KimiBackend model parsing', () => {
     expect(b.matches('claude-code/sonnet')).toBe(false)
   })
 
-  it('omits --model for the K2.6 alias so the local default stays authoritative', () => {
-    expect(b.resolveCliModel('kimi-code/kimi-k2.6')).toBeNull()
+  it('passes every qualified model so an alias cannot silently use the local default', () => {
+    expect(b.resolveCliModel('kimi-code/kimi-k2.6')).toBe('kimi-code/kimi-k2.6')
     expect(b.resolveCliModel('kimi-code')).toBeNull()
     expect(b.resolveCliModel('kimi-code/kimi-for-coding')).toBe('kimi-code/kimi-for-coding')
   })

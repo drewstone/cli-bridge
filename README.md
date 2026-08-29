@@ -575,7 +575,7 @@ into the profile when the flag is absent.
 | ---------- | --------- | ------------ | ------------------------------------------------------------- |
 | claude     | yes       | no (caveat)  | `--mcp-config <tempfile>` (canonical `mcp-config.json` shape) |
 | codex      | yes       | yes          | `CODEX_HOME=<tempdir>` with synthesised `config.toml`         |
-| kimi       | yes       | no           | `--mcp-config-file <tempfile>` (same shape as claude)         |
+| kimi       | yes       | no           | project-local `<cwd>/.kimi-code/mcp.json` (restored after the turn) |
 | opencode   | yes       | no           | `OPENCODE_CONFIG=<tempfile>` (opencode's per-config schema)   |
 | gemini     | no        | no           | not wired until Gemini exposes/validates per-invocation MCP   |
 
@@ -583,7 +583,7 @@ into the profile when the flag is absent.
 and `env` round-trip through the materialised config file unchanged
 (verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
 
-**http/sse caveat**: claude/kimi/opencode load HTTP MCP via the
+**http/sse caveat**: claude/opencode load HTTP MCP via the
 respective CLI's separate `mcp add --transport http` registry, which
 is per-user persistent state and not safe for cli-bridge to touch on
 every request. HTTP entries you pass to those backends are dropped at

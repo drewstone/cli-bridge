@@ -44,8 +44,8 @@ export const noopJail = new NoopJail()
 
 /**
  * Expose extra host paths read-only inside an fs-jail. An fs-jail mounts a
- * FRESH tmpfs over `/tmp`, which hides a backend's runtime config (MCP config,
- * OPENCODE_CONFIG, kimi config.toml) that was materialized under the host
+ * FRESH tmpfs over `/tmp`, which hides a backend's runtime config (MCP config
+ * and OPENCODE_CONFIG) that was materialized under the host
  * `/tmp` before spawn. Backends call this with those config paths so the
  * confined CLI can still read them; the linux backend binds them read-only
  * AFTER the tmpfs, so they reappear.
