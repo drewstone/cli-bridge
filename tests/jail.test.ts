@@ -312,14 +312,6 @@ describe('auth preservation', () => {
         expect(only).toEqual(['.credentials.json', 'credentials.json', 'settings.json'])
       }
     }
-    const kimiSources = authSourcesFor('kimi-code')
-    const kimiHome = kimiSources.find((entry) => entry.jailRel === '.kimi-code')
-    expect(kimiHome).toMatchObject({
-      jailRel: '.kimi-code',
-      mode: 'seed-writable',
-      only: ['config.toml', 'credentials', 'device_id'],
-    })
-    expect(kimiSources.find((entry) => entry.jailRel === '.kimi')?.mode).toBe('seed-writable')
     // codex must be preserved too (no-MCP jailed codex would otherwise lose
     // ~/.codex) and tagged so the jail redirects CODEX_HOME at the in-jail
     // home. Seeded WRITABLE: codex writes PATH aliases + app-server state +
@@ -332,6 +324,34 @@ describe('auth preservation', () => {
       expect(envVar).toBe('CODEX_HOME')
       expect(mode).toBe('seed-writable')
       expect(only).toEqual(['auth.json', 'config.toml'])
+    }
+  })
+
+  it('authSourcesFor seeds current and legacy Kimi homes', async () => {
+    const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-kimi-home-'))
+    cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
+    await mkdir(join(fakeHome, '.kimi-code'), { recursive: true })
+    await mkdir(join(fakeHome, '.kimi'), { recursive: true })
+    const previousHome = process.env.HOME
+    process.env.HOME = fakeHome
+    try {
+      expect(authSourcesFor('kimi-code')).toEqual([
+        {
+          source: join(fakeHome, '.kimi-code'),
+          jailRel: '.kimi-code',
+          mode: 'seed-writable',
+          only: ['config.toml', 'credentials', 'device_id'],
+        },
+        {
+          source: join(fakeHome, '.kimi'),
+          jailRel: '.kimi',
+          mode: 'seed-writable',
+          only: ['config.toml', 'credentials', 'device_id'],
+        },
+      ])
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
     }
   })
 
