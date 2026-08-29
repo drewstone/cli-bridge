@@ -46,7 +46,7 @@ const cadRenderSchema = z.object({
     .min(1)
     .optional(),
   imageSize: z.tuple([z.number().int().positive(), z.number().int().positive()]).optional(),
-  defines: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  defines: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
 })
 
 type CadRenderRequest = z.infer<typeof cadRenderSchema>

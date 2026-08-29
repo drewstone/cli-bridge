@@ -11,7 +11,9 @@ import { z } from 'zod'
 import {
   AgentRunControlRefSchema,
   AgentRunCancellationRequestSchema,
+  ContextTransferRequestSchema,
   RequestedInteractionsSchema,
+  type ContextTransferRequest,
   type RequestedInteractions,
   type AgentRunCancellationRequest,
   type AgentRunControlRef,
@@ -50,6 +52,11 @@ const boundedJsonRecordSchema = retainedPublicRecordSchema
 // Retained resource and caller run ids use one Agent Interface wire contract.
 const idSchema = wireIdentifierSchema
 
+const contextTransferSchema = z.custom<ContextTransferRequest>(
+  (value) => ContextTransferRequestSchema.safeParse(value).success,
+  { message: 'context_transfer must satisfy the portable-context request contract' },
+)
+
 const createSchema = z.strictObject({
   id: idSchema.optional(),
   session_id: idSchema.optional(),
@@ -75,6 +82,7 @@ const turnSchema = z.strictObject({
   run_id: idSchema.optional(),
   provider: idSchema.optional(),
   environment_id: idSchema.optional(),
+  context_transfer: contextTransferSchema.optional(),
   interactions: boundedJsonSchema.optional(),
   context: boundedJsonRecordSchema.optional(),
   provider_options: boundedJsonRecordSchema.optional(),

@@ -90,9 +90,23 @@ const capabilities: AgentEnvironmentCapabilities = {
 }
 
 const conditionListeners = new Set<() => void>()
+let notifyingConditions = false
+let conditionNotificationPending = false
 
 function notifyConditionChanged(): void {
-  for (const listener of [...conditionListeners]) listener()
+  if (notifyingConditions) {
+    conditionNotificationPending = true
+    return
+  }
+  notifyingConditions = true
+  try {
+    do {
+      conditionNotificationPending = false
+      for (const listener of [...conditionListeners]) listener()
+    } while (conditionNotificationPending)
+  } finally {
+    notifyingConditions = false
+  }
 }
 
 class FakeNative implements NativeSession {

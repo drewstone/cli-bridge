@@ -1,6 +1,6 @@
 /** Public value shapes of the retained-session surface. */
 
-import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
+import type { AgentEnvironmentCapabilities, AgentProfile } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../../backends/registry.js'
 import type { RunRegistry, RunSnapshot } from '../../runs/registry.js'
 import type { RetainedSessionRecord, RetainedSessionStatus, SessionStore } from '../store.js'
@@ -88,4 +88,14 @@ export interface RetainedSessionServiceOptions {
   inputQueueMaxDepth?: number
   inputQueueTimeoutMs?: number
   healthProbeTimeoutMs?: number
+}
+
+export interface RetainedContextTransferDestination {
+  provider: string
+  environmentId: string
+  sessionId: string
+  runId: string
+  executionId: string
+  model: string
+  profile: AgentProfile | undefined
 }

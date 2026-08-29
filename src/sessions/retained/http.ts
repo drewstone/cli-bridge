@@ -37,6 +37,42 @@ export function mountRetainedSessions(
     }
   })
 
+  app.post('/v1/context-transfers', async (c) => {
+    try {
+      const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
+      const result = await service.transferContext(await readBoundedJson(c.req.raw), caller, c.req.raw.signal)
+      return c.json(result, result.status === 'conflict' ? 409 : 200)
+    } catch (error) {
+      return retainedError(c, error)
+    }
+  })
+
+  app.get('/v1/context-transfers/:operationId', (c) => {
+    try {
+      const requestDigest = c.req.query('request_digest')
+      if (!requestDigest) {
+        throw new RetainedSessionError('request_digest query parameter is required', 400, 'invalid_request_error')
+      }
+      const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
+      const result = service.lookupContextTransfer(c.req.param('operationId'), requestDigest, caller)
+      if (!result) return c.json({ error: { message: 'context transfer not found', type: 'not_found_error' } }, 404)
+      return c.json(result, result.status === 'conflict' ? 409 : 200)
+    } catch (error) {
+      return retainedError(c, error)
+    }
+  })
+
+  app.get('/v1/context-transfer-environments/:environmentId', (c) => {
+    try {
+      const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
+      const result = service.lookupContextTransferByEnvironment(c.req.param('environmentId'), caller)
+      if (!result) return c.json({ error: { message: 'context transfer environment not found', type: 'not_found_error' } }, 404)
+      return c.json(result, 200)
+    } catch (error) {
+      return retainedError(c, error)
+    }
+  })
+
   if (options.includeSessionList !== false) {
     app.get('/v1/sessions', (c) => {
       const limit = parseLimit(c.req.query('limit'))
@@ -56,6 +92,7 @@ export function mountRetainedSessions(
     try {
       const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await readBoundedJson(c.req.raw)), {
         signal: c.req.raw.signal,
+        callerId: canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback'),
       })
       return c.json(
         { session: service.get(c.req.param('id')), run: result.run, context_boundary: result.contextBoundary },
@@ -98,6 +135,7 @@ export function mountRetainedSessions(
       const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await readBoundedJson(c.req.raw)), {
         queue: true,
         signal: c.req.raw.signal,
+        callerId: canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback'),
       })
       return c.json(
         { session: service.get(c.req.param('id')), run: result.run, context_boundary: result.contextBoundary },

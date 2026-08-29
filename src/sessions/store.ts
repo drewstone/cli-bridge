@@ -109,7 +109,11 @@ export type RetainedRunClaim =
   | { kind: 'created' | 'replayed'; admission: RetainedRunAdmission }
   | { kind: 'conflict'; admission: RetainedRunAdmission }
 
-export type RetainedControlOperationKind = 'steer' | 'cancel' | 'native_continuation'
+export type RetainedControlOperationKind =
+  | 'steer'
+  | 'cancel'
+  | 'native_continuation'
+  | 'context_transfer'
 
 export interface StoredRetainedControlOperation {
   operationId: string
@@ -120,6 +124,10 @@ export interface StoredRetainedControlOperation {
   requestDigest: string
   acknowledgement: Record<string, unknown>
 }
+
+export type ContextTransferOperationClaim =
+  | { kind: 'created' | 'existing'; operation: StoredRetainedControlOperation }
+  | { kind: 'coordinate_conflict'; operation: StoredRetainedControlOperation }
 
 export interface SessionExecutionLease {
   release(): void
@@ -1147,6 +1155,48 @@ export class SessionStore implements RetainedInteractionPersistence {
     return inserted.changes === 1
   }
 
+  /** Claim one portable-context operation and every destination coordinate atomically. */
+  claimContextTransferOperation(
+    operation: StoredRetainedControlOperation,
+    destination: { environmentId: string; executionId: string },
+  ): ContextTransferOperationClaim {
+    if (operation.kind !== 'context_transfer') {
+      throw new Error('context transfer claim requires a context_transfer operation')
+    }
+    return this.db.transaction((): ContextTransferOperationClaim => {
+      const existing = this.getRetainedControlOperation(operation.operationId)
+      if (existing) return { kind: 'existing', operation: existing }
+      const collision = this.db.prepare(
+        `SELECT * FROM retained_control_operations
+         WHERE kind = 'context_transfer'
+           AND (
+             run_id = ? OR session_id = ?
+             OR json_extract(acknowledgement_json, '$.binding.destination.environmentId') = ?
+             OR json_extract(acknowledgement_json, '$.binding.destination.executionId') = ?
+           )
+         ORDER BY created_at ASC
+         LIMIT 1`,
+      ).get(
+        operation.runId,
+        operation.sessionId,
+        destination.environmentId,
+        destination.executionId,
+      ) as Record<string, unknown> | undefined
+      if (collision) {
+        return {
+          kind: 'coordinate_conflict',
+          operation: hydrateRetainedControlOperation(collision),
+        }
+      }
+      if (!this.recordRetainedControlOperation(operation)) {
+        const raced = this.getRetainedControlOperation(operation.operationId)
+        if (!raced) throw new Error('context transfer claim disappeared during admission')
+        return { kind: 'existing', operation: raced }
+      }
+      return { kind: 'created', operation }
+    })()
+  }
+
   updateRetainedControlOperation(
     operationId: string,
     requestDigest: string,
@@ -1169,15 +1219,19 @@ export class SessionStore implements RetainedInteractionPersistence {
       'SELECT * FROM retained_control_operations WHERE operation_id = ?',
     ).get(operationId) as Record<string, unknown> | undefined
     if (!row) return null
-    return {
-      operationId: row.operation_id as string,
-      callerId: row.caller_id as string,
-      kind: row.kind as RetainedControlOperationKind,
-      runId: row.run_id as string,
-      sessionId: row.session_id as string,
-      requestDigest: row.request_digest as string,
-      acknowledgement: JSON.parse(row.acknowledgement_json as string) as Record<string, unknown>,
-    }
+    return hydrateRetainedControlOperation(row)
+  }
+
+  /** Recover the transfer that reserved one caller-owned destination environment. */
+  findContextTransferByEnvironmentId(environmentId: string): StoredRetainedControlOperation | null {
+    const row = this.db.prepare(
+      `SELECT * FROM retained_control_operations
+       WHERE kind = 'context_transfer'
+         AND json_extract(acknowledgement_json, '$.binding.destination.environmentId') = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+    ).get(environmentId) as Record<string, unknown> | undefined
+    return row ? hydrateRetainedControlOperation(row) : null
   }
 
   findInteraction(sessionId: string, interactionId: string): InteractionRequest | null {
@@ -1312,6 +1366,20 @@ export class SessionStore implements RetainedInteractionPersistence {
         event: JSON.parse(row.event_json as string),
       },
     }
+  }
+}
+
+function hydrateRetainedControlOperation(
+  row: Record<string, unknown>,
+): StoredRetainedControlOperation {
+  return {
+    operationId: row.operation_id as string,
+    callerId: row.caller_id as string,
+    kind: row.kind as RetainedControlOperationKind,
+    runId: row.run_id as string,
+    sessionId: row.session_id as string,
+    requestDigest: row.request_digest as string,
+    acknowledgement: JSON.parse(row.acknowledgement_json as string) as Record<string, unknown>,
   }
 }
 

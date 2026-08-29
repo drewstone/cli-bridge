@@ -1,7 +1,7 @@
 {
   "name": "cli-bridge",
   "version": "0.3.0",
-  "description": "Expose your local coding-CLI subscriptions (Claude Code, Codex, Kimi via opencode, \u2026) as an OpenAI-compatible HTTP API with persistent session resume. Personal tool \u2014 single-user by default.",
+  "description": "Expose your local coding-CLI subscriptions (Claude Code, Codex, Kimi via opencode, …) as an OpenAI-compatible HTTP API with persistent session resume. Personal tool — single-user by default.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -23,19 +23,19 @@
     "docker:build:runtime": "docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest ."
   },
   "dependencies": {
-    "@hono/node-server": "^1.13.0",
+    "@hono/node-server": "^2.1.1",
     "@tangle-network/agent-interface": "1.8.0",
-    "@tangle-network/agent-profile-materialize": "0.16.0",
+    "@tangle-network/agent-profile-materialize": "0.17.1",
     "@tangle-network/agent-trace-contract": "^1.0.2",
-    "better-sqlite3": "^12.0.0",
-    "hono": "^4.9.0",
-    "zod": "^3.24.0"
+    "better-sqlite3": "^13.0.3",
+    "hono": "^4.13.5",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
-    "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.7.0",
-    "vitest": "^2.0.0"
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
   }
 }

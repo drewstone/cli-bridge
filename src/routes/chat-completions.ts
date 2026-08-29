@@ -20,7 +20,9 @@ import { z } from 'zod'
 import {
   canonicalAgentProfileDigest,
   canonicalCandidateDigest,
+  ContextTransferRequestSchema,
   RequestedInteractionsSchema,
+  type ContextTransferRequest,
   type RequestedInteractions,
 } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../backends/registry.js'
@@ -73,7 +75,7 @@ import {
   retainedExecutionSchema,
   retainedPublicRecordSchema,
 } from '../sessions/retained/contract.js'
-import { ENVIRONMENT_ID } from '../sessions/retained/types.js'
+import { ENVIRONMENT_ID, RetainedSessionError } from '../sessions/retained/types.js'
 import { wireIdentifierSchema } from '../runs/identifiers.js'
 import { retainedRunSnapshot, unknownRunSnapshot } from '../sessions/retained/state.js'
 import type { RetainedEventRecord } from '../sessions/store.js'
@@ -99,12 +101,16 @@ class SandboxBackendUnavailableError extends Error {
 // no deadline.
 const maxExecutionTimeoutMs = 2_147_483_647
 
-// cli-bridge currently uses Zod 3 while Agent Interface publishes Zod 4.
-// Validate through the shared schema instead of embedding a foreign Zod
-// object inside the route's Zod 3 object.
+// Validate through the shared schema without coupling this route parser to a
+// separately installed Agent Interface schema instance.
 const requestedInteractionsSchema = z.custom<RequestedInteractions>(
   (value) => RequestedInteractionsSchema.safeParse(value).success,
   { message: 'interactions must be a bounded boolean map' },
+)
+
+const contextTransferSchema = z.custom<ContextTransferRequest>(
+  (value) => ContextTransferRequestSchema.safeParse(value).success,
+  { message: 'context_transfer must satisfy the portable-context request contract' },
 )
 
 const chatRequestSchema = z.object({
@@ -173,6 +179,7 @@ const chatRequestSchema = z.object({
   environment_id: z.string().optional(),
   /** Exact durable-run execution coordinate. Must be paired with the other exact coordinates. */
   execution_id: z.string().optional(),
+  context_transfer: contextTransferSchema.optional(),
   /**
    * Durable-run id. Decouples the JOB from this HTTP connection. A
    * client disconnect never kills the run; a reconnect/retry that reuses
@@ -210,7 +217,7 @@ const chatRequestSchema = z.object({
    * same shape). Body wins on conflict.
    */
   mcp: z.object({
-    mcpServers: z.record(z.unknown()).optional(),
+    mcpServers: z.record(z.string(), z.unknown()).optional(),
   }).passthrough().optional(),
   /**
    * Runtime-owned MCP attachments mounted OUTSIDE the session-bound
@@ -219,7 +226,7 @@ const chatRequestSchema = z.object({
    * identity. See ChatRequest.runtime_attachments.
    */
   runtime_attachments: z.strictObject({
-    mcp: z.record(z.unknown()),
+    mcp: z.record(z.string(), z.unknown()),
   }).optional(),
   cwd: z.string().optional(),
   metadata: retainedPublicRecordSchema.optional(),
@@ -381,6 +388,22 @@ export function mountChatCompletions(
     netJail?: NetJailRegistry
     /** Emits one conforming span per request. Absent = no tracing. */
     trace?: TraceEmitter
+    /** Durable context admission shared with retained-session execution. */
+    contextTransfers?: {
+      contextMessages: (
+        value: unknown,
+        callerId: string,
+        destination: {
+          provider: string
+          environmentId: string
+          sessionId: string
+          runId: string
+          executionId: string
+          model: string
+          profile: import('@tangle-network/agent-interface').AgentProfile | undefined
+        },
+      ) => ChatRequest['messages']
+    }
   },
 ): void {
   app.post('/v1/chat/completions', async (c) => {
@@ -449,6 +472,7 @@ export function mountChatCompletions(
       provider,
       environment_id,
       execution_id,
+      context_transfer,
       ...rest
     } = parsed.data
     const sessionResult = resolveSessionId({
@@ -653,6 +677,31 @@ export function mountChatCompletions(
         ...(tangleSource ? { tangleSource } : {}),
         ...(forwardedAuthz ? { forwardedAuthorization: forwardedAuthz } : {}),
       },
+    }
+
+    if (context_transfer !== undefined) {
+      if (!deps.contextTransfers || !exactCoordinates.value) {
+        return invalidRequest(c, 'context transfer requires an exact provider, environment, session, run, and execution')
+      }
+      try {
+        const profile = resolveAgentProfile(req, persistedSession)
+        const messages = deps.contextTransfers.contextMessages(
+          context_transfer,
+          canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback'),
+          {
+            provider: exactCoordinates.value.provider,
+            environmentId: exactCoordinates.value.environmentId,
+            sessionId: exactCoordinates.value.sessionId,
+            runId,
+            executionId: exactCoordinates.value.executionId,
+            model: req.model,
+            profile: profile ?? undefined,
+          },
+        )
+        req.messages = [...messages, ...req.messages]
+      } catch (error) {
+        return errorResponse(c, error)
+      }
     }
 
     if (req.session_id) {
@@ -1662,6 +1711,12 @@ function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_
 }
 
 function errorResponse(c: Context, err: unknown): Response {
+  if (err instanceof RetainedSessionError) {
+    return c.json(
+      { error: { message: err.message, type: err.code } },
+      err.status as 400 | 404 | 409 | 500,
+    )
+  }
   if (err instanceof SessionIdentityConflictError) return sessionIdentityConflict(c, err)
   if (err instanceof SessionProfileBindingConflictError) return sessionProfileBindingConflict(c, err)
   if (err instanceof ExecutorSaturatedError) return executorSaturated(c, err)
