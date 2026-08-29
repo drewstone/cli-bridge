@@ -14,6 +14,7 @@ import {
   normalizeInputParts,
   type NativeContextBoundaryProof,
   type InteractionRequest,
+  type AgentProfile,
   type RequestedInteractions,
 } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../../backends/registry.js'
@@ -39,6 +40,7 @@ import {
 import { commitCompletedTurn, recoverFailedTurnAdmission } from './turn-commit.js'
 import type { TurnLaneOptions, TurnLanes } from './turn-lane.js'
 import { ENVIRONMENT_ID, RetainedSessionError, type RetainedTurnResult } from './types.js'
+import type { RetainedContextTransfers } from './context-transfer.js'
 
 export interface RetainedTurnRunnerOptions {
   store: SessionStore
@@ -52,9 +54,12 @@ export interface RetainedTurnRunnerOptions {
     request: InteractionRequest
     nativeId: string
   }) => Promise<void>
+  contextTransfers: RetainedContextTransfers
 }
 
 export interface RetainedBeginTurnOptions extends TurnLaneOptions {
+  /** Digest of the authenticated bridge caller that owns context admission. */
+  callerId?: string
   /** Native continuation callers must compare this inside the turn owner. */
   expectedContextBoundary?: NativeContextBoundaryProof
   /** Report the source proof observed during the same native handoff check. */
@@ -69,6 +74,7 @@ export class RetainedTurnRunner {
   private readonly lanes: TurnLanes
   private readonly isClosing: (id: string) => boolean
   private readonly denyUnrequestedInteraction: RetainedTurnRunnerOptions['denyUnrequestedInteraction']
+  private readonly contextTransfers: RetainedContextTransfers
   /** In-flight durable commits, keyed by run id. */
   private readonly finalizations = new Map<string, Promise<void>>()
 
@@ -80,6 +86,7 @@ export class RetainedTurnRunner {
     this.lanes = options.lanes
     this.isClosing = options.isClosing
     this.denyUnrequestedInteraction = options.denyUnrequestedInteraction
+    this.contextTransfers = options.contextTransfers
   }
 
   async beginTurn(id: string, input: RetainedTurnInput, options: RetainedBeginTurnOptions = {}): Promise<RetainedTurnResult> {
@@ -192,6 +199,21 @@ export class RetainedTurnRunner {
     const interactions = admittedTurnInteractions(retained.capabilities, input.interactions)
     const providerName = input.provider ?? ENVIRONMENT_ID
     const environmentId = input.environment_id ?? ENVIRONMENT_ID
+    const contextMessages = input.context_transfer === undefined
+      ? []
+      : this.contextTransfers.messagesForTurn(
+          input.context_transfer,
+          options.callerId ?? canonicalCandidateDigest('loopback'),
+          {
+            provider: providerName,
+            environmentId,
+            sessionId: id,
+            runId,
+            executionId,
+            model: retained.model,
+            profile: config.profile as AgentProfile | undefined,
+          },
+        )
     const requestDigest = canonicalCandidateDigest({
       sessionId: id,
       runId,
@@ -209,6 +231,7 @@ export class RetainedTurnRunner {
       context: config.context ?? null,
       providerOptions: config.providerOptions ?? null,
       metadata: config.metadata,
+      contextTransfer: input.context_transfer ?? null,
     })
     if (retained.runId && this.state.hasFinalizationFailure(retained.runId)) {
       throw new RetainedSessionError(
@@ -348,7 +371,7 @@ export class RetainedTurnRunner {
       this.store.updateRetainedRun(runId, requestDigest, run.snapshot())
       this.store.updateRetained(id, { status: 'running', runId })
       releaseNativeAttachment = run.reserveNativeControlAttachment()
-      const request = this.requestFor(retained, input, prompt, interactions, config)
+      const request = this.requestFor(retained, input, prompt, interactions, config, contextMessages)
       try {
         if (!native) {
           native = await backend.startNativeSession(request, sessionRecordFor(retained), run.signal)
@@ -517,11 +540,12 @@ export class RetainedTurnRunner {
     prompt: string,
     interactions: RequestedInteractions,
     config: RetainedRequestConfig,
+    contextMessages: ChatRequest['messages'],
   ): ChatRequest {
     const mode = record.metadata.mode
     return {
       model: record.model,
-      messages: [{
+      messages: [...contextMessages, {
         role: 'user',
         content: input.parts ? normalizeInputParts({ message: input.message, parts: input.parts }) : prompt,
       }],

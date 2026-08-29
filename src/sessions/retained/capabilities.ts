@@ -125,6 +125,11 @@ export function genericCliBridgeCapabilities(_backendName?: string): AgentEnviro
       eventIdentity: true,
       cancellationIdempotency: true,
     },
+    contextTransfer: {
+      freshSession: true,
+      requestIdempotency: true,
+      lookup: true,
+    },
     workspace: {
       read: false,
       write: false,
@@ -168,7 +173,10 @@ function assertGenericDurableCapabilities(capabilities: AgentEnvironmentCapabili
     capabilities.retainedControl?.exactRunIdentity !== true ||
     capabilities.retainedControl.resultIdentity !== true ||
     capabilities.retainedControl.eventIdentity !== true ||
-    capabilities.retainedControl.cancellationIdempotency !== true
+    capabilities.retainedControl.cancellationIdempotency !== true ||
+    capabilities.contextTransfer?.freshSession !== true ||
+    capabilities.contextTransfer.requestIdempotency !== true ||
+    capabilities.contextTransfer.lookup !== true
   ) {
     throw new RetainedSessionError(
       'Bridge generic durable capabilities are incomplete',
@@ -202,7 +210,14 @@ async function assertReady(backend: Backend, healthProbeTimeoutMs: number, signa
 }
 
 function validatedNativeCapabilities(backend: NativeSessionBackend): AgentEnvironmentCapabilities {
-  const validated = AgentEnvironmentCapabilitiesSchema.safeParse(nativeCapabilities(backend))
+  const validated = AgentEnvironmentCapabilitiesSchema.safeParse({
+    ...nativeCapabilities(backend),
+    contextTransfer: {
+      freshSession: true,
+      requestIdempotency: true,
+      lookup: true,
+    },
+  })
   if (!validated.success) {
     throw new RetainedSessionError('backend advertised invalid Agent Interface capabilities', 500, 'server_error')
   }
@@ -231,6 +246,9 @@ function assertRetainedCapabilities(capabilities: AgentEnvironmentCapabilities, 
     capabilities.retainedControl.resultIdentity !== true ||
     capabilities.retainedControl.eventIdentity !== true ||
     capabilities.retainedControl.cancellationIdempotency !== true ||
+    capabilities.contextTransfer?.freshSession !== true ||
+    capabilities.contextTransfer.requestIdempotency !== true ||
+    capabilities.contextTransfer.lookup !== true ||
     !capabilities.sessions.continue ||
     !capabilities.sessions.list ||
     !capabilities.sessions.messages ||

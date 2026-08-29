@@ -8,6 +8,7 @@ import type { Backend, BackendHealth } from './types.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 3_500
+const DEFAULT_RETAINED_HEALTH_PROBE_TIMEOUT_MS = 15_000
 
 /** Run one backend health probe with a bounded caller-owned wait. */
 export async function boundedProbe(
@@ -101,6 +102,14 @@ export function resolveHealthProbeTimeoutMs(): number {
   if (raw === undefined) return DEFAULT_HEALTH_PROBE_TIMEOUT_MS
   const value = Number(raw)
   return Number.isFinite(value) && value >= 0 ? value : DEFAULT_HEALTH_PROBE_TIMEOUT_MS
+}
+
+/** Retained admission tolerates CLI cold starts without weakening /health's watchdog. */
+export function resolveRetainedHealthProbeTimeoutMs(): number {
+  const raw = process.env.BRIDGE_RETAINED_HEALTH_PROBE_TIMEOUT_MS
+  if (raw === undefined) return DEFAULT_RETAINED_HEALTH_PROBE_TIMEOUT_MS
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_RETAINED_HEALTH_PROBE_TIMEOUT_MS
 }
 
 /**

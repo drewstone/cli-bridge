@@ -620,7 +620,7 @@ function speak(port: number, payload: Buffer): Promise<{ closed: boolean; body: 
   return new Promise((resolve, reject) => {
     const socket = connect(port, '127.0.0.1', () => socket.write(payload))
     const chunks: Buffer[] = []
-    socket.on('data', (c) => chunks.push(c))
+    socket.on('data', (chunk) => chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk))
     socket.on('close', () => resolve({ closed: true, body: Buffer.concat(chunks).toString('utf8') }))
     socket.on('error', (error: NodeJS.ErrnoException) => {
       // A refused connection reads as ECONNRESET on some kernels; that is the

@@ -10,10 +10,11 @@ import {
   AgentEnvironmentCapabilitiesSchema,
   canonicalCandidateDigest,
   type AgentEnvironmentCapabilities,
+  type ContextTransferResult,
 } from '@tangle-network/agent-interface'
 import type { Backend, NativeSessionBackend } from '../backends/types.js'
 import type { BackendRegistry } from '../backends/registry.js'
-import { boundedProbe, resolveHealthProbeTimeoutMs } from '../backends/health.js'
+import { boundedProbe, resolveRetainedHealthProbeTimeoutMs } from '../backends/health.js'
 import {
   type RetainedSessionRecord,
   type RetainedSessionStatus,
@@ -42,6 +43,7 @@ import { RetainedEvents } from './retained/events.js'
 import { RetainedInteractions } from './retained/interactions.js'
 import { TurnLanes } from './retained/turn-lane.js'
 import { RetainedTurnRunner } from './retained/turns.js'
+import { RetainedContextTransfers } from './retained/context-transfer.js'
 import {
   parseNativeContinuation,
   RetainedNativeContinuation,
@@ -55,6 +57,7 @@ import {
   type RetainedSessionServiceOptions,
   type RetainedSessionView,
   type RetainedTurnResult,
+  type RetainedContextTransferDestination,
 } from './retained/types.js'
 
 const DEFAULT_INPUT_QUEUE_MAX_DEPTH = 16
@@ -71,13 +74,14 @@ export class RetainedSessionService {
   private readonly events: RetainedEvents
   private readonly interactions: RetainedInteractions
   private readonly nativeContinuation: RetainedNativeContinuation
+  private readonly contextTransfers: RetainedContextTransfers
   private readonly closures = new Set<string>()
 
   constructor(options: RetainedSessionServiceOptions) {
     this.store = options.store
     this.registry = options.registry
     this.runs = options.runs
-    this.healthProbeTimeoutMs = options.healthProbeTimeoutMs ?? resolveHealthProbeTimeoutMs()
+    this.healthProbeTimeoutMs = options.healthProbeTimeoutMs ?? resolveRetainedHealthProbeTimeoutMs()
     const maxDepth =
       options.inputQueueMaxDepth ??
       parseNonNegativeEnv('BRIDGE_RETAINED_INPUT_MAX_QUEUE', DEFAULT_INPUT_QUEUE_MAX_DEPTH)
@@ -92,6 +96,11 @@ export class RetainedSessionService {
 
     this.state = new RetainedSessionState(this.store, this.runs)
     this.interactions = new RetainedInteractions(this.store, this.runs)
+    this.contextTransfers = new RetainedContextTransfers(
+      this.store,
+      this.registry,
+      this.healthProbeTimeoutMs,
+    )
     this.turns = new RetainedTurnRunner({
       store: this.store,
       registry: this.registry,
@@ -100,6 +109,7 @@ export class RetainedSessionService {
       lanes: new TurnLanes(maxDepth, timeoutMs),
       isClosing: (id) => this.closures.has(id),
       denyUnrequestedInteraction: (input) => this.interactions.denyUnrequestedInteraction(input),
+      contextTransfers: this.contextTransfers,
     })
     this.control = new RetainedControl(this.store, this.runs, this.state)
     this.events = new RetainedEvents(this.store, this.runs, this.state)
@@ -278,9 +288,36 @@ export class RetainedSessionService {
   beginTurn(
     id: string,
     input: RetainedTurnInput,
-    options: { queue?: boolean; signal?: AbortSignal } = {},
+    options: { queue?: boolean; signal?: AbortSignal; callerId?: string } = {},
   ): Promise<RetainedTurnResult> {
     return this.turns.beginTurn(id, input, options)
+  }
+
+  transferContext(value: unknown, callerId: string, signal?: AbortSignal): Promise<ContextTransferResult> {
+    return this.contextTransfers.transfer(value, callerId, signal)
+  }
+
+  lookupContextTransfer(
+    operationId: string,
+    requestDigest: string,
+    callerId: string,
+  ): ContextTransferResult | null {
+    return this.contextTransfers.lookup(operationId, requestDigest, callerId)
+  }
+
+  lookupContextTransferByEnvironment(
+    environmentId: string,
+    callerId: string,
+  ): ContextTransferResult | null {
+    return this.contextTransfers.lookupByEnvironment(environmentId, callerId)
+  }
+
+  contextMessages(
+    value: unknown,
+    callerId: string,
+    destination: RetainedContextTransferDestination,
+  ): import('../backends/types.js').ChatMessage[] {
+    return this.contextTransfers.messagesForTurn(value, callerId, destination)
   }
 
   continueNative(
