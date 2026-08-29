@@ -86,9 +86,17 @@ export class RetainedTurnRunner {
     if (!input.run_id) {
       throw new RetainedSessionError('retained turns require a stable run_id', 400, 'invalid_request_error')
     }
-    this.state.require(id)
+    const retained = this.state.require(id)
     const control = this.runs.nativeSession(id)
-    if (!options.queue && ((control && !control.run.snapshot().terminal) || this.lanes.isActive(id))) {
+    const executionActive =
+      (control && !control.run.snapshot().terminal) ||
+      (this.lanes.isActive(id) && retained.status === 'running')
+    if (!options.queue && executionActive) {
+      // A retry for an admitted run is read-only. Resolve it before the lane
+      // check so the same operation remains idempotent during finalization.
+      if (this.runs.get(input.run_id) || this.store.getRetainedRun(input.run_id)) {
+        return this.beginTurnNow(id, input, options)
+      }
       throw new RetainedSessionError(
         'a turn is already active; use the steering endpoint for active-run input',
         409,

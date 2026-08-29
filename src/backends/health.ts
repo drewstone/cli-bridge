@@ -185,10 +185,13 @@ export async function versionHealth(
       return { name, state: 'unavailable', detail: `spawn failed: ${closed.spawnFailure}` }
     }
     if (closed.code === 0) {
+      // Some runners, including Prime Agent 0.7.0, write `--version` to stderr.
+      // Exit status still owns readiness; use stderr only when stdout is empty.
+      const version = closed.stdout.trim() || closed.stderr.trim() || undefined
       return {
         name,
         state: 'ready',
-        version: closed.stdout.trim() || undefined,
+        version,
         ...(readyDetail ? { detail: readyDetail } : {}),
       }
     }

@@ -70,6 +70,7 @@ const capabilities: AgentEnvironmentCapabilities = {
   nativeContinuation: {
     atomicBoundary: true,
     requestIdempotency: true,
+    admissionControl: true,
   },
   sessions: { continue: true, list: true, messages: true },
   interactions: {
@@ -498,7 +499,7 @@ class DeferredSecondTurnNative extends FakeNative {
   override async *turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
     if (this.prompts.length === 1) {
       this.signalSecondTurnStarted()
-      await this.secondTurnReady
+      await Promise.race([this.secondTurnReady, waitForAbort(signal)])
     }
     yield* super.turn(prompt, signal)
   }
@@ -1981,6 +1982,7 @@ describe('retained Agent Interface sessions', () => {
     expect(createdBody.capabilities.nativeContinuation).toMatchObject({
       atomicBoundary: true,
       requestIdempotency: true,
+      admissionControl: true,
     })
     expect(fixture.store.getRetained('s1')?.metadata.agent_profile).toEqual(profile)
     const listed = await fixture.app.request('/v1/sessions')
@@ -4219,6 +4221,105 @@ describe('retained Agent Interface sessions', () => {
     expect(secondOutcome.controlRef.runId).toBe(nativeContinuationRunId(secondInput.request.operationId))
     expect(agentNativeContextContinuationResultMatchesRequest(secondInput.request, secondOutcome)).toBe(true)
     expect(backend.natives[0]!.prompts).toEqual(['first', 'second', 'third'])
+  })
+
+  it('returns exact continuation admission before terminal output so the run can be cancelled', async () => {
+    const native = new DeferredSecondTurnNative()
+    fixture = setup(new FakeNativeBackend(() => native))
+    const created = await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'native-admission', model: 'pi/test' }),
+    })
+    expect(created.status).toBe(201)
+    const firstTurn = await fixture.app.request('/v1/sessions/native-admission/turns', {
+      method: 'POST',
+      body: turnBody('native-admission-first', { message: 'first' }),
+    })
+    expect(firstTurn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('native-admission')?.turns === 1)
+    const expectedBoundary = fixture.store.getRetained('native-admission')
+      ?.contextBoundary as NativeContextBoundaryProof
+    const input = nativeContinuationRequest(
+      fixture,
+      'native-admission',
+      'native-admission-operation',
+      'second',
+      expectedBoundary,
+    )
+
+    const admittedResponse = await fixture.app.request(
+      '/v1/sessions/native-admission/continue?return=admission',
+      { method: 'POST', body: nativeContinuationBody(input) },
+    )
+    expect(admittedResponse.status).toBe(202)
+    expect(admittedResponse.headers.get('location')).toBe(
+      `/v1/runs/${encodeURIComponent(nativeContinuationRunId(input.request.operationId))}`,
+    )
+    expect(admittedResponse.headers.get('x-run-id')).toBe(
+      nativeContinuationRunId(input.request.operationId),
+    )
+    const admitted = await json(admittedResponse)
+    expect(admitted).toMatchObject({
+      phase: 'admitted',
+      acknowledgement: {
+        operationId: input.request.operationId,
+        requestDigest: input.request.requestDigest,
+        historyMessagesSent: 0,
+        actualBoundary: {
+          ...input.request.run,
+          boundary: expectedBoundary.boundary,
+        },
+      },
+      controlRef: {
+        runId: nativeContinuationRunId(input.request.operationId),
+        provider: input.request.run.provider,
+        environmentId: input.request.run.environmentId,
+        sessionId: 'native-admission',
+      },
+    })
+    const replayedAdmissionResponse = await fixture.app.request(
+      '/v1/sessions/native-admission/continue?return=admission',
+      { method: 'POST', body: nativeContinuationBody(input) },
+    )
+    expect(replayedAdmissionResponse.status).toBe(202)
+    expect(await json(replayedAdmissionResponse)).toEqual(admitted)
+    await native.secondTurnStarted
+    expect(fixture.store.getRetainedRun(admitted.controlRef.runId)?.snapshot).toMatchObject({
+      terminal: false,
+      status: 'running',
+    })
+
+    const cancellation = await fixture.app.request(
+      '/v1/sessions/native-admission/cancel?wait_ms=1000',
+      {
+        method: 'POST',
+        body: cancellationBody(fixture, 'native-admission', 'native-admission-cancel'),
+      },
+    )
+    expect(cancellation.status).toBe(200)
+    expect(await json(cancellation)).toMatchObject({ status: 'accepted', effect: 'cancelled' })
+
+    const terminalResponse = await fixture.app.request('/v1/sessions/native-admission/continue', {
+      method: 'POST',
+      body: nativeContinuationBody(input),
+    })
+    expect(terminalResponse.status).toBe(200)
+    const terminal = successfulNativeOutcome(
+      AgentNativeContextContinuationResultSchema.parse(await json(terminalResponse)),
+    )
+    expect(terminal.controlRef).toEqual(admitted.controlRef)
+    expect(terminal.result).toMatchObject({ success: false })
+    expect(fixture.store.getRetainedRun(admitted.controlRef.runId)?.snapshot).toMatchObject({
+      terminal: true,
+      status: 'cancelled',
+    })
+
+    const recoveredAdmissionResponse = await fixture.app.request(
+      '/v1/sessions/native-admission/continue?return=admission',
+      { method: 'POST', body: nativeContinuationBody(input) },
+    )
+    expect(recoveredAdmissionResponse.status).toBe(202)
+    expect(await json(recoveredAdmissionResponse)).toEqual(admitted)
   })
 
   it('rejects an empty native continuation before dispatch', async () => {

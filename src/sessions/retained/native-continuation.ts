@@ -8,15 +8,18 @@
 
 import {
   AgentExactRunControlRefSchema,
+  AgentNativeContextContinuationAdmissionSchema,
   AgentNativeContextContinuationResultSchema,
   AgentTurnResultSchema,
   NativeContextBoundaryProofSchema,
   NativeContextContinuationRequestSchema,
   NativeContextContinuationTurnSchema,
+  agentNativeContextContinuationAdmissionMatchesRequest,
   agentNativeContextContinuationResultMatchesRequest,
   canonicalCandidateDigest,
   nativeContextContinuationTurnDigest,
   type AgentEnvironmentEvent,
+  type AgentNativeContextContinuationAdmission,
   type AgentNativeContextContinuationResult,
   type AgentTurnResult,
   type NativeContextBoundaryProof,
@@ -42,6 +45,16 @@ export interface NativeContinuationResult {
   outcome: AgentNativeContextContinuationResult
   status: 200 | 400 | 404 | 409 | 501 | 502
 }
+
+/** Exact continued-run identity returned after durable admission, before terminal output. */
+export interface NativeContinuationAdmissionResult {
+  outcome: AgentNativeContextContinuationAdmission
+  status: 202
+}
+
+export type NativeContinuationResponse =
+  | NativeContinuationResult
+  | NativeContinuationAdmissionResult
 
 interface NativeContinuationOptions {
   store: SessionStore
@@ -104,6 +117,7 @@ export class RetainedNativeContinuation {
     sessionId: string
     runId: string
     promise: Promise<NativeContinuationResult>
+    admission: Promise<NativeContinuationResponse>
   }>()
 
   constructor(options: NativeContinuationOptions) {
@@ -118,8 +132,8 @@ export class RetainedNativeContinuation {
     sessionId: string,
     request: NativeContextContinuationRequest,
     turn: NativeContextContinuationTurn,
-    options: { signal?: AbortSignal; callerId?: string } = {},
-  ): Promise<NativeContinuationResult> {
+    options: { signal?: AbortSignal; callerId?: string; returnOnAdmission?: boolean } = {},
+  ): Promise<NativeContinuationResponse> {
     const runId = continuationRunId(request.operationId)
     const callerId = options.callerId ?? canonicalCandidateDigest('loopback')
     const existingFlight = this.inFlight.get(request.operationId)
@@ -130,7 +144,7 @@ export class RetainedNativeContinuation {
         existingFlight.sessionId === sessionId &&
         existingFlight.runId === runId
       ) {
-        return existingFlight.promise
+        return options.returnOnAdmission ? existingFlight.admission : existingFlight.promise
       }
       return this.conflict(request, sessionId, runId, existingFlight.requestDigest)
     }
@@ -139,6 +153,10 @@ export class RetainedNativeContinuation {
     if (existing) {
       const mismatch = this.operationMismatch(existing, request, sessionId, runId, callerId)
       if (mismatch) return this.conflict(request, sessionId, runId, existing.requestDigest)
+      if (options.returnOnAdmission) {
+        const admitted = this.admissionFromStored(request, sessionId, runId, existing.acknowledgement)
+        if (admitted) return admitted
+      }
       const recovered = await this.recoverExisting(existing.acknowledgement, request, turn, sessionId, runId)
       if (recovered) return recovered
     }
@@ -152,28 +170,49 @@ export class RetainedNativeContinuation {
       )
     }
 
+    let resolveAdmission!: (result: NativeContinuationResponse) => void
+    let rejectAdmission!: (error: unknown) => void
+    const admission = new Promise<NativeContinuationResponse>((resolve, reject) => {
+      resolveAdmission = resolve
+      rejectAdmission = reject
+    })
+    // A terminal-only caller does not observe this companion promise. Keep a
+    // later admission replay possible without creating an unhandled rejection.
+    void admission.catch(() => {})
     const promise = Promise.resolve().then(() =>
-      this.execute({
-        sessionId,
-        request,
-        turn,
-        runId,
-        callerId,
-        signal: options.signal,
-      }),
+      this.execute(
+        {
+          sessionId,
+          request,
+          turn,
+          runId,
+          callerId,
+          signal: options.signal,
+        },
+        resolveAdmission,
+      ),
     )
+    void promise.then(resolveAdmission, rejectAdmission)
     this.inFlight.set(request.operationId, {
       callerId,
       requestDigest: request.requestDigest,
       sessionId,
       runId,
       promise,
+      admission,
     })
-    try {
-      return await promise
-    } finally {
-      if (this.inFlight.get(request.operationId)?.promise === promise) this.inFlight.delete(request.operationId)
-    }
+    void promise.then(
+      () => {
+        if (this.inFlight.get(request.operationId)?.promise === promise)
+          this.inFlight.delete(request.operationId)
+      },
+      () => {
+        if (this.inFlight.get(request.operationId)?.promise === promise)
+          this.inFlight.delete(request.operationId)
+      },
+    )
+    if (options.returnOnAdmission) return admission
+    return promise
   }
 
   private async execute(input: {
@@ -183,7 +222,7 @@ export class RetainedNativeContinuation {
     runId: string
     callerId: string
     signal?: AbortSignal
-  }): Promise<NativeContinuationResult> {
+  }, onAdmission: (result: NativeContinuationAdmissionResult) => void): Promise<NativeContinuationResult> {
     const pending: StoredNativeContinuation = { status: 'pending' }
     let observedBoundary: NativeContextBoundaryProof | undefined
     try {
@@ -240,6 +279,17 @@ export class RetainedNativeContinuation {
           'native continuation was admitted under a different run id',
         ).outcome)
       }
+      if (!observedBoundary) {
+        return this.settle(
+          input.request,
+          input.runId,
+          this.transportFailure(
+            input.request,
+            'native continuation admission omitted its verified source boundary',
+          ).outcome,
+        )
+      }
+      onAdmission(this.admissionResult(input.request, input.sessionId, input.runId, observedBoundary))
 
       try {
         await this.turns.waitForRun(input.runId)
@@ -261,6 +311,68 @@ export class RetainedNativeContinuation {
         this.transportFailure(input.request, error instanceof Error ? error.message : String(error)).outcome,
       )
     }
+  }
+
+  private admissionFromStored(
+    request: NativeContextContinuationRequest,
+    sessionId: string,
+    runId: string,
+    stored: Record<string, unknown>,
+  ): NativeContinuationAdmissionResult | null {
+    const decoded = decodeStoredContinuation(stored)
+    if (!decoded) return null
+    if (decoded.status === 'pending') {
+      if (!decoded.actualBoundary) return null
+      return this.admissionResult(request, sessionId, runId, decoded.actualBoundary)
+    }
+    if (
+      decoded.outcome.acknowledgement.status !== 'accepted' &&
+      decoded.outcome.acknowledgement.status !== 'replayed'
+    ) {
+      return null
+    }
+    const actualBoundary = decoded.outcome.acknowledgement.actualBoundary
+    if (!actualBoundary) return null
+    return this.admissionResult(
+      request,
+      sessionId,
+      runId,
+      actualBoundary,
+    )
+  }
+
+  private admissionResult(
+    request: NativeContextContinuationRequest,
+    sessionId: string,
+    runId: string,
+    actualBoundary: NativeContextBoundaryProof,
+  ): NativeContinuationAdmissionResult {
+    const admission = this.store.getRetainedRun(runId)
+    if (!admission || admission.sessionId !== sessionId) {
+      throw new Error('native continuation admission omitted its durable run identity')
+    }
+    const controlRef = AgentExactRunControlRefSchema.parse({
+      runId,
+      provider: admission.provider,
+      environmentId: admission.environmentId,
+      sessionId,
+      executionId: admission.executionId,
+      requestDigest: admission.requestDigest,
+    })
+    const outcome = AgentNativeContextContinuationAdmissionSchema.parse({
+      phase: 'admitted',
+      acknowledgement: {
+        operationId: request.operationId,
+        requestDigest: request.requestDigest,
+        historyMessagesSent: 0,
+        actualBoundary,
+      },
+      controlRef,
+    })
+    if (!agentNativeContextContinuationAdmissionMatchesRequest(request, outcome)) {
+      throw new Error('native continuation admission failed its exact Agent Interface binding')
+    }
+    return { status: 202, outcome }
   }
 
   private preflight(

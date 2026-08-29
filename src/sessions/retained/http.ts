@@ -5,6 +5,7 @@ import type { Context, Hono } from 'hono'
 import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import { BackendError } from '../../backends/types.js'
 import { ExecutorSaturatedError } from '../../executors/types.js'
+import { setExactRunIdentityHeaders } from '../../runs/headers.js'
 import { retainedCancellationAcknowledgement } from './control-acknowledgement.js'
 import { RETAINED_MAX_HTTP_BODY_BYTES } from './schema.js'
 import { RetainedSessionError } from './types.js'
@@ -67,12 +68,25 @@ export function mountRetainedSessions(
 
   app.post('/v1/sessions/:id/continue', async (c) => {
     try {
+      const returnMode = c.req.query('return')
+      if (returnMode !== undefined && returnMode !== 'admission') {
+        throw new RetainedSessionError(
+          'return must be admission when specified',
+          400,
+          'invalid_request_error',
+        )
+      }
       const input = service.parseNativeContinuation(await readBoundedJson(c.req.raw))
       const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
       const result = await service.continueNative(c.req.param('id'), input, {
         signal: c.req.raw.signal,
         callerId: caller,
+        returnOnAdmission: returnMode === 'admission',
       })
+      if (result.status === 202) {
+        setExactRunIdentityHeaders(c, result.outcome.controlRef)
+        c.header('Location', `/v1/runs/${encodeURIComponent(result.outcome.controlRef.runId)}`)
+      }
       return c.json(result.outcome, result.status)
     } catch (error) {
       return retainedError(c, error)
