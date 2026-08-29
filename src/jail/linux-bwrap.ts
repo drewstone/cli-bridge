@@ -151,14 +151,19 @@ export class LinuxBwrapJail implements JailBackend {
       )
     }
 
-    for (const path of spec.extraReadablePaths ?? []) {
-      // In an fs-jail these carry the materialized runtime config the backend
-      // wrote under the host /tmp (now hidden by the tmpfs above); `-try` keeps
-      // a since-removed path non-fatal. Bound after the tmpfs so they win.
-      bwrapArgs.push('--ro-bind-try', path, path)
-    }
+    // Writable extras FIRST, read-only extras after: a later mount masks an earlier one under
+    // it, so this order lets an operator declare a writable state dir and then carve its code
+    // subtree back to read-only (RW ~/.hermes, RO ~/.hermes/hermes-agent). The reverse order
+    // would silently make the code writable.
     for (const path of spec.extraWritablePaths ?? []) {
       bwrapArgs.push('--bind', path, path)
+    }
+    for (const path of spec.extraReadablePaths ?? []) {
+      // In an fs-jail these carry the materialized runtime config the backend
+      // wrote under the host /tmp (now hidden by the tmpfs above) and the
+      // operator's BRIDGE_JAIL_RO_PATHS; `-try` keeps a since-removed path
+      // non-fatal. Bound after the tmpfs so they win.
+      bwrapArgs.push('--ro-bind-try', path, path)
     }
     // Writable root last so it wins over any read-only mount above it.
     bwrapArgs.push('--bind', root, root)
