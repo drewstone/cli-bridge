@@ -1,10 +1,10 @@
 /**
  * Kimi CLI backend — Moonshot's own coding CLI.
  *
- * Uses the exact same ergonomics as Claude Code: `--print --prompt X`
- * for non-interactive, `--resume <id>` for session resume, `--model`
- * for model selection, `--output-format stream-json` for JSONL. We
- * parse the stream-json events to OpenAI chat deltas.
+ * Kimi Code's prompt mode uses `--prompt X` for non-interactive calls,
+ * `--session <id>` for session resume, `--model` for model selection,
+ * and `--output-format stream-json` for JSONL. We parse those events
+ * into OpenAI chat deltas.
  *
  * Model id scheme: `<harness>/<model>` where `<harness>` defaults to
  * `kimi-code` (the product name Moonshot ships the CLI under) and
@@ -18,31 +18,26 @@
  *   - Native OAuth + the right headers, no plugin plumbing
  *   - Non-interactive mode + stream-json are first-class, not bolted on
  *
- * Event shapes we parse (from `kimi --print --output-format stream-json`):
- *   - session/init events carry an id
- *   - assistant-message events with text content
+ * Event shapes we parse (from `kimi --prompt X --output-format stream-json`):
+ *   - system/version events carry metadata
+ *   - assistant events with string or block content
  *   - tool-use events
- *   - result / completion events with usage
+ *   - result / completion events with usage when emitted
  *   - error events
  *
  * The exact field names vary — we defensively pull content from the
  * common ones (`content`, `text`, `message.content`, `delta.text`).
  */
 
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
 import { type AgentProfile, nativeReasoningControl } from '@tangle-network/agent-interface'
-import { registerJailReadable } from '../jail/index.js'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
-  materializeEmptyMcpConfig,
+  materializeMcpServersForKimi,
   profileExecutionIdentity,
-  writeMcpConfigFile,
   provisionProfileWorkspace,
   resolveMcpServers,
   resolvePromptMessages,
@@ -53,7 +48,6 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
-import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
 export interface KimiBackendOptions {
@@ -96,11 +90,9 @@ export class KimiBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
-    // Compose the full prompt and pipe via stdin instead of stuffing
-    // it into argv. See backends/stdin-payload.ts for the rationale
-    // (Linux MAX_ARG_STRLEN = 128 KiB per arg; any non-trivial
-    // agentic call with tools[] or a long system prompt would E2BIG
-    // on the previous `--prompt <text>` path).
+    // Kimi Code 0.36.1 exposes prompt mode through argv. It does not
+    // implement Claude's structured stdin mode, so keep the prompt in
+    // the one supported `--prompt` argument.
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
 
@@ -118,13 +110,9 @@ export class KimiBackend implements Backend {
       profileExecutionIdentity(req, session, 'kimi-code', thinkingFlag),
     )
 
-    const args = [
-      '--print',
-      '--input-format', 'stream-json',
-      '--output-format', 'stream-json',
-    ]
+    const args = ['--prompt', prompt, '--output-format', 'stream-json']
     if (session?.internalId) {
-      args.push('--resume', session.internalId)
+      args.push('--session', session.internalId)
     }
     if (model) {
       args.push('--model', model)
@@ -132,25 +120,16 @@ export class KimiBackend implements Backend {
     if (thinkingFlag) args.push(thinkingFlag)
     args.push(...provisioned.flags)
 
-    let configFile: string | null = null
-    let mcpMaterialized: ReturnType<typeof writeMcpConfigFile> = null
+    let mcpMaterialized: ReturnType<typeof materializeMcpServersForKimi> = null
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      configFile = await this.prepareConfigFile(req.model)
-      mcpMaterialized =
-        writeMcpConfigFile(resolveMcpServers(req, session)) ?? materializeEmptyMcpConfig()
-      if (configFile) args.push('--config-file', configFile)
-      if (mcpMaterialized) args.push('--mcp-config-file', mcpMaterialized.configPath)
-      // Under an fs-jail the fresh tmpfs over /tmp hides these host-/tmp configs;
-      // expose their dirs read-only so the confined kimi can still read them.
-      registerJailReadable(
-        req.jailSpec,
-        ...(configFile ? [dirname(configFile)] : []),
-        ...(mcpMaterialized ? [dirname(mcpMaterialized.configPath)] : []),
-      )
+      // Kimi Code discovers request-scoped MCP from the project-local
+      // `<cwd>/.kimi-code/mcp.json`; the mount restores the original file
+      // after this process exits and serializes overlapping runs.
+      mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session), cwd)
 
       spawned = await this.spawner(this.opts.bin, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
         env: { ...process.env, ...provisioned.env },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
@@ -159,7 +138,6 @@ export class KimiBackend implements Backend {
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
     } catch (error) {
-      if (configFile) await cleanupConfigFile(configFile)
       mcpMaterialized?.cleanup()
       throw error
     }
@@ -191,33 +169,13 @@ export class KimiBackend implements Backend {
       if (!child.stdout) {
         throw new BackendError('kimi subprocess has no stdout pipe', 'upstream')
       }
-      if (!child.stdin) {
-        throw new BackendError('kimi subprocess has no stdin pipe', 'upstream')
-      }
-
-      // Pipe the prompt via stdin instead of argv. Kimi 1.44.0's
-      // `--input-format stream-json` parser accepts ONLY the flat
-      // NDJSON shape `{"role":"user","content":"..."}` — handing it
-      // claude-code's wrapped `{"type":"user","message":{…}}` envelope
-      // makes the CLI return 0 bytes silently (no error, no exit
-      // failure). Force the flat shape here; claude.ts keeps the
-      // default wrapped envelope.
-      const stdinResult = await writeStdinPayload(
-        child.stdin,
-        [{ role: 'user', content: prompt }],
-        { format: 'flat' },
-      )
-      if (!stdinResult.ok) {
-        throw new BackendError(`kimi stdin write failed: ${stdinResult.error}`, 'upstream')
-      }
       child.stderr?.on('data', (b) => {
         const chunk = b.toString()
         stderr.append(chunk)
-        // Kimi prints "To resume this session: kimi -r <uuid>" to
-        // stderr after --print. That's our session id when no init
-        // event carries one.
+        // Older Kimi builds printed a resume hint to stderr. Keep
+        // accepting that hint when a compatible executor supplies it.
         if (!internalSessionId) {
-          const m = chunk.match(/kimi\s+-r\s+([0-9a-f-]{8,})/i)
+          const m = chunk.match(/kimi\s+(?:-r|--session)\s+([0-9a-f-]{8,})/i)
           if (m) internalSessionId = m[1]
         }
       })
@@ -262,14 +220,14 @@ export class KimiBackend implements Backend {
           continue
         }
 
-        // Kimi's actual event shape for assistant output:
-        //   {"role":"assistant","content":[{"type":"think","think":"..."},
-        //                                   {"type":"text","text":"..."},
-        //                                   {"type":"tool_use",…}]}
+        // Kimi's event shape for assistant output is either a top-level
+        // string or a block array:
+        //   {"role":"assistant","content":"answer"}
+        //   {"role":"assistant","content":[{"type":"text","text":"answer"}]}
         // Walk the content array block-by-block — matches how we handle
         // Claude Code's stream-json. Generic extractText is a fallback
         // for events whose content is just a string.
-        const role = String(ev.role ?? '')
+        const role = String(ev.role ?? '').toLowerCase()
         const contentField = ev.content
         if (role === 'assistant' && Array.isArray(contentField)) {
           for (const block of contentField as Array<Record<string, unknown>>) {
@@ -295,7 +253,7 @@ export class KimiBackend implements Backend {
             }
             // 'think' blocks are reasoning chain-of-thought; don't surface.
           }
-          // kimi (1.44) emits agentic tool calls in a TOP-LEVEL `tool_calls` field
+          // Some Kimi builds emit agentic tool calls in a TOP-LEVEL `tool_calls` field
           // (OpenAI shape: [{type:'function', id, function:{name, arguments}}]), NOT
           // as `tool_use` blocks inside content. Without surfacing them, every
           // tool-call turn — whose content is just a `think` block — yields nothing,
@@ -320,7 +278,7 @@ export class KimiBackend implements Backend {
               }
             }
           }
-        } else {
+        } else if (role === '' || role === 'assistant') {
           const text = extractText(ev)
           if (text) {
             yield { content: text }
@@ -353,10 +311,8 @@ export class KimiBackend implements Backend {
         return
       }
       if (sawError) throw new BackendError(`kimi: ${sawError}`, 'upstream')
-      // Kimi CLI --print exits non-zero on some successful runs (known
-      // quirk — the "To resume this session: kimi -r <uuid>" stderr
-      // message is printed as a successful trailer, not an error). If
-      // we observed real assistant content, treat exit non-zero as OK.
+      // If Kimi reports a non-zero exit after assistant content, preserve
+      // the content because the process did complete a useful turn.
       if (exitCode !== 0 && exitCode !== null && !emittedContent) {
         throw new BackendError(await describeCliExit(spawned, 'kimi', exitCode, stderr.render()), 'upstream')
       }
@@ -369,14 +325,13 @@ export class KimiBackend implements Backend {
       // Always tear down the whole subtree (kimi + any MCP/tool forks)
       // before releasing the slot. Idempotent; waits for actual exit.
       await terminateSpawned(spawned)
-      if (configFile) await cleanupConfigFile(configFile)
       mcpMaterialized?.cleanup()
       releaseSpawner()
     }
   }
 
   /**
-   * Build the final prompt text passed to `kimi --print --prompt`. Kimi
+   * Build the final prompt text passed to `kimi --prompt`. Kimi
    * CLI has no `--append-system-prompt` equivalent and no native
    * json-mode flag, so when the caller asks for `json_object` we
    * prepend the directive to the user prompt. Best-effort — clients
@@ -394,75 +349,22 @@ export class KimiBackend implements Backend {
 
   /** Exposed so tests can verify when the backend omits `--model`. */
   resolveCliModel(fullModel: string): string | null {
-    // K2.6 is the required path on this machine, but the current Kimi
-    // CLI is unstable when passed `--model kimi-code/kimi-k2.6`
-    // explicitly. When the external caller requests that exact model,
-    // route to the CLI's default model instead and require the local
-    // config to pin that default to K2.6.
     const lower = fullModel.toLowerCase()
-    if (lower === this.name || lower === `${this.prefix}kimi-k2.6`) return null
+    if (lower === this.name) return null
 
-    // Kimi's config.toml uses `<provider>/<model>` as the literal key
-    // (e.g. `kimi-code/kimi-for-coding`) — the harness prefix IS the
-    // provider side of that key. Pass the full string through; stripping
-    // the prefix makes `--model kimi-for-coding` fail with "LLM not set".
+    // Kimi Code's config.toml uses `<provider>/<model>` as the literal
+    // key (for example `kimi-code/kimi-for-coding`). Pass every qualified
+    // model through, including aliases that the local config may reject.
+    // Omitting an explicit model for such an alias would silently run the
+    // configured default instead.
     if (lower.startsWith(this.prefix)) return fullModel
     return null
-  }
-
-  private async prepareConfigFile(fullModel: string): Promise<string | null> {
-    if (fullModel.toLowerCase() !== `${this.prefix}kimi-k2.6`) return null
-
-    const home = process.env.HOME
-    if (!home) throw new BackendError('HOME is not set for kimi backend', 'not_configured')
-
-    const source = join(home, '.kimi', 'config.toml')
-    let config: string
-    try {
-      config = await readFile(source, 'utf8')
-    } catch (error) {
-      throw new BackendError(`failed to read Kimi config: ${source}`, 'not_configured', error)
-    }
-
-    const next = ensureK2DefaultConfig(config)
-    const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-kimi-'))
-    const file = join(dir, 'config.toml')
-    await writeFile(file, next, 'utf8')
-    return file
   }
 
   private flattenPrompt(messages: ChatRequest['messages']): string {
     if (messages.length === 1) return contentToText(messages[0]?.content ?? '')
     return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
   }
-}
-
-function ensureK2DefaultConfig(config: string): string {
-  const nextDefault = 'default_model = "kimi-code/kimi-k2.6"'
-  let next = config
-
-  if (/^default_model\s*=.*$/m.test(next)) {
-    next = next.replace(/^default_model\s*=.*$/m, nextDefault)
-  } else {
-    next = `${nextDefault}\n${next}`
-  }
-
-  if (!/\[models\."kimi-code\/kimi-k2\.6"\]/.test(next)) {
-    next += '\n\n[models."kimi-code/kimi-k2.6"]\n'
-    next += 'provider = "managed:kimi-code"\n'
-    next += 'model = "kimi-k2.6"\n'
-    next += 'max_context_size = 262144\n'
-    next += 'capabilities = ["thinking", "video_in", "image_in"]\n'
-    next += 'display_name = "Kimi-k2.6"\n'
-  }
-
-  return next
-}
-
-
-async function cleanupConfigFile(file: string): Promise<void> {
-  await rm(file, { force: true }).catch(() => undefined)
-  await rm(dirname(file), { recursive: true, force: true }).catch(() => undefined)
 }
 
 function pickSessionId(ev: Record<string, unknown>): string | null {

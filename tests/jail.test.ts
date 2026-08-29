@@ -312,6 +312,14 @@ describe('auth preservation', () => {
         expect(only).toEqual(['.credentials.json', 'credentials.json', 'settings.json'])
       }
     }
+    const kimiSources = authSourcesFor('kimi-code')
+    const kimiHome = kimiSources.find((entry) => entry.jailRel === '.kimi-code')
+    expect(kimiHome).toMatchObject({
+      jailRel: '.kimi-code',
+      mode: 'seed-writable',
+      only: ['config.toml', 'credentials', 'device_id'],
+    })
+    expect(kimiSources.find((entry) => entry.jailRel === '.kimi')?.mode).toBe('seed-writable')
     // codex must be preserved too (no-MCP jailed codex would otherwise lose
     // ~/.codex) and tagged so the jail redirects CODEX_HOME at the in-jail
     // home. Seeded WRITABLE: codex writes PATH aliases + app-server state +

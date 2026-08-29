@@ -319,7 +319,7 @@ describe('writeStdinPayload', () => {
     ])
   })
 
-  it("format:'flat' produces the kimi-1.44.0 shape — top-level role+content, no envelope", async () => {
+  it("format:'flat' produces a top-level role+content shape, with no envelope", async () => {
     const cap = collectLines()
     const result = await writeStdinPayload(
       cap.stdin,
@@ -1535,81 +1535,70 @@ describe('Spawner injection works across all subprocess backends', () => {
     }
   })
 
-
-  /** The kimi-k2.6 path reads $HOME/.kimi/config.toml (then rewrites it into a temp
-   *  copy). That file exists on a dev host and not on a CI runner, which made these
-   *  two tests host-state-dependent — the repo's first CI run exposed it. A temp HOME
-   *  with a minimal config makes them hermetic; ensureK2DefaultConfig accepts any TOML. */
-  const withKimiHome = async (fn: () => Promise<void>): Promise<void> => {
-    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs')
-    const { tmpdir } = await import('node:os')
-    const { join } = await import('node:path')
-    const home = mkdtempSync(join(tmpdir(), 'kimi-home-'))
-    mkdirSync(join(home, '.kimi'), { recursive: true })
-    writeFileSync(join(home, '.kimi', 'config.toml'), 'default_model = "kimi-code/kimi-k2.6"\n')
-    const prev = process.env.HOME
-    process.env.HOME = home
-    try { await fn() } finally {
-      process.env.HOME = prev
-      rmSync(home, { recursive: true, force: true })
-    }
-  }
-
   it('KimiBackend uses injected spawner + forwards session_id', async () => {
-    await withKimiHome(async () => {
-      const stub = createStubSpawner([
-        JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: 'kimi here' }] }),
-        JSON.stringify({ type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }),
-      ])
-      const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
-      const ctrl = new AbortController()
-      const deltas: Array<{ content?: string; finish_reason?: string }> = []
-      for await (const d of backend.chat(
-        { model: 'kimi-code/kimi-k2.6', messages: [{ role: 'user', content: 'hi' }], session_id: 'kimi-sess' },
-        null,
-        ctrl.signal,
-      )) deltas.push(d)
-      expect(deltas.find((d) => d.content === 'kimi here')).toBeDefined()
-      expect(stub.observedArgs).toContain('--mcp-config-file')
-      expect(stub.observedOpts?.sessionId).toBe('kimi-sess')
-      expect(stub.releaseCalls).toBe(1)
-    })
+    const stub = createStubSpawner([
+      JSON.stringify({ role: 'assistant', content: 'kimi here' }),
+      JSON.stringify({
+        type: 'session.resume_hint',
+        role: 'meta',
+        content: 'To resume this session: kimi -r native-session',
+        session_id: 'native-session',
+      }),
+      JSON.stringify({ type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }),
+    ])
+    const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
+    const ctrl = new AbortController()
+    const deltas: Array<{ content?: string; finish_reason?: string }> = []
+    for await (const d of backend.chat(
+      { model: 'kimi-code/kimi-for-coding', messages: [{ role: 'user', content: 'hi' }], session_id: 'kimi-sess' },
+      null,
+      ctrl.signal,
+    )) deltas.push(d)
+    expect(deltas.find((d) => d.content === 'kimi here')).toBeDefined()
+    expect(deltas.some((d) => d.content?.includes('To resume this session'))).toBe(false)
+    expect(stub.observedArgs).toEqual([
+      '--prompt', 'hi',
+      '--output-format', 'stream-json',
+      '--model', 'kimi-code/kimi-for-coding',
+    ])
+    expect(stub.observedOpts?.stdio).toEqual(['ignore', 'pipe', 'pipe'])
+    expect(stub.stdinChunks).toEqual([])
+    expect(stub.observedOpts?.sessionId).toBe('kimi-sess')
+    expect(stub.releaseCalls).toBe(1)
   })
 
-  it('KimiBackend writes FLAT-shape NDJSON to stdin (kimi 1.44.0 rejects claude-wrapped envelope)', async () => {
-    await withKimiHome(async () => {
-      // Regression: kimi --print --input-format stream-json parses ONLY
-      // `{"role":"user","content":"…"}`. If we hand it claude-code's
-      // `{"type":"user","message":{…}}` envelope the CLI emits zero bytes
-      // silently — the bridge then surfaces "kimi produced no stream
-      // output", which from the caller's perspective looks like a model
-      // outage. Lock the wire shape here.
-      const stub = createStubSpawner([
-        JSON.stringify({ role: 'assistant', content: [{ type: 'text', text: 'PING' }] }),
-        JSON.stringify({ type: 'result', usage: { input_tokens: 1, output_tokens: 1 } }),
-      ])
-      const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
-      const ctrl = new AbortController()
-      const sink: Array<{ content?: string }> = []
-      for await (const d of backend.chat(
-        { model: 'kimi-code/kimi-k2.6', messages: [{ role: 'user', content: 'say PING' }] },
-        null,
-        ctrl.signal,
-      )) sink.push(d)
+  it('KimiBackend forwards native session resume with --session', async () => {
+    const stub = createStubSpawner([
+      JSON.stringify({ role: 'assistant', content: 'resumed' }),
+    ])
+    const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
+    const session = {
+      externalId: 'caller-session',
+      backend: 'kimi-code',
+      internalId: 'native-session',
+      cwd: null,
+      turns: 1,
+      createdAt: 0,
+      lastUsedAt: 0,
+      metadata: {},
+    }
+    const ctrl = new AbortController()
+    const deltas: Array<{ content?: string; finish_reason?: string }> = []
+    for await (const d of backend.chat(
+      { model: 'kimi-code/kimi-for-coding', messages: [{ role: 'user', content: 'resume' }] },
+      session,
+      ctrl.signal,
+    )) deltas.push(d)
 
-      const stdinText = stub.stdinChunks.join('')
-      const ndjson = stdinText.trim().split('\n').filter((l) => l.length > 0)
-      expect(ndjson.length).toBeGreaterThan(0)
-      const parsed = ndjson.map((l) => JSON.parse(l) as Record<string, unknown>)
-      // Every line MUST be the flat shape — top-level `role` + `content`,
-      // never the wrapped `{type:"user", message:{…}}` envelope.
-      for (const obj of parsed) {
-        expect(obj.role).toBe('user')
-        expect(typeof obj.content).toBe('string')
-        expect(obj.type).toBeUndefined()
-        expect(obj.message).toBeUndefined()
-      }
-    })
+    expect(deltas.find((d) => d.content === 'resumed')).toBeDefined()
+    expect(stub.observedArgs).toEqual([
+      '--prompt', 'resume',
+      '--output-format', 'stream-json',
+      '--session', 'native-session',
+      '--model', 'kimi-code/kimi-for-coding',
+    ])
+    expect(stub.observedArgs).not.toContain('--resume')
+    expect(stub.releaseCalls).toBe(1)
   })
 
   it('KimiBackend surfaces buffered-stdout silence as keepalive deltas (not synthetic tool_calls)', async () => {

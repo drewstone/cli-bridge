@@ -140,8 +140,8 @@ export class LinuxBwrapJail implements JailBackend {
     } else {
       // write-jail: reads stay OPEN (whole host read-only), only writes are
       // confined to the jail root. Note we do NOT tmpfs /tmp: the bridge
-      // materializes runtime config (MCP config, kimi config.toml,
-      // OPENCODE_CONFIG) under the host tmpdir before spawn, and the CLI must
+      // materializes runtime config (MCP config, OPENCODE_CONFIG) under the
+      // host tmpdir before spawn, and the CLI must
       // still read those paths. /tmp stays readable (read-only) via this bind;
       // the CLI's own temp WRITES are redirected to TMPDIR=<root>/.tmp (jailEnv).
       bwrapArgs.push(
