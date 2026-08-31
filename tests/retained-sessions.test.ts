@@ -5043,6 +5043,40 @@ describe('retained Agent Interface sessions', () => {
 })
 
 describe('retained chat deltas', () => {
+  it('clamps an over-bound string in the retained copy instead of killing the append', () => {
+    // Regression: a codex director at xhigh emitted single events holding a whole charter
+    // (measured 2026-08-31: strings to 1,048,547 chars against the envelope contract's 16,384).
+    // appendRetainedDelta threw from RuntimeEventEnvelopeSchema, commitDelta propagated, and the
+    // LIVE stream died — three 10-minute director attempts lost. The retained copy is clamped
+    // with a marked truncation; the append must succeed and record the original length.
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-clamp-'))
+    try {
+      const store = new SqliteSessionStore(dir)
+      store.createRetained({
+        id: 'clamp-session',
+        createRequestDigest: 'sha256:clamp-create',
+        backend: 'codex',
+        model: 'codex/openai/gpt-5.6-sol',
+        capabilities,
+      })
+      const oversized = 'charter '.repeat(140_000) // 1,120,000 chars, > CONTRACT_MAX_STRING_LENGTH
+      store.appendRetainedDelta('clamp-session', {
+        runId: 'bridge-run-clamp',
+        sequence: 1,
+        delta: { content: oversized, reasoning: 'small and untouched' },
+      })
+      const [row] = store.retainedEventsAfterRun('clamp-session', 'bridge-run-clamp')
+      expect(row).toBeDefined()
+      const event = row!.envelope.event as { event: { content: string, reasoning: string } }
+      expect(event.event.reasoning).toBe('small and untouched')
+      expect(event.event.content.length).toBeLessThanOrEqual(16_384)
+      expect(event.event.content).toContain(`[truncated for retention: ${oversized.length} chars]`)
+      store.close()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('keeps ChatDelta.reasoning on the persisted retained_events row', () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-retained-reasoning-'))
     try {
