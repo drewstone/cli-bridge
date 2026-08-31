@@ -369,6 +369,35 @@ const RELEASED_INTERACTION_OPERATION_COLUMNS: ExpectedColumn[] = [
 
 const RETAINED_SCHEMA_ERROR = 'incompatible retained-session data schema; use a fresh data directory for this unreleased format'
 
+/**
+ * The envelope contract's per-string ceiling (agent-interface CONTRACT_MAX_STRING_LENGTH; the
+ * package root does not re-export the constant). RuntimeEventEnvelopeSchema still validates
+ * after the clamp, so a drift between this number and the contract fails loudly there, never
+ * silently.
+ */
+const RETAINED_STRING_BOUND = 16_384
+const RETAINED_TRUNCATION_MARKER = '…[truncated for retention: '
+
+/** Clamp every string in a retained-copy JSON value to the envelope contract's string bound,
+ *  marking each cut with its original length. Mutates and returns the (already-cloned) value. */
+export function clampRetainedStrings(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (value.length <= RETAINED_STRING_BOUND) return value
+    const marker = `${RETAINED_TRUNCATION_MARKER}${value.length} chars]`
+    return value.slice(0, RETAINED_STRING_BOUND - marker.length) + marker
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) value[i] = clampRetainedStrings(value[i])
+    return value
+  }
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    for (const key of Object.keys(record)) record[key] = clampRetainedStrings(record[key])
+    return value
+  }
+  return value
+}
+
 export class SessionStore implements RetainedInteractionPersistence {
   private db: Database.Database
   private readonly databasePath: string
@@ -1033,13 +1062,23 @@ export class SessionStore implements RetainedInteractionPersistence {
     return append(input)
   }
 
-  /** Persist one OpenAI delta in the existing canonical retained event log. */
+  /** Persist one OpenAI delta in the existing canonical retained event log.
+   *
+   * The retained copy is CLAMPED to the envelope contract's string bound before it is
+   * validated. A codex director at xhigh effort emits legitimate single events holding a whole
+   * charter or ledger (measured 2026-08-31: strings to 1,048,547 chars in one rollout event,
+   * against CONTRACT_MAX_STRING_LENGTH 16,384). Refusing the retained write threw inside
+   * commitDelta, which killed the LIVE stream: three 10-minute director attempts died on
+   * "value exceeds the contract bounds or is not finite JSON" with the caller's work lost.
+   * Retention is replay/diagnostic bookkeeping; a marked truncation there is honest, while a
+   * dead stream is a lost run. The in-memory replay log keeps the full delta either way.
+   */
   appendRetainedDelta(sessionId: string, input: {
     runId: string
     sequence: number
     delta: ChatDelta
   }): RetainedEventRecord {
-    const event = JSON.parse(JSON.stringify(input.delta)) as unknown
+    const event = clampRetainedStrings(JSON.parse(JSON.stringify(input.delta)))
     return this.appendRetainedEvent(sessionId, {
       runId: input.runId,
       eventId: retainedDeltaEventId(input.runId, input.sequence),
