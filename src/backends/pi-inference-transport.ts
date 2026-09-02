@@ -264,6 +264,9 @@ const SAFE_MODEL_FIELDS = [
   'contextWindow',
   'maxTokens',
   'compat',
+  // Body-level request parameters Pi merges into every inference request
+  // (for example the gateway's streamIdleTimeout); auth never rides here.
+  'samplingParams',
 ] as const
 
 export interface AppliedPiModelHints {
@@ -527,10 +530,7 @@ function readConfiguredTransport(
     )
   }
 
-  const modelConfig: Record<string, unknown> = {}
-  for (const field of SAFE_MODEL_FIELDS) {
-    if (rawModel[field] !== undefined) modelConfig[field] = structuredClone(rawModel[field])
-  }
+  const modelConfig = copySafeModelFields(rawModel, selection)
   modelConfig.id = selection.model
   modelConfig.api = api
 
@@ -605,10 +605,7 @@ async function readCatalogTransport(options: {
       'not_configured',
     )
   }
-  const modelConfig: Record<string, unknown> = {}
-  for (const field of SAFE_MODEL_FIELDS) {
-    if (model[field] !== undefined) modelConfig[field] = structuredClone(model[field])
-  }
+  const modelConfig = copySafeModelFields(model, options.selection)
   modelConfig.id = options.selection.model
   modelConfig.api = api
 
@@ -620,6 +617,28 @@ async function readCatalogTransport(options: {
     providerConfig: { api },
     modelConfig,
   }
+}
+
+/**
+ * Copy one operator model entry through the allowlist.
+ * Pi spreads `samplingParams` into the request body, so any value other than a
+ * plain object would become a malformed upstream request; refuse it up front.
+ */
+function copySafeModelFields(
+  source: Record<string, unknown>,
+  selection: PiInferenceSelection,
+): Record<string, unknown> {
+  const modelConfig: Record<string, unknown> = {}
+  for (const field of SAFE_MODEL_FIELDS) {
+    if (source[field] !== undefined) modelConfig[field] = structuredClone(source[field])
+  }
+  if (modelConfig.samplingParams !== undefined && !isRecord(modelConfig.samplingParams)) {
+    throw new BackendError(
+      `backend pi model ${selection.provider}/${selection.model} samplingParams must be a plain object`,
+      'not_configured',
+    )
+  }
+  return modelConfig
 }
 
 function validateUpstreamBaseUrl(baseUrl: string, selection: PiInferenceSelection): string {

@@ -457,6 +457,84 @@ describe('Pi inference credential isolation', () => {
     expect(existsSync(marker)).toBe(false)
   })
 
+  it('carries model samplingParams into the isolated models.json', async () => {
+    const sourceAgentDir = tempDir('cli-bridge-pi-sampling-params-config-')
+    const fakePi = join(tempDir('cli-bridge-pi-sampling-params-bin-'), 'pi')
+    writeFileSync(fakePi, [
+      '#!/bin/sh',
+      'test "$1" = auth',
+      'test "$2" = print-api-key',
+      'test "$4" = tangle-router',
+      'test "$6" = idle-check',
+      'printf sampling-params-key',
+    ].join('\n'))
+    chmodSync(fakePi, 0o700)
+    const samplingParams = { gateway: { streamIdleTimeout: 180_000 } }
+    writeFileSync(join(sourceAgentDir, 'models.json'), JSON.stringify({
+      providers: {
+        'tangle-router': {
+          baseUrl: 'https://router.tangle.tools/v1',
+          api: 'openai-completions',
+          models: [{ id: 'idle-check', maxTokens: 64_000, samplingParams }],
+        },
+      },
+    }))
+
+    const resolver = createPiInferenceTransportResolver({
+      bin: fakePi,
+      agentDir: sourceAgentDir,
+      sessionDir: tempDir('cli-bridge-pi-sampling-params-sessions-'),
+      env: { HOME: tempDir('cli-bridge-pi-sampling-params-home-'), PATH: process.env.PATH },
+    })
+    const resolved = await resolver(
+      { provider: 'tangle-router', model: 'idle-check' },
+      new AbortController().signal,
+    )
+    expect(resolved.modelConfig.samplingParams).toEqual(samplingParams)
+
+    const transport = await provisionPiInferenceTransport(resolved)
+    try {
+      const isolated = JSON.parse(readFileSync(join(transport.agentDir, 'models.json'), 'utf8'))
+      expect(isolated.providers['tangle-router'].models[0].samplingParams).toEqual(samplingParams)
+    } finally {
+      await transport.cleanup()
+    }
+  })
+
+  it('rejects model samplingParams that are not a plain object', async () => {
+    const sourceAgentDir = tempDir('cli-bridge-pi-sampling-array-config-')
+    const marker = join(tempDir('cli-bridge-pi-sampling-array-marker-'), 'invoked')
+    const fakePi = join(tempDir('cli-bridge-pi-sampling-array-bin-'), 'pi')
+    writeFileSync(fakePi, [
+      '#!/bin/sh',
+      `printf invoked > ${JSON.stringify(marker)}`,
+      'exit 1',
+    ].join('\n'))
+    chmodSync(fakePi, 0o700)
+    writeFileSync(join(sourceAgentDir, 'models.json'), JSON.stringify({
+      providers: {
+        'tangle-router': {
+          baseUrl: 'https://router.tangle.tools/v1',
+          api: 'openai-completions',
+          models: [{ id: 'idle-check', samplingParams: [{ gateway: { streamIdleTimeout: 180_000 } }] }],
+        },
+      },
+    }))
+
+    const resolver = createPiInferenceTransportResolver({
+      bin: fakePi,
+      agentDir: sourceAgentDir,
+      sessionDir: tempDir('cli-bridge-pi-sampling-array-sessions-'),
+      env: { HOME: tempDir('cli-bridge-pi-sampling-array-home-'), PATH: process.env.PATH },
+    })
+
+    await expect(resolver(
+      { provider: 'tangle-router', model: 'idle-check' },
+      new AbortController().signal,
+    )).rejects.toThrow(/samplingParams must be a plain object/u)
+    expect(existsSync(marker)).toBe(false)
+  })
+
   it('keeps one bearer refresh alive when one concurrent request disconnects', async () => {
     const marker = join(tempDir('cli-bridge-pi-auth-refresh-marker-'), 'calls')
     const fakePi = join(tempDir('cli-bridge-pi-auth-refresh-bin-'), 'pi')
