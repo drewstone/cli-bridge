@@ -1,10 +1,10 @@
 /**
  * NanoclawBackend tests — drive the backend against a REAL Unix-socket server that
- * speaks NanoClaw's CLI-channel protocol ({"text":...} in, {"text":...} out, then
- * silence). Real socket I/O, the exact protocol — verifies the client end-to-end
+ * speaks NanoClaw's CLI-channel protocol ({"text":...} in, {"text":...} out).
+ * Real socket I/O, the exact protocol — verifies the client end-to-end
  * without the NanoClaw daemon (which needs a wired agent group).
  */
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import net from 'node:net'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -16,6 +16,7 @@ let server: net.Server | null = null
 let dir: string | null = null
 
 afterEach(async () => {
+  vi.useRealTimers()
   if (server) await new Promise<void>((r) => server!.close(() => r()))
   server = null
   if (dir) { try { rmSync(dir, { recursive: true, force: true }) } catch { /* ignore */ } dir = null }
@@ -60,6 +61,29 @@ describe('NanoclawBackend', () => {
     const r = await drain(be, req)
     expect(r.text).toBe('Hello world')
     expect(r.finish).toBe('stop')
+  })
+
+  it('does not treat silence as completion by default', async () => {
+    vi.useFakeTimers()
+    dir = mkdtempSync(join(tmpdir(), 'nano-'))
+    const sock = join(dir, 'cli.sock')
+    server = net.createServer((client) => {
+      client.on('data', () => {
+        client.write(JSON.stringify({ text: 'first' }) + '\n')
+        setTimeout(() => {
+          client.write(JSON.stringify({ text: ' second' }) + '\n')
+          client.end()
+        }, 3_500)
+      })
+    })
+    await new Promise<void>((resolve) => server!.listen(sock, resolve))
+
+    const stream = new NanoclawBackend({ socketPath: sock, timeoutMs: 0 })
+      .chat(req, null, new AbortController().signal)[Symbol.asyncIterator]()
+    expect((await stream.next()).value).toMatchObject({ content: 'first' })
+    await vi.advanceTimersByTimeAsync(3_500)
+    expect((await stream.next()).value).toMatchObject({ content: ' second' })
+    expect((await stream.next()).value).toMatchObject({ finish_reason: 'stop' })
   })
 
   it('finishes when the daemon closes the connection', async () => {
