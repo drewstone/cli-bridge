@@ -337,7 +337,7 @@ export async function buildApp(config: Config): Promise<{
     identityRetentionMs: parseEnvPositiveInt('BRIDGE_RUN_IDENTITY_RETENTION_MS', 86_400_000),
     maxReplayDeltas: parseEnvPositiveInt('BRIDGE_RUN_MAX_REPLAY_DELTAS', 10_000),
     maxReplayBytes: parseEnvPositiveInt('BRIDGE_RUN_MAX_REPLAY_BYTES', 32 * 1024 * 1024),
-    maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 21_600_000),
+    maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)

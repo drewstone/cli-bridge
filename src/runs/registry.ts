@@ -57,7 +57,7 @@ export interface RunRegistryOptions {
   maxReplayDeltas?: number
   /** Approximate delta payload ceiling per run. Default 32 MiB. */
   maxReplayBytes?: number
-  /** Maximum unsettled run lifetime. Default 6 hours; 0 disables it. */
+  /** Optional maximum unsettled run lifetime. Default 0 disables it. */
   maxLifetimeMs?: number
 }
 
@@ -75,7 +75,7 @@ export class RunRegistry {
     const identityRetentionMs = opts.identityRetentionMs ?? 86_400_000
     const maxReplayDeltas = opts.maxReplayDeltas ?? 10_000
     const maxReplayBytes = opts.maxReplayBytes ?? 32 * 1024 * 1024
-    const maxLifetimeMs = opts.maxLifetimeMs ?? 21_600_000
+    const maxLifetimeMs = opts.maxLifetimeMs ?? 0
     assertNonNegativeInt('replayRetentionMs', replayRetentionMs)
     assertNonNegativeInt('identityRetentionMs', identityRetentionMs)
     if (identityRetentionMs < replayRetentionMs) {

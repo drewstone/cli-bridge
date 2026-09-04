@@ -233,12 +233,11 @@ Replay storage is explicitly bounded per process:
   The oldest deltas are dropped first; the newest delta is always kept.
 - Terminal output expires after `BRIDGE_RUN_REPLAY_RETENTION_MS` (default `60000` ms).
 - The run-id/request binding remains after output expiry for `BRIDGE_RUN_IDENTITY_RETENTION_MS` (default `86400000` ms) so a late retry cannot accidentally execute the job again.
-- A run that has not reached a terminal state within `BRIDGE_RUN_MAX_LIFETIME_MS` (default `21600000` ms, 6 hours) is cancelled and released.
-  Set `0` to disable the ceiling.
+- `BRIDGE_RUN_MAX_LIFETIME_MS` is an optional emergency cap for one unsettled run.
+  It defaults to `0`, so elapsed time alone never cancels a run.
 
-The lifetime ceiling exists because every other bound above is armed when a run reaches a terminal state.
-A backend that never terminates would otherwise hold its replay buffer, its registry entry and its execution slot until the process exits.
-Raise it if a single turn legitimately runs longer than six hours; the ceiling applies to one run, not to a campaign.
+A live run keeps its bounded replay buffer, registry entry, and execution slot until it ends or receives explicit cancellation.
+Set a positive `BRIDGE_RUN_MAX_LIFETIME_MS` only when the operator requires a hard process-lifetime policy.
 
 ### Memory
 
