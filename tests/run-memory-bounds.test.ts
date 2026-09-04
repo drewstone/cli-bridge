@@ -9,13 +9,17 @@
  */
 
 import { Hono } from 'hono'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BackendRegistry } from '../src/backends/registry.js'
 import type { Backend, BackendHealth, ChatDelta } from '../src/backends/types.js'
 import { mountHealth } from '../src/routes/health.js'
 import { RunLifetimeExceededError, RunRegistry } from '../src/runs/registry.js'
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 /** A backend that produces output and then never terminates. */
 async function* hangsAfter(deltas: readonly ChatDelta[]): AsyncIterable<ChatDelta> {
@@ -28,6 +32,19 @@ function payload(bytes: number, seed: number): string {
 }
 
 describe('durable run memory bounds', () => {
+  it('does not end an unsettled run only because time passed', async () => {
+    vi.useFakeTimers()
+    const registry = new RunRegistry()
+    const { run } = registry.claim('persistent', 'digest')
+    void run.pump(hangsAfter([{ content: 'still working' }]))
+
+    await vi.advanceTimersByTimeAsync(21_600_001)
+
+    expect(run.isTerminal()).toBe(false)
+    expect(run.snapshot().lifetimeExpiresAt).toBeNull()
+    registry.clear()
+  })
+
   it('releases a run whose backend never reaches a terminal state', async () => {
     const registry = new RunRegistry({
       replayRetentionMs: 10,

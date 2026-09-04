@@ -24,6 +24,8 @@ describe('bridge capability advertisement', () => {
           usageCostProvenance: 'cli-bridge.usage-cost.v1',
         },
       })
+      const { run } = built.runs.claim('persistent-default', 'digest')
+      expect(run.snapshot().lifetimeExpiresAt).toBeNull()
     } finally {
       built.runs.clear()
       built.sessions.close()
