@@ -8,8 +8,8 @@
  *
  *   connect(socket) → write `{"text": "<prompt>"}\n`
  *   ← stream `{"text": "<reply>"}\n` lines  → ChatDelta.content
- *   completion is SILENCE-based — NanoClaw sends no explicit done event, so the turn
- *   ends after `silenceMs` of quiet following the first reply (or socket close / hard cap).
+ *   NanoClaw sends no explicit done event, so completion comes from socket close,
+ *   caller cancellation, or an explicitly configured `silenceMs` fallback.
  *
  * Because the daemon owns its own workspace, NanoClaw does NOT honor a per-request cwd —
  * profile/skill materialization into the request cwd does not reach it (documented
@@ -31,8 +31,7 @@ export interface NanoclawBackendOptions {
   socketPath: string
   /** Operator fallback when the caller omits `execution.timeoutMs`; zero means none. */
   timeoutMs: number
-  /** Quiet period after the first reply that ends the turn (NanoClaw has no done event;
-   *  see scripts/chat.ts, default 2s there). Default 3000ms. */
+  /** Optional quiet period after a reply that ends the turn. Zero or absent disables it. */
   silenceMs?: number
 }
 
@@ -53,7 +52,7 @@ export class NanoclawBackend implements Backend {
     this.name = opts.name ?? 'nanoclaw'
     this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.socketPath = opts.socketPath
-    this.silenceMs = opts.silenceMs ?? 3000
+    this.silenceMs = opts.silenceMs ?? 0
   }
 
   matches(model: string): boolean {
@@ -94,6 +93,7 @@ export class NanoclawBackend implements Backend {
       push({ finish_reason: reason })
     }
     const scheduleSilence = (): void => {
+      if (this.silenceMs <= 0) return
       if (silenceTimer) clearTimeout(silenceTimer)
       silenceTimer = setTimeout(() => finish('stop'), this.silenceMs)
     }
