@@ -1,17 +1,12 @@
 # cli-bridge
 
-OpenAI-compatible HTTP proxy for local CLI harnesses (claude-code, opencode,
-kimi-code, codex, amp, factory, forge, claudish, …) backed by your
-subscription. Translates `POST /v1/chat/completions` → spawn the right CLI
-in `--print` mode, parse its stream, return OpenAI-shaped deltas.
+This service exposes local agent backends through HTTP APIs.
+Read [README.md](README.md) for API usage and [src/config.ts](src/config.ts) for supported configuration.
+Backend implementations under [src/backends/](src/backends/) own command invocation and streaming behavior.
+Do not assume all backends use the same flags or session protocol.
 
-- `BRIDGE_BACKENDS` env picks which backends are active per-host.
-- Auth via static bearer (`BRIDGE_BEARER`) — required.
-- Sessions resumable via `X-Session-Id` header / `session_id` body field.
+Preserve the bearer requirement for non-loopback binding and the session identity checks at request boundaries.
+For deployment, read [deploy/README.md](deploy/README.md) and verify the target's actual configuration.
 
-## Commit hygiene
-
-- **Never add `Co-Authored-By: Claude …` trailers to commits.** Drew authors
-  every commit himself; AI assistance is implicit and not credited.
-- Subjects: imperative, lowercase, conventional-commit style.
-- Push feature branches; never push directly to `main`.
+Use Conventional Commits and the configured Git identity, without co-authorship or tool-attribution trailers.
+Push feature branches and use a reviewed PR; do not push directly to `main`.
