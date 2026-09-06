@@ -1,0 +1,16 @@
+{
+  "name": "cli-bridge-runtime-consumer-regression",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsx --test bridge-cache-accounting.consumer.ts"
+  },
+  "devDependencies": {
+    "@tangle-network/agent-eval": "0.173.3",
+    "@tangle-network/agent-interface": "2.3.1",
+    "@tangle-network/agent-profile-materialize": "0.19.2",
+    "@tangle-network/agent-runtime": "0.194.0",
+    "@tangle-network/sandbox": "0.37.1",
+    "tsx": "^4.23.12"
+  }
+}

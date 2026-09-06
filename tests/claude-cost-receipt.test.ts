@@ -42,7 +42,7 @@ async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
 
 function request(): ChatRequest {
   return {
-    model: 'claude/sonnet',
+    model: 'claude-code/anthropic/sonnet',
     messages: [{ role: 'user', content: 'do the thing' }],
     mode: 'byob',
   } as ChatRequest
@@ -57,6 +57,7 @@ const ASSISTANT = {
 function chatWith(lines: Array<Record<string, unknown>>): AsyncIterable<ChatDelta> {
   const backend = new ClaudeBackend({
     bin: 'claude',
+    harness: 'claude-code',
     timeoutMs: 5_000,
     spawner: claudeSpawner(lines),
   })
@@ -64,7 +65,7 @@ function chatWith(lines: Array<Record<string, unknown>>): AsyncIterable<ChatDelt
 }
 
 describe('claude dollar receipt', () => {
-  it('forwards total_cost_usd as a provider receipt covering the whole invocation', async () => {
+  it('normalizes Claude Code cache classes into a complete provider receipt', async () => {
     const deltas = await collect(
       chatWith([
         INIT,
@@ -73,17 +74,25 @@ describe('claude dollar receipt', () => {
           type: 'result',
           subtype: 'success',
           session_id: 'sess-1',
-          usage: { input_tokens: 1_200, output_tokens: 340 },
-          total_cost_usd: 0.0412,
+          usage: {
+            input_tokens: 2,
+            cache_creation_input_tokens: 10_753,
+            cache_read_input_tokens: 15_269,
+            output_tokens: 4,
+          },
+          total_cost_usd: 0.0470478,
         },
       ]),
     )
 
     const final = deltas.at(-1)
     expect(final?.usage).toEqual({
-      input_tokens: 1_200,
-      output_tokens: 340,
-      cost: 0.0412,
+      input_tokens: 26_024,
+      fresh_input_tokens: 2,
+      cache_read_input_tokens: 15_269,
+      cache_write_input_tokens: 10_753,
+      output_tokens: 4,
+      cost: 0.0470478,
       cost_known: true,
       cost_provenance: 'provider-receipt',
       cost_scope: 'total',
@@ -106,11 +115,66 @@ describe('claude dollar receipt', () => {
 
     const final = deltas.at(-1)
     expect(final?.usage).toEqual({
-      input_tokens: 90,
+      fresh_input_tokens: 90,
       output_tokens: 12,
       cost_known: false,
     })
     expect(final?.usage?.cost).toBeUndefined()
+  })
+
+  it('does not turn omitted, invalid, or overflowing cache classes into a prompt total', async () => {
+    const cases = [
+      {
+        usage: { input_tokens: 90, cache_creation_input_tokens: 0, output_tokens: 12 },
+        expected: {
+          fresh_input_tokens: 90,
+          cache_write_input_tokens: 0,
+          output_tokens: 12,
+          cost_known: false,
+        },
+      },
+      {
+        usage: {
+          input_tokens: 90,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: -1,
+          output_tokens: 12,
+        },
+        expected: {
+          fresh_input_tokens: 90,
+          cache_write_input_tokens: 0,
+          output_tokens: 12,
+          cost_known: false,
+        },
+      },
+      {
+        usage: {
+          input_tokens: Number.MAX_SAFE_INTEGER,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 1,
+          output_tokens: 0,
+        },
+        expected: {
+          fresh_input_tokens: Number.MAX_SAFE_INTEGER,
+          cache_read_input_tokens: 1,
+          cache_write_input_tokens: 0,
+          output_tokens: 0,
+          cost_known: false,
+        },
+      },
+    ]
+
+    for (const { usage, expected } of cases) {
+      const deltas = await collect(
+        chatWith([
+          INIT,
+          ASSISTANT,
+          { type: 'result', subtype: 'success', session_id: 'sess-1', usage },
+        ]),
+      )
+
+      expect(deltas.at(-1)?.usage).toEqual(expected)
+    }
   })
 
   it('refuses a negative or non-finite figure rather than billing it', async () => {
@@ -143,13 +207,18 @@ describe('claude dollar receipt', () => {
           type: 'result',
           subtype: 'success',
           session_id: 'sess-1',
-          usage: { input_tokens: 1_200, output_tokens: 340 },
+          usage: {
+            input_tokens: 1_200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: 340,
+          },
           total_cost_usd: 0.0412,
         },
       ]),
     )
     const final = deltas.at(-1)
-    const chunk = deltaToOpenAIChunk(final as ChatDelta, makeChunkMeta('claude/sonnet'))
+    const chunk = deltaToOpenAIChunk(final as ChatDelta, makeChunkMeta('claude-code/anthropic/sonnet'))
     const wire = JSON.parse((chunk as string).replace(/^data: /, '')) as {
       usage: Record<string, unknown>
     }
