@@ -71,10 +71,21 @@ interface ClaudeStreamResult {
   session_id: string
   is_error?: boolean
   result?: string
-  usage?: { input_tokens?: number; output_tokens?: number }
+  usage?: ClaudeNativeUsage
   total_cost_usd?: number
 }
 type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamResult | { type: string }
+
+/**
+ * Claude Code's native receipt is not OpenAI usage: `input_tokens` is fresh
+ * input, while cache reads and writes live in their own fields.
+ */
+interface ClaudeNativeUsage {
+  input_tokens?: number
+  cache_creation_input_tokens?: number
+  cache_read_input_tokens?: number
+  output_tokens?: number
+}
 
 const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 300
 
@@ -92,19 +103,64 @@ const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 300
  * amount at all. A zero here would read as a measured free turn.
  */
 function claudeResultUsage(result: ClaudeStreamResult): NonNullable<ChatDelta['usage']> | undefined {
+  const usage = normalizeClaudeUsage(result.usage)
   const cost = result.total_cost_usd
   const billed = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : undefined
   if (billed === undefined) {
-    if (!result.usage) return undefined
-    return { ...result.usage, cost_known: false }
+    if (!usage) return undefined
+    return { ...usage, cost_known: false }
   }
   return {
-    ...(result.usage ?? {}),
+    ...(usage ?? {}),
     cost: billed,
     cost_known: true,
     cost_provenance: 'provider-receipt',
     cost_scope: 'total',
   }
+}
+
+/**
+ * Translate Claude Code's native token classes into the bridge's canonical
+ * receipt. The wire's `input_tokens` is the whole prompt total, not just fresh
+ * input. When Claude omits, invalidates, or overflows part of its cache split,
+ * preserve the named classes but do not invent a total.
+ */
+function normalizeClaudeUsage(usage: ClaudeNativeUsage | undefined): NonNullable<ChatDelta['usage']> | undefined {
+  if (!usage) return undefined
+
+  const freshInput = tokenCount(usage.input_tokens)
+  const cacheRead = tokenCount(usage.cache_read_input_tokens)
+  const cacheWrite = tokenCount(usage.cache_creation_input_tokens)
+  const output = tokenCount(usage.output_tokens)
+  const promptTokens =
+    freshInput !== undefined && cacheRead !== undefined && cacheWrite !== undefined
+      ? sumTokenCounts(freshInput, cacheRead, cacheWrite)
+      : undefined
+
+  if (
+    promptTokens === undefined
+    && freshInput === undefined
+    && cacheRead === undefined
+    && cacheWrite === undefined
+    && output === undefined
+  ) return undefined
+
+  return {
+    ...(promptTokens !== undefined ? { input_tokens: promptTokens } : {}),
+    ...(freshInput !== undefined ? { fresh_input_tokens: freshInput } : {}),
+    ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cache_write_input_tokens: cacheWrite } : {}),
+    ...(output !== undefined ? { output_tokens: output } : {}),
+  }
+}
+
+function tokenCount(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function sumTokenCounts(...values: number[]): number | undefined {
+  const total = values.reduce((sum, value) => sum + value, 0)
+  return Number.isSafeInteger(total) ? total : undefined
 }
 
 function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
@@ -666,4 +722,3 @@ export class ClaudeBackend implements Backend {
     return null
   }
 }
-

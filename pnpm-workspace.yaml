@@ -1,11 +1,19 @@
+packages:
+  - tests/runtime-consumer
+
 # pnpm applies a minimum release age before it will install a package. These exempt exact
 # versions so a same-day publish can be consumed. Scoped to single versions on purpose: this
 # must NOT become a standing bypass of that supply-chain control. Each entry is dead weight
 # once its version is older than the minimum release age.
 minimumReleaseAgeExclude:
   - '@tangle-network/agent-profile-materialize@0.16.0'
+  - '@tangle-network/agent-profile-materialize@0.19.2'
   - '@tangle-network/agent-trace-contract@1.0.2'
   - '@tangle-network/agent-interface@1.8.0 || 1.9.0'
+  - '@tangle-network/agent-interface@2.3.1'
+  - '@tangle-network/agent-eval@0.173.3'
+  - '@tangle-network/agent-runtime@0.194.0'
+  - '@tangle-network/sandbox@0.37.1'
 
 # Dependencies allowed to run install scripts. better-sqlite3 needs its install script to
 # obtain the native binding the session store loads; esbuild needs its platform binary.
