@@ -2,12 +2,14 @@
  * A mounted skill carries the exact bytes the profile declared.
  *
  * Measured motive: agent-profile-materialize 0.17.1 re-quoted a SKILL.md whose
- * frontmatter already carried a quoted description. The Lab's
- * skills/profile-authoring/SKILL.md (3,862 bytes) mounted as 3,866 bytes, and a
- * child that copied the mounted file mounted 3,874. That skill instructs every
- * spawn-capable profile to carry a byte-identical copy, which no agent can do
- * while the mount itself changes the bytes. 0.19.2 returns a normalized
- * SKILL.md unchanged; this test pins that on the bridge's own claude-code path.
+ * frontmatter already carried a quoted description. On a scratch 0.17.1 install
+ * (materializeProfile, 2026-09-06), the Lab's skills/profile-authoring/SKILL.md
+ * (3,862 bytes) mounted as 3,866 bytes, and mounting that output again, as a
+ * child that copies the mount would, gave 3,874. No live run recorded those
+ * counts. That skill instructs every spawn-capable profile to carry a
+ * byte-identical copy, which no agent can do while the mount itself changes the
+ * bytes. 0.19.2 returns a normalized SKILL.md unchanged; this test pins that on
+ * the bridge's own claude-code path.
  */
 import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
