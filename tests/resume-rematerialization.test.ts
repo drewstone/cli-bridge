@@ -90,10 +90,37 @@ describe('resume re-materialization', () => {
     expect(readFileSync(join(otherCwd, 'CLAUDE.md'), 'utf8')).toContain('STANDING BRIEF')
   })
 
-  it('still refuses a mid-session profile swap, naming both content digests', () => {
+  // A generated context file carries the materializer's marker, so a changed
+  // plan replaces it instead of stopping the turn (agent-profile-materialize
+  // 0.19.1). The mid-session profile swap itself is refused earlier, at the
+  // session binding (tests/session-profile-binding.test.ts, 409).
+  it('replaces its own generated context file when the plan changes', () => {
     const cwd = root()
     const first = provisionProfileWorkspace(request(), null, 'claude-code', cwd)
     if (!first.workspacePlanDigest) throw new Error('turn 1 produced no plan digest')
+
+    const swapped: AgentProfile = {
+      ...PROFILE,
+      prompt: { ...PROFILE.prompt, instructions: ['A DIFFERENT BRIEF'] },
+    }
+    const second = provisionProfileWorkspace(
+      request(swapped),
+      sessionFor(cwd, first.workspacePlanDigest, swapped),
+      'claude-code',
+      cwd,
+    )
+    expect(second.workspacePlanDigest).not.toBe(first.workspacePlanDigest)
+    expect(second.written).toContain('CLAUDE.md')
+    const context = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')
+    expect(context).toContain('A DIFFERENT BRIEF')
+    expect(context).not.toContain('STANDING BRIEF')
+  })
+
+  it('still refuses to replace an agent-edited context file under a changed plan, naming both content digests', () => {
+    const cwd = root()
+    const first = provisionProfileWorkspace(request(), null, 'claude-code', cwd)
+    if (!first.workspacePlanDigest) throw new Error('turn 1 produced no plan digest')
+    appendFileSync(join(cwd, 'CLAUDE.md'), '\n- codeword: heliotrope\n')
 
     const swapped: AgentProfile = {
       ...PROFILE,
@@ -113,5 +140,6 @@ describe('resume re-materialization', () => {
     expect(message).toContain('Refusing to replace existing workspace file: CLAUDE.md')
     expect(message).toMatch(/planned sha256:[0-9a-f]{64}/)
     expect(message).toMatch(/existing sha256:[0-9a-f]{64}/)
+    expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toContain('codeword: heliotrope')
   })
 })
