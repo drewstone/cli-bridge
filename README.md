@@ -340,6 +340,11 @@ A session external id is the harness conversation key (`claude --resume`, `openc
 
 The client contract is one line: a session external id must be unique per logical run.
 The bridge cannot tell an intentional resume from an accidental id collision; only the caller can, by never deriving the same session id for two distinct runs.
+
+Claude profiles can share a task directory while loading different generated tool and permission settings through separate `--settings` files.
+The settings path includes the exact profile digest, and the materialization receipt records that path.
+Existing sessions retain their recorded plan when resumed after an upgrade.
+Shared skills and task files still require identical bytes; conflicting content is refused before the CLI starts.
 If a caller derives session ids from a digest, the digest must include an attempt-scoped or run-scoped term.
 
 The refusal body carries both bindings, so a caller can tell a drifted profile from a reused id:

@@ -34,6 +34,7 @@ import { ExecutorConfigurationError } from '../executors/types.js'
 import {
   applyWorkspacePlan,
   assertWorkspacePlanSupported,
+  hashWorkspacePlan,
   type HarnessId,
   materializeProfile,
   type WorkspacePlan,
@@ -149,6 +150,22 @@ export function provisionProfileWorkspace(
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   try {
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
+    // Claude loads this generated file through --settings, so its path need not
+    // occupy the shared task workspace's one conventional settings name.
+    // Bind it to the exact profile; resumed sessions retain the same plan path.
+    // A persisted session keeps its already-applied plan so an upgrade cannot
+    // change the materialization identity halfway through a conversation.
+    if (harness === 'claude-code' && sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest !== hashWorkspacePlan(plan)) {
+      const settingsPath = '.tangle/claude-settings.json'
+      const settings = plan.files.find((file) => file.relPath === settingsPath && file.source === 'generated')
+      if (settings) {
+        const scopedPath = `.tangle/claude-settings/${canonicalAgentProfileDigest(profile).slice('sha256:'.length)}.json`
+        settings.relPath = scopedPath
+        plan.flags = plan.flags.map((flag, index) =>
+          index > 0 && plan.flags[index - 1] === '--settings' && flag === settingsPath ? scopedPath : flag,
+        )
+      }
+    }
     assertWorkspacePlanSupported(plan)
     const applied = applyWorkspacePlan(plan, workspaceCwd, sessionAppliedPlanDigest(session, workspaceCwd))
     const receipt = retainProfileMaterializationReceipt(
