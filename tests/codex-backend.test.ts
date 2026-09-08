@@ -117,7 +117,11 @@ describe('CodexBackend tool-call translation', () => {
       runtime_attachments: { mcp: { coordination: { url: `http://127.0.0.1:${port}/mcp` } } },
     })
     try {
-      await Promise.all(['one', 'two'].map((id) => collect(backend.chat(makeRequest(id, 1001), null, new AbortController().signal))))
+      await Promise.all(['one', 'two'].map((id) => collect(backend.chat(
+        id === 'one' ? { ...request(), session_id: id } : makeRequest(id, 1001),
+        null, new AbortController().signal,
+      ))))
+      expect(seenConfigs[0]?.trim()).toBe('')
       expect(homes.get('one')).not.toBe(homes.get('two'))
       const firstHome = homes.get('one')!
       expect(existsSync(join(firstHome, 'config.toml'))).toBe(false)
@@ -137,6 +141,28 @@ describe('CodexBackend tool-call translation', () => {
       expect(existsSync(join(firstHome, 'auth.json'))).toBe(false)
       expect(existsSync(join(firstHome, 'config.toml'))).toBe(false)
       expect(readFileSync(join(firstHome, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('one')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps legacy no-MCP sessions on their original home and refuses a context-losing MCP migration', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'codex-legacy-session-'))
+    const observed: { args?: string[] } = {}
+    let dispatches = 0
+    const spawner: Spawner = async (bin, args, opts) => {
+      dispatches++
+      expect(opts.env?.CODEX_HOME).toBe(process.env.CODEX_HOME)
+      return codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed)(bin, args, opts)
+    }
+    const backend = new CodexBackend({ bin: 'codex', timeoutMs: 0, stateDir: root, spawner })
+    const session: SessionRecord = { externalId: 'legacy', backend: 'codex', internalId: THREAD.thread_id, cwd: null, turns: 1, createdAt: 0, lastUsedAt: 0, metadata: {} }
+    try {
+      await collect(backend.chat({ ...request(), session_id: 'legacy' }, session, new AbortController().signal))
+      expect(observed.args).toContain('resume')
+      const withMcp: ChatRequest = { ...request(), session_id: 'legacy', runtime_attachments: { mcp: { coordination: { url: 'http://127.0.0.1:1001/mcp' } } } }
+      await expect(collect(backend.chat(withMcp, session, new AbortController().signal))).rejects.toThrow('no retained native home')
+      expect(dispatches).toBe(1)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
