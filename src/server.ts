@@ -381,6 +381,7 @@ export async function buildApp(config: Config): Promise<{
     registry.register(new CodexBackend({
       bin: config.codexBin,
       timeoutMs: config.codexTimeoutMs,
+      stateDir: join(config.dataDir, 'codex'),
       ...(spawner ? { spawner } : {}),
     }))
   }

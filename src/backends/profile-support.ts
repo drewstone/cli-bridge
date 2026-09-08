@@ -1665,7 +1665,9 @@ export function materializeEmptyMcpConfig(): MaterializedMcpConfig {
  * http servers (spec.type === 'http' with `url`) — written as
  * `url = "..."` + optional `headers`/`bearer_token_env_var`.
  *
- * Returns null when no usable servers remain.
+ * A supplied sessionHome retains native state under the bridge data directory.
+ * Cleanup removes only this turn's config and auth; one-shot homes are removed entirely.
+ * Returns null when no usable servers remain and no session home was supplied.
  */
 export interface MaterializedCodexHome {
   /** Directory to pass via `CODEX_HOME` env. */
@@ -1678,12 +1680,13 @@ export interface MaterializedCodexHome {
 export function materializeMcpServersForCodex(
   specs: Record<string, McpServerSpec> | null,
   authSourcePath?: string,
+  sessionHome?: string,
 ): MaterializedCodexHome | null {
-  if (!specs) return null
+  if (!specs && !sessionHome) return null
 
   const lines: string[] = []
   const serverNames: string[] = []
-  for (const [name, spec] of Object.entries(specs)) {
+  for (const [name, spec] of Object.entries(specs ?? {})) {
     if (spec.enabled === false) continue
     if (!/^[A-Za-z0-9_-]+$/.test(name)) {
       // Codex's TOML table key parser is strict; skip names that would
@@ -1724,11 +1727,13 @@ export function materializeMcpServersForCodex(
     lines.push(block.join('\n'))
     serverNames.push(name)
   }
-  if (serverNames.length === 0) return null
+  if (serverNames.length === 0 && !sessionHome) return null
 
   // Codex aborts if CODEX_HOME is under the system tmpdir on some
   // platforms — use the user's HOME/.cache as a stable parent.
-  const baseDir = mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
+  const baseDir = sessionHome ?? mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
+  // A session keeps native rollouts and indexes, never the previous turn's credentials.
+  for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
   writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n')
 
   if (authSourcePath) {
@@ -1747,7 +1752,11 @@ export function materializeMcpServersForCodex(
     serverNames,
     cleanup: () => {
       try {
-        rmSync(baseDir, { recursive: true, force: true })
+        if (sessionHome) {
+          for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
+        } else {
+          rmSync(baseDir, { recursive: true, force: true })
+        }
       } catch {
         // best-effort
       }

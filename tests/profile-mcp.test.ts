@@ -500,6 +500,35 @@ describe('materializeMcpServersForKimi', () => {
 })
 
 describe('materializeMcpServersForCodex', () => {
+  it('retains session state but removes credentials and stale config between materializations', () => {
+    const fs = require('node:fs') as typeof import('node:fs')
+    const os = require('node:os') as typeof import('node:os')
+    const root = fs.mkdtempSync(join(os.tmpdir(), 'codex-session-home-'))
+    const source = join(root, 'operator-auth.json')
+    const home = join(root, 'session')
+    fs.mkdirSync(home)
+    fs.writeFileSync(source, '{"token":"fixture-only"}')
+    try {
+      const first = materializeMcpServersForCodex({ private: { command: 'tool', env: { TOKEN: 'fixture-mcp-only' } } }, source, home)!
+      expect(fs.readFileSync(join(home, 'auth.json'), 'utf8')).toContain('fixture-only')
+      fs.writeFileSync(join(home, 'native-state'), 'retained')
+      first.cleanup()
+      expect(fs.existsSync(join(home, 'auth.json'))).toBe(false)
+      expect(fs.existsSync(join(home, 'config.toml'))).toBe(false)
+      fs.rmSync(source)
+      const next = materializeMcpServersForCodex(null, source, home)!
+      expect(fs.readFileSync(join(home, 'config.toml'), 'utf8')).not.toContain('fixture-mcp-only')
+      expect(fs.existsSync(join(home, 'auth.json'))).toBe(false)
+      expect(fs.readFileSync(join(home, 'native-state'), 'utf8')).toBe('retained')
+      next.cleanup()
+      const oneShot = materializeMcpServersForCodex({ tool: { command: 'tool' } })!
+      oneShot.cleanup()
+      expect(fs.existsSync(oneShot.homePath)).toBe(false)
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('writes a TOML config.toml with stdio servers under [mcp_servers.<name>]', () => {
     const m = materializeMcpServersForCodex({
       echo: { command: 'node', args: ['./echo.js'], env: { FOO: 'bar' } },
