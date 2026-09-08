@@ -587,12 +587,15 @@ into the profile when the flag is absent.
 and `env` round-trip through the materialised config file unchanged
 (verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
 
-Codex MCP sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`.
+New recorded Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
 The existing session execution lease serializes turns using that home.
 Each turn refreshes authentication and MCP configuration, including changed Runtime attachment endpoints, and removes those two files when execution ends.
 One-shot MCP homes are removed entirely.
 Native session files remain with the bridge data directory; deleting a session mapping does not erase its transcripts.
 Previously deleted temporary rollouts cannot be recovered by this change.
+Legacy sessions without a retained home can continue without MCP on their original home; adding MCP is refused before execution.
+Start a new external session with explicitly carried context when that legacy session needs MCP.
+Continuity assumes an unchanged execution mode; moving a native session between host and jail is not verified.
 
 **http/sse caveat**: claude/opencode load HTTP MCP via the
 respective CLI's separate `mcp add --transport http` registry, which

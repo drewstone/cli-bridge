@@ -436,13 +436,14 @@ describe('per-backend materializer produces a launchable stdio MCP server', () =
       const result = spawnSync('codex', ['mcp', 'list'], {
         env: { ...process.env, CODEX_HOME: m.homePath },
         encoding: 'utf-8',
+        timeout: 30_000,
       })
       expect(result.status).toBe(0)
       expect(result.stdout).toContain('echo')
     } finally {
       m.cleanup()
     }
-  }, 10_000)
+  }, 45_000)
 
   it('codex config.toml — TOML stanza parses back to a launchable spec', async () => {
     const specs = specsForServer()

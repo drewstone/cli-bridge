@@ -138,10 +138,18 @@ export class CodexBackend implements Backend {
     const nativeHome = this.opts.stateDir && externalId
       ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))
       : undefined
+    const legacySession = nativeHome && session?.internalId && !existsSync(nativeHome)
+    if (legacySession && mcpServers) {
+      throw new BackendError(
+        'Codex session has no retained native home; cannot attach MCP without losing its thread. ' +
+        'Continue an existing no-MCP session without MCP, or start a new external session with retained context.',
+        'parse_error',
+      )
+    }
     const codexHome = materializeMcpServersForCodex(
       mcpServers,
       resolveCodexAuthPath(),
-      nativeHome && (mcpServers || existsSync(nativeHome))
+      nativeHome && !legacySession
         ? ensurePrivateDataDirectory(nativeHome)
         : undefined,
     )
