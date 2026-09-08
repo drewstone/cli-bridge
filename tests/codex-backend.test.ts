@@ -1,8 +1,10 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
 import { describe, expect, it } from 'vitest'
+import type { SessionRecord } from '../src/sessions/store.js'
 import { CodexBackend, splitCodexModel } from '../src/backends/codex.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
@@ -90,6 +92,56 @@ const TURN_DONE = {
 }
 
 describe('CodexBackend tool-call translation', () => {
+  it('retains native state across turns while refreshing MCP and isolating concurrent sessions', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'codex-native-session-'))
+    const homes = new Map<string, string>()
+    const seenConfigs: string[] = []
+    const spawner: Spawner = async (bin, args, opts) => {
+      const home = opts.env!.CODEX_HOME!
+      const id = opts.sessionId!
+      homes.set(id, home)
+      seenConfigs.push(readFileSync(join(home, 'config.toml'), 'utf8'))
+      if (args.includes('resume')) {
+        expect(args).toContain(THREAD.thread_id)
+        expect(readFileSync(join(home, 'sessions', 'rollout.jsonl'), 'utf8')).toBe(id)
+      } else {
+        expect(existsSync(join(home, 'sessions', 'rollout.jsonl'))).toBe(false)
+        mkdirSync(join(home, 'sessions'))
+        writeFileSync(join(home, 'sessions', 'rollout.jsonl'), id)
+      }
+      return codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE])(bin, args, opts)
+    }
+    const backend = new CodexBackend({ bin: 'codex', timeoutMs: 0, stateDir: root, spawner })
+    const makeRequest = (id: string, port: number): ChatRequest => ({
+      ...request(), session_id: id,
+      runtime_attachments: { mcp: { coordination: { url: `http://127.0.0.1:${port}/mcp` } } },
+    })
+    try {
+      await Promise.all(['one', 'two'].map((id) => collect(backend.chat(makeRequest(id, 1001), null, new AbortController().signal))))
+      expect(homes.get('one')).not.toBe(homes.get('two'))
+      const firstHome = homes.get('one')!
+      expect(existsSync(join(firstHome, 'config.toml'))).toBe(false)
+      expect(existsSync(join(firstHome, 'auth.json'))).toBe(false)
+      const session: SessionRecord = { externalId: 'one', backend: 'codex', internalId: THREAD.thread_id, cwd: null, turns: 1, createdAt: 0, lastUsedAt: 0, metadata: {} }
+      const restarted = new CodexBackend({ bin: 'codex', timeoutMs: 0, stateDir: root, spawner })
+      await collect(restarted.chat(makeRequest('one', 2002), session, new AbortController().signal))
+      expect(homes.get('one')).toBe(firstHome)
+      expect(seenConfigs.at(-1)).toContain(':2002/mcp')
+      expect(seenConfigs.at(-1)).not.toContain(':1001/mcp')
+      expect(existsSync(join(firstHome, 'config.toml'))).toBe(false)
+      expect(readFileSync(join(firstHome, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('one')
+      await collect(restarted.chat({ ...request(), session_id: 'one' }, session, new AbortController().signal))
+      expect(seenConfigs.at(-1)?.trim()).toBe('')
+      const refusing = new CodexBackend({ bin: 'codex', timeoutMs: 0, stateDir: root, spawner: async () => { throw new Error('fixture spawn failure') } })
+      await expect(collect(refusing.chat(makeRequest('one', 3003), session, new AbortController().signal))).rejects.toThrow('fixture spawn failure')
+      expect(existsSync(join(firstHome, 'auth.json'))).toBe(false)
+      expect(existsSync(join(firstHome, 'config.toml'))).toBe(false)
+      expect(readFileSync(join(firstHome, 'sessions', 'rollout.jsonl'), 'utf8')).toBe('one')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('surfaces command/mcp/web_search items as tool_calls deltas', async () => {
     const backend = new CodexBackend({
       bin: 'codex',

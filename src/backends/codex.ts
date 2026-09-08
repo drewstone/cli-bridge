@@ -26,6 +26,9 @@
  */
 
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
@@ -50,6 +53,8 @@ import { nativeReasoningControl } from '@tangle-network/agent-interface'
 export interface CodexBackendOptions {
   bin: string
   timeoutMs: number
+  /** Bridge-owned native state; session execution leases serialize access. */
+  stateDir?: string
   /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
   spawner?: Spawner
 }
@@ -126,23 +131,26 @@ export class CodexBackend implements Backend {
     )
     args.push(...provisioned.flags)
 
-    // MCP server passthrough — codex has no `--mcp-config` flag.
-    // Servers are loaded from `$CODEX_HOME/config.toml`'s
-    // `[mcp_servers.<name>]` stanzas. We synthesise a temp HOME
-    // containing the selected servers and copy the user's persistent
-    // `auth.json` so the spawned codex still authenticates as the
-    // operator. Cleanup runs in the outer finally so the temp dir
-    // doesn't leak on subprocess crash.
+    // Session leases own this directory's read/execute/update interval.
+    // Keep native state across turns, but regenerate MCP config and auth each time.
+    const mcpServers = resolveMcpServers(req, session)
+    const externalId = req.session_id ?? session?.externalId
+    const nativeHome = this.opts.stateDir && externalId
+      ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))
+      : undefined
     const codexHome = materializeMcpServersForCodex(
-      resolveMcpServers(req, session),
+      mcpServers,
       resolveCodexAuthPath(),
+      nativeHome && (mcpServers || existsSync(nativeHome))
+        ? ensurePrivateDataDirectory(nativeHome)
+        : undefined,
     )
 
     // When MCP passthrough is active, the synthetic CODEX_HOME (selected MCP config
     // + copied auth) is the source of truth. Register it as the jail's codex auth
     // source so a CONFINED run gets it surfaced inside the jail with CODEX_HOME
-    // redirected there. Seeded WRITABLE (the whole synthetic dir is two small
-    // files): codex must write PATH aliases, app-server state, and session
+    // redirected there. Seeded WRITABLE: codex must write PATH aliases,
+    // app-server state, and session
     // rollouts inside its home before it can run at all. The jail applies this
     // only when it actually wraps; on docker/fallback paths the host
     // `CODEX_HOME` env below is used unchanged.
@@ -153,6 +161,7 @@ export class CodexBackend implements Backend {
           source: codexHome.homePath,
           jailRel: '.codex',
           mode: 'seed-writable',
+          only: ['auth.json', 'config.toml'],
           envVar: 'CODEX_HOME',
         },
       ]

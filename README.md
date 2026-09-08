@@ -578,7 +578,7 @@ into the profile when the flag is absent.
 | backend    | stdio MCP | http/sse MCP | loader mechanism                                              |
 | ---------- | --------- | ------------ | ------------------------------------------------------------- |
 | claude     | yes       | no (caveat)  | `--mcp-config <tempfile>` (canonical `mcp-config.json` shape) |
-| codex      | yes       | yes          | `CODEX_HOME=<tempdir>` with synthesised `config.toml`         |
+| codex      | yes       | yes          | Isolated `CODEX_HOME` with per-turn `config.toml`         |
 | kimi       | yes       | no           | project-local `<cwd>/.kimi-code/mcp.json` (restored after the turn) |
 | opencode   | yes       | no           | `OPENCODE_CONFIG=<tempfile>` (opencode's per-config schema)   |
 | gemini     | no        | no           | not wired until Gemini exposes/validates per-invocation MCP   |
@@ -586,6 +586,13 @@ into the profile when the flag is absent.
 **stdio**: every MCP-enabled backend loads stdio MCP servers — `command`, `args`,
 and `env` round-trip through the materialised config file unchanged
 (verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
+
+Codex MCP sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`.
+The existing session execution lease serializes turns using that home.
+Each turn refreshes authentication and MCP configuration, including changed Runtime attachment endpoints, and removes those two files when execution ends.
+One-shot MCP homes are removed entirely.
+Native session files remain with the bridge data directory; deleting a session mapping does not erase its transcripts.
+Previously deleted temporary rollouts cannot be recovered by this change.
 
 **http/sse caveat**: claude/opencode load HTTP MCP via the
 respective CLI's separate `mcp add --transport http` registry, which
