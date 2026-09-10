@@ -453,9 +453,11 @@ export const PI_REQUEST_SCOPED_CREDENTIAL_SOURCE =
  * in the pi line the prime fork descends from but a literal in the upstream
  * 0.8x line, so a bare identifier is reported with the presence of a variable
  * of that name and left for the operator to read against their pi build.
- * Only `$VAR` names and paths are rendered, never the apiKey string itself:
- * the message crosses the HTTP boundary, and a bare identifier may BE the key
- * (an identifier-shaped literal such as a hex or `sk_live_` token).
+ * Only paths, pi's own credential type names, and the env var names pi itself
+ * reads are rendered, never the apiKey string or any part of it: the message
+ * crosses the HTTP boundary, a bare identifier may BE the key (an
+ * identifier-shaped literal such as a hex or `sk_live_` token), and the
+ * literal text of a template is key material too.
  */
 export function describePiCredentialSource(
   sourceAgentDir: string,
@@ -466,7 +468,9 @@ export function describePiCredentialSource(
   const modelsPath = join(sourceAgentDir, 'models.json')
   const stored = readJsonRecord(authPath)?.[selection.provider]
   if (isRecord(stored)) {
-    const type = typeof stored.type === 'string' ? stored.type : 'unknown-type'
+    // pi's auth.json knows exactly these two types (core/auth-storage.ts) and
+    // refuses any other; the field is file content, so it is not echoed.
+    const type = stored.type === 'api_key' || stored.type === 'oauth' ? stored.type : 'unrecognized-type'
     return `stored ${type} credential for provider "${selection.provider}" in ${authPath}`
   }
   const models = readJsonRecord(modelsPath)
@@ -478,18 +482,64 @@ export function describePiCredentialSource(
     return `pi's built-in auth for provider "${selection.provider}" (${missing}; no entry in ${authPath})`
   }
   if (apiKey.startsWith('!')) return `the shell command configured as ${keyPath}`
-  const template = apiKey.replace(/\$[$!]/gu, '')
-  const referenced = [...template.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)].map((match) => match[1]!)
-  if (referenced.length === 0 && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(apiKey)) {
+  const names = piConfigValueEnvNames(apiKey)
+  if (names.length === 0 && PI_ENV_NAME.test(apiKey)) {
     return `the bare identifier under ${keyPath} `
       + `(an env var of that name is ${env[apiKey] ? 'set' : 'unset'} in the bridge environment)`
   }
-  const names = [...new Set(referenced)]
   if (names.length === 0) return `the literal apiKey under ${keyPath}`
   const presence = names
     .map((name) => `${name} is ${env[name] ? 'set' : 'unset'} in the bridge environment`)
     .join(', ')
   return `the env var template under ${keyPath} (${presence})`
+}
+
+const PI_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u
+const PI_ENV_NAME_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*/u
+
+/**
+ * The env var names upstream pi reads from a config value: a port of its
+ * template scan (core/resolve-config-value.ts `parseConfigValueTemplate`).
+ * `$$` and `$!` are escapes; `$NAME` takes the longest identifier; `${NAME}`
+ * needs a closing brace around a valid identifier, else the whole `${...}` is
+ * literal; an unclosed `${` is literal. A looser scan reports literal key
+ * text as a name (`$A$$tail` as `Atail`, `k${tail` as `tail`), so the scan
+ * must match pi's exactly: only a name pi reads is not key material.
+ */
+function piConfigValueEnvNames(value: string): string[] {
+  const names: string[] = []
+  const add = (name: string): void => {
+    if (!names.includes(name)) names.push(name)
+  }
+  let index = 0
+  while (index < value.length) {
+    const dollar = value.indexOf('$', index)
+    if (dollar < 0) break
+    const next = value[dollar + 1]
+    if (next === '$' || next === '!') {
+      index = dollar + 2
+      continue
+    }
+    if (next === '{') {
+      const end = value.indexOf('}', dollar + 2)
+      if (end < 0) {
+        index = dollar + 1
+        continue
+      }
+      const name = value.slice(dollar + 2, end)
+      if (PI_ENV_NAME.test(name)) add(name)
+      index = end + 1
+      continue
+    }
+    const match = PI_ENV_NAME_PREFIX.exec(value.slice(dollar + 1))
+    if (match) {
+      add(match[0])
+      index = dollar + 1 + match[0].length
+      continue
+    }
+    index = dollar + 1
+  }
+  return names
 }
 
 function readJsonRecord(path: string): Record<string, unknown> | null {

@@ -1997,6 +1997,38 @@ describe('PiBackend', () => {
       expect(commandSource).not.toContain('/run/secrets')
     })
 
+    it('renders only the env var names pi itself reads, never literal key text beside them', () => {
+      // pi's template scan: `$$` and `$!` are escapes, `${NAME}` needs a closing
+      // brace around an identifier, and everything else is literal key text. A
+      // looser scan printed that text as a variable name in the 401 body.
+      const cases: Array<{ apiKey: string, names: string[], keyText: string }> = [
+        { apiKey: '$ROUTER_PREFIX$$9fQxT2vLm', names: ['ROUTER_PREFIX'], keyText: '9fQxT2vLm' },
+        { apiKey: 'k3y${fQxT2vLmZ', names: [], keyText: 'fQxT2vLmZ' },
+        { apiKey: '${xY7_q-9fQxT2}', names: [], keyText: 'xY7_q' },
+        { apiKey: '${a$Bsecret}', names: [], keyText: 'Bsecret' },
+        { apiKey: 'tok$!Zq8wR5_sEcReT', names: [], keyText: 'Zq8wR5' },
+        { apiKey: '${TANGLE_ROUTER_KEY}$$${DEEPSEEK_API_KEY}', names: ['TANGLE_ROUTER_KEY', 'DEEPSEEK_API_KEY'], keyText: '$$' },
+      ]
+      for (const { apiKey, names, keyText } of cases) {
+        const dir = agentDir({ 'models.json': { providers: { 'tangle-router': { apiKey } } } })
+        const keyPath = `providers.tangle-router.apiKey in ${join(dir, 'models.json')}`
+        const source = describePiCredentialSource(dir, selection, {})
+        expect(source).not.toContain(keyText)
+        expect(source).toBe(names.length === 0
+          ? `the literal apiKey under ${keyPath}`
+          : `the env var template under ${keyPath} (${names.map((name) => `${name} is unset in the bridge environment`).join(', ')})`)
+      }
+    })
+
+    it('names only the credential types pi stores, never other auth.json content', () => {
+      const dir = agentDir({ 'auth.json': { 'tangle-router': { type: 'sk-typo-secret-in-type', key: 'sk-stored-secret' } } })
+      const source = describePiCredentialSource(dir, selection, {})
+      expect(source).toBe(`stored unrecognized-type credential for provider "tangle-router" in ${join(dir, 'auth.json')}`)
+      expect(source).not.toContain('sk-')
+      const oauth = agentDir({ 'auth.json': { 'tangle-router': { type: 'oauth', access: 'a', refresh: 'r', expires: 1 } } })
+      expect(describePiCredentialSource(oauth, selection, {})).toMatch(/^stored oauth credential for provider "tangle-router"/u)
+    })
+
     it("falls back to pi's own provider auth when neither file names the provider", () => {
       const noKey = agentDir({ 'models.json': { providers: { 'tangle-router': { baseUrl: 'https://r.example/v1' } } } })
       expect(describePiCredentialSource(noKey, selection, {})).toBe(
