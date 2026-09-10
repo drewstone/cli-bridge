@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, posix } from 'node:path'
 import type {
   AgentProfile,
   AgentProfileConfigValue,
@@ -166,7 +166,9 @@ export function provisionProfileWorkspace(
         )
       }
     }
+    if (harness === 'opencode') scopeOpencodeProfileConfig(plan, profile)
     assertWorkspacePlanSupported(plan)
+    if (harness === 'opencode') removeLegacyOpencodeProfileConfig(workspaceCwd)
     const applied = applyWorkspacePlan(plan, workspaceCwd, sessionAppliedPlanDigest(session, workspaceCwd))
     const receipt = retainProfileMaterializationReceipt(
       req,
@@ -193,6 +195,96 @@ export function provisionProfileWorkspace(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
+  }
+}
+
+/** The environment variable opencode merges as its final local config layer. */
+const OPENCODE_PROFILE_CONFIG_ENV = 'OPENCODE_CONFIG_CONTENT'
+
+/**
+ * Keep opencode's generated profile config out of the shared task workspace's
+ * fixed names.
+ *
+ * Runtime gives a root and every manager it spawns one cwd. opencode reads the
+ * project `opencode.json`, and every instruction file that config names, on each
+ * model request. A profile written at those fixed paths was therefore replaced
+ * by whichever profile materialized next — mid-turn, and on resume — while each
+ * receipt still named its own profile.
+ *
+ * The generated config now reaches only this process, through
+ * `OPENCODE_CONFIG_CONTENT`; `OPENCODE_CONFIG` already carries the request's MCP
+ * file, which may hold credentials and so never enters the workspace. The
+ * instruction files the config names move under a path bound to the exact
+ * profile digest, so equal digests share equal bytes and unequal ones never
+ * share a path. Instruction paths stay relative: opencode resolves them from the
+ * cwd, verified against opencode 1.18.30, so the plan digest does not depend on
+ * where the workspace sits.
+ */
+function scopeOpencodeProfileConfig(plan: WorkspacePlan, profile: AgentProfile): void {
+  const generated = plan.files.filter((file) =>
+    file.relPath === 'opencode.json' && file.source === 'generated' && (file.root ?? 'workspace') === 'workspace')
+  const [configFile, ...extra] = generated
+  if (configFile === undefined) return
+  if (extra.length > 0) throw new Error('opencode materializer emitted more than one opencode.json')
+  if (configFile.secretSlots?.length) {
+    throw new Error('opencode materializer emitted a generated opencode.json that requires a secret provider')
+  }
+  if (plan.env[OPENCODE_PROFILE_CONFIG_ENV] !== undefined) {
+    throw new Error(`opencode materializer already set ${OPENCODE_PROFILE_CONFIG_ENV}`)
+  }
+  const config = JSON.parse(configFile.content) as Record<string, unknown>
+  const scope = `.tangle/opencode-profile/${canonicalAgentProfileDigest(profile).slice('sha256:'.length)}`
+  if (config.instructions !== undefined) {
+    if (!Array.isArray(config.instructions) || !config.instructions.every((entry) => typeof entry === 'string')) {
+      throw new Error('opencode materializer emitted non-string instructions')
+    }
+    config.instructions = config.instructions.map((entry: string) => {
+      const file = plan.files.find((candidate) =>
+        candidate.relPath === entry && candidate.source === 'generated' && (candidate.root ?? 'workspace') === 'workspace')
+      if (!file) return entry
+      file.relPath = `${scope}/${posix.basename(entry)}`
+      return file.relPath
+    })
+  }
+  plan.files = plan.files.filter((file) => file !== configFile)
+  plan.env[OPENCODE_PROFILE_CONFIG_ENV] = JSON.stringify(config)
+}
+
+/** The instruction files earlier bridge versions generated at fixed workspace paths. */
+const LEGACY_OPENCODE_INSTRUCTION_FILES = ['.opencode/profile-instructions.md', '.opencode/agent-system-prompt.md']
+const LEGACY_OPENCODE_CONFIG_KEYS = new Set(['$schema', 'instructions', 'mcp', 'tools', 'permission'])
+
+/**
+ * Remove the fixed-path profile config an earlier bridge version left in this workspace.
+ *
+ * opencode still loads a project `opencode.json`, so a workspace that an earlier
+ * version materialized into would keep adding the last profile's instructions to
+ * every opencode process started there. Only a config this materializer wrote is
+ * removed: its keys are the materializer's keys, and every instruction it names
+ * is one of the two reserved files no user or harness convention uses. The
+ * materializer replaced exactly such a file on every application before this
+ * change, so removing it takes no authority the bridge did not already hold.
+ */
+function removeLegacyOpencodeProfileConfig(workspaceCwd: string): void {
+  const configPath = join(workspaceCwd, 'opencode.json')
+  let config: unknown
+  try {
+    if (!lstatSync(configPath).isFile()) return
+    config = JSON.parse(readFileSync(configPath, 'utf8'))
+  } catch {
+    return
+  }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return
+  const record = config as Record<string, unknown>
+  if (!Object.keys(record).every((key) => LEGACY_OPENCODE_CONFIG_KEYS.has(key))) return
+  const instructions = record.instructions
+  if (!Array.isArray(instructions) || instructions.length === 0) return
+  if (!instructions.every((entry) => typeof entry === 'string' && LEGACY_OPENCODE_INSTRUCTION_FILES.includes(entry))) return
+  const directory = lstatSync(join(workspaceCwd, '.opencode'), { throwIfNoEntry: false })
+  if (directory && !directory.isDirectory()) return
+  for (const relPath of ['opencode.json', ...LEGACY_OPENCODE_INSTRUCTION_FILES]) {
+    const path = join(workspaceCwd, relPath)
+    if (lstatSync(path, { throwIfNoEntry: false })?.isFile()) rmSync(path, { force: true })
   }
 }
 

@@ -347,6 +347,16 @@ Claude profiles can share a task directory while loading different generated too
 The settings path includes the exact profile digest, and the materialization receipt records that path.
 Existing sessions retain their recorded plan when resumed after an upgrade.
 Shared skills and task files still require identical bytes; conflicting content is refused before the CLI starts.
+
+OpenCode profiles can also share a task directory.
+The bridge does not write a profile's generated `opencode.json` into the directory.
+It passes that config to the one process through `OPENCODE_CONFIG_CONTENT`.
+The instruction files the config names sit under `.tangle/opencode-profile/<profile digest>/`.
+OpenCode reads its config and instruction files on every model request.
+A profile that starts later therefore cannot change the instructions of a running or resumed session.
+The materialization receipt records the config value and the scoped paths.
+An `opencode.json` that an earlier bridge version generated is removed on the next OpenCode profile turn in that directory.
+A project `opencode.json` of any other shape is left in place, and OpenCode loads it for every process in that directory.
 If a caller derives session ids from a digest, the digest must include an attempt-scoped or run-scoped term.
 
 The refusal body carries both bindings, so a caller can tell a drifted profile from a reused id:

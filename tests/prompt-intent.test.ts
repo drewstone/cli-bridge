@@ -387,29 +387,28 @@ describe('prompt intents reach each harness through its own control', () => {
 
     it('registers the addition as its own instructions file, ahead of project instructions', () => {
       const cwd = workspace()
-      provisionProfileWorkspace(
-        request(
-          { prompt: { appendSystemPrompt: ADDITION, instructions: ['PROJECT-INSTRUCTION'] } },
-          'opencode',
-          cwd,
-        ),
-        null,
+      const req = request(
+        { prompt: { appendSystemPrompt: ADDITION, instructions: ['PROJECT-INSTRUCTION'] } },
         'opencode',
         cwd,
       )
+      const provisioned = provisionProfileWorkspace(req, null, 'opencode', cwd)
 
       // opencode joins these files into the same system message as its own
       // built-in prompt, which stays in place — that is the addition contract.
-      const config = JSON.parse(readFileSync(join(cwd, 'opencode.json'), 'utf8')) as {
+      // The config reaches only this process, and its files sit under the profile digest.
+      const config = JSON.parse(provisioned.env.OPENCODE_CONFIG_CONTENT!) as {
         instructions: string[]
       }
+      const scope = `.tangle/opencode-profile/${req.profile_materialization_receipt!.effectiveProfileDigest.slice('sha256:'.length)}`
       expect(config.instructions).toEqual([
-        '.opencode/agent-system-prompt.md',
-        '.opencode/profile-instructions.md',
+        `${scope}/agent-system-prompt.md`,
+        `${scope}/profile-instructions.md`,
       ])
-      expect(readFileSync(join(cwd, '.opencode/agent-system-prompt.md'), 'utf8')).toBe(
+      expect(readFileSync(join(cwd, `${scope}/agent-system-prompt.md`), 'utf8')).toBe(
         `${ADDITION}\n`,
       )
+      expect(readdirSync(cwd)).toEqual(['.tangle'])
     })
   })
 
