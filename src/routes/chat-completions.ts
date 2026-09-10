@@ -902,6 +902,19 @@ export function mountChatCompletions(
       if (session) {
         assertSessionProfileBinding(session, sessionProfileBinding)
       }
+      // Name the agent on this run's span. Placed here because this is the
+      // first point where the effective profile is settled for BOTH sources
+      // that can supply it — the request body and the session being resumed —
+      // and it costs nothing: the binding already hashed the profile, and
+      // `resolveAgentProfile` memoizes per request, so the digest stamped here
+      // is the same string as the run's `effectiveProfileDigest`, not a second
+      // computation that could disagree with it.
+      if (sessionProfileBinding) {
+        recorder?.recordNode({
+          profileDigest: sessionProfileBinding.effectiveProfileDigest,
+          ...(typeof profile?.name === 'string' ? { profileName: profile.name } : {}),
+        })
+      }
       if (req.session_id) {
         const remembered = deps.sessions.remember({
           externalId: req.session_id,
