@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join, posix } from 'node:path'
 import type {
   AgentProfile,
   AgentProfileConfigValue,
@@ -37,11 +37,13 @@ import {
   hashWorkspacePlan,
   type HarnessId,
   materializeProfile,
+  type PlanFile,
   type WorkspacePlan,
   type WorkspacePlanArgument,
   type WorkspacePlanConfigValue,
   type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
+import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES } from '../executors/host.js'
 
 export interface ProfileExecutionIdentity {
   provider: string | null
@@ -143,11 +145,20 @@ export function provisionProfileWorkspace(
    */
   systemPrompt?: string
   appendSystemPrompt?: string
+  /**
+   * Release the request-scoped files this provisioning wrote outside the plan.
+   *
+   * Only the opencode path returns one today. The caller MUST invoke it after
+   * the harness process exits — the profile's instruction bytes stay readable
+   * in the shared task directory until it runs.
+   */
+  cleanup?: () => void
 } {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
   if (!profile) return { env: {}, flags: [], written: [] }
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
+  let scoped: OpencodeProfileScope | undefined
   try {
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
     // Claude loads this generated file through --settings, so its path need not
@@ -167,33 +178,280 @@ export function provisionProfileWorkspace(
       }
     }
     assertWorkspacePlanSupported(plan)
-    const applied = applyWorkspacePlan(plan, workspaceCwd, sessionAppliedPlanDigest(session, workspaceCwd))
+    // The materialization identity of the WHOLE plan, fixed before opencode
+    // moves its harness-native half out of the shared directory. It is what the
+    // receipt reports and what a resumed session compares against, so where the
+    // bridge puts the bytes cannot change the identity of what it applied.
+    const planDigest = hashWorkspacePlan(plan)
+    const resumesSamePlan = sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest === planDigest
+    if (harness === 'opencode') {
+      scoped = scopeOpencodeProfileConfig(plan, workspaceCwd)
+      plan.files = scoped.workspaceFiles
+    }
+    const applied = applyWorkspacePlan(
+      plan,
+      workspaceCwd,
+      resumesSamePlan ? { appliedPlanDigest: hashWorkspacePlan(plan) } : {},
+    )
+    // The opencode-native files leave this plan, so the receipt names them here.
+    const written = scoped ? [...applied.written, ...scoped.written] : applied.written
     const receipt = retainProfileMaterializationReceipt(
       req,
       profile,
       harness,
       executionIdentity,
       plan,
-      applied,
+      { ...applied, written, workspacePlanDigest: planDigest },
     )
     return {
-      env: requirePublicPlanEnv(applied.env, harness),
+      env: { ...requirePublicPlanEnv(applied.env, harness), ...(scoped?.env ?? {}) },
       flags: applied.flags.map((flag, index) =>
         requirePublicPlanValue(flag, `launch flag ${index}`, harness),
       ),
-      written: applied.written,
+      written,
       unsupported: applied.unsupported,
-      workspacePlanDigest: applied.workspacePlanDigest,
+      workspacePlanDigest: planDigest,
       receipt,
       ...(applied.systemPrompt === undefined ? {} : { systemPrompt: applied.systemPrompt }),
       ...(applied.appendSystemPrompt === undefined
         ? {}
         : { appendSystemPrompt: applied.appendSystemPrompt }),
+      ...(scoped ? { cleanup: scoped.cleanup } : {}),
     }
   } catch (error) {
+    scoped?.cleanup()
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
   }
+}
+
+/** The environment variable opencode merges as its final local config layer. */
+const OPENCODE_PROFILE_CONFIG_ENV = 'OPENCODE_CONFIG_CONTENT'
+
+/**
+ * Stops opencode from reading the project layer of the directory it runs in:
+ * `<cwd>/opencode.json`, `<cwd>/.opencode/opencode.json`, every agent, skill,
+ * command and custom tool under `<cwd>/.opencode`, and the project context
+ * files `AGENTS.md`, `CLAUDE.md` and `CONTEXT.md`.
+ *
+ * Measured against opencode 1.18.30 with `opencode debug config` and
+ * `opencode debug agent`: with this set, a planted `<cwd>/opencode.json` no
+ * longer contributes `instructions` or `agent.<name>.prompt`, a planted
+ * `<cwd>/.opencode/agents/<name>.md` no longer defines that subagent, and a
+ * planted `<cwd>/.opencode/tools/<name>.js` no longer appears in the tool list.
+ * The operator's own global config still loads, so provider, model and plugin
+ * wiring is untouched.
+ */
+const OPENCODE_DISABLE_PROJECT_CONFIG_ENV = 'OPENCODE_DISABLE_PROJECT_CONFIG'
+
+/**
+ * One more directory opencode reads config, agents, skills, commands and tools
+ * from. Additive, measured the same way: the operator's global directory keeps
+ * loading beside it.
+ */
+const OPENCODE_CONFIG_DIR_ENV = 'OPENCODE_CONFIG_DIR'
+
+/** The cwd-relative directory the shared materializer writes opencode-native files into. */
+const OPENCODE_NATIVE_DIR = '.opencode'
+
+/** The project config file opencode reads from its cwd. */
+const OPENCODE_PROJECT_CONFIG_FILE = 'opencode.json'
+
+/** Prefix of the private per-turn directory this bridge materializes a profile into. */
+const OPENCODE_PROFILE_ROOT_PREFIX = '.cli-bridge-opencode-profile-'
+
+interface OpencodeProfileScope {
+  /** Env this turn adds on top of the plan's own launch env. */
+  env: Record<string, string>
+  /** Workspace-relative paths written under the private root, for the receipt. */
+  written: string[]
+  /** The plan files that still belong in the shared task directory. */
+  workspaceFiles: PlanFile[]
+  /** Idempotent; removes the private root. Run it after the process exits. */
+  cleanup(): void
+}
+
+/**
+ * Give one opencode process its own configuration, and close the shared task
+ * directory as a channel into it.
+ *
+ * Runtime gives a root and every manager it spawns one cwd. opencode reads the
+ * project layer of that cwd on every model request, so profiles sharing a
+ * directory ran under each other's instructions, subagents and tool grants, and
+ * an agent that wrote `opencode.json` or `.opencode/agents/<name>.md` into its
+ * own workspace changed the next profile's turn — measured end to end, with the
+ * later director quoting the earlier one's file, while each receipt still named
+ * its own profile.
+ *
+ * Three moves, each measured against opencode 1.18.30 rather than inferred:
+ *
+ *   1. The generated `opencode.json` never enters the workspace. It reaches this
+ *      process through `OPENCODE_CONFIG_CONTENT`; `OPENCODE_CONFIG` already
+ *      carries the request's MCP file, which may hold credentials.
+ *   2. `OPENCODE_DISABLE_PROJECT_CONFIG` closes the project layer, so no file in
+ *      the shared directory — this bridge's own earlier output, a repository's
+ *      config, or one an agent wrote mid-run — reaches the process at all. No
+ *      file is deleted to achieve that: a user's config is indistinguishable
+ *      from a stale generated one, and it is now harmless either way.
+ *   3. The profile's own `.opencode/**` files are applied into a private
+ *      per-turn directory under the cwd, named by `OPENCODE_CONFIG_DIR`. The
+ *      directory is fresh on every turn, so an edited or re-rendered file can
+ *      never refuse a later session, and it is removed when the turn ends.
+ *
+ * Instruction paths are made absolute in the value handed to the spawn, because
+ * with the project layer closed a relative one resolves from the config
+ * directory rather than the cwd. The plan keeps the materializer's relative
+ * form, so the plan digest stays independent of where the workspace sits.
+ *
+ * The project context files — `<cwd>/AGENTS.md`, `CLAUDE.md`, `CONTEXT.md` —
+ * are gated behind the same flag, so they are closed too.
+ *
+ * What this does NOT close, and what the README says plainly: skills under
+ * `<cwd>/.claude/skills` and `<cwd>/.agents/skills`, which opencode gates on a
+ * separate `OPENCODE_DISABLE_EXTERNAL_SKILLS`; and a co-resident agent WRITING
+ * into a running turn's private directory, which no mode can prevent while both
+ * run as the same user.
+ */
+function scopeOpencodeProfileConfig(
+  plan: WorkspacePlan,
+  workspaceCwd: string,
+): OpencodeProfileScope {
+  const isWorkspaceFile = (file: PlanFile): boolean => (file.root ?? 'workspace') === 'workspace'
+  const generated = plan.files.filter((file) =>
+    file.relPath === OPENCODE_PROJECT_CONFIG_FILE && file.source === 'generated' && isWorkspaceFile(file))
+  const [configFile, ...extra] = generated
+  if (extra.length > 0) throw new Error('opencode materializer emitted more than one opencode.json')
+  if (configFile?.secretSlots?.length) {
+    throw new Error('opencode materializer emitted a generated opencode.json that requires a secret provider')
+  }
+  for (const name of [OPENCODE_PROFILE_CONFIG_ENV, OPENCODE_CONFIG_DIR_ENV, OPENCODE_DISABLE_PROJECT_CONFIG_ENV]) {
+    if (plan.env[name] !== undefined) throw new Error(`opencode materializer already set ${name}`)
+  }
+
+  const nativeFiles = plan.files.filter((file) =>
+    file !== configFile && isWorkspaceFile(file) && file.relPath.startsWith(`${OPENCODE_NATIVE_DIR}/`))
+  const nativePaths = new Set(nativeFiles)
+  const workspaceFiles = plan.files.filter((file) => file !== configFile && !nativePaths.has(file))
+
+  // A profile with no instructions, no prompt addition, no tools and no
+  // permissions generates no config at all — a manager whose only declared
+  // tools were coordination tools arrives exactly like that, because the caller
+  // strips those before sending. Returning early for it would hand that turn
+  // the whole open project layer: its own subagent in the shared
+  // `.opencode/agents/`, and the directory's instructions, `agent.<name>.prompt`,
+  // custom tools and skills resolved into its process. An empty config is still
+  // a config, and the isolation is a property of the turn, not of the profile's
+  // contents.
+  const config = (configFile === undefined ? {} : JSON.parse(configFile.content)) as Record<string, unknown>
+  const instructions = config.instructions
+  if (instructions !== undefined) {
+    if (!Array.isArray(instructions) || !instructions.every((entry) => typeof entry === 'string')) {
+      throw new Error('opencode materializer emitted non-string instructions')
+    }
+    for (const entry of instructions as string[]) {
+      if (nativeFiles.some((file) => file.relPath === entry)) continue
+      // An unrelocated entry would resolve against the config directory and
+      // silently name nothing, leaving the profiled agent with no instructions.
+      throw new Error(
+        `opencode materializer named instruction file ${JSON.stringify(entry)}, which is not one of the ` +
+          `${OPENCODE_NATIVE_DIR}/ files this plan generates, so the bridge cannot bind it to this process`,
+      )
+    }
+  }
+
+  let profileRoot: string | null = null
+  try {
+    // Under the cwd so a Docker executor sees the identical absolute path: its
+    // pool bind-mounts the workspace root and nothing else. Traversable and
+    // world-readable because the container may run opencode under a different
+    // uid, and a mode it cannot read would drop the profile's instructions with
+    // nothing reported.
+    profileRoot = mkdtempSync(join(workspaceCwd, OPENCODE_PROFILE_ROOT_PREFIX))
+    chmodSync(profileRoot, 0o755)
+    const applied = applyWorkspacePlan(
+      { harness: plan.harness, files: nativeFiles, env: {}, flags: [], unsupported: [] },
+      profileRoot,
+      { existingFiles: 'reject' },
+    )
+    const configDir = join(profileRoot, OPENCODE_NATIVE_DIR)
+    // A profile with no native files still needs the directory to exist, so the
+    // config directory opencode reads is this empty private one and never a
+    // populated ambient default.
+    mkdirSync(configDir, { recursive: true, mode: 0o755 })
+    chmodSync(configDir, 0o755)
+
+    const spawnConfig = instructions === undefined
+      ? config
+      : { ...config, instructions: (instructions as string[]).map((entry) => join(profileRoot!, entry)) }
+    const root = profileRoot
+    let cleaned = false
+    return {
+      env: {
+        [OPENCODE_PROFILE_CONFIG_ENV]: opencodeProcessConfigValue(spawnConfig),
+        [OPENCODE_DISABLE_PROJECT_CONFIG_ENV]: '1',
+        [OPENCODE_CONFIG_DIR_ENV]: configDir,
+      },
+      written: applied.written.map((relPath) => posix.join(basename(root), relPath)),
+      workspaceFiles,
+      cleanup: () => {
+        if (cleaned) return
+        cleaned = true
+        rmSync(root, { recursive: true, force: true })
+      },
+    }
+  } catch (error) {
+    if (profileRoot) rmSync(profileRoot, { recursive: true, force: true })
+    throw error
+  }
+}
+
+/**
+ * Serialize the config this process receives, merged under the operator's own.
+ *
+ * The spawn merges provisioned env over `process.env`, so an operator who set
+ * `OPENCODE_CONFIG_CONTENT` for the daemon — a custom provider, a base URL —
+ * had it replaced by the profile's config with nothing reported. That value
+ * reached the child untouched before the bridge used this variable, so it
+ * becomes the BASE here and every key the profile declares replaces it. The
+ * profile stays the authority for `instructions`, `tools`, `permission` and
+ * `mcp`; the operator's unrelated keys survive.
+ *
+ * The result is refused when the host executor's sanitizer would drop it. That
+ * sanitizer discards an oversize value silently, which leaves opencode running
+ * on the headless defaults — no instructions, no tool restrictions, bash
+ * allowed — while the receipt still commits to the profile. `buildDockerExecArgs`
+ * applies no such ceiling, so refusing here is also what makes one profile mean
+ * the same thing on both executors.
+ */
+function opencodeProcessConfigValue(config: Record<string, unknown>): string {
+  const ambient = process.env[OPENCODE_PROFILE_CONFIG_ENV]
+  let merged = config
+  if (ambient !== undefined && ambient.length > 0) {
+    let base: unknown
+    try {
+      base = JSON.parse(ambient)
+    } catch {
+      throw new Error(
+        `the ${OPENCODE_PROFILE_CONFIG_ENV} already present in this process is not valid JSON, so the profile's ` +
+          'config cannot be merged under it; correct or unset it before running an opencode AgentProfile',
+      )
+    }
+    if (!base || typeof base !== 'object' || Array.isArray(base)) {
+      throw new Error(
+        `the ${OPENCODE_PROFILE_CONFIG_ENV} already present in this process is not a JSON object`,
+      )
+    }
+    merged = { ...(base as Record<string, unknown>), ...config }
+  }
+  const value = JSON.stringify(merged)
+  if (exceedsHostEnvValueLimit(value)) {
+    throw new Error(
+      `the opencode config for this turn is ${value.length} characters and this bridge carries at most ` +
+        `${MAX_ENV_VALUE_BYTES} in one environment value, so it would not reach the process on the host executor; ` +
+        'reduce agent_profile.permissions, tools or mcp, or split the profile',
+    )
+  }
+  return value
 }
 
 export interface ProvisionedPiProfile {

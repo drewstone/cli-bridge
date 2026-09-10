@@ -28,7 +28,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { AgentProfile } from '@tangle-network/agent-interface'
@@ -387,29 +387,31 @@ describe('prompt intents reach each harness through its own control', () => {
 
     it('registers the addition as its own instructions file, ahead of project instructions', () => {
       const cwd = workspace()
-      provisionProfileWorkspace(
-        request(
-          { prompt: { appendSystemPrompt: ADDITION, instructions: ['PROJECT-INSTRUCTION'] } },
-          'opencode',
-          cwd,
-        ),
-        null,
+      const req = request(
+        { prompt: { appendSystemPrompt: ADDITION, instructions: ['PROJECT-INSTRUCTION'] } },
         'opencode',
         cwd,
       )
+      const provisioned = provisionProfileWorkspace(req, null, 'opencode', cwd)
 
       // opencode joins these files into the same system message as its own
       // built-in prompt, which stays in place — that is the addition contract.
-      const config = JSON.parse(readFileSync(join(cwd, 'opencode.json'), 'utf8')) as {
+      // The config reaches only this process, and the files it names sit in this
+      // turn's private config directory rather than the shared task directory.
+      const config = JSON.parse(provisioned.env.OPENCODE_CONFIG_CONTENT!) as {
         instructions: string[]
       }
+      const configDir = provisioned.env.OPENCODE_CONFIG_DIR!
       expect(config.instructions).toEqual([
-        '.opencode/agent-system-prompt.md',
-        '.opencode/profile-instructions.md',
+        join(configDir, 'agent-system-prompt.md'),
+        join(configDir, 'profile-instructions.md'),
       ])
-      expect(readFileSync(join(cwd, '.opencode/agent-system-prompt.md'), 'utf8')).toBe(
-        `${ADDITION}\n`,
-      )
+      expect(readFileSync(join(configDir, 'agent-system-prompt.md'), 'utf8')).toBe(`${ADDITION}\n`)
+      expect(req.profile_materialization_receipt!.files.map((file) => file.path))
+        .toContain(`${basename(dirname(configDir))}/.opencode/agent-system-prompt.md`)
+      expect(readdirSync(cwd)).toEqual([basename(dirname(configDir))])
+      provisioned.cleanup?.()
+      expect(readdirSync(cwd)).toEqual([])
     })
   })
 

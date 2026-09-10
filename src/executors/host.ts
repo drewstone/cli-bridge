@@ -253,7 +253,7 @@ export function sanitizeHostEnv(
 
   for (const [key, value] of Object.entries(env)) {
     if (typeof value !== 'string' || value.length === 0) continue
-    if (value.length > MAX_ENV_VALUE_BYTES) continue
+    if (exceedsHostEnvValueLimit(value)) continue
     // Trace-context keys pass only when they are NOT the daemon's own ambient
     // value. A backend that stamps per-request trace context (pi, from
     // `ChatRequest.childTrace`) produces a value the daemon env does not
@@ -287,7 +287,21 @@ export function sanitizeHostEnv(
   return out
 }
 
-const MAX_ENV_VALUE_BYTES = 16_384
+/**
+ * Ceiling on one env value this executor will carry to a child.
+ *
+ * Exported with {@link exceedsHostEnvValueLimit} so a backend that puts a
+ * generated configuration in an env var can REFUSE the turn instead of running
+ * it with that configuration silently dropped here. A dropped value is the
+ * dangerous shape: the harness starts, falls back to its own defaults, and the
+ * materialization receipt still names the profile whose limits never applied.
+ */
+export const MAX_ENV_VALUE_BYTES = 16_384
+
+/** True when {@link sanitizeHostEnv} would drop this value for size. */
+export function exceedsHostEnvValueLimit(value: string): boolean {
+  return value.length > MAX_ENV_VALUE_BYTES
+}
 
 const BASE_HOST_ENV_KEYS = new Set([
   'HOME',
