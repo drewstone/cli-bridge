@@ -186,7 +186,7 @@ export function provisionProfileWorkspace(
     const resumesSamePlan = sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest === planDigest
     if (harness === 'opencode') {
       scoped = scopeOpencodeProfileConfig(plan, workspaceCwd)
-      if (scoped) plan.files = scoped.workspaceFiles
+      plan.files = scoped.workspaceFiles
     }
     const applied = applyWorkspacePlan(
       plan,
@@ -230,8 +230,9 @@ const OPENCODE_PROFILE_CONFIG_ENV = 'OPENCODE_CONFIG_CONTENT'
 
 /**
  * Stops opencode from reading the project layer of the directory it runs in:
- * `<cwd>/opencode.json`, `<cwd>/.opencode/opencode.json`, and every agent,
- * skill, command and custom tool under `<cwd>/.opencode`.
+ * `<cwd>/opencode.json`, `<cwd>/.opencode/opencode.json`, every agent, skill,
+ * command and custom tool under `<cwd>/.opencode`, and the project context
+ * files `AGENTS.md`, `CLAUDE.md` and `CONTEXT.md`.
  *
  * Measured against opencode 1.18.30 with `opencode debug config` and
  * `opencode debug agent`: with this set, a planted `<cwd>/opencode.json` no
@@ -302,21 +303,25 @@ interface OpencodeProfileScope {
  * directory rather than the cwd. The plan keeps the materializer's relative
  * form, so the plan digest stays independent of where the workspace sits.
  *
- * What this does NOT close, and what the README says plainly: `<cwd>/AGENTS.md`
- * is read by opencode's session layer, not its config layer, and no
- * configuration setting turns it off.
+ * The project context files — `<cwd>/AGENTS.md`, `CLAUDE.md`, `CONTEXT.md` —
+ * are gated behind the same flag, so they are closed too.
+ *
+ * What this does NOT close, and what the README says plainly: skills under
+ * `<cwd>/.claude/skills` and `<cwd>/.agents/skills`, which opencode gates on a
+ * separate `OPENCODE_DISABLE_EXTERNAL_SKILLS`; and a co-resident agent WRITING
+ * into a running turn's private directory, which no mode can prevent while both
+ * run as the same user.
  */
 function scopeOpencodeProfileConfig(
   plan: WorkspacePlan,
   workspaceCwd: string,
-): OpencodeProfileScope | undefined {
+): OpencodeProfileScope {
   const isWorkspaceFile = (file: PlanFile): boolean => (file.root ?? 'workspace') === 'workspace'
   const generated = plan.files.filter((file) =>
     file.relPath === OPENCODE_PROJECT_CONFIG_FILE && file.source === 'generated' && isWorkspaceFile(file))
   const [configFile, ...extra] = generated
-  if (configFile === undefined) return undefined
   if (extra.length > 0) throw new Error('opencode materializer emitted more than one opencode.json')
-  if (configFile.secretSlots?.length) {
+  if (configFile?.secretSlots?.length) {
     throw new Error('opencode materializer emitted a generated opencode.json that requires a secret provider')
   }
   for (const name of [OPENCODE_PROFILE_CONFIG_ENV, OPENCODE_CONFIG_DIR_ENV, OPENCODE_DISABLE_PROJECT_CONFIG_ENV]) {
@@ -328,7 +333,16 @@ function scopeOpencodeProfileConfig(
   const nativePaths = new Set(nativeFiles)
   const workspaceFiles = plan.files.filter((file) => file !== configFile && !nativePaths.has(file))
 
-  const config = JSON.parse(configFile.content) as Record<string, unknown>
+  // A profile with no instructions, no prompt addition, no tools and no
+  // permissions generates no config at all — a manager whose only declared
+  // tools were coordination tools arrives exactly like that, because the caller
+  // strips those before sending. Returning early for it would hand that turn
+  // the whole open project layer: its own subagent in the shared
+  // `.opencode/agents/`, and the directory's instructions, `agent.<name>.prompt`,
+  // custom tools and skills resolved into its process. An empty config is still
+  // a config, and the isolation is a property of the turn, not of the profile's
+  // contents.
+  const config = (configFile === undefined ? {} : JSON.parse(configFile.content)) as Record<string, unknown>
   const instructions = config.instructions
   if (instructions !== undefined) {
     if (!Array.isArray(instructions) || !instructions.every((entry) => typeof entry === 'string')) {

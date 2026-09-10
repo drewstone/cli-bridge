@@ -168,6 +168,45 @@ describe('opencode profiles in a shared task workspace', () => {
     }
   })
 
+  it('scopes a profile that generates no config of its own', () => {
+    const cwd = workspace('bare')
+    try {
+      // No instructions, no prompt addition, no tools, no permissions: the
+      // materializer emits no opencode.json. A manager whose only declared
+      // tools are coordination tools arrives exactly like this, because the
+      // caller strips those before sending. Scoping it is what keeps the
+      // directory's own material out of its process.
+      const bare: ChatRequest = {
+        cwd,
+        session_id: 'bare-session',
+        mode: 'byob',
+        model: MODEL,
+        messages: [{ role: 'user', content: 'go' }],
+        agent_profile: {
+          name: 'bare',
+          harness: 'opencode',
+          subagents: { helper: { description: 'helper', prompt: 'BARE-HELPER-PROMPT' } },
+          resources: {
+            files: [{ path: 'inputs/shared.md', resource: { kind: 'inline', name: 'shared', content: 'shared\n' } }],
+          },
+        },
+      }
+      const provisioned = provisionProfileWorkspace(bare, null, 'opencode', cwd)
+      expect(provisioned.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe('1')
+      expect(configDir(provisioned).startsWith(`${cwd}/`)).toBe(true)
+      // Its own subagent is private, and the shared directory holds only the
+      // task file the profile declared.
+      expect(existsSync(join(cwd, '.opencode'))).toBe(false)
+      expect(readFileSync(join(configDir(provisioned), 'agents/helper.md'), 'utf8')).toContain('BARE-HELPER-PROMPT')
+      expect(readFileSync(join(cwd, 'inputs/shared.md'), 'utf8')).toBe('shared\n')
+      expect(processConfig(provisioned)).toEqual({})
+      provisioned.cleanup?.()
+      expect(readdirSync(cwd).filter((name) => name.startsWith('.cli-bridge-opencode-profile-'))).toEqual([])
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   it('refuses a turn whose config the host executor would drop, on either executor', () => {
     const cwd = workspace('oversize')
     try {

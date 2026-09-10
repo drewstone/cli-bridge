@@ -352,7 +352,8 @@ If a caller derives session ids from a digest, the digest must include an attemp
 OpenCode profiles can also share a task directory, and the bridge closes that directory as a channel into the process.
 OpenCode reads the project layer of its working directory on every model request, so a file written there changed the next profile's turn.
 The bridge no longer writes a profile's generated `opencode.json` into the directory; it passes that config to the one process through `OPENCODE_CONFIG_CONTENT`.
-It sets `OPENCODE_DISABLE_PROJECT_CONFIG`, which stops OpenCode from reading `opencode.json`, `.opencode/opencode.json`, and every agent, skill, command and custom tool under `.opencode` in that directory.
+It sets `OPENCODE_DISABLE_PROJECT_CONFIG`, which stops OpenCode from reading `opencode.json`, `.opencode/opencode.json`, every agent, skill, command and custom tool under `.opencode`, and the project context files `AGENTS.md`, `CLAUDE.md` and `CONTEXT.md` in that directory.
+Every profile turn is scoped this way, including one whose profile generates no config of its own.
 It applies the profile's own OpenCode files into a private directory under the working directory and names it in `OPENCODE_CONFIG_DIR`.
 That directory is created for the turn and removed when the turn ends, so a later profile cannot read it and an edited file cannot refuse a later session.
 The operator's own global OpenCode config still loads, so provider, model and plugin wiring is unchanged.
@@ -363,10 +364,11 @@ The materialization receipt records the workspace plan digest and the relative p
 A profile whose serialized config exceeds one environment value is refused before any process starts, on the host executor and in Docker alike.
 The host sanitizer drops an oversize value silently, which would leave OpenCode on its own defaults while the receipt still named the profile.
 
-Two things an operator should still count on rather than assume.
+Three things an operator should count on rather than assume.
 No project config is deleted: a config a user wrote and a stale one an earlier bridge version generated cannot be told apart, and neither reaches a profile process now.
-`AGENTS.md` in the task directory is read by OpenCode's session layer, not its config layer, so it still reaches every process in that directory; keep per-profile instructions in the profile.
-An agent that shares the working directory can also read another profile's private directory while that turn runs, because a shared directory has no user boundary.
+Skills under `.claude/skills` and `.agents/skills` in the task directory still reach every profile, because OpenCode gates those on a separate `OPENCODE_DISABLE_EXTERNAL_SKILLS`, which would also remove the operator's own global skills.
+An agent that shares the working directory can read and WRITE another profile's private directory while that turn runs, and OpenCode rereads its instruction files on every model request, so a write there changes the running turn.
+Both agents run as the same user on the host executor, so no file mode separates them; give a profile its own working directory when that matters.
 
 The refusal body carries both bindings, so a caller can tell a drifted profile from a reused id:
 

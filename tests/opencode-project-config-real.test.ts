@@ -115,4 +115,58 @@ describe.skipIf(!ENABLED)('a real opencode process started for an AgentProfile',
       rmSync(xdg, { recursive: true, force: true })
     }
   }, 240_000)
+
+  it('scopes a profile that generates no config of its own', () => {
+    // A manager whose only declared tools are coordination tools arrives with
+    // no instructions, no prompt addition, no tools and no permissions, so the
+    // materializer emits no `opencode.json`. Scoping has to be a property of
+    // the turn: an unscoped one resolves the whole directory into its process.
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-real-bare-'))
+    const xdg = mkdtempSync(join(tmpdir(), 'opencode-real-bare-xdg-'))
+    const req: ChatRequest = {
+      cwd,
+      session_id: 'real-opencode-bare',
+      mode: 'byob',
+      model: 'opencode/zai-coding-plan/glm-5.3',
+      messages: [{ role: 'user', content: 'probe' }],
+      agent_profile: {
+        name: 'bare',
+        harness: 'opencode',
+        subagents: { helper: { description: 'helper', prompt: 'BARE-HELPER-PROMPT' } },
+      },
+    }
+    const provisioned = provisionProfileWorkspace(req, null, 'opencode', cwd)
+    try {
+      seedProjectLayer(cwd)
+      const env: Record<string, string> = {
+        HOME: process.env.HOME!,
+        PATH: '/usr/bin:/bin',
+        XDG_CONFIG_HOME: join(xdg, 'config'),
+        XDG_DATA_HOME: join(xdg, 'data'),
+        XDG_STATE_HOME: join(xdg, 'state'),
+        XDG_CACHE_HOME: join(xdg, 'cache'),
+        ...provisioned.env,
+      }
+      const debug = (args: string[]): Record<string, unknown> => {
+        const run = spawnSync(BIN, args, { cwd, env, encoding: 'utf8', timeout: 180_000 })
+        if (run.status !== 0) throw new Error(`opencode ${args.join(' ')} exited ${run.status}: ${run.stderr?.slice(0, 400)}`)
+        return JSON.parse(run.stdout) as Record<string, unknown>
+      }
+
+      const config = debug(['debug', 'config'])
+      expect((config.instructions as string[] | undefined) ?? []).not.toContain('notes.md')
+      expect((config.agent as Record<string, { prompt?: string }> | undefined)?.build?.prompt)
+        .not.toBe('INJECTED-BUILD-PROMPT-9911')
+      const build = debug(['debug', 'agent', 'build'])
+      expect(Object.keys((build.tools ?? {}) as Record<string, unknown>)).not.toContain('foreign_tool')
+      const helper = debug(['debug', 'agent', 'helper'])
+      expect(String(helper.prompt)).toContain('BARE-HELPER-PROMPT')
+      const critic = spawnSync(BIN, ['debug', 'agent', 'critic'], { cwd, env, encoding: 'utf8', timeout: 180_000 })
+      expect(critic.status).not.toBe(0)
+    } finally {
+      provisioned.cleanup?.()
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(xdg, { recursive: true, force: true })
+    }
+  }, 240_000)
 })
