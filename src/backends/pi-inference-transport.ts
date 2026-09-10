@@ -74,6 +74,12 @@ export interface ResolvedPiInferenceTransport {
   requestScopedEndpoint?: boolean
   /** Finite per-request memory boundary for the model-binding JSON inspection. */
   maxRequestBytes: number
+  /**
+   * Where the upstream credential was taken from, as a file path, env var
+   * name, or header name — never a value. A provider 401 carries it so a jail
+   * or HOME misconfiguration reads as one. See {@link describePiCredentialSource}.
+   */
+  credentialSource: string
   providerConfig: Record<string, unknown>
   modelConfig: Record<string, unknown>
   sourceAgentDir: string
@@ -95,6 +101,8 @@ export interface ProvisionedPiInferenceTransport {
   providerDispatchMarker: string
   /** True when the endpoint came from a protected request header. */
   requestScopedEndpoint?: boolean
+  /** Copied from the resolved transport; see {@link ResolvedPiInferenceTransport.credentialSource}. */
+  credentialSource: string
   apiMode: PiApiMode
   /** Exact profile cap applied to this run's isolated model catalog, when requested. */
   appliedMaxTotalOutputTokens?: number
@@ -387,10 +395,12 @@ export function createPiInferenceTransportResolver(options: {
         upstreamApiKey: credential.token,
         requestScopedEndpoint: true,
         maxRequestBytes,
+        credentialSource: PI_REQUEST_SCOPED_CREDENTIAL_SOURCE,
         sourceAgentDir,
         sourceSessionDir,
       }
     }
+    const credentialSource = describePiCredentialSource(sourceAgentDir, selection, trustedEnv)
     let resolvedCredential: Awaited<ReturnType<typeof resolvePiAuthCredential>>
     try {
       resolvedCredential = await resolvePiAuthCredential({
@@ -403,7 +413,8 @@ export function createPiInferenceTransportResolver(options: {
       })
     } catch (error) {
       throw new BackendError(
-        `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model}`,
+        `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model} `
+        + `(credential source: ${credentialSource})`,
         'not_configured',
         error,
       )
@@ -416,10 +427,129 @@ export function createPiInferenceTransportResolver(options: {
         ? { resolveUpstreamApiKey: resolvedCredential.resolve }
         : {}),
       maxRequestBytes,
+      credentialSource,
       sourceAgentDir,
       sourceSessionDir,
     }
   }
+}
+
+/**
+ * The request header the chat route reads a protected model credential from
+ * (routes/chat-completions.ts `PROTECTED_MODEL_CREDENTIAL_HEADER`); spelled
+ * here so this module does not import the route layer.
+ */
+export const PI_REQUEST_SCOPED_CREDENTIAL_SOURCE =
+  'request-scoped protected model credential (x-cli-bridge-model-credential header)'
+
+/**
+ * Name where `pi auth print-api-key` takes the provider credential from, so a
+ * provider 401 reads as the file or variable to fix instead of as a bad key.
+ *
+ * Mirrors pi's own precedence (core/provider-composer.ts): a stored credential
+ * for the provider in the agent dir's auth.json wins over the provider's
+ * `apiKey` in models.json, which pi resolves as a `!command`, a `$VAR` /
+ * `${VAR}` template, or a literal — and a bare identifier is an env var name
+ * in the pi line the prime fork descends from but a literal in the upstream
+ * 0.8x line, so a bare identifier is reported with the presence of a variable
+ * of that name and left for the operator to read against their pi build.
+ * Only paths, pi's own credential type names, and the env var names pi itself
+ * reads are rendered, never the apiKey string or any part of it: the message
+ * crosses the HTTP boundary, a bare identifier may BE the key (an
+ * identifier-shaped literal such as a hex or `sk_live_` token), and the
+ * literal text of a template is key material too.
+ */
+export function describePiCredentialSource(
+  sourceAgentDir: string,
+  selection: PiInferenceSelection,
+  env: NodeJS.ProcessEnv,
+): string {
+  const authPath = join(sourceAgentDir, 'auth.json')
+  const modelsPath = join(sourceAgentDir, 'models.json')
+  const stored = readJsonRecord(authPath)?.[selection.provider]
+  if (isRecord(stored)) {
+    // pi's auth.json knows exactly these two types (core/auth-storage.ts) and
+    // refuses any other; the field is file content, so it is not echoed.
+    const type = stored.type === 'api_key' || stored.type === 'oauth' ? stored.type : 'unrecognized-type'
+    return `stored ${type} credential for provider "${selection.provider}" in ${authPath}`
+  }
+  const models = readJsonRecord(modelsPath)
+  const provider = models && isRecord(models.providers) ? models.providers[selection.provider] : undefined
+  const apiKey = isRecord(provider) ? provider.apiKey : undefined
+  const keyPath = `providers.${selection.provider}.apiKey in ${modelsPath}`
+  if (typeof apiKey !== 'string' || apiKey.length === 0) {
+    const missing = models === null ? `no ${modelsPath}` : `no ${keyPath}`
+    return `pi's built-in auth for provider "${selection.provider}" (${missing}; no entry in ${authPath})`
+  }
+  if (apiKey.startsWith('!')) return `the shell command configured as ${keyPath}`
+  const names = piConfigValueEnvNames(apiKey)
+  if (names.length === 0 && PI_ENV_NAME.test(apiKey)) {
+    return `the bare identifier under ${keyPath} `
+      + `(an env var of that name is ${env[apiKey] ? 'set' : 'unset'} in the bridge environment)`
+  }
+  if (names.length === 0) return `the literal apiKey under ${keyPath}`
+  const presence = names
+    .map((name) => `${name} is ${env[name] ? 'set' : 'unset'} in the bridge environment`)
+    .join(', ')
+  return `the env var template under ${keyPath} (${presence})`
+}
+
+const PI_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u
+const PI_ENV_NAME_PREFIX = /^[A-Za-z_][A-Za-z0-9_]*/u
+
+/**
+ * The env var names upstream pi reads from a config value: a port of its
+ * template scan (core/resolve-config-value.ts `parseConfigValueTemplate`).
+ * `$$` and `$!` are escapes; `$NAME` takes the longest identifier; `${NAME}`
+ * needs a closing brace around a valid identifier, else the whole `${...}` is
+ * literal; an unclosed `${` is literal. A looser scan reports literal key
+ * text as a name (`$A$$tail` as `Atail`, `k${tail` as `tail`), so the scan
+ * must match pi's exactly: only a name pi reads is not key material.
+ */
+function piConfigValueEnvNames(value: string): string[] {
+  const names: string[] = []
+  const add = (name: string): void => {
+    if (!names.includes(name)) names.push(name)
+  }
+  let index = 0
+  while (index < value.length) {
+    const dollar = value.indexOf('$', index)
+    if (dollar < 0) break
+    const next = value[dollar + 1]
+    if (next === '$' || next === '!') {
+      index = dollar + 2
+      continue
+    }
+    if (next === '{') {
+      const end = value.indexOf('}', dollar + 2)
+      if (end < 0) {
+        index = dollar + 1
+        continue
+      }
+      const name = value.slice(dollar + 2, end)
+      if (PI_ENV_NAME.test(name)) add(name)
+      index = end + 1
+      continue
+    }
+    const match = PI_ENV_NAME_PREFIX.exec(value.slice(dollar + 1))
+    if (match) {
+      add(match[0])
+      index = dollar + 1 + match[0].length
+      continue
+    }
+    index = dollar + 1
+  }
+  return names
+}
+
+function readJsonRecord(path: string): Record<string, unknown> | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    return null
+  }
+  return isRecord(parsed) ? parsed : null
 }
 
 function validateProtectedUpstreamBaseUrl(
@@ -458,6 +588,7 @@ function readConfiguredTransport(
   | 'upstreamApiKey'
   | 'resolveUpstreamApiKey'
   | 'maxRequestBytes'
+  | 'credentialSource'
   | 'sourceAgentDir'
   | 'sourceSessionDir'
 > | null {
@@ -560,6 +691,7 @@ async function readCatalogTransport(options: {
   | 'upstreamApiKey'
   | 'resolveUpstreamApiKey'
   | 'maxRequestBytes'
+  | 'credentialSource'
   | 'sourceAgentDir'
   | 'sourceSessionDir'
 >> {
@@ -718,6 +850,7 @@ export async function provisionPiInferenceTransport(
       upstreamBaseUrl: resolved.upstreamBaseUrl,
       providerDispatchMarker: proxy.providerDispatchMarker,
       ...(resolved.requestScopedEndpoint ? { requestScopedEndpoint: true } : {}),
+      credentialSource: resolved.credentialSource,
       apiMode: resolved.apiMode,
       ...(applied.appliedMaxTotalOutputTokens === undefined
         ? {}

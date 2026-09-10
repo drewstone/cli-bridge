@@ -964,9 +964,10 @@ export class PiBackend implements NativeSessionBackend {
 
       if (exitCode !== 0) {
         const detail = sawError ?? (stderr.render(300) || `exit ${exitCode ?? 'unknown'}`)
+        const kind = piFailureKind(detail)
         throw piFailureError(
-          `pi exit ${exitCode ?? 'unknown'}: ${detail}`,
-          piFailureKind(detail),
+          withPiCredentialSource(`pi exit ${exitCode ?? 'unknown'}: ${detail}`, kind, inference),
+          kind,
           inference?.providerDispatchMarker,
         )
       }
@@ -976,9 +977,10 @@ export class PiBackend implements NativeSessionBackend {
       // an empty or partial body reported as `stop` is silent data loss for any caller
       // scoring outcomes, which is exactly what agent-runtime's piExecutor refuses.
       if (turnFailure) {
+        const kind = piFailureKind(turnFailure)
         throw piFailureError(
-          `pi assistant turn failed: ${turnFailure}`,
-          piFailureKind(turnFailure),
+          withPiCredentialSource(`pi assistant turn failed: ${turnFailure}`, kind, inference),
+          kind,
           inference?.providerDispatchMarker,
         )
       }
@@ -1165,6 +1167,22 @@ export function piAssistantFailure(message: unknown): string | null {
   return errorMessage !== '' ? errorMessage : `stopReason=${stopReason ?? 'error'}`
 }
 
+/**
+ * A credential failure (401/403/expired) names where the credential came from
+ * — a file path, an env var name, or a header — so a jail or HOME
+ * misconfiguration reads as one rather than as a bad key that "works on the
+ * sibling bridge" (cli-bridge#194 ask 2). Transient upstream failures are
+ * unchanged: the source is not the problem there.
+ */
+function withPiCredentialSource(
+  message: string,
+  code: BackendError['code'],
+  inference: ProvisionedPiInferenceTransport | null,
+): string {
+  if (code !== 'not_configured' || !inference) return message
+  return `${message} (credential source: ${inference.credentialSource})`
+}
+
 function piFailureError(
   message: string,
   code: BackendError['code'],
@@ -1217,9 +1235,11 @@ async function delayBeforeRetry(ms: number, signal: AbortSignal): Promise<void> 
 }
 
 /** Auth/scope failures are a local credential problem, not a transient upstream one, whether they
- *  arrive on pi's stderr or in the provider's error body. */
+ *  arrive on pi's stderr or in the provider's error body. The status codes match only as whole
+ *  tokens: a millisecond timestamp (`15.401Z`) or a bundle line number (`chunk.js:4031`) in a log
+ *  line is not an HTTP status, and misreading one turns a retryable crash into a 501. */
 export function piFailureKind(detail: string): 'not_configured' | 'upstream' {
-  return /401|403|token expired|forbidden|unauthorized/i.test(detail) ? 'not_configured' : 'upstream'
+  return /\b(?:401|403)\b|token expired|forbidden|unauthorized/i.test(detail) ? 'not_configured' : 'upstream'
 }
 
 export function piUsageReceiptsFromEvent(ev: Record<string, unknown>): PiUsageReceipt[] {

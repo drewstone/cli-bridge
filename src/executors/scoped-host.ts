@@ -422,7 +422,10 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
       signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: resolveScopedSpawnEnv(sanitizeHostEnv(jailed.env, opts.cwd), busTransportEnv),
+      env: resolveScopedSpawnEnv(
+        sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys),
+        busTransportEnv,
+      ),
       // `detached: true` makes the wrapper a process-group leader, so
       // existing killTree() (kill -pgid) still works as the graceful
       // first signal. The cgroup-kill in release() is the hard backstop.

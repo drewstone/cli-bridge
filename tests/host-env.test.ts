@@ -46,4 +46,37 @@ describe('sanitizeHostEnv PWD/cwd agreement', () => {
     expect(out?.PI_PACKAGE_DIR).toBe('/opt/pi')
     expect(out?.UNRELATED_SECRET).toBeUndefined()
   })
+
+  it('forwards prime-agent controls by prefix (cli-bridge#194)', () => {
+    const out = sanitizeHostEnv({
+      HOME: '/home/x',
+      PATH: '/bin',
+      PRIME_AGENT_CODING_AGENT_DIR: '/srv/bridge/prime/ephemeral-1/home/.prime/agent',
+      PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: '1',
+      PRIME_AGENT_KERNEL_VENV: '/opt/kernel',
+      UNRELATED_SECRET: 'must-not-cross',
+    })
+    expect(out?.PRIME_AGENT_CODING_AGENT_DIR).toBe('/srv/bridge/prime/ephemeral-1/home/.prime/agent')
+    expect(out?.PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND).toBe('1')
+    expect(out?.PRIME_AGENT_KERNEL_VENV).toBe('/opt/kernel')
+    expect(out?.UNRELATED_SECRET).toBeUndefined()
+  })
+
+  it('forwards request-declared names exactly and nothing beside them', () => {
+    const out = sanitizeHostEnv(
+      {
+        HOME: '/home/x',
+        PATH: '/bin',
+        DEEPSEEK_API_KEY: 'named-by-models-json',
+        DEEPSEEK_API_KEY_BACKUP: 'same-prefix-not-named',
+        UNRELATED_SECRET: 'must-not-cross',
+      },
+      '/work',
+      ['DEEPSEEK_API_KEY', 'NOT_IN_ENV'],
+    )
+    expect(out?.DEEPSEEK_API_KEY).toBe('named-by-models-json')
+    expect(out?.DEEPSEEK_API_KEY_BACKUP).toBeUndefined()
+    expect(out?.UNRELATED_SECRET).toBeUndefined()
+    expect(out?.NOT_IN_ENV).toBeUndefined()
+  })
 })
