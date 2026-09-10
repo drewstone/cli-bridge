@@ -10,6 +10,11 @@
  *     chat <backend>  (LLM)      gen_ai.request.model, gen_ai.system, usage, status
  *       └─ <tool>     (TOOL)     gen_ai.tool.name, gen_ai.tool.call.id
  *
+ * Both spans carry the effective AgentProfile digest when the request named one
+ * (`cli_bridge.profile.*`), so a trace with several agents in it can be read per
+ * agent. On the tool span too, not only on its parent: a reader that filters
+ * this file to one agent's work must not have to reassemble the tree first.
+ *
  * The LLM span is the whole request because that is the granularity the bridge
  * can actually see: a CLI harness reports ONE usage record for the turn, not one
  * per model call, so splitting it into per-call spans would mean inventing
@@ -68,6 +73,37 @@ export const BRIDGE_ATTR = Object.freeze({
   /** Tool call id, so a span joins to the caller's matching tool result. */
   toolCallId: 'gen_ai.tool.call.id',
   /**
+   * Digest of the EFFECTIVE AgentProfile this request ran under — WHICH AGENT
+   * did this work.
+   *
+   * Without it a multi-agent run is unreadable: several agents share one run
+   * and one trace file, and the only other discriminator is `gen_ai.request.model`,
+   * which is not an identity — two agents on the same model are indistinguishable,
+   * and one agent whose model changed looks like two.
+   *
+   * The value is `canonicalAgentProfileDigest` of the profile the request
+   * actually executed, which is the SAME `sha256:` string the bridge already
+   * writes as `effectiveProfileDigest` on its profile-materialization receipt
+   * and its session profile binding — the profile is resolved once per request
+   * and memoized, so all three read one object. That makes the digest a join
+   * key an operator can carry outward: agent-runtime records the same digest
+   * per node (`profileDigest` / `authoredProfileDigest` on its spawn journal),
+   * so span → node needs no coincidence of timing or model id.
+   *
+   * A digest, not the profile: a profile carries prompts, instructions and file
+   * contents, and a trace file must not become a second copy of them.
+   */
+  profileDigest: 'cli_bridge.profile.effective_digest',
+  /**
+   * The caller's own name for that profile — `agent_profile.name`, verbatim.
+   *
+   * Read as a LABEL, never as identity: it is caller-supplied, unvalidated and
+   * not unique. The digest is the identity; this is what makes a trace readable
+   * without a lookup table. Absent when the caller named no profile, because an
+   * invented label would be indistinguishable from one the caller chose.
+   */
+  profileName: 'cli_bridge.profile.name',
+  /**
    * Digest of the installed `@tangle-network/agent-trace-contract` build.
    *
    * The package's version string is not an identity — two builds declare the
@@ -104,6 +140,23 @@ export interface RequestSpanInit {
   mode?: string | undefined
   execution?: 'host' | 'sandbox'
   caller: ResolvedCallerTrace
+}
+
+/**
+ * Which agent this request ran as.
+ *
+ * Not part of {@link RequestSpanInit} because it is not known when the span
+ * opens: the span is opened by the run's creator before the profile is
+ * resolved, and the profile may arrive on the request OR be carried by the
+ * session being resumed. Recorded by {@link RequestSpanRecorder.recordNode}
+ * once the route has resolved it, on the same footing as the backend session
+ * id the stream discovers mid-flight.
+ */
+export interface NodeIdentity {
+  /** `canonicalAgentProfileDigest` of the effective profile — the join key. */
+  profileDigest: string
+  /** `agent_profile.name` as the caller wrote it. A label, not an identity. */
+  profileName?: string | undefined
 }
 
 export class TraceEmitter {
@@ -171,6 +224,7 @@ export class RequestSpanRecorder {
   private sawOutputTokens = false
   private toolCallsObserved = 0
   private backendSessionId: string | undefined
+  private node: NodeIdentity | undefined
   private finishReason: string | undefined
   private deltaErrorMessage: string | undefined
   /**
@@ -207,6 +261,24 @@ export class RequestSpanRecorder {
     }
   }
 
+  /**
+   * Name the agent this request runs as. Never throws; last call wins.
+   *
+   * Called by the route the moment the effective profile is known — before the
+   * backend streams — so the identity is on the request span AND on every tool
+   * span the turn produces. A request that carries no profile records nothing:
+   * the attributes stay absent rather than carrying a placeholder a reader
+   * could mistake for an agent.
+   */
+  recordNode(node: NodeIdentity): void {
+    try {
+      if (node.profileDigest.length === 0) return
+      this.node = node
+    } catch (error) {
+      this.report(error)
+    }
+  }
+
   /** Close the span as a failure, with `error` as the recorded reason. Idempotent. */
   fail(error: unknown): void {
     if (this.ended) return
@@ -226,9 +298,32 @@ export class RequestSpanRecorder {
   private writeSpans(): void {
     this.ended = true
     try {
-      this.options.sink.write([this.buildRequestSpan(), ...this.toolSpans])
+      // Applied here rather than in `recordToolCall` because a tool span is
+      // built the moment the model asks for the call, and nothing guarantees
+      // the profile was resolved before the first delta arrived. At write time
+      // the identity is whatever the turn finally established, so every span of
+      // one turn names the same agent or none of them does.
+      const node = this.nodeAttributes()
+      const toolSpans = Object.keys(node).length === 0
+        ? this.toolSpans
+        : this.toolSpans.map((span) => ({ ...span, attributes: { ...span.attributes, ...node } }))
+      this.options.sink.write([this.buildRequestSpan(), ...toolSpans])
     } catch (error) {
       this.report(error)
+    }
+  }
+
+  /** The node identity as span attributes — empty when the request named no agent. */
+  private nodeAttributes(): Record<string, string> {
+    if (this.node === undefined) return {}
+    const name = this.node.profileName
+    return {
+      [BRIDGE_ATTR.profileDigest]: truncate(this.node.profileDigest, MAX_ATTR_CHARS),
+      // Absent, never `''`: an empty label reads as "the caller named it
+      // nothing", which is a different claim from "the caller named nothing".
+      ...(name !== undefined && name.length > 0
+        ? { [BRIDGE_ATTR.profileName]: truncate(name, MAX_ATTR_CHARS) }
+        : {}),
     }
   }
 
@@ -263,6 +358,7 @@ export class RequestSpanRecorder {
       [BRIDGE_ATTR.correlation]: init.caller.correlation,
       [BRIDGE_ATTR.execution]: init.execution ?? 'host',
       [BRIDGE_ATTR.toolCallsObserved]: this.toolCallsObserved,
+      ...this.nodeAttributes(),
     }
     if (init.mode) attributes[BRIDGE_ATTR.mode] = truncate(init.mode, MAX_ATTR_CHARS)
     if (init.sessionId) attributes[BRIDGE_ATTR.sessionId] = truncate(init.sessionId, MAX_ATTR_CHARS)

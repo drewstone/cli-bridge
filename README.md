@@ -1003,6 +1003,8 @@ the bridge's own execution context:
 | `cli_bridge.run.id` | Durable run id — joins to `GET /v1/runs/:id` |
 | `cli_bridge.session.id` | Caller-owned session id, when resuming |
 | `cli_bridge.backend.session_id` | The harness's own session id — joins to that CLI's transcript |
+| `cli_bridge.profile.effective_digest` | WHICH AGENT ran this — `sha256:…` of the effective `agent_profile` |
+| `cli_bridge.profile.name` | The caller's `agent_profile.name`, verbatim. A readable label, not an identity |
 | `cli_bridge.mode` / `cli_bridge.execution` | `byob`/`hosted-safe` and `host`/`sandbox` |
 | `cli_bridge.trace.correlation` | `traceparent` / `headers` / `none` / `invalid` |
 | `cli_bridge.finish_reason` | Terminal reason — separates `length` from `stop` |
@@ -1012,7 +1014,22 @@ the bridge's own execution context:
 Tool ARGUMENTS are never written: they carry prompts, paths and file contents, and
 a trace file must not become a second copy of everything the agent read. Cost is
 written only when every usage record reported one, so a floor is never read as a
-total.
+total. The profile is written as a DIGEST for the same reason — the profile itself
+carries prompts and instructions.
+
+**Which agent did this.** `cli_bridge.profile.effective_digest` is the one attribute
+that makes a multi-agent trace readable. Several agents commonly share one run and
+one `spans.jsonl`; without it the only discriminator left is `gen_ai.request.model`,
+which is not an identity — two agents on the same model are indistinguishable, and
+one agent whose model changed reads as two. The value is the SAME `sha256:` string
+the bridge already reports as `effectiveProfileDigest` on the profile-materialization
+receipt (`GET /v1/runs/:id`) and on the session's profile binding: the profile is
+resolved once per request and memoized, so the three cannot disagree. `agent-runtime`
+records that digest per node on its spawn journal (`profileDigest` /
+`authoredProfileDigest`), so span → node is a join, not an inference. Both attributes
+are absent — never a placeholder — on a request that carried no `agent_profile`,
+and they appear on the tool spans as well as the request span, so filtering the file
+to one agent's work does not require rebuilding the tree first.
 
 ## Deploy
 
