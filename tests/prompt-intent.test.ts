@@ -28,7 +28,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { AgentProfile } from '@tangle-network/agent-interface'
@@ -396,19 +396,22 @@ describe('prompt intents reach each harness through its own control', () => {
 
       // opencode joins these files into the same system message as its own
       // built-in prompt, which stays in place — that is the addition contract.
-      // The config reaches only this process, and its files sit under the profile digest.
+      // The config reaches only this process, and the files it names sit in this
+      // turn's private config directory rather than the shared task directory.
       const config = JSON.parse(provisioned.env.OPENCODE_CONFIG_CONTENT!) as {
         instructions: string[]
       }
-      const scope = `.tangle/opencode-profile/${req.profile_materialization_receipt!.effectiveProfileDigest.slice('sha256:'.length)}`
+      const configDir = provisioned.env.OPENCODE_CONFIG_DIR!
       expect(config.instructions).toEqual([
-        `${scope}/agent-system-prompt.md`,
-        `${scope}/profile-instructions.md`,
+        join(configDir, 'agent-system-prompt.md'),
+        join(configDir, 'profile-instructions.md'),
       ])
-      expect(readFileSync(join(cwd, `${scope}/agent-system-prompt.md`), 'utf8')).toBe(
-        `${ADDITION}\n`,
-      )
-      expect(readdirSync(cwd)).toEqual(['.tangle'])
+      expect(readFileSync(join(configDir, 'agent-system-prompt.md'), 'utf8')).toBe(`${ADDITION}\n`)
+      expect(req.profile_materialization_receipt!.files.map((file) => file.path))
+        .toContain(`${basename(dirname(configDir))}/.opencode/agent-system-prompt.md`)
+      expect(readdirSync(cwd)).toEqual([basename(dirname(configDir))])
+      provisioned.cleanup?.()
+      expect(readdirSync(cwd)).toEqual([])
     })
   })
 

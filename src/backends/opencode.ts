@@ -107,10 +107,21 @@ export class OpencodeBackend implements Backend {
     //
     // Cleanup runs in the outer finally so the temp dir doesn't leak
     // when the subprocess crashes.
-    const mcpMaterialized = materializeMcpServersForOpencode(
-      resolveMcpServers(req, session),
-      (resolveAgentProfile(req, session) as { permissions?: Record<string, unknown> } | null)?.permissions,
-    )
+    //
+    // The provisioning above owns a second request-scoped directory — the
+    // private opencode config directory this profile runs from — and it leaks
+    // into the shared task workspace if anything between here and the spawn
+    // throws, so both releases are paired at every exit.
+    let mcpMaterialized: ReturnType<typeof materializeMcpServersForOpencode>
+    try {
+      mcpMaterialized = materializeMcpServersForOpencode(
+        resolveMcpServers(req, session),
+        (resolveAgentProfile(req, session) as { permissions?: Record<string, unknown> } | null)?.permissions,
+      )
+    } catch (error) {
+      provisioned.cleanup?.()
+      throw error
+    }
     // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
     // expose its dir read-only so the confined opencode can still read it.
     if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
@@ -174,6 +185,7 @@ export class OpencodeBackend implements Backend {
       })
     } catch (error) {
       mcpMaterialized?.cleanup()
+      provisioned.cleanup?.()
       throw error
     }
     const child = spawned.child
@@ -325,6 +337,10 @@ export class OpencodeBackend implements Backend {
       await terminateSpawned(spawned)
       releaseSpawner()
       mcpMaterialized?.cleanup()
+      // Only after the process is gone: opencode rereads its config directory
+      // on every model request, so removing it earlier would strip a running
+      // turn's instructions.
+      provisioned.cleanup?.()
     }
   }
 
