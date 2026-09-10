@@ -1618,10 +1618,15 @@ describe('Pi inference credential isolation', () => {
         },
       },
     }))
+    // The pre-spawn resolution failure names the credential source too
+    // (cli-bridge#194 ask 2): here pi's own provider auth, since neither file
+    // names the provider's key.
     await expect(resolver(
       { provider: 'isolated-test', model: 'credential-check' },
       new AbortController().signal,
-    )).rejects.toThrow(/cannot establish isolated inference auth/u)
+    )).rejects.toThrow(
+      /cannot establish isolated inference auth for isolated-test\/credential-check \(credential source: pi's built-in auth for provider "isolated-test"/u,
+    )
     await expect(resolver(
       { provider: 'isolated-test', model: 'credential-check' },
       new AbortController().signal,

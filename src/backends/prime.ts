@@ -724,7 +724,8 @@ export class PrimeBackend implements Backend {
       }
 
       if (exitCode !== 0) {
-        const detail = [sawError, stderr.render()]
+        const retainedStderr = stderr.render()
+        const detail = [sawError, retainedStderr]
           .filter((part): part is string => Boolean(part))
           .join('\nstderr:\n')
           || `exit ${exitCode ?? 'unknown'}`
@@ -735,7 +736,7 @@ export class PrimeBackend implements Backend {
             detail,
             daemonSocketPath: home.daemonSocketPath,
           }),
-          piFailureKind(detail),
+          primeExitFailureKind(sawError, retainedStderr),
         )
       }
 
@@ -835,6 +836,24 @@ export class PrimeBackend implements Backend {
  */
 const PRIME_DAEMON_LAUNCH_FAILURE =
   /Prime Agent daemon exited during startup|Failed to spawn Prime Agent daemon|Timed out waiting for daemon to start/u
+
+/**
+ * Classify a non-zero exit from the structured signal when the fork gave one
+ * (an rpc error reply or an `error` event), else from the first line of
+ * stderr only. The message carries the whole retained stderr, but the daemon
+ * log tail it now includes is kilobytes of timestamped, line-numbered text; a
+ * `401` inside `04:50:15.401Z` or `chunk.js:4031` must not turn a daemon
+ * crash into a never-retried `not_configured`. The first line is where the
+ * fork prints a CLI-level auth refusal, the case the stderr scan exists for.
+ */
+export function primeExitFailureKind(
+  sawError: string | null | undefined,
+  retainedStderr: string,
+): 'not_configured' | 'upstream' {
+  if (sawError) return piFailureKind(sawError)
+  const firstLine = retainedStderr.split('\n').find((line) => line.trim() !== '') ?? ''
+  return piFailureKind(firstLine.slice(0, 300))
+}
 
 /**
  * Render a non-zero prime-agent exit with what an operator needs to act

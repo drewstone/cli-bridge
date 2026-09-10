@@ -400,6 +400,7 @@ export function createPiInferenceTransportResolver(options: {
         sourceSessionDir,
       }
     }
+    const credentialSource = describePiCredentialSource(sourceAgentDir, selection, trustedEnv)
     let resolvedCredential: Awaited<ReturnType<typeof resolvePiAuthCredential>>
     try {
       resolvedCredential = await resolvePiAuthCredential({
@@ -412,7 +413,8 @@ export function createPiInferenceTransportResolver(options: {
       })
     } catch (error) {
       throw new BackendError(
-        `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model}`,
+        `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model} `
+        + `(credential source: ${credentialSource})`,
         'not_configured',
         error,
       )
@@ -425,7 +427,7 @@ export function createPiInferenceTransportResolver(options: {
         ? { resolveUpstreamApiKey: resolvedCredential.resolve }
         : {}),
       maxRequestBytes,
-      credentialSource: describePiCredentialSource(sourceAgentDir, selection, trustedEnv),
+      credentialSource,
       sourceAgentDir,
       sourceSessionDir,
     }
@@ -449,9 +451,11 @@ export const PI_REQUEST_SCOPED_CREDENTIAL_SOURCE =
  * `apiKey` in models.json, which pi resolves as a `!command`, a `$VAR` /
  * `${VAR}` template, or a literal — and a bare identifier is an env var name
  * in the pi line the prime fork descends from but a literal in the upstream
- * 0.8x line, so a bare name is reported with the variable's presence and left
- * for the operator to read against their pi build. Only names and paths are
- * rendered, never values: the message crosses the HTTP boundary.
+ * 0.8x line, so a bare identifier is reported with the presence of a variable
+ * of that name and left for the operator to read against their pi build.
+ * Only `$VAR` names and paths are rendered, never the apiKey string itself:
+ * the message crosses the HTTP boundary, and a bare identifier may BE the key
+ * (an identifier-shaped literal such as a hex or `sk_live_` token).
  */
 export function describePiCredentialSource(
   sourceAgentDir: string,
@@ -476,15 +480,16 @@ export function describePiCredentialSource(
   if (apiKey.startsWith('!')) return `the shell command configured as ${keyPath}`
   const template = apiKey.replace(/\$[$!]/gu, '')
   const referenced = [...template.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)].map((match) => match[1]!)
-  const bare = referenced.length === 0 && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(apiKey)
-  const names = [...new Set(bare ? [apiKey] : referenced)]
+  if (referenced.length === 0 && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(apiKey)) {
+    return `the bare identifier under ${keyPath} `
+      + `(an env var of that name is ${env[apiKey] ? 'set' : 'unset'} in the bridge environment)`
+  }
+  const names = [...new Set(referenced)]
   if (names.length === 0) return `the literal apiKey under ${keyPath}`
   const presence = names
     .map((name) => `${name} is ${env[name] ? 'set' : 'unset'} in the bridge environment`)
     .join(', ')
-  return bare
-    ? `the bare name under ${keyPath} (${presence})`
-    : `the env var template under ${keyPath} (${presence})`
+  return `the env var template under ${keyPath} (${presence})`
 }
 
 function readJsonRecord(path: string): Record<string, unknown> | null {

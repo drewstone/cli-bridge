@@ -21,6 +21,7 @@ import { BackendRegistry } from '../src/backends/registry.js'
 import {
   DEFAULT_PI_TURN_ATTEMPTS,
   PiBackend,
+  piFailureKind,
   piMcpAdapterAvailable,
   piResponseIdentityFromEvent,
 } from '../src/backends/pi.js'
@@ -1908,6 +1909,25 @@ describe('PiBackend', () => {
     })
   })
 
+  describe('piFailureKind', () => {
+    it('reads an HTTP status only as a whole token, never inside a timestamp or line number', () => {
+      for (const detail of [
+        '401 Unauthorized: token expired',
+        '401: {"message":"probe: invalid api key","type":"invalid_request_error"}',
+        'HTTP 403',
+        'provider answered (401)',
+        'Forbidden',
+      ]) expect(piFailureKind(detail)).toBe('not_configured')
+      for (const detail of [
+        '[2026-09-10T04:50:15.401Z] supervisor: Daemon supervisor startup failed',
+        'chunk-IAW7YJNT.js:4031 at foo',
+        'request id 14013',
+        'Overloaded',
+        '',
+      ]) expect(piFailureKind(detail)).toBe('upstream')
+    })
+  })
+
   describe('credential source naming (cli-bridge#194 ask 2)', () => {
     function agentDir(files: Record<string, unknown>): string {
       const dir = mkdtempSync(join(tmpdir(), 'pi-credential-source-'))
@@ -1941,12 +1961,29 @@ describe('PiBackend', () => {
       expect(describePiCredentialSource(dir, selection, {})).toContain('TANGLE_ROUTER_KEY is unset in the bridge environment')
     })
 
-    it('reports a bare identifier with the variable presence, since pi lines disagree on it', () => {
+    it('reports a bare identifier by presence only, since pi lines disagree on whether it is a name or the key', () => {
       const dir = agentDir({ 'models.json': { providers: { 'tangle-router': { apiKey: 'TANGLE_ROUTER_KEY' } } } })
       expect(describePiCredentialSource(dir, selection, {})).toBe(
-        `the bare name under providers.tangle-router.apiKey in ${join(dir, 'models.json')} `
-        + '(TANGLE_ROUTER_KEY is unset in the bridge environment)',
+        `the bare identifier under providers.tangle-router.apiKey in ${join(dir, 'models.json')} `
+        + '(an env var of that name is unset in the bridge environment)',
       )
+      expect(describePiCredentialSource(dir, selection, { TANGLE_ROUTER_KEY: 'x' })).toContain(
+        'an env var of that name is set in the bridge environment',
+      )
+      expect(describePiCredentialSource(dir, selection, {})).not.toContain('TANGLE_ROUTER_KEY')
+    })
+
+    it('never echoes an identifier-shaped literal key, which upstream pi treats as the key itself', () => {
+      // Hex and underscore-style tokens match identifier syntax; the source must
+      // cross the HTTP boundary without them.
+      for (const literal of ['abcdef0123456789', 'a9f3e1c2b4d5e6f7a8b9c0d1e2f3a4b5', 'sk_live_abcDEF123']) {
+        const dir = agentDir({ 'models.json': { providers: { 'tangle-router': { apiKey: literal } } } })
+        for (const env of [{}, { [literal]: 'present' }]) {
+          const source = describePiCredentialSource(dir, selection, env)
+          expect(source).not.toContain(literal)
+          expect(source).toMatch(/^the bare identifier under providers\.tangle-router\.apiKey in /u)
+        }
+      }
     })
 
     it('never renders a literal key or a command', () => {

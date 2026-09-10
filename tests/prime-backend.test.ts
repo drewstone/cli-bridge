@@ -9,6 +9,7 @@ import {
   describePrimeExit,
   primeApiKeyEnv,
   PrimeBackend,
+  primeExitFailureKind,
   primeProcessEnvironment,
 } from '../src/backends/prime.js'
 import { hostSpawner } from '../src/executors/host.js'
@@ -1234,6 +1235,39 @@ describe('PrimeBackend startup failure diagnostics (cli-bridge#194)', () => {
     // a wrapper or env filter that strips it before the fork sees it.
     expect(err.message).toMatch(/ignores that frontend .* dropped the variable/su)
     expect(err.code).toBe('upstream')
+  })
+
+  it('classifies a daemon crash as upstream whatever the log tail\'s timestamps and line numbers contain', async () => {
+    // The daemon log tail is timestamped to the millisecond and cites bundle
+    // line numbers; `.401Z` and `:4031` are not HTTP statuses, and a 501
+    // not_configured here would stop the caller from ever retrying a crash.
+    const shifted = DAEMON_STARTUP_STDERR
+      .replace('[2026-09-10T04:50:15.385Z]', '[2026-09-10T04:50:15.401Z]')
+      .replace('chunk-IAW7YJNT.js:60733:3', 'chunk-IAW7YJNT.js:4031:3')
+    expect(shifted).toContain('15.401Z')
+    expect(shifted).toContain('js:4031')
+    const err = await failure(newBackend(primeSpawner([], [], 1, shifted)))
+    expect(err.code).toBe('upstream')
+    expect(err.message).toContain('15.401Z')
+    expect(err.message).toContain('js:4031')
+  })
+
+  it('still reads a credential refusal from the structured signal or the first stderr line', async () => {
+    const fromRpc = await failure(newBackend(primeSpawner(
+      [{ id: 'bridge-get-state', type: 'response', command: 'get_state', success: false, error: '401 Unauthorized: token expired' }],
+      [],
+      1,
+      '[2026-09-10T04:50:15.385Z] worker: exiting\n',
+    )))
+    expect(fromRpc.code).toBe('not_configured')
+    const fromStderr = await failure(newBackend(primeSpawner([], [], 1, '401 Unauthorized: token expired\n[2026-09-10T04:50:15.385Z] worker: exiting\n')))
+    expect(fromStderr.code).toBe('not_configured')
+    expect(fromStderr.message).toContain('worker: exiting')
+    // A status buried below the first line of an otherwise unstructured crash does not classify it.
+    expect(primeExitFailureKind(null, 'worker: fatal\n401 Unauthorized\n')).toBe('upstream')
+    expect(primeExitFailureKind(null, '\n\n  403 Forbidden\n')).toBe('not_configured')
+    expect(primeExitFailureKind('forbidden', 'anything')).toBe('not_configured')
+    expect(primeExitFailureKind(null, '')).toBe('upstream')
   })
 
   it('keeps both an rpc error reply and stderr when the process then exits non-zero', async () => {

@@ -1235,9 +1235,11 @@ async function delayBeforeRetry(ms: number, signal: AbortSignal): Promise<void> 
 }
 
 /** Auth/scope failures are a local credential problem, not a transient upstream one, whether they
- *  arrive on pi's stderr or in the provider's error body. */
+ *  arrive on pi's stderr or in the provider's error body. The status codes match only as whole
+ *  tokens: a millisecond timestamp (`15.401Z`) or a bundle line number (`chunk.js:4031`) in a log
+ *  line is not an HTTP status, and misreading one turns a retryable crash into a 501. */
 export function piFailureKind(detail: string): 'not_configured' | 'upstream' {
-  return /401|403|token expired|forbidden|unauthorized/i.test(detail) ? 'not_configured' : 'upstream'
+  return /\b(?:401|403)\b|token expired|forbidden|unauthorized/i.test(detail) ? 'not_configured' : 'upstream'
 }
 
 export function piUsageReceiptsFromEvent(ev: Record<string, unknown>): PiUsageReceipt[] {
