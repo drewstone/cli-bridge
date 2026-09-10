@@ -1230,6 +1230,9 @@ describe('PrimeBackend startup failure diagnostics (cli-bridge#194)', () => {
     const socketPath = captures[0]!.args[captures[0]!.args.indexOf('--daemon-socket') + 1]!
     expect(err.message).toContain('PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND=1')
     expect(err.message).toContain(`socket ${socketPath}`)
+    // Both ways the request can be lost are named: a build that ignores it and
+    // a wrapper or env filter that strips it before the fork sees it.
+    expect(err.message).toMatch(/ignores that frontend .* dropped the variable/su)
     expect(err.code).toBe('upstream')
   })
 

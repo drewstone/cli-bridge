@@ -846,8 +846,10 @@ const PRIME_DAEMON_LAUNCH_FAILURE =
  *
  * A daemon-launch failure gets one more line: this backend asks for the
  * owned-worker frontend precisely so no daemon is reached, and the pinned fork
- * (be9e2fa0) honors that for `--mode rpc`, so reaching the daemon identifies
- * the build behind PRIME_BIN as one that does not.
+ * (be9e2fa0) honors that for `--mode rpc`, so reaching the daemon means either
+ * the build behind PRIME_BIN ignores the request or something between the
+ * bridge and the fork dropped the variable (a wrapper script, an env filter —
+ * the host sanitizer did exactly that before cli-bridge#194).
  */
 export function describePrimeExit(input: {
   exitCode: number | null
@@ -860,9 +862,10 @@ export function describePrimeExit(input: {
   if (PRIME_DAEMON_LAUNCH_FAILURE.test(input.detail)) {
     lines.push(
       `[bridge] prime-agent reached its background daemon (socket ${input.daemonSocketPath}) although the bridge `
-      + 'requested the owned-worker frontend (PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND=1); the build behind '
-      + 'PRIME_BIN does not take that frontend for --mode rpc (fork be9e2fa0 does), and the daemon\'s own error is '
-      + 'in the daemon log named above',
+      + 'requested the owned-worker frontend (PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND=1): either the build '
+      + 'behind PRIME_BIN ignores that frontend for --mode rpc (fork be9e2fa0 honors it) or a PRIME_BIN wrapper or env '
+      + 'filter between the bridge and the fork dropped the variable; the daemon\'s own error is in the daemon log '
+      + 'named above',
     )
   }
   return lines.join('\n')
