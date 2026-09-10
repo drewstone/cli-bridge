@@ -1,15 +1,18 @@
 import { execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  describePrimeExit,
   primeApiKeyEnv,
   PrimeBackend,
   primeProcessEnvironment,
 } from '../src/backends/prime.js'
+import { hostSpawner } from '../src/executors/host.js'
+import type { JailSpec } from '../src/jail/types.js'
 // The profile lowering itself is the shared implementation both prime
 // executors run; these tests exercise it through this backend's own contract.
 import {
@@ -45,6 +48,10 @@ interface SpawnCapture {
   argFiles: Record<string, string>
   /** Relative paths under every argv-named directory, read at spawn. */
   argDirs: Record<string, string[]>
+  /** The jail spec as the spawner received it, after the backend's own path registrations. */
+  jail: JailSpec | null
+  /** Exact env names the backend told the executor's sanitizer to keep. */
+  envPassthroughKeys: string[]
 }
 
 function snapshotArgPaths(args: string[]): Pick<SpawnCapture, 'argFiles' | 'argDirs'> {
@@ -76,6 +83,8 @@ function primeSpawner(
       env: { ...(opts.env ?? {}) },
       cwd: opts.cwd,
       stdin: '',
+      jail: opts.jail ?? null,
+      envPassthroughKeys: [...(opts.envPassthroughKeys ?? [])],
       ...snapshotArgPaths(args),
     }
     captures.push(capture)
@@ -287,6 +296,9 @@ describe('PrimeBackend', () => {
       providers: { tangle: { apiKey: 'PRIME_TEST_ROUTER_KEY' } },
     })
     expect(env.PRIME_TEST_ROUTER_KEY).toBe('sk-router-123')
+    // The host executor re-filters env by its own allowlist, which cannot know
+    // an operator's key names; the backend declares them by exact name.
+    expect(captures[0]!.envPassthroughKeys).toEqual(['PRIME_TEST_ROUTER_KEY'])
   })
 
   it('sends request images through the rpc prompt command instead of dropping them', async () => {
@@ -1172,6 +1184,192 @@ describe('prime config validation', () => {
     expect(config.primeModelsJson).toBe(modelsJson)
     expect(config.primePersistentAgentDir).toBeNull()
     expect(config.primeBin).toBe('prime-agent')
+  })
+})
+
+// Captured verbatim from fork be9e2fa0 (`--mode rpc` without the owned-worker
+// frontend, socket dir unwritable), the same shape as cli-bridge#194: the
+// fork's launcher error and the daemon log tail ride stderr, 1 KB long, and a
+// 300-byte head/tail clip drops exactly the code and the log.
+const DAEMON_STARTUP_STDERR = [
+  'file:///opt/prime-agent/packages/coding-agent/dist/bundle/chunk-IAW7YJNT.js:60719',
+  '    throw new Error(`Prime Agent daemon exited during startup (code ${childFailure.code ?? "unknown"}${signal}).${logTail}`);',
+  '          ^',
+  '',
+  'Error: Prime Agent daemon exited during startup (code 1). Recent daemon log (/srv/bridge/prime/ephemeral-x/home/.prime/agent/logs/d.sock.09929e69.log):',
+  "[2026-09-10T04:50:15.385Z] supervisor: Daemon supervisor startup failed: Error: EACCES: permission denied, mkdir '/tmp/prime-sock-mDwi/d.sock.lock'",
+  '    at throwIfFailed (file:///opt/prime-agent/packages/coding-agent/dist/bundle/chunk-IAW7YJNT.js:60719:11)',
+  '    at ensureDaemonRunning (file:///opt/prime-agent/packages/coding-agent/dist/bundle/chunk-IAW7YJNT.js:60733:3)',
+  '',
+  'Node.js v22.23.2',
+  '',
+].join('\n')
+
+describe('PrimeBackend startup failure diagnostics (cli-bridge#194)', () => {
+  const TASK: ChatRequest = { model: 'prime/tangle-router/deepseek-v4-flash', messages: [{ role: 'user', content: 'TASK' }] }
+
+  async function failure(backend: PrimeBackend, req: ChatRequest = TASK): Promise<BackendError> {
+    try {
+      await collect(backend.chat(req, null, new AbortController().signal))
+    } catch (err) {
+      expect(err).toBeInstanceOf(BackendError)
+      return err as BackendError
+    }
+    throw new Error('expected the prime run to fail')
+  }
+
+  it('carries the exit code and the whole daemon log tail instead of a 300-byte clip', async () => {
+    const captures: SpawnCapture[] = []
+    const err = await failure(newBackend(primeSpawner([], captures, 1, DAEMON_STARTUP_STDERR)))
+    expect(err.message).toMatch(/^prime exit 1: /u)
+    expect(err.message).not.toContain('[... clipped ...]')
+    expect(err.message).toContain('Prime Agent daemon exited during startup (code 1). Recent daemon log (')
+    expect(err.message).toContain("EACCES: permission denied, mkdir '/tmp/prime-sock-mDwi/d.sock.lock'")
+    expect(err.message).toContain('Node.js v22.23.2')
+    // The bridge names the contract the build broke and the socket it handed over.
+    const socketPath = captures[0]!.args[captures[0]!.args.indexOf('--daemon-socket') + 1]!
+    expect(err.message).toContain('PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND=1')
+    expect(err.message).toContain(`socket ${socketPath}`)
+    expect(err.code).toBe('upstream')
+  })
+
+  it('keeps both an rpc error reply and stderr when the process then exits non-zero', async () => {
+    const err = await failure(newBackend(primeSpawner(
+      [{ id: 'bridge-get-state', type: 'response', command: 'get_state', success: false, error: 'state unavailable' }],
+      [],
+      2,
+      'worker: fatal\n',
+    )))
+    expect(err.message).toBe('prime exit 2: state unavailable\nstderr:\nworker: fatal\n')
+  })
+
+  it('reproduces the failure through a real process: a prime-agent whose daemon dies at startup', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'prime-fake-bin-'))
+    cleanupDirs.push(binDir)
+    const bin = join(binDir, 'prime-agent')
+    // Behaves like the fork's launcher: writes the daemon log where the fork
+    // writes it (under the agent dir), prints the launcher error with the log
+    // tail to stderr, exits 1 without ever answering on the rpc channel.
+    writeFileSync(bin, [
+      '#!/bin/sh',
+      'cat >/dev/null',
+      'sock=""',
+      'while [ $# -gt 0 ]; do if [ "$1" = "--daemon-socket" ]; then sock="$2"; fi; shift; done',
+      'logs="$PRIME_AGENT_CODING_AGENT_DIR/logs"',
+      'mkdir -p "$logs"',
+      'log="$logs/d.sock.deadbeef.log"',
+      'echo "[2026-09-10T04:50:15.385Z] supervisor: Daemon supervisor startup failed: Error: EACCES: permission denied, mkdir \'$sock.lock\'" > "$log"',
+      'cat >&2 <<EOF',
+      'file:///opt/prime-agent/dist/bundle/chunk-IAW7YJNT.js:60719',
+      '    throw new Error(\\`Prime Agent daemon exited during startup (code \\${childFailure.code ?? "unknown"}\\${signal}).\\${logTail}\\`);',
+      '          ^',
+      '',
+      'Error: Prime Agent daemon exited during startup (code 1). Recent daemon log ($log):',
+      '$(cat "$log")',
+      '    at throwIfFailed (file:///opt/prime-agent/dist/bundle/chunk-IAW7YJNT.js:60719:11)',
+      '    at ensureDaemonRunning (file:///opt/prime-agent/dist/bundle/chunk-IAW7YJNT.js:60733:3)',
+      '',
+      'Node.js v22.23.2',
+      'EOF',
+      'exit 1',
+      '',
+    ].join('\n'))
+    chmodSync(bin, 0o700)
+
+    const err = await failure(newBackend(hostSpawner, { bin }))
+    expect(err.message).toMatch(/^prime exit 1: /u)
+    expect(err.message).not.toContain('[... clipped ...]')
+    const lock = /mkdir '([^']+\/prime-sock-[^']+\/d\.sock)\.lock'/u.exec(err.message)
+    expect(lock?.[1]).toBeTruthy()
+    // The daemon log path the fork printed and the socket the bridge handed over are both readable off the error.
+    expect(err.message).toMatch(/Recent daemon log \(\S+\/\.prime\/agent\/logs\/d\.sock\.deadbeef\.log\):/u)
+    expect(err.message).toContain(`socket ${lock![1]}`)
+  })
+
+  it('delivers the no-daemon contract, the agent dir, and the named apiKey through the real host executor', async () => {
+    // Before cli-bridge#194 the host sanitizer dropped every PRIME_* variable
+    // and any apiKey name outside its allowlist, so the fork never saw the
+    // owned-worker request (and reached its daemon) and resolved the bare key
+    // name as the literal credential.
+    const modelsDir = mkdtempSync(join(tmpdir(), 'prime-env-models-'))
+    cleanupDirs.push(modelsDir)
+    const modelsJsonPath = join(modelsDir, 'models.json')
+    writeFileSync(modelsJsonPath, JSON.stringify({
+      providers: {
+        'tangle-router': {
+          baseUrl: 'https://router.example/v1',
+          api: 'openai-completions',
+          apiKey: 'DEEPSEEK_API_KEY',
+          models: [{ id: 'deepseek-v4-flash' }],
+        },
+      },
+    }))
+    const binDir = mkdtempSync(join(tmpdir(), 'prime-env-bin-'))
+    cleanupDirs.push(binDir)
+    const bin = join(binDir, 'prime-agent')
+    // Echoes what it can see of its environment as the assistant's text.
+    writeFileSync(bin, [
+      '#!/bin/sh',
+      'cat >/dev/null',
+      'seen="legacy=$PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND;dir=$PRIME_AGENT_CODING_AGENT_DIR;key=$DEEPSEEK_API_KEY;ambient=$PRIME_ENV_TEST_AMBIENT"',
+      'printf \'%s\\n\' \'{"id":"bridge-get-state","type":"response","command":"get_state","success":true,"data":{"sessionId":"env-run"}}\'',
+      'printf \'%s\\n\' \'{"id":"bridge-prompt","type":"response","command":"prompt","success":true}\'',
+      'printf \'{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"%s"}}\\n\' "$seen"',
+      'printf \'%s\\n\' \'{"type":"turn_end","message":{"role":"assistant","stopReason":"stop","usage":{"input":1,"output":1,"totalTokens":2}}}\'',
+      'printf \'%s\\n\' \'{"type":"agent_end","messages":[]}\'',
+      'exit 0',
+      '',
+    ].join('\n'))
+    chmodSync(bin, 0o700)
+
+    const previousKey = process.env.DEEPSEEK_API_KEY
+    const previousAmbient = process.env.PRIME_ENV_TEST_AMBIENT
+    process.env.DEEPSEEK_API_KEY = 'sk-named-by-models-json'
+    process.env.PRIME_ENV_TEST_AMBIENT = 'ambient-must-not-cross'
+    let deltas: ChatDelta[]
+    try {
+      deltas = await collect(newBackend(hostSpawner, { bin, modelsJsonPath }).chat(TASK, null, new AbortController().signal))
+    } finally {
+      if (previousKey === undefined) delete process.env.DEEPSEEK_API_KEY
+      else process.env.DEEPSEEK_API_KEY = previousKey
+      if (previousAmbient === undefined) delete process.env.PRIME_ENV_TEST_AMBIENT
+      else process.env.PRIME_ENV_TEST_AMBIENT = previousAmbient
+    }
+    const seen = deltas.map((delta) => delta.content ?? '').join('')
+    expect(seen).toMatch(/^legacy=1;dir=\S+\/\.prime\/agent;key=sk-named-by-models-json;ambient=$/u)
+  })
+
+  it('names a terminating signal when there is no exit code', () => {
+    const message = describePrimeExit({ exitCode: null, signal: 'SIGKILL', detail: 'killed', daemonSocketPath: '/tmp/x/d.sock' })
+    expect(message).toBe('prime exit signal SIGKILL: killed')
+    expect(describePrimeExit({ exitCode: 3, signal: null, detail: 'uv is required', daemonSocketPath: '/tmp/x/d.sock' }))
+      .toBe('prime exit 3: uv is required')
+  })
+
+  it('exposes the daemon socket dir writable and the prompt dir readable inside a jail', async () => {
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
+    const projectDir = mkdtempSync(join(tmpdir(), 'prime-jail-project-'))
+    cleanupDirs.push(projectDir)
+    const jailSpec: JailSpec = { root: join(projectDir, '.agent-home'), projectDir, readConfine: true }
+    await collect(backend.chat({
+      ...TASK,
+      messages: [{ role: 'system', content: 'Be terse.' }, { role: 'user', content: 'TASK' }],
+      jailSpec,
+    }, null, new AbortController().signal))
+
+    const capture = captures[0]!
+    const args = capture.args
+    const socketPath = args[args.indexOf('--daemon-socket') + 1]!
+    const appendPath = args[args.indexOf('--append-system-prompt') + 1]!
+    expect(capture.jail).toBe(jailSpec)
+    // Every jail mode hides the host tmpdir the socket lives under; the fork
+    // locks `<socket>.lock` beside it before listening.
+    expect(capture.jail?.extraWritablePaths).toContain(dirname(socketPath))
+    expect(capture.jail?.extraWritablePaths).toContain(capture.env.HOME)
+    // The prompt file is outside HOME; an fs-jail that cannot see it would
+    // hand the fork the path string as the prompt.
+    expect(capture.jail?.extraReadablePaths).toContain(dirname(appendPath))
   })
 })
 

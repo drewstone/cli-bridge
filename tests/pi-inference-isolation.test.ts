@@ -29,6 +29,7 @@ import {
   applyPiModelHints,
   createPiInferenceTransportResolver,
   ensurePiSessionFile,
+  PI_REQUEST_SCOPED_CREDENTIAL_SOURCE,
   provisionPiInferenceTransport,
   rewriteOpenAiSseLine,
 } from '../src/backends/pi-inference-transport.js'
@@ -345,11 +346,18 @@ describe('Pi inference credential isolation', () => {
     expect(overridden.upstreamApiKey).toBe(requestToken)
     expect(overridden.upstreamBaseUrl).toBe(requestBaseUrl)
     expect(overridden.requestScopedEndpoint).toBe(true)
+    expect(overridden.credentialSource).toBe(PI_REQUEST_SCOPED_CREDENTIAL_SOURCE)
     expect(existsSync(marker)).toBe(false)
 
     const operatorResolved = await resolver(selection, signal)
     expect(operatorResolved.upstreamApiKey).toBe(operatorToken)
     expect(readFileSync(marker, 'utf8')).toBe('invoked')
+    // The operator path names where `pi auth` looked, never what it found.
+    expect(operatorResolved.credentialSource).toBe(
+      `pi's built-in auth for provider "isolated-test" (no providers.isolated-test.apiKey in ${join(sourceAgentDir, 'models.json')}; `
+      + `no entry in ${join(sourceAgentDir, 'auth.json')})`,
+    )
+    expect(operatorResolved.credentialSource).not.toContain(operatorToken)
   })
 
   it('reads built-in model metadata from Pi and uses subscription bearer auth', async () => {
@@ -1894,6 +1902,7 @@ describe('Pi inference credential isolation', () => {
             apiMode: 'openai-completions',
             upstreamApiKey: SENTINELS.TANGLE_API_KEY,
             maxRequestBytes: 256 * 1024 * 1024,
+            credentialSource: 'test resolver: sentinel',
             providerConfig: {
               api: 'openai-completions',
               compat: {
@@ -2565,6 +2574,7 @@ function fixtureTransport(
     apiMode: 'openai-completions',
     upstreamApiKey: 'test-upstream-key',
     maxRequestBytes: 256 * 1024 * 1024,
+    credentialSource: 'test fixture: literal apiKey',
     providerConfig: { api: 'openai-completions' },
     modelConfig: {
       id: 'credential-check',

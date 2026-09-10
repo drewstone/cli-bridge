@@ -47,7 +47,10 @@
  * dir's own `models.json` is read instead. Either way, provider `apiKey`
  * entries that name environment variables are forwarded into the child env by
  * exact name; the rest of the environment is a neutral allowlist, so ambient
- * provider keys never reach the CLI or its tools.
+ * provider keys never reach the CLI or its tools. The host executors apply
+ * their own allowlist on top (executors/host.ts `sanitizeHostEnv`): the
+ * fork's `PRIME_*` knobs pass by prefix there, and the apiKey names are
+ * declared per spawn as `envPassthroughKeys`.
  *
  * Vision: images in the request ride the rpc `prompt` command's native
  * `images` field (base64 + mimeType) instead of being flattened away.
@@ -110,6 +113,7 @@ import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { registerJailReadable } from '../jail/index.js'
 import {
   piAssistantFailure,
   piFailureKind,
@@ -282,6 +286,8 @@ interface ProvisionedPrimeHome {
   promptDir: string
   /** Short tmpdir-based socket path — AF_UNIX paths cap at ~104 bytes. */
   daemonSocketPath: string
+  /** The socket's own dir; a jail must expose it writable or the daemon cannot lock/bind. */
+  socketDir: string
   apiKeyEnv: Record<string, string>
   cleanup: () => void
 }
@@ -462,9 +468,24 @@ export class PrimeBackend implements Backend {
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     if (req.jailSpec) {
+      // The socket dir lives under the HOST tmpdir, which every jail mode
+      // hides: write-jail binds the host root read-only and fs-jail replaces
+      // /tmp with an empty tmpfs. The fork's daemon supervisor takes a lockfile
+      // beside the socket before it listens, so an unexposed dir dies as
+      // "Prime Agent daemon exited during startup" with EACCES/ENOENT on
+      // `<socket>.lock` in the daemon log (reproduced against fork be9e2fa0).
+      // The prompt dir carries --append-system-prompt and profile files; an
+      // fs-jail that cannot see the path makes the fork take it as literal
+      // prompt text (resource-loader.ts resolves a path only when it exists).
       req.jailSpec.extraWritablePaths = [
-        ...new Set([...(req.jailSpec.extraWritablePaths ?? []), home.home, home.sessionArtifactDir]),
+        ...new Set([
+          ...(req.jailSpec.extraWritablePaths ?? []),
+          home.home,
+          home.sessionArtifactDir,
+          home.socketDir,
+        ]),
       ]
+      registerJailReadable(req.jailSpec, home.promptDir)
     }
 
     let spawned: Awaited<ReturnType<Spawner>>
@@ -481,6 +502,11 @@ export class PrimeBackend implements Backend {
           PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: '1',
           ...home.apiKeyEnv,
         }),
+        // The host executors re-filter the child env through their own
+        // allowlist; the apiKey names a models.json picks are arbitrary
+        // (DEEPSEEK_API_KEY, TANGLE_ROUTER_KEY, ...), so they are declared
+        // by exact name or the fork resolves the bare name as the literal key.
+        envPassthroughKeys: Object.keys(home.apiKeyEnv),
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
@@ -698,8 +724,19 @@ export class PrimeBackend implements Backend {
       }
 
       if (exitCode !== 0) {
-        const detail = sawError ?? (stderr.render(300) || `exit ${exitCode ?? 'unknown'}`)
-        throw new BackendError(`prime exit ${exitCode ?? 'unknown'}: ${detail}`, piFailureKind(detail))
+        const detail = [sawError, stderr.render()]
+          .filter((part): part is string => Boolean(part))
+          .join('\nstderr:\n')
+          || `exit ${exitCode ?? 'unknown'}`
+        throw new BackendError(
+          describePrimeExit({
+            exitCode,
+            signal: child.signalCode,
+            detail,
+            daemonSocketPath: home.daemonSocketPath,
+          }),
+          piFailureKind(detail),
+        )
       }
 
       // A failed provider call must never complete as success — the fork exits
@@ -779,6 +816,7 @@ export class PrimeBackend implements Backend {
       sessionArtifactDir,
       promptDir,
       daemonSocketPath: join(socketDir, 'd.sock'),
+      socketDir,
       apiKeyEnv,
       cleanup: (): void => {
         cleanupSocketDir()
@@ -788,6 +826,46 @@ export class PrimeBackend implements Backend {
       },
     }
   }
+}
+
+/**
+ * The fork's daemon-launch failures (cli/daemon-launch.ts). Each embeds the
+ * daemon log path and its tail, the only place the daemon's own error
+ * survives: the daemon is spawned detached with stdio ignored.
+ */
+const PRIME_DAEMON_LAUNCH_FAILURE =
+  /Prime Agent daemon exited during startup|Failed to spawn Prime Agent daemon|Timed out waiting for daemon to start/u
+
+/**
+ * Render a non-zero prime-agent exit with what an operator needs to act
+ * without rebuilding the bridge's environment by hand: the exit status (or
+ * the terminating signal) and the retained stderr in full. The diagnostic
+ * buffer already bounds memory (head + tail, omissions marked), so nothing
+ * here clips it again — a 300-byte clip is what hid the daemon log tail and
+ * exit code behind `[... clipped ...]` in cli-bridge#194.
+ *
+ * A daemon-launch failure gets one more line: this backend asks for the
+ * owned-worker frontend precisely so no daemon is reached, and the pinned fork
+ * (be9e2fa0) honors that for `--mode rpc`, so reaching the daemon identifies
+ * the build behind PRIME_BIN as one that does not.
+ */
+export function describePrimeExit(input: {
+  exitCode: number | null
+  signal: NodeJS.Signals | null | undefined
+  detail: string
+  daemonSocketPath: string
+}): string {
+  const status = input.exitCode ?? (input.signal ? `signal ${input.signal}` : 'unknown')
+  const lines = [`prime exit ${status}: ${input.detail}`]
+  if (PRIME_DAEMON_LAUNCH_FAILURE.test(input.detail)) {
+    lines.push(
+      `[bridge] prime-agent reached its background daemon (socket ${input.daemonSocketPath}) although the bridge `
+      + 'requested the owned-worker frontend (PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND=1); the build behind '
+      + 'PRIME_BIN does not take that frontend for --mode rpc (fork be9e2fa0 does), and the daemon\'s own error is '
+      + 'in the daemon log named above',
+    )
+  }
+  return lines.join('\n')
 }
 
 /** Preserve a single user task exactly; serialize only genuine multi-message input. */

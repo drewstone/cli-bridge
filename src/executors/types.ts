@@ -90,6 +90,15 @@ export interface SpawnOpts {
   cwd?: string
   /** Env to set on the child. */
   env?: NodeJS.ProcessEnv
+  /**
+   * Exact names in `env` that the backend resolved for THIS request and that
+   * must reach the child even though the host sanitizer's allowlist does not
+   * know them — the apiKey variables a materialized models.json names, for
+   * example. Exact names only, never prefixes; a name absent from `env` is
+   * ignored. The sanitizer still drops everything else, so a backend that
+   * spreads `process.env` gains nothing from it.
+   */
+  envPassthroughKeys?: readonly string[]
   /** Stdio config — defaults to ['ignore', 'pipe', 'pipe']. */
   stdio?: ['ignore' | 'pipe' | 'inherit', 'pipe' | 'inherit', 'pipe' | 'inherit']
   /** Sticky session id (Docker variant uses this to route to a warm slot). */

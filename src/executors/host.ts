@@ -195,7 +195,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
       signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: sanitizeHostEnv(jailed.env, opts.cwd),
+      env: sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys),
       detached: true,
     })
     // Synchronous error capture — Node fires 'error' on nextTick for spawn
@@ -237,10 +237,15 @@ export function resolveHostAcquireDeadlineMs(requestedDeadlineMs?: number): numb
   return hostSemaphore.resolveDeadline(requestedDeadlineMs)
 }
 
-export function sanitizeHostEnv(env: NodeJS.ProcessEnv | undefined, cwd?: string): NodeJS.ProcessEnv | undefined {
+export function sanitizeHostEnv(
+  env: NodeJS.ProcessEnv | undefined,
+  cwd?: string,
+  passthroughKeys: readonly string[] = [],
+): NodeJS.ProcessEnv | undefined {
   if (!env) return undefined
 
   const out: NodeJS.ProcessEnv = {}
+  const passthrough = new Set(passthroughKeys)
   for (const key of BASE_HOST_ENV_KEYS) {
     const value = env[key]
     if (typeof value === 'string' && value.length > 0) out[key] = value
@@ -262,7 +267,12 @@ export function sanitizeHostEnv(env: NodeJS.ProcessEnv | undefined, cwd?: string
       if (process.env[key] !== value) out[key] = value
       continue
     }
-    if (BASE_HOST_ENV_KEYS.has(key) || PROXIED_ENV_KEYS.has(key) || PROXIED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+    if (
+      BASE_HOST_ENV_KEYS.has(key)
+      || PROXIED_ENV_KEYS.has(key)
+      || passthrough.has(key)
+      || PROXIED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
+    ) {
       out[key] = value
     }
   }
@@ -344,6 +354,11 @@ const PROXIED_ENV_PREFIXES = [
   'OPENAI_',
   'OPENCODE_',
   'PI_',
+  // prime-agent's own knobs: PRIME_AGENT_CODING_AGENT_DIR (its only agent-dir
+  // name), PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND (the no-daemon
+  // contract) and the kernel venv controls. Dropping them left the agent dir
+  // and daemon-avoidance the prime backend pins on the floor (cli-bridge#194).
+  'PRIME_',
   'TANGLE_',
   'ZAI_',
   'ZHIPU_',

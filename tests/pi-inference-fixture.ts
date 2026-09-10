@@ -15,6 +15,7 @@ export function testPiInferenceTransport(
     apiMode: 'openai-completions',
     upstreamApiKey: 'test-upstream-key',
     maxRequestBytes: 256 * 1024 * 1024,
+    credentialSource: 'test fixture: the literal apiKey under providers.test.apiKey in /nonexistent/models.json',
     providerConfig: { api: 'openai-completions' },
     modelConfig: {
       id: model,

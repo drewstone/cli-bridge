@@ -27,7 +27,8 @@ import {
 import { BackendError } from '../src/backends/types.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
-import { mountChatCompletions } from '../src/routes/chat-completions.js'
+import { mountChatCompletions, PROTECTED_MODEL_CREDENTIAL_HEADER } from '../src/routes/chat-completions.js'
+import { describePiCredentialSource, PI_REQUEST_SCOPED_CREDENTIAL_SOURCE } from '../src/backends/pi-inference-transport.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { authSourcesFor } from '../src/jail/auth-preserve.js'
@@ -1864,6 +1865,10 @@ describe('PiBackend', () => {
     await run.catch((err: BackendError) => {
       expect(err.code).toBe('not_configured')
     })
+    // cli-bridge#194 ask 2: the 401 names which credential the bridge resolved.
+    await expect(run).rejects.toThrow(
+      /\(credential source: test fixture: the literal apiKey under providers\.test\.apiKey in \/nonexistent\/models\.json\)$/u,
+    )
   })
 
   it('fails a truncated turn: partial text streamed before the provider failure is not success', async () => {
@@ -1898,6 +1903,73 @@ describe('PiBackend', () => {
     await expect(run).rejects.toThrow(/pi assistant turn failed.*Overloaded/su)
     await run.catch((err: BackendError) => {
       expect(err.code).toBe('upstream')
+      // A transient failure is not about the credential; the source stays out of it.
+      expect(err.message).not.toContain('credential source')
+    })
+  })
+
+  describe('credential source naming (cli-bridge#194 ask 2)', () => {
+    function agentDir(files: Record<string, unknown>): string {
+      const dir = mkdtempSync(join(tmpdir(), 'pi-credential-source-'))
+      for (const [name, value] of Object.entries(files)) {
+        writeFileSync(join(dir, name), JSON.stringify(value))
+      }
+      return dir
+    }
+    const selection = { provider: 'tangle-router', model: 'deepseek-v4-flash' }
+
+    it('names the request header for a request-scoped credential', () => {
+      expect(PI_REQUEST_SCOPED_CREDENTIAL_SOURCE).toContain(PROTECTED_MODEL_CREDENTIAL_HEADER)
+    })
+
+    it('prefers a stored auth.json credential, as pi does', () => {
+      const dir = agentDir({
+        'auth.json': { 'tangle-router': { type: 'api_key', key: 'sk-stored-secret' } },
+        'models.json': { providers: { 'tangle-router': { apiKey: '$TANGLE_ROUTER_KEY' } } },
+      })
+      const source = describePiCredentialSource(dir, selection, { TANGLE_ROUTER_KEY: 'x' })
+      expect(source).toBe(`stored api_key credential for provider "tangle-router" in ${join(dir, 'auth.json')}`)
+      expect(source).not.toContain('sk-stored-secret')
+    })
+
+    it('names the env var of a $VAR template and whether the bridge has it', () => {
+      const dir = agentDir({ 'models.json': { providers: { 'tangle-router': { apiKey: '${TANGLE_ROUTER_KEY}' } } } })
+      expect(describePiCredentialSource(dir, selection, { TANGLE_ROUTER_KEY: 'x' })).toBe(
+        `the env var template under providers.tangle-router.apiKey in ${join(dir, 'models.json')} `
+        + '(TANGLE_ROUTER_KEY is set in the bridge environment)',
+      )
+      expect(describePiCredentialSource(dir, selection, {})).toContain('TANGLE_ROUTER_KEY is unset in the bridge environment')
+    })
+
+    it('reports a bare identifier with the variable presence, since pi lines disagree on it', () => {
+      const dir = agentDir({ 'models.json': { providers: { 'tangle-router': { apiKey: 'TANGLE_ROUTER_KEY' } } } })
+      expect(describePiCredentialSource(dir, selection, {})).toBe(
+        `the bare name under providers.tangle-router.apiKey in ${join(dir, 'models.json')} `
+        + '(TANGLE_ROUTER_KEY is unset in the bridge environment)',
+      )
+    })
+
+    it('never renders a literal key or a command', () => {
+      const literal = agentDir({ 'models.json': { providers: { 'tangle-router': { apiKey: 'sk-live-literal-secret' } } } })
+      const literalSource = describePiCredentialSource(literal, selection, {})
+      expect(literalSource).toBe(`the literal apiKey under providers.tangle-router.apiKey in ${join(literal, 'models.json')}`)
+      expect(literalSource).not.toContain('sk-live')
+      const command = agentDir({ 'models.json': { providers: { 'tangle-router': { apiKey: '!cat /run/secrets/router' } } } })
+      const commandSource = describePiCredentialSource(command, selection, {})
+      expect(commandSource).toBe(`the shell command configured as providers.tangle-router.apiKey in ${join(command, 'models.json')}`)
+      expect(commandSource).not.toContain('/run/secrets')
+    })
+
+    it("falls back to pi's own provider auth when neither file names the provider", () => {
+      const noKey = agentDir({ 'models.json': { providers: { 'tangle-router': { baseUrl: 'https://r.example/v1' } } } })
+      expect(describePiCredentialSource(noKey, selection, {})).toBe(
+        `pi's built-in auth for provider "tangle-router" (no providers.tangle-router.apiKey in ${join(noKey, 'models.json')}; `
+        + `no entry in ${join(noKey, 'auth.json')})`,
+      )
+      const empty = agentDir({})
+      expect(describePiCredentialSource(empty, selection, {})).toBe(
+        `pi's built-in auth for provider "tangle-router" (no ${join(empty, 'models.json')}; no entry in ${join(empty, 'auth.json')})`,
+      )
     })
   })
 

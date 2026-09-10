@@ -74,6 +74,12 @@ export interface ResolvedPiInferenceTransport {
   requestScopedEndpoint?: boolean
   /** Finite per-request memory boundary for the model-binding JSON inspection. */
   maxRequestBytes: number
+  /**
+   * Where the upstream credential was taken from, as a file path, env var
+   * name, or header name — never a value. A provider 401 carries it so a jail
+   * or HOME misconfiguration reads as one. See {@link describePiCredentialSource}.
+   */
+  credentialSource: string
   providerConfig: Record<string, unknown>
   modelConfig: Record<string, unknown>
   sourceAgentDir: string
@@ -95,6 +101,8 @@ export interface ProvisionedPiInferenceTransport {
   providerDispatchMarker: string
   /** True when the endpoint came from a protected request header. */
   requestScopedEndpoint?: boolean
+  /** Copied from the resolved transport; see {@link ResolvedPiInferenceTransport.credentialSource}. */
+  credentialSource: string
   apiMode: PiApiMode
   /** Exact profile cap applied to this run's isolated model catalog, when requested. */
   appliedMaxTotalOutputTokens?: number
@@ -387,6 +395,7 @@ export function createPiInferenceTransportResolver(options: {
         upstreamApiKey: credential.token,
         requestScopedEndpoint: true,
         maxRequestBytes,
+        credentialSource: PI_REQUEST_SCOPED_CREDENTIAL_SOURCE,
         sourceAgentDir,
         sourceSessionDir,
       }
@@ -416,10 +425,76 @@ export function createPiInferenceTransportResolver(options: {
         ? { resolveUpstreamApiKey: resolvedCredential.resolve }
         : {}),
       maxRequestBytes,
+      credentialSource: describePiCredentialSource(sourceAgentDir, selection, trustedEnv),
       sourceAgentDir,
       sourceSessionDir,
     }
   }
+}
+
+/**
+ * The request header the chat route reads a protected model credential from
+ * (routes/chat-completions.ts `PROTECTED_MODEL_CREDENTIAL_HEADER`); spelled
+ * here so this module does not import the route layer.
+ */
+export const PI_REQUEST_SCOPED_CREDENTIAL_SOURCE =
+  'request-scoped protected model credential (x-cli-bridge-model-credential header)'
+
+/**
+ * Name where `pi auth print-api-key` takes the provider credential from, so a
+ * provider 401 reads as the file or variable to fix instead of as a bad key.
+ *
+ * Mirrors pi's own precedence (core/provider-composer.ts): a stored credential
+ * for the provider in the agent dir's auth.json wins over the provider's
+ * `apiKey` in models.json, which pi resolves as a `!command`, a `$VAR` /
+ * `${VAR}` template, or a literal — and a bare identifier is an env var name
+ * in the pi line the prime fork descends from but a literal in the upstream
+ * 0.8x line, so a bare name is reported with the variable's presence and left
+ * for the operator to read against their pi build. Only names and paths are
+ * rendered, never values: the message crosses the HTTP boundary.
+ */
+export function describePiCredentialSource(
+  sourceAgentDir: string,
+  selection: PiInferenceSelection,
+  env: NodeJS.ProcessEnv,
+): string {
+  const authPath = join(sourceAgentDir, 'auth.json')
+  const modelsPath = join(sourceAgentDir, 'models.json')
+  const stored = readJsonRecord(authPath)?.[selection.provider]
+  if (isRecord(stored)) {
+    const type = typeof stored.type === 'string' ? stored.type : 'unknown-type'
+    return `stored ${type} credential for provider "${selection.provider}" in ${authPath}`
+  }
+  const models = readJsonRecord(modelsPath)
+  const provider = models && isRecord(models.providers) ? models.providers[selection.provider] : undefined
+  const apiKey = isRecord(provider) ? provider.apiKey : undefined
+  const keyPath = `providers.${selection.provider}.apiKey in ${modelsPath}`
+  if (typeof apiKey !== 'string' || apiKey.length === 0) {
+    const missing = models === null ? `no ${modelsPath}` : `no ${keyPath}`
+    return `pi's built-in auth for provider "${selection.provider}" (${missing}; no entry in ${authPath})`
+  }
+  if (apiKey.startsWith('!')) return `the shell command configured as ${keyPath}`
+  const template = apiKey.replace(/\$[$!]/gu, '')
+  const referenced = [...template.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu)].map((match) => match[1]!)
+  const bare = referenced.length === 0 && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(apiKey)
+  const names = [...new Set(bare ? [apiKey] : referenced)]
+  if (names.length === 0) return `the literal apiKey under ${keyPath}`
+  const presence = names
+    .map((name) => `${name} is ${env[name] ? 'set' : 'unset'} in the bridge environment`)
+    .join(', ')
+  return bare
+    ? `the bare name under ${keyPath} (${presence})`
+    : `the env var template under ${keyPath} (${presence})`
+}
+
+function readJsonRecord(path: string): Record<string, unknown> | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'))
+  } catch {
+    return null
+  }
+  return isRecord(parsed) ? parsed : null
 }
 
 function validateProtectedUpstreamBaseUrl(
@@ -458,6 +533,7 @@ function readConfiguredTransport(
   | 'upstreamApiKey'
   | 'resolveUpstreamApiKey'
   | 'maxRequestBytes'
+  | 'credentialSource'
   | 'sourceAgentDir'
   | 'sourceSessionDir'
 > | null {
@@ -560,6 +636,7 @@ async function readCatalogTransport(options: {
   | 'upstreamApiKey'
   | 'resolveUpstreamApiKey'
   | 'maxRequestBytes'
+  | 'credentialSource'
   | 'sourceAgentDir'
   | 'sourceSessionDir'
 >> {
@@ -718,6 +795,7 @@ export async function provisionPiInferenceTransport(
       upstreamBaseUrl: resolved.upstreamBaseUrl,
       providerDispatchMarker: proxy.providerDispatchMarker,
       ...(resolved.requestScopedEndpoint ? { requestScopedEndpoint: true } : {}),
+      credentialSource: resolved.credentialSource,
       apiMode: resolved.apiMode,
       ...(applied.appliedMaxTotalOutputTokens === undefined
         ? {}
