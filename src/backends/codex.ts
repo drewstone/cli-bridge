@@ -29,9 +29,9 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
-import { BackendError, terminalOutcome } from './types.js'
+import { BackendError, BRIDGE_RESERVED_FAILURE_CODES, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
@@ -96,7 +96,13 @@ export class CodexBackend implements Backend {
     // is the builtin default) and only the remainder is the `model` id —
     // passing the qualified form verbatim was rejected by the API as a
     // nonexistent model, killing every profile-declared codex lead.
-    const { provider: providerArg, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+    const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+    // #161: the harness name is never a codex provider. A caller composes one harness prefix
+    // and spends a provider equal to the harness there, so a second `codex/` segment restates
+    // the harness rather than naming a `[model_providers.*]` key — passing it on made codex
+    // resolve a provider that no config.toml defines. Dropped here, where the argv is built,
+    // so the rule holds for an unprofiled request too; a profile comparison never sees one.
+    const providerArg = splitProvider === this.name ? null : splitProvider
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
     // else `codex exec <prompt>`. --json emits JSONL events.
@@ -221,7 +227,7 @@ export class CodexBackend implements Backend {
       if (!child.stdout) {
         throw new BackendError('codex subprocess has no stdout pipe', 'upstream')
       }
-      let sawError: string | null = null
+      let sawError: BackendFailureReason | null = null
 
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
@@ -239,7 +245,7 @@ export class CodexBackend implements Backend {
         }
 
         if (type === 'error') {
-          sawError = String(ev.message ?? 'codex error')
+          sawError = codexFailureReason(ev)
           continue
         }
 
@@ -274,7 +280,12 @@ export class CodexBackend implements Backend {
         return
       }
       if (sawError) {
-        throw new BackendError(`codex: ${sawError}`, 'upstream')
+        // Ended through the delta envelope, not a throw: `BackendError.code` is the
+        // bridge's own closed taxonomy and cannot carry a provider discriminant, while
+        // the terminal error delta reaches the caller with it. The route answers both
+        // shapes 502 (`BackendReportedFailureError`), so only the code is new.
+        yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId }
+        return
       }
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(await describeCliExit(spawned, 'codex', exitCode, stderr.render()), 'upstream')
@@ -339,6 +350,191 @@ export function splitCodexModel(
 function resolveCodexAuthPath(): string | undefined {
   const home = process.env.CODEX_HOME ?? (process.env.HOME ? join(process.env.HOME, '.codex') : undefined)
   return home ? join(home, 'auth.json') : undefined
+}
+
+/**
+ * Read one codex failure event as a reason a caller can branch on.
+ *
+ * Codex states the same refusal in two places and the bridge sees both. It sets
+ * its own `CodexErrorInfo` discriminant — `server_overloaded` (410),
+ * `response_too_many_failed_attempts` (309), `other` (164),
+ * `usage_limit_exceeded` (92) and `unauthorized` (8) across the 983 refusals
+ * recorded on this machine — and where the refusal came over the wire it quotes
+ * the provider's JSON body inside the message text, which is where
+ * `invalid_request_error` and its `code` live.
+ *
+ * Both were flattened into one opaque `upstream` string, which made a capacity
+ * refusal that clears on its own indistinguishable from a request that will
+ * fail identically forever — the difference between waiting and giving up.
+ * agent-runtime reads the relayed `type` as `upstreamCode` and the relayed
+ * `status` through its own classifier, which is what ends the retry loop on a
+ * malformed request instead of re-driving it to the attempt ceiling.
+ *
+ * Permissive on shape for the same reason `extractText` is: codex's field
+ * naming has drifted across versions, and a reason with no code is still a
+ * reason. An unrecognized payload keeps `upstream` and the CLI's own words.
+ */
+export function codexFailureReason(ev: Record<string, unknown>): BackendFailureReason {
+  const message = firstString(ev.message) ?? 'codex error'
+  const codexCode = codexErrorDiscriminant(ev.codex_error_info)
+  const variant = codexErrorVariantPayload(ev.codex_error_info)
+  const provider = providerErrorBody(message)
+  const providerCode = firstString(provider?.body.type, provider?.body.code)
+  // `other` is codex declining to classify, so it must not outrank a code the
+  // provider did state: 20 of the 983 recorded refusals are a malformed request
+  // whose body names `invalid_request_error` under an `other` discriminant. It
+  // still beats nothing when the body names no code either.
+  const relayed = codexCode === CODEX_UNCLASSIFIED
+    ? relayableCode(providerCode) ?? relayableCode(codexCode)
+    : relayableCode(codexCode) ?? relayableCode(providerCode)
+  // Both structured channels, and only those: the variant payload's own
+  // `http_status_code` (429 on every recorded rate-limit refusal) and the status
+  // the provider's wrapper states beside its body (400 on the recorded malformed
+  // requests). Codex also names a status in prose on 139 of the 983, and that one
+  // is left alone — agent-runtime already reads a status out of message text, and
+  // a second scraper here would only disagree with it.
+  const status = httpStatus(variant?.http_status_code) ?? httpStatus(provider?.status)
+  return {
+    message,
+    type: relayed ?? 'upstream',
+    ...(status === undefined ? {} : { status }),
+  }
+}
+
+/**
+ * A code the bridge may relay as its own failure type, or undefined.
+ *
+ * The relay channel is shared with the bridge's own taxonomy: the route answers
+ * 504 for `timeout` and 502 for everything else, and agent-runtime treats
+ * `parse_error`, `not_configured` and `capability_denied` as never-retry. The
+ * text on this channel comes from a provider, so a body that quotes one of those
+ * words would otherwise decide the bridge's status and the caller's retry.
+ * Refusing the collision costs only the code — the CLI's own words still reach
+ * the caller in `message`.
+ */
+function relayableCode(code: string | undefined): string | undefined {
+  return code === undefined || BRIDGE_RESERVED_FAILURE_CODES.has(code) ? undefined : code
+}
+
+/** A status a provider actually stated, within the range HTTP defines. */
+function httpStatus(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : undefined
+}
+
+/** Codex's own discriminant for a failure it did not classify. */
+const CODEX_UNCLASSIFIED = 'other'
+
+/**
+ * The `CodexErrorInfo` variant codex named, from either form it serializes.
+ *
+ * A unit variant is a bare string (`server_overloaded`, `usage_limit_exceeded`,
+ * `unauthorized`, `other`); a variant that carries data is a single-key object,
+ * and the 429 codex reports after exhausting its retries is
+ * `{"response_too_many_failed_attempts":{"http_status_code":429}}` — no `type`
+ * and no `code` field, so reading only those lost the most common classified
+ * refusal in the recordings (309 of 983).
+ */
+function codexErrorDiscriminant(value: unknown): string | undefined {
+  const bare = firstString(value)
+  if (bare !== undefined) return bare
+  const info = asRecord(value)
+  if (!info) return undefined
+  const named = firstString(info.type, info.code)
+  if (named !== undefined) return named
+  const keys = Object.keys(info)
+  return keys.length === 1 ? keys[0] : undefined
+}
+
+/**
+ * The fields a data-carrying `CodexErrorInfo` variant holds.
+ *
+ * They sit one level UNDER the variant key, which is the same nesting
+ * {@link codexErrorDiscriminant} reads the key from — every field a caller wants
+ * from this channel has to come through here, or it reads a shape serde never
+ * writes. A unit variant is a bare string and carries no fields at all.
+ */
+function codexErrorVariantPayload(value: unknown): Record<string, unknown> | null {
+  const info = asRecord(value)
+  if (!info) return null
+  const keys = Object.keys(info)
+  return keys.length === 1 ? asRecord(info[keys[0]!]) : null
+}
+
+/**
+ * The provider's own error body, quoted inside a codex message, with the status
+ * its wrapper states beside it.
+ *
+ * Codex wraps it in its own prose (`unexpected status 400, url: …, cf-ray: …:
+ * <body>`), and the prose continues after it on some paths, so the body is read
+ * as a balanced object rather than as the tail of the string. Each `{` is tried
+ * in turn because the prose before it may itself contain a brace; the attempt
+ * count is bounded so a message full of braces cannot become quadratic.
+ *
+ * A codex message also quotes tool output and assistant text, so a parseable
+ * object is not yet a provider error: the candidate must carry an `error` object
+ * or name its own class beside a message. Without that test, a tool call echoed
+ * into the prose supplied the code the bridge relayed.
+ */
+function providerErrorBody(
+  message: string,
+): { body: Record<string, unknown>; status: unknown } | null {
+  let attempts = 0
+  for (let at = message.indexOf('{'); at !== -1 && attempts < 8; at = message.indexOf('{', at + 1)) {
+    attempts += 1
+    const candidate = balancedObjectAt(message, at)
+    if (candidate === null) continue
+    let parsed: unknown
+    try { parsed = JSON.parse(candidate) } catch { continue }
+    const wrapper = asRecord(parsed)
+    if (!wrapper) continue
+    // `{"error":{…},"status":400}` is the wrapper the provider sends; a bare body is
+    // also accepted, and then the wrapper IS the body.
+    const nested = asRecord(wrapper.error)
+    const body = nested ?? wrapper
+    const namesItsOwnClass = firstString(body.type, body.code) !== undefined
+      && typeof body.message === 'string'
+    if (nested === null && !namesItsOwnClass) continue
+    return { body, status: wrapper.status }
+  }
+  return null
+}
+
+/** The `{…}` span starting at `from`, or null when it never closes. String-aware. */
+function balancedObjectAt(text: string, from: number): string | null {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = from; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '{') depth += 1
+    else if (ch === '}') {
+      depth -= 1
+      if (depth === 0) return text.slice(from, i + 1)
+    }
+  }
+  return null
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.length > 0) return value
+  }
+  return undefined
 }
 
 /**

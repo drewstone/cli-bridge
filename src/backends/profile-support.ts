@@ -37,7 +37,10 @@ import {
   hashWorkspacePlan,
   type HarnessId,
   materializeProfile,
+  modelIdsMatch,
   type PlanFile,
+  qualifyModelId,
+  unqualifyModelId,
   type WorkspacePlan,
   type WorkspacePlanArgument,
   type WorkspacePlanConfigValue,
@@ -882,8 +885,28 @@ export function profileExecutionIdentity(
  * second behavioral channel changes it. Limits and execution mode may still
  * constrain the run; model, prompt, MCP, and reasoning must agree with the
  * profile before any harness process starts.
+ *
+ * Model agreement is decided by `modelIdsMatch`, the one canonicalization of a
+ * model id (`@tangle-network/agent-profile-materialize`). Both sides are first
+ * made harness-relative, because the harness prefix is the one qualification
+ * that package does not own: the request carries it and the profile does not.
+ * A second independent copy of the qualification rule is what issue #212 was —
+ * a stripped request compared against an unstripped profile id refused an
+ * exactly matching pair and printed two identical-looking strings as the
+ * conflict (`request model "kimi-code/kimi-for-coding" conflicts with
+ * agent_profile.model "kimi-code/kimi-for-coding"`).
+ *
+ * Cross-run against agent-runtime's own `profileBridgeWireModel` over 14 profile
+ * shapes, this accepts 13 of the ids it composes. Both exceptions are profiles
+ * whose model is absent, and `assertExecutableAgentProfile` refuses those before
+ * execution: a harness-native `model.default` (the sentinel resolves to no model
+ * and the composer sends the bare harness id, which selects no model here), and
+ * a profile that declares only `model.provider`. In the second case the composer
+ * has nothing to qualify, so the provider never reaches the wire and this check
+ * cannot confirm the run will honour it — unless the provider IS the harness,
+ * which the wire id's prefix does state.
  */
-function assertExactProfileRequest(
+export function assertExactProfileRequest(
   req: ChatRequest,
   profile: AgentProfile,
   harness: HarnessId,
@@ -899,25 +922,32 @@ function assertExactProfileRequest(
   const requestedModel = profile.model?.default
   const requestedProvider = profile.model?.provider
   if (requestedModel !== undefined) {
-    const modelWithoutHarness = requestedModel.startsWith(`${harness}/`)
-      ? requestedModel.slice(harness.length + 1)
-      : requestedModel
-    const qualified = requestedProvider
-      && !modelWithoutHarness.startsWith(`${requestedProvider}/`)
-      ? `${requestedProvider}/${modelWithoutHarness}`
-      : modelWithoutHarness
-    if (wireModel !== qualified) {
+    // The profile's id made harness-relative, so both operands are at the same level before
+    // `modelIdsMatch` qualifies them by the declared provider. A profile that spells its own
+    // harness into `model.default` composes the same wire id, which is why one prefix comes off.
+    const declaredModel = unqualifyModelId(harness, requestedModel)
+    if (!modelIdsMatch(wireModel, declaredModel, requestedProvider)) {
       throw new BackendError(
-        `request model ${JSON.stringify(req.model)} conflicts with agent_profile.model ${JSON.stringify(qualified)}`,
+        `request model ${JSON.stringify(req.model)} selects ${JSON.stringify(wireModel)} within harness `
+        + `${JSON.stringify(harness)}, which conflicts with agent_profile.model `
+        + `${JSON.stringify(qualifyModelId(requestedProvider, declaredModel))}`,
         'parse_error',
       )
     }
   } else if (requestedProvider !== undefined) {
     const slash = wireModel.indexOf('/')
     const wireProvider = slash > 0 ? wireModel.slice(0, slash) : null
-    if (wireProvider !== requestedProvider) {
+    // A provider equal to the harness is spent as the wire id's single harness prefix, so the
+    // remainder usually carries no provider segment of its own. A caller that states it twice
+    // anyway still names the same provider, and the harness name is kept out of the CLI's own
+    // provider argument by the backend that builds the argv (#161), not by this comparison —
+    // which never sees an unprofiled request and so could never enforce it for every route.
+    const selected = wireProvider === requestedProvider
+      || (requestedProvider === harness && wireProvider === null)
+    if (!selected) {
       throw new BackendError(
-        `request model ${JSON.stringify(req.model)} does not select agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
+        `request model ${JSON.stringify(req.model)} selects provider ${JSON.stringify(wireProvider)} within harness `
+        + `${JSON.stringify(harness)}, not agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
         'parse_error',
       )
     }
@@ -936,6 +966,17 @@ function modelWithinHarness(model: string, harness: HarnessId): string {
   )
 }
 
+/**
+ * Every prefix that selects this harness on the wire.
+ *
+ * A backend's registered name and the `HarnessId` it passes to this file are
+ * independent: `ClaudeBackend` claims `<its own name>/` and states `claude-code`
+ * here, so a deployment that registers it under its default `claude` name routes
+ * `claude/opus` into a `claude-code` check. Dropping the alias makes that
+ * configuration refuse every request (measured: it fails
+ * tests/docker-executor.test.ts with `request model "claude/opus" does not
+ * select harness "claude-code"`).
+ */
 function harnessModelPrefixes(harness: HarnessId): readonly string[] {
   return harness === 'claude-code'
     ? ['claude-code', 'claude']
