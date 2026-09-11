@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -254,7 +255,9 @@ describe('Pi inference credential isolation', () => {
       .toThrow(/no valid maxTokens cap/u)
   })
 
-  it('starts from an allowlist, so ambient provider aliases never reach a child or descendant', () => {
+  // Reads /proc/self/environ to prove what a descendant actually inherits. /proc exists only on
+  // Linux, which is also the only platform where pi runs at all: it requires a bubblewrap fs-jail.
+  it.skipIf(process.platform !== 'linux')('starts from an allowlist, so ambient provider aliases never reach a child or descendant', () => {
     const childEnv = piToolProcessEnvironment({
       HOME: '/home/test',
       PATH: process.env.PATH,
@@ -1446,7 +1449,10 @@ describe('Pi inference credential isolation', () => {
 
       expect(first.sessionDir).toBe(resumed.sessionDir)
       expect(other.sessionDir).not.toBe(first.sessionDir)
-      expect(first.sessionDir.startsWith(join(sourceSessionDir, 'cli-bridge'))).toBe(true)
+      // The transport realpaths the session root so a symlink cannot redirect sessions elsewhere.
+      // Compare against the same realpath: on macOS tmpdir() is /var/..., a symlink to /private/var/...,
+      // so a raw prefix check fails there while passing on Linux, where /tmp is not a symlink.
+      expect(first.sessionDir.startsWith(join(realpathSync(sourceSessionDir), 'cli-bridge'))).toBe(true)
       expect(basename(first.sessionDir)).toMatch(/^[a-f0-9]{64}$/u)
       expect(first.sessionDir).not.toContain('customer-visible-session-alpha')
 
