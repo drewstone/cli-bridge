@@ -9,6 +9,18 @@ import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 3_500
 const DEFAULT_RETAINED_HEALTH_PROBE_TIMEOUT_MS = 15_000
+const DEFAULT_READY_CACHE_TTL_MS = 0
+
+// Readiness is opt-in cached because a successful probe is safe to reuse only
+// for a short operator-selected interval. Failures are never cached.
+const readyCache = new Map<string, { health: BackendHealth; expiresAt: number }>()
+
+function readyCacheTtlMs(): number {
+  const raw = process.env.BRIDGE_HEALTH_READY_CACHE_TTL_MS
+  if (raw === undefined) return DEFAULT_READY_CACHE_TTL_MS
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_READY_CACHE_TTL_MS
+}
 
 /** Run one backend health probe with a bounded caller-owned wait. */
 export async function boundedProbe(
@@ -161,6 +173,11 @@ export async function versionHealth(
   readyDetail?: string,
   signal?: AbortSignal,
 ): Promise<BackendHealth> {
+  const ttl = readyCacheTtlMs()
+  const key = `${name}\u0000${bin}`
+  const cached = ttl > 0 ? readyCache.get(key) : undefined
+  if (cached && cached.expiresAt > Date.now() && !signal?.aborted) return cached.health
+  if (cached) readyCache.delete(key)
   let release = (): void => {}
   try {
     // The request path, taken first: a request that cannot resolve a cwd or
@@ -197,12 +214,14 @@ export async function versionHealth(
       // Some runners, including Prime Agent 0.7.0, write `--version` to stderr.
       // Exit status still owns readiness; use stderr only when stdout is empty.
       const version = closed.stdout.trim() || closed.stderr.trim() || undefined
-      return {
+      const health: BackendHealth = {
         name,
         state: 'ready',
         version,
         ...(readyDetail ? { detail: readyDetail } : {}),
       }
+      if (ttl > 0) readyCache.set(key, { health, expiresAt: Date.now() + ttl })
+      return health
     }
     return {
       name,
