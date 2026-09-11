@@ -380,6 +380,22 @@ export class PiBackend implements NativeSessionBackend {
   }
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
+    // Report the same precondition chat() enforces, or health lies. On a host executor pi
+    // refuses every turn unless an enforced Linux fs-jail (bubblewrap) is available, because
+    // pi's Bash can otherwise read host credentials and sibling sessions. `pi --version`
+    // succeeds regardless, so a version probe alone reported `ready` on macOS — where the
+    // only jail is a write-only seatbelt — while every request failed with `not_configured`.
+    // Measured 2026-09-11: /health said `pi -> ready` and the first real turn returned 501.
+    if (this.spawner.executionEnvironment === 'host') {
+      const jailBackend = selectJailBackend()
+      if (jailBackend.name !== 'bwrap' || !(await jailBackend.isAvailable())) {
+        return {
+          name: this.name,
+          state: 'unavailable',
+          detail: `pi needs an enforced Linux fs-jail (bubblewrap) on a host executor; this host offers ${jailBackend.name}`,
+        }
+      }
+    }
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
