@@ -379,13 +379,43 @@ export interface ChatRequest {
  * on the error envelope's `type` channel, which agent-runtime decodes as
  * `upstreamCode`. `upstream` means the failure named no code — it is the
  * bridge's "I cannot classify this", not a classification.
+ *
+ * Codex is the only backend that fills one in today; the others still collapse
+ * every provider refusal into `upstream` through the string arm of
+ * {@link terminalOutcome}. The shape is here rather than in `codex.ts` because
+ * it is the seam that arm widens to, not because it is already shared.
  */
 export interface BackendFailureReason {
   message: string
   type: string
-  /** ISO instant at which refused capacity returns, when the provider stated one. */
-  resetAt?: string
+  /**
+   * The status the provider itself stated for this failure, when it stated one
+   * as a field, for the `status` channel on {@link ChatDelta}'s error — which
+   * exists for exactly this: a frame with no status is read as "unknown, assume
+   * a bad moment" and a permanently malformed request is retried to its ceiling.
+   * The bridge never infers one from prose.
+   */
+  status?: number
 }
+
+/**
+ * Failure codes the bridge assigns its own meaning to, so a relayed provider
+ * code must never be one of them.
+ *
+ * This is `BackendError`'s taxonomy: the route picks an HTTP status from it and
+ * agent-runtime's retry policy reads three of its members as never-retry. The
+ * relay channel carries provider and CLI text, so without this a quoted body
+ * could choose the bridge's status or end a caller's retries on its behalf.
+ * `upstream` is absent deliberately — it is the fallback, not a claim.
+ */
+export const BRIDGE_RESERVED_FAILURE_CODES: ReadonlySet<string> = new Set([
+  'not_configured',
+  'cli_missing',
+  'timeout',
+  'aborted',
+  'parse_error',
+  'capability_denied',
+])
 
 /**
  * The terminal `finish_reason` for a CLI stream that ended on its own, plus the
@@ -400,7 +430,7 @@ export interface BackendFailureReason {
  *
  * A bare string is a reason with no code, which is how a backend that has not
  * yet parsed its CLI's structured payload reports one. A `BackendFailureReason`
- * carries the code and any reset instant through to the caller.
+ * carries the code and the provider's own status through to the caller.
  *
  * `Run.pump` still guarantees a non-empty reason on any terminal error delta;
  * this is what makes that reason the CLI's own words rather than the bridge's
@@ -419,7 +449,7 @@ export function terminalOutcome(
       error: {
         message: `${label}: ${reason.message}`,
         type: reason.type,
-        ...(reason.resetAt === undefined ? {} : { reset_at: reason.resetAt }),
+        ...(reason.status === undefined ? {} : { status: reason.status }),
       },
     }
   }
@@ -472,12 +502,6 @@ export interface ChatDelta {
      * the non-streaming response say the same thing.
      */
     status?: number
-    /**
-     * When the refused capacity returns, as an ISO instant, exactly as the
-     * provider stated it. Only a provider knows this; the bridge never guesses
-     * one, so its absence means the provider named no reset.
-     */
-    reset_at?: string
     /** Capacity refusal: the bridge never started the model. */
     capacity?: true
     /** Which executor semaphore refused, with the counts behind the refusal. */

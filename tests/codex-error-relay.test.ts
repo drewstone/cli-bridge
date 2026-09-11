@@ -7,15 +7,16 @@
  * backoff, and a malformed request that will fail identically forever all read
  * the same, so a retry policy can only guess. agent-runtime decodes this exact
  * channel as `upstreamCode` (`bridgeUpstreamError`, src/runtime/supervise/
- * runtime.ts) and its `classifyDriverFailure` branches on it, so the code has a
- * consumer the moment the bridge stops discarding it.
+ * runtime.ts) and reads the relayed `status` in `classifyDriverFailure`, which
+ * is what stops a 400 from being re-driven to the attempt ceiling.
  *
  * The fixtures are recorded refusals, not invented ones — provenance and counts
- * are in tests/fixtures/codex-error-events.ts. Two of these tests exist because
- * the recordings disagreed with what the parser first assumed: the commonest
- * rate-limit refusal names its variant with the object key rather than a `type`
- * field, and a malformed request arrives under an `other` discriminant with the
- * real code in the body.
+ * are in tests/fixtures/codex-error-events.ts. Three of these tests exist
+ * because the recordings disagreed with what the parser first assumed: the
+ * commonest rate-limit refusal names its variant with the object key rather than
+ * a `type` field, a malformed request arrives under an `other` discriminant with
+ * the real code in the body, and the status a provider states sits on the
+ * wrapper beside its error rather than inside it.
  */
 
 import { EventEmitter } from 'node:events'
@@ -29,12 +30,11 @@ import {
   CODEX_BAD_REQUEST_NESTED_EVENT,
   CODEX_CAPACITY_EVENT,
   CODEX_GATEWAY_EVENT,
-  CODEX_PROVIDER_RESET_EVENT,
   CODEX_RATE_LIMIT_EVENT,
+  CODEX_STREAM_DISCONNECT_EVENT,
   CODEX_UNAUTHORIZED_EVENT,
   CODEX_UNCLASSIFIED_EVENT,
   CODEX_USAGE_LIMIT_EVENT,
-  RESETS_AT_EPOCH_SECONDS,
 } from './fixtures/codex-error-events.js'
 
 class FakeChild extends EventEmitter {
@@ -93,18 +93,18 @@ describe('codex relays the provider refusal, not one opaque class', () => {
   it('surfaces a malformed-request refusal with a different code again', async () => {
     const error = await relayedError(CODEX_BAD_REQUEST_EVENT)
     expect(error.type).toBe('invalid_request_error')
-    // Nothing to wait for: a request this shape fails the same way on every attempt.
-    expect(error.reset_at).toBeUndefined()
     expect(error.message).toBe(`codex: ${CODEX_BAD_REQUEST_EVENT.message}`)
   })
 
-  it('gives the three refusals three distinct codes', async () => {
+  it('gives the three refusals the three codes their providers stated', async () => {
     const codes = await Promise.all(
       [CODEX_CAPACITY_EVENT, CODEX_RATE_LIMIT_EVENT, CODEX_BAD_REQUEST_EVENT].map(
         async (event) => (await relayedError(event)).type,
       ),
     )
-    expect(new Set(codes).size).toBe(3)
+    // Named rather than counted: a parser that let codex's `other` win would still
+    // produce three distinct values, and three distinct wrong values is the regression.
+    expect(codes).toEqual(['server_overloaded', 'response_too_many_failed_attempts', 'invalid_request_error'])
   })
 
   it('separates a spent allowance from an overloaded model and from expired credentials', async () => {
@@ -112,16 +112,25 @@ describe('codex relays the provider refusal, not one opaque class', () => {
     expect((await relayedError(CODEX_UNAUTHORIZED_EVENT)).type).toBe('unauthorized')
   })
 
-  it('carries the reset instant when the provider states one', async () => {
-    const error = await relayedError(CODEX_PROVIDER_RESET_EVENT)
-    expect(error.type).toBe('usage_limit_reached')
-    expect(error.reset_at).toBe(new Date(RESETS_AT_EPOCH_SECONDS * 1000).toISOString())
+  it('carries the status the provider stated, which is what ends a retry loop', async () => {
+    // 400 on the wrapper beside the body. agent-runtime prefers a structured status over
+    // the message text and reads a 4xx as "fails identically forever", so this is the
+    // field that stops a malformed request being retried to the attempt ceiling.
+    expect((await relayedError(CODEX_BAD_REQUEST_NESTED_EVENT)).status).toBe(400)
+    // 429 from the variant payload, which the classifier reads as worth another attempt.
+    expect((await relayedError(CODEX_RATE_LIMIT_EVENT)).status).toBe(429)
+  })
+
+  it('states no status when the provider stated none as a field', async () => {
+    // Codex names 502 in prose here. agent-runtime already reads a status out of message
+    // text; a second scraper in the bridge would only disagree with it.
+    expect((await relayedError(CODEX_GATEWAY_EVENT)).status).toBeUndefined()
+    expect((await relayedError(CODEX_CAPACITY_EVENT)).status).toBeUndefined()
   })
 
   it('keeps reporting upstream when the refusal names no code at all', async () => {
     const error = await relayedError(CODEX_UNCLASSIFIED_EVENT)
     expect(error.type).toBe('upstream')
-    expect(error.reset_at).toBeUndefined()
     expect(error.message).toBe(`codex: ${CODEX_UNCLASSIFIED_EVENT.message}`)
   })
 
@@ -143,6 +152,20 @@ describe('codexFailureReason reads both channels codex reports a refusal on', ()
     expect(codexFailureReason(CODEX_RATE_LIMIT_EVENT).type).toBe('response_too_many_failed_attempts')
   })
 
+  it('reads a data-carrying variant field through the variant key it is nested under', () => {
+    // The key and its fields are one nesting apart, and every reader of this channel has
+    // to go through it: a flat read of `codex_error_info.http_status_code` matches a shape
+    // serde never writes, so it would silently report no status on all 309 recordings.
+    expect(codexFailureReason(CODEX_RATE_LIMIT_EVENT).status).toBe(429)
+    expect(
+      codexFailureReason({
+        type: 'error',
+        message: 'boom',
+        codex_error_info: { response_too_many_failed_attempts: 'no fields' },
+      }).status,
+    ).toBeUndefined()
+  })
+
   it('prefers the provider code over codex declining to classify', () => {
     // Both bad-request recordings arrive as `other` with the real code in the body.
     expect(codexFailureReason(CODEX_BAD_REQUEST_EVENT).type).toBe('invalid_request_error')
@@ -150,13 +173,15 @@ describe('codexFailureReason reads both channels codex reports a refusal on', ()
   })
 
   it('prefers a real discriminant over the provider body it quoted', () => {
-    const reason = codexFailureReason({ ...CODEX_PROVIDER_RESET_EVENT, codex_error_info: 'usage_limit_exceeded' })
+    const reason = codexFailureReason({ ...CODEX_BAD_REQUEST_EVENT, codex_error_info: 'usage_limit_exceeded' })
     expect(reason.type).toBe('usage_limit_exceeded')
   })
 
   it('keeps other when the quoted body names no code either', () => {
     // A gateway fault: `other` is still what codex said, and it beats inventing nothing.
     expect(codexFailureReason(CODEX_GATEWAY_EVENT).type).toBe('other')
+    // The transport fault codex reports as prose only is the same shape.
+    expect(codexFailureReason(CODEX_STREAM_DISCONNECT_EVENT).type).toBe('other')
   })
 
   it('ignores a brace in the prose that is not the provider body', () => {
@@ -165,6 +190,36 @@ describe('codexFailureReason reads both channels codex reports a refusal on', ()
       message: 'sandbox denied exec error, exit code: 1, stderr: bad substitution near ${HOME',
     })
     expect(reason.type).toBe('upstream')
+  })
+
+  it('ignores a parseable object in the prose that is not an error body', () => {
+    // Codex quotes tool calls and assistant output into the same message text, and the
+    // first balanced object in a message is not therefore the provider's error body.
+    expect(
+      codexFailureReason({
+        type: 'error',
+        message: 'assistant said: {"type":"function_call","name":"shell"} then the turn failed',
+      }).type,
+    ).toBe('upstream')
+  })
+
+  it('refuses to relay a code the bridge itself assigns meaning to', () => {
+    // The relay channel is shared with the bridge's taxonomy: the route answers 504 for
+    // `timeout`, and agent-runtime never retries `parse_error`. Both words are reachable
+    // from text a provider controls, so neither may be relayed off this channel.
+    const timeout = codexFailureReason({
+      type: 'error',
+      message: 'stream error: {"error":{"type":"timeout","message":"gateway gave up"}}',
+    })
+    expect(timeout.type).toBe('upstream')
+    expect(timeout.message).toContain('gateway gave up')
+    expect(
+      codexFailureReason({
+        type: 'error',
+        message: 'tool output echoed: {"error":{"type":"parse_error","message":"nope"}}',
+        codex_error_info: 'other',
+      }).type,
+    ).toBe('other')
   })
 
   it('refuses to invent a reason for an event with no message', () => {

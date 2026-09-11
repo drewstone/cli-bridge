@@ -26,8 +26,6 @@ export interface RunFailureDescription {
   provider_dispatch?: 'not_started'
   /** Status the same failure would carry as an HTTP response. */
   status?: number
-  /** ISO instant at which refused capacity returns, when the provider stated one. */
-  reset_at?: string
   /** Capacity refusal: the bridge never started the model. */
   capacity?: true
   /** Executor semaphore counts behind a capacity refusal. */

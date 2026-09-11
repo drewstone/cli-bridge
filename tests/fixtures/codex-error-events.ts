@@ -1,20 +1,28 @@
 /**
  * Codex failure payloads, recorded from real runs on this machine.
  *
- * PROVENANCE. Every `message` / `codex_error_info` pair below is copied
- * verbatim from `~/.codex/sessions`: 514 rollout files scanned on 2026-09-10,
- * 1092 recorded refusals, 8 distinct shapes. The `type: 'error'` key is the
- * stdout event tag `codex exec --json` puts around the same pair, which is what
- * the backend reads; the rollout stores it as a turn record's `error` object.
- * Counts and source files are on each fixture.
+ * PROVENANCE. Every `message` / `codex_error_info` pair below is copied verbatim
+ * from `~/.codex/sessions`. Counting rule, so the denominator is reproducible:
+ * one refusal is one JSON object inside a rollout line that carries both a
+ * `message` string and a `codex_error_info` field — the shape codex stores as a
+ * turn record's `error`, and the same pair `codex exec --json` prints on stdout
+ * under a `type: "error"` event tag, which is what the backend reads. On
+ * 2026-09-10 that rule gives 517 rollout files and 983 refusals in five
+ * discriminants: `server_overloaded` 410, `response_too_many_failed_attempts`
+ * 309, `other` 164, `usage_limit_exceeded` 92, `unauthorized` 8.
  *
- * The two serialized forms of `CodexErrorInfo` both occur, and the difference
- * matters: serde writes a unit variant as a bare string and a variant carrying
- * data as a single-key object. Only the constructed reset fixture at the bottom
- * is not a recording, and it says so.
+ * Two measured facts shape the parser, and each is pinned by a fixture here:
+ * serde writes a unit variant as a bare string and a variant carrying data as a
+ * single-key object whose fields sit under that key; and `other` is codex
+ * declining to classify, not an absence of information — all 20 recorded
+ * `invalid_request_error` refusals arrive under it.
+ *
+ * Every refusal in the 983 sets `codex_error_info`; none is missing it. The
+ * constructed fixture at the bottom is the only payload here that is not a
+ * recording, and it says so.
  */
 
-/** Capacity refusal, 436 of the 1092 — the most common one recorded. */
+/** Capacity refusal, 410 of the 983 — the most common one recorded. */
 export const CODEX_CAPACITY_EVENT = {
   type: 'error',
   message: 'Selected model is at capacity. Please try a different model.',
@@ -22,33 +30,34 @@ export const CODEX_CAPACITY_EVENT = {
 }
 
 /**
- * Rate-limit refusal, 320 of the 1092, and the reason the discriminant cannot
- * be read as `codex_error_info.type`: this variant carries data, so serde names
- * it with the key itself. Source: 2026/09/03/rollout-2026-09-03T16-14-31
- * -01a0698d-6d22-74a1-b8e7-649ee39f249d.jsonl.
+ * Rate-limit refusal, 309 of the 983, and the reason the discriminant cannot be
+ * read as `codex_error_info.type`: this variant carries data, so serde names it
+ * with the key itself and puts its fields one level under that key. Every one of
+ * the 309 carries `http_status_code: 429` there. Source:
+ * 2026/09/04/rollout-2026-09-04T20-13-41-01a06f8e-bfd5-7501-9332-5d22daf4e394.jsonl.
  */
 export const CODEX_RATE_LIMIT_EVENT = {
   type: 'error',
-  message: 'exceeded retry limit, last status: 429 Too Many Requests, request id: b76609ea-7d20-406e-a7ea-51abe3d97652',
+  message: 'exceeded retry limit, last status: 429 Too Many Requests, request id: 417f664c-7c66-4c58-b36c-992667687a41',
   codex_error_info: { response_too_many_failed_attempts: { http_status_code: 429 } },
 }
 
 /**
- * The account's allowance is spent, 127 of the 1092. Codex states the reset in
- * prose here, not as a field — no recorded refusal carries a machine-readable
- * reset instant. Source: 2026/07/01/rollout-2026-07-01T19-52-50
- * -019f2019-8145-7890-ac60-3edbc2525fa0.jsonl.
+ * The account's allowance is spent, 92 of the 983. Codex states the reset in
+ * prose here, not as a field: no refusal among the 983 carries a
+ * machine-readable reset instant anywhere in its payload. Source:
+ * 2026/07/29/rollout-2026-07-29T13-46-54-019fafa1-5918-77a0-871a-c70c8856f643.jsonl.
  */
 export const CODEX_USAGE_LIMIT_EVENT = {
   type: 'error',
   message:
     "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits"
-    + ' or try again at Aug 4th, 2026 11:46 PM.',
+    + ' or try again at Aug 8th, 2026 2:35 PM.',
   codex_error_info: 'usage_limit_exceeded',
 }
 
 /**
- * Malformed request, 18 of the 1092: the whole message IS the provider's body,
+ * Malformed request, 18 of the 983: the whole message IS the provider's body,
  * and codex classified it `other`. Source: 2026/09/04/rollout-2026-09-04T18-21-24
  * -01a06f27-f489-7be2-92ec-ee5fbd381355.jsonl.
  */
@@ -66,9 +75,10 @@ export const CODEX_BAD_REQUEST_EVENT = {
 }
 
 /**
- * The same class through a body that wraps itself in its own `type`, 2 of the
- * 1092. Source: 2026/09/10/rollout-2026-09-10T01-23-31
- * -01a08a6a-3465-7cf1-b333-19062ee7d12b.jsonl.
+ * The same class through a body that wraps itself, 2 of the 983, and the only
+ * recorded refusals that state a status as a field. The status sits on the
+ * WRAPPER beside `error`, not inside it. Source: 2026/09/10/rollout-2026-09-10
+ * T01-23-31-01a08a6a-3465-7cf1-b333-19062ee7d12b.jsonl.
  */
 export const CODEX_BAD_REQUEST_NESTED_EVENT = {
   type: 'error',
@@ -85,7 +95,7 @@ export const CODEX_BAD_REQUEST_NESTED_EVENT = {
   codex_error_info: 'other',
 }
 
-/** Expired credentials, 9 of the 1092. */
+/** Expired credentials, 8 of the 983. */
 export const CODEX_UNAUTHORIZED_EVENT = {
   type: 'error',
   message:
@@ -95,8 +105,10 @@ export const CODEX_UNAUTHORIZED_EVENT = {
 }
 
 /**
- * A gateway fault, 175 of the 1092: codex says `other` and the quoted body
- * names no code either, so there is nothing to relay but the words.
+ * A gateway fault, 139 of the 983: codex says `other`, and the object quoted in
+ * the message is a `detail` envelope that names no error class, so there is
+ * nothing to relay but codex's own word for it. Source:
+ * 2026/07/29/rollout-2026-07-29T13-46-54-019fafa1-5918-77a0-871a-c70c8856f643.jsonl.
  */
 export const CODEX_GATEWAY_EVENT = {
   type: 'error',
@@ -106,28 +118,27 @@ export const CODEX_GATEWAY_EVENT = {
   codex_error_info: 'other',
 }
 
-/** A transport fault codex reports as prose only, 5 of the 1092. */
-export const CODEX_UNCLASSIFIED_EVENT = {
+/**
+ * A transport fault codex reports as prose only, 5 of the 983. It still sets the
+ * discriminant — `other`, like every unclassified refusal in the recordings.
+ * Source: 2026/07/29/rollout-2026-07-29T13-46-54-019fafa1-5918-77a0-871a
+ * -c70c8856f643.jsonl.
+ */
+export const CODEX_STREAM_DISCONNECT_EVENT = {
   type: 'error',
   message: 'stream disconnected before completion: error sending request for url (http://127.0.0.1:17322/v1/responses)',
+  codex_error_info: 'other',
 }
 
-/** Epoch seconds, the unit codex uses for a reset wherever it reports one. */
-export const RESETS_AT_EPOCH_SECONDS = 1789230014
-
 /**
- * CONSTRUCTED, not recorded — the one fixture here that is.
+ * CONSTRUCTED, not recorded — the one payload here that is.
  *
- * No refusal among the 1092 carries a machine-readable reset instant, so the
- * `resets_at` path has no recording to copy. The shape is codex's own
- * `UsageErrorBody{type, plan_type, resets_at}` inside `UsageErrorResponse`,
- * which codex-cli 0.153.4 parses out of a provider 429, and the epoch value is
- * real: read from a `rate_limits.primary.resets_at` field in
- * 2026/09/03/rollout-2026-09-03T16-14-31-01a0698d-6d22-74a1-b8e7-649ee39f249d.jsonl.
+ * No refusal among the 983 omits `codex_error_info`, so the fallback for a
+ * failure that names no code at all has no recording to copy. It guards a codex
+ * older or newer than the 0.153.4 these rollouts came from, and the bridge must
+ * not invent a code for one.
  */
-export const CODEX_PROVIDER_RESET_EVENT = {
+export const CODEX_UNCLASSIFIED_EVENT = {
   type: 'error',
-  message:
-    'stream error: unexpected status 429, url: https://chatgpt.com/backend-api/codex/responses: '
-    + `{"error":{"type":"usage_limit_reached","plan_type":"pro","resets_at":${RESETS_AT_EPOCH_SECONDS}}}`,
+  message: 'codex exec failed before it reported a class',
 }
