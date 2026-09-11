@@ -96,7 +96,13 @@ export class CodexBackend implements Backend {
     // is the builtin default) and only the remainder is the `model` id —
     // passing the qualified form verbatim was rejected by the API as a
     // nonexistent model, killing every profile-declared codex lead.
-    const { provider: providerArg, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+    const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+    // #161: the harness name is never a codex provider. A caller composes one harness prefix
+    // and spends a provider equal to the harness there, so a second `codex/` segment restates
+    // the harness rather than naming a `[model_providers.*]` key — passing it on made codex
+    // resolve a provider that no config.toml defines. Dropped here, where the argv is built,
+    // so the rule holds for an unprofiled request too; a profile comparison never sees one.
+    const providerArg = splitProvider === this.name ? null : splitProvider
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
     // else `codex exec <prompt>`. --json emits JSONL events.

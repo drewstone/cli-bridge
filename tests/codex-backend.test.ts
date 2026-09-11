@@ -310,6 +310,28 @@ describe('CodexBackend model translation', () => {
     expect(observed.args!.some((arg) => arg.startsWith('model_provider='))).toBe(false)
   })
 
+  // The invariant #161 stood for, on the route a profile comparison cannot reach: a request
+  // that restates the harness as its provider segment, with no agent_profile at all. Before
+  // this was enforced at the argv, `codex/codex/<model>` spawned codex with
+  // `model_provider="codex"`, which resolves no `[model_providers.*]` key in any config.toml.
+  it('never passes its own harness name to the CLI as a model provider', async () => {
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+
+    await collect(backend.chat(
+      { ...request(), model: 'codex/codex/gpt-5-codex' },
+      null,
+      new AbortController().signal,
+    ))
+
+    expect(observed.args).toContain('model="gpt-5-codex"')
+    expect(observed.args!.some((arg) => arg.startsWith('model_provider='))).toBe(false)
+  })
+
   it('still rejects a provider segment the request model does not select', async () => {
     const backend = new CodexBackend({
       bin: 'codex',

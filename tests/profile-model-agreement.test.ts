@@ -14,6 +14,12 @@
  * `harness/provider/model` in `profileBridgeWireModel` (src/runtime/supervise/
  * model-policy.ts), and the Kimi CLI resolves `--model` against literal
  * `config.toml` keys such as `[models."kimi-code/kimi-for-coding"]`.
+ *
+ * The comparison itself is `modelIdsMatch` from
+ * `@tangle-network/agent-profile-materialize`, which owns model-id equality for
+ * every writer and reader of an `AgentProfile`. These cases therefore pin what
+ * the bridge adds on top of it — the harness prefix, which that package does not
+ * own — and not the qualification rule itself, which has its own tests upstream.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -38,6 +44,9 @@ describe('assertExactProfileRequest — the wire id each harness actually receiv
   it('accepts the claude-code id Runtime composes, under either harness prefix', () => {
     const declared = { default: 'claude-sonnet-4-5', provider: 'anthropic' }
     expect(() => check('claude-code/anthropic/claude-sonnet-4-5', 'claude-code', declared)).not.toThrow()
+    // The `claude` prefix is not a spelling variant to be tolerated: a ClaudeBackend
+    // registered under its default name claims `claude/` while still stating the
+    // `claude-code` harness here, which is the route tests/docker-executor.test.ts drives.
     expect(() => check('claude/anthropic/claude-sonnet-4-5', 'claude-code', declared)).not.toThrow()
   })
 
@@ -112,6 +121,11 @@ describe('assertExactProfileRequest — the wire id each harness actually receiv
 describe('assertExactProfileRequest — a profile that names only its provider', () => {
   it('accepts a provider that is its own harness, present or absent on the wire', () => {
     expect(() => check('kimi-code/kimi-for-coding', 'kimi-code', { provider: 'kimi-code' })).not.toThrow()
+    // A caller that states the provider twice still names the same provider, so this is not a
+    // disagreement between the request and the profile. Keeping the harness name out of the
+    // CLI's own provider argument (#161) is enforced where the argv is built — see
+    // tests/codex-backend.test.ts — because that is the only place it also holds for a
+    // request that carries no profile at all.
     expect(() =>
       check('kimi-code/kimi-code/kimi-for-coding', 'kimi-code', { provider: 'kimi-code' }),
     ).not.toThrow()
@@ -121,6 +135,16 @@ describe('assertExactProfileRequest — a profile that names only its provider',
     expect(() =>
       check('claude-code/anthropic/claude-sonnet-4-5', 'claude-code', { provider: 'anthropic' }),
     ).not.toThrow()
+  })
+
+  it('refuses a request that selects no model at all, where the provider cannot be confirmed', () => {
+    // agent-runtime composes the bare harness id for a profile with no model: there is
+    // nothing to qualify, so the declared provider never reaches the wire. Accepting would
+    // let the CLI pick its own provider while the profile named one.
+    expect(() => check('codex', 'codex', { provider: 'openai' })).toThrow(
+      'request model "codex" selects provider null within harness "codex", '
+      + 'not agent_profile.model.provider "openai"',
+    )
   })
 
   it('refuses a request that selects a different provider', () => {
