@@ -29,7 +29,7 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -221,7 +221,7 @@ export class CodexBackend implements Backend {
       if (!child.stdout) {
         throw new BackendError('codex subprocess has no stdout pipe', 'upstream')
       }
-      let sawError: string | null = null
+      let sawError: BackendFailureReason | null = null
 
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
@@ -239,7 +239,7 @@ export class CodexBackend implements Backend {
         }
 
         if (type === 'error') {
-          sawError = String(ev.message ?? 'codex error')
+          sawError = codexFailureReason(ev)
           continue
         }
 
@@ -274,7 +274,12 @@ export class CodexBackend implements Backend {
         return
       }
       if (sawError) {
-        throw new BackendError(`codex: ${sawError}`, 'upstream')
+        // Ended through the delta envelope, not a throw: `BackendError.code` is the
+        // bridge's own closed taxonomy and cannot carry a provider discriminant, while
+        // the terminal error delta reaches the caller with it. The route answers both
+        // shapes 502 (`BackendReportedFailureError`), so only the code is new.
+        yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId }
+        return
       }
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(await describeCliExit(spawned, 'codex', exitCode, stderr.render()), 'upstream')
@@ -339,6 +344,134 @@ export function splitCodexModel(
 function resolveCodexAuthPath(): string | undefined {
   const home = process.env.CODEX_HOME ?? (process.env.HOME ? join(process.env.HOME, '.codex') : undefined)
   return home ? join(home, 'auth.json') : undefined
+}
+
+/**
+ * Read one codex failure event as a reason a caller can branch on.
+ *
+ * Codex states the same refusal in two places and the bridge sees both. It sets
+ * its own `CodexErrorInfo` discriminant — `server_overloaded`,
+ * `usage_limit_exceeded`, `unauthorized`, `response_too_many_failed_attempts`,
+ * `other` in the 1092 refusals recorded on this machine — and where the refusal
+ * came over the wire it quotes the provider's JSON body inside the message text,
+ * which is where `invalid_request_error` and its `code` live.
+ *
+ * Both were flattened into one opaque `upstream` string, which made a capacity
+ * refusal that clears on its own indistinguishable from a request that will
+ * fail identically forever — the difference between waiting and giving up, and
+ * agent-runtime's retry policy reads exactly this code as `upstreamCode`.
+ *
+ * Permissive on shape for the same reason `extractText` is: codex's field
+ * naming has drifted across versions, and a reason with no code is still a
+ * reason. An unrecognized payload keeps `upstream` and the CLI's own words.
+ */
+export function codexFailureReason(ev: Record<string, unknown>): BackendFailureReason {
+  const message = firstString(ev.message) ?? 'codex error'
+  const info = asRecord(ev.codex_error_info)
+  const codexCode = codexErrorDiscriminant(ev.codex_error_info)
+  const provider = providerErrorBody(message)
+  const providerCode = firstString(provider?.type, provider?.code)
+  // `other` is codex declining to classify, so it must not outrank a code the
+  // provider did state: 20 of the 1092 recorded refusals are a malformed request
+  // whose body names `invalid_request_error` under an `other` discriminant. It
+  // still beats nothing when the body names no code either.
+  const type = (codexCode === CODEX_UNCLASSIFIED ? providerCode ?? codexCode : codexCode ?? providerCode)
+    ?? 'upstream'
+  const resetAt = isoInstant(info?.resets_at ?? provider?.resets_at)
+  return { message, type, ...(resetAt === undefined ? {} : { resetAt }) }
+}
+
+/** Codex's own discriminant for a failure it did not classify. */
+const CODEX_UNCLASSIFIED = 'other'
+
+/**
+ * The `CodexErrorInfo` variant codex named, from either form it serializes.
+ *
+ * A unit variant is a bare string (`server_overloaded`, `usage_limit_exceeded`,
+ * `unauthorized`, `other`); a variant that carries data is a single-key object,
+ * and the 429 codex reports after exhausting its retries is
+ * `{"response_too_many_failed_attempts":{"http_status_code":429}}` — no `type`
+ * and no `code` field, so reading only those lost the most common classified
+ * refusal in the recordings (320 of 1092).
+ */
+function codexErrorDiscriminant(value: unknown): string | undefined {
+  const bare = firstString(value)
+  if (bare !== undefined) return bare
+  const info = asRecord(value)
+  if (!info) return undefined
+  const named = firstString(info.type, info.code)
+  if (named !== undefined) return named
+  const keys = Object.keys(info)
+  return keys.length === 1 ? keys[0] : undefined
+}
+
+/**
+ * The provider's own error body, quoted inside a codex message.
+ *
+ * Codex wraps it in its own prose (`unexpected status 400, url: …, cf-ray: …:
+ * <body>`), and the prose continues after it on some paths, so the body is read
+ * as a balanced object rather than as the tail of the string. Each `{` is tried
+ * in turn because the prose before it may itself contain a brace; the attempt
+ * count is bounded so a message full of braces cannot become quadratic.
+ */
+function providerErrorBody(message: string): Record<string, unknown> | null {
+  let attempts = 0
+  for (let at = message.indexOf('{'); at !== -1 && attempts < 8; at = message.indexOf('{', at + 1)) {
+    attempts += 1
+    const candidate = balancedObjectAt(message, at)
+    if (candidate === null) continue
+    let parsed: unknown
+    try { parsed = JSON.parse(candidate) } catch { continue }
+    const body = asRecord(parsed)
+    if (!body) continue
+    // `{"error":{…}}` is the wrapper the provider sends; a bare body is also accepted.
+    return asRecord(body.error) ?? body
+  }
+  return null
+}
+
+/** The `{…}` span starting at `from`, or null when it never closes. String-aware. */
+function balancedObjectAt(text: string, from: number): string | null {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = from; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '{') depth += 1
+    else if (ch === '}') {
+      depth -= 1
+      if (depth === 0) return text.slice(from, i + 1)
+    }
+  }
+  return null
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value.length > 0) return value
+  }
+  return undefined
+}
+
+/** Codex and its providers report a reset as epoch seconds; callers want an instant. */
+function isoInstant(value: unknown): string | undefined {
+  if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return new Date(value).toISOString()
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  const at = new Date(value * 1000)
+  return Number.isNaN(at.getTime()) ? undefined : at.toISOString()
 }
 
 /**

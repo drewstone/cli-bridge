@@ -373,6 +373,21 @@ export interface ChatRequest {
 }
 
 /**
+ * One failure a CLI reported, with whatever the provider said about it.
+ *
+ * `type` is the provider's or the CLI's own discriminant and reaches the caller
+ * on the error envelope's `type` channel, which agent-runtime decodes as
+ * `upstreamCode`. `upstream` means the failure named no code — it is the
+ * bridge's "I cannot classify this", not a classification.
+ */
+export interface BackendFailureReason {
+  message: string
+  type: string
+  /** ISO instant at which refused capacity returns, when the provider stated one. */
+  resetAt?: string
+}
+
+/**
  * The terminal `finish_reason` for a CLI stream that ended on its own, plus the
  * reason when the CLI reported one.
  *
@@ -383,17 +398,30 @@ export interface ChatRequest {
  * the caller got HTTP 200 with an empty completion. One implementation, so the
  * next backend inherits the reason instead of the bug.
  *
+ * A bare string is a reason with no code, which is how a backend that has not
+ * yet parsed its CLI's structured payload reports one. A `BackendFailureReason`
+ * carries the code and any reset instant through to the caller.
+ *
  * `Run.pump` still guarantees a non-empty reason on any terminal error delta;
  * this is what makes that reason the CLI's own words rather than the bridge's
  * admission that it cannot attribute the failure.
  */
 export function terminalOutcome(
   label: string,
-  sawError: string | null,
+  sawError: string | BackendFailureReason | null,
   emittedToolCall: boolean,
 ): Pick<ChatDelta, 'finish_reason' | 'error'> {
   if (sawError !== null) {
-    return { finish_reason: 'error', error: { message: `${label}: ${sawError}`, type: 'upstream' } }
+    const reason: BackendFailureReason =
+      typeof sawError === 'string' ? { message: sawError, type: 'upstream' } : sawError
+    return {
+      finish_reason: 'error',
+      error: {
+        message: `${label}: ${reason.message}`,
+        type: reason.type,
+        ...(reason.resetAt === undefined ? {} : { reset_at: reason.resetAt }),
+      },
+    }
   }
   return { finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }
 }
@@ -444,6 +472,12 @@ export interface ChatDelta {
      * the non-streaming response say the same thing.
      */
     status?: number
+    /**
+     * When the refused capacity returns, as an ISO instant, exactly as the
+     * provider stated it. Only a provider knows this; the bridge never guesses
+     * one, so its absence means the provider named no reset.
+     */
+    reset_at?: string
     /** Capacity refusal: the bridge never started the model. */
     capacity?: true
     /** Which executor semaphore refused, with the counts behind the refusal. */
