@@ -882,8 +882,16 @@ export function profileExecutionIdentity(
  * second behavioral channel changes it. Limits and execution mode may still
  * constrain the run; model, prompt, MCP, and reasoning must agree with the
  * profile before any harness process starts.
+ *
+ * Model agreement is decided between two harness-RELATIVE ids. The request's id
+ * was already stripped of its harness prefix; the profile's id is composed into
+ * the wire form its author would have sent and stripped the same way. Comparing
+ * a stripped request against an unstripped profile id refused an exactly
+ * matching pair and printed two identical-looking strings as the conflict
+ * (issue #212: `request model "kimi-code/kimi-for-coding" conflicts with
+ * agent_profile.model "kimi-code/kimi-for-coding"`).
  */
-function assertExactProfileRequest(
+export function assertExactProfileRequest(
   req: ChatRequest,
   profile: AgentProfile,
   harness: HarnessId,
@@ -899,30 +907,51 @@ function assertExactProfileRequest(
   const requestedModel = profile.model?.default
   const requestedProvider = profile.model?.provider
   if (requestedModel !== undefined) {
-    const modelWithoutHarness = requestedModel.startsWith(`${harness}/`)
-      ? requestedModel.slice(harness.length + 1)
-      : requestedModel
-    const qualified = requestedProvider
-      && !modelWithoutHarness.startsWith(`${requestedProvider}/`)
-      ? `${requestedProvider}/${modelWithoutHarness}`
-      : modelWithoutHarness
-    if (wireModel !== qualified) {
+    const profileModel = modelWithinHarness(profileWireModel(requestedModel, requestedProvider, harness), harness)
+    if (wireModel !== profileModel) {
       throw new BackendError(
-        `request model ${JSON.stringify(req.model)} conflicts with agent_profile.model ${JSON.stringify(qualified)}`,
+        `request model ${JSON.stringify(req.model)} selects ${JSON.stringify(wireModel)} within harness `
+        + `${JSON.stringify(harness)}, which conflicts with agent_profile.model ${JSON.stringify(profileModel)}`,
         'parse_error',
       )
     }
   } else if (requestedProvider !== undefined) {
     const slash = wireModel.indexOf('/')
     const wireProvider = slash > 0 ? wireModel.slice(0, slash) : null
-    if (wireProvider !== requestedProvider) {
+    // A provider equal to the harness is spent as the wire id's single harness prefix, so the
+    // remainder carries no provider segment of its own — the same composition rule as above.
+    const selected = wireProvider === requestedProvider
+      || (requestedProvider === harness && wireProvider === null)
+    if (!selected) {
       throw new BackendError(
-        `request model ${JSON.stringify(req.model)} does not select agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
+        `request model ${JSON.stringify(req.model)} selects provider ${JSON.stringify(wireProvider)} within harness `
+        + `${JSON.stringify(harness)}, not agent_profile.model.provider ${JSON.stringify(requestedProvider)}`,
         'parse_error',
       )
     }
   }
 
+}
+
+/**
+ * The `harness/provider/model` id a profile declares, composed exactly as the
+ * caller composes it (agent-runtime `profileBridgeWireModel`): one harness
+ * prefix, and a provider segment only where the model does not already carry it.
+ * A provider that IS the harness therefore collapses into the harness prefix
+ * instead of appearing twice.
+ */
+function profileWireModel(
+  model: string,
+  provider: string | undefined,
+  harness: HarnessId,
+): string {
+  const modelWithoutHarness = model.startsWith(`${harness}/`)
+    ? model.slice(harness.length + 1)
+    : model
+  const qualified = provider && !modelWithoutHarness.startsWith(`${provider}/`)
+    ? `${provider}/${modelWithoutHarness}`
+    : modelWithoutHarness
+  return qualified.startsWith(`${harness}/`) ? qualified : `${harness}/${qualified}`
 }
 
 function modelWithinHarness(model: string, harness: HarnessId): string {

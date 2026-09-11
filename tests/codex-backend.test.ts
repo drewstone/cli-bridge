@@ -278,7 +278,39 @@ describe('CodexBackend model translation', () => {
     expect(observed.args!.some((arg) => arg.startsWith('model='))).toBe(false)
   })
 
-  it('rejects a harness name presented as the model provider', async () => {
+  // #161 refused a profile whose provider IS its harness, to keep a harness name out of
+  // codex's `model_provider`. #212 measured what that cost: agent-runtime requires an
+  // explicit `model.provider`, and for kimi-code the only provider the CLI has a
+  // config.toml key for is the harness, so no profile satisfied all three sides. The
+  // invariant the refusal stood for is enforced where it actually applies — at the CLI
+  // arguments — because the composed wire id carries one harness prefix and a provider
+  // equal to it is spent there, leaving no provider segment for `model_provider`.
+  it('accepts a harness name as the model provider without passing it to the CLI', async () => {
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+
+    await collect(backend.chat(
+      {
+        ...request(),
+        model: 'codex/gpt-5-codex',
+        agent_profile: {
+          harness: 'codex',
+          model: { provider: 'codex', default: 'gpt-5-codex' },
+        },
+      },
+      null,
+      new AbortController().signal,
+    ))
+
+    expect(observed.args).toContain('model="gpt-5-codex"')
+    expect(observed.args!.some((arg) => arg.startsWith('model_provider='))).toBe(false)
+  })
+
+  it('still rejects a provider segment the request model does not select', async () => {
     const backend = new CodexBackend({
       bin: 'codex',
       timeoutMs: 5_000,
@@ -288,10 +320,10 @@ describe('CodexBackend model translation', () => {
     await expect(collect(backend.chat(
       {
         ...request(),
-        model: 'codex/default',
+        model: 'codex/openai/gpt-5-codex',
         agent_profile: {
           harness: 'codex',
-          model: { provider: 'codex', default: 'default' },
+          model: { provider: 'codex', default: 'gpt-5-codex' },
         },
       },
       null,

@@ -148,7 +148,10 @@ Behavior:
 - `sandbox` backends honor the full `agent_profile` natively
 - local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`, `prime`) persist the full profile and reject profile dimensions they cannot execute
 - `codex/default` selects the Codex CLI configured default without a model override.
-  Its exact profile omits `model.provider`; a harness name is not a model provider.
+  Its exact profile may omit `model.provider` or name the harness as the provider.
+  A harness name is still never passed to a CLI as its model provider: the caller composes
+  `harness/provider/model` with one harness prefix, so a provider equal to the harness is
+  already spent as that prefix and no `<harness>/<harness>/<model>` route exists.
 - Codex reasoning maps the shared values directly and maps `ultracode` to native `ultra`.
   Codex CLI 0.147.0 supplied the accepted values through direct probes.
 - A jailed OpenCode run seeds only `auth.json` into its writable private data directory.
