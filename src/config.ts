@@ -7,6 +7,7 @@
  * keys is the failure mode we refuse to allow.
  */
 
+import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailPathList } from './jail/resolve-spec.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { assertDockerNetworkName } from './executors/docker-network.js'
@@ -122,6 +123,10 @@ export interface Config {
    * `execution.jail.root` overrides this.
    */
   jailRoot: string | null
+  /** Operator extra read-only binds for fs-jailed workers (`BRIDGE_JAIL_RO_PATHS`), validated at boot. */
+  jailReadablePaths: string[]
+  /** Operator extra writable binds for jailed workers (`BRIDGE_JAIL_RW_PATHS`), validated at boot. */
+  jailWritablePaths: string[]
   /**
    * Default net-jail mode, from `BRIDGE_NET_JAIL_MODE` (off|net-jail, default
    * off; `WORKER_NET_JAIL=1` is a shorthand for net-jail). Sibling of
@@ -317,6 +322,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     executors,
     jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
+    ...resolveJailPathLists(env),
     netJailMode,
     // Parsed (not merely split) so an unusable token is rejected at startup
     // rather than at provisioning time, when it would read as a Docker failure.
@@ -858,4 +864,19 @@ function parseOauthMode(key: string, value: string | undefined, fallback: 'share
   if (value === 'share' || value === 'per-slot') return value
   if (value === undefined || value === '') return fallback
   throw new Error(`invalid ${key}: ${value} — expected share|per-slot`)
+}
+
+/**
+ * BRIDGE_JAIL_RO_PATHS / BRIDGE_JAIL_RW_PATHS — parsed at boot so a malformed or unsafe path
+ * refuses the bridge instead of one worker request. RO binds are inert unless the jail floor is
+ * fs-jail; that case is a boot warning, not a refusal, because an env file may carry the list
+ * for a bridge that toggles its floor per deploy.
+ */
+function resolveJailPathLists(env: NodeJS.ProcessEnv): Pick<Config, 'jailReadablePaths' | 'jailWritablePaths'> {
+  const jailReadablePaths = parseJailPathList(env[JAIL_RO_PATHS_ENV], JAIL_RO_PATHS_ENV)
+  const jailWritablePaths = parseJailPathList(env[JAIL_RW_PATHS_ENV], JAIL_RW_PATHS_ENV)
+  if (jailReadablePaths.length > 0 && jailFloor(env) !== 'fs-jail') {
+    console.warn(`${JAIL_RO_PATHS_ENV} is set but the jail floor is ${jailFloor(env)} — read-only extras apply only under fs-jail`)
+  }
+  return { jailReadablePaths, jailWritablePaths }
 }
