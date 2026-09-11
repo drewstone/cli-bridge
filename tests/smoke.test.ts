@@ -1392,6 +1392,7 @@ describe('GET /v1/models', () => {
     expect(ids.has('pi/openai-codex/gpt-5.6-luna')).toBe(true)
     expect(ids.has('pi/openai-codex/gpt-5.6-sol')).toBe(true)
     expect(ids.has('pi/openai-codex/gpt-5.6-terra')).toBe(true)
+    expect(ids.has('pi/deepseek/deepseek-v4.1-flash')).toBe(true)
     expect(ids.has('pi/openai-codex/gpt-5.3-codex')).toBe(false)
   })
 

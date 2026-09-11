@@ -45,6 +45,7 @@ const OPENCODE_MODELS: ReadonlyArray<ModelSpec> = [
 const PI_MODELS: ReadonlyArray<ModelSpec> = [
   { id: 'deepseek/deepseek-v4-pro', note: 'DeepSeek V4 Pro via pi' },
   { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek V4 Flash via pi' },
+  { id: 'deepseek/deepseek-v4.1-flash', note: 'DeepSeek V4.1 Flash via pi → tangle-router' },
   { id: 'moonshot/kimi-k2.5', note: 'Moonshot Kimi K2.5 via pi' },
   { id: 'moonshot/kimi-k2.6', note: 'Moonshot Kimi K2.6 via pi' },
   { id: 'moonshot/kimi-k2-thinking', note: 'Moonshot Kimi K2 Thinking via pi' },
