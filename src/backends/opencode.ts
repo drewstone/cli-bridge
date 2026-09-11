@@ -280,9 +280,23 @@ export class OpencodeBackend implements Backend {
           // with 'bridgeExecutor: bridge stream error: opencode: opencode error' as their
           // ONLY recorded cause, and the retry ladder burned ~48 minutes per round against a
           // failure nobody could read. An error the operator cannot see is one nobody fixes.
+          // `data.message` FIRST, because that is where opencode actually puts it. Every error
+          // in its SDK is a NamedError, `{ name, data: { message, ... } }`, and there is no
+          // top-level `error.message` on any of them. opencode's own reader agrees:
+          //   function b(j){ if(j.data?.message) return j.data.message
+          //                  if(j.message) return j.message
+          //                  if(j.name) return j.name
+          //                  return "unknown error" }
+          // Reading only `error.message` therefore missed EVERY error, and the raw-event
+          // fallback below fired on all of them — 16 of them in this host's bridge logs, each
+          // one a readable provider message rendered as an unreadable JSON dump truncated at
+          // 400 chars, which is where `data` was being cut off.
+          const errorObject = ev.error as { message?: unknown; name?: unknown; data?: { message?: unknown } } | undefined
           sawError = String(
             ev.message ??
-              (ev.error as Record<string, unknown> | undefined)?.message ??
+              errorObject?.data?.message ??
+              errorObject?.message ??
+              errorObject?.name ??
               `opencode error event without a message: ${JSON.stringify(ev).slice(0, 400)}`,
           )
           continue
