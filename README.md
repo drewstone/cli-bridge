@@ -665,6 +665,11 @@ The semaphore is the box-protection layer: each `claude --print` is 500 MB to 2 
 | `BRIDGE_POOL_ACQUIRE_DEADLINE_MS` | `60000` | Default wait for a Docker pool slot. |
 | `BRIDGE_POOL_MAX_ACQUIRE_DEADLINE_MS` | `900000` | Its ceiling on a request value. |
 
+`BRIDGE_HEALTH_READY_CACHE_TTL_MS` optionally caches successful backend readiness probes for the
+specified number of milliseconds. It defaults to `0`, so readiness is rechecked on every request.
+Use a short interval only when repeated cold-start probes exceed the caller's admission deadline;
+failures are never cached.
+
 **A slot is held per live SESSION on a retained backend, not per turn.**
 For `pi`, the RPC child holds its slot from spawn to session termination, including the idle time between turns.
 Size `BRIDGE_HOST_MAX_CONCURRENCY` against peak concurrent live sessions — leads plus workers — not against peak concurrent turns.
