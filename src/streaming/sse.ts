@@ -28,6 +28,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   const hasReasoning = delta.reasoning !== undefined
   const hasIdentity = delta.model !== undefined || delta.system_fingerprint !== undefined
   const hasToolCalls = !!delta.tool_calls && delta.tool_calls.length > 0
+  const hasToolResults = !!delta.tool_results && delta.tool_results.length > 0
   const hasFinish = delta.finish_reason !== undefined
   const hasUsage = !!delta.usage
   const hasSessionId = !!delta.internal_session_id
@@ -37,14 +38,14 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   // comments via `deltaToSseComment` instead. `internal_session_id`-only
   // deltas are also non-OpenAI metadata (consumed by the session store)
   // and are intentionally skipped here.
-  if (!hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (!hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
   // internal_session_id-only deltas: the session id is bookkeeping for
   // the bridge's own store, not OpenAI surface area. Skip to avoid
   // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
   // some agent harnesses) reject as malformed.
-  if (hasSessionId && !hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (hasSessionId && !hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization) {
     return null
   }
 
@@ -61,11 +62,13 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
       function: { name: tc.name, arguments: tc.arguments },
     }))
   }
+  // Bridge extension beside `tool_calls`: the finished call's outcome, keyed by the same id.
+  if (hasToolResults) choiceDelta.tool_results = delta.tool_results
 
   // Usage/profile metadata without content/reasoning/tool_calls/finish carries
   // `choices: []`, not an empty choice, so strict OpenAI clients do not parse
   // it as output.
-  const metadataOnly = (hasIdentity || hasUsage || hasProfileMaterialization) && !hasContent && !hasReasoning && !hasToolCalls && !hasFinish
+  const metadataOnly = (hasIdentity || hasUsage || hasProfileMaterialization) && !hasContent && !hasReasoning && !hasToolCalls && !hasToolResults && !hasFinish
   const usage = delta.usage
   const trustedCostProvenance = usage?.cost_provenance === 'provider-receipt'
     || usage?.cost_provenance === 'billing-receipt'
