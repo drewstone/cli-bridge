@@ -473,6 +473,23 @@ export interface ChatDelta {
   system_fingerprint?: string
   /** Tool calls the assistant emitted this delta. Each is appended. */
   tool_calls?: Array<{ id: string; name: string; arguments: string }>
+  /**
+   * Outcomes of tool calls the harness ran itself, one entry per finished call, keyed by the same
+   * `id` as the `tool_calls` entry that announced it. SSE carries them as
+   * `choices[0].delta.tool_results`, a bridge extension beside `tool_calls`; `collectNonStreaming`
+   * keeps them out of `message.content`. Without this the wire says what the agent asked for and
+   * never what it got back: measured 2026-09-15 on two Runtime roots, 0 tool-output bytes crossed
+   * against 99k-160k held in opencode's own store (cli-bridge#227).
+   */
+  tool_results?: Array<{
+    id: string
+    name: string
+    status: 'completed' | 'error'
+    /** The tool's output on completion, as the harness rendered it for the model. */
+    output?: string
+    /** The harness's error text when `status` is `error`. */
+    error?: string
+  }>
   /** Terminal reason. Emitted once on the final chunk. */
   finish_reason?: 'stop' | 'length' | 'tool_calls' | 'error' | 'timeout'
   /**

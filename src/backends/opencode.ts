@@ -146,7 +146,11 @@ export class OpencodeBackend implements Backend {
     // the argv+envp stack page budget). Mirrors the kimi/claude
     // stream-json stdin path, but opencode's stdin schema is raw bytes,
     // not NDJSON — see writeStdinPayload's 'raw' format.
-    const args: string[] = ['run', '--format', 'json']
+    // `--thinking` is off by default for a non-interactive `run`, and without it opencode's JSON
+    // printer skips every reasoning part (run.ts: `part.type === "reasoning" && ... && thinking`).
+    // Measured 2026-09-15: two Runtime roots crossed this wire with 0 reasoning bytes against
+    // 33k-41k in opencode's own store (cli-bridge#227).
+    const args: string[] = ['run', '--format', 'json', '--thinking']
     if (model) args.push('-m', model)
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
@@ -302,6 +306,13 @@ export class OpencodeBackend implements Backend {
           continue
         }
 
+        // Reasoning rides `part.text` too, so it must be claimed before `extractText` would
+        // yield it as assistant content.
+        if (type === 'reasoning') {
+          const reasoning = extractText(ev)
+          if (reasoning) yield { reasoning }
+          continue
+        }
         const text = extractText(ev)
         if (text) {
           yield { content: text }
@@ -309,6 +320,10 @@ export class OpencodeBackend implements Backend {
         }
         const toolCall = extractToolUse(ev)
         if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
+        // opencode announces a tool part only once it has finished, so the outcome is on the
+        // same event as the call and can be forwarded beside it.
+        const toolResult = extractToolResult(ev)
+        if (toolResult) yield { tool_results: [toolResult] }
 
         if (
           type === 'message.completed'
@@ -404,6 +419,26 @@ function extractToolUse(ev: Record<string, unknown>): { id: string; name: string
     name,
     arguments: typeof input === 'string' ? input : JSON.stringify(input),
   }
+}
+
+/** The finished tool part's outcome, keyed by the same id `extractToolUse` reports. */
+function extractToolResult(
+  ev: Record<string, unknown>,
+): { id: string; name: string; status: 'completed' | 'error'; output?: string; error?: string } | null {
+  const part = ev.part as Record<string, unknown> | undefined
+  if (!part || (part.type !== 'tool' && part.type !== 'tool_call')) return null
+  const state = part.state as Record<string, unknown> | undefined
+  const status = state?.status
+  if (status !== 'completed' && status !== 'error') return null
+  const id = String(part.id ?? part.callID ?? part.toolCallID ?? part.tool_call_id ?? '')
+  const name = String(part.name ?? part.tool ?? '')
+  if (!id || !name) return null
+  if (status === 'completed') {
+    const output = state?.output
+    return { id, name, status, ...(typeof output === 'string' ? { output } : {}) }
+  }
+  const error = state?.error
+  return { id, name, status, ...(typeof error === 'string' ? { error } : {}) }
 }
 
 function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
