@@ -38,6 +38,7 @@ import {
   materializeMcpServersForCodex,
   profileExecutionIdentity,
   provisionProfileWorkspace,
+  resolveAgentProfile,
   resolveMcpServers,
   resolvePromptMessages,
   resolveRequestedReasoningEffort,
@@ -49,6 +50,13 @@ import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
+import {
+  assertRouterCodexExecution,
+  assertRouterCodexVersion,
+  codexRouterArgs,
+  openRouterLaunchRecord,
+  prepareRouterLaunch,
+} from './router-launch.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -89,6 +97,13 @@ export class CodexBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'codex hosted-safe requires verified --sandbox read-only audit')
 
+    let router: ReturnType<typeof prepareRouterLaunch>
+    try {
+      router = prepareRouterLaunch(req)
+    } catch (error) {
+      throw new BackendError((error as Error).message, 'not_configured')
+    }
+
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
     // The canonical wire id is `codex/<provider>/<model>` (agent-runtime's
     // profileBridgeWireModel). Codex config keys the two separately: the
@@ -111,9 +126,17 @@ export class CodexBackend implements Backend {
       '--json',
       '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox',
+      // Receipt-required launches refuse any override this codex version does not
+      // recognize: an ignored provider table would spend tokens Router cannot attribute.
+      ...(router ? ['--strict-config'] : []),
     ]
-    if (providerArg) args.push('-c', `model_provider="${providerArg}"`)
-    if (modelArg) args.push('-c', `model="${modelArg}"`)
+    // In receipt mode `codexRouterArgs` is the single owner of the route, so the
+    // split wire id is not restated here: a second `model_provider` naming a table
+    // no config defines relies on undocumented last-override-wins precedence.
+    if (!router) {
+      if (providerArg) args.push('-c', `model_provider="${providerArg}"`)
+      if (modelArg) args.push('-c', `model="${modelArg}"`)
+    }
     const reasoningEffort = nativeReasoningControl(
       'codex',
       resolveRequestedReasoningEffort(req, session),
@@ -124,7 +147,7 @@ export class CodexBackend implements Backend {
       args.splice(1, 0, 'resume', session.internalId)
       // codex exec resume <id> [prompt]
     }
-    args.push(prompt)
+    if (!router) args.push(prompt)
 
     // Reject unsupported profile plans before copying auth or writing MCP
     // credentials into a synthetic CODEX_HOME.
@@ -136,6 +159,28 @@ export class CodexBackend implements Backend {
       profileExecutionIdentity(req, session, 'codex', reasoningEffort),
     )
     args.push(...provisioned.flags)
+    let routerVersion: string | undefined
+    if (router) {
+      try {
+        assertRouterCodexExecution({
+          bin: this.opts.bin,
+          environment: this.spawner.executionEnvironment,
+          jail: req.jailSpec,
+          flags: provisioned.flags,
+          env: process.env,
+          ...(session?.externalId ? { resumedExternalId: session.externalId } : {}),
+          launch: router,
+        })
+        const health = await this.health(AbortSignal.any([signal, AbortSignal.timeout(10_000)]))
+        if (health.state !== 'ready') throw new Error('Router receipt preflight: harness version probe failed')
+        assertRouterCodexVersion(health.version)
+        routerVersion = health.version
+        signal.throwIfAborted()
+        args.push(...codexRouterArgs(router), '--', prompt)
+      } catch (error) {
+        throw new BackendError((error as Error).message, 'not_configured')
+      }
+    }
 
     // Session leases own this directory's read/execute/update interval.
     // Keep native state across turns, but regenerate MCP config and auth each time.
@@ -181,8 +226,30 @@ export class CodexBackend implements Backend {
       ]
     }
 
+    let record: ReturnType<typeof openRouterLaunchRecord> | undefined
     let spawned: Awaited<ReturnType<Spawner>>
     try {
+      if (router) {
+        // Evidence is created before inference on purpose: an unattributable launch
+        // must be refused, never reported as a success with the record missing.
+        try {
+          router.directory = ensurePrivateDataDirectory(router.directory)
+          const profile = resolveAgentProfile(req, session)
+          record = openRouterLaunchRecord(router, {
+            version: routerVersion!,
+            profileDigest: provisioned.receipt?.effectiveProfileDigest ?? null,
+            configuredTools: profile?.tools ?? null,
+            mcpServers: Object.keys(mcpServers ?? {}).sort(),
+          })
+        } catch (error) {
+          throw new BackendError(
+            'Router receipt preflight: cannot write launch evidence under BRIDGE_LAUNCH_RECORD_DIR '
+            + `(${(error as Error).message})`,
+            'not_configured',
+          )
+        }
+        signal.throwIfAborted()
+      }
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
@@ -190,6 +257,7 @@ export class CodexBackend implements Backend {
           ...process.env,
           ...provisioned.env,
           ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
+          ...(router ? { TANGLE_ROUTER_CREDENTIAL: router.key } : {}),
         },
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
@@ -197,7 +265,7 @@ export class CodexBackend implements Backend {
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
     } catch (error) {
-      codexHome?.cleanup()
+      try { codexHome?.cleanup() } finally { record?.close(signal.aborted ? 'aborted' : 'failed') }
       throw error
     }
     const child = spawned.child
@@ -217,6 +285,14 @@ export class CodexBackend implements Backend {
     signal.addEventListener('abort', onAbort, { once: true })
 
     let emittedToolCall = false
+    let recordOutcome: 'closed' | 'failed' = 'failed'
+    let routerTerminated = false
+    const finishRecord = async (): Promise<void> => {
+      if (!record) return
+      await terminateSpawned(spawned)
+      routerTerminated = true
+      record.close(signal.aborted ? 'aborted' : recordOutcome)
+    }
     try {
       let internalSessionId: string | undefined
       const stderr = new BoundedDiagnosticBuffer()
@@ -232,6 +308,7 @@ export class CodexBackend implements Backend {
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
         const line = event.line
+        record?.append(line)
         if (!line.trim()) continue
         let ev: Record<string, unknown>
         try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
@@ -251,6 +328,7 @@ export class CodexBackend implements Backend {
 
         const toolCall = extractToolCall(ev)
         if (toolCall) {
+          record?.observeTool(toolCall.name)
           yield { tool_calls: [toolCall] }
           emittedToolCall = true
           // Fall through to extractText: a tool item can also carry a
@@ -263,7 +341,11 @@ export class CodexBackend implements Backend {
         }
 
         if (type === 'turn.completed' || type === 'thread.completed') {
+          if (record && signal.aborted) throw new BackendError('Codex receipt launch was aborted', 'upstream')
+          record?.terminal(sawError ? 'error' : 'completed')
+          recordOutcome = sawError ? 'failed' : 'closed'
           const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
+          await finishRecord()
           yield {
             ...terminalOutcome('codex', sawError, emittedToolCall),
             usage,
@@ -276,6 +358,7 @@ export class CodexBackend implements Backend {
       const exitCode = await waitForProcessClose(child)
 
       if (signal.aborted) {
+        await finishRecord()
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
@@ -284,20 +367,34 @@ export class CodexBackend implements Backend {
         // bridge's own closed taxonomy and cannot carry a provider discriminant, while
         // the terminal error delta reaches the caller with it. The route answers both
         // shapes 502 (`BackendReportedFailureError`), so only the code is new.
+        record?.terminal('error')
+        await finishRecord()
         yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId }
         return
       }
       if (exitCode !== 0 && exitCode !== null) {
         throw new BackendError(await describeCliExit(spawned, 'codex', exitCode, stderr.render()), 'upstream')
       }
+      if (record) {
+        throw new BackendError('Codex receipt launch ended without a native terminal event', 'parse_error')
+      }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree — codex spawns sub-processes for MCP
       // tool calls, model HTTP I/O, etc. and we owe them a clean exit.
-      await terminateSpawned(spawned)
-      releaseSpawner()
-      codexHome?.cleanup()
+      // Each cleanup runs even if an earlier one throws, so the evidence record is
+      // always closed. `recordOutcome` is 'closed' only after a native terminal event
+      // already closed the record, so this call is a no-op on the success path.
+      try {
+        if (!routerTerminated) await terminateSpawned(spawned)
+      } finally {
+        try { releaseSpawner() } finally {
+          try { codexHome?.cleanup() } finally {
+            record?.close(signal.aborted ? 'aborted' : recordOutcome)
+          }
+        }
+      }
     }
   }
 

@@ -25,6 +25,7 @@ import {
   type ContextTransferRequest,
   type RequestedInteractions,
 } from '@tangle-network/agent-interface'
+import { routerReceiptsRequired } from '../backends/router-launch.js'
 import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
@@ -597,7 +598,13 @@ export function mountChatCompletions(
     if (!backend) {
       return c.json({
         error: {
-          message: `no backend matches model "${selectedModel}". Check /health for registered backends.`,
+          // Receipt-required deployments admit only the harness whose Router tuple carrier is
+          // verified, so say that instead of letting an excluded harness look unregistered.
+          message: routerReceiptsRequired()
+            ? `no backend admitted for model "${selectedModel}": BRIDGE_ROUTER_RECEIPTS_REQUIRED=1 admits only codex, `
+              + 'the one harness whose Tangle Router receipt-tuple carrier is verified. '
+              + 'Unset it to launch the other harnesses without receipts.'
+            : `no backend matches model "${selectedModel}". Check /health for registered backends.`,
           type: 'not_found_error',
         },
       }, 404)

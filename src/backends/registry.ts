@@ -9,6 +9,7 @@
  */
 
 import type { Backend } from './types.js'
+import { routerBackendAllowed } from './router-launch.js'
 
 export class BackendRegistry {
   private readonly backends: Backend[] = []
@@ -20,16 +21,16 @@ export class BackendRegistry {
 
   resolve(model: string): Backend | null {
     for (const b of this.backends) {
-      if (b.matches(model)) return b
+      if (b.matches(model)) return routerBackendAllowed(b.name) ? b : null
     }
     return null
   }
 
   byName(name: string): Backend | null {
-    return this.backends.find(b => b.name === name) ?? null
+    return routerBackendAllowed(name) ? this.backends.find(b => b.name === name) ?? null : null
   }
 
   all(): readonly Backend[] {
-    return this.backends
+    return this.backends.filter(b => routerBackendAllowed(b.name))
   }
 }
