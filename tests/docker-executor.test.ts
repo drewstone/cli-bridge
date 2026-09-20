@@ -556,8 +556,8 @@ describe('Docker container run configuration', () => {
   })
 
   it('canonicalizes nested cwd and rejects lexical and symlink escapes', () => {
-    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-root-'))
-    const outside = mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-outside-'))
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-root-')))
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-cwd-outside-')))
     const task = join(root, 'task-1')
     const inRootLink = join(root, 'task-link')
     const outsideLink = join(root, 'outside-link')
@@ -1327,7 +1327,7 @@ describe('per-backend executor config (parseAllExecutors)', () => {
   })
 
   it('loads and canonicalizes an existing Docker workspace directory', () => {
-    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-workspace-'))
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-workspace-')))
     try {
       const config = loadConfig({
         HOME: '/home/test',
@@ -1341,7 +1341,7 @@ describe('per-backend executor config (parseAllExecutors)', () => {
   })
 
   it('rejects workspace roots that are inactive, relative, missing, files, or filesystem root', () => {
-    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-workspace-invalid-'))
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-workspace-invalid-')))
     const file = join(root, 'file')
     writeFileSync(file, 'not a directory')
     try {
@@ -1375,9 +1375,9 @@ describe('per-backend executor config (parseAllExecutors)', () => {
   })
 
   it('rejects host or container OAuth/config overlap, including symlink aliases', () => {
-    const home = mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-home-'))
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-home-')))
     const oauth = join(home, '.claude')
-    const separate = mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-workspace-'))
+    const separate = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-overlap-workspace-')))
     const oauthAlias = join(home, 'oauth-alias')
     mkdirSync(oauth)
     symlinkSync(oauth, oauthAlias)
@@ -1451,7 +1451,7 @@ function subprocessBackendCases(spawner: Spawner) {
 
 describe('Spawner injection works across all subprocess backends', () => {
   it('rejects an unsafe profile before writing profile files or spawning any backend', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-pre-spawn-'))
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-pre-spawn-')))
     const originalTmpdir = process.env.TMPDIR
     const originalPiAdapter = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
     let spawnCalls = 0
@@ -1491,8 +1491,8 @@ describe('Spawner injection works across all subprocess backends', () => {
   })
 
   it('removes every MCP config and lock when the spawner rejects before returning a child', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'cli-bridge-spawn-reject-'))
-    const piAgentDir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-adapter-'))
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-spawn-reject-')))
+    const piAgentDir = realpathSync(mkdtempSync(join(tmpdir(), 'cli-bridge-pi-adapter-')))
     const originalTmpdir = process.env.TMPDIR
     const originalPiAgentDir = process.env.PI_CODING_AGENT_DIR
     let spawnCalls = 0

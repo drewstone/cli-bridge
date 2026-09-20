@@ -1,11 +1,11 @@
 {
   "name": "cli-bridge",
   "version": "0.3.0",
-  "description": "Expose your local coding-CLI subscriptions (Claude Code, Codex, Kimi via opencode, …) as an OpenAI-compatible HTTP API with persistent session resume. Personal tool — single-user by default.",
+  "description": "Expose your local coding-CLI subscriptions (Claude Code, Codex, Kimi via opencode, \u2026) as an OpenAI-compatible HTTP API with persistent session resume. Personal tool \u2014 single-user by default.",
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",

@@ -77,7 +77,7 @@ pnpm start
 # → http://127.0.0.1:3344  (was 8787; changed to dodge port collisions)
 ```
 
-**Prereqs:** Node 22+. For each backend you want enabled, install + log in on the host. The install commands below are wrapped by:
+**Prereqs:** Node 22.13+. For each backend you want enabled, install + log in on the host. The install commands below are wrapped by:
 
 ```bash
 pnpm install:harness -- claude
