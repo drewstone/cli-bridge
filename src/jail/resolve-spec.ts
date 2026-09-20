@@ -87,7 +87,7 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   if (mode === 'off') return null
 
   const projectDir = resolve(input.cwd)
-  const scratchBase = resolve(projectDir, DEFAULT_JAIL_ROOT)
+  const scratchBase = resolveJailRoot(DEFAULT_JAIL_ROOT, projectDir)
   const requested = input.execRoot ?? env.BRIDGE_JAIL_ROOT ?? DEFAULT_JAIL_ROOT
   // The writable root must be a dedicated scratch dir INSIDE <cwd>/.agent-home,
   // never an arbitrary repo subtree (which would make tracked files writable and

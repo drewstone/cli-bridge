@@ -98,7 +98,7 @@ afterEach(async () => {
   )
 })
 
-test('published Runtime 0.194 debits Claude cache writes without charging cache reads twice', async () => {
+test('published Runtime debits Claude cache writes without charging cache reads twice', async () => {
   const usageFrame = await normalizedClaudeUsageFrame()
   let requestModel: string | undefined
   const server = createServer(async (request, response) => {

@@ -68,7 +68,7 @@ afterEach(async () => {
 async function tempProjectDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-test-'))
   cleanups.push(() => rm(dir, { recursive: true, force: true }))
-  return dir
+  return realpath(dir)
 }
 
 describe('LinuxBwrapJail.wrap', () => {
@@ -226,8 +226,8 @@ describe('MacosSeatbeltJail.wrap', () => {
 
     // Regression: shared temp trees must NOT be writable — a confined run could
     // otherwise persist files outside the jail root. Temp goes to <root>/.tmp.
-    expect(profile, 'must not whitelist the per-user temp tree').not.toContain('/private/var/folders')
-    expect(profile, 'must not whitelist /private/tmp').not.toContain('/private/tmp')
+    expect(profile, 'must not whitelist the per-user temp tree').not.toContain('(subpath "/private/var/folders")')
+    expect(profile, 'must not whitelist /private/tmp').not.toContain('(subpath "/private/tmp")')
     // Standard device nodes stay writable so output redirection / RNG still work.
     expect(profile).toContain('(literal "/dev/null")')
 
@@ -990,29 +990,44 @@ describe('resolveJailSpec', () => {
     ).toBe(true)
   })
 
-  it('defaults the writable root to .agent-home inside cwd', () => {
-    const cwd = '/home/user/project'
+  it('defaults the writable root to .agent-home inside cwd', async () => {
+    const cwd = await tempProjectDir()
     const spec = resolveJailSpec({ cwd, execMode: 'write-jail', env: {} })
     expect(spec).not.toBeNull()
     expect(spec?.projectDir).toBe(resolve(cwd))
     expect(spec?.root).toBe(resolve(cwd, DEFAULT_JAIL_ROOT))
   })
 
-  it('honors a nested root inside the .agent-home scratch namespace', () => {
-    const cwd = '/home/user/project'
+  it('honors a nested root inside the .agent-home scratch namespace', async () => {
+    const cwd = await tempProjectDir()
     const spec = resolveJailSpec({ cwd, execMode: 'write-jail', execRoot: '.agent-home/run1', env: {} })
     expect(spec?.root).toBe(resolve(cwd, '.agent-home/run1'))
   })
 
-  it('clamps a root that points at an arbitrary repo subtree to the scratch default', () => {
-    const cwd = '/home/user/project'
+  it('honors nested scratch roots when cwd uses a symlink alias', async () => {
+    const projectDir = await tempProjectDir()
+    const alias = join(await tempProjectDir(), 'workspace')
+    await symlink(projectDir, alias)
+    const spec = resolveJailSpec({
+      cwd: alias,
+      execMode: 'write-jail',
+      execRoot: '.agent-home/run1',
+      env: {},
+    })
+    expect(spec?.root).toBe(join(projectDir, '.agent-home/run1'))
+    const escaped = resolveJailSpec({ cwd: alias, execMode: 'write-jail', execRoot: 'src', env: {} })
+    expect(escaped?.root).toBe(join(projectDir, DEFAULT_JAIL_ROOT))
+  })
+
+  it('clamps a root that points at an arbitrary repo subtree to the scratch default', async () => {
+    const cwd = await tempProjectDir()
     // 'src' is inside cwd but OUTSIDE .agent-home — must not become the writable jail.
     const spec = resolveJailSpec({ cwd, execMode: 'write-jail', execRoot: 'src', env: {} })
     expect(spec?.root).toBe(resolve(cwd, DEFAULT_JAIL_ROOT))
   })
 
-  it('clamps a root that escapes cwd back to the in-cwd default (fail closed)', () => {
-    const cwd = '/home/user/project'
+  it('clamps a root that escapes cwd back to the in-cwd default (fail closed)', async () => {
+    const cwd = await tempProjectDir()
     const escapeAttempts = ['../../etc', '../outside', '/etc', '.']
     for (const execRoot of escapeAttempts) {
       const spec = resolveJailSpec({ cwd, execMode: 'write-jail', execRoot, env: {} })
