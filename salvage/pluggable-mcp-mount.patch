@@ -1,0 +1,744 @@
+From 739fa6f3bf33c70a747aa57afaa658dbb149f3af Mon Sep 17 00:00:00 2001
+From: Drew Stone <drewstone329@gmail.com>
+Date: Tue, 22 Sep 2026 14:26:05 -0600
+Subject: [PATCH] refactor(mcp): route every backend's MCP exposure through
+ pluggable mount strategies
+
+One registered strategy per CLI (opencode config layer, kimi flag, pi adapter file)
+owns env, argv, cleanup, and the fail-loud decision when a CLI cannot serve the
+requested servers, so adding a harness no longer edits each backend's spawn path.
+
+Salvaged uncommitted work from 2026-07-06 against the backends as they were then.
+---
+ src/backends/kimi.ts            |  28 ++---
+ src/backends/mcp-mount.ts       | 201 ++++++++++++++++++++++++++++++++
+ src/backends/opencode.ts        |  34 +++---
+ src/backends/pi.ts              |  86 +++-----------
+ src/backends/profile-support.ts |  51 +++++++-
+ tests/mcp-mount.test.ts         | 159 +++++++++++++++++++++++++
+ 6 files changed, 454 insertions(+), 105 deletions(-)
+ create mode 100644 src/backends/mcp-mount.ts
+ create mode 100644 tests/mcp-mount.test.ts
+
+diff --git a/src/backends/kimi.ts b/src/backends/kimi.ts
+index 5ce38e7..90a19f3 100644
+--- a/src/backends/kimi.ts
++++ b/src/backends/kimi.ts
+@@ -38,12 +38,11 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
+ import { assertModeSupported } from '../modes.js'
+ import type { SessionRecord } from '../sessions/store.js'
+ import {
+-  materializeEmptyMcpConfig,
+-  materializeMcpServersForClaudeKimi,
+   provisionProfileWorkspace,
+   resolveMcpServers,
+   resolvePromptMessages,
+ } from './profile-support.js'
++import { mcpMountRegistry } from './mcp-mount.js'
+ import { contentToText } from './content.js'
+ import { scopedHostSpawner } from '../executors/scoped-host.js'
+ import type { Spawner } from '../executors/types.js'
+@@ -122,13 +121,14 @@ export class KimiBackend implements Backend {
+     const prompt = this.buildPrompt(req, session)
+     const model = this.resolveCliModel(req.model)
+     const configFile = await this.prepareConfigFile(req.model)
+-    // Materialize agent_profile.mcp into a temp mcp-config.json. Same
+-    // shape claude expects ({mcpServers: {name: {command,args,env}}});
+-    // kimi takes the path via --mcp-config-file. Cleanup runs in the
+-    // outer finally so the temp dir doesn't leak when the subprocess
+-    // crashes.
+-    const mcpMaterialized =
+-      materializeMcpServersForClaudeKimi(resolveMcpServers(req, session)) ?? materializeEmptyMcpConfig()
++    const cwd = req.cwd ?? session?.cwd ?? process.cwd()
++    // Mount MCP servers (request-body `mcp.mcpServers` ∪ `agent_profile.mcp`)
++    // via the pluggable MCP-mount registry. kimi's strategy materializes a
++    // temp mcp-config.json (canonical {mcpServers} shape, remote {type,url,
++    // headers} forwarded verbatim) and returns `--mcp-config-file <path>`.
++    // Cleanup runs in the outer finally so the temp dir doesn't leak when
++    // the subprocess crashes.
++    const mcpMount = mcpMountRegistry.mount('kimi', resolveMcpServers(req, session), { cwd })
+ 
+     const args = [
+       '--print',
+@@ -138,8 +138,8 @@ export class KimiBackend implements Backend {
+     if (configFile) {
+       args.push('--config-file', configFile)
+     }
+-    if (mcpMaterialized) {
+-      args.push('--mcp-config-file', mcpMaterialized.configPath)
++    if (mcpMount) {
++      args.push(...mcpMount.args)
+     }
+     if (session?.internalId) {
+       args.push('--resume', session.internalId)
+@@ -152,10 +152,10 @@ export class KimiBackend implements Backend {
+ 
+     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
+     // stays on kimi's existing path). Fail-safe.
+-    provisionProfileWorkspace(req, session, 'kimi', req.cwd ?? session?.cwd ?? process.cwd())
++    provisionProfileWorkspace(req, session, 'kimi', cwd)
+     const spawned = await this.spawner(this.opts.bin, args, {
+       stdio: ['pipe', 'pipe', 'pipe'],
+-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
++      cwd,
+       env: process.env,
+       ...(req.session_id ? { sessionId: req.session_id } : {}),
+       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+@@ -369,7 +369,7 @@ export class KimiBackend implements Backend {
+       // before releasing the slot. Idempotent; waits for actual exit.
+       await killTree(child)
+       if (configFile) await cleanupConfigFile(configFile)
+-      mcpMaterialized?.cleanup()
++      mcpMount?.cleanup()
+       releaseSpawner()
+     }
+   }
+diff --git a/src/backends/mcp-mount.ts b/src/backends/mcp-mount.ts
+new file mode 100644
+index 0000000..771e87c
+--- /dev/null
++++ b/src/backends/mcp-mount.ts
+@@ -0,0 +1,201 @@
++/**
++ * Pluggable MCP-mount strategies — the one seam every backend uses to
++ * expose a set of MCP servers to its CLI.
++ *
++ * Each CLI loads MCP config differently: opencode layers a JSON file via
++ * the `OPENCODE_CONFIG` env var, kimi takes a `--mcp-config-file` flag,
++ * pi discovers `<cwd>/.pi/mcp.json` through the `pi-mcp-adapter`
++ * extension, codex reads `$CODEX_HOME/config.toml`. That per-vendor
++ * knowledge used to live inline in each backend's spawn path, so adding a
++ * harness meant forking a materializer AND editing that backend. This
++ * module collapses it into ONE declarative strategy per backend,
++ * registered by name. Adding a vendor is a single `register()` call — the
++ * spawn path never changes.
++ *
++ * A strategy takes the resolved MCP server map (request ∪ profile) and
++ * returns a {@link McpMount}: env vars to merge, argv flags to append, and
++ * a `cleanup()` the backend runs in its `finally`. The strategy — not the
++ * backend — owns the fail-loud decision when a caller requests servers the
++ * CLI genuinely cannot serve (pi without its adapter).
++ *
++ * Mirrors the {@link BackendRegistry} pattern (registry.ts): first-class
++ * registration, resolve-by-name, no global mutable singleton beyond the
++ * shared default registry the backends consume.
++ */
++
++import type { McpServerSpec } from './types.js'
++import { BackendError } from './types.js'
++import {
++  buildCanonicalMcpServers,
++  materializeEmptyMcpConfig,
++  materializeMcpServersForClaudeKimi,
++  materializeMcpServersForOpencode,
++  materializeMcpServersForPi,
++  piMcpAdapterAvailable,
++} from './profile-support.js'
++
++/** Everything a strategy needs to materialize a mount for one turn. */
++export interface McpMountContext {
++  /**
++   * Run working directory. cwd-native config files (pi's `.pi/mcp.json`)
++   * land here; strategies that use a temp dir ignore it.
++   */
++  cwd: string
++}
++
++/**
++ * The result of mounting MCP servers for one backend, one turn.
++ *
++ * The backend merges {@link env} into the spawned CLI's environment,
++ * appends {@link args} to its argv, and calls {@link cleanup} in its
++ * `finally` block (after the subprocess is reaped). `env`/`args` are the
++ * ONLY two injection shapes any current CLI needs — a strategy uses one,
++ * the other, or (pi) neither (it writes a cwd file instead).
++ */
++export interface McpMount {
++  /** Env vars to merge into the spawned CLI's environment (e.g. `OPENCODE_CONFIG`). */
++  readonly env: Record<string, string>
++  /** Argv flags to append when spawning the CLI (e.g. `['--mcp-config-file', path]`). */
++  readonly args: readonly string[]
++  /** Names of the servers actually mounted — for logging / assertions. */
++  readonly serverNames: readonly string[]
++  /** Tear down temp files / workspace writes. Idempotent; safe to call once. */
++  cleanup(): void
++}
++
++/**
++ * How one backend exposes a set of MCP servers to its CLI. Registered per
++ * backend in the shared {@link mcpMountRegistry}.
++ */
++export interface McpMountStrategy {
++  /** Backend name this serves — matches `Backend.name`. */
++  readonly backend: string
++  /**
++   * Materialize `specs` (the resolved request ∪ profile server map) into a
++   * mount.
++   *
++   * Return `null` when there is nothing to mount AND the backend needs no
++   * config for an empty set. MUST throw `BackendError('not_configured')`
++   * when the caller requested servers this backend genuinely cannot serve —
++   * fail loud, never silent-drop (a tool-less run that scores zero for the
++   * wrong reason is the bug this whole path exists to prevent).
++   */
++  mount(specs: Record<string, McpServerSpec> | null, ctx: McpMountContext): McpMount | null
++}
++
++/**
++ * Registry of MCP-mount strategies, keyed by backend name. One instance
++ * (the exported {@link mcpMountRegistry}) is shared by every backend;
++ * tests can build their own.
++ */
++export class McpMountRegistry {
++  private readonly strategies = new Map<string, McpMountStrategy>()
++
++  /** Register (or replace) the strategy for a backend. Last write wins. */
++  register(strategy: McpMountStrategy): this {
++    this.strategies.set(strategy.backend, strategy)
++    return this
++  }
++
++  /** The strategy for `backend`, or null when none is registered. */
++  get(backend: string): McpMountStrategy | null {
++    return this.strategies.get(backend) ?? null
++  }
++
++  /** Backend names with a registered strategy. */
++  backends(): string[] {
++    return [...this.strategies.keys()]
++  }
++
++  /**
++   * Resolve the strategy for `backend` and mount `specs`. Returns null when
++   * the backend has no registered strategy (MCP is a no-op for it) or the
++   * strategy mounts nothing. Propagates a strategy's fail-loud
++   * `BackendError` when it rejects the requested servers.
++   */
++  mount(
++    backend: string,
++    specs: Record<string, McpServerSpec> | null,
++    ctx: McpMountContext,
++  ): McpMount | null {
++    const strategy = this.strategies.get(backend)
++    if (!strategy) return null
++    return strategy.mount(specs, ctx)
++  }
++}
++
++const NO_OP_CLEANUP = (): void => {}
++
++/**
++ * opencode — the config file is layered on top of the user's global
++ * `~/.config/opencode/opencode.json` via the `OPENCODE_CONFIG` env var
++ * (opencode-cli has no per-invocation MCP flag). ALWAYS mounts, even for
++ * an empty server set, because the same file carries the headless
++ * permission map that keeps automated runs from blocking on a prompt.
++ */
++export const opencodeMcpMountStrategy: McpMountStrategy = {
++  backend: 'opencode',
++  mount(specs) {
++    const m = materializeMcpServersForOpencode(specs)
++    return {
++      env: { OPENCODE_CONFIG: m.configPath },
++      args: [],
++      serverNames: m.serverNames,
++      cleanup: m.cleanup,
++    }
++  },
++}
++
++/**
++ * kimi — a temp `mcp-config.json` (canonical claude/kimi shape, remote
++ * `{type,url,headers}` entries forwarded verbatim) passed via
++ * `--mcp-config-file`. ALWAYS passes a file (empty fallback) so the run
++ * ignores the operator's global `~/.kimi/mcp.json` and stays deterministic.
++ */
++export const kimiMcpMountStrategy: McpMountStrategy = {
++  backend: 'kimi',
++  mount(specs) {
++    const m = materializeMcpServersForClaudeKimi(specs) ?? materializeEmptyMcpConfig()
++    return {
++      env: {},
++      args: ['--mcp-config-file', m.configPath],
++      serverNames: m.serverNames,
++      cleanup: m.cleanup,
++    }
++  },
++}
++
++/**
++ * pi — pi's CLI ships no MCP support; the `pi-mcp-adapter` extension
++ * discovers `<cwd>/.pi/mcp.json`. FAIL LOUD when the adapter is absent:
++ * writing a config pi never reads would silently drop the requested tools,
++ * turning a tool-dependent run into a zero for the wrong reason. Mounts
++ * nothing (returns null) when no servers were requested.
++ */
++export const piMcpMountStrategy: McpMountStrategy = {
++  backend: 'pi',
++  mount(specs, ctx) {
++    const serverNames = specs ? Object.keys(buildCanonicalMcpServers(specs)) : []
++    if (serverNames.length === 0) return null
++    if (!piMcpAdapterAvailable()) {
++      throw new BackendError(
++        `backend pi cannot mount MCP servers: pi-mcp-adapter extension not installed `
++        + `(run \`pi install npm:pi-mcp-adapter\` or set CLI_BRIDGE_PI_MCP_ADAPTER=1); `
++        + `requested: ${serverNames.join(', ')}`,
++        'not_configured',
++      )
++    }
++    const m = materializeMcpServersForPi(specs, ctx.cwd)
++    if (!m) return null
++    return { env: {}, args: [], serverNames: m.serverNames, cleanup: m.cleanup ?? NO_OP_CLEANUP }
++  },
++}
++
++/**
++ * The shared registry every backend consumes. Adding a vendor is one
++ * `.register()` call here (or at startup) — no backend spawn-path edit.
++ */
++export const mcpMountRegistry = new McpMountRegistry()
++  .register(opencodeMcpMountStrategy)
++  .register(kimiMcpMountStrategy)
++  .register(piMcpMountStrategy)
+diff --git a/src/backends/opencode.ts b/src/backends/opencode.ts
+index 49998fe..020e140 100644
+--- a/src/backends/opencode.ts
++++ b/src/backends/opencode.ts
+@@ -21,7 +21,8 @@ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+ import { BackendError } from './types.js'
+ import { assertModeSupported } from '../modes.js'
+ import type { SessionRecord } from '../sessions/store.js'
+-import { materializeMcpServersForOpencode, provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
++import { provisionProfileWorkspace, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
++import { mcpMountRegistry } from './mcp-mount.js'
+ import { contentToText } from './content.js'
+ import { scopedHostSpawner } from '../executors/scoped-host.js'
+ import type { Spawner } from '../executors/types.js'
+@@ -89,18 +90,16 @@ export class OpencodeBackend implements Backend {
+     const prompt = this.flattenPrompt(resolvePromptMessages(req, session))
+     const model = this.extractModel(req.model)
+ 
+-    // Materialize MCP servers (request-body `mcp.mcpServers` ∪
+-    // `agent_profile.mcp`) into a temp opencode-shape config file.
+-    // opencode-cli has no per-invocation `--mcp-config-file` flag —
+-    // config layering is the only inline injection point. We set
+-    // OPENCODE_CONFIG to the temp file path; opencode loads it on top
+-    // of the user's global config (verified: a non-existent
+-    // OPENCODE_CONFIG path is logged + skipped, and a valid one
+-    // contributes mcp servers to the tool registry).
+-    //
+-    // Cleanup runs in the outer finally so the temp dir doesn't leak
+-    // when the subprocess crashes.
+-    const mcpMaterialized = materializeMcpServersForOpencode(resolveMcpServers(req, session))
++    // Mount MCP servers (request-body `mcp.mcpServers` ∪
++    // `agent_profile.mcp`) via the pluggable MCP-mount registry. opencode's
++    // strategy materializes a temp opencode-shape config file and returns it
++    // as `OPENCODE_CONFIG` env (opencode-cli has no per-invocation
++    // `--mcp-config-file` flag — config layering is the only inline
++    // injection point; a valid path contributes mcp servers to the tool
++    // registry). Cleanup runs in the outer finally so the temp dir doesn't
++    // leak when the subprocess crashes.
++    const cwd = req.cwd ?? session?.cwd ?? process.cwd()
++    const mcpMount = mcpMountRegistry.mount('opencode', resolveMcpServers(req, session), { cwd })
+ 
+     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
+     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
+@@ -118,16 +117,17 @@ export class OpencodeBackend implements Backend {
+     const variant = opencodeVariantForEffort(req.effort)
+     if (variant) args.push('--variant', variant)
+     if (session?.internalId) args.push('-s', session.internalId)
++    if (mcpMount) args.push(...mcpMount.args)
+ 
+     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn (MCP
+     // stays on opencode.json path). Fail-safe.
+-    provisionProfileWorkspace(req, session, 'opencode', req.cwd ?? session?.cwd ?? process.cwd())
++    provisionProfileWorkspace(req, session, 'opencode', cwd)
+     const spawned = await this.spawner(this.opts.bin, args, {
+       stdio: ['pipe', 'pipe', 'pipe'],
+-      cwd: req.cwd ?? session?.cwd ?? process.cwd(),
++      cwd,
+       env: {
+         ...process.env,
+-        ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
++        ...(mcpMount?.env ?? {}),
+       },
+       ...(req.session_id ? { sessionId: req.session_id } : {}),
+       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+@@ -267,7 +267,7 @@ export class OpencodeBackend implements Backend {
+       // which left opencode's HTTP-client + MCP children alive.
+       await killTree(child)
+       releaseSpawner()
+-      mcpMaterialized?.cleanup()
++      mcpMount?.cleanup()
+     }
+   }
+ 
+diff --git a/src/backends/pi.ts b/src/backends/pi.ts
+index 94a7456..025835d 100644
+--- a/src/backends/pi.ts
++++ b/src/backends/pi.ts
+@@ -50,20 +50,20 @@
+  * handles its `think` blocks for non-thinking-aware callers).
+  */
+ 
+-import { existsSync, readFileSync } from 'node:fs'
+-import { homedir } from 'node:os'
+-import { isAbsolute, join } from 'node:path'
+ import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+ import { BackendError } from './types.js'
+ import { assertModeSupported } from '../modes.js'
+ import type { SessionRecord } from '../sessions/store.js'
+ import {
+-  buildCanonicalMcpServers,
+-  materializeMcpServersForPi,
+   provisionProfileWorkspace,
+   resolveMcpServers,
+   resolvePromptMessages,
+ } from './profile-support.js'
++import { mcpMountRegistry } from './mcp-mount.js'
++
++// pi's MCP adapter probe lives with the pi materializer in profile-support;
++// re-exported here so existing importers (and pi-backend tests) are stable.
++export { piMcpAdapterAvailable } from './profile-support.js'
+ import { contentToText } from './content.js'
+ import { scopedHostSpawner } from '../executors/scoped-host.js'
+ import type { Spawner } from '../executors/types.js'
+@@ -103,53 +103,6 @@ function thinkingFlagForEffort(effort?: string): string | null {
+   return allowed.has(e) ? e : null
+ }
+ 
+-/**
+- * True when pi can actually consume MCP config — i.e. the
+- * `pi-mcp-adapter` extension is installed. Pi itself ships no MCP
+- * support, so mounting `.pi/mcp.json` without the adapter is a silent
+- * no-op; callers use this to fail loudly instead.
+- *
+- * `CLI_BRIDGE_PI_MCP_ADAPTER=1|0` overrides detection for nonstandard
+- * installs (e.g. the adapter vendored under a local package path whose
+- * name doesn't contain "pi-mcp-adapter").
+- */
+-export function piMcpAdapterAvailable(): boolean {
+-  const override = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
+-  if (override === '1' || override === 'true') return true
+-  if (override === '0' || override === 'false') return false
+-  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')
+-  if (existsSync(join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter'))) return true
+-  try {
+-    const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf-8')) as { packages?: unknown }
+-    if (Array.isArray(settings.packages)) {
+-      return settings.packages.some((p) => {
+-        if (typeof p !== 'string') return false
+-        if (p.includes('pi-mcp-adapter')) return true
+-        // Local-path installs (`/some/dir`, `./rel`, `file:…`, `path:…`) may
+-        // not carry the adapter's name in the path — resolve the
+-        // package.json name. Relative specs resolve against the agent dir
+-        // (where settings.json lives), NOT the bridge process cwd.
+-        const spec = p.replace(/^(file|path):(\/\/)?/, '')
+-        // `isAbsolute` covers POSIX and (on Windows builds) drive-letter
+-        // forms; the explicit drive-letter check keeps a Windows-authored
+-        // settings.json from being misread as an npm name elsewhere.
+-        const winAbsolute = /^[A-Za-z]:[\\/]/.test(spec)
+-        if (!isAbsolute(spec) && !winAbsolute && !spec.startsWith('.')) return false
+-        const localPath = isAbsolute(spec) || winAbsolute ? spec : join(agentDir, spec)
+-        try {
+-          const pkg = JSON.parse(readFileSync(join(localPath, 'package.json'), 'utf-8')) as { name?: unknown }
+-          return pkg.name === 'pi-mcp-adapter'
+-        } catch {
+-          return false
+-        }
+-      })
+-    }
+-  } catch {
+-    // unreadable/absent settings — fall through to "not detected"
+-  }
+-  return false
+-}
+-
+ export class PiBackend implements Backend {
+   readonly name = 'pi'
+   private readonly spawner: Spawner
+@@ -224,24 +177,13 @@ export class PiBackend implements Backend {
+ 
+     const runCwd = req.cwd ?? session?.cwd ?? process.cwd()
+ 
+-    // MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
+-    // `agent_profile.mcp`) mount as `<cwd>/.pi/mcp.json` for the
+-    // pi-mcp-adapter extension. FAIL-LOUD, not fail-safe: if the caller
+-    // requested MCP tools pi can't provide, reject the request — a
+-    // silently tool-less run scores zero for the wrong reason.
+-    const mcpSpecs = resolveMcpServers(req, session)
+-    const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []
+-    if (requestedMcpNames.length > 0 && !piMcpAdapterAvailable()) {
+-      throw new BackendError(
+-        `backend pi cannot mount MCP servers: pi-mcp-adapter extension not installed `
+-        + `(run \`pi install npm:pi-mcp-adapter\` or set CLI_BRIDGE_PI_MCP_ADAPTER=1); `
+-        + `requested: ${requestedMcpNames.join(', ')}`,
+-        'not_configured',
+-      )
+-    }
+-    const mcpMounted = requestedMcpNames.length > 0
+-      ? materializeMcpServersForPi(mcpSpecs, runCwd)
+-      : null
++    // Mount MCP servers (X-Mcp-Config header ∪ body `mcp.mcpServers` ∪
++    // `agent_profile.mcp`) via the pluggable MCP-mount registry. pi's
++    // strategy writes `<cwd>/.pi/mcp.json` for the pi-mcp-adapter extension
++    // and FAILS LOUD (BackendError) when the adapter is absent — a silently
++    // tool-less run scores zero for the wrong reason. Cleanup restores the
++    // workspace file; run it on spawn failure and in the finally.
++    const mcpMount = mcpMountRegistry.mount('pi', resolveMcpServers(req, session), { cwd: runCwd })
+ 
+     // Phase-2 host wiring: provision cwd-native profile dimensions before spawn. Fail-safe.
+     provisionProfileWorkspace(req, session, 'pi', runCwd)
+@@ -257,7 +199,7 @@ export class PiBackend implements Backend {
+     } catch (err) {
+       // `.pi/mcp.json` lives in the caller's workspace, not a temp dir —
+       // never leave it behind when the subprocess failed to spawn.
+-      mcpMounted?.cleanup()
++      mcpMount?.cleanup()
+       throw err
+     }
+     const child = spawned.child
+@@ -421,7 +363,7 @@ export class PiBackend implements Backend {
+       // Reap the whole subtree before releasing the slot.
+       await killTree(child)
+       try { releaseSpawner() } catch { /* best effort */ }
+-      mcpMounted?.cleanup()
++      mcpMount?.cleanup()
+     }
+   }
+ 
+diff --git a/src/backends/profile-support.ts b/src/backends/profile-support.ts
+index fd46b86..3b32fc1 100644
+--- a/src/backends/profile-support.ts
++++ b/src/backends/profile-support.ts
+@@ -1,6 +1,6 @@
+ import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs'
+-import { tmpdir } from 'node:os'
+-import { join } from 'node:path'
++import { homedir, tmpdir } from 'node:os'
++import { isAbsolute, join } from 'node:path'
+ import type { AgentProfile, AgentProfileMcpServer } from '@tangle-network/agent-interface'
+ import type { ChatMessage, ChatRequest, McpServerSpec } from './types.js'
+ import { BackendError } from './types.js'
+@@ -270,6 +270,53 @@ export function materializeMcpServersForClaudeKimi(
+   }
+ }
+ 
++/**
++ * True when pi can actually consume MCP config — i.e. the
++ * `pi-mcp-adapter` extension is installed. Pi itself ships no MCP
++ * support, so mounting `.pi/mcp.json` without the adapter is a silent
++ * no-op; callers use this to fail loudly instead.
++ *
++ * `CLI_BRIDGE_PI_MCP_ADAPTER=1|0` overrides detection for nonstandard
++ * installs (e.g. the adapter vendored under a local package path whose
++ * name doesn't contain "pi-mcp-adapter").
++ */
++export function piMcpAdapterAvailable(): boolean {
++  const override = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
++  if (override === '1' || override === 'true') return true
++  if (override === '0' || override === 'false') return false
++  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), '.pi', 'agent')
++  if (existsSync(join(agentDir, 'npm', 'node_modules', 'pi-mcp-adapter'))) return true
++  try {
++    const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf-8')) as { packages?: unknown }
++    if (Array.isArray(settings.packages)) {
++      return settings.packages.some((p) => {
++        if (typeof p !== 'string') return false
++        if (p.includes('pi-mcp-adapter')) return true
++        // Local-path installs (`/some/dir`, `./rel`, `file:…`, `path:…`) may
++        // not carry the adapter's name in the path — resolve the
++        // package.json name. Relative specs resolve against the agent dir
++        // (where settings.json lives), NOT the bridge process cwd.
++        const spec = p.replace(/^(file|path):(\/\/)?/, '')
++        // `isAbsolute` covers POSIX and (on Windows builds) drive-letter
++        // forms; the explicit drive-letter check keeps a Windows-authored
++        // settings.json from being misread as an npm name elsewhere.
++        const winAbsolute = /^[A-Za-z]:[\\/]/.test(spec)
++        if (!isAbsolute(spec) && !winAbsolute && !spec.startsWith('.')) return false
++        const localPath = isAbsolute(spec) || winAbsolute ? spec : join(agentDir, spec)
++        try {
++          const pkg = JSON.parse(readFileSync(join(localPath, 'package.json'), 'utf-8')) as { name?: unknown }
++          return pkg.name === 'pi-mcp-adapter'
++        } catch {
++          return false
++        }
++      })
++    }
++  } catch {
++    // unreadable/absent settings — fall through to "not detected"
++  }
++  return false
++}
++
+ /**
+  * Materialize MCP servers for the pi backend by writing the canonical
+  * `{mcpServers}` JSON to `<cwd>/.pi/mcp.json` — pi's project-level MCP
+diff --git a/tests/mcp-mount.test.ts b/tests/mcp-mount.test.ts
+new file mode 100644
+index 0000000..2fd0182
+--- /dev/null
++++ b/tests/mcp-mount.test.ts
+@@ -0,0 +1,159 @@
++/**
++ * Unit tests for the pluggable MCP-mount registry + the built-in
++ * opencode / kimi / pi strategies (src/backends/mcp-mount.ts).
++ *
++ * The contract under test: each strategy turns a resolved McpServerSpec
++ * map into a mount (env vars + argv flags + cleanup) that makes the
++ * backend's CLI load the servers — including REMOTE http servers with a
++ * url + Authorization header, the case this whole path exists to fix.
++ */
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import {
++  McpMountRegistry,
++  kimiMcpMountStrategy,
++  mcpMountRegistry,
++  opencodeMcpMountStrategy,
++  piMcpMountStrategy,
++} from '../src/backends/mcp-mount.js'
++import { BackendError } from '../src/backends/types.js'
++import type { McpMountStrategy } from '../src/backends/mcp-mount.js'
++
++/** A live remote HTTP MCP spec (shape the Tangle Router search MCP uses). */
++const remoteSearch = {
++  'tangle-search': {
++    type: 'http' as const,
++    url: 'https://router.tangle.tools/v1/search/mcp?provider=you',
++    headers: { Authorization: 'Bearer sk-tan-test' },
++  },
++}
++
++describe('McpMountRegistry', () => {
++  it('resolves a registered strategy by backend name and mounts', () => {
++    const calls: string[] = []
++    const stub: McpMountStrategy = {
++      backend: 'stub',
++      mount() {
++        calls.push('mount')
++        return { env: { X: '1' }, args: ['--flag'], serverNames: ['s'], cleanup() {} }
++      },
++    }
++    const reg = new McpMountRegistry().register(stub)
++    expect(reg.get('stub')).toBe(stub)
++    expect(reg.backends()).toEqual(['stub'])
++    const m = reg.mount('stub', null, { cwd: '/tmp' })
++    expect(m?.env).toEqual({ X: '1' })
++    expect(m?.args).toEqual(['--flag'])
++    expect(calls).toEqual(['mount'])
++  })
++
++  it('returns null for an unregistered backend (MCP is a no-op there)', () => {
++    const reg = new McpMountRegistry()
++    expect(reg.mount('nope', remoteSearch, { cwd: '/tmp' })).toBeNull()
++  })
++
++  it('last register wins for a backend name', () => {
++    const a: McpMountStrategy = { backend: 'x', mount: () => null }
++    const b: McpMountStrategy = { backend: 'x', mount: () => ({ env: {}, args: ['b'], serverNames: [], cleanup() {} }) }
++    const reg = new McpMountRegistry().register(a).register(b)
++    expect(reg.get('x')).toBe(b)
++  })
++
++  it('the shared registry ships opencode + kimi + pi', () => {
++    expect(mcpMountRegistry.backends().sort()).toEqual(['kimi', 'opencode', 'pi'])
++  })
++})
++
++describe('opencodeMcpMountStrategy', () => {
++  it('always mounts (even empty specs) and exposes OPENCODE_CONFIG; forwards a remote http server', () => {
++    const empty = opencodeMcpMountStrategy.mount(null, { cwd: '/tmp' })
++    expect(empty).not.toBeNull()
++    expect(empty?.args).toEqual([])
++    expect(empty?.env.OPENCODE_CONFIG).toBeTruthy()
++    empty?.cleanup()
++
++    const m = opencodeMcpMountStrategy.mount(remoteSearch, { cwd: '/tmp' })
++    expect(m?.serverNames).toEqual(['tangle-search'])
++    const cfg = JSON.parse(readFileSync(m!.env.OPENCODE_CONFIG!, 'utf-8')) as {
++      mcp: Record<string, { type: string; url: string; headers?: Record<string, string> }>
++    }
++    // opencode's remote MCP shape: {type:'remote', url, headers}
++    expect(cfg.mcp['tangle-search']?.type).toBe('remote')
++    expect(cfg.mcp['tangle-search']?.url).toContain('router.tangle.tools')
++    expect(cfg.mcp['tangle-search']?.headers?.Authorization).toBe('Bearer sk-tan-test')
++    const path = m!.env.OPENCODE_CONFIG!
++    m?.cleanup()
++    expect(existsSync(path)).toBe(false)
++  })
++})
++
++describe('kimiMcpMountStrategy', () => {
++  it('passes --mcp-config-file with an empty config when no servers', () => {
++    const m = kimiMcpMountStrategy.mount(null, { cwd: '/tmp' })
++    expect(m?.args[0]).toBe('--mcp-config-file')
++    const path = m!.args[1]!
++    const cfg = JSON.parse(readFileSync(path, 'utf-8')) as { mcpServers: Record<string, unknown> }
++    expect(cfg.mcpServers).toEqual({})
++    m?.cleanup()
++    expect(existsSync(path)).toBe(false)
++  })
++
++  it('forwards a remote http server verbatim (type/url/headers) in the config file', () => {
++    const m = kimiMcpMountStrategy.mount(remoteSearch, { cwd: '/tmp' })
++    expect(m?.serverNames).toEqual(['tangle-search'])
++    const path = m!.args[1]!
++    const cfg = JSON.parse(readFileSync(path, 'utf-8')) as {
++      mcpServers: Record<string, { type: string; url: string; headers?: Record<string, string> }>
++    }
++    expect(cfg.mcpServers['tangle-search']?.type).toBe('http')
++    expect(cfg.mcpServers['tangle-search']?.url).toContain('router.tangle.tools')
++    expect(cfg.mcpServers['tangle-search']?.headers?.Authorization).toBe('Bearer sk-tan-test')
++    m?.cleanup()
++  })
++})
++
++describe('piMcpMountStrategy', () => {
++  let cwd: string
++  const priorOverride = process.env.CLI_BRIDGE_PI_MCP_ADAPTER
++
++  beforeEach(() => {
++    cwd = mkdtempSync(join(tmpdir(), 'mcp-mount-pi-'))
++  })
++  afterEach(() => {
++    if (priorOverride === undefined) delete process.env.CLI_BRIDGE_PI_MCP_ADAPTER
++    else process.env.CLI_BRIDGE_PI_MCP_ADAPTER = priorOverride
++    rmSync(cwd, { recursive: true, force: true })
++  })
++
++  it('mounts nothing (null) when no servers requested', () => {
++    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
++    expect(piMcpMountStrategy.mount(null, { cwd })).toBeNull()
++    expect(piMcpMountStrategy.mount({}, { cwd })).toBeNull()
++  })
++
++  it('FAILS LOUD when servers are requested but the adapter is unavailable', () => {
++    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '0'
++    expect(() => piMcpMountStrategy.mount(remoteSearch, { cwd })).toThrow(BackendError)
++    expect(() => piMcpMountStrategy.mount(remoteSearch, { cwd })).toThrow(/pi-mcp-adapter/)
++  })
++
++  it('writes .pi/mcp.json with the remote http server when the adapter is present', () => {
++    process.env.CLI_BRIDGE_PI_MCP_ADAPTER = '1'
++    const m = piMcpMountStrategy.mount(remoteSearch, { cwd })
++    expect(m?.serverNames).toEqual(['tangle-search'])
++    expect(m?.env).toEqual({})
++    expect(m?.args).toEqual([])
++    const cfgPath = join(cwd, '.pi', 'mcp.json')
++    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8')) as {
++      mcpServers: Record<string, { type: string; url: string; headers?: Record<string, string> }>
++    }
++    expect(cfg.mcpServers['tangle-search']?.type).toBe('http')
++    expect(cfg.mcpServers['tangle-search']?.url).toContain('router.tangle.tools')
++    expect(cfg.mcpServers['tangle-search']?.headers?.Authorization).toBe('Bearer sk-tan-test')
++    m?.cleanup()
++    // workspace file restored (removed) after cleanup
++    expect(existsSync(cfgPath)).toBe(false)
++  })
++})
+-- 
+2.43.0
+
