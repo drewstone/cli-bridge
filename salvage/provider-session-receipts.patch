@@ -1,0 +1,805 @@
+From c0ab9304d4769e95f7664a66039545ed915ddfb6 Mon Sep 17 00:00:00 2001
+From: Drew Stone <drewstone329@gmail.com>
+Date: Tue, 22 Sep 2026 14:23:50 -0600
+Subject: [PATCH] feat(sessions): record provider turn receipts and exact
+ session lookup
+
+Reserve a one-based native prompt ordinal at admission, store the provider
+interval, bridge request digest, and exact user prompt hash per turn, and
+expose one exact read-only session lookup at GET /v1/sessions/:externalId.
+
+Salvaged uncommitted work from 2026-07-30; written against the pre-retained
+session store and not yet reconciled with the retained sessions API on main.
+---
+ src/routes/chat-completions.ts |  39 ++++-
+ src/routes/sessions.ts         |  28 ++++
+ src/sessions/store.ts          | 297 +++++++++++++++++++++++++++++++++
+ tests/smoke.test.ts            | 275 ++++++++++++++++++++++++++++++
+ 4 files changed, 638 insertions(+), 1 deletion(-)
+
+diff --git a/src/routes/chat-completions.ts b/src/routes/chat-completions.ts
+index b8aa698..4f78cbb 100644
+--- a/src/routes/chat-completions.ts
++++ b/src/routes/chat-completions.ts
+@@ -17,6 +17,7 @@
+ import type { Context, Hono } from 'hono'
+ import { streamSSE } from 'hono/streaming'
+ import { z } from 'zod'
++import { createHash } from 'node:crypto'
+ import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
+ import type { BackendRegistry } from '../backends/registry.js'
+ import type { SessionStore } from '../sessions/store.js'
+@@ -406,6 +407,8 @@ export function mountChatCompletions(
+       // report no usage. Estimated in wrap; tool calls are included so tool-heavy turns
+       // are not systematically undercounted.
+       const promptChars = estimateMessagesChars(req.messages)
++      const promptSha256 = exactUserPromptSha256(req)
++      const providerCwd = req.cwd ?? session?.cwd ?? process.cwd()
+ 
+       // Persist internal session id as it flows in. Returns a new
+       // AsyncIterable<ChatDelta> so the typed boundary stays clean.
+@@ -415,9 +418,14 @@ export function mountChatCompletions(
+       // HTTP/SSE shape from the buffered finish_reason.
+       const wrap = (source: AsyncIterable<ChatDelta>): AsyncIterable<ChatDelta> => ({
+         [Symbol.asyncIterator]: async function* () {
++          const providerStartedAt = Date.now()
++          const providerOrdinal = req.session_id
++            ? deps.sessions.approveProviderTurn(req.session_id, backend.name, run.id)
++            : undefined
+           let sawUsage = false
+           let failed = false
+           let completionChars = 0
++          let nativeSessionId = session?.internalId
+           try {
+             for await (const delta of source) {
+               if (delta.usage) sawUsage = true
+@@ -428,11 +436,12 @@ export function mountChatCompletions(
+                   0,
+                 ) ?? 0)
+               if (delta.internal_session_id && req.session_id) {
++                nativeSessionId = delta.internal_session_id
+                 deps.sessions.upsert({
+                   externalId: req.session_id,
+                   backend: backend.name,
+                   internalId: delta.internal_session_id,
+-                  cwd: req.cwd ?? session?.cwd ?? null,
++                  cwd: providerCwd,
+                   metadata: {
+                     model: req.model,
+                     ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
+@@ -457,6 +466,21 @@ export function mountChatCompletions(
+               } satisfies ChatDelta
+             }
+           } finally {
++            const providerEndedAt = Date.now()
++            if (req.session_id && nativeSessionId && providerOrdinal !== undefined) {
++              deps.sessions.recordProviderTurn({
++                externalId: req.session_id,
++                backend: backend.name,
++                internalId: nativeSessionId,
++                cwd: providerCwd,
++                runId: run.id,
++                ordinal: providerOrdinal,
++                bridgeRequestDigest: run.requestDigest,
++                ...(promptSha256 ? { promptSha256 } : {}),
++                startedAt: providerStartedAt,
++                endedAt: providerEndedAt,
++              })
++            }
+             // Errors are NOT caught here. `Run.pump` records a throw that
+             // happened before any output as the run's dispatch error, which the
+             // reader turns into a real HTTP status carrying the message; a throw
+@@ -487,6 +511,19 @@ export function mountChatCompletions(
+   })
+ }
+ 
++/**
++ * Hash only bytes proven to be the native provider's exact user prompt.
++ * Multipart content and synthesized multi-message transcripts remain unknown.
++ */
++function exactUserPromptSha256(
++  req: ChatRequest,
++): `sha256:${string}` | undefined {
++  if (req.messages.length !== 1) return undefined
++  const message = req.messages[0]
++  if (message?.role !== 'user' || typeof message.content !== 'string') return undefined
++  return `sha256:${createHash('sha256').update(message.content, 'utf8').digest('hex')}`
++}
++
+ /** The subset of the non-streaming completion body this route reasons about. */
+ interface CollectedCompletion {
+   error?: { message: string; type: string }
+diff --git a/src/routes/sessions.ts b/src/routes/sessions.ts
+index 5a3d0bf..0dbf480 100644
+--- a/src/routes/sessions.ts
++++ b/src/routes/sessions.ts
+@@ -14,6 +14,34 @@ export function mountSessions(app: Hono, deps: { sessions: SessionStore }): void
+     return c.json({ data: deps.sessions.list(limit) })
+   })
+ 
++  app.get('/v1/sessions/:externalId', (c) => {
++    const externalId = c.req.param('externalId')
++    const backend = c.req.query('backend')
++    if (backend !== undefined && backend.trim().length === 0) {
++      return c.json({
++        error: {
++          message: 'backend must be non-empty when supplied',
++          type: 'invalid_request_error',
++        },
++      }, 400)
++    }
++    const result = deps.sessions.getExact(externalId, backend)
++    if (result.status === 'not-found') {
++      return c.json({
++        error: { message: 'session not found', type: 'not_found_error' },
++      }, 404)
++    }
++    if (result.status === 'ambiguous') {
++      return c.json({
++        error: {
++          message: 'session id is ambiguous; supply backend',
++          type: 'conflict_error',
++        },
++      }, 409)
++    }
++    return c.json({ data: result.session })
++  })
++
+   app.delete('/v1/sessions/:externalId', (c) => {
+     const externalId = c.req.param('externalId')
+     const backend = c.req.query('backend') ?? undefined
+diff --git a/src/sessions/store.ts b/src/sessions/store.ts
+index e5105f9..ce00e89 100644
+--- a/src/sessions/store.ts
++++ b/src/sessions/store.ts
+@@ -26,6 +26,41 @@ export interface SessionRecord {
+   metadata: Record<string, unknown>
+ }
+ 
++export interface ControllerTurnReceipt {
++  /** One-based native provider prompt ordinal within this external session. */
++  ordinal: number
++  runId: string
++  bridgeRequestDigest: string
++  promptSha256: `sha256:${string}`
++  /** Provider request interval as Unix milliseconds. */
++  startedAt: number
++  /** Provider request interval as Unix milliseconds. */
++  endedAt: number
++}
++
++export interface ExactSessionRecord {
++  externalId: string
++  backend: string
++  internalId: string
++  cwd: string
++  nativePromptCount: number
++  controllerTurns: ControllerTurnReceipt[]
++}
++
++export type ExactSessionLookup =
++  | { status: 'found'; session: ExactSessionRecord }
++  | { status: 'not-found' }
++  | { status: 'ambiguous' }
++
++interface StoredProviderTurn {
++  ordinal: number
++  runId: string
++  bridgeRequestDigest: string
++  promptSha256?: `sha256:${string}`
++  startedAt: number
++  endedAt: number
++}
++
+ export class SessionStore {
+   private db: Database.Database
+ 
+@@ -44,10 +79,27 @@ export class SessionStore {
+         created_at INTEGER NOT NULL,
+         last_used_at INTEGER NOT NULL,
+         metadata_json TEXT NOT NULL DEFAULT '{}',
++        provider_turns_json TEXT NOT NULL DEFAULT '[]',
+         PRIMARY KEY (external_id, backend)
+       );
+       CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used_at);
++      CREATE TABLE IF NOT EXISTS provider_turn_approvals (
++        external_id TEXT NOT NULL,
++        backend TEXT NOT NULL,
++        run_id TEXT NOT NULL,
++        ordinal INTEGER NOT NULL,
++        PRIMARY KEY (external_id, backend, run_id),
++        UNIQUE (external_id, backend, ordinal)
++      );
+     `)
++    const columns = this.db.prepare('PRAGMA table_info(sessions)').all() as Array<{
++      name: string
++    }>
++    if (!columns.some((column) => column.name === 'provider_turns_json')) {
++      this.db.exec(
++        "ALTER TABLE sessions ADD COLUMN provider_turns_json TEXT NOT NULL DEFAULT '[]'",
++      )
++    }
+   }
+ 
+   get(externalId: string, backend: string): SessionRecord | null {
+@@ -58,6 +110,41 @@ export class SessionStore {
+     return this.hydrate(row)
+   }
+ 
++  /**
++   * Resolve one exact read-only session without scanning the session list.
++   * Omitting backend succeeds only when the external id names exactly one row.
++   */
++  getExact(externalId: string, backend?: string): ExactSessionLookup {
++    if (backend !== undefined) {
++      const session = this.get(externalId, backend)
++      if (!session) return { status: 'not-found' }
++      return {
++        status: 'found',
++        session: this.exactRecord(
++          session,
++          this.providerTurns(externalId, backend),
++          this.approvedPromptCount(externalId, backend),
++        ),
++      }
++    }
++
++    const rows = this.db.prepare(
++      'SELECT * FROM sessions WHERE external_id = ? ORDER BY backend ASC LIMIT 2',
++    ).all(externalId) as Record<string, unknown>[]
++    if (rows.length === 0) return { status: 'not-found' }
++    if (rows.length > 1) return { status: 'ambiguous' }
++    const row = rows[0]!
++    const session = this.hydrate(row)
++    return {
++      status: 'found',
++      session: this.exactRecord(
++        session,
++        this.hydrateProviderTurns(row.provider_turns_json),
++        this.approvedPromptCount(session.externalId, session.backend),
++      ),
++    }
++  }
++
+   upsert(args: {
+     externalId: string
+     backend: string
+@@ -101,6 +188,154 @@ export class SessionStore {
+     }
+   }
+ 
++  /**
++   * Reserve the native prompt ordinal at controller admission, before execution.
++   *
++   * Existing session.turns anchors migrations whose earlier native prompts predate
++   * receipts. The separate approval row also keeps concurrent completions ordered by
++   * admission rather than whichever provider happens to finish first.
++   */
++  approveProviderTurn(
++    externalId: string,
++    backend: string,
++    runId: string,
++  ): number {
++    return this.db.transaction(() => {
++      const prior = this.db.prepare(
++        `SELECT ordinal FROM provider_turn_approvals
++         WHERE external_id = ? AND backend = ? AND run_id = ?`,
++      ).get(externalId, backend, runId) as { ordinal: number } | undefined
++      if (prior) return prior.ordinal
++      const approved = this.db.prepare(
++        `SELECT MAX(ordinal) AS ordinal FROM provider_turn_approvals
++         WHERE external_id = ? AND backend = ?`,
++      ).get(externalId, backend) as { ordinal: number | null }
++      const session = this.db.prepare(
++        'SELECT turns FROM sessions WHERE external_id = ? AND backend = ?',
++      ).get(externalId, backend) as { turns: number } | undefined
++      const ordinal = Math.max(approved.ordinal ?? 0, session?.turns ?? 0) + 1
++      this.db.prepare(
++        `INSERT INTO provider_turn_approvals (external_id, backend, run_id, ordinal)
++         VALUES (?, ?, ?, ?)`,
++      ).run(externalId, backend, runId, ordinal)
++      return ordinal
++    })()
++  }
++
++  /**
++   * Commit one terminal provider request exactly once.
++   *
++   * The ordinal counts every native prompt, including multipart prompts whose exact
++   * user bytes are unavailable. Those turns remain internal and are deliberately
++   * absent from the public controller-turn receipts.
++   */
++  recordProviderTurn(args: {
++    externalId: string
++    backend: string
++    internalId: string
++    cwd: string
++    runId: string
++    ordinal: number
++    bridgeRequestDigest: string
++    promptSha256?: `sha256:${string}`
++    startedAt: number
++    endedAt: number
++  }): ExactSessionRecord {
++    return this.db.transaction(() => {
++      const row = this.db.prepare(
++        'SELECT * FROM sessions WHERE external_id = ? AND backend = ?',
++      ).get(args.externalId, args.backend) as Record<string, unknown> | undefined
++      const existing = row ? this.hydrate(row) : null
++      const turns = row ? this.hydrateProviderTurns(row.provider_turns_json) : []
++      const prior = turns.find((turn) => turn.runId === args.runId)
++      const approval = this.db.prepare(
++        `SELECT ordinal FROM provider_turn_approvals
++         WHERE external_id = ? AND backend = ? AND run_id = ?`,
++      ).get(args.externalId, args.backend, args.runId) as { ordinal: number } | undefined
++      if (!approval || approval.ordinal !== args.ordinal) {
++        throw new Error(
++          `provider run ${JSON.stringify(args.runId)} has no matching approved native prompt ordinal`,
++        )
++      }
++      const expected = {
++        runId: args.runId,
++        bridgeRequestDigest: args.bridgeRequestDigest,
++        ...(args.promptSha256 ? { promptSha256: args.promptSha256 } : {}),
++        startedAt: args.startedAt,
++        endedAt: args.endedAt,
++      }
++      if (prior) {
++        const { ordinal, ...material } = prior
++        if (ordinal !== args.ordinal) {
++          throw new Error(
++            `provider run ${JSON.stringify(args.runId)} changed its native prompt ordinal`,
++          )
++        }
++        if (JSON.stringify(material) !== JSON.stringify(expected)) {
++          throw new Error(
++            `provider run ${JSON.stringify(args.runId)} is already bound to a different terminal receipt`,
++          )
++        }
++        if (
++          existing?.internalId !== args.internalId
++          || existing.cwd !== args.cwd
++        ) {
++          throw new Error(
++            `provider run ${JSON.stringify(args.runId)} changed its native session identity`,
++          )
++        }
++        return this.exactRecord(
++          existing,
++          turns,
++          this.approvedPromptCount(args.externalId, args.backend),
++        )
++      }
++
++      const providerTurn: StoredProviderTurn = { ordinal: args.ordinal, ...expected }
++      const nextTurns = [...turns, providerTurn].sort((left, right) => left.ordinal - right.ordinal)
++      const now = Date.now()
++      const createdAt = existing?.createdAt ?? now
++      const metadata = existing?.metadata ?? {}
++      // `upsert` already advances the public session turn count. Keep that historical
++      // counter intact when adding the separate terminal-receipt ledger, including for
++      // databases created before provider receipts existed.
++      const sessionTurns = existing?.turns ?? nextTurns.length
++      this.db.prepare(
++        `INSERT INTO sessions (
++           external_id, backend, internal_id, cwd, turns, created_at, last_used_at,
++           metadata_json, provider_turns_json
++         )
++         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++         ON CONFLICT(external_id, backend) DO UPDATE SET
++           internal_id = excluded.internal_id,
++           cwd = excluded.cwd,
++           turns = excluded.turns,
++           last_used_at = excluded.last_used_at,
++           provider_turns_json = excluded.provider_turns_json`,
++      ).run(
++        args.externalId,
++        args.backend,
++        args.internalId,
++        args.cwd,
++        sessionTurns,
++        createdAt,
++        now,
++        JSON.stringify(metadata),
++        JSON.stringify(nextTurns),
++      )
++      return this.exactRecord({
++        externalId: args.externalId,
++        backend: args.backend,
++        internalId: args.internalId,
++        cwd: args.cwd,
++        turns: sessionTurns,
++        createdAt,
++        lastUsedAt: now,
++        metadata,
++      }, nextTurns, this.approvedPromptCount(args.externalId, args.backend))
++    })()
++  }
++
+   list(limit = 100): SessionRecord[] {
+     const rows = this.db.prepare(
+       'SELECT * FROM sessions ORDER BY last_used_at DESC LIMIT ?',
+@@ -135,4 +370,66 @@ export class SessionStore {
+       metadata: JSON.parse((row.metadata_json as string) || '{}'),
+     }
+   }
++
++  private providerTurns(externalId: string, backend: string): StoredProviderTurn[] {
++    const row = this.db.prepare(
++      'SELECT provider_turns_json FROM sessions WHERE external_id = ? AND backend = ?',
++    ).get(externalId, backend) as { provider_turns_json?: unknown } | undefined
++    return this.hydrateProviderTurns(row?.provider_turns_json)
++  }
++
++  private approvedPromptCount(externalId: string, backend: string): number {
++    const approved = this.db.prepare(
++      `SELECT MAX(ordinal) AS ordinal FROM provider_turn_approvals
++       WHERE external_id = ? AND backend = ?`,
++    ).get(externalId, backend) as { ordinal: number | null }
++    const session = this.db.prepare(
++      'SELECT turns FROM sessions WHERE external_id = ? AND backend = ?',
++    ).get(externalId, backend) as { turns: number } | undefined
++    return Math.max(approved.ordinal ?? 0, session?.turns ?? 0)
++  }
++
++  private hydrateProviderTurns(value: unknown): StoredProviderTurn[] {
++    const parsed: unknown = JSON.parse(typeof value === 'string' ? value : '[]')
++    if (!Array.isArray(parsed)) {
++      throw new Error('session provider-turn ledger is malformed')
++    }
++    return parsed as StoredProviderTurn[]
++  }
++
++  private exactRecord(
++    session: SessionRecord,
++    turns: StoredProviderTurn[],
++    nativePromptCount: number,
++  ): ExactSessionRecord {
++    if (!session.cwd) {
++      throw new Error(
++        `session ${JSON.stringify(session.externalId)} has no exact working directory`,
++      )
++    }
++    if (nativePromptCount <= 0) {
++      throw new Error(
++        `session ${JSON.stringify(session.externalId)} has no approved native prompts`,
++      )
++    }
++    return {
++      externalId: session.externalId,
++      backend: session.backend,
++      internalId: session.internalId,
++      cwd: session.cwd,
++      nativePromptCount,
++      controllerTurns: turns.flatMap((turn) =>
++        turn.promptSha256
++          ? [{
++              ordinal: turn.ordinal,
++              runId: turn.runId,
++              bridgeRequestDigest: turn.bridgeRequestDigest,
++              promptSha256: turn.promptSha256,
++              startedAt: turn.startedAt,
++              endedAt: turn.endedAt,
++            }]
++          : [],
++      ),
++    }
++  }
+ }
+diff --git a/tests/smoke.test.ts b/tests/smoke.test.ts
+index 0a39226..01bb028 100644
+--- a/tests/smoke.test.ts
++++ b/tests/smoke.test.ts
+@@ -8,6 +8,7 @@
+  */
+ 
+ import { describe, expect, it, beforeEach, afterEach } from 'vitest'
++import { createHash } from 'node:crypto'
+ import { mkdtempSync, rmSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+@@ -71,6 +72,16 @@ class TerminalFailureBackend extends FakeBackend {
+   }
+ }
+ 
++class SessionTerminalFailureBackend extends FakeBackend {
++  override async *chat(): AsyncIterable<ChatDelta> {
++    yield { internal_session_id: `${this.name}-native` }
++    yield {
++      finish_reason: 'error',
++      error: { message: 'provider failed after session start', type: 'provider_error' },
++    }
++  }
++}
++
+ class TypedFailureBackend extends FakeBackend {
+   calls = 0
+ 
+@@ -154,6 +165,123 @@ describe('SessionStore', () => {
+     expect(store.get('e1', 'claude')?.internalId).toBe('1')
+     expect(store.get('e1', 'claudish')?.internalId).toBe('2')
+   })
++
++  it('assigns one-based native prompt ordinals at terminal commit', () => {
++    const multipartOrdinal = store.approveProviderTurn('e1', 'codex', 'run-multipart')
++    store.recordProviderTurn({
++      externalId: 'e1',
++      backend: 'codex',
++      internalId: 'native-1',
++      cwd: '/workspace',
++      runId: 'run-multipart',
++      ordinal: multipartOrdinal,
++      bridgeRequestDigest: 'bridge-multipart',
++      startedAt: 10,
++      endedAt: 20,
++    })
++    const stringOrdinal = store.approveProviderTurn('e1', 'codex', 'run-string')
++    store.recordProviderTurn({
++      externalId: 'e1',
++      backend: 'codex',
++      internalId: 'native-1',
++      cwd: '/workspace',
++      runId: 'run-string',
++      ordinal: stringOrdinal,
++      bridgeRequestDigest: 'bridge-string',
++      promptSha256: `sha256:${'a'.repeat(64)}`,
++      startedAt: 30,
++      endedAt: 40,
++    })
++
++    expect(store.getExact('e1', 'codex')).toEqual({
++      status: 'found',
++      session: {
++        externalId: 'e1',
++        backend: 'codex',
++        internalId: 'native-1',
++        cwd: '/workspace',
++        nativePromptCount: 2,
++        controllerTurns: [{
++          ordinal: 2,
++          runId: 'run-string',
++          bridgeRequestDigest: 'bridge-string',
++          promptSha256: `sha256:${'a'.repeat(64)}`,
++          startedAt: 30,
++          endedAt: 40,
++        }],
++      },
++    })
++  })
++
++  it('anchors the first receipt after migration to the existing native turn count', () => {
++    for (let turn = 0; turn < 5; turn += 1) {
++      store.upsert({
++        externalId: 'migrated',
++        backend: 'pi',
++        internalId: 'native-migrated',
++        cwd: '/workspace',
++      })
++    }
++    const ordinal = store.approveProviderTurn('migrated', 'pi', 'new-run')
++    expect(ordinal).toBe(6)
++    store.recordProviderTurn({
++      externalId: 'migrated',
++      backend: 'pi',
++      internalId: 'native-migrated',
++      cwd: '/workspace',
++      runId: 'new-run',
++      ordinal,
++      bridgeRequestDigest: `sha256:${'c'.repeat(64)}`,
++      promptSha256: `sha256:${'d'.repeat(64)}`,
++      startedAt: 100,
++      endedAt: 200,
++    })
++
++    expect(store.getExact('migrated', 'pi')).toEqual({
++      status: 'found',
++      session: {
++        externalId: 'migrated',
++        backend: 'pi',
++        internalId: 'native-migrated',
++        cwd: '/workspace',
++        nativePromptCount: 6,
++        controllerTurns: [{
++          ordinal: 6,
++          runId: 'new-run',
++          bridgeRequestDigest: `sha256:${'c'.repeat(64)}`,
++          promptSha256: `sha256:${'d'.repeat(64)}`,
++          startedAt: 100,
++          endedAt: 200,
++        }],
++      },
++    })
++  })
++
++  it('keeps approval order when concurrent turns finish out of order', () => {
++    const first = store.approveProviderTurn('concurrent', 'claude', 'run-1')
++    const second = store.approveProviderTurn('concurrent', 'claude', 'run-2')
++    expect([first, second]).toEqual([1, 2])
++    for (const turn of [
++      { ordinal: second, runId: 'run-2', startedAt: 200, endedAt: 300 },
++      { ordinal: first, runId: 'run-1', startedAt: 100, endedAt: 200 },
++    ]) {
++      store.recordProviderTurn({
++        externalId: 'concurrent',
++        backend: 'claude',
++        internalId: 'native-concurrent',
++        cwd: '/workspace',
++        ...turn,
++        bridgeRequestDigest: `sha256:${turn.ordinal.toString(16).padStart(64, '0')}`,
++        promptSha256: `sha256:${(turn.ordinal + 10).toString(16).padStart(64, '0')}`,
++      })
++    }
++
++    const exact = store.getExact('concurrent', 'claude')
++    expect(exact.status).toBe('found')
++    if (exact.status !== 'found') throw new Error('expected concurrent session')
++    expect(exact.session.nativePromptCount).toBe(2)
++    expect(exact.session.controllerTurns.map((turn) => turn.ordinal)).toEqual([1, 2])
++  })
+ })
+ 
+ describe('BackendRegistry harness matching', () => {
+@@ -357,6 +485,71 @@ describe('POST /v1/chat/completions', () => {
+     expect(sessions.get('s1', 'claude')?.internalId).toBe('claude-int-xyz')
+   })
+ 
++  it('records the exact terminal provider interval, bridge digest, prompt hash, and ordinal', async () => {
++    const res = await app.request('/v1/chat/completions', {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({
++        model: 'claude/sonnet',
++        messages: [{ role: 'user', content: 'exact UTF-8: 🌲' }],
++        stream: true,
++        session_id: 'receipt-session',
++        run_id: 'runtime-node:turn-1',
++        cwd: '/workspace',
++      }),
++    })
++    const bridgeRequestDigest = res.headers.get('x-run-request-digest')
++    expect(bridgeRequestDigest).toBeTruthy()
++    await res.text()
++
++    const exact = sessions.getExact('receipt-session', 'claude')
++    expect(exact.status).toBe('found')
++    if (exact.status !== 'found') throw new Error('expected exact session')
++    const receipt = exact.session.controllerTurns[0]
++    expect(receipt).toMatchObject({
++      ordinal: 1,
++      runId: 'runtime-node:turn-1',
++      bridgeRequestDigest,
++      promptSha256: `sha256:${createHash('sha256').update('exact UTF-8: 🌲', 'utf8').digest('hex')}`,
++    })
++    expect(receipt?.startedAt).toEqual(expect.any(Number))
++    expect(receipt?.endedAt).toEqual(expect.any(Number))
++    expect(receipt!.endedAt).toBeGreaterThanOrEqual(receipt!.startedAt)
++  })
++
++  it('preserves exact session identity for a failed terminal provider turn', async () => {
++    const appLocal = new Hono()
++    mountChatCompletions(appLocal, {
++      registry: new BackendRegistry().register(new SessionTerminalFailureBackend('failed-native')),
++      sessions,
++      runs: new RunRegistry(),
++    })
++
++    const res = await appLocal.request('/v1/chat/completions', {
++      method: 'POST',
++      headers: { 'content-type': 'application/json' },
++      body: JSON.stringify({
++        model: 'failed-native',
++        messages: [{ role: 'user', content: 'fail exactly' }],
++        session_id: 'failed-session',
++        run_id: 'failed-turn',
++        cwd: '/workspace',
++      }),
++    })
++    expect(res.status).toBe(502)
++
++    const exact = sessions.getExact('failed-session', 'failed-native')
++    expect(exact.status).toBe('found')
++    if (exact.status !== 'found') throw new Error('expected failed exact session')
++    expect(exact.session.controllerTurns).toEqual([
++      expect.objectContaining({
++        ordinal: 1,
++        runId: 'failed-turn',
++        bridgeRequestDigest: res.headers.get('x-run-request-digest'),
++      }),
++    ])
++  })
++
+   it('keeps SSE alive while a backend is silent', async () => {
+     const oldHeartbeat = process.env.BRIDGE_SSE_HEARTBEAT_MS
+     process.env.BRIDGE_SSE_HEARTBEAT_MS = '10'
+@@ -1344,6 +1537,88 @@ describe('GET /v1/sessions', () => {
+     expect(Array.isArray(body.data)).toBe(true)
+   })
+ 
++  it('returns one exact backend-disambiguated session without private metadata', async () => {
++    sessions.upsert({
++      externalId: 'exact/id',
++      backend: 'pi',
++      internalId: 'native-pi',
++      cwd: '/workspace',
++      metadata: {
++        forwardedAuthorization: 'Bearer secret',
++        agent_profile: { prompt: { systemPrompt: 'private' } },
++      },
++    })
++    sessions.recordProviderTurn({
++      externalId: 'exact/id',
++      backend: 'pi',
++      internalId: 'native-pi',
++      cwd: '/workspace',
++      runId: 'runtime-node:turn-1',
++      ordinal: sessions.approveProviderTurn('exact/id', 'pi', 'runtime-node:turn-1'),
++      bridgeRequestDigest: 'header-value',
++      promptSha256: `sha256:${'b'.repeat(64)}`,
++      startedAt: 100,
++      endedAt: 200,
++    })
++
++    const res = await app.request('/v1/sessions/exact%2Fid?backend=pi')
++
++    expect(res.status).toBe(200)
++    const body = await res.json() as Record<string, unknown>
++    expect(body).toEqual({
++      data: {
++        externalId: 'exact/id',
++        backend: 'pi',
++        internalId: 'native-pi',
++        cwd: '/workspace',
++        nativePromptCount: 2,
++        controllerTurns: [{
++          ordinal: 2,
++          runId: 'runtime-node:turn-1',
++          bridgeRequestDigest: 'header-value',
++          promptSha256: `sha256:${'b'.repeat(64)}`,
++          startedAt: 100,
++          endedAt: 200,
++        }],
++      },
++    })
++    expect(JSON.stringify(body)).not.toContain('secret')
++    expect(JSON.stringify(body)).not.toContain('agent_profile')
++  })
++
++  it('returns 404 for an exact session that does not exist', async () => {
++    const res = await app.request('/v1/sessions/missing?backend=codex')
++    expect(res.status).toBe(404)
++    await expect(res.json()).resolves.toEqual({
++      error: { message: 'session not found', type: 'not_found_error' },
++    })
++  })
++
++  it('fails closed when an external id is ambiguous without a backend', async () => {
++    sessions.upsert({
++      externalId: 'shared',
++      backend: 'claude',
++      internalId: 'native-claude',
++      cwd: '/workspace',
++    })
++    sessions.upsert({
++      externalId: 'shared',
++      backend: 'opencode',
++      internalId: 'native-opencode',
++      cwd: '/workspace',
++    })
++
++    const res = await app.request('/v1/sessions/shared')
++
++    expect(res.status).toBe(409)
++    await expect(res.json()).resolves.toEqual({
++      error: {
++        message: 'session id is ambiguous; supply backend',
++        type: 'conflict_error',
++      },
++    })
++  })
++
+   it('deletes a session by externalId', async () => {
+     sessions.upsert({ externalId: 'del', backend: 'claude', internalId: 'i-del' })
+     const res = await app.request('/v1/sessions/del', { method: 'DELETE' })
+-- 
+2.43.0
+
