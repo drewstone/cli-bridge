@@ -1017,6 +1017,7 @@ A caller that runs under the operator's `lineage` tool (tangle-tools `lineage/`)
 The bridge sets them as the harness child's `TANGLE_*` environment on the host, scoped-host and docker executors, and adds them to its `OTEL_RESOURCE_ATTRIBUTES`.
 The recognized headers are `x-tangle-run-id`, `-parent-run-id`, `-root-run-id`, `-edge-kind`, `-operator`, `-project`, `-account` and `-harness`.
 `TANGLE_HOST` is the bridge's own host, because the child runs there.
+Retained sessions read the same headers on `POST /v1/sessions/:id/turns` and `/input`; the turn that starts the native process sets its lineage.
 A request without `x-tangle-run-id` stamps nothing.
 The bridge never passes its own ambient `TANGLE_*` lineage to a child.
 Header values outside `[A-Za-z0-9_.:@+/-]`, or longer than 128 characters, are dropped.

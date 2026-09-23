@@ -1190,6 +1190,24 @@ describe('retained Agent Interface sessions', () => {
     expect(backend.requests[0]?.agent_profile).toBeUndefined()
   })
 
+  it('hands the turn lineage headers to the native spawn', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    expect((await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'lineage-turn', model: 'pi/test' }),
+    })).status).toBe(201)
+    const run = `run_${'c'.repeat(32)}`
+    const turn = await fixture.app.request('/v1/sessions/lineage-turn/turns', {
+      method: 'POST',
+      headers: { 'x-tangle-run-id': run, 'x-tangle-harness': 'pi' },
+      body: JSON.stringify({ message: 'work', run_id: 'lineage-run' }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('lineage-turn')?.turns === 1)
+    expect(backend.requests[0]?.childLineage).toMatchObject({ TANGLE_RUN_ID: run, TANGLE_HARNESS: 'pi' })
+  })
+
   it('rejects retained creates and turns that omit caller-owned retry identities', async () => {
     fixture = setup(new FakeNativeBackend())
     const missingSessionId = await fixture.app.request('/v1/sessions', {

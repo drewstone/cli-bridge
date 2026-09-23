@@ -6,6 +6,7 @@ import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import { BackendError } from '../../backends/types.js'
 import { ExecutorSaturatedError } from '../../executors/types.js'
 import { setExactRunIdentityHeaders } from '../../runs/headers.js'
+import { lineageChildEnv } from '../../trace/lineage.js'
 import { retainedCancellationAcknowledgement } from './control-acknowledgement.js'
 import { RETAINED_MAX_HTTP_BODY_BYTES } from './schema.js'
 import { RetainedSessionError } from './types.js'
@@ -93,6 +94,7 @@ export function mountRetainedSessions(
       const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await readBoundedJson(c.req.raw)), {
         signal: c.req.raw.signal,
         callerId: canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback'),
+        childLineage: lineageChildEnv((name) => c.req.header(name)),
       })
       return c.json(
         { session: service.get(c.req.param('id')), run: result.run, context_boundary: result.contextBoundary },
@@ -136,6 +138,7 @@ export function mountRetainedSessions(
         queue: true,
         signal: c.req.raw.signal,
         callerId: canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback'),
+        childLineage: lineageChildEnv((name) => c.req.header(name)),
       })
       return c.json(
         { session: service.get(c.req.param('id')), run: result.run, context_boundary: result.contextBoundary },
