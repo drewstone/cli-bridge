@@ -678,6 +678,7 @@ The `3G` floor is the previous fixed default, so no host gets a tighter cap than
 The `8G` ceiling is about 2.6 times the largest legitimate lane observed: python review lanes at 3.0 GB were OOM-killed under the old `3G` cap.
 Set `CLI_BRIDGE_SCOPE_MEMORY_MAX` to any systemd `MemoryMax=` value to override it.
 `/health` reports the effective value as `executor.scoped_host.memory_max`.
+The value is `null` when systemd scopes are unavailable, because spawns then run without a cap.
 
 `BRIDGE_HEALTH_READY_CACHE_TTL_MS` optionally caches successful backend readiness probes for the
 specified number of milliseconds. It defaults to `0`, so readiness is rechecked on every request.

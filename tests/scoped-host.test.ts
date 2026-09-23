@@ -120,8 +120,10 @@ describe('scopedHostSpawner — host-sized memory cap', () => {
     expect(resolveScopeMemoryMax({ CLI_BRIDGE_SCOPE_MEMORY_MAX: '' }, '8G')).toBe('8G')
   })
 
-  it('reports the cap the next scope receives in the executor snapshot', () => {
-    expect(scopedHostExecutorSnapshot().memory_max).toBe(resolveScopeMemoryMax())
+  it('reports the cap the next scope receives, and null when spawns fall back unscoped', () => {
+    // Without a systemd user manager (macOS, Docker CI) spawns go to hostSpawner with no MemoryMax,
+    // so reporting a cap there would tell /health consumers a runaway child is bounded when it is not.
+    expect(scopedHostExecutorSnapshot().memory_max).toBe(systemdRunAvailable ? resolveScopeMemoryMax() : null)
   })
 })
 

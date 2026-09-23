@@ -529,7 +529,8 @@ export function scopedHostConcurrencyLimits(): { max: number; reserved: number }
 /**
  * Diagnostics for /metrics and /health. `memory_max` is the value the next
  * scope receives, so an operator can confirm the host-sized default or the
- * override without starting a run.
+ * override without starting a run. It is `null` when systemd-run is unusable:
+ * spawns then fall back to hostSpawner and no cap bounds them.
  */
 export function scopedHostExecutorSnapshot(): {
   in_flight: number
@@ -544,9 +545,12 @@ export function scopedHostExecutorSnapshot(): {
   bulk_max: number
   queued_reserved: number
   queued_bulk: number
-  memory_max: string
+  memory_max: string | null
 } {
-  return { ...scopedSemaphore.snapshot(), memory_max: resolveScopeMemoryMax() }
+  return {
+    ...scopedSemaphore.snapshot(),
+    memory_max: probeSystemdRun() ? resolveScopeMemoryMax() : null,
+  }
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
