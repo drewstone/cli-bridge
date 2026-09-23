@@ -1612,7 +1612,9 @@ describe('Spawner injection works across all subprocess backends', () => {
     // by every conforming consumer) — see backends/types.ts ChatDelta.
     const originalProgressMs = process.env.KIMI_PROGRESS_MS
     process.env.KIMI_PROGRESS_MS = '10'
-    const stub = createDelayedStubSpawner(35)
+    // The child stays silent 25x the progress interval, so a loaded event loop still fires a
+    // keepalive before stdout closes (35 ms flaked under the full parallel suite).
+    const stub = createDelayedStubSpawner(250)
     const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5000, spawner: stub.spawner })
     const ctrl = new AbortController()
     const deltas: Array<{
@@ -1994,7 +1996,7 @@ describe('Spawner injection works across all subprocess backends', () => {
     // tool_call to signal liveness.
     const originalProgressMs = process.env.OPENCODE_PROGRESS_MS
     process.env.OPENCODE_PROGRESS_MS = '10'
-    const stub = createDelayedStubSpawner(35)
+    const stub = createDelayedStubSpawner(250)
     const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5000, spawner: stub.spawner })
     const ctrl = new AbortController()
     const deltas: Array<{

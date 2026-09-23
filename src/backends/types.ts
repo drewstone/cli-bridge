@@ -345,6 +345,13 @@ export interface ChatRequest {
    */
   childTrace?: CallerTrace | null
   /**
+   * Session lineage (`TANGLE_*`) the spawned harness child inherits, set by the chat route from the
+   * request's `x-tangle-*` headers (see `trace/lineage.ts`). NOT part of the wire schema. Each
+   * backend forwards it to its spawn as `lineageEnv`, beside `jail`. null/absent = the caller sent
+   * no lineage and the child env is unchanged.
+   */
+  childLineage?: Readonly<Record<string, string>> | null
+  /**
    * Admission lane this turn was granted, set by the chat route. NOT part of
    * the wire schema — it is derived from `x-tangle-client`.
    *
