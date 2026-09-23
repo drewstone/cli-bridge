@@ -665,8 +665,19 @@ The semaphore is the box-protection layer: each `claude --print` is 500 MB to 2 
 | `CLI_BRIDGE_SCOPE_MAX_CONCURRENCY` | `4` | The same cap for the systemd-scoped executor on Linux. |
 | `CLI_BRIDGE_SCOPE_ACQUIRE_DEADLINE_MS` | `60000` | Its default wait. |
 | `CLI_BRIDGE_SCOPE_MAX_ACQUIRE_DEADLINE_MS` | `900000` | Its ceiling on a request value. |
+| `CLI_BRIDGE_SCOPE_MEMORY_MAX` | host RAM ÷ 8, from `3G` to `8G` | `MemoryMax` of each systemd scope, for the CLI and every process under it. |
 | `BRIDGE_POOL_ACQUIRE_DEADLINE_MS` | `60000` | Default wait for a Docker pool slot. |
 | `BRIDGE_POOL_MAX_ACQUIRE_DEADLINE_MS` | `900000` | Its ceiling on a request value. |
+
+The scope memory cap follows host memory, so a new box needs no override.
+The bridge divides `MemTotal` by 8, rounds up to a whole GiB, and keeps the result from `3G` to `8G`.
+A host with 64 GB or more gets `8G`; a 32 GB host gets `4G`; a 24 GB or smaller host gets `3G`.
+Rounding up absorbs up to 8 GiB of firmware and integrated-GPU reservation, so a 128 GB host that reports 121 GiB still counts as large.
+One eighth keeps the default 4 concurrent scopes within half of host memory.
+The `3G` floor is the previous fixed default, so no host gets a tighter cap than before.
+The `8G` ceiling is about 2.6 times the largest legitimate lane observed: python review lanes at 3.0 GB were OOM-killed under the old `3G` cap.
+Set `CLI_BRIDGE_SCOPE_MEMORY_MAX` to any systemd `MemoryMax=` value to override it.
+`/health` reports the effective value as `executor.scoped_host.memory_max`.
 
 `BRIDGE_HEALTH_READY_CACHE_TTL_MS` optionally caches successful backend readiness probes for the
 specified number of milliseconds. It defaults to `0`, so readiness is rechecked on every request.
