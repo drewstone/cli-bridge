@@ -84,15 +84,15 @@ describe('scopedHostSpawner — host-sized memory cap', () => {
     ['the 128 GB GTR as os.totalmem() reports it', 127_396_944 * 1024, '8G'],
     ['a 64 GB host with nothing reserved', 64 * GiB, '8G'],
     ['a 64 GB host whose firmware reserves ~6%, as the GTR does', 60.5 * GiB, '8G'],
-    ['a 64 GB host with just under 8 GiB reserved', 56.1 * GiB, '8G'],
+    ['a 64 GB host with just under 8 GiB reserved', Math.round(56.1 * GiB), '8G'],
     ['a 512 GiB host, held at the ceiling', 512 * GiB, '8G'],
     ['a 64 GB host with a full 8 GiB carve-out, which leaves 56 GiB', 56 * GiB, '7G'],
-    ['a 48 GB host', 46.8 * GiB, '6G'],
+    ['a 48 GB host', Math.round(46.8 * GiB), '6G'],
     ['a 32 GB host', 31 * GiB, '4G'],
     ['a 24 GB host', 23 * GiB, '3G'],
     ['a 16 GB host, raised to the floor', 15.5 * GiB, '3G'],
     ['an 8 GiB VM, raised to the floor', 8 * GiB, '3G'],
-  ])('sizes %s at %s', (_host, bytes, expected) => {
+  ])('gives %s (%d bytes) a %s cap', (_host, bytes, expected) => {
     expect(defaultScopeMemoryMax(bytes)).toBe(expected)
   })
 
