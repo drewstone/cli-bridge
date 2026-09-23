@@ -32,14 +32,14 @@ const CODEX_MODELS = [
 // prefixes are routable — discovery keeps only models under these providers,
 // dropping the CLI's free tiers and unconfigured providers.
 const OPENCODE_MODELS: ReadonlyArray<ModelSpec> = [
-  { id: 'kimi-for-coding/k2p6', note: 'Kimi K2.6 via opencode provider' },
-  { id: 'kimi-for-coding/k2p7', note: 'Kimi K2.7 via opencode provider' },
-  { id: 'kimi-for-coding/k3', note: 'Kimi K3 via opencode provider' },
-  { id: 'zai-coding-plan/glm-5.2', note: 'GLM 5.2 via configured coding provider' },
-  { id: 'zai-coding-plan/glm-5.1', note: 'GLM 5.1 via configured coding provider' },
-  { id: 'zai-coding-plan/glm-5-turbo', note: 'GLM 5 Turbo via configured coding provider' },
+  { id: 'kimi-for-coding/k3', note: 'Kimi K3 via the Kimi Code subscription' },
+  { id: 'zai-coding-plan/glm-5.3', note: 'GLM 5.3 via the Z.ai coding plan' },
+  { id: 'zai-coding-plan/glm-5-turbo', note: 'GLM 5 Turbo via the Z.ai coding plan' },
   { id: 'deepseek/deepseek-v4-pro' },
-  { id: 'deepseek/deepseek-v4-flash', note: 'DeepSeek v4 light/flash tier' },
+  { id: 'deepseek/deepseek-flash', note: 'DeepSeek V4.1 Flash; deepseek-v4-flash is a retired alias' },
+  // The router seed makes tangle-router a routable opencode provider, so a host
+  // whose direct provider account is unfunded can still reach the same model.
+  { id: 'tangle-router/deepseek/deepseek-v4.1-flash', note: 'DeepSeek V4.1 Flash via opencode → tangle-router (TANGLE_API_KEY required)' },
 ]
 
 const PI_MODELS: ReadonlyArray<ModelSpec> = [
