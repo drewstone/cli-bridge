@@ -45,6 +45,27 @@ interface PiMarkerWaiter {
   timer?: ReturnType<typeof setTimeout>
 }
 
+const STDERR_DRAIN_GRACE_MS = 500
+const STDERR_TAIL_CHARS = 1_000
+
+/**
+ * Returns the last printable stderr characters with common credential shapes
+ * removed. Pi's stderr is untrusted child output that reaches API callers.
+ */
+export function redactedStderrTail(stderr: string, maxChars = STDERR_TAIL_CHARS): string {
+  const sanitized = stderr
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f-\x9f]+/gu, ' ')
+    .replace(/\b(Bearer\s+)[^\s,;]+/giu, '$1<redacted>')
+    .replace(/\b(sk-(?:ant-|proj-)?|ghp_|gho_|github_pat_|xox[a-z]-)[A-Za-z0-9_-]{8,}/gu, '<redacted>')
+    .replace(/\b([A-Za-z0-9_]*(?:api[_-]?key|token|secret|password)[A-Za-z0-9_]*["']?\s*[:=]\s*["']?)[^\s"',;]+/giu, '$1<redacted>')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  return sanitized.length <= maxChars ? sanitized : `...${sanitized.slice(-maxChars)}`
+}
+
 /** A single Pi RPC child; the retained-session service owns the public events. */
 export class PiNativeSession implements NativeSession {
   readonly capabilities: AgentEnvironmentCapabilities
@@ -92,12 +113,12 @@ export class PiNativeSession implements NativeSession {
     this.child.stdout?.on('data', (chunk) => this.consume(chunk.toString()))
     this.child.stderr?.on('data', (chunk) => this.stderr.append(chunk))
     this.child.stdin?.on('error', (error) => this.end(error))
-    this.child.stdout?.on('end', () => this.end(new Error('pi RPC stdout ended')))
+    this.child.stdout?.on('end', () => this.endAfterStderrDrains('pi RPC stdout ended'))
     this.child.on('error', (error) => {
       this.childError = error
       this.end(error)
     })
-    this.child.on('close', () => this.end(this.childError ?? new Error('pi RPC process closed')))
+    this.child.on('close', () => this.end(this.childError ?? this.exitError('pi RPC process closed')))
   }
 
   providerSessionId(): string | null {
@@ -420,6 +441,37 @@ export class PiNativeSession implements NativeSession {
       })
       signal.addEventListener('abort', onAbort, { once: true })
     })
+  }
+
+  /**
+   * Pi reports fatal startup failures (for example EROFS on its session file) on
+   * stderr just before its stdout closes. The two pipes end in no fixed order,
+   * so wait briefly for stderr to drain before building the terminal error.
+   */
+  private endAfterStderrDrains(reason: string): void {
+    const stderr = this.child.stderr
+    if (this.closed || !stderr || stderr.readableEnded || stderr.destroyed) {
+      this.end(this.exitError(reason))
+      return
+    }
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      stderr.off('end', finish)
+      stderr.off('close', finish)
+      this.end(this.exitError(reason))
+    }
+    const timer = setTimeout(finish, STDERR_DRAIN_GRACE_MS)
+    timer.unref?.()
+    stderr.once('end', finish)
+    stderr.once('close', finish)
+  }
+
+  private exitError(reason: string): Error {
+    const tail = redactedStderrTail(this.stderr.render())
+    return new Error(tail ? `${reason}: ${tail}` : reason)
   }
 
   private end(error: Error): void {

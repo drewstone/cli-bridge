@@ -150,6 +150,33 @@ describe('LinuxBwrapJail.wrap read-confine (fs-jail)', () => {
     expect(cfgAt, 'config dir re-bound').toBeGreaterThanOrEqual(0)
     expect(cfgAt, 'config re-bind comes AFTER the tmpfs so it wins').toBeGreaterThan(tmpfsAt)
   })
+
+  it('keeps a path registered as both writable and readable writable, and a nested read-only subpath read-only', async () => {
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    const stateDir = await mkdtemp(join(tmpdir(), 'cli-bridge-pi-state-'))
+    cleanups.push(() => rm(stateDir, { recursive: true, force: true }))
+    const sessionDir = join(stateDir, 'sessions')
+    const codeDir = join(stateDir, 'code')
+
+    // pi registers its agent/session dirs in BOTH lists (pi-native-start.ts).
+    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
+      root,
+      projectDir,
+      readConfine: true,
+      extraWritablePaths: [stateDir, sessionDir],
+      extraReadablePaths: [sessionDir, codeDir],
+    })
+    const argv = [wrap.bin, ...wrap.args]
+    const sessionRw = seqIndex(argv, '--bind', sessionDir, sessionDir)
+    expect(sessionRw, 'session dir is bind-writable').toBeGreaterThanOrEqual(0)
+    expect(seqIndex(argv, '--ro-bind-try', sessionDir, sessionDir), 'no ro-bind masks the writable session dir').toBe(-1)
+
+    const stateRw = seqIndex(argv, '--bind', stateDir, stateDir)
+    const codeRo = seqIndex(argv, '--ro-bind-try', codeDir, codeDir)
+    expect(codeRo, 'nested read-only subpath is still bound read-only').toBeGreaterThanOrEqual(0)
+    expect(codeRo, 'and after its writable parent so it wins').toBeGreaterThan(stateRw)
+  })
 })
 
 describe('toolchainReadPaths', () => {
