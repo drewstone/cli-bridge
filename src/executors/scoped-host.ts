@@ -55,6 +55,7 @@ import { writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { posix } from 'node:path'
 import { promisify } from 'node:util'
+import { withLineageEnv } from '../trace/lineage.js'
 import { executorSaturatedError, hostSpawner, sanitizeHostEnv } from './host.js'
 import { applyJail } from './jail-support.js'
 import type { Spawner, SpawnResult } from './types.js'
@@ -423,7 +424,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
       env: resolveScopedSpawnEnv(
-        sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys),
+        withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv),
         busTransportEnv,
       ),
       // `detached: true` makes the wrapper a process-group leader, so

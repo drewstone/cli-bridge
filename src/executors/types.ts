@@ -113,6 +113,13 @@ export interface SpawnOpts {
    */
   jail?: JailSpec | null
   /**
+   * Session lineage (`TANGLE_*`) for this spawn, from `ChatRequest.childLineage`. The host and
+   * scoped-host spawners merge it OVER the sanitized env, because the sanitizer's allowlist drops
+   * the daemon's own ambient `TANGLE_*` on purpose: a child's lineage is the request's, never the
+   * bridge's. Absent/null = the env is byte-identical to the unstamped path.
+   */
+  lineageEnv?: Readonly<Record<string, string>> | null
+  /**
    * Admission lane for this spawn. The scoped-host executor keeps
    * `reserved` slots free of `bulk` work so a merge-gating caller that already
    * cleared host admission is not starved again at the executor.

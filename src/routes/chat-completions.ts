@@ -58,6 +58,7 @@ import {
 import { BackendReportedFailureError } from '../runs/error-shape.js'
 import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
+import { lineageChildEnv } from '../trace/lineage.js'
 import {
   assertPiOutputTokenRequest,
   assertProfileRequestAuthority,
@@ -867,6 +868,9 @@ export function mountChatCompletions(
     // then nests under the node that actually spawned it — else the caller's
     // ids travel through verbatim. A request with no correlation stamps
     // nothing: the child env stays byte-identical to the pre-channel bridge.
+    // Session lineage rides beside the trace: `x-tangle-*` headers become the child's
+    // `TANGLE_*` env (see `trace/lineage.ts`); absent headers stamp nothing.
+    req.childLineage = lineageChildEnv((name) => c.req.header(name))
     req.childTrace = callerTrace.caller === null
       ? null
       : recorder !== null

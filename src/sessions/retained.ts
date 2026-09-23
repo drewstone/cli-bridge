@@ -288,7 +288,12 @@ export class RetainedSessionService {
   beginTurn(
     id: string,
     input: RetainedTurnInput,
-    options: { queue?: boolean; signal?: AbortSignal; callerId?: string } = {},
+    options: {
+      queue?: boolean
+      signal?: AbortSignal
+      callerId?: string
+      childLineage?: Readonly<Record<string, string>> | null
+    } = {},
   ): Promise<RetainedTurnResult> {
     return this.turns.beginTurn(id, input, options)
   }

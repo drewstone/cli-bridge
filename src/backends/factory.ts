@@ -92,6 +92,7 @@ export class FactoryBackend implements Backend {
       env: process.env,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
       ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
     })
     const child = spawned.child

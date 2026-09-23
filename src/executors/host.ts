@@ -25,6 +25,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { LINEAGE_ENV_KEYS, withLineageEnv } from '../trace/lineage.js'
 import { applyJail } from './jail-support.js'
 import { ExecutorSaturatedError, type SpawnOpts, type SpawnResult, type Spawner } from './types.js'
 
@@ -195,7 +196,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
       signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys),
+      env: withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv),
       detached: true,
     })
     // Synchronous error capture — Node fires 'error' on nextTick for spawn
@@ -263,6 +264,7 @@ export function sanitizeHostEnv(
     // restarted the daemon — and letting that through would parent every
     // child's spans under the bridge's own launch context instead of its
     // caller's trace. Same value as ambient = inherited, so it stays stripped.
+    if (LINEAGE_ENV_KEYS.has(key)) continue
     if (TRACE_PROPAGATION_ENV_KEYS.has(key)) {
       if (process.env[key] !== value) out[key] = value
       continue

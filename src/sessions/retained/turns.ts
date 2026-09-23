@@ -64,6 +64,11 @@ export interface RetainedBeginTurnOptions extends TurnLaneOptions {
   expectedContextBoundary?: NativeContextBoundaryProof
   /** Report the source proof observed during the same native handoff check. */
   onBoundaryVerified?: (proof: NativeContextBoundaryProof) => void
+  /**
+   * Session lineage from the turn's `x-tangle-*` headers. Only a turn that starts the native
+   * process uses it: the harness child keeps the lineage it started with for its whole life.
+   */
+  childLineage?: Readonly<Record<string, string>> | null
 }
 
 export class RetainedTurnRunner {
@@ -371,7 +376,8 @@ export class RetainedTurnRunner {
       this.store.updateRetainedRun(runId, requestDigest, run.snapshot())
       this.store.updateRetained(id, { status: 'running', runId })
       releaseNativeAttachment = run.reserveNativeControlAttachment()
-      const request = this.requestFor(retained, input, prompt, interactions, config, contextMessages)
+      const request = this.requestFor(retained, input, prompt, interactions, config, contextMessages,
+        options.childLineage)
       try {
         if (!native) {
           native = await backend.startNativeSession(request, sessionRecordFor(retained), run.signal)
@@ -541,6 +547,7 @@ export class RetainedTurnRunner {
     interactions: RequestedInteractions,
     config: RetainedRequestConfig,
     contextMessages: ChatRequest['messages'],
+    childLineage?: Readonly<Record<string, string>> | null,
   ): ChatRequest {
     const mode = record.metadata.mode
     return {
@@ -571,6 +578,7 @@ export class RetainedTurnRunner {
         ? { runtime_attachments: { mcp: config.runtimeAttachments } as ChatRequest['runtime_attachments'] }
         : {}),
       ...(Object.keys(config.metadata).length > 0 ? { metadata: config.metadata } : {}),
+      ...(childLineage ? { childLineage } : {}),
     }
   }
 
