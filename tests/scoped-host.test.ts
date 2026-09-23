@@ -11,12 +11,17 @@
  * systemd-run + a user manager (Docker CI, macOS).
  */
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
+  defaultScopeMemoryMax,
   isOwnedScopeControlGroup,
+  resolveScopeMemoryMax,
   resolveScopedSpawnEnv,
+  scopedHostExecutorSnapshot,
   scopedHostSpawner,
 } from '../src/executors/scoped-host.js'
 import { killTree } from '../src/executors/process-tree.js'
@@ -61,6 +66,89 @@ describe('scopedHostSpawner — the wrapper environment', () => {
 
   it('does not invent transport variables the bridge itself does not have', () => {
     expect(resolveScopedSpawnEnv({ PATH: '/usr/bin' }, {})).toEqual({ PATH: '/usr/bin' })
+  })
+})
+
+const GiB = 1024 ** 3
+
+/** systemd's MemoryMax= syntax (base-1024 K/M/G/T suffix, or bytes) → bytes. */
+function systemdBytes(value: string): number {
+  const m = /^(\d+)([KMGT]?)$/.exec(value)
+  if (!m) throw new Error(`unparseable MemoryMax: ${value}`)
+  const exp = ['', 'K', 'M', 'G', 'T'].indexOf(m[2]!)
+  return Number(m[1]) * 1024 ** exp
+}
+
+describe('scopedHostSpawner — host-sized memory cap', () => {
+  it.each([
+    // The regression: the 128 GB GTR (MemTotal 127396944 kB) had a fixed 3G cap and the kernel
+    // OOM-killed ~3.0 GB python review lanes inside their scopes on 2026-09-22.
+    ['the 128 GB GTR as os.totalmem() reports it', 127_396_944 * 1024, '8G'],
+    ['a 64 GB host with nothing reserved', 64 * GiB, '8G'],
+    ['a 64 GB host whose firmware reserves ~6%, as the GTR does', 60.5 * GiB, '8G'],
+    ['a 64 GB host with just under 8 GiB reserved', Math.round(56.1 * GiB), '8G'],
+    ['a 512 GiB host, held at the ceiling', 512 * GiB, '8G'],
+    ['a 64 GB host with a full 8 GiB carve-out, which leaves 56 GiB', 56 * GiB, '7G'],
+    ['a 48 GB host', Math.round(46.8 * GiB), '6G'],
+    ['a 32 GB host', 31 * GiB, '4G'],
+    ['a 24 GB host', 23 * GiB, '3G'],
+    ['a 16 GB host, raised to the floor', 15.5 * GiB, '3G'],
+    ['an 8 GiB VM, raised to the floor', 8 * GiB, '3G'],
+  ])('gives %s (%d bytes) a %s cap', (_host, bytes, expected) => {
+    expect(defaultScopeMemoryMax(bytes)).toBe(expected)
+  })
+
+  it('never lowers a host below the old fixed 3G default', () => {
+    for (let gib = 1; gib <= 1024; gib += 1) {
+      expect(systemdBytes(defaultScopeMemoryMax(gib * GiB))).toBeGreaterThanOrEqual(3 * GiB)
+    }
+  })
+
+  it('falls back to the floor when the host reports no usable memory size', () => {
+    expect(defaultScopeMemoryMax(0)).toBe('3G')
+    expect(defaultScopeMemoryMax(-1)).toBe('3G')
+    expect(defaultScopeMemoryMax(Number.NaN)).toBe('3G')
+    expect(defaultScopeMemoryMax(Number.POSITIVE_INFINITY)).toBe('3G')
+  })
+
+  it('lets CLI_BRIDGE_SCOPE_MEMORY_MAX override the host-sized default verbatim', () => {
+    expect(resolveScopeMemoryMax({ CLI_BRIDGE_SCOPE_MEMORY_MAX: '12G' }, '8G')).toBe('12G')
+    expect(resolveScopeMemoryMax({ CLI_BRIDGE_SCOPE_MEMORY_MAX: '2G' }, '8G')).toBe('2G')
+    expect(resolveScopeMemoryMax({ CLI_BRIDGE_SCOPE_MEMORY_MAX: 'infinity' }, '8G')).toBe('infinity')
+  })
+
+  it('treats an unset or empty override as absent', () => {
+    expect(resolveScopeMemoryMax({}, '8G')).toBe('8G')
+    expect(resolveScopeMemoryMax({ CLI_BRIDGE_SCOPE_MEMORY_MAX: '' }, '8G')).toBe('8G')
+  })
+
+  it('reports the cap the next scope receives, and null when spawns fall back unscoped', () => {
+    // Without a systemd user manager (macOS, Docker CI) spawns go to hostSpawner with no MemoryMax,
+    // so reporting a cap there would tell /health consumers a runaway child is bounded when it is not.
+    expect(scopedHostExecutorSnapshot().memory_max).toBe(systemdRunAvailable ? resolveScopeMemoryMax() : null)
+  })
+
+  // Needs only the systemd-run binary (ubuntu CI has it): the user manager is faked with a runtime
+  // dir, and no scope is started.
+  const systemdRunInstalled = existsSync('/usr/bin/systemd-run') || existsSync('/bin/systemd-run')
+  ;(systemdRunInstalled ? it : it.skip)('does not let a diagnostic read cache a transient user-manager absence', async () => {
+    // Regression: the snapshot once called the caching spawn probe, so polling /health while the
+    // user manager restarted cached `false` and sent every later spawn to the uncapped fallback.
+    const runtimeDir = mkdtempSync(join(tmpdir(), 'cli-bridge-xdg-'))
+    const savedRuntimeDir = process.env.XDG_RUNTIME_DIR
+    process.env.XDG_RUNTIME_DIR = runtimeDir
+    try {
+      vi.resetModules()
+      const fresh = await import('../src/executors/scoped-host.js')
+      expect(fresh.scopedHostExecutorSnapshot().memory_max).toBeNull()
+      mkdirSync(join(runtimeDir, 'systemd'))
+      writeFileSync(join(runtimeDir, 'systemd', 'private'), '')
+      expect(fresh.scopedHostExecutorSnapshot().memory_max).toBe(fresh.resolveScopeMemoryMax())
+    } finally {
+      if (savedRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = savedRuntimeDir
+      rmSync(runtimeDir, { recursive: true, force: true })
+    }
   })
 })
 
@@ -197,6 +285,25 @@ describeReal('scopedHostSpawner — real cgroup isolation', () => {
       try { process.kill(grandchildPid, 0); return false } catch { return true }
     }, 3000)
     expect(reaped, `grandchild pid=${grandchildPid} survived release()`).toBe(true)
+  })
+
+  it('applies the resolved memory cap to the scope cgroup', async () => {
+    const r = await scopedHostSpawner('/bin/sleep', ['5'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    try {
+      const inScope = await waitUntil(
+        () => cgroupOf(r.child.pid!)?.includes('cli-bridge-llm.slice') ?? false,
+        2000,
+      )
+      expect(inScope, `process is not in cli-bridge-llm.slice; cgroup=${cgroupOf(r.child.pid!)}`).toBe(true)
+      const memoryMax = readFileSync(`/sys/fs/cgroup${cgroupOf(r.child.pid!)}/memory.max`, 'utf8').trim()
+      const expected = resolveScopeMemoryMax()
+      expect(memoryMax).toBe(expected === 'infinity' ? 'max' : String(systemdBytes(expected)))
+    } finally {
+      r.release()
+      await killTree(r.child)
+    }
   })
 
   it('release() is idempotent', async () => {

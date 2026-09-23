@@ -53,6 +53,7 @@ import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { totalmem } from 'node:os'
 import { posix } from 'node:path'
 import { promisify } from 'node:util'
 import { withLineageEnv } from '../trace/lineage.js'
@@ -62,8 +63,58 @@ import type { Spawner, SpawnResult } from './types.js'
 
 const SLICE = 'cli-bridge-llm.slice'
 const DEFAULT_SCOPE_TASKS_MAX = 128
-const DEFAULT_SCOPE_MEMORY_MAX = '3G'
 const DEFAULT_SCOPE_MAX_CONCURRENCY = 4
+const GIB = 1024 ** 3
+
+/**
+ * Per-scope `MemoryMax` default, sized from host memory.
+ *
+ * `MemoryMax` bounds the whole scope: the harness CLI, the tools it runs, and
+ * any test workers under them. The old fixed `3G` fit a 32 GB box but killed
+ * legitimate work on the 128 GB GTR: on 2026-09-22 the kernel OOM-killed
+ * python lanes under Kimi at `anon-rss` ≈ 3.0 GB (pids 953753 and 940526),
+ * then 12 discovery-lab lanes, all in `cli-bridge-llm` scopes limited to
+ * 3145728 kB, until each bridge got a per-host override.
+ *
+ * - One eighth of host memory: one runaway lane can hold at most 1/8 of RAM,
+ *   so the default 4 concurrent scopes hold at most half the host and
+ *   interactive sessions and sshd keep the rest.
+ * - Rounded up to a whole GiB: `MemTotal` reads below installed RAM because
+ *   firmware, the kernel, and integrated-GPU carve-outs reserve some of it
+ *   (the 128 GB GTR reports 121 GiB). Rounding up keeps a 64 GB host at 8G
+ *   when up to 8 GiB is reserved.
+ * - Floor 3G: the previous fixed default, which every deployed bridge has run
+ *   with, so this change does not tighten the cap on any host. It also covers
+ *   a harness at rest (`claude --print` is 0.5 to 2 GB resident).
+ * - Ceiling 8G: about 2.6 times the largest legitimate lane observed. A lane
+ *   above that is almost always a leak or runaway test workers, and a larger
+ *   cap only delays the kill while the lane presses on the host.
+ *
+ * Sized from `os.totalmem()`, not `os.constrainedMemory()`: scopes live under
+ * `cli-bridge-llm.slice`, outside the bridge service's own cgroup, so the
+ * service's `MemoryMax` does not bound them. An aggregate cap belongs on the
+ * slice. `CLI_BRIDGE_SCOPE_MEMORY_MAX` overrides this default.
+ */
+export const SCOPE_MEMORY_FLOOR_GIB = 3
+export const SCOPE_MEMORY_CEILING_GIB = 8
+const SCOPE_MEMORY_HOST_DIVISOR = 8
+
+export function defaultScopeMemoryMax(hostMemoryBytes: number): string {
+  // Fail toward the proven floor if the host reports nothing usable.
+  if (!Number.isFinite(hostMemoryBytes) || hostMemoryBytes <= 0) return `${SCOPE_MEMORY_FLOOR_GIB}G`
+  const shareGib = Math.ceil(hostMemoryBytes / SCOPE_MEMORY_HOST_DIVISOR / GIB)
+  return `${Math.min(SCOPE_MEMORY_CEILING_GIB, Math.max(SCOPE_MEMORY_FLOOR_GIB, shareGib))}G`
+}
+
+const DEFAULT_SCOPE_MEMORY_MAX = defaultScopeMemoryMax(totalmem())
+
+/** The `MemoryMax` each scope receives: the operator override, else the host-sized default. */
+export function resolveScopeMemoryMax(
+  env: NodeJS.ProcessEnv = process.env,
+  hostDefault: string = DEFAULT_SCOPE_MEMORY_MAX,
+): string {
+  return env.CLI_BRIDGE_SCOPE_MEMORY_MAX || hostDefault
+}
 const DEFAULT_SCOPE_ACQUIRE_DEADLINE_MS = 60_000
 const DEFAULT_SCOPE_MAX_ACQUIRE_DEADLINE_MS = 900_000
 const SYSTEMD_RUN_BIN = existsSync('/usr/bin/systemd-run') ? '/usr/bin/systemd-run' : '/bin/systemd-run'
@@ -205,8 +256,7 @@ const scopedSemaphore = new ScopedSemaphore(
 /** Result of the one-shot probe. `null` until first call, then cached. */
 let systemdRunUsable: boolean | null = null
 
-function probeSystemdRun(): boolean {
-  if (systemdRunUsable !== null) return systemdRunUsable
+function systemdRunReachable(): boolean {
   try {
     // systemd-run is at a stable path on every distro we support.
     // We probe by spawning `systemd-run --user --scope --quiet -- /bin/true`
@@ -214,22 +264,31 @@ function probeSystemdRun(): boolean {
     // env check. The actual call site catches spawn errors and falls
     // back per-invocation; this just avoids the overhead of trying
     // when we know systemd-run can't work.
-    if (!existsSync('/usr/bin/systemd-run') && !existsSync('/bin/systemd-run')) {
-      systemdRunUsable = false
-      return false
-    }
+    if (!existsSync('/usr/bin/systemd-run') && !existsSync('/bin/systemd-run')) return false
     // User systemd manager must be reachable. XDG_RUNTIME_DIR
     // pointing at a directory with systemd/private is the canonical
     // signal that `--user` will work.
     const xdg = process.env.XDG_RUNTIME_DIR
-    if (!xdg) { systemdRunUsable = false; return false }
-    if (!existsSync(`${xdg}/systemd/private`)) { systemdRunUsable = false; return false }
-    systemdRunUsable = true
-    return true
+    return !!xdg && existsSync(`${xdg}/systemd/private`)
   } catch {
-    systemdRunUsable = false
     return false
   }
+}
+
+/** The first spawn decides, and every later spawn reuses that answer. */
+function probeSystemdRun(): boolean {
+  if (systemdRunUsable === null) systemdRunUsable = systemdRunReachable()
+  return systemdRunUsable
+}
+
+/**
+ * What the next spawn would decide, without deciding it. A diagnostic read
+ * must not cache a transient answer (the user manager restarting while
+ * /health is polled) that would pin every later spawn to the uncapped
+ * hostSpawner fallback.
+ */
+function scopedExecutionAvailable(): boolean {
+  return systemdRunUsable ?? systemdRunReachable()
 }
 
 /**
@@ -373,7 +432,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   const unitName = `cli-bridge-${process.pid}-${randomBytes(6).toString('hex')}.scope`
   const tasksMax = positiveIntEnv('CLI_BRIDGE_SCOPE_TASKS_MAX', DEFAULT_SCOPE_TASKS_MAX)
   const runtimeMaxSec = optionalPositiveIntEnv('CLI_BRIDGE_SCOPE_RUNTIME_MAX_SEC')
-  const memoryMax = process.env.CLI_BRIDGE_SCOPE_MEMORY_MAX || DEFAULT_SCOPE_MEMORY_MAX
+  const memoryMax = resolveScopeMemoryMax()
 
   // Wrap (bin, args) in the OS write-jail FIRST (when a spec is present),
   // then put the wrapped command inside the systemd scope: the cgroup
@@ -475,7 +534,12 @@ export function scopedHostConcurrencyLimits(): { max: number; reserved: number }
   return { max: snap.max, reserved: snap.reserved }
 }
 
-/** Diagnostics for /metrics and /health. */
+/**
+ * Diagnostics for /metrics and /health. `memory_max` is the value the next
+ * scope receives, so an operator can confirm the host-sized default or the
+ * override without starting a run. It is `null` when systemd-run is unusable:
+ * spawns then fall back to hostSpawner and no cap bounds them.
+ */
 export function scopedHostExecutorSnapshot(): {
   in_flight: number
   max: number
@@ -489,8 +553,12 @@ export function scopedHostExecutorSnapshot(): {
   bulk_max: number
   queued_reserved: number
   queued_bulk: number
+  memory_max: string | null
 } {
-  return scopedSemaphore.snapshot()
+  return {
+    ...scopedSemaphore.snapshot(),
+    memory_max: scopedExecutionAvailable() ? resolveScopeMemoryMax() : null,
+  }
 }
 
 function positiveIntEnv(name: string, fallback: number): number {
