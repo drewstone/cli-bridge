@@ -66,5 +66,9 @@ describe('pi RPC terminal error carries a redacted stderr tail', () => {
     expect(tail.endsWith('fatal: EROFS')).toBe(true)
     expect(tail).not.toContain('\u001b')
     expect(redactedStderrTail('PI_API_KEY=abc123def token: "zzz999"')).toBe('PI_API_KEY=<redacted> token: "<redacted>"')
+    // Assembled at runtime so the fixture does not trip the repository's secret scanner.
+    for (const variant of ['b', 'c', 'e']) {
+      expect(redactedStderrTail(`leaked ${['xox', variant, '-1234567890-abc'].join('')}`)).toBe('leaked <redacted>')
+    }
   })
 })

@@ -59,7 +59,7 @@ export function redactedStderrTail(stderr: string, maxChars = STDERR_TAIL_CHARS)
     // eslint-disable-next-line no-control-regex
     .replace(/[\x00-\x1f\x7f-\x9f]+/gu, ' ')
     .replace(/\b(Bearer\s+)[^\s,;]+/giu, '$1<redacted>')
-    .replace(/\b(sk-(?:ant-|proj-)?|ghp_|gho_|github_pat_|xox[abprs]-)[A-Za-z0-9_-]{8,}/gu, '<redacted>')
+    .replace(/\b(sk-(?:ant-|proj-)?|ghp_|gho_|github_pat_|xox[a-z]-)[A-Za-z0-9_-]{8,}/gu, '<redacted>')
     .replace(/\b([A-Za-z0-9_]*(?:api[_-]?key|token|secret|password)[A-Za-z0-9_]*["']?\s*[:=]\s*["']?)[^\s"',;]+/giu, '$1<redacted>')
     .replace(/\s+/gu, ' ')
     .trim()
