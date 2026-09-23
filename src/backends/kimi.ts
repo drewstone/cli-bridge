@@ -102,7 +102,7 @@ export class KimiBackend implements Backend {
       'kimi-code',
       resolveRequestedReasoningEffort(req, session),
     )
-    const provisioned = provisionProfileWorkspace(
+    const provisioned = await provisionProfileWorkspace(
       req,
       session,
       'kimi-code',

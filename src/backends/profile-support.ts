@@ -36,6 +36,7 @@ import {
   assertWorkspacePlanSupported,
   type HarnessId,
   materializeProfile,
+  resolveAgentProfileResources,
   type WorkspacePlan,
   type WorkspacePlanArgument,
   type WorkspacePlanConfigValue,
@@ -116,17 +117,17 @@ function requirePublicPlanEnv(
  * Provision an AgentProfile's CWD-NATIVE dimensions (skills, context, hooks, subagents,
  * commands) into the run workspace before the harness spawns — the shared Phase-2 host
  * wiring. MCP is SKIPPED here so cli-bridge's existing per-harness MCP path (config-dir +
- * env) stays the source of truth (additive, can't regress MCP). Purely writes files into
- * `cwd`; returns env/flags (empty for the non-MCP dimensions, which are all cwd-native)
- * for the caller to apply if present. No-op only when there is no profile.
+ * env) stays the source of truth (additive, can't regress MCP). Remote resource refs resolve
+ * before the plan writes files into `cwd`. The original profile remains the execution identity.
+ * Returns env/flags for the caller to apply. No-op only when there is no profile.
  */
-export function provisionProfileWorkspace(
+export async function provisionProfileWorkspace(
   req: ChatRequest,
   session: SessionRecord | null,
   harness: HarnessId,
   cwd: string | undefined,
   executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, harness, null),
-): {
+): Promise<{
   env: Record<string, string>
   flags: string[]
   written: string[]
@@ -142,13 +143,17 @@ export function provisionProfileWorkspace(
    */
   systemPrompt?: string
   appendSystemPrompt?: string
-} {
+}> {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
   if (!profile) return { env: {}, flags: [], written: [] }
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   try {
-    const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
+    const resolvedProfile = await resolveAgentProfileResources(profile)
+    const plan = materializeProfile(resolvedProfile, harness, {
+      skip: ['mcp'],
+      toolBindings: req.runtime_attachments?.tool_bindings,
+    })
     assertWorkspacePlanSupported(plan)
     const applied = applyWorkspacePlan(plan, workspaceCwd, sessionAppliedPlanDigest(session, workspaceCwd))
     const receipt = retainProfileMaterializationReceipt(
@@ -204,13 +209,13 @@ export interface ProvisionedPiProfile {
  * MCP and `extensions.pi` are handled by PiBackend's native controls, so they
  * are skipped here only after that caller has validated and prepared them.
  */
-export function provisionPiProfile(
+export async function provisionPiProfile(
   req: ChatRequest,
   session: SessionRecord | null,
   cwd: string | undefined,
   executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, 'pi', null),
   inference?: NonNullable<ProfileMaterializationReceipt['inference']>,
-): ProvisionedPiProfile | null {
+): Promise<ProvisionedPiProfile | null> {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
   if (!profile) return null
@@ -218,13 +223,17 @@ export function provisionPiProfile(
 
   let profileRoot: string | null = null
   try {
-    const genericFiles = profile.resources?.files?.map((file) => file.path) ?? []
+    const resolvedProfile = await resolveAgentProfileResources(profile)
+    const genericFiles = resolvedProfile.resources?.files?.map((file) => file.path) ?? []
     if (genericFiles.length > 0) {
       throw new Error(
         `no request-scoped Pi loader exists for generic workspace file(s): ${genericFiles.join(', ')}`,
       )
     }
-    const plan = materializeProfile(profile, 'pi', { skip: ['mcp', 'extensions'] })
+    const plan = materializeProfile(resolvedProfile, 'pi', {
+      skip: ['mcp', 'extensions'],
+      toolBindings: req.runtime_attachments?.tool_bindings,
+    })
     assertWorkspacePlanSupported(plan)
     const nativeLoaders = assertPiPlanHasNativeLoaders(plan)
 
@@ -394,6 +403,7 @@ function retainProfileMaterializationReceipt(
     model: executionIdentity.model,
     reasoningEffort: executionIdentity.reasoningEffort,
     workspacePlanDigest: applied.workspacePlanDigest,
+    ...(applied.toolBindings === undefined ? {} : { toolBindings: applied.toolBindings }),
     files: applied.written.map((path) => ({ path, mode: modes.get(path) ?? 0o644 })),
     unsupported: applied.unsupported,
     ...(inference ? { inference } : {}),
@@ -454,6 +464,12 @@ export function assertProfileRequestAuthority(
   session: SessionRecord | null,
 ): AgentProfile | null {
   const profile = resolveAgentProfile(req, session)
+  if (!profile && Object.keys(req.runtime_attachments?.tool_bindings ?? {}).length > 0) {
+    throw new BackendError(
+      'runtime_attachments.tool_bindings requires agent_profile.tools',
+      'parse_error',
+    )
+  }
   if (!profile) return null
   if (Object.keys(req.mcp?.mcpServers ?? {}).length > 0) {
     throw new BackendError(

@@ -526,7 +526,7 @@ export async function buildApp(config: Config): Promise<{
       usageCostProvenance: 'cli-bridge.usage-cost.v1',
       // Platform attachments carried outside the session-bound profile;
       // dispatchers gate on this flag and refuse loud when it is absent.
-      runtimeAttachments: { mcp: true },
+      runtimeAttachments: { mcp: true, toolBindings: true },
     },
     backends: registry.all().map(b => b.name),
     endpoints: [

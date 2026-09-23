@@ -57,14 +57,14 @@ describe('resume re-materialization', () => {
     for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true })
   })
 
-  it('re-applies an agent-edited workspace as a no-op when the session digest matches', () => {
+  it('re-applies an agent-edited workspace as a no-op when the session digest matches', async () => {
     const cwd = root()
-    const first = provisionProfileWorkspace(request(), null, 'claude-code', cwd)
+    const first = await provisionProfileWorkspace(request(), null, 'claude-code', cwd)
     if (!first.workspacePlanDigest) throw new Error('turn 1 produced no plan digest')
     // The agent stores session memory in its context file between turns.
     appendFileSync(join(cwd, 'CLAUDE.md'), '\n- codeword: heliotrope\n')
 
-    const second = provisionProfileWorkspace(
+    const second = await provisionProfileWorkspace(
       request(),
       sessionFor(cwd, first.workspacePlanDigest),
       'claude-code',
@@ -74,13 +74,13 @@ describe('resume re-materialization', () => {
     expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toContain('codeword: heliotrope')
   })
 
-  it('materializes fully when the session digest was recorded for a different cwd', () => {
+  it('materializes fully when the session digest was recorded for a different cwd', async () => {
     const cwd = root()
-    const first = provisionProfileWorkspace(request(), null, 'claude-code', cwd)
+    const first = await provisionProfileWorkspace(request(), null, 'claude-code', cwd)
     if (!first.workspacePlanDigest) throw new Error('turn 1 produced no plan digest')
 
     const otherCwd = root()
-    const second = provisionProfileWorkspace(
+    const second = await provisionProfileWorkspace(
       request(),
       sessionFor(cwd, first.workspacePlanDigest),
       'claude-code',
@@ -90,9 +90,9 @@ describe('resume re-materialization', () => {
     expect(readFileSync(join(otherCwd, 'CLAUDE.md'), 'utf8')).toContain('STANDING BRIEF')
   })
 
-  it('still refuses a mid-session profile swap, naming both content digests', () => {
+  it('still refuses a mid-session profile swap, naming both content digests', async () => {
     const cwd = root()
-    const first = provisionProfileWorkspace(request(), null, 'claude-code', cwd)
+    const first = await provisionProfileWorkspace(request(), null, 'claude-code', cwd)
     if (!first.workspacePlanDigest) throw new Error('turn 1 produced no plan digest')
 
     const swapped: AgentProfile = {
@@ -101,7 +101,7 @@ describe('resume re-materialization', () => {
     }
     let message = ''
     try {
-      provisionProfileWorkspace(
+      await provisionProfileWorkspace(
         request(swapped),
         sessionFor(cwd, first.workspacePlanDigest, swapped),
         'claude-code',

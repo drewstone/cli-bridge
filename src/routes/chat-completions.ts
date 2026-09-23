@@ -221,12 +221,13 @@ const chatRequestSchema = z.object({
   }).passthrough().optional(),
   /**
    * Runtime-owned MCP attachments mounted OUTSIDE the session-bound
-   * AgentProfile. Allowed beside `agent_profile`; excluded from the
-   * session profile binding, from receipt digests, and from durable-run
-   * identity. See ChatRequest.runtime_attachments.
+   * AgentProfile. Allowed beside `agent_profile`; excluded from the session
+   * profile binding and durable-run identity. Tool bindings enter the applied
+   * workspace plan digest because they change executable capability.
    */
   runtime_attachments: z.strictObject({
     mcp: z.record(z.string(), z.unknown()),
+    tool_bindings: z.record(z.string(), z.boolean()).optional(),
   }).optional(),
   cwd: z.string().optional(),
   metadata: retainedPublicRecordSchema.optional(),

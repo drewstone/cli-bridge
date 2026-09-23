@@ -89,7 +89,7 @@ export class OpencodeBackend implements Backend {
       'opencode',
       resolveRequestedReasoningEffort(req, session),
     )
-    const provisioned = provisionProfileWorkspace(
+    const provisioned = await provisionProfileWorkspace(
       req,
       session,
       'opencode',

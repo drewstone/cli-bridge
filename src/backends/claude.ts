@@ -220,7 +220,7 @@ export class ClaudeBackend implements Backend {
       'claude-code',
       resolveRequestedReasoningEffort(req, session),
     )
-    const provisioned = provisionProfileWorkspace(
+    const provisioned = await provisionProfileWorkspace(
       req,
       session,
       'claude-code',
@@ -666,4 +666,3 @@ export class ClaudeBackend implements Backend {
     return null
   }
 }
-

@@ -578,7 +578,7 @@ export class PiBackend implements NativeSessionBackend {
     // prompt, and large prompt material rides file paths rather than argv.
     args.push(...piExtensionArgs(req, session, mcpAdapterPath))
     let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
-    let provisioned: ReturnType<typeof provisionPiProfile> = null
+    let provisioned: Awaited<ReturnType<typeof provisionPiProfile>> = null
     let inference: ProvisionedPiInferenceTransport | null = null
     let spawned: Awaited<ReturnType<Spawner>>
     try {
@@ -618,7 +618,7 @@ export class PiBackend implements NativeSessionBackend {
         ? materializeMcpServersForPi(mcpSpecs, runCwd)
         : null
       if (mcpMounted) args.push('--mcp-config', mcpMounted.configPath)
-      provisioned = provisionPiProfile(
+      provisioned = await provisionPiProfile(
         req,
         session,
         runCwd,

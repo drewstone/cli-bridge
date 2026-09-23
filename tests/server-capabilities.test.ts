@@ -22,6 +22,7 @@ describe('bridge capability advertisement', () => {
         capabilities: {
           profileMaterialization: 'cli-bridge.profile-materialization.v2',
           usageCostProvenance: 'cli-bridge.usage-cost.v1',
+          runtimeAttachments: { mcp: true, toolBindings: true },
         },
       })
       const { run } = built.runs.claim('persistent-default', 'digest')

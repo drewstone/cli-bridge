@@ -73,7 +73,7 @@ export class GeminiBackend implements Backend {
 
     // Validate the profile before touching project-scoped Gemini settings,
     // which can contain MCP headers and other credentials.
-    const provisioned = provisionProfileWorkspace(
+    const provisioned = await provisionProfileWorkspace(
       req,
       session,
       'gemini',

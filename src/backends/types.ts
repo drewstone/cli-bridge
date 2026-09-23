@@ -119,11 +119,14 @@ export interface McpRequestConfig {
  *
  * Each `mcp` entry uses the same canonical server schema as
  * `agent_profile.mcp` and merges into MCP materialization for the run.
+ * `tool_bindings` names the exact profile tool declarations that those
+ * platform mounts enforce outside the harness's native tool controls.
  * The channel exists because attachment endpoints are process-ephemeral:
  * a runtime that restarts rebinds its coordination server on a new port,
  * and that new URL must not move any stable identity. So attachments are
- * excluded from the session AgentProfile binding, from every profile
- * materialization receipt digest, and from durable-run request identity.
+ * excluded from the session AgentProfile binding and durable-run request
+ * identity. Endpoint configuration stays outside the workspace plan digest.
+ * Tool bindings enter that digest because they change executable capability.
  * They are also never persisted into durable session state — the caller
  * supplies them on every request that needs the mount.
  *
@@ -132,6 +135,7 @@ export interface McpRequestConfig {
  */
 export interface RuntimeAttachments {
   mcp: Record<string, AgentProfileMcpServer>
+  tool_bindings?: Readonly<Record<string, boolean>>
 }
 
 /** Safe proof of the exact AgentProfile workspace plan applied before spawn. */
@@ -151,6 +155,8 @@ export interface ProfileMaterializationReceipt {
   }
   /** Covers planned file contents/modes, flags, environment, and unsupported dimensions. */
   workspacePlanDigest: string
+  /** Exact executor-owned tool declarations covered by the workspace plan. */
+  toolBindings?: Readonly<Record<string, boolean>>
   /** Relative paths only; profile contents and environment values never cross the API. */
   files: Array<{ path: string; mode: number }>
   unsupported: Array<{ dimension: string; reason: string }>

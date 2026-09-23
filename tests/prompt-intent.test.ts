@@ -329,9 +329,9 @@ describe('prompt intents reach each harness through its own control', () => {
   })
 
   describe('codex', () => {
-    it('points model_instructions_file at the written replacement file', () => {
+    it('points model_instructions_file at the written replacement file', async () => {
       const cwd = workspace()
-      const provisioned = provisionProfileWorkspace(
+      const provisioned = await provisionProfileWorkspace(
         request({ prompt: { systemPrompt: REPLACEMENT } }, 'codex', cwd),
         null,
         'codex',
@@ -346,16 +346,16 @@ describe('prompt intents reach each harness through its own control', () => {
       expect(provisioned.systemPrompt).toBeUndefined()
     })
 
-    it('refuses an addition instead of flattening it into the user turn', () => {
+    it('refuses an addition instead of flattening it into the user turn', async () => {
       const cwd = workspace()
-      expect(() =>
+      await expect(
         provisionProfileWorkspace(
           request({ prompt: { appendSystemPrompt: ADDITION } }, 'codex', cwd),
           null,
           'codex',
           cwd,
         ),
-      ).toThrow(/no verified additive system-prompt control/)
+      ).rejects.toThrow(/no verified additive system-prompt control/)
     })
 
     it('never lets the replacement reach the prompt text', () => {
@@ -373,21 +373,21 @@ describe('prompt intents reach each harness through its own control', () => {
   })
 
   describe('opencode', () => {
-    it('refuses a replacement it cannot bind to the launched agent', () => {
+    it('refuses a replacement it cannot bind to the launched agent', async () => {
       const cwd = workspace()
-      expect(() =>
+      await expect(
         provisionProfileWorkspace(
           request({ prompt: { systemPrompt: REPLACEMENT } }, 'opencode', cwd),
           null,
           'opencode',
           cwd,
         ),
-      ).toThrow(/only system-prompt replacement is per-agent/)
+      ).rejects.toThrow(/only system-prompt replacement is per-agent/)
     })
 
-    it('registers the addition as its own instructions file, ahead of project instructions', () => {
+    it('registers the addition as its own instructions file, ahead of project instructions', async () => {
       const cwd = workspace()
-      provisionProfileWorkspace(
+      await provisionProfileWorkspace(
         request(
           { prompt: { appendSystemPrompt: ADDITION, instructions: ['PROJECT-INSTRUCTION'] } },
           'opencode',
@@ -414,9 +414,9 @@ describe('prompt intents reach each harness through its own control', () => {
   })
 
   describe('gemini', () => {
-    it('installs a replacement as its native system file', () => {
+    it('installs a replacement as its native system file', async () => {
       const cwd = workspace()
-      const provisioned = provisionProfileWorkspace(
+      const provisioned = await provisionProfileWorkspace(
         request({ prompt: { systemPrompt: REPLACEMENT } }, 'gemini', cwd),
         null,
         'gemini',
@@ -427,16 +427,16 @@ describe('prompt intents reach each harness through its own control', () => {
       expect(readFileSync(join(cwd, '.gemini/system.md'), 'utf8')).toBe(REPLACEMENT)
     })
 
-    it('refuses an addition rather than aliasing GEMINI.md memory', () => {
+    it('refuses an addition rather than aliasing GEMINI.md memory', async () => {
       const cwd = workspace()
-      expect(() =>
+      await expect(
         provisionProfileWorkspace(
           request({ prompt: { appendSystemPrompt: ADDITION } }, 'gemini', cwd),
           null,
           'gemini',
           cwd,
         ),
-      ).toThrow(/only additive system-prompt channel is GEMINI\.md memory/)
+      ).rejects.toThrow(/only additive system-prompt channel is GEMINI\.md memory/)
     })
   })
 

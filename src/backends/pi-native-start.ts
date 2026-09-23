@@ -142,7 +142,7 @@ export async function startPiNativeSession(
 
   let interactionRoot: PrivateTemporaryRoot | null = null
   let mcpMounted: ReturnType<typeof materializeMcpServersForPi> = null
-  let provisioned: ReturnType<typeof provisionPiProfile> = null
+  let provisioned: Awaited<ReturnType<typeof provisionPiProfile>> = null
   let inference: Awaited<ReturnType<typeof provisionPiInferenceTransport>> | null = null
   let spawned: Awaited<ReturnType<Spawner>> | null = null
 
@@ -199,7 +199,7 @@ export async function startPiNativeSession(
       args.push('--mcp-config', mcpMounted.configPath)
       registerJailReadable(req.jailSpec, mcpMounted.configPath, dirname(mcpMounted.configPath))
     }
-    provisioned = provisionPiProfile(
+    provisioned = await provisionPiProfile(
       req,
       session,
       runCwd,

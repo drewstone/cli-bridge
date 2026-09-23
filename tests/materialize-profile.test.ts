@@ -4,11 +4,14 @@
  * capability matrix. A wrong path here = the live sandbox loads nothing, so these
  * lock the matrix down.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
+import {
+  canonicalAgentProfileDigest,
+  defineAgentProfilePublicConfig as pub,
+} from '@tangle-network/agent-interface'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
   applyWorkspacePlan,
@@ -17,6 +20,7 @@ import {
   normalizeSkillMd,
 } from '@tangle-network/agent-profile-materialize'
 import {
+  provisionPiProfile,
   provisionProfileWorkspace,
   resolveAgentProfile,
 } from '../src/backends/profile-support.js'
@@ -171,11 +175,11 @@ describe('materializeProfile — verified per-harness routing', () => {
     expect(r.written).toContain('.kimi/skills/fhenix-core/SKILL.md')
   })
 
-  it('fails closed on unsafe profile paths', () => {
+  it('fails closed on unsafe profile paths', async () => {
     const root = mkdtempSync(join(tmpdir(), 'profile-fail-closed-'))
     const escaped = join(root, '..', 'escaped', 'SKILL.md')
     try {
-      expect(() => provisionProfileWorkspace({
+      await expect(provisionProfileWorkspace({
         model: 'claude-code/opus',
         messages: [{ role: 'user', content: 'work' }],
         agent_profile: {
@@ -183,14 +187,14 @@ describe('materializeProfile — verified per-harness routing', () => {
             skills: [{ kind: 'inline', name: '../../../escaped', content: 'unsafe' }],
           },
         },
-      }, null, 'claude-code', root)).toThrow(/materialization failed/)
+      }, null, 'claude-code', root)).rejects.toThrow(/materialization failed/)
       expect(existsSync(escaped)).toBe(false)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
   })
 
-  it('returns and retains a safe receipt for the exact applied workspace plan', () => {
+  it('returns and retains a safe receipt for the exact applied workspace plan', async () => {
     const root = mkdtempSync(join(tmpdir(), 'profile-receipt-'))
     try {
       const req: ChatRequest = {
@@ -202,7 +206,7 @@ describe('materializeProfile — verified per-harness routing', () => {
           },
         },
       }
-      const result = provisionProfileWorkspace(req, null, 'claude-code', root)
+      const result = await provisionProfileWorkspace(req, null, 'claude-code', root)
       expect(result.receipt).toMatchObject({
         schema: 'cli-bridge.profile-materialization.v2',
         harness: 'claude-code',
@@ -221,7 +225,141 @@ describe('materializeProfile — verified per-harness routing', () => {
     }
   })
 
-  it('applies Gemini profile systemPrompt exactly once through its native system file', () => {
+  it('resolves a pinned skill reference without changing the authored profile identity', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'profile-pinned-skill-'))
+    const ref = 'a'.repeat(40)
+    const profile: AgentProfile = {
+      resources: {
+        skills: [{
+          kind: 'github',
+          repository: 'tangle-network/discovery-lab',
+          path: 'skills/profile-authoring/SKILL.md',
+          ref,
+          name: 'profile-authoring',
+        }],
+      },
+    }
+    const fetchResource = vi.fn(async (_input: string | URL | Request) =>
+      new Response(
+        '---\nname: profile-authoring\ndescription: Author profiles.\n---\n\nPreserve exact identity.\n',
+      ))
+    vi.stubGlobal('fetch', fetchResource)
+    const req: ChatRequest = {
+      model: 'claude-code/opus',
+      messages: [{ role: 'user', content: 'work' }],
+      agent_profile: profile,
+    }
+    try {
+      const result = await provisionProfileWorkspace(req, null, 'claude-code', root)
+
+      expect(fetchResource).toHaveBeenCalledOnce()
+      expect(String(fetchResource.mock.calls[0]?.[0])).toContain(
+        `/tangle-network/discovery-lab/${ref}/skills/profile-authoring/SKILL.md`,
+      )
+      expect(req.agent_profile).toEqual(profile)
+      expect(result.receipt?.effectiveProfileDigest).toBe(canonicalAgentProfileDigest(profile))
+      expect(readFileSync(
+        join(root, '.claude/skills/profile-authoring/SKILL.md'),
+        'utf8',
+      )).toContain('Preserve exact identity.')
+    } finally {
+      vi.unstubAllGlobals()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['claude-code', 'codex', 'opencode'] as const)(
+    'binds Runtime-owned enabled and disabled tools on %s',
+    async (harness) => {
+      const root = mkdtempSync(join(tmpdir(), `profile-tool-bindings-${harness}-`))
+      const profile: AgentProfile = {
+        tools: {
+          agent_runtime_coordination_spawn_worker: true,
+          agent_runtime_coordination_disabled: false,
+        },
+      }
+      const sourceBytes = JSON.stringify(profile)
+      const request: ChatRequest = {
+        model: `${harness}/test`,
+        messages: [{ role: 'user', content: 'work' }],
+        agent_profile: profile,
+        runtime_attachments: {
+          mcp: {
+            coordination: { url: 'http://127.0.0.1:36827/mcp' },
+          },
+          tool_bindings: {
+            agent_runtime_coordination_spawn_worker: true,
+            agent_runtime_coordination_disabled: false,
+          },
+        },
+      }
+      try {
+        const provisioned = await provisionProfileWorkspace(request, null, harness, root)
+        expect(provisioned.unsupported).toEqual([])
+        expect(provisioned.receipt?.toolBindings).toEqual({
+          agent_runtime_coordination_disabled: false,
+          agent_runtime_coordination_spawn_worker: true,
+        })
+        expect(JSON.stringify(profile)).toBe(sourceBytes)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('binds Runtime-owned enabled and disabled tools on Pi', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'profile-tool-bindings-pi-'))
+    const request: ChatRequest = {
+      model: 'pi/test',
+      messages: [{ role: 'user', content: 'work' }],
+      agent_profile: {
+        tools: {
+          agent_runtime_coordination_spawn_worker: true,
+          agent_runtime_coordination_disabled: false,
+        },
+      },
+      runtime_attachments: {
+        mcp: {
+          coordination: { url: 'http://127.0.0.1:36827/mcp' },
+        },
+        tool_bindings: {
+          agent_runtime_coordination_spawn_worker: true,
+          agent_runtime_coordination_disabled: false,
+        },
+      },
+    }
+    try {
+      const provisioned = await provisionPiProfile(request, null, root)
+      expect(provisioned?.receipt.toolBindings).toEqual({
+        agent_runtime_coordination_disabled: false,
+        agent_runtime_coordination_spawn_worker: true,
+      })
+      provisioned?.cleanup()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a Runtime tool binding absent from the authored profile', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'profile-tool-bindings-unknown-'))
+    try {
+      await expect(provisionProfileWorkspace({
+        model: 'claude-code/test',
+        messages: [{ role: 'user', content: 'work' }],
+        agent_profile: { tools: { agent_runtime_coordination_spawn_worker: true } },
+        runtime_attachments: {
+          mcp: {
+            coordination: { url: 'http://127.0.0.1:36827/mcp' },
+          },
+          tool_bindings: { agent_runtime_coordination_unknown: true },
+        },
+      }, null, 'claude-code', root)).rejects.toThrow(/agent_runtime_coordination_unknown.*absent from profile\.tools/u)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('applies Gemini profile systemPrompt exactly once through its native system file', async () => {
     const root = mkdtempSync(join(tmpdir(), 'profile-gemini-prompt-'))
     const marker = 'SYSTEM_PROMPT_MUST_APPEAR_ONCE'
     try {
@@ -235,7 +373,7 @@ describe('materializeProfile — verified per-harness routing', () => {
           },
         },
       }
-      const provisioned = provisionProfileWorkspace(req, null, 'gemini', root)
+      const provisioned = await provisionProfileWorkspace(req, null, 'gemini', root)
       const prompt = new GeminiBackend({ bin: '/nonexistent', timeoutMs: 1_000 })
         .buildPrompt(req, null)
       const nativeSystemPrompt = readFileSync(join(root, '.gemini/system.md'), 'utf8')

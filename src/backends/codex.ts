@@ -117,7 +117,7 @@ export class CodexBackend implements Backend {
 
     // Reject unsupported profile plans before copying auth or writing MCP
     // credentials into a synthetic CODEX_HOME.
-    const provisioned = provisionProfileWorkspace(
+    const provisioned = await provisionProfileWorkspace(
       req,
       session,
       'codex',

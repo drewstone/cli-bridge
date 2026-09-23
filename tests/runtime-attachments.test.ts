@@ -126,6 +126,19 @@ describe('runtime attachments — chat completions', () => {
     expect(backend.lastConfig?.mcpServers.notes).toMatchObject({ command: 'notes-mcp' })
   })
 
+  it('rejects a non-boolean tool binding before backend dispatch', async () => {
+    const response = await post({
+      agent_profile: PROFILE,
+      runtime_attachments: {
+        mcp: { coordination: coordination(36827) },
+        tool_bindings: { agent_runtime_coordination_spawn_worker: 'yes' },
+      },
+    })
+
+    expect(response.status).toBe(400)
+    expect(backend.last).toBeNull()
+  })
+
   it('keeps one session binding across a resume that rebinds the attachment port', async () => {
     const first = await post({
       session_id: 'resume-across-ports',
