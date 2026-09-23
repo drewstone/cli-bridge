@@ -1014,7 +1014,7 @@ attaches; concatenate both exports and the tree validates clean.
 ### Session lineage
 
 A caller that runs under the operator's `lineage` tool (tangle-tools `lineage/`) sends its worker's session ids as `x-tangle-*` headers.
-The bridge sets them as the harness child's `TANGLE_*` environment and adds them to its `OTEL_RESOURCE_ATTRIBUTES`.
+The bridge sets them as the harness child's `TANGLE_*` environment on the host, scoped-host and docker executors, and adds them to its `OTEL_RESOURCE_ATTRIBUTES`.
 The recognized headers are `x-tangle-run-id`, `-parent-run-id`, `-root-run-id`, `-edge-kind`, `-operator`, `-project`, `-account` and `-harness`.
 `TANGLE_HOST` is the bridge's own host, because the child runs there.
 A request without `x-tangle-run-id` stamps nothing.

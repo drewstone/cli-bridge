@@ -112,3 +112,19 @@ describe('every backend forwards lineage beside the jail', () => {
     }
   })
 })
+
+describe('docker executor', () => {
+  it('passes request lineage into docker exec, including the cleared Claude session', async () => {
+    const { buildDockerExecArgs } = await import('../src/executors/docker.js')
+    const lineageEnv = lineageChildEnv(headers({ 'x-tangle-run-id': RUN, 'x-tangle-edge-kind': 'spawned' }), { LINEAGE_HOST: 'box-a' })
+    const argv = buildDockerExecArgs('ctr', 'claude', ['-p'], { env: { TANGLE_RUN_ID: PARENT }, lineageEnv })
+    const env = argv.flatMap((arg, i) => (argv[i - 1] === '-e' ? [arg] : []))
+    expect(env).toContain(`TANGLE_RUN_ID=${RUN}`)
+    expect(env).toContain('TANGLE_CLAUDE_SESSION=')
+    expect(env).not.toContain(`TANGLE_RUN_ID=${PARENT}`)
+    expect(env.find((e) => e.startsWith('OTEL_RESOURCE_ATTRIBUTES='))).toBe(
+      `OTEL_RESOURCE_ATTRIBUTES=tangle.run.id=${RUN},tangle.edge.kind=spawned,host.name=box-a`,
+    )
+    expect(argv.slice(-3)).toEqual(['ctr', 'claude', '-p'])
+  })
+})

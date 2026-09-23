@@ -31,6 +31,7 @@ import {
   type SpawnResult,
   type Spawner,
 } from './types.js'
+import { withLineageEnv } from '../trace/lineage.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -430,6 +431,14 @@ export function buildDockerExecArgs(
       if (PROXIED_ENV_KEYS.has(k) || k.startsWith('ANTHROPIC_') || k.startsWith('CLAUDE_') || k.startsWith('CODEX_') || k.startsWith('KIMI_') || k.startsWith('OPENCODE_')) {
         out.push('-e', `${k}=${v}`)
       }
+    }
+  }
+  // Request lineage goes in as-is, empty values included: `TANGLE_CLAUDE_SESSION=` must clear
+  // any inherited value so a Claude Code child takes the stamped run as its own.
+  if (spawnOpts.lineageEnv) {
+    const lineage = withLineageEnv({}, spawnOpts.lineageEnv) ?? {}
+    for (const [k, v] of Object.entries(lineage)) {
+      if (typeof v === 'string') out.push('-e', `${k}=${v}`)
     }
   }
   out.push(containerId, binPrefix ? `${binPrefix}${bin}` : bin, ...args)
