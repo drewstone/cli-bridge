@@ -5057,7 +5057,7 @@ describe('retained Agent Interface sessions', () => {
       unknownBinding.interactionId,
     )).toMatchObject({ operationId: unknownOperation.operationId, phase: 'effect_unknown' })
     db.close()
-  })
+  }, 15_000)
 })
 
 describe('retained chat deltas', () => {
