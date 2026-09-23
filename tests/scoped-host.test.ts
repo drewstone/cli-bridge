@@ -11,9 +11,11 @@
  * systemd-run + a user manager (Docker CI, macOS).
  */
 
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   defaultScopeMemoryMax,
   isOwnedScopeControlGroup,
@@ -124,6 +126,29 @@ describe('scopedHostSpawner — host-sized memory cap', () => {
     // Without a systemd user manager (macOS, Docker CI) spawns go to hostSpawner with no MemoryMax,
     // so reporting a cap there would tell /health consumers a runaway child is bounded when it is not.
     expect(scopedHostExecutorSnapshot().memory_max).toBe(systemdRunAvailable ? resolveScopeMemoryMax() : null)
+  })
+
+  // Needs only the systemd-run binary (ubuntu CI has it): the user manager is faked with a runtime
+  // dir, and no scope is started.
+  const systemdRunInstalled = existsSync('/usr/bin/systemd-run') || existsSync('/bin/systemd-run')
+  ;(systemdRunInstalled ? it : it.skip)('does not let a diagnostic read cache a transient user-manager absence', async () => {
+    // Regression: the snapshot once called the caching spawn probe, so polling /health while the
+    // user manager restarted cached `false` and sent every later spawn to the uncapped fallback.
+    const runtimeDir = mkdtempSync(join(tmpdir(), 'cli-bridge-xdg-'))
+    const savedRuntimeDir = process.env.XDG_RUNTIME_DIR
+    process.env.XDG_RUNTIME_DIR = runtimeDir
+    try {
+      vi.resetModules()
+      const fresh = await import('../src/executors/scoped-host.js')
+      expect(fresh.scopedHostExecutorSnapshot().memory_max).toBeNull()
+      mkdirSync(join(runtimeDir, 'systemd'))
+      writeFileSync(join(runtimeDir, 'systemd', 'private'), '')
+      expect(fresh.scopedHostExecutorSnapshot().memory_max).toBe(fresh.resolveScopeMemoryMax())
+    } finally {
+      if (savedRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = savedRuntimeDir
+      rmSync(runtimeDir, { recursive: true, force: true })
+    }
   })
 })
 

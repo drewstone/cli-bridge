@@ -256,8 +256,7 @@ const scopedSemaphore = new ScopedSemaphore(
 /** Result of the one-shot probe. `null` until first call, then cached. */
 let systemdRunUsable: boolean | null = null
 
-function probeSystemdRun(): boolean {
-  if (systemdRunUsable !== null) return systemdRunUsable
+function systemdRunReachable(): boolean {
   try {
     // systemd-run is at a stable path on every distro we support.
     // We probe by spawning `systemd-run --user --scope --quiet -- /bin/true`
@@ -265,22 +264,31 @@ function probeSystemdRun(): boolean {
     // env check. The actual call site catches spawn errors and falls
     // back per-invocation; this just avoids the overhead of trying
     // when we know systemd-run can't work.
-    if (!existsSync('/usr/bin/systemd-run') && !existsSync('/bin/systemd-run')) {
-      systemdRunUsable = false
-      return false
-    }
+    if (!existsSync('/usr/bin/systemd-run') && !existsSync('/bin/systemd-run')) return false
     // User systemd manager must be reachable. XDG_RUNTIME_DIR
     // pointing at a directory with systemd/private is the canonical
     // signal that `--user` will work.
     const xdg = process.env.XDG_RUNTIME_DIR
-    if (!xdg) { systemdRunUsable = false; return false }
-    if (!existsSync(`${xdg}/systemd/private`)) { systemdRunUsable = false; return false }
-    systemdRunUsable = true
-    return true
+    return !!xdg && existsSync(`${xdg}/systemd/private`)
   } catch {
-    systemdRunUsable = false
     return false
   }
+}
+
+/** The first spawn decides, and every later spawn reuses that answer. */
+function probeSystemdRun(): boolean {
+  if (systemdRunUsable === null) systemdRunUsable = systemdRunReachable()
+  return systemdRunUsable
+}
+
+/**
+ * What the next spawn would decide, without deciding it. A diagnostic read
+ * must not cache a transient answer (the user manager restarting while
+ * /health is polled) that would pin every later spawn to the uncapped
+ * hostSpawner fallback.
+ */
+function scopedExecutionAvailable(): boolean {
+  return systemdRunUsable ?? systemdRunReachable()
 }
 
 /**
@@ -549,7 +557,7 @@ export function scopedHostExecutorSnapshot(): {
 } {
   return {
     ...scopedSemaphore.snapshot(),
-    memory_max: probeSystemdRun() ? resolveScopeMemoryMax() : null,
+    memory_max: scopedExecutionAvailable() ? resolveScopeMemoryMax() : null,
   }
 }
 
