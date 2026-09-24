@@ -10,6 +10,7 @@
  * full chat() loop without spawning anything.
  */
 
+import { spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -184,19 +185,21 @@ describe('killTree', () => {
   })
 
   it.skipIf(process.platform !== 'linux')('kills descendants after the process-group leader exits first', async () => {
-    const parent = await hostSpawner('node', [
+    // hostSpawner now stops the whole group on leader exit. Spawn directly to
+    // preserve the orphaned-group state that killTree itself must handle.
+    const parent = spawn(process.execPath, [
       '-e',
       [
         'const { spawn } = require("node:child_process");',
         'const g = spawn("node", ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 100)"], { stdio: "ignore" });',
         'process.stdout.write(String(g.pid) + "\\n", () => process.exit(0));',
       ].join(''),
-    ], { stdio: ['ignore', 'pipe', 'pipe'] })
+    ], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     try {
       const grandchildPid = await new Promise<number>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('grandchild pid never reported')), 5_000)
         let buffer = ''
-        parent.child.stdout?.on('data', (chunk) => {
+        parent.stdout?.on('data', (chunk) => {
           buffer += chunk.toString()
           const match = buffer.match(/(\d+)/u)
           if (!match) return
@@ -205,33 +208,33 @@ describe('killTree', () => {
         })
       })
       await new Promise<void>((resolve) => {
-        if (parent.child.exitCode !== null || parent.child.signalCode !== null) resolve()
-        else parent.child.once('exit', () => resolve())
+        if (parent.exitCode !== null || parent.signalCode !== null) resolve()
+        else parent.once('exit', () => resolve())
       })
       expect(processExists(grandchildPid)).toBe(true)
 
-      await killTree(parent.child, { gracefulMs: 100 })
+      await killTree(parent, { gracefulMs: 100 })
       await new Promise<void>((resolve) => setTimeout(resolve, 50))
       expect(processExists(grandchildPid)).toBe(false)
     } finally {
-      parent.release()
+      killTreeSync(parent, 'SIGKILL')
     }
   })
 
   it.skipIf(process.platform !== 'linux')('synchronously signals descendants after the process-group leader exits first', async () => {
-    const parent = await hostSpawner('node', [
+    const parent = spawn(process.execPath, [
       '-e',
       [
         'const { spawn } = require("node:child_process");',
         'const g = spawn("node", ["-e", "setInterval(() => {}, 100)"], { stdio: "ignore" });',
         'process.stdout.write(String(g.pid) + "\\n", () => process.exit(0));',
       ].join(''),
-    ], { stdio: ['ignore', 'pipe', 'pipe'] })
+    ], { detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     try {
       const grandchildPid = await new Promise<number>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('grandchild pid never reported')), 5_000)
         let buffer = ''
-        parent.child.stdout?.on('data', (chunk) => {
+        parent.stdout?.on('data', (chunk) => {
           buffer += chunk.toString()
           const match = buffer.match(/(\d+)/u)
           if (!match) return
@@ -240,12 +243,12 @@ describe('killTree', () => {
         })
       })
       await new Promise<void>((resolve) => {
-        if (parent.child.exitCode !== null || parent.child.signalCode !== null) resolve()
-        else parent.child.once('exit', () => resolve())
+        if (parent.exitCode !== null || parent.signalCode !== null) resolve()
+        else parent.once('exit', () => resolve())
       })
       expect(processExists(grandchildPid)).toBe(true)
 
-      killTreeSync(parent.child, 'SIGKILL')
+      killTreeSync(parent, 'SIGKILL')
       // A busy host can delay the signal's scheduler tick; an orphan can also
       // remain as a zombie until init reaps it, although it cannot run work.
       for (let attempt = 0; attempt < 20 && processExists(grandchildPid); attempt++) {
@@ -253,7 +256,7 @@ describe('killTree', () => {
       }
       expect(processExists(grandchildPid)).toBe(false)
     } finally {
-      parent.release()
+      killTreeSync(parent, 'SIGKILL')
     }
   })
 
