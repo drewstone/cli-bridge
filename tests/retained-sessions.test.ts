@@ -223,6 +223,9 @@ class FakeNative implements NativeSession {
       }
     }
     if (prompt === 'identity') yield { type: 'synthetic_observation', provider: this.backendName }
+    if (prompt.startsWith('long-native-user-event:')) {
+      yield { type: 'message_start', message: { role: 'user', content: prompt } }
+    }
     if (this.aborted || signal.aborted) throw new Error('aborted')
     yield {
       type: 'message_update',
@@ -1904,6 +1907,32 @@ describe('retained Agent Interface sessions', () => {
     await waitFor(() => backend.natives[0]?.prompts.length === 1)
     expect(backend.natives[0]?.prompts[0]).toBe(message)
     expect(backend.requests[0]?.messages[0]?.content).toBe(message)
+  })
+
+  it('persists and replays a long native user message event without failing its turn', async () => {
+    fixture = setup(new FakeNativeBackend())
+    const message = `long-native-user-event:${'x'.repeat(27_148 - 'long-native-user-event:'.length)}`
+    expect(message.length).toBe(27_148)
+    const created = await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'long-user-event', model: 'pi/test' }),
+    })
+    expect(created.status).toBe(201)
+    const turn = await fixture.app.request('/v1/sessions/long-user-event/turns', {
+      method: 'POST',
+      body: JSON.stringify({ message, run_id: 'long-user-event-run' }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => fixture!.store.getRetained('long-user-event')?.turns === 1)
+    const events = fixture.store.retainedEventsAfter('long-user-event').map(item => item.envelope.event)
+    const userEvent = events.find(event => event.type === 'raw' && recordEventType(event.event) === 'message_start')
+    expect(userEvent).toMatchObject({ type: 'raw', backend: 'pi' })
+    expect((userEvent as { event: { message: { content: string } } }).event.message.content).toBe(message)
+    expect(events).toContainEqual({ type: 'status', status: 'completed' })
+
+    const replay = await fixture.app.request('/v1/sessions/long-user-event/events')
+    expect(replay.status).toBe(200)
+    expect(await replay.text()).toContain(JSON.stringify(message))
   })
 
   it('requires the durable run digest before retained cancellation', async () => {
