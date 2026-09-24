@@ -138,7 +138,7 @@ const cleanupRetries = new Map<() => Promise<void> | void, CleanupRetry>()
 const CLEANUP_RETRY_BASE_MS = 250
 const CLEANUP_RETRY_MAX_MS = 30_000
 
-/** Retry one failed request-owned cleanup without retaining executor capacity. */
+/** Retry one failed request-owned cleanup until it can settle. */
 export function retryCleanupUntilSuccessful(cleanup: () => Promise<void> | void): void {
   const retry = cleanupRetries.get(cleanup) ?? { cleanup, attempts: 0, timer: null }
   cleanupRetries.set(cleanup, retry)
@@ -218,7 +218,7 @@ async function waitForProcessGroupExitOrTimeout(processGroupId: number, ms: numb
   }
 }
 
-function processGroupExists(processGroupId: number): boolean {
+export function processGroupExists(processGroupId: number): boolean {
   try {
     process.kill(-processGroupId, 0)
     return true

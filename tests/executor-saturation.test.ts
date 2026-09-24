@@ -29,6 +29,7 @@ import type { Backend, ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { processGroupExists } from '../src/executors/process-tree.js'
 
 /** A backend whose only behaviour is the refusal the host semaphore raises. */
 class SaturatedBackend implements Backend {
@@ -129,6 +130,88 @@ describe('host executor — typed saturation refusal', () => {
     } finally {
       holder.child.kill()
       holder.release()
+    }
+  })
+
+  it('holds the slot after abort error until a SIGTERM-ignoring child stops', async () => {
+    const { hostSpawner, hostExecutorSnapshot } = await import('../src/executors/host.js')
+    const { terminateSpawned } = await import('../src/executors/process-tree.js')
+    const controller = new AbortController()
+    const holder = await hostSpawner('node', [
+      '-e',
+      "process.on('SIGTERM',()=>{});process.stdout.write('ready');setInterval(()=>{},1000)",
+    ], { stdio: ['ignore', 'pipe', 'pipe'], signal: controller.signal })
+    let next: Awaited<ReturnType<typeof hostSpawner>> | undefined
+    try {
+      await new Promise<void>((resolve) => holder.child.stdout?.once('data', () => resolve()))
+      let admitted = false
+      const waiting = hostSpawner('node', ['-e', 'setTimeout(()=>{},1000)'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        acquireDeadlineMs: 5_000,
+      }).then((spawned) => {
+        admitted = true
+        return spawned
+      })
+      const abortError = new Promise<NodeJS.ErrnoException>((resolve) => {
+        holder.child.once('error', (error) => resolve(error as NodeJS.ErrnoException))
+      })
+      controller.abort()
+      expect((await abortError).code).toBe('ABORT_ERR')
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      expect(admitted).toBe(false)
+      expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 1, queued: 1 })
+      holder.child.kill('SIGKILL')
+      next = await waiting
+      expect(admitted).toBe(true)
+    } finally {
+      holder.child.kill('SIGKILL')
+      holder.release()
+      if (next) {
+        await terminateSpawned(next)
+        next.release()
+      }
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('holds the slot after leader exit while its helper survives', async () => {
+    const { hostSpawner, hostExecutorSnapshot } = await import('../src/executors/host.js')
+    const { terminateSpawned } = await import('../src/executors/process-tree.js')
+    const helperCode = "process.on('SIGTERM',()=>{});process.stdout.write('ready');setInterval(()=>{},1000)"
+    const leaderCode = `const {spawn}=require('node:child_process');const helper=spawn(process.execPath,['-e',${JSON.stringify(helperCode)}],{stdio:['ignore','pipe','ignore']});helper.stdout.once('data',()=>process.stdout.write('ready'));process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000)`
+    const controller = new AbortController()
+    const holder = await hostSpawner('node', ['-e', leaderCode], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      signal: controller.signal,
+    })
+    let next: Awaited<ReturnType<typeof hostSpawner>> | undefined
+    const groupId = holder.child.pid as number
+    try {
+      await new Promise<void>((resolve) => holder.child.stdout?.once('data', () => resolve()))
+      let admitted = false
+      const waiting = hostSpawner('node', ['-e', 'setTimeout(()=>{},1000)'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        acquireDeadlineMs: 400,
+      }).then((spawned) => {
+        admitted = true
+        return spawned
+      })
+      const leaderExit = new Promise<void>((resolve) => holder.child.once('exit', () => resolve()))
+      controller.abort()
+      await leaderExit
+      expect(processGroupExists(groupId)).toBe(true)
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      expect(admitted).toBe(false)
+      expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 1, queued: 1 })
+      process.kill(-groupId, 'SIGKILL')
+      next = await waiting
+      expect(admitted).toBe(true)
+    } finally {
+      try { process.kill(-groupId, 'SIGKILL') } catch { /* already stopped */ }
+      holder.release()
+      if (next) {
+        await terminateSpawned(next)
+        next.release()
+      }
     }
   })
 })

@@ -24,9 +24,10 @@
  *   per-request `execution.acquireTimeoutMs`.
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { LINEAGE_ENV_KEYS, withLineageEnv } from '../trace/lineage.js'
 import { applyJail } from './jail-support.js'
+import { killTree, processGroupExists, retryCleanupUntilSuccessful } from './process-tree.js'
 import { ExecutorSaturatedError, type SpawnOpts, type SpawnResult, type Spawner } from './types.js'
 
 const DEFAULT_MAX = 4
@@ -190,16 +191,41 @@ const hostSemaphore = new HostSemaphore(
 export const hostSpawner: Spawner = async (bin, args, opts) => {
   await hostSemaphore.acquire(opts.acquireDeadlineMs, opts.signal)
   let released = false
+  let releaseRequested = false
   let jailCleanup: (() => Promise<void> | void) | undefined
+  let child: ChildProcess | undefined
+  let stopPromise: Promise<void> | null = null
+  const terminate = (): Promise<void> => {
+    if (!child) return Promise.resolve()
+    stopPromise ??= (async () => {
+      await killTree(child)
+      const pid = child.pid
+      if (pid !== undefined && process.platform !== 'win32' && processGroupExists(pid)) {
+        throw new Error(`host process group ${pid} is still alive after termination`)
+      }
+      if (pid !== undefined && process.platform === 'win32' && child.exitCode === null && child.signalCode === null) {
+        throw new Error(`host process ${pid} termination is unconfirmed`)
+      }
+    })().catch((error) => {
+      stopPromise = null
+      throw error
+    })
+    return stopPromise
+  }
+  const cleanup = async (): Promise<void> => {
+    await terminate()
+    if (!released) {
+      released = true
+      hostSemaphore.release()
+    }
+    if (jailCleanup) await jailCleanup()
+  }
   const release = (): void => {
-    if (released) return
-    released = true
-    hostSemaphore.release()
-    // Idempotent: release() guards on `released`, so the jail cleanup
-    // (e.g. an SBPL profile temp dir) fires exactly once whether release
-    // is triggered by the backend's finally block or the child exit/error
-    // listeners below.
-    if (jailCleanup) void Promise.resolve(jailCleanup()).catch(() => {})
+    if (releaseRequested) return
+    releaseRequested = true
+    // Abort emits an error before the process group exits. Keep the capacity
+    // slot until the owned group has stopped; retry jail cleanup separately.
+    void cleanup().catch(() => retryCleanupUntilSuccessful(cleanup))
   }
   try {
     opts.signal?.throwIfAborted()
@@ -212,7 +238,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     // pgid equals its pid. kill(-pid, sig) reaches every descendant. We
     // do NOT call child.unref() — the bridge still owns the child for
     // the lifetime of the chat() call.
-    const child = spawn(jailed.bin, jailed.args, {
+    child = spawn(jailed.bin, jailed.args, {
       signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
@@ -231,6 +257,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     child.once('error', release)
     const result: SpawnResult = {
       child,
+      terminate,
       release,
       spawnError: () => spawnError,
     }

@@ -8,6 +8,7 @@ import { PassThrough } from 'node:stream'
 import type { Spawner } from '../src/executors/types.js'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend } from '../src/backends/pi.js'
+import { PiNativeSession } from '../src/backends/pi-native-session.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { RetainedSessionService, mountRetainedSessions } from '../src/sessions/retained.js'
@@ -543,6 +544,45 @@ describe('Pi native RPC adapter', () => {
     const observedChild = child as ReturnType<typeof spawn> | null
     expect(observedChild).not.toBeNull()
     expect(observedChild!.exitCode !== null || observedChild!.signalCode !== null).toBe(true)
+  })
+
+  it('observes abort-listener stop failures and retries before releasing', async () => {
+    const child = new InMemoryPiChild()
+    let stopAttempts = 0
+    let releases = 0
+    let cleanups = 0
+    const unhandled: unknown[] = []
+    const onUnhandled = (error: unknown): void => { unhandled.push(error) }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const native = new PiNativeSession({
+        child: child as never,
+        release: () => { releases += 1 },
+        terminate: async () => {
+          stopAttempts += 1
+          if (stopAttempts <= 2) throw new Error('stop not proven')
+          child.kill('SIGKILL')
+        },
+      }, {
+        capabilities: {} as never,
+        requestTimeoutMs: 20,
+        cleanup: () => { cleanups += 1 },
+      })
+      const controller = new AbortController()
+      const turn = native.turn('work', controller.signal)[Symbol.asyncIterator]().next()
+        .catch((error: unknown) => error)
+      controller.abort()
+      await turn
+      expect(releases).toBe(0)
+      expect(cleanups).toBe(0)
+      await waitFor(() => releases === 1)
+      expect(stopAttempts).toBeGreaterThanOrEqual(3)
+      expect(cleanups).toBe(1)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      child.kill('SIGKILL')
+    }
   })
 
   it('returns the native executor allocation when private-file cleanup must retry', async () => {

@@ -90,7 +90,9 @@ describe('host executor semaphore', () => {
     queuedResult.child.kill()
     late.release()
     late.child.kill()
-    expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
+    await waitFor(() => {
+      expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
+    })
   })
 
   it('removes an aborted waiter before the holder frees its slot', async () => {
@@ -109,7 +111,9 @@ describe('host executor semaphore', () => {
       holder.child.kill()
       holder.release()
     }
-    expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
+    await waitFor(() => {
+      expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
+    })
   })
 
   it('rejects with timeout when no slot frees within the deadline', async () => {

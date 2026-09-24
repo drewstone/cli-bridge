@@ -93,6 +93,7 @@ export class PiNativeSession implements NativeSession {
   private childError: Error | null = null
   private abortInFlight: Promise<void> | null = null
   private terminationInFlight: Promise<void> | null = null
+  private readonly retryStartCleanup = (): Promise<void> => this.startCleanup()
 
   constructor(spawned: Awaited<ReturnType<Spawner>>, options: PiNativeSessionOptions) {
     this.capabilities = options.capabilities
@@ -164,7 +165,10 @@ export class PiNativeSession implements NativeSession {
     this.turnActive = true
     const requestId = `prompt-${randomUUID()}`
     const onAbort = (): void => {
-      void this.abort()
+      void this.abort().catch(() => {
+        // The explicit turn path observes the failure. The signal listener
+        // must also settle its own promise so Node cannot exit on rejection.
+      })
     }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
@@ -201,10 +205,12 @@ export class PiNativeSession implements NativeSession {
   }
 
   async abort(): Promise<void> {
-    if (this.closed) return
+    if (this.closed) return this.startCleanup()
     if (this.abortInFlight) return this.abortInFlight
     this.abortInFlight = (async () => {
-      const termination = this.terminate()
+      // Keep the hard-stop running while the courtesy RPC uses its bounded
+      // window. A failed first stop is retried by startCleanup below.
+      const termination = this.terminate().catch(() => {})
       try {
         await this.request(
           { id: `abort-${randomUUID()}`, type: 'abort' },
@@ -218,8 +224,11 @@ export class PiNativeSession implements NativeSession {
       } finally {
         await termination
         this.end(new Error('pi native session aborted'))
-        await this.closing
-        this.abortInFlight = null
+        try {
+          await this.startCleanup()
+        } finally {
+          this.abortInFlight = null
+        }
       }
     })()
     return this.abortInFlight
@@ -512,7 +521,14 @@ export class PiNativeSession implements NativeSession {
   private startCleanup(): Promise<void> {
     if (this.closing) return this.closing
     const attempt = (async () => {
-      await this.terminate()
+      try {
+        await this.terminate()
+      } catch (error) {
+        // Keep the lease and private files until the owned workload stops.
+        // A later attempt can prove the stop and finish cleanup.
+        retryCleanupUntilSuccessful(this.retryStartCleanup)
+        throw error
+      }
       const failures: unknown[] = []
       try {
         await this.cleanup()
