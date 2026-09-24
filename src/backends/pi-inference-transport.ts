@@ -91,6 +91,7 @@ export type PiInferenceTransportResolver = (
   selection: PiInferenceSelection,
   signal: AbortSignal,
   credential?: PiInferenceCredentialOverride,
+  diagnosticId?: string,
 ) => Promise<ResolvedPiInferenceTransport>
 
 export interface ProvisionedPiInferenceTransport {
@@ -392,7 +393,7 @@ export function createPiInferenceTransportResolver(options: {
       ?? join(sourceAgentDir, 'sessions'),
   )
 
-  return async (selection, signal, credential) => {
+  return async (selection, signal, credential, diagnosticId) => {
     const config = readConfiguredTransport(sourceAgentDir, selection)
       ?? await readCatalogTransport({
         bin: options.bin,
@@ -437,6 +438,7 @@ export function createPiInferenceTransportResolver(options: {
         apiMode: config.apiMode,
         env: trustedEnv,
         signal,
+        diagnosticId,
       })
     } catch (error) {
       const authFailure = error instanceof PiAuthResolutionError ? error : null

@@ -28,7 +28,7 @@ class PiAuthCommandError extends Error {
 
 /** Only fixed helper names, exit status and monotonic durations cross this boundary. */
 export class PiAuthResolutionError extends Error {
-  readonly backendCode: 'not_configured' | 'cli_missing' | 'timeout' | 'aborted' | 'upstream'
+  readonly backendCode: 'cli_missing' | 'timeout' | 'aborted' | 'upstream'
 
   constructor(readonly diagnosticId: string, readonly attempts: readonly PiAuthAttempt[]) {
     super(`pi auth helper failed id=${diagnosticId} (${attempts.map(formatAttempt).join('; ')})`)
@@ -36,9 +36,7 @@ export class PiAuthResolutionError extends Error {
     this.backendCode = attempts.some((attempt) => attempt.outcome === 'aborted') ? 'aborted'
       : attempts.some((attempt) => attempt.outcome === 'timeout') ? 'timeout'
       : attempts.some((attempt) => attempt.outcome === 'missing') ? 'cli_missing'
-      : attempts.every((attempt) => attempt.outcome === 'exit' || attempt.outcome === 'invalid_output')
-        ? 'not_configured'
-        : 'upstream'
+      : 'upstream'
   }
 }
 
@@ -55,8 +53,11 @@ export async function resolvePiAuthCredential(options: {
   apiMode: string
   env: NodeJS.ProcessEnv
   signal: AbortSignal
+  diagnosticId?: string
 }): Promise<PiAuthCredential> {
-  const diagnosticId = randomUUID()
+  const diagnosticId = options.diagnosticId && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(options.diagnosticId)
+    ? options.diagnosticId
+    : randomUUID()
   if (options.apiMode === 'openai-codex-responses') {
     try {
       return await bearerCredential(options, diagnosticId)

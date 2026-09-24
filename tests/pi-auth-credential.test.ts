@@ -47,7 +47,7 @@ it('reports both failed auth helper exits and durations without command output o
   expect(error).toBeInstanceOf(PiAuthResolutionError)
   if (!(error instanceof PiAuthResolutionError)) throw new Error('expected PiAuthResolutionError')
   expect(error).toMatchObject({
-    backendCode: 'not_configured',
+    backendCode: 'upstream',
     attempts: [
       { command: 'print-api-key', outcome: 'exit', exitCode: 17 },
       { command: 'print-bearer-token', outcome: 'exit', exitCode: 23 },
@@ -74,14 +74,19 @@ it('reports both failed auth helper exits and durations without command output o
     sessionDir: join(dir, 'sessions'),
     env: { PATH: process.env.PATH },
   })
+  const diagnosticId = '82f7e59a-3950-440f-9f19-03981575c0f1'
   const backendError = await resolver(
     { provider: 'tangle-router', model: 'gpt-5-mini' },
     new AbortController().signal,
+    undefined,
+    diagnosticId,
   ).catch((failure: unknown) => failure)
   expect(backendError).toBeInstanceOf(BackendError)
   if (!(backendError instanceof BackendError)) throw new Error('expected BackendError')
-  expect(backendError.code).toBe('not_configured')
+  expect(backendError.code).toBe('upstream')
+  expect(backendError.message).toContain(`id=${diagnosticId}`)
   expect(backendError.message).toContain('print-api-key')
   expect(backendError.message).toContain('print-bearer-token')
   expect(backendError.message).not.toContain(secret)
+  expect(warnings.slice(2).every((message) => message.includes(`id=${diagnosticId}`))).toBe(true)
 })

@@ -611,7 +611,7 @@ export class PiBackend implements NativeSessionBackend {
       const resolvedInference = await this.transportResolver({
         provider: spec.provider,
         model: spec.model,
-      }, signal, req.protectedModelCredential)
+      }, signal, req.protectedModelCredential, prestartId)
       advancePhase('provision_transport')
       inference = await provisionPiInferenceTransport(
         resolvedInference,
@@ -694,8 +694,6 @@ export class PiBackend implements NativeSessionBackend {
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
       })
-      advancePhase('started')
-      console.info(`[pi-prestart] id=${prestartId} outcome=ok phases_ms=${phaseDurations.join(',')}`)
     } catch (err) {
       advancePhase('failed')
       console.warn(
@@ -707,13 +705,19 @@ export class PiBackend implements NativeSessionBackend {
       await inference?.cleanup()
       throw err
     }
+    const earlySpawnError = spawned.spawnError?.()
+    const prestartFailure = earlySpawnError ? 'spawn_error' : !spawned.child.stdout ? 'missing_stdout' : null
+    advancePhase(prestartFailure ? 'failed' : 'started')
+    const prestartMessage = `[pi-prestart] id=${prestartId} outcome=${prestartFailure ? 'failed' : 'ok'} `
+      + `code=${prestartFailure ?? 'none'} phases_ms=${phaseDurations.join(',')}`
+    if (prestartFailure) console.warn(prestartMessage)
+    else console.info(prestartMessage)
     const child = spawned.child
     const releaseSpawner = spawned.release
     stage.started = true
 
     let spawnErrorMessage = ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
-    const earlySpawnError = spawned.spawnError?.()
     if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
     // The durable run owns the deadline and delivers it through this signal.

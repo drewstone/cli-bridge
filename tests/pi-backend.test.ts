@@ -724,6 +724,39 @@ describe('PiBackend', () => {
     ])
   })
 
+  it('reports a captured spawn error as prestart failure rather than a started Pi session', async () => {
+    const baseSpawner = piSpawner([])
+    const spawner: Spawner = async (...args) => ({
+      ...await baseSpawner(...args),
+      spawnError: () => new Error('fake spawn failure'),
+    })
+    spawner.executionEnvironment = 'test-double'
+    const warnings: string[] = []
+    const info: string[] = []
+    const warning = vi.spyOn(console, 'warn').mockImplementation((message: string) => { warnings.push(message) })
+    const information = vi.spyOn(console, 'info').mockImplementation((message: string) => { info.push(message) })
+    try {
+      const backend = new PiBackend({
+        bin: 'pi',
+        timeoutMs: 1000,
+        maxTurnAttempts: 1,
+        spawner,
+        transportResolver: testPiInferenceTransport(),
+      })
+      await expect(collect(backend.chat({
+        model: 'pi/tangle-router/glm-5.2',
+        messages: [{ role: 'user', content: 'task' }],
+      }, null, new AbortController().signal))).rejects.toThrow(/pi spawn failed: fake spawn failure/u)
+    } finally {
+      warning.mockRestore()
+      information.mockRestore()
+    }
+    expect(warnings).toContainEqual(
+      expect.stringMatching(/\[pi-prestart\] id=[a-f0-9-]+ outcome=failed code=spawn_error phases_ms=.*spawn:\d+/u),
+    )
+    expect(info.some((message) => message.startsWith('[pi-prestart]'))).toBe(false)
+  })
+
   it('refuses Docker before auth resolution instead of using mounted provider credentials', async () => {
     let resolves = 0
     let spawns = 0
