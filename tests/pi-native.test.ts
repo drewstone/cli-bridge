@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Hono } from 'hono'
 import { spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync } from 'node:fs'
@@ -8,6 +8,7 @@ import { PassThrough } from 'node:stream'
 import type { Spawner } from '../src/executors/types.js'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend } from '../src/backends/pi.js'
+import { BackendError } from '../src/backends/types.js'
 import { PiNativeSession } from '../src/backends/pi-native-session.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
@@ -289,6 +290,40 @@ describe('Pi native RPC adapter', () => {
     dir = null
     store = null
     runs = null
+  })
+
+  it('joins retained Pi auth and prestart evidence before any child is spawned', async () => {
+    dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-prestart-`)
+    const lifecycle = { children: [] as ReturnType<typeof spawn>[], releases: 0, terminations: 0 }
+    const warnings: string[] = []
+    const warning = vi.spyOn(console, 'warn').mockImplementation((message: string) => { warnings.push(message) })
+    let diagnosticId: string | undefined
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 1_000,
+      spawner: makeChildSpawner([], lifecycle),
+      transportResolver: async (_selection, _signal, _credential, id) => {
+        diagnosticId = id
+        throw new BackendError('synthetic transport failure', 'upstream')
+      },
+    })
+    try {
+      await expect(backend.startNativeSession({
+        model: 'pi/test/model',
+        messages: [{ role: 'user', content: 'start' }],
+        cwd: dir,
+        mode: 'byob',
+        interaction_policy: 'interactive',
+      }, null)).rejects.toThrow(/synthetic transport failure/u)
+    } finally {
+      warning.mockRestore()
+    }
+    expect(diagnosticId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u)
+    expect(warnings).toContainEqual(
+      expect.stringMatching(new RegExp(`^\\[pi-native-prestart\\] id=${diagnosticId} outcome=failed code=upstream phases_ms=interaction_root:\\d+,resolve_inference:\\d+$`, 'u')),
+    )
+    expect(lifecycle.children).toHaveLength(0)
+    expect(privateRootCount(dir)).toBe(0)
   })
 
   it('uses a real JSONL child for two HTTP turns, state proof, and canonical replay', async () => {

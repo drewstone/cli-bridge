@@ -1,6 +1,7 @@
 import { writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import {
   type AgentEnvironmentCapabilities,
   nativeReasoningControl,
@@ -145,6 +146,15 @@ export async function startPiNativeSession(
   let provisioned: ReturnType<typeof provisionPiProfile> = null
   let inference: Awaited<ReturnType<typeof provisionPiInferenceTransport>> | null = null
   let spawned: Awaited<ReturnType<Spawner>> | null = null
+  const prestartId = randomUUID()
+  const phaseDurations: string[] = []
+  let phase = 'interaction_root'
+  let phaseStarted = performance.now()
+  const advancePhase = (next: string): void => {
+    phaseDurations.push(`${phase}:${Math.max(0, Math.round(performance.now() - phaseStarted))}`)
+    phase = next
+    phaseStarted = performance.now()
+  }
 
   const cleanupOwnedFiles = async (): Promise<void> => {
     const failures: unknown[] = []
@@ -167,15 +177,18 @@ export async function startPiNativeSession(
     registerJailReadable(req.jailSpec, interactionExtension)
     args.push('--extension', interactionExtension)
 
+    advancePhase('resolve_inference')
     const resolvedInference = await options.transportResolver({
       provider: spec.provider,
       model: spec.model,
-    }, signal ?? new AbortController().signal, req.protectedModelCredential)
+    }, signal ?? new AbortController().signal, req.protectedModelCredential, prestartId)
+    advancePhase('provision_transport')
     inference = await provisionPiInferenceTransport(resolvedInference, {
       sessionId: req.session_id,
       ...(runCwd ? { projectDir: runCwd } : {}),
       ...(profile?.model === undefined ? {} : { modelHints: profile.model }),
     })
+    advancePhase('reserve_session')
     if (req.jailSpec) {
       req.jailSpec.extraWritablePaths = [
         ...new Set([
@@ -194,11 +207,13 @@ export async function startPiNativeSession(
       { createIfMissing: !session?.internalId },
     )
 
+    advancePhase('mcp')
     mcpMounted = requestedMcpNames.length > 0 ? materializeMcpServersForPi(mcpSpecs, runCwd) : null
     if (mcpMounted) {
       args.push('--mcp-config', mcpMounted.configPath)
       registerJailReadable(req.jailSpec, mcpMounted.configPath, dirname(mcpMounted.configPath))
     }
+    advancePhase('profile')
     provisioned = provisionPiProfile(
       req,
       session,
@@ -217,6 +232,7 @@ export async function startPiNativeSession(
     )
     if (provisioned) args.push(...provisioned.flags)
 
+    advancePhase('spawn')
     spawned = await options.spawner(options.bin, args, {
       signal,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -235,10 +251,13 @@ export async function startPiNativeSession(
       ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
       ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
     })
+    const earlySpawnError = spawned.spawnError?.()
+    if (earlySpawnError) throw new BackendError('pi RPC subprocess failed to start', 'upstream', earlySpawnError)
     if (!spawned.child.stdin || !spawned.child.stdout) {
       throw new BackendError('pi RPC subprocess has no stdin/stdout pipes', 'upstream')
     }
-    return new PiNativeSession(spawned, {
+    advancePhase('construct_session')
+    const native = new PiNativeSession(spawned, {
       capabilities: piNativeCapabilities(),
       requestTimeoutMs: options.timeoutMs > 0
         ? Math.min(options.timeoutMs, PI_RPC_REQUEST_TIMEOUT_CAP_MS)
@@ -246,7 +265,15 @@ export async function startPiNativeSession(
       providerSessionId,
       cleanup: cleanupOwnedFiles,
     })
+    advancePhase('started')
+    console.info(`[pi-native-prestart] id=${prestartId} outcome=ok code=none phases_ms=${phaseDurations.join(',')}`)
+    return native
   } catch (error) {
+    advancePhase('failed')
+    console.warn(
+      `[pi-native-prestart] id=${prestartId} outcome=failed code=${error instanceof BackendError ? error.code : 'other'} `
+      + `phases_ms=${phaseDurations.join(',')}`,
+    )
     const cleanupFailures: unknown[] = []
     try {
       if (spawned) await terminateSpawned(spawned)
