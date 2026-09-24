@@ -255,6 +255,32 @@ describe('Pi inference credential isolation', () => {
       .toThrow(/no valid maxTokens cap/u)
   })
 
+  it('sends a total Pi cap to Tangle Router without adding reasoning headroom', async () => {
+    const resolved = fixtureTransport({
+      provider: 'tangle-router',
+      model: 'glm-5.2',
+      upstreamBaseUrl: 'https://router.tangle.tools/v1',
+      modelConfig: {
+        id: 'glm-5.2',
+        api: 'openai-completions',
+        maxTokens: 128_000,
+        compat: { supportsDeveloperRole: false },
+      },
+    })
+    const transport = await provisionPiInferenceTransport(resolved, {
+      modelHints: { maxTotalOutputTokens: 2_048 },
+    })
+    try {
+      const isolated = JSON.parse(readFileSync(join(transport.agentDir, 'models.json'), 'utf8'))
+      expect(isolated.providers['tangle-router'].models[0]).toMatchObject({
+        maxTokens: 2_048,
+        compat: { supportsDeveloperRole: false, maxTokensField: 'max_completion_tokens' },
+      })
+    } finally {
+      await transport.cleanup()
+    }
+  })
+
   // Reads /proc/self/environ to prove what a descendant actually inherits. /proc exists only on
   // Linux, which is also the only platform where pi runs at all: it requires a bubblewrap fs-jail.
   it.skipIf(process.platform !== 'linux')('starts from an allowlist, so ambient provider aliases never reach a child or descendant', () => {
