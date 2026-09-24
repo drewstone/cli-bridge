@@ -340,6 +340,33 @@ export function applyPiModelHints(
   return { modelConfig: isolatedModelConfig, appliedMaxTotalOutputTokens: requested }
 }
 
+function modelConfigForRouterTotalCap(
+  resolved: ResolvedPiInferenceTransport,
+  applied: AppliedPiModelHints,
+): Record<string, unknown> {
+  if (
+    applied.appliedMaxTotalOutputTokens === undefined ||
+    resolved.apiMode !== 'openai-completions' ||
+    new URL(resolved.upstreamBaseUrl).origin !== 'https://router.tangle.tools'
+  ) return applied.modelConfig
+
+  const compat = applied.modelConfig.compat
+  if (compat !== undefined && (!isRecord(compat) || Array.isArray(compat))) {
+    throw new BackendError('backend pi Tangle Router model compat must be an object', 'not_configured')
+  }
+  if (compat?.maxTokensField !== undefined && compat.maxTokensField !== 'max_completion_tokens') {
+    throw new BackendError(
+      'backend pi cannot enforce a total completion cap with Tangle Router compat.maxTokensField=max_tokens',
+      'not_configured',
+    )
+  }
+  // Router adds reasoning headroom to max_tokens. This spelling retains the profile's total cap.
+  return {
+    ...applied.modelConfig,
+    compat: { ...compat, maxTokensField: 'max_completion_tokens' },
+  }
+}
+
 /**
  * Resolve the same provider credential Pi would use, but do so in a trusted,
  * tool-free helper process before the coding agent starts.
@@ -813,6 +840,7 @@ export async function provisionPiInferenceTransport(
 ): Promise<ProvisionedPiInferenceTransport> {
   assertExactModelBinding(resolved)
   const applied = applyPiModelHints(resolved.modelConfig, options.modelHints)
+  const modelConfig = modelConfigForRouterTotalCap(resolved, applied)
   const proxy = await startScopedProxy(resolved)
   let agentDir: string | null = null
   try {
@@ -829,7 +857,7 @@ export async function provisionPiInferenceTransport(
           ...resolved.providerConfig,
           baseUrl: proxy.localBaseUrl,
           apiKey: proxy.scopedApiKey,
-          models: [applied.modelConfig],
+          models: [modelConfig],
         },
       },
     }
