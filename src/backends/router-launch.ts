@@ -171,6 +171,7 @@ export function openRouterLaunchRecord(launch: RouterLaunch, input: LaunchRecord
   append(line: string): void
   observeTool(name: string): void
   terminal(kind: 'completed' | 'error'): void
+  termination(outcome: 'stopped' | 'failed' | 'unknown'): void
   close(outcome: 'closed' | 'failed' | 'aborted'): void
 } {
   const directory = join(launch.directory, launch.id)
@@ -212,6 +213,7 @@ export function openRouterLaunchRecord(launch: RouterLaunch, input: LaunchRecord
     transcript: 'transcript.jsonl',
     transcriptRedactions: ['launch Router credential'],
     status: 'prepared',
+    processTermination: 'unknown' as 'stopped' | 'failed' | 'unknown',
     terminalEvent: null as 'completed' | 'error' | null,
     publication: 'unknown',
   }
@@ -240,6 +242,7 @@ export function openRouterLaunchRecord(launch: RouterLaunch, input: LaunchRecord
     },
     observeTool(name): void { tools.add(name) },
     terminal(kind): void { record.terminalEvent = kind },
+    termination(outcome): void { record.processTermination = outcome },
     close(outcome): void {
       if (closed) return
       closed = true

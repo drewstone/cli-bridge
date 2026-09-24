@@ -93,6 +93,25 @@ describe('host executor semaphore', () => {
     expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
   })
 
+  it('removes an aborted waiter before the holder frees its slot', async () => {
+    process.env.BRIDGE_HOST_MAX_CONCURRENCY = '1'
+    vi.resetModules()
+    const { hostSpawner, hostExecutorSnapshot } = await import('../src/executors/host.js')
+    const holder = await hostSpawner('node', ['-e', 'setTimeout(()=>{},5000)'], {})
+    const controller = new AbortController()
+    try {
+      const queued = hostSpawner('node', ['-e', 'setTimeout(()=>{},5000)'], { signal: controller.signal })
+      await waitFor(() => { expect(hostExecutorSnapshot().queued).toBe(1) })
+      controller.abort(new Error('cancelled while queued'))
+      await expect(queued).rejects.toThrow('cancelled while queued')
+      expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 1, queued: 0 })
+    } finally {
+      holder.child.kill()
+      holder.release()
+    }
+    expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, queued: 0 })
+  })
+
   it('rejects with timeout when no slot frees within the deadline', async () => {
     process.env.BRIDGE_HOST_MAX_CONCURRENCY = '1'
     process.env.BRIDGE_HOST_ACQUIRE_DEADLINE_MS = '50'
@@ -136,6 +155,32 @@ describe('container pool — snapshot + counters', async () => {
   // callback shape the pool is not supposed to depend on.
   beforeEach(() => {
     vi.resetModules()
+  })
+
+  it('drops an aborted container waiter before a holder releases', async () => {
+    const { ContainerPool } = await import('../src/executors/container-pool.js')
+    const pool = await ContainerPool.create({
+      size: 1,
+      image: 'fake',
+      namePrefix: 'cli-bridge-cancel-test',
+      oauthMode: 'share',
+      shareMounts: [],
+      acquireDeadlineMs: 1000,
+      cli: async (args) => ({ code: 0, stdout: args.includes('run') ? 'fakeid-cancel' : '', stderr: '' }),
+    })
+    try {
+      const holder = await pool.acquire()
+      const controller = new AbortController()
+      const waiting = pool.acquire(undefined, 1000, controller.signal)
+      expect(pool.snapshot()).toMatchObject({ in_flight: 1, queued: 1 })
+      controller.abort(new Error('cancelled while queued'))
+      await expect(waiting).rejects.toThrow('cancelled while queued')
+      expect(pool.snapshot()).toMatchObject({ in_flight: 1, queued: 0 })
+      holder.release()
+      expect(pool.snapshot()).toMatchObject({ in_flight: 0, queued: 0 })
+    } finally {
+      await pool.destroy()
+    }
   })
 
   it('snapshot returns the documented shape', async () => {

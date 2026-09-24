@@ -10,7 +10,7 @@
  * full chat() loop without spawning anything.
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Readable, PassThrough } from 'node:stream'
@@ -246,7 +246,11 @@ describe('killTree', () => {
       expect(processExists(grandchildPid)).toBe(true)
 
       killTreeSync(parent.child, 'SIGKILL')
-      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      // A busy host can delay the signal's scheduler tick; an orphan can also
+      // remain as a zombie until init reaps it, although it cannot run work.
+      for (let attempt = 0; attempt < 20 && processExists(grandchildPid); attempt++) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 25))
+      }
       expect(processExists(grandchildPid)).toBe(false)
     } finally {
       parent.release()
@@ -268,6 +272,10 @@ function processExists(pid: number): boolean {
     // Signal 0 doesn't deliver but does check the pid exists + we have
     // permission. ESRCH = not found.
     process.kill(pid, 0)
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      if (/^\d+ \([^)]+\) Z /u.test(stat)) return false
+    }
     return true
   } catch {
     return false

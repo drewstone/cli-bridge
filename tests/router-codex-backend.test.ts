@@ -47,7 +47,7 @@ class FakeChild extends EventEmitter {
   stderr = new PassThrough()
   exitCode: number | null = null
 }
-function fixture(options: { version?: string; spawnError?: boolean; errorEvent?: boolean; omitTerminal?: boolean; corruptEvidence?: boolean } = {}) {
+function fixture(options: { version?: string; spawnError?: boolean; errorEvent?: boolean; omitTerminal?: boolean; corruptEvidence?: boolean; terminateFails?: boolean } = {}) {
   const modelCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv; opts: SpawnOpts }> = []
   let probes = 0
   let releases = 0
@@ -85,7 +85,12 @@ function fixture(options: { version?: string; spawnError?: boolean; errorEvent?:
       finish()
     }, 5)
     return { child: child as never, spawnError: () => null, release: () => { releases++ },
-      terminate: async () => { terminations++; clearTimeout(timer); finish() } }
+      terminate: async () => {
+        terminations++
+        if (options.terminateFails) throw new Error('fixture scope stop failed')
+        clearTimeout(timer)
+        finish()
+      } }
   }
   spawner.executionEnvironment = 'host'
   spawner.resolveCwd = () => root
@@ -129,6 +134,7 @@ describe('CodexBackend receipt-required launch path', () => {
     assert.equal(record.webSearch.enabled, false)
     assert.deepEqual(record.toolInventory.observed, ['bash'])
     assert.equal(record.publication, 'unknown')
+    assert.equal(record.processTermination, 'stopped')
     assert.ok(readFileSync(join(root, record.launchId, record.transcript), 'utf8').includes('native-private-thread'))
   })
   it('keeps flag-shaped prompts after the option terminator', async () => {
@@ -210,6 +216,16 @@ describe('CodexBackend receipt-required launch path', () => {
     await assert.rejects(collect(f.backend.chat(request(), null, new AbortController().signal)), /fixture model spawn failure/u)
     assert.equal(records()[0]!.status, 'failed')
     assert.equal(records()[0]!.publication, 'unknown')
+  })
+  it('does not certify a successful receipt when executor stop fails', async () => {
+    const f = fixture({ terminateFails: true })
+    const received: ChatDelta[] = []
+    await assert.rejects((async () => {
+      for await (const delta of f.backend.chat(request(), null, new AbortController().signal)) received.push(delta)
+    })(), /termination is unconfirmed/u)
+    assert.equal(records()[0]!.processTermination, 'failed')
+    assert.equal(records()[0]!.status, 'failed')
+    assert.ok(!received.some(delta => delta.finish_reason === 'stop'))
   })
   it('records native failures and propagates evidence-write failures after releasing the process', async () => {
     const f = fixture({ errorEvent: true })

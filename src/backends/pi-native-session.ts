@@ -102,7 +102,11 @@ export class PiNativeSession implements NativeSession {
     this.release = spawned.release
     this.terminate = async () => {
       if (this.terminationInFlight) return this.terminationInFlight
-      this.terminationInFlight = spawned.terminate ? spawned.terminate() : terminateSpawned(spawned)
+      this.terminationInFlight = spawned.terminate
+        ? spawned.terminate()
+        : terminateSpawned(spawned).then((outcome) => {
+            if (outcome !== 'stopped') throw new Error(`pi native session termination ${outcome}`)
+          })
       try {
         await this.terminationInFlight
       } finally {

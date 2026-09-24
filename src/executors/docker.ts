@@ -75,7 +75,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
   const cli = opts.cli ?? dockerCli
   const spawner: Spawner = async (bin, args, spawnOpts) => {
     const cwd = assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd, naming)
-    const slot = await opts.pool.acquire(spawnOpts.sessionId, spawnOpts.acquireDeadlineMs)
+    const slot = await opts.pool.acquire(spawnOpts.sessionId, spawnOpts.acquireDeadlineMs, spawnOpts.signal)
     let released = false
     let terminationFinished = false
     let terminationPromise: Promise<void> | null = null
@@ -85,6 +85,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       slot.release()
     }
     try {
+      spawnOpts.signal?.throwIfAborted()
       const dockerArgs = buildDockerExecArgs(
         slot.containerId,
         bin,

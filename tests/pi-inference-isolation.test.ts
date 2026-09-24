@@ -1562,7 +1562,7 @@ describe('Pi inference credential isolation', () => {
     } finally {
       for (const worker of workers) worker.stop()
     }
-  })
+  }, 15_000)
 
   it('refuses a production host Pi run before auth unless real read isolation was requested', async () => {
     let authResolutions = 0

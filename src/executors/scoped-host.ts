@@ -59,6 +59,7 @@ import { promisify } from 'node:util'
 import { withLineageEnv } from '../trace/lineage.js'
 import { executorSaturatedError, hostSpawner, sanitizeHostEnv } from './host.js'
 import { applyJail } from './jail-support.js'
+import { killTree, retryCleanupUntilSuccessful } from './process-tree.js'
 import type { Spawner, SpawnResult } from './types.js'
 
 const SLICE = 'cli-bridge-llm.slice'
@@ -127,7 +128,7 @@ interface Waiter {
   timer: NodeJS.Timeout
 }
 
-class ScopedSemaphore {
+export class ScopedSemaphore {
   private inFlight = 0
   private bulkInFlight = 0
   private readonly waiters: Record<'reserved' | 'bulk', Waiter[]> = { reserved: [], bulk: [] }
@@ -164,8 +165,9 @@ class ScopedSemaphore {
     if (admissionClass === 'bulk') this.bulkInFlight += 1
   }
 
-  async acquire(admissionClass: 'reserved' | 'bulk' = 'bulk', requestedDeadlineMs?: number): Promise<void> {
+  async acquire(admissionClass: 'reserved' | 'bulk' = 'bulk', requestedDeadlineMs?: number, signal?: AbortSignal): Promise<void> {
     this.acquires += 1
+    signal?.throwIfAborted()
     const deadlineMs = this.resolveDeadline(requestedDeadlineMs)
     if (this.canAdmit(admissionClass)) {
       this.take(admissionClass)
@@ -173,11 +175,21 @@ class ScopedSemaphore {
     }
     await new Promise<void>((resolve, reject) => {
       const queue = this.waiters[admissionClass]
+      const onAbort = (): void => {
+        const idx = queue.indexOf(waiter)
+        if (idx < 0) return
+        queue.splice(idx, 1)
+        waiter.reject(signal?.reason instanceof Error ? signal.reason : new Error('scoped-host acquire aborted'))
+      }
+      const finish = (): void => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+      }
       const timer = setTimeout(() => {
-        const idx = queue.findIndex((w) => w.timer === timer)
+        const idx = queue.indexOf(waiter)
         if (idx >= 0) queue.splice(idx, 1)
         this.timeouts += 1
-        reject(executorSaturatedError(
+        waiter.reject(executorSaturatedError(
           'scoped-host',
           'scoped-host-executor',
           this.inFlight,
@@ -187,7 +199,14 @@ class ScopedSemaphore {
           `lane=${admissionClass}, bulk=${this.bulkInFlight}/${this.max - this.reserved}`,
         ))
       }, deadlineMs).unref()
-      queue.push({ resolve, reject, timer })
+      const waiter: Waiter = {
+        resolve: () => { finish(); resolve() },
+        reject: (error) => { finish(); reject(error) },
+        timer,
+      }
+      queue.push(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
     })
   }
 
@@ -206,7 +225,6 @@ class ScopedSemaphore {
       while (queue.length > 0 && this.canAdmit(lane)) {
         const next = queue.shift()
         if (!next) break
-        clearTimeout(next.timer)
         this.take(lane)
         next.resolve()
       }
@@ -380,15 +398,21 @@ async function resolveUnitControlGroup(unitName: string): Promise<string | null>
 }
 
 async function stopScopeUnit(unitName: string): Promise<void> {
-  if (!isOwnedScopeUnitName(unitName)) return
+  if (!isOwnedScopeUnitName(unitName)) throw new Error('refusing to stop an unowned scope unit')
   try {
     await execFileAsync(
       SYSTEMCTL_BIN,
       ['--user', '--quiet', 'stop', unitName],
       { encoding: 'utf8', timeout: 3000, maxBuffer: 4096 },
     )
-  } catch {
-    // The unit may already have exited and auto-collected.
+  } catch (error) {
+    // A collected scope is stopped. A missing user manager is not proof.
+    const { stdout } = await execFileAsync(
+      SYSTEMCTL_BIN,
+      ['--user', 'show', '--property=LoadState', '--value', unitName],
+      { encoding: 'utf8', timeout: 3000, maxBuffer: 4096 },
+    )
+    if (stdout.trim() !== 'not-found') throw error
   }
 }
 
@@ -413,13 +437,23 @@ async function killCgroup(unitName: string): Promise<void> {
   await stopScopeUnit(unitName)
 }
 
+/** The request cannot finish until its owned scope stop has settled. */
+export async function terminateScopedWorkload(
+  child: SpawnResult['child'],
+  unitName: string,
+  stopScope: (unit: string) => Promise<void> = killCgroup,
+): Promise<void> {
+  await killTree(child)
+  await stopScope(unitName)
+}
+
 export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   if (!probeSystemdRun()) {
     return hostSpawner(bin, args, opts)
   }
 
   const admissionClass = opts.admissionClass ?? 'bulk'
-  await scopedSemaphore.acquire(admissionClass, opts.acquireDeadlineMs)
+  await scopedSemaphore.acquire(admissionClass, opts.acquireDeadlineMs, opts.signal)
   let semaphoreReleased = false
   const releaseSemaphore = (): void => {
     if (semaphoreReleased) return
@@ -441,10 +475,13 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   let jailCleanup: (() => Promise<void> | void) | undefined
   let jailed
   try {
+    opts.signal?.throwIfAborted()
     jailed = await applyJail(bin, args, opts)
     jailCleanup = jailed.cleanup
+    opts.signal?.throwIfAborted()
   } catch (err) {
     releaseSemaphore()
+    if (jailCleanup) await jailCleanup()
     throw err
   }
 
@@ -499,28 +536,31 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
 
   let spawnError: Error | null = null
   child.on('error', (err) => { spawnError = err })
-  child.once('exit', releaseSemaphore)
-  child.once('error', releaseSemaphore)
-
   let released = false
+  let scopeStop: Promise<void> | null = null
+  const stopScope = (): Promise<void> => {
+    scopeStop ??= killCgroup(unitName).catch((error) => {
+      scopeStop = null
+      throw error
+    })
+    return scopeStop
+  }
+  const cleanup = async (): Promise<void> => {
+    await stopScope()
+    releaseSemaphore()
+    if (jailCleanup) await jailCleanup()
+  }
   const release = (): void => {
     if (released) return
     released = true
-    releaseSemaphore()
-    // Fire-and-forget: writing 1 to cgroup.kill is synchronous from
-    // the kernel's perspective; the actual SIGKILLs cascade
-    // asynchronously and we don't need to await them. Errors are
-    // swallowed because by the time release() runs the scope may
-    // have already auto-collected if the child exited cleanly.
-    void killCgroup(unitName).catch(() => {})
-    // Idempotent via the `released` guard: jail temp state is torn down
-    // exactly once regardless of which path (finally / exit / error)
-    // fires release first.
-    if (jailCleanup) void Promise.resolve(jailCleanup()).catch(() => {})
+    void cleanup().catch(() => retryCleanupUntilSuccessful(cleanup))
   }
+  child.once('exit', release)
+  child.once('error', release)
 
   const result: SpawnResult = {
     child,
+    terminate: () => terminateScopedWorkload(child, unitName, stopScope),
     release,
     spawnError: () => spawnError,
   }

@@ -147,7 +147,7 @@ describe('a cleanup failure is not the answer to the request', () => {
       terminate: async () => { throw new Error('docker executor could not terminate container c60496099aaa') },
     } as unknown as SpawnResult
 
-    await expect(terminateSpawned(spawned)).resolves.toBeUndefined()
+    await expect(terminateSpawned(spawned)).resolves.toBe('failed')
   })
 
   it('keeps the CLI outcome when termination fails after a successful run', async () => {

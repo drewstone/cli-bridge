@@ -64,21 +64,39 @@ class HostSemaphore {
    * The refusal is a typed capacity answer, not a spawn failure: it happens
    * before the child exists, so the caller can retry it with nothing lost.
    */
-  async acquire(requestedDeadlineMs?: number): Promise<void> {
+  async acquire(requestedDeadlineMs?: number, signal?: AbortSignal): Promise<void> {
     this.acquires += 1
+    signal?.throwIfAborted()
     const deadlineMs = this.resolveDeadline(requestedDeadlineMs)
     if (this.inFlight < this.max) {
       this.inFlight += 1
       return
     }
     await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        const idx = this.waiters.indexOf(waiter)
+        if (idx < 0) return
+        this.waiters.splice(idx, 1)
+        waiter.reject(signal?.reason instanceof Error ? signal.reason : new Error('host acquire aborted'))
+      }
+      const finish = (): void => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+      }
       const timer = setTimeout(() => {
-        const idx = this.waiters.findIndex((w) => w.timer === timer)
+        const idx = this.waiters.indexOf(waiter)
         if (idx >= 0) this.waiters.splice(idx, 1)
         this.timeouts += 1
-        reject(saturated('host', 'host-executor', this.inFlight, this.max, this.waiters.length, deadlineMs))
+        waiter.reject(saturated('host', 'host-executor', this.inFlight, this.max, this.waiters.length, deadlineMs))
       }, deadlineMs).unref()
-      this.waiters.push({ resolve, reject, timer })
+      const waiter: Waiter = {
+        resolve: () => { finish(); resolve() },
+        reject: (error) => { finish(); reject(error) },
+        timer,
+      }
+      this.waiters.push(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
     })
   }
 
@@ -170,7 +188,7 @@ const hostSemaphore = new HostSemaphore(
 )
 
 export const hostSpawner: Spawner = async (bin, args, opts) => {
-  await hostSemaphore.acquire(opts.acquireDeadlineMs)
+  await hostSemaphore.acquire(opts.acquireDeadlineMs, opts.signal)
   let released = false
   let jailCleanup: (() => Promise<void> | void) | undefined
   const release = (): void => {
@@ -184,10 +202,12 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     if (jailCleanup) void Promise.resolve(jailCleanup()).catch(() => {})
   }
   try {
+    opts.signal?.throwIfAborted()
     // Wrap (bin, args) in the OS write-jail when a spec is present;
     // otherwise this is a pass-through and (bin, args, env) are unchanged.
     const jailed = await applyJail(bin, args, opts)
     jailCleanup = jailed.cleanup
+    opts.signal?.throwIfAborted()
     // detached: true → child is the leader of a new process group whose
     // pgid equals its pid. kill(-pid, sig) reaches every descendant. We
     // do NOT call child.unref() — the bridge still owns the child for
