@@ -56,6 +56,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
+import { performance } from 'node:perf_hooks'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth, NativeSessionBackend } from './types.js'
 import { versionHealth } from './health.js'
@@ -597,11 +598,21 @@ export class PiBackend implements NativeSessionBackend {
     let provisioned: ReturnType<typeof provisionPiProfile> = null
     let inference: ProvisionedPiInferenceTransport | null = null
     let spawned: Awaited<ReturnType<Spawner>>
+    const prestartId = randomUUID()
+    const phaseDurations: string[] = []
+    let phase = 'resolve_inference'
+    let phaseStarted = performance.now()
+    const advancePhase = (next: string): void => {
+      phaseDurations.push(`${phase}:${Math.max(0, Math.round(performance.now() - phaseStarted))}`)
+      phase = next
+      phaseStarted = performance.now()
+    }
     try {
       const resolvedInference = await this.transportResolver({
         provider: spec.provider,
         model: spec.model,
       }, signal, req.protectedModelCredential)
+      advancePhase('provision_transport')
       inference = await provisionPiInferenceTransport(
         resolvedInference,
         {
@@ -612,6 +623,7 @@ export class PiBackend implements NativeSessionBackend {
             : { modelHints }),
         },
       )
+      advancePhase('session_and_mcp')
       if (req.jailSpec) {
         req.jailSpec.extraWritablePaths = [
           ...new Set([
@@ -634,6 +646,7 @@ export class PiBackend implements NativeSessionBackend {
         ? materializeMcpServersForPi(mcpSpecs, runCwd)
         : null
       if (mcpMounted) args.push('--mcp-config', mcpMounted.configPath)
+      advancePhase('profile')
       provisioned = provisionPiProfile(
         req,
         session,
@@ -654,6 +667,7 @@ export class PiBackend implements NativeSessionBackend {
       // The task prompt remains the sole positional message. Profile system and
       // additive instructions retain their native, separate authority channels.
       args.push(prompt)
+      advancePhase('spawn')
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: runCwd,
@@ -680,7 +694,14 @@ export class PiBackend implements NativeSessionBackend {
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
       })
+      advancePhase('started')
+      console.info(`[pi-prestart] id=${prestartId} outcome=ok phases_ms=${phaseDurations.join(',')}`)
     } catch (err) {
+      advancePhase('failed')
+      console.warn(
+        `[pi-prestart] id=${prestartId} outcome=failed code=${err instanceof BackendError ? err.code : 'other'} `
+        + `phases_ms=${phaseDurations.join(',')}`,
+      )
       mcpMounted?.cleanup()
       provisioned?.cleanup()
       await inference?.cleanup()

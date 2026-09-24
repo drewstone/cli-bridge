@@ -15,7 +15,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Hono } from 'hono'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { defineAgentProfilePublicConfig as pub } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
 import {
@@ -699,6 +699,8 @@ describe('PiBackend', () => {
 
   it('refuses a failed isolated transport before spawning a Pi child', async () => {
     let spawns = 0
+    const warnings: string[] = []
+    const warning = vi.spyOn(console, 'warn').mockImplementation((message: string) => { warnings.push(message) })
     const backend = new PiBackend({
       bin: 'pi',
       timeoutMs: 1000,
@@ -708,11 +710,18 @@ describe('PiBackend', () => {
       spawner: piSpawner([], () => { spawns += 1 }),
     })
 
-    await expect(collect(backend.chat({
-      model: 'pi/tangle-router/glm-5.2',
-      messages: [{ role: 'user', content: 'task' }],
-    }, null, new AbortController().signal))).rejects.toThrow(/isolated transport unavailable/u)
+    try {
+      await expect(collect(backend.chat({
+        model: 'pi/tangle-router/glm-5.2',
+        messages: [{ role: 'user', content: 'task' }],
+      }, null, new AbortController().signal))).rejects.toThrow(/isolated transport unavailable/u)
+    } finally {
+      warning.mockRestore()
+    }
     expect(spawns).toBe(0)
+    expect(warnings).toEqual([
+      expect.stringMatching(/^\[pi-prestart\] id=[a-f0-9-]+ outcome=failed code=not_configured phases_ms=resolve_inference:\d+$/u),
+    ])
   })
 
   it('refuses Docker before auth resolution instead of using mounted provider credentials', async () => {

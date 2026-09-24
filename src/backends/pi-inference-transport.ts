@@ -22,7 +22,7 @@ import {
 } from 'node:fs'
 import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
 import { assertPiModelMetadataCompatibility } from './profile-support.js'
-import { resolvePiAuthCredential } from './pi-auth-credential.js'
+import { PiAuthResolutionError, resolvePiAuthCredential } from './pi-auth-credential.js'
 import { readPiSelectedModel, type PiCatalogModel } from './pi-catalog-rpc.js'
 import { BackendError } from './types.js'
 
@@ -439,10 +439,12 @@ export function createPiInferenceTransportResolver(options: {
         signal,
       })
     } catch (error) {
+      const authFailure = error instanceof PiAuthResolutionError ? error : null
       throw new BackendError(
         `backend pi cannot establish isolated inference auth for ${selection.provider}/${selection.model} `
-        + `(credential source: ${credentialSource})`,
-        'not_configured',
+        + `(credential source: ${credentialSource})`
+        + (authFailure ? `: ${authFailure.message}` : ''),
+        authFailure?.backendCode ?? 'not_configured',
         error,
       )
     }
