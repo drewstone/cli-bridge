@@ -11,6 +11,7 @@ import {
 import { isRuntimeProcessControlEnvironmentName } from '@tangle-network/agent-interface/profile-security'
 
 export const RETAINED_MAX_TEXT_LENGTH = 16_384
+export const RETAINED_MAX_TURN_MESSAGE_LENGTH = 262_144
 export const RETAINED_MAX_CWD_LENGTH = 4_096
 export const RETAINED_MAX_JSON_DEPTH = 16
 export const RETAINED_MAX_JSON_NODES = 8_192

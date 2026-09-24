@@ -152,6 +152,10 @@ The session creation wire shape owns `id` or `session_id`, `model`, `cwd`, `mode
 
 The retained turn wire shape owns `message` or `parts`, `turn_id`, `execution_id`, `run_id`, `provider`, `environment_id`, `interactions`, `context`, `provider_options`, `metadata`, `execution`, and `env`.
 
+A retained turn `message` accepts at most 262,144 characters, so a long model prompt can retain its exact text.
+
+Each text part and other bounded string still accepts at most 16,384 characters, and the entire HTTP body remains capped at 1 MiB.
+
 The `parts` union accepts strict `text`, `file`, and `image` records with bounded `filename`, `mediaType`, `url`, `path`, and `content` fields where the part type permits them.
 
 The SDK `CliBridgeProviderOptions.defaultExecution` field maps to the retained `execution` field.
