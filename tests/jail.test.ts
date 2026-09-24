@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -267,6 +267,60 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(wrap.env?.HOME).toBe(expectedRoot)
     expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(expectedRoot, '.config'))
     expect(wrap.env?.XDG_CACHE_HOME).toBe(join(expectedRoot, '.cache'))
+  })
+
+  it('links the host keychain directory into the jail HOME', async () => {
+    // Regression: claude keeps its macOS login in the login keychain, and with
+    // HOME at the jail root a jailed claude answered "Not logged in".
+    const home = await tempProjectDir()
+    await mkdir(join(home, 'Library', 'Keychains'), { recursive: true })
+    const previousHome = process.env.HOME
+    process.env.HOME = home
+    cleanups.push(async () => {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+    })
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+
+    const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], { root, projectDir })
+    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+
+    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
+    expect(await readlink(join(expectedRoot, 'Library', 'Keychains'))).toBe(join(home, 'Library', 'Keychains'))
+    // The confined child must not be able to redirect the link or its parent.
+    const profile = await readFile(wrap.args[1] as string, 'utf8')
+    expect(profile).toContain(`(literal "${join(expectedRoot, 'Library')}")`)
+    expect(profile).toContain(`(literal "${join(expectedRoot, 'Library', 'Keychains')}")`)
+  })
+
+  it('never follows a Library link a confined run planted in the jail HOME', async () => {
+    // Review finding on #238: an earlier run could replace <root>/Library with a
+    // link to a host directory, and the unsandboxed rm -r then deleted host
+    // files through it.
+    const home = await tempProjectDir()
+    await mkdir(join(home, 'Library', 'Keychains'), { recursive: true })
+    const previousHome = process.env.HOME
+    process.env.HOME = home
+    cleanups.push(async () => {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+    })
+    const hostDir = await tempProjectDir()
+    await mkdir(join(hostDir, 'Keychains'), { recursive: true })
+    await writeFile(join(hostDir, 'Keychains', 'login.keychain-db'), 'host')
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+    await mkdir(root, { recursive: true })
+    await symlink(hostDir, join(root, 'Library'))
+
+    const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], { root, projectDir })
+    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+
+    expect(await readFile(join(hostDir, 'Keychains', 'login.keychain-db'), 'utf8')).toBe('host')
+    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
+    expect((await lstat(join(expectedRoot, 'Library'))).isDirectory()).toBe(true)
+    expect(await readlink(join(expectedRoot, 'Library', 'Keychains'))).toBe(join(home, 'Library', 'Keychains'))
   })
 })
 

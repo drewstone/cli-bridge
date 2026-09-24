@@ -17,10 +17,11 @@
  */
 
 import { accessSync, constants, existsSync } from 'node:fs'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
+  backendHome,
   copyAuthIntoJail,
   removeAuthCopies,
   removeStaleAuthCopies,
@@ -57,6 +58,7 @@ export class MacosSeatbeltJail implements JailBackend {
     // Create the redirected HOME/XDG dirs under the (canonical) root so the CLI
     // can write to them; they sit inside `root`, already in the writable set.
     await prepareJailHome(root)
+    const fixedPaths = await linkHostKeychains(root)
     ignoreJailRoot(spec.projectDir, root)
     // sandbox-exec cannot bind-mount, so copy the backend's host auth into the
     // jail HOME (writable, under root) — the CLI authenticates as the operator.
@@ -118,7 +120,7 @@ export class MacosSeatbeltJail implements JailBackend {
         authEnv[envVar] = resolveJailRoot(jailRel, root)
       }
 
-      const profile = buildProfile(writable)
+      const profile = buildProfile(writable, fixedPaths)
       const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
       const profilePath = join(dir, 'profile.sb')
       await writeFile(profilePath, profile, { mode: 0o600 })
@@ -141,9 +143,62 @@ export class MacosSeatbeltJail implements JailBackend {
   }
 }
 
-function buildProfile(writable: string[]): string {
+/**
+ * Claude Code on macOS keeps its OAuth login in the login keychain, not in
+ * ~/.claude. macOS resolves the keychain search list under
+ * $HOME/Library/Keychains, so with HOME at the jail root a confined claude saw
+ * only the System keychain and answered "Not logged in". Link the host
+ * keychain directory into the jail HOME. The profile already allows reads
+ * everywhere, so the link grants the child no access it lacked. Writes stay
+ * denied: measured on macOS, `security add-generic-password` fails inside the
+ * jail. A jailed claude that refreshes its token therefore cannot persist it,
+ * as with the per-run credential seed on Linux.
+ *
+ * The bridge runs this unsandboxed on a tree the confined child can write, so
+ * it never follows an entry the child could have planted: it removes a
+ * non-directory `Library` and a foreign link by unlinking the entry itself,
+ * and moves a real `Keychains` directory aside instead of deleting it. The
+ * returned paths are fixed in the profile, so no later confined run can
+ * redirect them.
+ */
+async function linkHostKeychains(root: string): Promise<string[]> {
+  const source = join(backendHome(), 'Library', 'Keychains')
+  if (!existsSync(source)) return []
+  const library = join(root, 'Library')
+  const target = join(library, 'Keychains')
+  const libraryStat = await lstat(library).catch(() => null)
+  if (libraryStat && !libraryStat.isDirectory()) await unlink(library)
+  await mkdir(library, { recursive: true })
+  const targetStat = await lstat(target).catch(() => null)
+  if (targetStat?.isSymbolicLink()) {
+    if ((await readlink(target)) === source) return [library, target]
+    await unlink(target)
+  } else if (targetStat?.isDirectory()) {
+    await rename(target, `${target}.moved-${process.pid}-${Date.now()}`)
+  } else if (targetStat) {
+    await unlink(target)
+  }
+  try {
+    await symlink(source, target)
+  } catch (error) {
+    // A concurrent wrap of the same jail root may have linked it first.
+    const linked = (await readlink(target).catch(() => null)) === source
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !linked) throw error
+  }
+  return [library, target]
+}
+
+function buildProfile(writable: string[], fixed: string[] = []): string {
   const allowSubpaths = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
   const allowDevices = DEVICE_WRITABLE.map((path) => `  (literal "${sbplEscape(path)}")`).join('\n')
+  const denyFixed = fixed.length === 0 ? [] : [
+    '; The keychain link and its parent stay fixed, so a confined run cannot',
+    '; point them at host paths the unsandboxed bridge later touches.',
+    '(deny file-write*',
+    ...fixed.map((path) => `  (literal "${sbplEscape(path)}")`),
+    ')',
+    '',
+  ]
   return [
     '(version 1)',
     '(allow default)',
@@ -157,6 +212,7 @@ function buildProfile(writable: string[]): string {
     allowDevices,
     ')',
     '',
+    ...denyFixed,
   ].join('\n')
 }
 
