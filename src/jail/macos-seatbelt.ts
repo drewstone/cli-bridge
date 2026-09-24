@@ -17,10 +17,11 @@
  */
 
 import { accessSync, constants, existsSync } from 'node:fs'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
-import { delimiter, join } from 'node:path'
+import { mkdir, mkdtemp, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { delimiter, dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
+  backendHome,
   copyAuthIntoJail,
   removeAuthCopies,
   removeStaleAuthCopies,
@@ -57,6 +58,7 @@ export class MacosSeatbeltJail implements JailBackend {
     // Create the redirected HOME/XDG dirs under the (canonical) root so the CLI
     // can write to them; they sit inside `root`, already in the writable set.
     await prepareJailHome(root)
+    await linkHostKeychains(root)
     ignoreJailRoot(spec.projectDir, root)
     // sandbox-exec cannot bind-mount, so copy the backend's host auth into the
     // jail HOME (writable, under root) — the CLI authenticates as the operator.
@@ -138,6 +140,33 @@ export class MacosSeatbeltJail implements JailBackend {
       await removeCopiedAuth()
       throw err
     }
+  }
+}
+
+/**
+ * Claude Code on macOS keeps its OAuth login in the login keychain, not in
+ * ~/.claude. macOS resolves the keychain search list under
+ * $HOME/Library/Keychains, so with HOME at the jail root a confined claude saw
+ * only the System keychain and answered "Not logged in". Link the host
+ * keychain directory into the jail HOME. The profile already allows reads
+ * everywhere and securityd writes keychain items outside the sandbox, so the
+ * link grants the child no access it lacked; file writes through it stay
+ * denied because its target is outside the writable set.
+ */
+async function linkHostKeychains(root: string): Promise<void> {
+  const source = join(backendHome(), 'Library', 'Keychains')
+  if (!existsSync(source)) return
+  const target = join(root, 'Library', 'Keychains')
+  if ((await readlink(target).catch(() => null)) === source) return
+  // An earlier jailed run may have left a real directory here.
+  await rm(target, { recursive: true, force: true })
+  await mkdir(dirname(target), { recursive: true })
+  try {
+    await symlink(source, target)
+  } catch (error) {
+    // A concurrent run in the same jail root may have linked it first.
+    const linked = (await readlink(target).catch(() => null)) === source
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !linked) throw error
   }
 }
 

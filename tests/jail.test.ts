@@ -16,7 +16,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -267,6 +267,27 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(wrap.env?.HOME).toBe(expectedRoot)
     expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(expectedRoot, '.config'))
     expect(wrap.env?.XDG_CACHE_HOME).toBe(join(expectedRoot, '.cache'))
+  })
+
+  it('links the host keychain directory into the jail HOME', async () => {
+    // Regression: claude keeps its macOS login in the login keychain, and with
+    // HOME at the jail root a jailed claude answered "Not logged in".
+    const home = await tempProjectDir()
+    await mkdir(join(home, 'Library', 'Keychains'), { recursive: true })
+    const previousHome = process.env.HOME
+    process.env.HOME = home
+    cleanups.push(async () => {
+      if (previousHome === undefined) delete process.env.HOME
+      else process.env.HOME = previousHome
+    })
+    const projectDir = await tempProjectDir()
+    const root = join(projectDir, '.agent-home')
+
+    const wrap = await new MacosSeatbeltJail().wrap('/bin/sh', ['-c', 'x'], { root, projectDir })
+    if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+
+    const expectedRoot = await realpath(resolveJailRoot(root, projectDir))
+    expect(await readlink(join(expectedRoot, 'Library', 'Keychains'))).toBe(join(home, 'Library', 'Keychains'))
   })
 })
 

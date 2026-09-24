@@ -73,7 +73,7 @@ const OPENCODE_SEED_ENTRIES = ['auth.json'] as const
 
 /** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME
  * override (matches how the backends resolve config/auth at runtime). */
-function backendHome(): string {
+export function backendHome(): string {
   return process.env.HOME?.trim() || homedir()
 }
 
