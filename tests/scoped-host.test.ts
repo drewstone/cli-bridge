@@ -21,10 +21,13 @@ import {
   isOwnedScopeControlGroup,
   resolveScopeMemoryMax,
   resolveScopedSpawnEnv,
+  ScopedSemaphore,
   scopedHostExecutorSnapshot,
   scopedHostSpawner,
+  terminateScopedWorkload,
 } from '../src/executors/scoped-host.js'
 import { killTree } from '../src/executors/process-tree.js'
+import { terminateSpawned } from '../src/executors/process-tree.js'
 
 const systemdRunAvailable =
   (existsSync('/usr/bin/systemd-run') || existsSync('/bin/systemd-run')) &&
@@ -37,6 +40,40 @@ const systemdRunAvailable =
 const describeReal = systemdRunAvailable && process.env.CLI_BRIDGE_REAL_CGROUP_TESTS === '1'
   ? describe
   : describe.skip
+
+describe('scoped-host cancellation', () => {
+  it('removes a cancelled reserved waiter without consuming the next slot', async () => {
+    const slots = new ScopedSemaphore(1, 1000, 1000, 0)
+    await slots.acquire('bulk')
+    const controller = new AbortController()
+    const waiting = slots.acquire('reserved', 1000, controller.signal)
+    expect(slots.snapshot()).toMatchObject({ in_flight: 1, queued: 1, queued_reserved: 1 })
+    controller.abort(new Error('cancelled while queued'))
+    await expect(waiting).rejects.toThrow('cancelled while queued')
+    slots.release('bulk')
+    expect(slots.snapshot()).toMatchObject({ in_flight: 0, queued: 0 })
+  })
+
+  it('waits for the owned cgroup stop before reporting a stopped workload', async () => {
+    let finishStop!: () => void
+    const stop = new Promise<void>((resolve) => { finishStop = resolve })
+    const unit = 'cli-bridge-1234-a1b2c3d4e5f6.scope'
+    const child = { pid: undefined } as never
+    let settled = false
+    const termination = terminateSpawned({
+      child,
+      release: () => {},
+      terminate: () => terminateScopedWorkload(child, unit, async (received) => {
+        expect(received).toBe(unit)
+        await stop
+      }),
+    }).then((outcome) => { settled = true; return outcome })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    finishStop()
+    await expect(termination).resolves.toBe('stopped')
+  })
+})
 
 describe('scopedHostSpawner — the wrapper environment', () => {
   it('leaves an absent env absent, because undefined means INHERIT and PATH lives there', () => {

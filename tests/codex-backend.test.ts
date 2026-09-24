@@ -92,6 +92,60 @@ const TURN_DONE = {
 }
 
 describe('CodexBackend tool-call translation', () => {
+  it('passes cancellation through a delayed spawn before any model start', async () => {
+    const controller = new AbortController()
+    let enterSpawn!: () => void
+    let resumeSpawn!: () => void
+    const entered = new Promise<void>((resolve) => { enterSpawn = resolve })
+    const gate = new Promise<void>((resolve) => { resumeSpawn = resolve })
+    let modelStarts = 0
+    const spawner: Spawner = async (_bin, _args, opts) => {
+      enterSpawn()
+      await gate
+      if (opts.signal?.aborted) throw new Error('cancelled before model start')
+      modelStarts += 1
+      return codexSpawner([TURN_DONE])(_bin, _args, opts)
+    }
+    const backend = new CodexBackend({ bin: 'codex', timeoutMs: 0, spawner })
+    const run = collect(backend.chat(request(), null, controller.signal))
+    await entered
+    controller.abort()
+    resumeSpawn()
+    await expect(run).rejects.toThrow('cancelled before model start')
+    expect(modelStarts).toBe(0)
+  })
+
+  it('kills a late child from a spawner that ignored cancellation and never reports stop', async () => {
+    const controller = new AbortController()
+    let enterSpawn!: () => void
+    let resumeSpawn!: () => void
+    const entered = new Promise<void>((resolve) => { enterSpawn = resolve })
+    const gate = new Promise<void>((resolve) => { resumeSpawn = resolve })
+    let terminations = 0
+    let releases = 0
+    const spawner: Spawner = async () => {
+      enterSpawn()
+      await gate
+      return {
+        child: new FakeChild() as never,
+        release: () => { releases += 1 },
+        terminate: async () => { terminations += 1 },
+      }
+    }
+    const backend = new CodexBackend({ bin: 'codex', timeoutMs: 0, spawner })
+    const received: ChatDelta[] = []
+    const run = (async () => {
+      for await (const delta of backend.chat(request(), null, controller.signal)) received.push(delta)
+    })()
+    await entered
+    controller.abort()
+    resumeSpawn()
+    await expect(run).rejects.toMatchObject({ code: 'aborted' })
+    expect(terminations).toBe(1)
+    expect(releases).toBe(1)
+    expect(received.some((delta) => delta.finish_reason === 'stop')).toBe(false)
+  })
+
   it('retains native state across turns while refreshing MCP and isolating concurrent sessions', async () => {
     const root = mkdtempSync(join(tmpdir(), 'codex-native-session-'))
     const homes = new Map<string, string>()

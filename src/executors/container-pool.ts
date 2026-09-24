@@ -203,9 +203,10 @@ const DEFAULTS = {
 
 interface Waiter {
   sessionId: string | undefined
-  resolve: (slot: SlotState) => void
+  resolve: (slot: SlotState) => boolean
   reject: (err: Error) => void
   timer: NodeJS.Timeout
+  settled: boolean
 }
 
 export class ContainerPool {
@@ -307,8 +308,9 @@ export class ContainerPool {
   /**
    * Take a slot, waiting up to `requestedDeadlineMs` capped by the pool ceiling.
    */
-  async acquire(sessionId?: string, requestedDeadlineMs?: number): Promise<AcquiredSlot> {
+  async acquire(sessionId?: string, requestedDeadlineMs?: number, signal?: AbortSignal): Promise<AcquiredSlot> {
     if (this.destroyed) throw new Error('container pool destroyed')
+    signal?.throwIfAborted()
     this.counters.acquires += 1
     const deadlineMs = requestedDeadlineMs === undefined
       ? this.acquireDeadlineMs
@@ -318,10 +320,10 @@ export class ContainerPool {
     // this session.
     if (sessionId) {
       const sticky = this.slots.find((s) => !s.busy && !s.dead && s.lastSession === sessionId)
-      if (sticky) return await this.handOut(sticky, sessionId)
+      if (sticky) return await this.handOut(sticky, sessionId, signal)
     }
     const free = this.slots.find((s) => !s.busy && !s.dead)
-    if (free) return await this.handOut(free, sessionId)
+    if (free) return await this.handOut(free, sessionId, signal)
 
     // All slots busy or dead — count alive slots so we don't queue
     // against a permanently-dead pool.
@@ -349,11 +351,20 @@ export class ContainerPool {
     }
 
     return new Promise<AcquiredSlot>((resolve, reject) => {
+      const onAbort = (): void => {
+        const idx = this.waiters.indexOf(waiter)
+        if (idx >= 0) this.waiters.splice(idx, 1)
+        waiter.reject(signal?.reason instanceof Error ? signal.reason : new Error('container-pool acquire aborted'))
+      }
+      const finish = (): void => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+      }
       const timer = setTimeout(() => {
-        const idx = this.waiters.findIndex((w) => w.timer === timer)
+        const idx = this.waiters.indexOf(waiter)
         if (idx >= 0) this.waiters.splice(idx, 1)
         this.counters.acquire_timeouts += 1
-        reject(
+        waiter.reject(
           new ExecutorSaturatedError(
             'container-pool',
             {
@@ -369,14 +380,30 @@ export class ContainerPool {
         )
       }, deadlineMs).unref()
       this.waiters.push({
+        settled: false,
         sessionId,
         resolve: (slot) => {
-          clearTimeout(timer)
+          if (waiter.settled) return false
+          if (signal?.aborted) {
+            onAbort()
+            return false
+          }
+          waiter.settled = true
+          finish()
           resolve(this.markAcquired(slot, sessionId))
+          return true
         },
-        reject,
+        reject: (error) => {
+          if (waiter.settled) return
+          waiter.settled = true
+          finish()
+          reject(error)
+        },
         timer,
       })
+      const waiter = this.waiters.at(-1)!
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
     })
   }
 
@@ -432,12 +459,14 @@ export class ContainerPool {
    * Reservation happens BEFORE the async liveness probe so two concurrent
    * acquires cannot both be handed the same slot while one is verifying.
    */
-  private async handOut(slot: SlotState, sessionId: string | undefined): Promise<AcquiredSlot> {
+  private async handOut(slot: SlotState, sessionId: string | undefined, signal?: AbortSignal): Promise<AcquiredSlot> {
     slot.busy = true
     try {
       await this.ensureSlotUsable(slot)
+      signal?.throwIfAborted()
     } catch (err) {
       slot.busy = false
+      this.serveWaiterWith(slot)
       throw err
     }
     slot.busy = false
@@ -584,13 +613,20 @@ export class ContainerPool {
     void this.ensureSlotUsable(slot).then(
       () => {
         slot.busy = false
-        if (waiter.sessionId) slot.lastSession = waiter.sessionId
         // `waiter.resolve` runs markAcquired, which reserves the slot and bumps
         // the generation the waiter's own release() is bound to.
-        waiter.resolve(slot)
+        if (waiter.resolve(slot)) {
+          if (waiter.sessionId) slot.lastSession = waiter.sessionId
+        } else {
+          this.serveWaiterWith(slot)
+        }
       },
       (err: Error) => {
         slot.busy = false
+        if (waiter.settled) {
+          this.serveWaiterWith(slot)
+          return
+        }
         // This slot could not be made usable. Another alive slot may still
         // serve the waiter; only when none exists does the waiter learn why.
         const alternative = this.slots.find((s) => s !== slot && !s.busy && !s.dead)

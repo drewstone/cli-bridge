@@ -87,7 +87,9 @@ export async function killTree(
   }
 }
 
-const terminationBySpawn = new WeakMap<SpawnResult, Promise<void>>()
+export type TerminationOutcome = 'stopped' | 'failed' | 'unknown'
+
+const terminationBySpawn = new WeakMap<SpawnResult, Promise<TerminationOutcome>>()
 
 /**
  * Ask the executor to terminate the workload it owns, then wait for proof of
@@ -95,20 +97,32 @@ const terminationBySpawn = new WeakMap<SpawnResult, Promise<void>>()
  * override this because that PID belongs to the local `docker exec` client,
  * not to the command that continues running inside the container.
  */
-export function terminateSpawned(spawned: SpawnResult): Promise<void> {
+export function terminateSpawned(spawned: SpawnResult): Promise<TerminationOutcome> {
   const active = terminationBySpawn.get(spawned)
   if (active) return active
 
-  // Never rejects. Backends await this in their `finally`, so a rejection here
-  // REPLACED the outcome the CLI had already produced: measured live, a request
-  // whose container was swept answered HTTP 500 with "docker executor could not
-  // terminate container …", a sentence containing nothing the caller sent.
-  // Cleanup is the executor's business — the docker spawner's own release path
-  // sees the same failure and recycles the slot — while the caller's answer stays
-  // the CLI's answer.
-  const termination = (spawned.terminate?.() ?? killTree(spawned.child)).catch((error) => {
-    terminationBySpawn.delete(spawned)
-    console.error('[cli-bridge] termination failed after the run completed:', error)
+  // Preserve the CLI's answer without claiming that an uncertain stop succeeded.
+  // The executor still owns recycling or retrying its workload before slot reuse.
+  const termination = (async (): Promise<TerminationOutcome> => {
+    try {
+      if (spawned.terminate) {
+        await spawned.terminate()
+        return 'stopped'
+      }
+      await killTree(spawned.child)
+      const pid = spawned.child.pid
+      if (pid === undefined) return 'stopped'
+      if (process.platform === 'win32') {
+        return spawned.child.exitCode !== null || spawned.child.signalCode !== null ? 'stopped' : 'unknown'
+      }
+      return processGroupExists(pid) ? 'unknown' : 'stopped'
+    } catch (error) {
+      console.error('[cli-bridge] termination failed after the run completed:', error)
+      return 'failed'
+    }
+  })()
+  void termination.then((outcome) => {
+    if (outcome !== 'stopped') terminationBySpawn.delete(spawned)
   })
   terminationBySpawn.set(spawned, termination)
   return termination
@@ -124,7 +138,7 @@ const cleanupRetries = new Map<() => Promise<void> | void, CleanupRetry>()
 const CLEANUP_RETRY_BASE_MS = 250
 const CLEANUP_RETRY_MAX_MS = 30_000
 
-/** Retry one failed request-owned cleanup without retaining executor capacity. */
+/** Retry one failed request-owned cleanup until it can settle. */
 export function retryCleanupUntilSuccessful(cleanup: () => Promise<void> | void): void {
   const retry = cleanupRetries.get(cleanup) ?? { cleanup, attempts: 0, timer: null }
   cleanupRetries.set(cleanup, retry)
@@ -204,7 +218,7 @@ async function waitForProcessGroupExitOrTimeout(processGroupId: number, ms: numb
   }
 }
 
-function processGroupExists(processGroupId: number): boolean {
+export function processGroupExists(processGroupId: number): boolean {
   try {
     process.kill(-processGroupId, 0)
     return true

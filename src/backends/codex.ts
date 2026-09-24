@@ -250,7 +250,9 @@ export class CodexBackend implements Backend {
         }
         signal.throwIfAborted()
       }
+      signal.throwIfAborted()
       spawned = await this.spawner(this.opts.bin, args, {
+        signal,
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
         env: {
@@ -265,6 +267,14 @@ export class CodexBackend implements Backend {
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
+      // A custom spawner may settle after cancellation even if it ignores the
+      // signal. Do not read a late child's output or report a normal stop.
+      if (signal.aborted) {
+        const outcome = await terminateSpawned(spawned)
+        record?.termination(outcome)
+        spawned.release()
+        throw new BackendError(`Codex launch aborted during spawn; termination ${outcome}`, 'aborted')
+      }
     } catch (error) {
       try { codexHome?.cleanup() } finally { record?.close(signal.aborted ? 'aborted' : 'failed') }
       throw error
@@ -287,14 +297,18 @@ export class CodexBackend implements Backend {
 
     let emittedToolCall = false
     let recordOutcome: 'closed' | 'failed' = 'failed'
-    let routerTerminated = false
-    const finishRecord = async (): Promise<void> => {
-      if (!record) return
-      await terminateSpawned(spawned)
-      routerTerminated = true
-      record.close(signal.aborted ? 'aborted' : recordOutcome)
+    let terminationOutcome: 'stopped' | 'failed' | 'unknown' | null = null
+    const finishRecord = async (): Promise<'stopped' | 'failed' | 'unknown'> => {
+      terminationOutcome ??= await terminateSpawned(spawned)
+      record?.termination(terminationOutcome)
+      record?.close(signal.aborted ? 'aborted' : terminationOutcome === 'stopped' ? recordOutcome : 'failed')
+      return terminationOutcome
     }
     try {
+      if (signal.aborted) {
+        onAbort()
+        throw new BackendError('Codex launch was aborted', 'aborted')
+      }
       let internalSessionId: string | undefined
       const stderr = new BoundedDiagnosticBuffer()
       child.stderr?.on('data', (b) => { stderr.append(b) })
@@ -342,11 +356,14 @@ export class CodexBackend implements Backend {
         }
 
         if (type === 'turn.completed' || type === 'thread.completed') {
-          if (record && signal.aborted) throw new BackendError('Codex receipt launch was aborted', 'upstream')
+          if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
           record?.terminal(sawError ? 'error' : 'completed')
           recordOutcome = sawError ? 'failed' : 'closed'
           const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
-          await finishRecord()
+          if (await finishRecord() !== 'stopped') {
+            throw new BackendError('Codex process termination is unconfirmed', 'upstream')
+          }
+          if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
           yield {
             ...terminalOutcome('codex', sawError, emittedToolCall),
             usage,
@@ -369,7 +386,9 @@ export class CodexBackend implements Backend {
         // the terminal error delta reaches the caller with it. The route answers both
         // shapes 502 (`BackendReportedFailureError`), so only the code is new.
         record?.terminal('error')
-        await finishRecord()
+        if (await finishRecord() !== 'stopped') {
+          throw new BackendError('Codex process termination is unconfirmed', 'upstream')
+        }
         yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId }
         return
       }
@@ -379,6 +398,10 @@ export class CodexBackend implements Backend {
       if (record) {
         throw new BackendError('Codex receipt launch ended without a native terminal event', 'parse_error')
       }
+      if (await finishRecord() !== 'stopped') {
+        throw new BackendError('Codex process termination is unconfirmed', 'upstream')
+      }
+      if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
       signal.removeEventListener('abort', onAbort)
@@ -388,7 +411,7 @@ export class CodexBackend implements Backend {
       // always closed. `recordOutcome` is 'closed' only after a native terminal event
       // already closed the record, so this call is a no-op on the success path.
       try {
-        if (!routerTerminated) await terminateSpawned(spawned)
+        await finishRecord()
       } finally {
         try { releaseSpawner() } finally {
           try { codexHome?.cleanup() } finally {

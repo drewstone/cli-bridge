@@ -24,9 +24,10 @@
  *   per-request `execution.acquireTimeoutMs`.
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { LINEAGE_ENV_KEYS, withLineageEnv } from '../trace/lineage.js'
 import { applyJail } from './jail-support.js'
+import { killTree, processGroupExists, retryCleanupUntilSuccessful } from './process-tree.js'
 import { ExecutorSaturatedError, type SpawnOpts, type SpawnResult, type Spawner } from './types.js'
 
 const DEFAULT_MAX = 4
@@ -64,21 +65,39 @@ class HostSemaphore {
    * The refusal is a typed capacity answer, not a spawn failure: it happens
    * before the child exists, so the caller can retry it with nothing lost.
    */
-  async acquire(requestedDeadlineMs?: number): Promise<void> {
+  async acquire(requestedDeadlineMs?: number, signal?: AbortSignal): Promise<void> {
     this.acquires += 1
+    signal?.throwIfAborted()
     const deadlineMs = this.resolveDeadline(requestedDeadlineMs)
     if (this.inFlight < this.max) {
       this.inFlight += 1
       return
     }
     await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        const idx = this.waiters.indexOf(waiter)
+        if (idx < 0) return
+        this.waiters.splice(idx, 1)
+        waiter.reject(signal?.reason instanceof Error ? signal.reason : new Error('host acquire aborted'))
+      }
+      const finish = (): void => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+      }
       const timer = setTimeout(() => {
-        const idx = this.waiters.findIndex((w) => w.timer === timer)
+        const idx = this.waiters.indexOf(waiter)
         if (idx >= 0) this.waiters.splice(idx, 1)
         this.timeouts += 1
-        reject(saturated('host', 'host-executor', this.inFlight, this.max, this.waiters.length, deadlineMs))
+        waiter.reject(saturated('host', 'host-executor', this.inFlight, this.max, this.waiters.length, deadlineMs))
       }, deadlineMs).unref()
-      this.waiters.push({ resolve, reject, timer })
+      const waiter: Waiter = {
+        resolve: () => { finish(); resolve() },
+        reject: (error) => { finish(); reject(error) },
+        timer,
+      }
+      this.waiters.push(waiter)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted) onAbort()
     })
   }
 
@@ -170,29 +189,56 @@ const hostSemaphore = new HostSemaphore(
 )
 
 export const hostSpawner: Spawner = async (bin, args, opts) => {
-  await hostSemaphore.acquire(opts.acquireDeadlineMs)
+  await hostSemaphore.acquire(opts.acquireDeadlineMs, opts.signal)
   let released = false
+  let releaseRequested = false
   let jailCleanup: (() => Promise<void> | void) | undefined
+  let child: ChildProcess | undefined
+  let stopPromise: Promise<void> | null = null
+  const terminate = (): Promise<void> => {
+    if (!child) return Promise.resolve()
+    stopPromise ??= (async () => {
+      await killTree(child)
+      const pid = child.pid
+      if (pid !== undefined && process.platform !== 'win32' && processGroupExists(pid)) {
+        throw new Error(`host process group ${pid} is still alive after termination`)
+      }
+      if (pid !== undefined && process.platform === 'win32' && child.exitCode === null && child.signalCode === null) {
+        throw new Error(`host process ${pid} termination is unconfirmed`)
+      }
+    })().catch((error) => {
+      stopPromise = null
+      throw error
+    })
+    return stopPromise
+  }
+  const cleanup = async (): Promise<void> => {
+    await terminate()
+    if (!released) {
+      released = true
+      hostSemaphore.release()
+    }
+    if (jailCleanup) await jailCleanup()
+  }
   const release = (): void => {
-    if (released) return
-    released = true
-    hostSemaphore.release()
-    // Idempotent: release() guards on `released`, so the jail cleanup
-    // (e.g. an SBPL profile temp dir) fires exactly once whether release
-    // is triggered by the backend's finally block or the child exit/error
-    // listeners below.
-    if (jailCleanup) void Promise.resolve(jailCleanup()).catch(() => {})
+    if (releaseRequested) return
+    releaseRequested = true
+    // Abort emits an error before the process group exits. Keep the capacity
+    // slot until the owned group has stopped; retry jail cleanup separately.
+    void cleanup().catch(() => retryCleanupUntilSuccessful(cleanup))
   }
   try {
+    opts.signal?.throwIfAborted()
     // Wrap (bin, args) in the OS write-jail when a spec is present;
     // otherwise this is a pass-through and (bin, args, env) are unchanged.
     const jailed = await applyJail(bin, args, opts)
     jailCleanup = jailed.cleanup
+    opts.signal?.throwIfAborted()
     // detached: true → child is the leader of a new process group whose
     // pgid equals its pid. kill(-pid, sig) reaches every descendant. We
     // do NOT call child.unref() — the bridge still owns the child for
     // the lifetime of the chat() call.
-    const child = spawn(jailed.bin, jailed.args, {
+    child = spawn(jailed.bin, jailed.args, {
       signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
@@ -211,6 +257,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     child.once('error', release)
     const result: SpawnResult = {
       child,
+      terminate,
       release,
       spawnError: () => spawnError,
     }
