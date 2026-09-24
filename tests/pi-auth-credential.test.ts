@@ -89,4 +89,35 @@ it('reports both failed auth helper exits and durations without command output o
   expect(backendError.message).toContain('print-bearer-token')
   expect(backendError.message).not.toContain(secret)
   expect(warnings.slice(2).every((message) => message.includes(`id=${diagnosticId}`))).toBe(true)
+
+  const injectedId = 'secret\nforged-log'
+  const rejectedIdError = await resolvePiAuthCredential({
+    bin,
+    provider: 'tangle-router',
+    model: 'gpt-5-mini',
+    apiMode: 'openai-completions',
+    env: { PATH: process.env.PATH },
+    signal: new AbortController().signal,
+    diagnosticId: injectedId,
+  }).catch((failure: unknown) => failure)
+  expect(rejectedIdError).toBeInstanceOf(PiAuthResolutionError)
+  if (!(rejectedIdError instanceof PiAuthResolutionError)) throw new Error('expected PiAuthResolutionError')
+  expect(`${rejectedIdError.message}\n${warnings.slice(4).join('\n')}`).not.toContain('forged-log')
+  expect(rejectedIdError.diagnosticId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u)
+
+  const deadline = new AbortController()
+  deadline.abort(Object.assign(new Error('deadline detail must stay private'), { code: 'timeout' }))
+  const timeoutError = await resolvePiAuthCredential({
+    bin,
+    provider: 'tangle-router',
+    model: 'gpt-5-mini',
+    apiMode: 'openai-completions',
+    env: { PATH: process.env.PATH },
+    signal: deadline.signal,
+  }).catch((failure: unknown) => failure)
+  expect(timeoutError).toBeInstanceOf(PiAuthResolutionError)
+  if (!(timeoutError instanceof PiAuthResolutionError)) throw new Error('expected PiAuthResolutionError')
+  expect(timeoutError.backendCode).toBe('timeout')
+  expect(timeoutError.attempts).toMatchObject([{ command: 'print-api-key', outcome: 'timeout' }])
+  expect(timeoutError.message).not.toContain('deadline detail must stay private')
 })

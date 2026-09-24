@@ -182,7 +182,12 @@ function classifyAttempt(
   signal: AbortSignal,
   durationMs: number,
 ): PiAuthAttempt {
-  if (signal.aborted || isAbortError(error)) return { command, outcome: 'aborted', elapsedMs: durationMs }
+  if (signal.aborted) {
+    const reason = signal.reason
+    const timedOut = reason instanceof Error && 'code' in reason && reason.code === 'timeout'
+    return { command, outcome: timedOut ? 'timeout' : 'aborted', elapsedMs: durationMs }
+  }
+  if (isAbortError(error)) return { command, outcome: 'aborted', elapsedMs: durationMs }
   if (error instanceof InvalidPiCredentialError) {
     return { command, outcome: 'invalid_output', elapsedMs: durationMs }
   }
