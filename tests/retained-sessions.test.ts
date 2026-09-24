@@ -44,6 +44,7 @@ import {
 import {
   RETAINED_MAX_HTTP_BODY_BYTES,
   RETAINED_MAX_TEXT_LENGTH,
+  RETAINED_MAX_TURN_MESSAGE_LENGTH,
 } from '../src/sessions/retained/schema.js'
 import { parseSafePublicRecord } from '../src/sessions/retained/contract.js'
 
@@ -1855,8 +1856,12 @@ describe('retained Agent Interface sessions', () => {
   it('rejects oversized retained schema values and HTTP bodies before provider work', async () => {
     fixture = setup(new FakeNativeBackend())
     expect(() => fixture!.service.parseTurn({
-      message: 'x'.repeat(RETAINED_MAX_TEXT_LENGTH + 1),
+      message: 'x'.repeat(RETAINED_MAX_TURN_MESSAGE_LENGTH + 1),
       run_id: 'oversized-message',
+    })).toThrow()
+    expect(() => fixture!.service.parseTurn({
+      parts: [{ type: 'text', text: 'x'.repeat(RETAINED_MAX_TEXT_LENGTH + 1) }],
+      run_id: 'oversized-part',
     })).toThrow()
     expect(() => fixture!.service.parseCreate({
       id: 'oversized-model',
@@ -1874,6 +1879,31 @@ describe('retained Agent Interface sessions', () => {
     expect(response.status).toBe(413)
     expect(await json(response)).toMatchObject({ error: { type: 'request_too_large' } })
     expect(fixture.store.getRetained('oversized-body')).toBeNull()
+  })
+
+  it('admits the full analyst message when its JSON envelope exceeds the ordinary text field bound', async () => {
+    const backend = new FakeNativeBackend()
+    fixture = setup(backend)
+    const emptyEnvelope = JSON.stringify({ messages: [{ role: 'user', content: '' }] })
+    const message = JSON.stringify({
+      messages: [{ role: 'user', content: 'x'.repeat(20_321 - emptyEnvelope.length) }],
+    })
+    expect(message.length).toBe(20_321)
+    expect(message.length).toBeGreaterThan(RETAINED_MAX_TEXT_LENGTH)
+    const created = await fixture.app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'long-analyst-message', model: 'pi/test' }),
+    })
+    expect(created.status).toBe(201)
+
+    const turn = await fixture.app.request('/v1/sessions/long-analyst-message/turns', {
+      method: 'POST',
+      body: JSON.stringify({ message, run_id: 'long-analyst-message-run' }),
+    })
+    expect(turn.status).toBe(202)
+    await waitFor(() => backend.natives[0]?.prompts.length === 1)
+    expect(backend.natives[0]?.prompts[0]).toBe(message)
+    expect(backend.requests[0]?.messages[0]?.content).toBe(message)
   })
 
   it('requires the durable run digest before retained cancellation', async () => {

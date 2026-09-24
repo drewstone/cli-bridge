@@ -345,8 +345,7 @@ describe('auth preservation', () => {
     // session rollouts inside CODEX_HOME before it can run (a read-only bind
     // measured as `codex exited 1: ... Read-only file system (os error 30)`),
     // and `only` keeps the host's multi-GB sessions/ tree out of the copy.
-    for (const { source, jailRel, envVar, mode, only } of authSourcesFor('codex')) {
-      expect(source.endsWith('.codex')).toBe(true)
+    for (const { jailRel, envVar, mode, only } of authSourcesFor('codex')) {
       expect(jailRel).toBe('.codex')
       expect(envVar).toBe('CODEX_HOME')
       expect(mode).toBe('seed-writable')

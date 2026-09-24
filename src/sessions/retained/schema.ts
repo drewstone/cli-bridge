@@ -31,6 +31,7 @@ import {
   RETAINED_MAX_CWD_LENGTH,
   RETAINED_MAX_JSON_ARRAY_LENGTH,
   RETAINED_MAX_TEXT_LENGTH,
+  RETAINED_MAX_TURN_MESSAGE_LENGTH,
 } from './contract.js'
 
 export {
@@ -40,6 +41,7 @@ export {
   RETAINED_MAX_JSON_MAP_ENTRIES,
   RETAINED_MAX_JSON_NODES,
   RETAINED_MAX_TEXT_LENGTH,
+  RETAINED_MAX_TURN_MESSAGE_LENGTH,
 } from './contract.js'
 
 export const RETAINED_MAX_HTTP_BODY_BYTES = 1_048_576
@@ -75,7 +77,7 @@ const createSchema = z.strictObject({
 })
 
 const turnSchema = z.strictObject({
-  message: z.string().min(1).max(RETAINED_MAX_TEXT_LENGTH).optional(),
+  message: z.string().min(1).max(RETAINED_MAX_TURN_MESSAGE_LENGTH).optional(),
   parts: z.array(retainedInputPartSchema).min(1).max(RETAINED_MAX_JSON_ARRAY_LENGTH).optional(),
   turn_id: idSchema.optional(),
   execution_id: idSchema.optional(),
