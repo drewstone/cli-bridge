@@ -156,6 +156,9 @@ A retained turn `message` accepts at most 262,144 characters, so a long model pr
 
 Each text part and other bounded string still accepts at most 16,384 characters, and the entire HTTP body remains capped at 1 MiB.
 
+Canonical raw provider events use Agent Interface's 1 MiB serialized JSON content bound.
+This preserves long provider message echoes in the retained event log while keeping finite JSON and structural limits.
+
 The `parts` union accepts strict `text`, `file`, and `image` records with bounded `filename`, `mediaType`, `url`, `path`, and `content` fields where the part type permits them.
 
 The SDK `CliBridgeProviderOptions.defaultExecution` field maps to the retained `execution` field.
@@ -200,9 +203,9 @@ A pid-only legacy record is blocked when its process is live and reclaimed only 
 
 The released Agent Interface dependency provides `isCredentialBearingProfileConfigName` from `profile-schema` and `isRuntimeProcessControlEnvironmentName` from `profile-security`.
 
-These exports are provided by `@tangle-network/agent-interface` 1.3.0.
+These exports are provided by `@tangle-network/agent-interface` 2.12.0.
 
-Bridge pins `@tangle-network/agent-interface` 1.3.0 and `@tangle-network/agent-profile-materialize` 0.16.0 before release.
+Bridge pins `@tangle-network/agent-interface` 2.12.0 and `@tangle-network/agent-profile-materialize` 0.19.2.
 
 The Bridge keeps only its five Pi-owned child-process control names locally because Agent Interface does not own Pi environment injection.
 
