@@ -72,7 +72,7 @@ export class CodexBackend implements Backend {
   readonly name = 'codex'
   readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
-  private authTurnTail: Promise<void> = Promise.resolve()
+  private authPreparationTail: Promise<void> = Promise.resolve()
   constructor(private readonly opts: CodexBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? scopedHostSpawner
@@ -88,46 +88,6 @@ export class CodexBackend implements Backend {
   }
 
   async *chat(
-    req: ChatRequest,
-    session: SessionRecord | null,
-    signal: AbortSignal,
-  ): AsyncIterable<ChatDelta> {
-    // Codex's refresh token rotates once. Keep one bridge turn per selected
-    // account in flight so two private jail copies cannot spend it together.
-    const releaseAuthTurn = await this.acquireAuthTurn(signal)
-    try {
-      yield* this.chatOwned(req, session, signal)
-    } finally {
-      releaseAuthTurn()
-    }
-  }
-
-  private async acquireAuthTurn(signal: AbortSignal): Promise<() => void> {
-    const prior = this.authTurnTail
-    let release!: () => void
-    const own = new Promise<void>((resolve) => { release = resolve })
-    this.authTurnTail = prior.then(() => own)
-    let onAbort: (() => void) | undefined
-    try {
-      await Promise.race([
-        prior,
-        new Promise<never>((_, reject) => {
-          onAbort = () => reject(new BackendError('Codex account turn aborted while queued', 'aborted'))
-          signal.addEventListener('abort', onAbort, { once: true })
-          if (signal.aborted) onAbort()
-        }),
-      ])
-      if (signal.aborted) throw new BackendError('Codex account turn aborted while queued', 'aborted')
-      return release
-    } catch (error) {
-      release()
-      throw error
-    } finally {
-      if (onAbort) signal.removeEventListener('abort', onAbort)
-    }
-  }
-
-  private async *chatOwned(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
@@ -251,14 +211,21 @@ export class CodexBackend implements Backend {
     try {
       if (req.jailSpec && this.spawner.executionEnvironment !== 'docker') {
         if (!authSourcePath) throw new BackendError('Jailed Codex requires a selected CODEX_HOME', 'not_configured')
-        jailHome = await prepareCodexJailAuth(
-          this.opts.bin,
-          authSourcePath,
-          codexHome ? join(codexHome.homePath, 'config.toml') : join(dirname(authSourcePath), 'config.toml'),
-          req.execution?.timeoutMs ?? this.opts.timeoutMs,
-          signal,
-          req.jailSpec.readConfine === true,
-        )
+        // Only canonical auth preparation can rotate the account. Access-only
+        // jailed turns may run concurrently after their private seeds exist.
+        const releasePreparation = await this.acquireAuthPreparation(signal)
+        try {
+          jailHome = await prepareCodexJailAuth(
+            this.opts.bin,
+            authSourcePath,
+            codexHome ? join(codexHome.homePath, 'config.toml') : join(dirname(authSourcePath), 'config.toml'),
+            req.execution?.timeoutMs ?? this.opts.timeoutMs,
+            signal,
+            req.jailSpec.readConfine === true,
+          )
+        } finally {
+          releasePreparation()
+        }
         if (req.jailSpec.readConfine) req.jailSpec.requireEnforcement = true
         // The jail seed has no refresh capability. File storage must win over
         // an account config that would otherwise select an unrelated keyring.
@@ -487,6 +454,31 @@ export class CodexBackend implements Backend {
           }
         }
       }
+    }
+  }
+
+  private async acquireAuthPreparation(signal: AbortSignal): Promise<() => void> {
+    const prior = this.authPreparationTail
+    let release!: () => void
+    const own = new Promise<void>((resolve) => { release = resolve })
+    this.authPreparationTail = prior.then(() => own)
+    let onAbort: (() => void) | undefined
+    try {
+      await Promise.race([
+        prior,
+        new Promise<never>((_, reject) => {
+          onAbort = () => reject(new BackendError('Codex account preparation aborted while queued', 'aborted'))
+          signal.addEventListener('abort', onAbort, { once: true })
+          if (signal.aborted) onAbort()
+        }),
+      ])
+      if (signal.aborted) throw new BackendError('Codex account preparation aborted while queued', 'aborted')
+      return release
+    } catch (error) {
+      release()
+      throw error
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort)
     }
   }
 
