@@ -251,6 +251,7 @@ export class CodexBackend implements Backend {
             req.execution?.timeoutMs ?? this.opts.timeoutMs,
             signal,
             req.jailSpec.readConfine === true,
+            Boolean(codexHome),
           )
         } finally {
           releasePreparation()

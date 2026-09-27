@@ -641,6 +641,7 @@ Per-slot Docker turns do not inherit the bridge process's ambient Codex credenti
 Docker turns sharing one account home run one at a time while their private MCP config is installed.
 Before a jailed turn whose deadline extends past access-token expiry, the bridge asks the installed Codex app-server to refresh the persistent account, then checks the selected account and token lifetime.
 The jail receives the current per-turn MCP configuration, including changed Runtime attachment endpoints.
+When a jailed turn declares no MCP servers, its account settings are retained without ambient MCP servers.
 The bridge removes its temporary auth link and MCP configuration after the turn.
 One-shot MCP homes are removed entirely.
 Native session files remain with the bridge data directory; deleting a session mapping does not erase its transcripts.

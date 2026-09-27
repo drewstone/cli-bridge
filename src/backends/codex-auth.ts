@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline'
 import { hostSpawner } from '../executors/host.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { BackendError } from './types.js'
+import { replaceCodexMcpTables } from '../codex-config.js'
 
 interface FileAuth {
   auth_mode?: unknown
@@ -162,10 +163,11 @@ export async function prepareCodexJailAuth(
   turnTimeoutMs: number,
   signal: AbortSignal,
   readConfine: boolean,
+  configAlreadyScoped: boolean,
 ): Promise<{ homePath: string; subscription: boolean; cleanup(): void }> {
   // API-key and Router launches may authenticate entirely from the child env.
   // Their selected home need not contain an auth.json file.
-  if (!authPath || !authFileExists(authPath)) return writeJailHome(null, configPath, false)
+  if (!authPath || !authFileExists(authPath)) return writeJailHome(null, configPath, false, configAlreadyScoped)
   const auth = readFileAuth(authPath)
   const accountId = auth.tokens?.account_id
   const mode = classifyFileAuth(auth)
@@ -203,7 +205,7 @@ export async function prepareCodexJailAuth(
         refresh_token: '',
       },
       last_refresh: current.last_refresh,
-    }, configPath, true)
+    }, configPath, true, configAlreadyScoped)
   }
   if (mode === 'external-access') {
     return writeJailHome({
@@ -215,12 +217,12 @@ export async function prepareCodexJailAuth(
         refresh_token: '',
       },
       last_refresh: auth.last_refresh,
-    }, configPath, false)
+    }, configPath, false, configAlreadyScoped)
   }
-  return writeJailHome(auth, configPath, false)
+  return writeJailHome(auth, configPath, false, configAlreadyScoped)
 }
 
-function writeJailHome(auth: FileAuth | null, configPath: string | undefined, subscription: boolean): {
+function writeJailHome(auth: FileAuth | null, configPath: string | undefined, subscription: boolean, configAlreadyScoped: boolean): {
   homePath: string
   subscription: boolean
   cleanup(): void
@@ -228,8 +230,8 @@ function writeJailHome(auth: FileAuth | null, configPath: string | undefined, su
   const homePath = mkdtempSync(join(tmpdir(), 'cli-bridge-codex-jail-'))
   try {
     if (auth) writeFileSync(join(homePath, 'auth.json'), JSON.stringify(auth), { mode: 0o600 })
-    const config = configPath && existsSync(configPath) ? readFileSync(configPath) : '\n'
-    writeFileSync(join(homePath, 'config.toml'), config, { mode: 0o600 })
+    const config = configPath && existsSync(configPath) ? readFileSync(configPath, 'utf8') : '\n'
+    writeFileSync(join(homePath, 'config.toml'), configAlreadyScoped ? config : replaceCodexMcpTables(config, ''), { mode: 0o600 })
     return {
       homePath,
       subscription,
