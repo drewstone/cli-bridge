@@ -618,7 +618,7 @@ into the profile when the flag is absent.
 and `env` round-trip through the materialised config file unchanged
 (verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
 
-New recorded Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
+New host Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
 The existing session execution lease serializes turns using that home.
 The Codex backend serializes selected account preparation and refresh on one bridge process; access-only jailed turns can run concurrently.
 Unconfined ChatGPT turns hold that account lease until their native turn ends because the CLI may refresh during inference.
@@ -631,7 +631,11 @@ Recognized non-ChatGPT file auth modes retain their existing credential behavior
 Env-authenticated launches can materialize MCP config without a local `auth.json`.
 For Codex exec, a nonempty `CODEX_API_KEY` or `CODEX_ACCESS_TOKEN` takes precedence over persisted `auth.json`.
 The bridge preserves that effective credential in a jail and does not seed an unrelated subscription account.
-Docker Codex turns keep the container's mounted account home and receive MCP settings through a private per-turn config file.
+Docker Codex turns keep the container's mounted account home and receive only the declared MCP settings through a private per-turn config file.
+The bridge removes ambient MCP servers even when a turn declares none, then restores the original config after the turn.
+Per-slot Docker Codex sessions use a stable slot chosen from the external session ID while the pool size stays fixed.
+A busy slot queues the turn until its acquire deadline, even when another slot is free.
+Changing the pool size can remap existing sessions; migrate or finish them before resizing.
 Per-slot Docker turns do not inherit the bridge process's ambient Codex credentials.
 Docker turns sharing one account home run one at a time while their private MCP config is installed.
 Before a jailed turn whose deadline extends past access-token expiry, the bridge asks the installed Codex app-server to refresh the persistent account, then checks the selected account and token lifetime.

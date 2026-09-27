@@ -25,6 +25,7 @@ import { killTree } from './process-tree.js'
 import {
   cwdPolicyFinding,
   ExecutorConfigurationError,
+  ExecutorSaturatedError,
   type ExecutorFinding,
   type ExecutorReadiness,
   type SpawnOpts,
@@ -76,14 +77,35 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
   }
   const cli = opts.cli ?? dockerCli
   let sharedCodexTail: Promise<void> = Promise.resolve()
-  const acquireSharedCodex = async (signal: AbortSignal | undefined): Promise<() => void> => {
+  let sharedCodexPending = 0
+  const acquireSharedCodex = async (signal: AbortSignal | undefined, deadlineMs: number): Promise<() => void> => {
+    const maxQueue = opts.pool.snapshot?.().max_queue ?? 4
+    if (sharedCodexPending >= maxQueue + 1) {
+      throw new ExecutorSaturatedError('docker-codex-shared-auth', {
+        in_flight: 1, max: 1, queued: sharedCodexPending - 1, deadline_ms: 0,
+      }, `Docker Codex shared auth queue full (depth=${sharedCodexPending - 1}/${maxQueue})`)
+    }
+    sharedCodexPending += 1
     const prior = sharedCodexTail
-    let release!: () => void
-    const own = new Promise<void>((resolve) => { release = resolve })
+    let resolveOwn!: () => void
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      sharedCodexPending -= 1
+      resolveOwn()
+    }
+    const own = new Promise<void>((resolve) => { resolveOwn = resolve })
     sharedCodexTail = prior.then(() => own)
     const onAbort = (): void => { release() }
     let rejectAbort: ((reason: unknown) => void) | undefined
     const aborted = new Promise<never>((_, reject) => { rejectAbort = reject })
+    const timeout = setTimeout(() => {
+      release()
+      rejectAbort?.(new ExecutorSaturatedError('docker-codex-shared-auth', {
+        in_flight: 1, max: 1, queued: sharedCodexPending - 1, deadline_ms: deadlineMs,
+      }, `Docker Codex shared auth acquire timeout after ${deadlineMs}ms`))
+    }, deadlineMs).unref()
     const abortQueued = (): void => {
       onAbort()
       rejectAbort?.(signal?.reason)
@@ -98,6 +120,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       release()
       throw error
     } finally {
+      clearTimeout(timeout)
       signal?.removeEventListener('abort', abortQueued)
     }
   }
@@ -105,11 +128,18 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
     const cwd = assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd, naming)
     // A shared OAuth mount has one config.toml across every pool slot. Include
     // no-MCP turns in the lease so none can read a sibling's temporary headers.
+    const acquisitionStartedAt = Date.now()
+    const acquireDeadlineMs = opts.pool.resolveAcquireDeadlineMs?.(spawnOpts.acquireDeadlineMs)
+      ?? Math.max(1, spawnOpts.acquireDeadlineMs ?? 60_000)
     const releaseShared = opts.backend === 'codex' && (opts.oauthMode ?? 'share') === 'share'
-      ? await acquireSharedCodex(spawnOpts.signal) : undefined
+      ? await acquireSharedCodex(spawnOpts.signal, acquireDeadlineMs) : undefined
     let slot: Awaited<ReturnType<ContainerPool['acquire']>>
     try {
-      slot = await opts.pool.acquire(spawnOpts.sessionId, spawnOpts.acquireDeadlineMs, spawnOpts.signal)
+      const remainingMs = acquireDeadlineMs - (Date.now() - acquisitionStartedAt)
+      if (remainingMs <= 0) throw new ExecutorSaturatedError('docker-codex-shared-auth', {
+        in_flight: 1, max: 1, queued: 0, deadline_ms: acquireDeadlineMs,
+      }, `Docker Codex shared auth acquire timeout after ${acquireDeadlineMs}ms`)
+      slot = await opts.pool.acquire(spawnOpts.sessionId, remainingMs, spawnOpts.signal)
     } catch (error) {
       releaseShared?.()
       throw error
@@ -129,7 +159,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       if (opts.backend === 'codex' && opts.containerConfigDir) {
         await recoverDockerCodexConfig(slot.containerId, opts.containerConfigDir)
       }
-      if (spawnOpts.dockerCodexConfig) {
+      if (spawnOpts.dockerCodexConfig !== undefined) {
         if (!opts.containerConfigDir) throw new Error('Docker Codex config directory is missing')
         restoreCodexConfig = await installDockerCodexConfig(
           slot.containerId, opts.containerConfigDir, spawnOpts.dockerCodexConfig,
@@ -341,8 +371,6 @@ async function readDockerCodexConfig(containerId: string, configDir: string): Pr
 }
 
 function replaceCodexMcpTables(base: string, requested: string): string {
-  const names = new Set([...requested.matchAll(/^\[mcp_servers\.([A-Za-z0-9_-]+)\]$/gm)].map((match) => match[1]))
-  if (names.size === 0) throw new Error('Docker Codex MCP config has no server table')
   const kept: string[] = []
   let skipSection = false
   let section = ''
@@ -350,18 +378,14 @@ function replaceCodexMcpTables(base: string, requested: string): string {
     const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line)
     if (header) {
       section = header[1]!.trim()
-      const server = /^mcp_servers\.(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))(?:\.|$)/.exec(section)
-      skipSection = !!server && names.has(server[1] ?? server[2] ?? server[3]!)
+      const root = section.replace(/^(?:"mcp_servers"|'mcp_servers')(?=\.|$)/, 'mcp_servers')
+      skipSection = root === 'mcp_servers' || root.startsWith('mcp_servers.')
     }
     if (skipSection) continue
-    if (section === '' && /^\s*mcp_servers\s*=/.test(line)) {
-      throw new Error('Docker Codex base config uses an inline MCP table that cannot be replaced safely')
-    }
-    if (section === '' && [...names].some((name) => new RegExp(`^\\s*mcp_servers\\.(?:"${name}"|'${name}'|${name})(?:\\.|\\s*=)`).test(line))) continue
-    if (section === 'mcp_servers' && [...names].some((name) => new RegExp(`^\\s*(?:"${name}"|'${name}'|${name})(?:\\.|\\s*=)`).test(line))) continue
+    if (section === '' && /^\s*(?:mcp_servers|"mcp_servers"|'mcp_servers')(?:\s*=|\.)/.test(line)) continue
     kept.push(line)
   }
-  return `${kept.join('\n').trimEnd()}\n\n${requested}`
+  return `${kept.join('\n').trimEnd()}\n${requested ? `\n${requested}` : ''}`
 }
 
 async function recoverDockerCodexConfig(containerId: string, configDir: string): Promise<void> {

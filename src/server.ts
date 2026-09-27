@@ -219,6 +219,7 @@ async function buildExecutorForBackend(
     image: cfg.image,
     namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
     oauthMode: cfg.oauthMode ?? 'share',
+    strictSessionAffinity: cfg.name === 'codex' && cfg.oauthMode === 'per-slot',
     memory,
     cpus,
     maxQueueDepth,

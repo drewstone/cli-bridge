@@ -200,9 +200,9 @@ export class CodexBackend implements Backend {
     const dockerExecution = this.spawner.executionEnvironment === 'docker'
     // The container's mounted home owns per-slot credentials and native state.
     // MCP settings travel through stdin into that private home, never argv.
-    const dockerCodexConfig = dockerExecution ? codexMcpConfigText(mcpServers) : null
+    const dockerCodexConfig = dockerExecution ? codexMcpConfigText(mcpServers) ?? '' : undefined
     const externalId = req.session_id ?? session?.externalId
-    const nativeHome = this.opts.stateDir && externalId
+    const nativeHome = !dockerExecution && this.opts.stateDir && externalId
       ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))
       : undefined
     const legacySession = nativeHome && session?.internalId && !existsSync(nativeHome)
@@ -327,12 +327,12 @@ export class CodexBackend implements Backend {
           ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
           ...(router ? { TANGLE_ROUTER_CREDENTIAL: router.key } : {}),
         },
-        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(externalId ? { sessionId: externalId } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
-        ...(dockerCodexConfig ? { dockerCodexConfig } : {}),
+        ...(dockerCodexConfig !== undefined ? { dockerCodexConfig } : {}),
       })
       // A custom spawner may settle after cancellation even if it ignores the
       // signal. Do not read a late child's output or report a normal stop.

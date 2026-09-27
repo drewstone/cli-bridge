@@ -60,6 +60,7 @@
  */
 
 import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
 import { assertDockerNetworkName } from './docker-network.js'
 import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
@@ -83,6 +84,8 @@ export interface ContainerPoolOptions {
    *                  requires re-`claude /login` per slot on first run.
    */
   oauthMode: 'share' | 'per-slot'
+  /** Keep a retained session on one credential slot across turns and restarts. */
+  strictSessionAffinity?: boolean
   /** Bind paths for the `share` mode. Each entry is `host:container`. */
   shareMounts?: string[]
   /**
@@ -203,6 +206,7 @@ const DEFAULTS = {
 
 interface Waiter {
   sessionId: string | undefined
+  slotIndex?: number
   resolve: (slot: SlotState) => boolean
   reject: (err: Error) => void
   timer: NodeJS.Timeout
@@ -305,6 +309,12 @@ export class ContainerPool {
     }
   }
 
+  resolveAcquireDeadlineMs(requestedDeadlineMs?: number): number {
+    return requestedDeadlineMs === undefined
+      ? this.acquireDeadlineMs
+      : Math.max(1, Math.min(requestedDeadlineMs, this.maxAcquireDeadlineMs))
+  }
+
   /**
    * Take a slot, waiting up to `requestedDeadlineMs` capped by the pool ceiling.
    */
@@ -312,17 +322,20 @@ export class ContainerPool {
     if (this.destroyed) throw new Error('container pool destroyed')
     signal?.throwIfAborted()
     this.counters.acquires += 1
-    const deadlineMs = requestedDeadlineMs === undefined
-      ? this.acquireDeadlineMs
-      : Math.max(1, Math.min(requestedDeadlineMs, this.maxAcquireDeadlineMs))
+    const deadlineMs = this.resolveAcquireDeadlineMs(requestedDeadlineMs)
+    const strictSlot = this.opts.strictSessionAffinity && sessionId
+      ? this.slots[createHash('sha256').update(sessionId).digest().readUInt32BE(0) % this.slots.length]
+      : undefined
+    if (strictSlot?.dead) throw new Error(`container-pool: retained session slot ${strictSlot.index} is dead`)
+    if (strictSlot && !strictSlot.busy) return await this.handOut(strictSlot, sessionId, signal)
 
     // Sticky preference: prefer a free, non-dead slot that last served
     // this session.
-    if (sessionId) {
+    if (!strictSlot && sessionId) {
       const sticky = this.slots.find((s) => !s.busy && !s.dead && s.lastSession === sessionId)
       if (sticky) return await this.handOut(sticky, sessionId, signal)
     }
-    const free = this.slots.find((s) => !s.busy && !s.dead)
+    const free = strictSlot ? undefined : this.slots.find((s) => !s.busy && !s.dead)
     if (free) return await this.handOut(free, sessionId, signal)
 
     // All slots busy or dead — count alive slots so we don't queue
@@ -382,6 +395,7 @@ export class ContainerPool {
       this.waiters.push({
         settled: false,
         sessionId,
+        ...(strictSlot ? { slotIndex: strictSlot.index } : {}),
         resolve: (slot) => {
           if (waiter.settled) return false
           if (signal?.aborted) {
@@ -629,7 +643,9 @@ export class ContainerPool {
         }
         // This slot could not be made usable. Another alive slot may still
         // serve the waiter; only when none exists does the waiter learn why.
-        const alternative = this.slots.find((s) => s !== slot && !s.busy && !s.dead)
+        const alternative = waiter.slotIndex === undefined
+          ? this.slots.find((s) => s !== slot && !s.busy && !s.dead)
+          : undefined
         if (alternative) {
           this.waiters.unshift(waiter)
           this.serveWaiterWith(alternative)
@@ -644,8 +660,10 @@ export class ContainerPool {
   /** Next waiter for this slot, preferring one whose session it last served. */
   private takeWaiterFor(slot: SlotState): Waiter | undefined {
     if (this.waiters.length === 0) return undefined
-    const stickyIdx = this.waiters.findIndex((w) => w.sessionId && w.sessionId === slot.lastSession)
-    return this.waiters.splice(stickyIdx >= 0 ? stickyIdx : 0, 1)[0]
+    const eligible = (waiter: Waiter): boolean => waiter.slotIndex === undefined || waiter.slotIndex === slot.index
+    const stickyIdx = this.waiters.findIndex((w) => eligible(w) && w.sessionId && w.sessionId === slot.lastSession)
+    const firstIdx = stickyIdx >= 0 ? stickyIdx : this.waiters.findIndex(eligible)
+    return firstIdx >= 0 ? this.waiters.splice(firstIdx, 1)[0] : undefined
   }
 
   /**
