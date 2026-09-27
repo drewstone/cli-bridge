@@ -627,7 +627,8 @@ ChatGPT subscription turns in an enforced `fs-jail` receive only their selected 
 This subscription isolation requires Linux bubblewrap read confinement; the bridge rejects macOS jailed subscription turns.
 The bridge refuses a ChatGPT subscription turn in `write-jail` because that mode can read the host refresh token.
 An unavailable jail cannot fall back to an unconfined subscription turn, even with `BRIDGE_JAIL_FALLBACK=warn`.
-Other Codex auth modes retain their existing credential behavior.
+Recognized non-ChatGPT file auth modes retain their existing credential behavior; unrecognized files fail closed.
+Env-authenticated launches can materialize MCP config without a local `auth.json`.
 Before a jailed turn whose deadline extends past access-token expiry, the bridge asks the installed Codex app-server to refresh the persistent account, then checks the selected account and token lifetime.
 The jail receives the current per-turn MCP configuration, including changed Runtime attachment endpoints.
 The bridge removes its temporary auth link and MCP configuration after the turn.

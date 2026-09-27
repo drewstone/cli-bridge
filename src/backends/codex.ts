@@ -229,7 +229,6 @@ export class CodexBackend implements Backend {
     let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
     try {
       if (req.jailSpec && this.spawner.executionEnvironment !== 'docker') {
-        if (!authSourcePath) throw new BackendError('Jailed Codex requires a selected CODEX_HOME', 'not_configured')
         // Only canonical auth preparation can rotate the account. Access-only
         // jailed turns may run concurrently after their private seeds exist.
         const releasePreparation = await this.acquireAuthPreparation(signal)
@@ -237,7 +236,8 @@ export class CodexBackend implements Backend {
           jailHome = await prepareCodexJailAuth(
             this.opts.bin,
             authSourcePath,
-            codexHome ? join(codexHome.homePath, 'config.toml') : join(dirname(authSourcePath), 'config.toml'),
+            codexHome ? join(codexHome.homePath, 'config.toml')
+              : authSourcePath ? join(dirname(authSourcePath), 'config.toml') : undefined,
             req.execution?.timeoutMs ?? this.opts.timeoutMs,
             signal,
             req.jailSpec.readConfine === true,

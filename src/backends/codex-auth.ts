@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -18,6 +18,17 @@ interface FileAuth {
   [key: string]: unknown
 }
 
+const OTHER_FILE_AUTH_MODES = new Set([
+  'apikey', 'agentIdentity', 'personalAccessToken', 'bedrockApiKey', 'bedrockAccessKeys', 'headers',
+])
+
+function authFileExists(path: string): boolean {
+  try { lstatSync(path); return true } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw new BackendError('Codex account auth.json cannot be inspected', 'not_configured')
+  }
+}
+
 function readFileAuth(path: string): FileAuth {
   let auth: FileAuth
   try { auth = JSON.parse(readFileSync(path, 'utf8')) as FileAuth } catch {
@@ -31,8 +42,20 @@ function readFileAuth(path: string): FileAuth {
 
 /** Only an unconfined file-backed ChatGPT turn can rotate this host account during inference. */
 export function isCodexSubscriptionAuth(path: string | undefined): boolean {
-  if (!path) return false
-  try { return readFileAuth(path).auth_mode === 'chatgpt' } catch { return false }
+  if (!path || !authFileExists(path)) return false
+  return classifyFileAuth(readFileAuth(path)) === 'subscription'
+}
+
+function classifyFileAuth(auth: FileAuth): 'subscription' | 'other' {
+  if (auth.auth_mode === 'chatgpt') return 'subscription'
+  if (auth.tokens != null) {
+    if (typeof auth.tokens !== 'object' || Array.isArray(auth.tokens) || 'refresh_token' in auth.tokens) {
+      throw new BackendError('Codex auth mode cannot expose token data to the jail', 'not_configured')
+    }
+  }
+  if (typeof auth.auth_mode === 'string' && OTHER_FILE_AUTH_MODES.has(auth.auth_mode)) return 'other'
+  if ((auth.auth_mode === undefined || auth.auth_mode === null) && typeof auth.OPENAI_API_KEY === 'string') return 'other'
+  throw new BackendError('Codex account auth mode is unrecognized', 'not_configured')
 }
 
 function accessExpiry(token: unknown): number {
@@ -115,15 +138,18 @@ async function refreshAccountWithCodex(bin: string, authPath: string, signal: Ab
  */
 export async function prepareCodexJailAuth(
   bin: string,
-  authPath: string,
+  authPath: string | undefined,
   configPath: string | undefined,
   turnTimeoutMs: number,
   signal: AbortSignal,
   readConfine: boolean,
 ): Promise<{ homePath: string; subscription: boolean; cleanup(): void }> {
+  // API-key and Router launches may authenticate entirely from the child env.
+  // Their selected home need not contain an auth.json file.
+  if (!authPath || !authFileExists(authPath)) return writeJailHome(null, configPath, false)
   const auth = readFileAuth(authPath)
   const accountId = auth.tokens?.account_id
-  if (auth.auth_mode === 'chatgpt') {
+  if (classifyFileAuth(auth) === 'subscription') {
     if (process.platform !== 'linux' || !readConfine) {
       throw new BackendError('Jailed Codex subscription turns require Linux fs-jail read confinement', 'not_configured')
     }
@@ -161,14 +187,14 @@ export async function prepareCodexJailAuth(
   return writeJailHome(auth, configPath, false)
 }
 
-function writeJailHome(auth: FileAuth, configPath: string | undefined, subscription: boolean): {
+function writeJailHome(auth: FileAuth | null, configPath: string | undefined, subscription: boolean): {
   homePath: string
   subscription: boolean
   cleanup(): void
 } {
   const homePath = mkdtempSync(join(tmpdir(), 'cli-bridge-codex-jail-'))
   try {
-    writeFileSync(join(homePath, 'auth.json'), JSON.stringify(auth), { mode: 0o600 })
+    if (auth) writeFileSync(join(homePath, 'auth.json'), JSON.stringify(auth), { mode: 0o600 })
     const config = configPath && existsSync(configPath) ? readFileSync(configPath) : '\n'
     writeFileSync(join(homePath, 'config.toml'), config, { mode: 0o600 })
     return {
