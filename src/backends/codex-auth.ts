@@ -46,6 +46,11 @@ export function isCodexSubscriptionAuth(path: string | undefined): boolean {
   return classifyFileAuth(readFileAuth(path)) === 'subscription'
 }
 
+/** Codex exec selects these environment credentials before persisted auth.json. */
+export function hasCodexEnvAuth(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.CODEX_API_KEY?.trim() || env.CODEX_ACCESS_TOKEN?.trim())
+}
+
 function classifyFileAuth(auth: FileAuth): 'subscription' | 'external-access' | 'other' {
   const mode = auth.auth_mode ?? (
     auth.personal_access_token != null ? 'personalAccessToken'

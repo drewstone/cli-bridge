@@ -1984,6 +1984,51 @@ export function materializeMcpServersForCodex(
 ): MaterializedCodexHome | null {
   if (!specs && !sessionHome) return null
 
+  const { lines, serverNames } = codexMcpConfig(specs)
+  if (serverNames.length === 0 && !sessionHome) return null
+
+  // Codex aborts if CODEX_HOME is under the system tmpdir on some
+  // platforms — use the user's HOME/.cache as a stable parent.
+  const baseDir = sessionHome ?? mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
+  // A session keeps native rollouts and indexes, never the previous turn's auth link.
+  for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
+  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n', { mode: 0o600 })
+
+  if (authSourcePath) {
+    try {
+      if (existsSync(authSourcePath)) symlinkSync(resolve(authSourcePath), join(baseDir, 'auth.json'))
+    } catch {
+      // Best-effort: Codex without auth.json reports its own auth error.
+    }
+  }
+
+  return {
+    homePath: baseDir,
+    serverNames,
+    cleanup: () => {
+      try {
+        if (sessionHome) {
+          for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
+        } else {
+          rmSync(baseDir, { recursive: true, force: true })
+        }
+      } catch {
+        // best-effort
+      }
+    },
+  }
+}
+
+/** Docker Codex keeps its mounted auth home; write this MCP config through stdin. */
+export function codexMcpConfigText(specs: Record<string, McpServerSpec> | null): string | null {
+  const { lines, serverNames } = codexMcpConfig(specs)
+  return serverNames.length ? `${lines.join('\n\n')}\n` : null
+}
+
+function codexMcpConfig(specs: Record<string, McpServerSpec> | null): {
+  lines: string[]
+  serverNames: string[]
+} {
   const lines: string[] = []
   const serverNames: string[] = []
   for (const [name, spec] of Object.entries(specs ?? {})) {
@@ -2027,38 +2072,7 @@ export function materializeMcpServersForCodex(
     lines.push(block.join('\n'))
     serverNames.push(name)
   }
-  if (serverNames.length === 0 && !sessionHome) return null
-
-  // Codex aborts if CODEX_HOME is under the system tmpdir on some
-  // platforms — use the user's HOME/.cache as a stable parent.
-  const baseDir = sessionHome ?? mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
-  // A session keeps native rollouts and indexes, never the previous turn's auth link.
-  for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
-  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n', { mode: 0o600 })
-
-  if (authSourcePath) {
-    try {
-      if (existsSync(authSourcePath)) symlinkSync(resolve(authSourcePath), join(baseDir, 'auth.json'))
-    } catch {
-      // Best-effort: Codex without auth.json reports its own auth error.
-    }
-  }
-
-  return {
-    homePath: baseDir,
-    serverNames,
-    cleanup: () => {
-      try {
-        if (sessionHome) {
-          for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
-        } else {
-          rmSync(baseDir, { recursive: true, force: true })
-        }
-      } catch {
-        // best-effort
-      }
-    },
-  }
+  return { lines, serverNames }
 }
 
 function stableTmpRoot(): string {

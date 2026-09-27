@@ -35,6 +35,7 @@ import { BackendError, BRIDGE_RESERVED_FAILURE_CODES, terminalOutcome } from './
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
+  codexMcpConfigText,
   materializeMcpServersForCodex,
   profileExecutionIdentity,
   provisionProfileWorkspace,
@@ -49,7 +50,7 @@ import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/t
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
-import { isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
+import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
 import {
   assertRouterCodexExecution,
@@ -92,18 +93,7 @@ export class CodexBackend implements Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    // Unconfined ChatGPT may rotate the canonical file at any point in its
-    // native turn. API-key, Router, Docker and access-only jail turns do not.
-    const hostSubscription = !req.jailSpec
-      && this.spawner.executionEnvironment !== 'docker'
-      && process.env.BRIDGE_ROUTER_RECEIPTS_REQUIRED !== '1'
-      && isCodexSubscriptionAuth(resolveCodexAuthPath())
-    const releaseHostAuth = hostSubscription ? await this.acquireAuthPreparation(signal) : undefined
-    try {
-      yield* this.chatOwned(req, session, signal)
-    } finally {
-      releaseHostAuth?.()
-    }
+    yield* this.chatOwned(req, session, signal)
   }
 
   private async *chatOwned(
@@ -179,6 +169,7 @@ export class CodexBackend implements Backend {
       cwd,
       profileExecutionIdentity(req, session, 'codex', reasoningEffort),
     )
+    const launchEnv = { ...process.env, ...provisioned.env }
     args.push(...provisioned.flags)
     let routerVersion: string | undefined
     if (router) {
@@ -206,6 +197,10 @@ export class CodexBackend implements Backend {
     // Session leases own native state; the account turn lease owns auth rotation.
     // Keep native state across turns, but regenerate MCP config and auth links.
     const mcpServers = resolveMcpServers(req, session)
+    const dockerExecution = this.spawner.executionEnvironment === 'docker'
+    // The container's mounted home owns per-slot credentials and native state.
+    // MCP settings travel through stdin into that private home, never argv.
+    const dockerCodexConfig = dockerExecution ? codexMcpConfigText(mcpServers) : null
     const externalId = req.session_id ?? session?.externalId
     const nativeHome = this.opts.stateDir && externalId
       ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))
@@ -219,23 +214,38 @@ export class CodexBackend implements Backend {
       )
     }
     const authSourcePath = resolveCodexAuthPath()
-    const codexHome = materializeMcpServersForCodex(
-      mcpServers,
-      authSourcePath,
-      nativeHome && !legacySession
-        ? ensurePrivateDataDirectory(nativeHome)
-        : undefined,
-    )
+    // Only an unconfined file-backed ChatGPT turn can rotate the shared host
+    // credential during inference. Use the effective launch env after profile
+    // materialization; Codex exec prefers env API keys and access tokens.
+    const hostSubscription = !req.jailSpec
+      && !dockerExecution
+      && !router
+      && !hasCodexEnvAuth(launchEnv)
+      && isCodexSubscriptionAuth(authSourcePath)
+    const releaseHostAuth = hostSubscription ? await this.acquireAuthPreparation(signal) : undefined
+    let codexHome: ReturnType<typeof materializeMcpServersForCodex>
+    try {
+      codexHome = dockerExecution ? null : materializeMcpServersForCodex(
+        mcpServers,
+        authSourcePath,
+        nativeHome && !legacySession
+          ? ensurePrivateDataDirectory(nativeHome)
+          : undefined,
+      )
+    } catch (error) {
+      releaseHostAuth?.()
+      throw error
+    }
     let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
     try {
-      if (req.jailSpec && this.spawner.executionEnvironment !== 'docker') {
+      if (req.jailSpec && !dockerExecution) {
         // Only canonical auth preparation can rotate the account. Access-only
         // jailed turns may run concurrently after their private seeds exist.
         const releasePreparation = await this.acquireAuthPreparation(signal)
         try {
           jailHome = await prepareCodexJailAuth(
             this.opts.bin,
-            authSourcePath,
+            hasCodexEnvAuth(launchEnv) ? undefined : authSourcePath,
             codexHome ? join(codexHome.homePath, 'config.toml')
               : authSourcePath ? join(dirname(authSourcePath), 'config.toml') : undefined,
             req.execution?.timeoutMs ?? this.opts.timeoutMs,
@@ -251,7 +261,7 @@ export class CodexBackend implements Backend {
         args.splice(1, 0, '-c', 'cli_auth_credentials_store="file"')
       }
     } catch (error) {
-      codexHome?.cleanup()
+      try { codexHome?.cleanup() } finally { releaseHostAuth?.() }
       throw error
     }
 
@@ -300,8 +310,14 @@ export class CodexBackend implements Backend {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
         env: {
-          ...process.env,
-          ...provisioned.env,
+          ...launchEnv,
+          ...(dockerExecution ? {
+            CODEX_HOME: undefined,
+            ...(this.spawner.dockerOauthMode === 'per-slot' ? {
+              CODEX_API_KEY: provisioned.env.CODEX_API_KEY,
+              CODEX_ACCESS_TOKEN: provisioned.env.CODEX_ACCESS_TOKEN,
+            } : {}),
+          } : {}),
           ...(jailHome?.subscription ? {
             OPENAI_API_KEY: undefined,
             OPENAI_BASE_URL: undefined,
@@ -316,6 +332,7 @@ export class CodexBackend implements Backend {
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
+        ...(dockerCodexConfig ? { dockerCodexConfig } : {}),
       })
       // A custom spawner may settle after cancellation even if it ignores the
       // signal. Do not read a late child's output or report a normal stop.
@@ -327,7 +344,9 @@ export class CodexBackend implements Backend {
       }
     } catch (error) {
       try { codexHome?.cleanup() } finally {
-        try { jailHome?.cleanup() } finally { record?.close(signal.aborted ? 'aborted' : 'failed') }
+        try { jailHome?.cleanup() } finally {
+          try { record?.close(signal.aborted ? 'aborted' : 'failed') } finally { releaseHostAuth?.() }
+        }
       }
       throw error
     }
@@ -469,7 +488,7 @@ export class CodexBackend implements Backend {
           try {
             try { codexHome?.cleanup() } finally { jailHome?.cleanup() }
           } finally {
-            record?.close(signal.aborted ? 'aborted' : recordOutcome)
+            try { record?.close(signal.aborted ? 'aborted' : recordOutcome) } finally { releaseHostAuth?.() }
           }
         }
       }

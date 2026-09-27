@@ -37,6 +37,8 @@ const execFileAsync = promisify(execFile)
 
 export interface DockerSpawnerOptions {
   pool: ContainerPool
+  oauthMode?: 'share' | 'per-slot'
+  containerConfigDir?: string
   /**
    * If the CLI binary lives at a non-standard path inside the
    * container, set this prefix. Most images install /usr/local/bin/...
@@ -73,18 +75,66 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
     ...(opts.envPrefix ? { envPrefix: opts.envPrefix } : {}),
   }
   const cli = opts.cli ?? dockerCli
+  let sharedCodexTail: Promise<void> = Promise.resolve()
+  const acquireSharedCodex = async (signal: AbortSignal | undefined): Promise<() => void> => {
+    const prior = sharedCodexTail
+    let release!: () => void
+    const own = new Promise<void>((resolve) => { release = resolve })
+    sharedCodexTail = prior.then(() => own)
+    const onAbort = (): void => { release() }
+    let rejectAbort: ((reason: unknown) => void) | undefined
+    const aborted = new Promise<never>((_, reject) => { rejectAbort = reject })
+    const abortQueued = (): void => {
+      onAbort()
+      rejectAbort?.(signal?.reason)
+    }
+    signal?.addEventListener('abort', abortQueued, { once: true })
+    try {
+      if (signal?.aborted) abortQueued()
+      await Promise.race([prior, aborted])
+      signal?.throwIfAborted()
+      return release
+    } catch (error) {
+      release()
+      throw error
+    } finally {
+      signal?.removeEventListener('abort', abortQueued)
+    }
+  }
   const spawner: Spawner = async (bin, args, spawnOpts) => {
     const cwd = assertDockerWorkspaceCwd(opts.workspaceRoot, spawnOpts.cwd, naming)
-    const slot = await opts.pool.acquire(spawnOpts.sessionId, spawnOpts.acquireDeadlineMs, spawnOpts.signal)
+    // A shared OAuth mount has one config.toml across every pool slot. Include
+    // no-MCP turns in the lease so none can read a sibling's temporary headers.
+    const releaseShared = opts.backend === 'codex' && (opts.oauthMode ?? 'share') === 'share'
+      ? await acquireSharedCodex(spawnOpts.signal) : undefined
+    let slot: Awaited<ReturnType<ContainerPool['acquire']>>
+    try {
+      slot = await opts.pool.acquire(spawnOpts.sessionId, spawnOpts.acquireDeadlineMs, spawnOpts.signal)
+    } catch (error) {
+      releaseShared?.()
+      throw error
+    }
     let released = false
     let terminationFinished = false
     let terminationPromise: Promise<void> | null = null
+    let restoreCodexConfig: (() => Promise<void>) | undefined
     const releaseNow = (): void => {
       if (released) return
       released = true
       slot.release()
+      releaseShared?.()
     }
     try {
+      spawnOpts.signal?.throwIfAborted()
+      if (opts.backend === 'codex' && opts.containerConfigDir) {
+        await recoverDockerCodexConfig(slot.containerId, opts.containerConfigDir)
+      }
+      if (spawnOpts.dockerCodexConfig) {
+        if (!opts.containerConfigDir) throw new Error('Docker Codex config directory is missing')
+        restoreCodexConfig = await installDockerCodexConfig(
+          slot.containerId, opts.containerConfigDir, spawnOpts.dockerCodexConfig,
+        )
+      }
       spawnOpts.signal?.throwIfAborted()
       const dockerArgs = buildDockerExecArgs(
         slot.containerId,
@@ -104,7 +154,8 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
           slot.containerId,
           opts.restartContainer ?? restartDockerContainer,
           cli,
-        ).then(() => {
+        ).then(async () => {
+          await restoreCodexConfig?.()
           terminationFinished = true
         }).catch((error) => {
           terminationPromise = null
@@ -130,8 +181,8 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
           // here, so the slot was never returned and /health could not recover
           // even though the pool knew how to rebuild it.
           void opts.pool.recycleHeldSlot(slot.containerId)
+            .then(releaseNow)
             .catch(() => {})
-            .finally(releaseNow)
         })
       }
       child.once('close', release)
@@ -168,7 +219,17 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
       }
       return result
     } catch (err) {
-      releaseNow()
+      let safeToRelease = true
+      try {
+        if (restoreCodexConfig) await restoreCodexConfig()
+        else if (opts.backend === 'codex' && opts.containerConfigDir) {
+          await recoverDockerCodexConfig(slot.containerId, opts.containerConfigDir)
+        }
+      } catch {
+        safeToRelease = false
+        try { await opts.pool.recycleHeldSlot(slot.containerId); safeToRelease = true } catch {}
+      }
+      if (safeToRelease) releaseNow()
       throw err
     }
   }
@@ -236,7 +297,94 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
     return { cwd, findings }
   }
   spawner.executionEnvironment = 'docker'
+  spawner.dockerOauthMode = opts.oauthMode ?? 'share'
   return spawner
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+async function installDockerCodexConfig(
+  containerId: string,
+  configDir: string,
+  config: string,
+): Promise<() => Promise<void>> {
+  const dir = shellQuote(configDir)
+  const paths = `d=${dir}; p="$d/config.toml"; b="$d/.cli-bridge-config.backup"; m="$d/.cli-bridge-config.absent"`
+  const base = await readDockerCodexConfig(containerId, configDir)
+  const merged = replaceCodexMcpTables(base, config)
+  const prepare = `set -eu; ${paths}; if [ -e "$p" ]; then cp -p "$p" "$b"; chmod 600 "$b"; else umask 077; : > "$m"; fi; rm -f "$p"; umask 077; cat > "$p"`
+  try {
+    await dockerExecWithStdin(containerId, prepare, merged)
+  } catch {
+    await recoverDockerCodexConfig(containerId, configDir).catch(() => {})
+    throw new Error('Docker Codex MCP config could not be installed')
+  }
+  let restorePromise: Promise<void> | undefined
+  return () => {
+    restorePromise ??= recoverDockerCodexConfig(containerId, configDir)
+    return restorePromise
+  }
+}
+
+async function readDockerCodexConfig(containerId: string, configDir: string): Promise<string> {
+  const dir = shellQuote(configDir)
+  try {
+    const { stdout } = await execFileAsync('docker', [
+      'exec', containerId, 'sh', '-c', `set -eu; d=${dir}; if [ -f "$d/config.toml" ]; then cat "$d/config.toml"; fi`,
+    ], { timeout: 10_000, maxBuffer: 2 * 1024 * 1024 })
+    return stdout
+  } catch {
+    throw new Error('Docker Codex base config cannot be read')
+  }
+}
+
+function replaceCodexMcpTables(base: string, requested: string): string {
+  const names = new Set([...requested.matchAll(/^\[mcp_servers\.([A-Za-z0-9_-]+)\]$/gm)].map((match) => match[1]))
+  if (names.size === 0) throw new Error('Docker Codex MCP config has no server table')
+  const kept: string[] = []
+  let skipSection = false
+  let section = ''
+  for (const line of base.split('\n')) {
+    const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line)
+    if (header) {
+      section = header[1]!.trim()
+      const server = /^mcp_servers\.(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))(?:\.|$)/.exec(section)
+      skipSection = !!server && names.has(server[1] ?? server[2] ?? server[3]!)
+    }
+    if (skipSection) continue
+    if (section === '' && /^\s*mcp_servers\s*=/.test(line)) {
+      throw new Error('Docker Codex base config uses an inline MCP table that cannot be replaced safely')
+    }
+    if (section === '' && [...names].some((name) => new RegExp(`^\\s*mcp_servers\\.(?:"${name}"|'${name}'|${name})(?:\\.|\\s*=)`).test(line))) continue
+    if (section === 'mcp_servers' && [...names].some((name) => new RegExp(`^\\s*(?:"${name}"|'${name}'|${name})(?:\\.|\\s*=)`).test(line))) continue
+    kept.push(line)
+  }
+  return `${kept.join('\n').trimEnd()}\n\n${requested}`
+}
+
+async function recoverDockerCodexConfig(containerId: string, configDir: string): Promise<void> {
+  const dir = shellQuote(configDir)
+  const script = `set -eu; d=${dir}; p="$d/config.toml"; b="$d/.cli-bridge-config.backup"; m="$d/.cli-bridge-config.absent"; if [ -f "$b" ]; then mv -f "$b" "$p"; elif [ -e "$m" ]; then rm -f "$p"; fi; rm -f "$m"`
+  try {
+    await execFileAsync('docker', ['exec', containerId, 'sh', '-c', script], { timeout: 10_000 })
+  } catch {
+    throw new Error('Docker Codex MCP config recovery failed')
+  }
+}
+
+async function dockerExecWithStdin(containerId: string, script: string, input: string): Promise<void> {
+  const child = spawn('docker', ['exec', '-i', containerId, 'sh', '-c', script], {
+    stdio: ['pipe', 'ignore', 'ignore'],
+    signal: AbortSignal.timeout(10_000),
+  })
+  child.stdin.on('error', () => {})
+  child.stdin.end(input)
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', () => reject(new Error('Docker Codex config write failed')))
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error('Docker Codex config write failed')))
+  })
 }
 
 /**

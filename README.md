@@ -629,6 +629,11 @@ The bridge refuses a ChatGPT subscription turn in `write-jail` because that mode
 An unavailable jail cannot fall back to an unconfined subscription turn, even with `BRIDGE_JAIL_FALLBACK=warn`.
 Recognized non-ChatGPT file auth modes retain their existing credential behavior; unrecognized files fail closed.
 Env-authenticated launches can materialize MCP config without a local `auth.json`.
+For Codex exec, a nonempty `CODEX_API_KEY` or `CODEX_ACCESS_TOKEN` takes precedence over persisted `auth.json`.
+The bridge preserves that effective credential in a jail and does not seed an unrelated subscription account.
+Docker Codex turns keep the container's mounted account home and receive MCP settings through a private per-turn config file.
+Per-slot Docker turns do not inherit the bridge process's ambient Codex credentials.
+Docker turns sharing one account home run one at a time while their private MCP config is installed.
 Before a jailed turn whose deadline extends past access-token expiry, the bridge asks the installed Codex app-server to refresh the persistent account, then checks the selected account and token lifetime.
 The jail receives the current per-turn MCP configuration, including changed Runtime attachment endpoints.
 The bridge removes its temporary auth link and MCP configuration after the turn.

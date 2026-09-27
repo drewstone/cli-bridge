@@ -312,6 +312,8 @@ async function buildExecutorForBackend(
 
   return createDockerSpawner({
     pool,
+    oauthMode: cfg.oauthMode ?? 'share',
+    containerConfigDir: cfg.containerConfigDir,
     backend: cfg.name,
     envPrefix: cfg.name.toUpperCase(),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),

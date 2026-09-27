@@ -442,8 +442,8 @@ describe('CodexBackend jailed MCP visibility', () => {
       OPENAI_API_KEY: 'fixture-extra-secret',
     }), { mode: 0o600 })
     process.env.CODEX_HOME = sourceHome
-    process.env.CODEX_ACCESS_TOKEN = 'fixture-ambient-access'
-    process.env.CODEX_API_KEY = 'fixture-ambient-api-key'
+    delete process.env.CODEX_ACCESS_TOKEN
+    delete process.env.CODEX_API_KEY
     let seededConfig: string | null = null
     let seededAuth: Record<string, unknown> | null = null
     let spawnedEnv: NodeJS.ProcessEnv | undefined
