@@ -378,11 +378,18 @@ function replaceCodexMcpTables(base: string, requested: string): string {
     const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line)
     if (header) {
       section = header[1]!.trim()
-      const root = section.replace(/^(?:"mcp_servers"|'mcp_servers')(?=\.|$)/, 'mcp_servers')
+      if (section.includes('\\')) throw new Error('Docker Codex base config has unsupported escaped table keys')
+      const root = section.replace(/\s*\.\s*/g, '.')
+        .replace(/^(?:"mcp_servers"|'mcp_servers')(?=\.|$)/, 'mcp_servers')
       skipSection = root === 'mcp_servers' || root.startsWith('mcp_servers.')
     }
     if (skipSection) continue
-    if (section === '' && /^\s*(?:mcp_servers|"mcp_servers"|'mcp_servers')(?:\s*=|\.)/.test(line)) continue
+    if (section === '' && /^\s*(?:mcp_servers|"mcp_servers"|'mcp_servers')(?:\s*=|\s*\.)/.test(line)) continue
+    // Refuse any MCP form the narrow rewrite did not recognize. Codex accepts
+    // quoted and spaced TOML keys; passing one through grants ambient tools.
+    if (line.includes('mcp_servers') || /^\s*["'][^"']*\\/.test(line)) {
+      throw new Error('Docker Codex base config has unsupported MCP key syntax')
+    }
     kept.push(line)
   }
   return `${kept.join('\n').trimEnd()}\n${requested ? `\n${requested}` : ''}`

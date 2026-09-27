@@ -633,6 +633,7 @@ For Codex exec, a nonempty `CODEX_API_KEY` or `CODEX_ACCESS_TOKEN` takes precede
 The bridge preserves that effective credential in a jail and does not seed an unrelated subscription account.
 Docker Codex turns keep the container's mounted account home and receive only the declared MCP settings through a private per-turn config file.
 The bridge removes ambient MCP servers even when a turn declares none, then restores the original config after the turn.
+It refuses base config MCP syntax it cannot safely remove.
 Per-slot Docker Codex sessions use a stable slot chosen from the external session ID while the pool size stays fixed.
 A busy slot queues the turn until its acquire deadline, even when another slot is free.
 Changing the pool size can remap existing sessions; migrate or finish them before resizing.
