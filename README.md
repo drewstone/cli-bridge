@@ -100,6 +100,11 @@ pnpm install:harnesses      # all harnesses
 | `prime` | prime-agent, the PrimeIntellect fork of pi. It is **not installable from npm**: the registry serves the upstream pi line under the fork's own package name `@earendil-works/pi-coding-agent` (latest `0.84.x`; the fork's `0.7.x` does not exist there), and the two are wire-incompatible. Run `pnpm install:harness prime` — it builds from source at the pinned commit and installs the entrypoint as `prime-agent`, which is what `PRIME_BIN` defaults to. Do **not** install it as `pi` | Operator `models.json` named by `PRIME_MODELS_JSON`, materialized into an isolated per-run agent dir; only the apiKey env vars it names are forwarded |
 | `passthrough` | (none) | provider API keys in `.env` |
 
+For Codex, enable `codex` in `BRIDGE_BACKENDS` on the bridge process that will serve the request.
+That process selects one subscription account from `CODEX_HOME/auth.json`, or from `$HOME/.codex/auth.json` when `CODEX_HOME` is unset.
+Use a separate bridge process and port for each account, and send Runtime to the port for the intended account.
+Check that account's authentication before a run; a healthy bridge on another port does not validate it.
+
 For a Nix-provisioned host shell with the shared prerequisites:
 
 ```bash
