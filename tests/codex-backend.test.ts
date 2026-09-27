@@ -438,6 +438,7 @@ describe('CodexBackend jailed MCP visibility', () => {
     writeFileSync(join(sourceHome, 'auth.json'), JSON.stringify({
       auth_mode: 'chatgpt',
       tokens: { account_id: 'fixture-account', id_token: 'fixture-id', access_token: accessToken, refresh_token: 'fixture-refresh' },
+      last_refresh: new Date().toISOString(),
       OPENAI_API_KEY: 'fixture-extra-secret',
     }), { mode: 0o600 })
     process.env.CODEX_HOME = sourceHome

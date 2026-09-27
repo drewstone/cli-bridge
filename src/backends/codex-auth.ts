@@ -46,15 +46,29 @@ export function isCodexSubscriptionAuth(path: string | undefined): boolean {
   return classifyFileAuth(readFileAuth(path)) === 'subscription'
 }
 
-function classifyFileAuth(auth: FileAuth): 'subscription' | 'other' {
-  if (auth.auth_mode === 'chatgpt') return 'subscription'
+function classifyFileAuth(auth: FileAuth): 'subscription' | 'external-access' | 'other' {
+  const mode = auth.auth_mode ?? (
+    auth.personal_access_token != null ? 'personalAccessToken'
+      : auth.bedrock_api_key != null ? 'bedrockApiKey'
+        : auth.bedrock_access_keys != null ? 'bedrockAccessKeys'
+          : auth.OPENAI_API_KEY != null ? 'apikey' : 'chatgpt'
+  )
+  if (mode === 'chatgpt') return 'subscription'
+  if (mode === 'chatgptAuthTokens') {
+    if (typeof auth.tokens?.id_token !== 'string' || typeof auth.tokens.access_token !== 'string'
+      || typeof auth.tokens.account_id !== 'string'
+      || (auth.tokens.refresh_token !== undefined && auth.tokens.refresh_token !== '')
+      || typeof auth.last_refresh !== 'string' || !Number.isFinite(Date.parse(auth.last_refresh))) {
+      throw new BackendError('Externally managed Codex auth must contain access-only tokens', 'not_configured')
+    }
+    return 'external-access'
+  }
   if (auth.tokens != null) {
     if (typeof auth.tokens !== 'object' || Array.isArray(auth.tokens) || 'refresh_token' in auth.tokens) {
       throw new BackendError('Codex auth mode cannot expose token data to the jail', 'not_configured')
     }
   }
-  if (typeof auth.auth_mode === 'string' && OTHER_FILE_AUTH_MODES.has(auth.auth_mode)) return 'other'
-  if ((auth.auth_mode === undefined || auth.auth_mode === null) && typeof auth.OPENAI_API_KEY === 'string') return 'other'
+  if (typeof mode === 'string' && OTHER_FILE_AUTH_MODES.has(mode)) return 'other'
   throw new BackendError('Codex account auth mode is unrecognized', 'not_configured')
 }
 
@@ -149,7 +163,8 @@ export async function prepareCodexJailAuth(
   if (!authPath || !authFileExists(authPath)) return writeJailHome(null, configPath, false)
   const auth = readFileAuth(authPath)
   const accountId = auth.tokens?.account_id
-  if (classifyFileAuth(auth) === 'subscription') {
+  const mode = classifyFileAuth(auth)
+  if (mode === 'subscription') {
     if (process.platform !== 'linux' || !readConfine) {
       throw new BackendError('Jailed Codex subscription turns require Linux fs-jail read confinement', 'not_configured')
     }
@@ -166,11 +181,12 @@ export async function prepareCodexJailAuth(
       await refreshAccountWithCodex(bin, authPath, signal)
     }
     const current = readFileAuth(authPath)
-    if (current.auth_mode !== 'chatgpt' || current.tokens?.account_id !== accountId
+    if (classifyFileAuth(current) !== 'subscription' || current.tokens?.account_id !== accountId
       || !(accessExpiry(current.tokens?.access_token) > requiredUntil)) {
       throw new BackendError('Codex account access token will expire during the jailed turn', 'upstream')
     }
-    if (typeof current.tokens?.id_token !== 'string' || typeof current.tokens.access_token !== 'string') {
+    if (typeof current.tokens?.id_token !== 'string' || typeof current.tokens.access_token !== 'string'
+      || typeof current.last_refresh !== 'string' || !Number.isFinite(Date.parse(current.last_refresh))) {
       throw new BackendError('Codex subscription account is missing access credentials', 'not_configured')
     }
     return writeJailHome({
@@ -181,8 +197,20 @@ export async function prepareCodexJailAuth(
         account_id: accountId,
         refresh_token: '',
       },
-      ...(typeof current.last_refresh === 'string' ? { last_refresh: current.last_refresh } : {}),
+      last_refresh: current.last_refresh,
     }, configPath, true)
+  }
+  if (mode === 'external-access') {
+    return writeJailHome({
+      auth_mode: 'chatgptAuthTokens',
+      tokens: {
+        id_token: auth.tokens!.id_token,
+        access_token: auth.tokens!.access_token,
+        account_id: auth.tokens!.account_id,
+        refresh_token: '',
+      },
+      last_refresh: auth.last_refresh,
+    }, configPath, false)
   }
   return writeJailHome(auth, configPath, false)
 }
