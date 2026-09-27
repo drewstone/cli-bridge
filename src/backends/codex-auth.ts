@@ -29,6 +29,12 @@ function readFileAuth(path: string): FileAuth {
   return auth
 }
 
+/** Only an unconfined file-backed ChatGPT turn can rotate this host account during inference. */
+export function isCodexSubscriptionAuth(path: string | undefined): boolean {
+  if (!path) return false
+  try { return readFileAuth(path).auth_mode === 'chatgpt' } catch { return false }
+}
+
 function accessExpiry(token: unknown): number {
   if (typeof token !== 'string') return NaN
   try {

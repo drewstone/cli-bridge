@@ -49,7 +49,7 @@ import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/t
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
-import { prepareCodexJailAuth } from './codex-auth.js'
+import { isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
 import {
   assertRouterCodexExecution,
@@ -88,6 +88,25 @@ export class CodexBackend implements Backend {
   }
 
   async *chat(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    // Unconfined ChatGPT may rotate the canonical file at any point in its
+    // native turn. API-key, Router, Docker and access-only jail turns do not.
+    const hostSubscription = !req.jailSpec
+      && this.spawner.executionEnvironment !== 'docker'
+      && process.env.BRIDGE_ROUTER_RECEIPTS_REQUIRED !== '1'
+      && isCodexSubscriptionAuth(resolveCodexAuthPath())
+    const releaseHostAuth = hostSubscription ? await this.acquireAuthPreparation(signal) : undefined
+    try {
+      yield* this.chatOwned(req, session, signal)
+    } finally {
+      releaseHostAuth?.()
+    }
+  }
+
+  private async *chatOwned(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,

@@ -621,6 +621,7 @@ and `env` round-trip through the materialised config file unchanged
 New recorded Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
 The existing session execution lease serializes turns using that home.
 The Codex backend serializes selected account preparation and refresh on one bridge process; access-only jailed turns can run concurrently.
+Unconfined ChatGPT turns hold that account lease until their native turn ends because the CLI may refresh during inference.
 Host turns link `auth.json` to that home, so Codex writes a refreshed token to the persistent account file.
 ChatGPT subscription turns in an enforced `fs-jail` receive only their selected account's access credential.
 This subscription isolation requires Linux bubblewrap read confinement; the bridge rejects macOS jailed subscription turns.
