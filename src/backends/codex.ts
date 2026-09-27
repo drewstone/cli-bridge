@@ -25,7 +25,7 @@
  * again, adjust `extractText` below rather than the whole pipeline.
  */
 
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
@@ -49,6 +49,7 @@ import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/t
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { prepareCodexJailAuth } from './codex-auth.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
 import {
   assertRouterCodexExecution,
@@ -71,6 +72,7 @@ export class CodexBackend implements Backend {
   readonly name = 'codex'
   readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
+  private authTurnTail: Promise<void> = Promise.resolve()
   constructor(private readonly opts: CodexBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? scopedHostSpawner
@@ -86,6 +88,46 @@ export class CodexBackend implements Backend {
   }
 
   async *chat(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    // Codex's refresh token rotates once. Keep one bridge turn per selected
+    // account in flight so two private jail copies cannot spend it together.
+    const releaseAuthTurn = await this.acquireAuthTurn(signal)
+    try {
+      yield* this.chatOwned(req, session, signal)
+    } finally {
+      releaseAuthTurn()
+    }
+  }
+
+  private async acquireAuthTurn(signal: AbortSignal): Promise<() => void> {
+    const prior = this.authTurnTail
+    let release!: () => void
+    const own = new Promise<void>((resolve) => { release = resolve })
+    this.authTurnTail = prior.then(() => own)
+    let onAbort: (() => void) | undefined
+    try {
+      await Promise.race([
+        prior,
+        new Promise<never>((_, reject) => {
+          onAbort = () => reject(new BackendError('Codex account turn aborted while queued', 'aborted'))
+          signal.addEventListener('abort', onAbort, { once: true })
+          if (signal.aborted) onAbort()
+        }),
+      ])
+      if (signal.aborted) throw new BackendError('Codex account turn aborted while queued', 'aborted')
+      return release
+    } catch (error) {
+      release()
+      throw error
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  private async *chatOwned(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
@@ -182,8 +224,8 @@ export class CodexBackend implements Backend {
       }
     }
 
-    // Session leases own this directory's read/execute/update interval.
-    // Keep native state across turns, but regenerate MCP config and auth each time.
+    // Session leases own native state; the account turn lease owns auth rotation.
+    // Keep native state across turns, but regenerate MCP config and auth links.
     const mcpServers = resolveMcpServers(req, session)
     const externalId = req.session_id ?? session?.externalId
     const nativeHome = this.opts.stateDir && externalId
@@ -197,27 +239,43 @@ export class CodexBackend implements Backend {
         'parse_error',
       )
     }
+    const authSourcePath = resolveCodexAuthPath()
     const codexHome = materializeMcpServersForCodex(
       mcpServers,
-      resolveCodexAuthPath(),
+      authSourcePath,
       nativeHome && !legacySession
         ? ensurePrivateDataDirectory(nativeHome)
         : undefined,
     )
+    let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
+    try {
+      if (req.jailSpec && this.spawner.executionEnvironment !== 'docker') {
+        if (!authSourcePath) throw new BackendError('Jailed Codex requires a selected CODEX_HOME', 'not_configured')
+        jailHome = await prepareCodexJailAuth(
+          this.opts.bin,
+          authSourcePath,
+          codexHome ? join(codexHome.homePath, 'config.toml') : join(dirname(authSourcePath), 'config.toml'),
+          req.execution?.timeoutMs ?? this.opts.timeoutMs,
+          signal,
+          req.jailSpec.readConfine === true,
+        )
+        if (req.jailSpec.readConfine) req.jailSpec.requireEnforcement = true
+        // The jail seed has no refresh capability. File storage must win over
+        // an account config that would otherwise select an unrelated keyring.
+        args.splice(1, 0, '-c', 'cli_auth_credentials_store="file"')
+      }
+    } catch (error) {
+      codexHome?.cleanup()
+      throw error
+    }
 
-    // When MCP passthrough is active, the synthetic CODEX_HOME (selected MCP config
-    // + copied auth) is the source of truth. Register it as the jail's codex auth
-    // source so a CONFINED run gets it surfaced inside the jail with CODEX_HOME
-    // redirected there. Seeded WRITABLE: codex must write PATH aliases,
-    // app-server state, and session
-    // rollouts inside its home before it can run at all. The jail applies this
-    // only when it actually wraps; on docker/fallback paths the host
-    // `CODEX_HOME` env below is used unchanged.
-    if (req.jailSpec && codexHome) {
+    // Seed only an access-only credential into the writable jail home. The
+    // source account file is never mounted or promoted from agent-writable state.
+    if (req.jailSpec && jailHome) {
       req.jailSpec.authSources = [
         ...(req.jailSpec.authSources ?? []).filter((s) => s.envVar !== 'CODEX_HOME'),
         {
-          source: codexHome.homePath,
+          source: jailHome.homePath,
           jailRel: '.codex',
           mode: 'seed-writable',
           only: ['auth.json', 'config.toml'],
@@ -258,6 +316,12 @@ export class CodexBackend implements Backend {
         env: {
           ...process.env,
           ...provisioned.env,
+          ...(jailHome?.subscription ? {
+            OPENAI_API_KEY: undefined,
+            OPENAI_BASE_URL: undefined,
+            CODEX_ACCESS_TOKEN: undefined,
+            CODEX_API_KEY: undefined,
+          } : {}),
           ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
           ...(router ? { TANGLE_ROUTER_CREDENTIAL: router.key } : {}),
         },
@@ -276,7 +340,9 @@ export class CodexBackend implements Backend {
         throw new BackendError(`Codex launch aborted during spawn; termination ${outcome}`, 'aborted')
       }
     } catch (error) {
-      try { codexHome?.cleanup() } finally { record?.close(signal.aborted ? 'aborted' : 'failed') }
+      try { codexHome?.cleanup() } finally {
+        try { jailHome?.cleanup() } finally { record?.close(signal.aborted ? 'aborted' : 'failed') }
+      }
       throw error
     }
     const child = spawned.child
@@ -414,7 +480,9 @@ export class CodexBackend implements Backend {
         await finishRecord()
       } finally {
         try { releaseSpawner() } finally {
-          try { codexHome?.cleanup() } finally {
+          try {
+            try { codexHome?.cleanup() } finally { jailHome?.cleanup() }
+          } finally {
             record?.close(signal.aborted ? 'aborted' : recordOutcome)
           }
         }

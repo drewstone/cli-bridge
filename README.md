@@ -620,7 +620,16 @@ and `env` round-trip through the materialised config file unchanged
 
 New recorded Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
 The existing session execution lease serializes turns using that home.
-Each turn refreshes authentication and MCP configuration, including changed Runtime attachment endpoints, and removes those two files when execution ends.
+The Codex backend also serializes turns on one bridge process while that process uses one selected account home.
+Host turns link `auth.json` to that home, so Codex writes a refreshed token to the persistent account file.
+ChatGPT subscription turns in an enforced `fs-jail` receive only their selected account's access credential.
+This subscription isolation requires Linux bubblewrap read confinement; the bridge rejects macOS jailed subscription turns.
+The bridge refuses a ChatGPT subscription turn in `write-jail` because that mode can read the host refresh token.
+An unavailable jail cannot fall back to an unconfined subscription turn, even with `BRIDGE_JAIL_FALLBACK=warn`.
+Other Codex auth modes retain their existing credential behavior.
+Before a jailed turn whose deadline extends past access-token expiry, the bridge asks the installed Codex app-server to refresh the persistent account, then checks the selected account and token lifetime.
+The jail receives the current per-turn MCP configuration, including changed Runtime attachment endpoints.
+The bridge removes its temporary auth link and MCP configuration after the turn.
 One-shot MCP homes are removed entirely.
 Native session files remain with the bridge data directory; deleting a session mapping does not erase its transcripts.
 Previously deleted temporary rollouts cannot be recovered by this change.

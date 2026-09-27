@@ -12,10 +12,11 @@ import {
   renameSync,
   rmdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join, posix } from 'node:path'
+import { basename, join, posix, resolve } from 'node:path'
 import type {
   AgentProfile,
   AgentProfileConfigValue,
@@ -1957,15 +1958,15 @@ export function materializeEmptyMcpConfig(): MaterializedMcpConfig {
  *
  * `authSourcePath` is the path to the user's persistent `auth.json`
  * (default `~/.codex/auth.json`). Codex looks up the session's bearer
- * token here. We copy it into the temp dir so the spawned codex still
- * authenticates as the operator. The copy is deleted at cleanup.
+ * token here. The host turn links to this file so a native token refresh
+ * persists immediately. Confined turns use a separate access-only seed.
  *
  * stdio servers — written as `command = "..."` + optional `args`/`env`.
  * http servers (spec.type === 'http' with `url`) — written as
  * `url = "..."` + optional `headers`/`bearer_token_env_var`.
  *
  * A supplied sessionHome retains native state under the bridge data directory.
- * Cleanup removes only this turn's config and auth; one-shot homes are removed entirely.
+ * Cleanup removes only this turn's config and auth link; one-shot homes are removed entirely.
  * Returns null when no usable servers remain and no session home was supplied.
  */
 export interface MaterializedCodexHome {
@@ -2031,18 +2032,15 @@ export function materializeMcpServersForCodex(
   // Codex aborts if CODEX_HOME is under the system tmpdir on some
   // platforms — use the user's HOME/.cache as a stable parent.
   const baseDir = sessionHome ?? mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
-  // A session keeps native rollouts and indexes, never the previous turn's credentials.
+  // A session keeps native rollouts and indexes, never the previous turn's auth link.
   for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
-  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n')
+  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n', { mode: 0o600 })
 
   if (authSourcePath) {
     try {
-      const auth = readFileMaybe(authSourcePath)
-      if (auth !== null) writeFileSync(join(baseDir, 'auth.json'), auth)
+      if (existsSync(authSourcePath)) symlinkSync(resolve(authSourcePath), join(baseDir, 'auth.json'))
     } catch {
-      // Best-effort: codex without auth.json will fail to call the
-      // model. Surface that as an upstream error from the backend
-      // rather than silently swallowing it here.
+      // Best-effort: Codex without auth.json reports its own auth error.
     }
   }
 
