@@ -90,6 +90,8 @@ export interface SpawnOpts {
   cwd?: string
   /** Env to set on the child. */
   env?: NodeJS.ProcessEnv
+  /** Codex MCP config written through stdin into the acquired Docker slot. */
+  dockerCodexConfig?: string
   /**
    * Exact names in `env` that the backend resolved for THIS request and that
    * must reach the child even though the host sanitizer's allowlist does not
@@ -280,6 +282,8 @@ export interface Spawner {
    * executor because credential safety cannot depend on guessing its behavior.
    */
   executionEnvironment?: 'host' | 'docker' | 'test-double'
+  /** Docker credential mount ownership; per-slot homes must not inherit host Codex auth. */
+  dockerOauthMode?: 'share' | 'per-slot'
 }
 
 /**

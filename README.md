@@ -618,9 +618,32 @@ into the profile when the flag is absent.
 and `env` round-trip through the materialised config file unchanged
 (verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
 
-New recorded Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
+New host Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
 The existing session execution lease serializes turns using that home.
-Each turn refreshes authentication and MCP configuration, including changed Runtime attachment endpoints, and removes those two files when execution ends.
+The Codex backend serializes selected account preparation and refresh on one bridge process; access-only jailed turns can run concurrently.
+Unconfined ChatGPT turns hold that account lease until their native turn ends because the CLI may refresh during inference.
+Host turns link `auth.json` to that home, so Codex writes a refreshed token to the persistent account file.
+ChatGPT subscription turns in an enforced `fs-jail` receive only their selected account's access credential.
+This subscription isolation requires Linux bubblewrap read confinement; the bridge rejects macOS jailed subscription turns.
+The bridge refuses a ChatGPT subscription turn in `write-jail` because that mode can read the host refresh token.
+An unavailable jail cannot fall back to an unconfined subscription turn, even with `BRIDGE_JAIL_FALLBACK=warn`.
+Recognized non-ChatGPT file auth modes retain their existing credential behavior; unrecognized files fail closed.
+Env-authenticated launches can materialize MCP config without a local `auth.json`.
+For Codex exec, a nonempty `CODEX_API_KEY` or `CODEX_ACCESS_TOKEN` takes precedence over persisted `auth.json`.
+The bridge preserves that effective credential in a jail and does not seed an unrelated subscription account.
+Docker Codex turns keep the container's mounted account home and receive only the declared MCP settings through a private per-turn config file.
+The bridge removes ambient MCP servers even when a turn declares none, then restores the original config after the turn.
+It refuses base config MCP syntax it cannot safely remove.
+Docker and jailed Codex turns omit saved project trust from their temporary config, so project `.codex/` config, hooks, and rules cannot add tools outside the request.
+Per-slot Docker Codex sessions use a stable slot chosen from the external session ID while the pool size stays fixed.
+A busy slot queues the turn until its acquire deadline, even when another slot is free.
+Changing the pool size can remap existing sessions; migrate or finish them before resizing.
+Per-slot Docker turns do not inherit the bridge process's ambient Codex credentials.
+Docker turns sharing one account home run one at a time while their private MCP config is installed.
+Before a jailed turn whose deadline extends past access-token expiry, the bridge asks the installed Codex app-server to refresh the persistent account, then checks the selected account and token lifetime.
+The jail receives the current per-turn MCP configuration, including changed Runtime attachment endpoints.
+When a jailed turn declares no MCP servers, its account settings are retained without ambient MCP servers.
+The bridge removes its temporary auth link and MCP configuration after the turn.
 One-shot MCP homes are removed entirely.
 Native session files remain with the bridge data directory; deleting a session mapping does not erase its transcripts.
 Previously deleted temporary rollouts cannot be recovered by this change.

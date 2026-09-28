@@ -417,7 +417,7 @@ describe('CodexBackend model translation', () => {
 })
 
 describe('CodexBackend jailed MCP visibility', () => {
-  it('registers the synthetic CODEX_HOME as a writable seed so a confined codex reads its MCP config', async () => {
+  it('registers the synthetic CODEX_HOME as a writable access-only seed so a confined codex reads its MCP config', async () => {
     // The MCP stanzas live in the synthetic CODEX_HOME's config.toml. Under
     // an fs-jail that home must arrive INSIDE the jail (seed-writable, the
     // jail copies it to <root>/.codex and redirects CODEX_HOME) — the host
@@ -430,30 +430,64 @@ describe('CodexBackend jailed MCP visibility', () => {
     // The synthetic home is removed in chat()'s finally, so its config must
     // be captured while the subprocess is (fake-)running — exactly when the
     // real jail would seed it.
+    const sourceHome = mkdtempSync(join(tmpdir(), 'codex-jail-auth-source-'))
+    const previousHome = process.env.CODEX_HOME
+    const previousAccess = process.env.CODEX_ACCESS_TOKEN
+    const previousApiKey = process.env.CODEX_API_KEY
+    const accessToken = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.sig`
+    writeFileSync(join(sourceHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { account_id: 'fixture-account', id_token: 'fixture-id', access_token: accessToken, refresh_token: 'fixture-refresh' },
+      last_refresh: new Date().toISOString(),
+      OPENAI_API_KEY: 'fixture-extra-secret',
+    }), { mode: 0o600 })
+    process.env.CODEX_HOME = sourceHome
+    delete process.env.CODEX_ACCESS_TOKEN
+    delete process.env.CODEX_API_KEY
     let seededConfig: string | null = null
+    let seededAuth: Record<string, unknown> | null = null
+    let spawnedEnv: NodeJS.ProcessEnv | undefined
     const inner = codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE])
     const backend = new CodexBackend({
       bin: 'codex',
       timeoutMs: 5_000,
       spawner: async (bin, args, opts) => {
+        spawnedEnv = opts.env
         const source = (jailSpec.authSources ?? []).find((s) => s.envVar === 'CODEX_HOME')?.source
-        if (source) seededConfig = readFileSync(join(source, 'config.toml'), 'utf8')
+        if (source) {
+          seededConfig = readFileSync(join(source, 'config.toml'), 'utf8')
+          seededAuth = JSON.parse(readFileSync(join(source, 'auth.json'), 'utf8')) as Record<string, unknown>
+        }
         return inner(bin, args, opts)
       },
     })
-    await collect(backend.chat(
-      {
-        ...request(),
-        mcp: { mcpServers: { coordination: { command: '/bin/true' } } },
-        jailSpec,
-      },
-      null,
-      new AbortController().signal,
-    ))
-    const codexSources = (jailSpec.authSources ?? []).filter((s) => s.envVar === 'CODEX_HOME')
-    expect(codexSources).toHaveLength(1)
-    expect(codexSources[0]).toMatchObject({ jailRel: '.codex', mode: 'seed-writable' })
-    expect(seededConfig).toContain('[mcp_servers.coordination]')
-    expect(seededConfig).toContain('command = "/bin/true"')
+    try {
+      await collect(backend.chat(
+        {
+          ...request(),
+          mcp: { mcpServers: { coordination: { command: '/bin/true' } } },
+          jailSpec,
+        },
+        null,
+        new AbortController().signal,
+      ))
+      const codexSources = (jailSpec.authSources ?? []).filter((s) => s.envVar === 'CODEX_HOME')
+      expect(codexSources).toHaveLength(1)
+      expect(codexSources[0]).toMatchObject({ jailRel: '.codex', mode: 'seed-writable' })
+      expect(seededConfig).toContain('[mcp_servers.coordination]')
+      expect(seededConfig).toContain('command = "/bin/true"')
+      expect(seededAuth).toMatchObject({ auth_mode: 'chatgpt', tokens: { account_id: 'fixture-account', refresh_token: '' } })
+      expect(seededAuth).not.toHaveProperty('OPENAI_API_KEY')
+      expect(spawnedEnv?.CODEX_ACCESS_TOKEN).toBeUndefined()
+      expect(spawnedEnv?.CODEX_API_KEY).toBeUndefined()
+    } finally {
+      if (previousHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = previousHome
+      if (previousAccess === undefined) delete process.env.CODEX_ACCESS_TOKEN
+      else process.env.CODEX_ACCESS_TOKEN = previousAccess
+      if (previousApiKey === undefined) delete process.env.CODEX_API_KEY
+      else process.env.CODEX_API_KEY = previousApiKey
+      rmSync(sourceHome, { recursive: true, force: true })
+    }
   })
 })

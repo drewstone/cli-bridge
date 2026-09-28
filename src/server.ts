@@ -219,6 +219,7 @@ async function buildExecutorForBackend(
     image: cfg.image,
     namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
     oauthMode: cfg.oauthMode ?? 'share',
+    strictSessionAffinity: cfg.name === 'codex' && cfg.oauthMode === 'per-slot',
     memory,
     cpus,
     maxQueueDepth,
@@ -312,6 +313,8 @@ async function buildExecutorForBackend(
 
   return createDockerSpawner({
     pool,
+    oauthMode: cfg.oauthMode ?? 'share',
+    containerConfigDir: cfg.containerConfigDir,
     backend: cfg.name,
     envPrefix: cfg.name.toUpperCase(),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
