@@ -1,4 +1,4 @@
-FROM node:22-slim AS base
+FROM node:24-slim AS base
 WORKDIR /app
 
 # Build toolchain + CLI-install prereqs. curl is needed for the opencode
@@ -43,10 +43,10 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 # manually on hosts that need them. They change rapidly.
 
 # --- App install ---
-COPY package.json pnpm-lock.yaml* ./
-RUN corepack enable && corepack prepare pnpm@10 --activate \
-  && pnpm install --frozen-lockfile --prod=false \
-  && pnpm rebuild better-sqlite3
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY tests/runtime-consumer/package.json tests/runtime-consumer/
+RUN corepack enable && corepack prepare pnpm@12.6.0 --activate \
+  && pnpm install --frozen-lockfile --prod=false
 COPY . .
 RUN pnpm typecheck
 

@@ -14,18 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # No packageManager field in package.json, so the pnpm major must be
-      # pinned here. pnpm-workspace.yaml carries both allowBuilds (pnpm 11)
-      # and onlyBuiltDependencies (pnpm 9/10) so either major installs the
-      # native better-sqlite3 binding.
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11
+      # Installs the pnpm that package.json `packageManager` pins.
+      - uses: pnpm/action-setup@v6.1.0
 
       # engines.node declares >=22; test on the declared floor.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
