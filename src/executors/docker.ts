@@ -345,7 +345,7 @@ async function installDockerCodexConfig(
   const paths = `d=${dir}; p="$d/config.toml"; b="$d/.cli-bridge-config.backup"; m="$d/.cli-bridge-config.absent"`
   const base = await readDockerCodexConfig(containerId, configDir)
   const merged = scopeCodexTurnConfig(base, config)
-  const prepare = `set -eu; ${paths}; if [ -e "$p" ]; then cp -p "$p" "$b"; chmod 600 "$b"; else umask 077; : > "$m"; fi; rm -f "$p"; umask 077; cat > "$p"`
+  const prepare = `set -eu; ${paths}; if [ -e "$p" ] || [ -L "$p" ]; then cp -Pp "$p" "$b"; if [ ! -L "$b" ]; then chmod 600 "$b"; fi; else umask 077; : > "$m"; fi; rm -f "$p"; umask 077; cat > "$p"`
   try {
     await dockerExecWithStdin(containerId, prepare, merged)
   } catch {
