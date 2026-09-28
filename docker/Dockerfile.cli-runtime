@@ -31,7 +31,7 @@
 # The bridge's container-pool config bind-mounts only the dirs the
 # active backend needs.
 
-FROM node:22-slim
+FROM node:24-slim
 
 ARG CLI_BRIDGE_HARNESSES=all
 
