@@ -3,8 +3,11 @@ export function scopeCodexTurnConfig(base: string, requested: string): string {
   const kept: string[] = []
   let skipSection = false
   let section = ''
+  let multilineQuote: '"""' | "'''" | null = null
   for (const line of base.split('\n')) {
-    const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line)
+    const insideMultiline = multilineQuote !== null
+    const header = insideMultiline ? null : /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line)
+    multilineQuote = nextMultilineQuote(line, multilineQuote)
     if (header) {
       section = header[1]!.trim()
       const root = tomlRootKey(section)
@@ -12,8 +15,8 @@ export function scopeCodexTurnConfig(base: string, requested: string): string {
     }
     if (skipSection) continue
     const trimmed = line.trimStart()
-    if (!header && trimmed.startsWith('[')) throw new Error('Codex base config has unsupported table syntax')
-    if (section === '' && !header && trimmed && !trimmed.startsWith('#')
+    if (!insideMultiline && !header && trimmed.startsWith('[')) throw new Error('Codex base config has unsupported table syntax')
+    if (section === '' && !insideMultiline && !header && trimmed && !trimmed.startsWith('#')
       && trimmed.includes('=') && ['mcp_servers', 'projects'].includes(tomlRootKey(trimmed))) {
       if (!singleLineTomlValue(trimmed.slice(trimmed.indexOf('=') + 1))) {
         throw new Error('Codex base config has unsupported multiline MCP or project key')
@@ -23,6 +26,33 @@ export function scopeCodexTurnConfig(base: string, requested: string): string {
     kept.push(line)
   }
   return `${kept.join('\n').trimEnd()}\n${requested ? `\n${requested}` : ''}`
+}
+
+/** Track strings across lines so table-like text in a setting is not a header. */
+function nextMultilineQuote(
+  line: string,
+  initial: '"""' | "'''" | null,
+): '"""' | "'''" | null {
+  let multiline = initial
+  let quoted: '"' | "'" | null = null
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i]
+    if (multiline) {
+      if (multiline === '"""' && char === '\\') { i++; continue }
+      if (line.startsWith(multiline, i)) { multiline = null; i += 2 }
+      continue
+    }
+    if (quoted) {
+      if (quoted === '"' && char === '\\') { i++; continue }
+      if (char === quoted) quoted = null
+      continue
+    }
+    if (char === '#') break
+    if (line.startsWith('"""', i)) { multiline = '"""'; i += 2; continue }
+    if (line.startsWith("'''", i)) { multiline = "'''"; i += 2; continue }
+    if (char === '"' || char === "'") quoted = char
+  }
+  return multiline
 }
 
 /** A dotted key can be removed only when its entire value ends on this line. */
