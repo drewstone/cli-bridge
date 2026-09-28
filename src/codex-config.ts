@@ -1,5 +1,5 @@
-/** Keep account settings while giving a turn only its declared MCP servers. */
-export function replaceCodexMcpTables(base: string, requested: string): string {
+/** Keep account settings while excluding ambient MCP and project config layers. */
+export function scopeCodexTurnConfig(base: string, requested: string): string {
   const kept: string[] = []
   let skipSection = false
   let section = ''
@@ -7,16 +7,45 @@ export function replaceCodexMcpTables(base: string, requested: string): string {
     const header = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(?:#.*)?$/.exec(line)
     if (header) {
       section = header[1]!.trim()
-      skipSection = tomlRootKey(section) === 'mcp_servers'
+      const root = tomlRootKey(section)
+      skipSection = root === 'mcp_servers' || root === 'projects'
     }
     if (skipSection) continue
     const trimmed = line.trimStart()
     if (!header && trimmed.startsWith('[')) throw new Error('Codex base config has unsupported table syntax')
     if (section === '' && !header && trimmed && !trimmed.startsWith('#')
-      && trimmed.includes('=') && tomlRootKey(trimmed) === 'mcp_servers') continue
+      && trimmed.includes('=') && ['mcp_servers', 'projects'].includes(tomlRootKey(trimmed))) {
+      if (!singleLineTomlValue(trimmed.slice(trimmed.indexOf('=') + 1))) {
+        throw new Error('Codex base config has unsupported multiline MCP or project key')
+      }
+      continue
+    }
     kept.push(line)
   }
   return `${kept.join('\n').trimEnd()}\n${requested ? `\n${requested}` : ''}`
+}
+
+/** A dotted key can be removed only when its entire value ends on this line. */
+function singleLineTomlValue(value: string): boolean {
+  const trimmed = value.trimStart()
+  if (trimmed.startsWith('"""') || trimmed.startsWith("'''")) return false
+  let quote: '"' | "'" | null = null
+  let escaped = false
+  let depth = 0
+  for (const char of trimmed) {
+    if (quote) {
+      if (quote === '"' && !escaped && char === '\\') { escaped = true; continue }
+      if (!escaped && char === quote) quote = null
+      escaped = false
+      continue
+    }
+    if (char === '#') break
+    if (char === '"' || char === "'") { quote = char; continue }
+    if (char === '[' || char === '{') depth++
+    if (char === ']' || char === '}') depth--
+    if (depth < 0) return false
+  }
+  return quote === null && depth === 0
 }
 
 /** Read the first TOML key component; refuse syntax we cannot classify safely. */

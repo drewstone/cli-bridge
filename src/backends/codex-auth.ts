@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline'
 import { hostSpawner } from '../executors/host.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { BackendError } from './types.js'
-import { replaceCodexMcpTables } from '../codex-config.js'
+import { scopeCodexTurnConfig } from '../codex-config.js'
 
 interface FileAuth {
   auth_mode?: unknown
@@ -231,7 +231,7 @@ function writeJailHome(auth: FileAuth | null, configPath: string | undefined, su
   try {
     if (auth) writeFileSync(join(homePath, 'auth.json'), JSON.stringify(auth), { mode: 0o600 })
     const config = configPath && existsSync(configPath) ? readFileSync(configPath, 'utf8') : '\n'
-    writeFileSync(join(homePath, 'config.toml'), configAlreadyScoped ? config : replaceCodexMcpTables(config, ''), { mode: 0o600 })
+    writeFileSync(join(homePath, 'config.toml'), configAlreadyScoped ? config : scopeCodexTurnConfig(config, ''), { mode: 0o600 })
     return {
       homePath,
       subscription,

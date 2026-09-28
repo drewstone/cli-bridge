@@ -33,7 +33,7 @@ import {
   type Spawner,
 } from './types.js'
 import { withLineageEnv } from '../trace/lineage.js'
-import { replaceCodexMcpTables } from '../codex-config.js'
+import { scopeCodexTurnConfig } from '../codex-config.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -344,7 +344,7 @@ async function installDockerCodexConfig(
   const dir = shellQuote(configDir)
   const paths = `d=${dir}; p="$d/config.toml"; b="$d/.cli-bridge-config.backup"; m="$d/.cli-bridge-config.absent"`
   const base = await readDockerCodexConfig(containerId, configDir)
-  const merged = replaceCodexMcpTables(base, config)
+  const merged = scopeCodexTurnConfig(base, config)
   const prepare = `set -eu; ${paths}; if [ -e "$p" ]; then cp -p "$p" "$b"; chmod 600 "$b"; else umask 077; : > "$m"; fi; rm -f "$p"; umask 077; cat > "$p"`
   try {
     await dockerExecWithStdin(containerId, prepare, merged)
