@@ -373,7 +373,7 @@ async function readDockerCodexConfig(containerId: string, configDir: string): Pr
 
 async function recoverDockerCodexConfig(containerId: string, configDir: string): Promise<void> {
   const dir = shellQuote(configDir)
-  const script = `set -eu; d=${dir}; p="$d/config.toml"; b="$d/.cli-bridge-config.backup"; m="$d/.cli-bridge-config.absent"; if [ -f "$b" ]; then mv -f "$b" "$p"; elif [ -e "$m" ]; then rm -f "$p"; fi; rm -f "$m"`
+  const script = `set -eu; d=${dir}; p="$d/config.toml"; b="$d/.cli-bridge-config.backup"; m="$d/.cli-bridge-config.absent"; if [ -e "$b" ] || [ -L "$b" ]; then mv -f "$b" "$p"; elif [ -e "$m" ]; then rm -f "$p"; fi; rm -f "$m"`
   try {
     await execFileAsync('docker', ['exec', containerId, 'sh', '-c', script], { timeout: 10_000 })
   } catch {
