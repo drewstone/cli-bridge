@@ -1,3 +1,4 @@
+import { DurableRunWriter } from './sessions/durable-writer.js'
 /**
  * cli-bridge server entry — Hono on Node.
  *
@@ -343,6 +344,11 @@ export async function buildApp(config: Config): Promise<{
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
+  const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
+  if (durableWriter) {
+    await durableWriter.open()
+    extras.shutdownHooks.push(() => durableWriter.close())
+  }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)
   extras.shutdownHooks.push(async () => admission.close())
@@ -510,6 +516,7 @@ export async function buildApp(config: Config): Promise<{
     registry,
     sessions,
     retainedRuns: sessions,
+    durableWriter: durableWriter ?? undefined,
     contextTransfers: retained,
     runs,
     admission,

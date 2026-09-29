@@ -235,6 +235,41 @@ An ahead cursor returns `409 invalid_replay_cursor`.
 A cursor older than the retained window returns `410 expired_replay_cursor`; the bridge never silently restarts at event zero.
 `Last-Event-ID` is rejected for non-streaming responses because a single JSON response cannot express partial replay.
 
+### Asynchronous durable writes
+
+Set `BRIDGE_ASYNC_DURABLE_WRITES=on` to isolate streamed chat persistence in a worker.
+The default is `off` during staged rollout.
+All chat backends use the same worker path.
+
+The worker keeps SQLite WAL with `synchronous=FULL`.
+It groups queued writes into one transaction, with savepoints isolating invalid requests.
+A producer awaits each acknowledgement before exposing its delta and checkpoint.
+Terminal state remains pending until its checkpoint is acknowledged.
+Write failures produce an unknown outcome; capacity exhaustion refuses further writes explicitly.
+
+The pending queue holds at most 128 requests and 32 MiB of serialized inputs.
+Awaiting commits applies backpressure to each source.
+Shutdown drains accepted writes before closing the worker.
+
+This option isolates streaming database writes only.
+Admission, retained-session controls, raw process capture, and span-file writes still have synchronous paths.
+A slow filesystem can still delay those operations.
+
+On 2026-09-29, three live bridge main threads were sampled inside `fsync`.
+Their file descriptors resolved to their respective `sessions.sqlite-wal` files.
+The streaming path made two FULL commits for each delta.
+
+The regression fixture holds an actual SQLite write lock while requesting HTTP health.
+Eight health responses completed with a maximum of 23.6 ms in the initial fixture run.
+No pending output became visible.
+After releasing the lock, reopening recovered 17 events and their terminal checkpoint.
+This proves isolated worker behavior, not deployed fleet performance.
+
+Enable the option first on an idle canary after its existing jobs settle.
+Check health latency, admission, persisted replay, cancellation, and native capture before expanding.
+Rollback disables the option at the next safe service restart.
+Do not restart an active fleet solely to apply this change.
+
 Replay storage is explicitly bounded per process:
 
 - At most `BRIDGE_RUN_MAX_REPLAY_DELTAS` deltas are retained per run (default `10000`).

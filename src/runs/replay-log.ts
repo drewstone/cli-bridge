@@ -21,6 +21,7 @@ import type {
   RunClaimOptions,
   RunReplayWindow,
   RunRetention,
+  RunSnapshot,
   SeqCanonicalEvent,
   SeqDelta,
 } from './types.js'
@@ -37,7 +38,7 @@ export interface RunReplayLogOptions {
   /** The run-id binding expired — the registry may forget this run. */
   onIdentityExpired: () => void
   /** Persist the run checkpoint after the delta is in the local replay log. */
-  onDeltaCommitted?: () => void
+  onDeltaCommitted?: (checkpoint: Pick<RunSnapshot, 'lastSeq' | 'replay' | 'profileMaterialization'>) => void | Promise<void>
   commitDelta?: RunClaimOptions['commitDelta']
   commitCanonicalEvent?: RunClaimOptions['commitCanonicalEvent']
   /** A canonical commit failed; the owning run records the outcome as unknown. */
@@ -45,6 +46,8 @@ export interface RunReplayLogOptions {
 }
 
 export class RunReplayLog {
+  private sealed = false
+  private deltaCommit: Promise<void> = Promise.resolve()
   private readonly deltas: SeqDelta[] = []
   private deltaBytes = 0
   private readonly canonical: SeqCanonicalEvent[] = []
@@ -99,33 +102,63 @@ export class RunReplayLog {
     }
   }
 
-  append(delta: ChatDelta): void {
+  append(delta: ChatDelta): Promise<void> {
+    if (this.sealed) return Promise.resolve()
+    const commit = this.deltaCommit.then(() => this.appendDelta(delta))
+    // Lifetime cancellation may append while the source awaits its current commit.
+    // One failed write remains an error to its caller, without poisoning shutdown.
+    this.deltaCommit = commit.catch(() => {})
+    return commit
+  }
+
+  seal(): void { this.sealed = true }
+
+  async flush(): Promise<void> { await this.deltaCommit }
+
+  private async appendDelta(delta: ChatDelta): Promise<void> {
+    if (this.options.isClosed()) return
     const committed = structuredClone(delta)
-    if (committed.profile_materialization) {
-      if (
-        this.profileMaterialization
-        && JSON.stringify(this.profileMaterialization) !== JSON.stringify(committed.profile_materialization)
-      ) {
-        throw new Error(`run ${JSON.stringify(this.options.runId)} emitted conflicting profile materialization receipts`)
-      }
-      this.profileMaterialization = structuredClone(committed.profile_materialization)
+    const receipt = committed.profile_materialization ?? this.profileMaterialization
+    if (
+      committed.profile_materialization && this.profileMaterialization
+      && JSON.stringify(this.profileMaterialization) !== JSON.stringify(committed.profile_materialization)
+    ) {
+      throw new Error(`run ${JSON.stringify(this.options.runId)} emitted conflicting profile materialization receipts`)
     }
     const sequence = this.seq + 1
+    let evicted = 0
+    let retainedCount = this.deltas.length + 1
+    let bytes = this.deltaBytes + approximateDeltaBytes(committed)
+    while (retainedCount > this.options.retention.maxReplayDeltas
+      || (retainedCount > 1 && bytes > this.options.retention.maxReplayBytes)) {
+      bytes -= approximateDeltaBytes(this.deltas[evicted++]!.delta)
+      retainedCount--
+    }
     try {
-      this.options.commitDelta?.({ runId: this.options.runId, sequence, delta: committed })
+      await this.options.commitDelta?.({ runId: this.options.runId, sequence, delta: committed })
+      await this.options.onDeltaCommitted?.({
+        lastSeq: sequence,
+        replay: {
+          ...this.replayWindow(),
+          firstAvailableSeq: this.deltas[evicted]?.seq ?? sequence,
+          lastSeq: sequence,
+          retainedDeltas: retainedCount,
+          retainedBytes: bytes,
+        },
+        profileMaterialization: receipt ? structuredClone(receipt) : null,
+      })
     } catch (error) {
-      if (this.options.commitDelta) this.options.onCommitFailure(error)
+      this.options.onCommitFailure(error)
       throw error
     }
+    // Neither an existing reader nor a new attachment can see uncommitted data.
+    if (this.options.isClosed()) return
     this.seq = sequence
+    this.deltas.splice(0, evicted)
     this.deltas.push({ seq: sequence, delta: committed })
-    this.deltaBytes += approximateDeltaBytes(committed)
-    while (this.deltas.length > this.options.retention.maxReplayDeltas) this.evictOldestDelta()
-    while (this.deltas.length > 1 && this.deltaBytes > this.options.retention.maxReplayBytes) {
-      this.evictOldestDelta()
-    }
+    this.deltaBytes = bytes
+    this.profileMaterialization = receipt ? structuredClone(receipt) : null
     this.wakeAll()
-    this.options.onDeltaCommitted?.()
   }
 
   appendCanonical(input: CanonicalEventInput): RuntimeEventEnvelope {

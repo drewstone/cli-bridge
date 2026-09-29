@@ -30,8 +30,8 @@ export interface RunClaimOptions {
   executionId?: string
   provider?: string
   environmentId?: string
-  commitDelta?: (input: { runId: string; sequence: number; delta: ChatDelta }) => void
-  commitSnapshot?: (snapshot: RunSnapshot) => void
+  commitDelta?: (input: { runId: string; sequence: number; delta: ChatDelta }) => void | Promise<void>
+  commitSnapshot?: (snapshot: RunSnapshot) => void | Promise<void>
   commitCanonicalEvent?: (input: {
     runId: string
     sequence: number

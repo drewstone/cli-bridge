@@ -24,7 +24,7 @@ export interface DeltaStreamHost {
   setSetupError(error: unknown): void
   /** Mark the run unknown when replay persistence cannot commit an event. */
   markDurabilityUnknown(error: unknown): void
-  finish(status: Exclude<RunStatus, 'running'>): void
+  finish(status: Exclude<RunStatus, 'running'>): Promise<void>
 }
 
 export interface DeltaStreamOptions {
@@ -52,15 +52,15 @@ export class DeltaRunStream {
     try {
       let outcome: 'done' | 'error' = 'done'
       for await (const delta of source) {
-        this.log.append(this.withTerminalReason(delta))
+        await this.log.append(this.withTerminalReason(delta))
         if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') {
           outcome = 'error'
         }
       }
-      this.host.finish(this.host.signal.aborted ? 'cancelled' : outcome)
+      await this.host.finish(this.host.signal.aborted ? 'cancelled' : outcome)
     } catch (error) {
       if (this.host.signal.aborted) {
-        this.host.finish('cancelled')
+        await this.host.finish('cancelled')
       } else {
         this.host.setFailure(error)
         if (this.log.lastSeq() === 0) this.host.setSetupError(error)
@@ -70,13 +70,13 @@ export class DeltaRunStream {
         // process's stdout.
         try {
           const receipt = options.terminalReceipt?.()
-          if (receipt) this.log.append({ profile_materialization: receipt })
-          this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
-          this.host.finish('error')
+          if (receipt) await this.log.append({ profile_materialization: receipt })
+          await this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
+          await this.host.finish('error')
         } catch (persistenceError) {
           this.host.setFailure(persistenceError)
           this.host.markDurabilityUnknown(persistenceError)
-          this.host.finish('unknown')
+          await this.host.finish('unknown')
         }
         console.error(`[cli-bridge] run ${this.host.runId} failed:`, error)
       }
@@ -84,11 +84,16 @@ export class DeltaRunStream {
   }
 
   /** Commit a claimed run whose admission/backend setup failed before `pump()`. */
-  failSetup(error: unknown): void {
+  async failSetup(error: unknown): Promise<void> {
     this.host.setSetupError(error)
     this.host.setFailure(error)
-    this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
-    this.host.finish(this.host.signal.aborted ? 'cancelled' : 'error')
+    try {
+      await this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
+      await this.host.finish(this.host.signal.aborted ? 'cancelled' : 'error')
+    } catch (persistenceError) {
+      this.host.markDurabilityUnknown(persistenceError)
+      await this.host.finish('unknown')
+    }
   }
 
   /**
