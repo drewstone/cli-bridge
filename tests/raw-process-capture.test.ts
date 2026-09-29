@@ -138,3 +138,30 @@ test('a process stream write failure refuses successful capture and remains expl
   const manifests=readdirSync(join(root,'evidence')).filter(x=>x.endsWith('.json'))
   expect(JSON.parse(readFileSync(join(root,'evidence',manifests[0]!), 'utf8')).processStreams).toBe('incomplete')
 })
+
+
+test('retains process terminal and manifest even when source cleanup rejects', async () => {
+  const root=fixture()
+  let spawned=false
+  const source: AsyncIterable<unknown>={
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          if (!spawned) {
+            spawned=true
+            spawnCaptured(process.execPath,['-e',"process.stdout.write('retained-before-cleanup-error')"],{})
+          }
+          throw new Error('source execution failed')
+        },
+        async return() { throw new Error('source cleanup failed') },
+      }
+    },
+  }
+  const error=await consume(withRawProcessCapture(source,snapshot('cleanup-error'),'any-harness',join(root,'workspace'))).catch(error=>error)
+  expect(error).toBeInstanceOf(AggregateError)
+  expect(error.errors.map((item: Error)=>item.message)).toEqual(['source execution failed','source cleanup failed'])
+  const rows=frames(root)[0]!
+  expect(Buffer.concat(rows.filter(x=>x.stream==='stdout').map(x=>Buffer.from(x.base64Bytes,'base64'))).toString()).toBe('retained-before-cleanup-error')
+  const manifests=readdirSync(join(root,'evidence')).filter(x=>x.endsWith('.json'))
+  expect(manifests).toHaveLength(1)
+})

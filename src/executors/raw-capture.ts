@@ -33,6 +33,8 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
   return {
     async *[Symbol.asyncIterator]() {
       const iterator = scopes.run(scope, () => source[Symbol.asyncIterator]())
+      let sourceError: unknown
+      let cleanupError: unknown
       try {
         while (true) {
           const next = await scopes.run(scope, () => iterator.next())
@@ -47,8 +49,11 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
           }
           yield next.value
         }
+      } catch (error) {
+        sourceError = error
       } finally {
         const closing = scopes.run(scope, async () => { await iterator.return?.() })
+          .catch(error => { cleanupError = error })
         // A parser may stop at a terminal message before consuming the last pipe bytes.
         for (const { child } of scope.pending) { child.stdout?.resume(); child.stderr?.resume() }
         await closing
@@ -69,7 +74,9 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
             fsyncSync(fd)
           } finally { closeSync(fd) }
         }
-        if (scope.failures.length) throw new AggregateError(scope.failures, 'Original process capture failed')
+        const errors = [sourceError, cleanupError, ...scope.failures].filter(error => error !== undefined)
+        if (errors.length === 1) throw errors[0]
+        if (errors.length) throw new AggregateError(errors, 'Source execution, cleanup, or original process capture failed')
       }
     },
   }
@@ -153,7 +160,9 @@ export function spawnCaptured(command: string, args: readonly string[], options:
   let spawnError: string | undefined
   child.once('error', error => { spawnError = error.message })
   const done = new Promise<void>(resolveDone => {
-    child.once('close', (code, signal) => { close(code, signal, spawnError); resolveDone() })
+    child.once('close', (code, signal) => {
+      try { close(code, signal, spawnError) } catch (error) { fail(error) } finally { resolveDone() }
+    })
   })
   scope.pending.push({ child, done })
   return child
