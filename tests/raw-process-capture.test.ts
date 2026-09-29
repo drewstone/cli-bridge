@@ -86,7 +86,8 @@ test('drains trailing bytes after parser terminal without waiting on its finally
   await consume(withRawProcessCapture(source(), snapshot('tail'), 'any-harness', join(root, 'workspace')))
   const rows = frames(root)[0]!
   const original = Buffer.concat(rows.filter(x => x.stream === 'stdout').map(x => Buffer.from(x.base64Bytes, 'base64')))
-  expect(original).toEqual(Buffer.alloc(2*1024*1024,42))
+  expect(original.length).toBe(2*1024*1024)
+  expect(original.equals(Buffer.alloc(2*1024*1024,42))).toBe(true)
 })
 
 test.each(['inherit', 'ignore'] as const)('refuses uncapturable %s stdio before spawning', async stdio => {
@@ -164,4 +165,23 @@ test('retains process terminal and manifest even when source cleanup rejects', a
   expect(Buffer.concat(rows.filter(x=>x.stream==='stdout').map(x=>Buffer.from(x.base64Bytes,'base64'))).toString()).toBe('retained-before-cleanup-error')
   const manifests=readdirSync(join(root,'evidence')).filter(x=>x.endsWith('.json'))
   expect(manifests).toHaveLength(1)
+})
+
+
+test('preserves a source failure when terminal manifest emission also fails', async () => {
+  const root=fixture()
+  async function* source() {
+    const child=spawnCaptured(process.execPath,['-e',"process.stdout.write('retained')"],{})
+    const closed=once(child,'close')
+    child.stderr!.resume()
+    for await(const _ of child.stdout!) { /* drain */ }
+    await closed
+    writeFault.remaining=0
+    throw new Error('source failed before manifest')
+    yield {}
+  }
+  const error=await consume(withRawProcessCapture(source(),snapshot('manifest-error'),'any-harness',join(root,'workspace'))).catch(error=>error)
+  expect(error).toBeInstanceOf(AggregateError)
+  expect(error.errors.map((item: Error)=>item.message)).toEqual(['source failed before manifest','injected capture write failure'])
+  expect(frames(root)).toHaveLength(1)
 })

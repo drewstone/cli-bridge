@@ -14,7 +14,7 @@ class FakeChild extends EventEmitter {
   exitCode: number | null = null
 }
 
-function claudeSpawner(lines: Array<Record<string, unknown>>): Spawner {
+function claudeSpawner(lines: Array<Record<string, unknown>>, exitCode = 0): Spawner {
   return async (): Promise<SpawnResult> => {
     const child = new FakeChild()
     queueMicrotask(() => {
@@ -22,8 +22,8 @@ function claudeSpawner(lines: Array<Record<string, unknown>>): Spawner {
       child.stdout.end()
       child.stderr.end()
       setTimeout(() => {
-        child.exitCode = 0
-        child.emit('close', 0)
+        child.exitCode = exitCode
+        child.emit('close', exitCode)
       }, 10)
     })
     return {
@@ -260,5 +260,18 @@ describe('claude dollar receipt', () => {
     expect(collected.costComplete).toBe(false)
     expect(collected.costProvenance).toBeUndefined()
     expect(collected.estimatedCost).toBe(0.005)
+  })
+})
+
+
+describe('claude native identity', () => {
+  it('emits its observed native identity before a process failure', async () => {
+    const backend=new ClaudeBackend({bin:'claude',harness:'claude-code',timeoutMs:5000,spawner:claudeSpawner([INIT,ASSISTANT],134)})
+    const deltas: ChatDelta[]=[]
+    await expect((async () => {
+      for await(const delta of backend.chat(request(),null,new AbortController().signal)) deltas.push(delta)
+    })()).rejects.toThrow('claude exited 134')
+    expect(deltas[0]).toEqual({internal_session_id:'sess-1'})
+    expect(deltas.some(delta=>delta.finish_reason==='stop')).toBe(false)
   })
 })

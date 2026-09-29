@@ -33,8 +33,7 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
   return {
     async *[Symbol.asyncIterator]() {
       const iterator = scopes.run(scope, () => source[Symbol.asyncIterator]())
-      let sourceError: unknown
-      let cleanupError: unknown
+      const sourceErrors: unknown[] = []
       try {
         while (true) {
           const next = await scopes.run(scope, () => iterator.next())
@@ -50,31 +49,33 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
           yield next.value
         }
       } catch (error) {
-        sourceError = error
+        sourceErrors.push(error)
       } finally {
         const closing = scopes.run(scope, async () => { await iterator.return?.() })
-          .catch(error => { cleanupError = error })
+          .catch(error => { sourceErrors.push(error) })
         // A parser may stop at a terminal message before consuming the last pipe bytes.
         for (const { child } of scope.pending) { child.stdout?.resume(); child.stderr?.resume() }
         await closing
         await Promise.all(scope.pending.map(({ done }) => done))
-        if (scope.processIds.length) {
-          const name = createHash('sha256').update(JSON.stringify(scope.identity)).digest('hex') + '.json'
-          const fd = openSync(join(scope.root, name), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600)
-          try {
-            const bytes = Buffer.from(JSON.stringify({ ...scope.identity, backend: scope.backend,
-              nativeSessionIds: [...scope.nativeSessionIds], processIds: scope.processIds,
-              processStreams: scope.failures.length ? 'incomplete' : 'captured', nativeStore: 'external',
-            }) + '\n')
-            for (let offset = 0; offset < bytes.length;) {
-              const written = writeSync(fd, bytes, offset, bytes.length - offset)
-              if (written <= 0) throw new Error('Raw manifest write made no progress')
-              offset += written
-            }
-            fsyncSync(fd)
-          } finally { closeSync(fd) }
-        }
-        const errors = [sourceError, cleanupError, ...scope.failures].filter(error => error !== undefined)
+        try {
+          if (scope.processIds.length) {
+            const name = createHash('sha256').update(JSON.stringify(scope.identity)).digest('hex') + '.json'
+            const fd = openSync(join(scope.root, name), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600)
+            try {
+              const bytes = Buffer.from(JSON.stringify({ ...scope.identity, backend: scope.backend,
+                nativeSessionIds: [...scope.nativeSessionIds], processIds: scope.processIds,
+                processStreams: scope.failures.length ? 'incomplete' : 'captured', nativeStore: 'external',
+              }) + '\n')
+              for (let offset = 0; offset < bytes.length;) {
+                const written = writeSync(fd, bytes, offset, bytes.length - offset)
+                if (written <= 0) throw new Error('Raw manifest write made no progress')
+                offset += written
+              }
+              fsyncSync(fd)
+            } finally { closeSync(fd) }
+          }
+        } catch (error) { sourceErrors.push(error) }
+        const errors = [...sourceErrors, ...scope.failures]
         if (errors.length === 1) throw errors[0]
         if (errors.length) throw new AggregateError(errors, 'Source execution, cleanup, or original process capture failed')
       }
