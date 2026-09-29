@@ -24,7 +24,8 @@
  *   per-request `execution.acquireTimeoutMs`.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process'
+import { type ChildProcess } from 'node:child_process'
+import { spawnCaptured as spawn } from './raw-capture.js'
 import { LINEAGE_ENV_KEYS, withLineageEnv } from '../trace/lineage.js'
 import { applyJail } from './jail-support.js'
 import { killTree, processGroupExists, retryCleanupUntilSuccessful } from './process-tree.js'

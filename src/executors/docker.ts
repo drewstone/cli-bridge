@@ -14,6 +14,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { spawnCaptured } from './raw-capture.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, relative, sep } from 'node:path'
 import { promisify } from 'node:util'
@@ -174,7 +175,7 @@ export function createDockerSpawner(opts: DockerSpawnerOptions): Spawner {
         { ...spawnOpts, ...(cwd ? { cwd } : {}) },
         opts.binPrefixInContainer,
       )
-      const child = (opts.spawnProcess ?? spawn)('docker', dockerArgs, {
+      const child = (opts.spawnProcess ?? spawnCaptured)('docker', dockerArgs, {
         signal: spawnOpts.signal,
         stdio: spawnOpts.stdio ?? ['ignore', 'pipe', 'pipe'],
       })

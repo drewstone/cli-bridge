@@ -411,6 +411,8 @@ export class ClaudeBackend implements Backend {
 
         if (msg.type === 'system' && (msg as ClaudeStreamInit).subtype === 'init') {
           internalSessionId = (msg as ClaudeStreamInit).session_id
+          // Retain the provider identity even when the process fails before its result.
+          yield { internal_session_id: internalSessionId }
           continue
         }
 
