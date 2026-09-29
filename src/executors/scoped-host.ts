@@ -49,7 +49,8 @@
  *   module load — cheap and definitive.
  */
 
-import { execFile, spawn } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { spawnCaptured as spawn } from './raw-capture.js'
 import { randomBytes } from 'node:crypto'
 import { writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'

@@ -1114,3 +1114,22 @@ See `deploy/README.md` for Hetzner box (Docker or systemd). Remote deploy requir
 ## License
 
 MIT
+
+
+### Original process evidence
+
+Set `BRIDGE_RAW_CAPTURE_DIR` to a private absolute directory to retain original stdout and stderr for one-shot durable runs.
+Use an enforced filesystem jail whose writable workspace cannot reach that directory.
+The shared host, scoped-host, and Docker process seam captures bytes before a harness parser decodes them.
+Each private frame records byte length, SHA-256, process ID, sequence, and timestamp.
+A protocol frame binds the process to the existing durable run coordinates.
+A terminal records the actual exit and capture errors.
+A separate manifest links those coordinates to native session IDs observed by the backend.
+Capture write failures fail the run; they never become successful capture receipts.
+
+These files can contain sensitive original output.
+The bridge does not expose them over HTTP or redact their bytes.
+Normalized event replay remains separate.
+Native CLI stores remain in their configured private homes and require independent retention with credential files excluded.
+The process manifest does not claim native-store completeness, trusted image identity, or coverage of native subprocess stores.
+Retained native-session API jobs do not yet enter this one-shot capture scope.
