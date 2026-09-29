@@ -1031,7 +1031,7 @@ describe('ClaudeBackend with injected spawner', () => {
     expect(failure).toMatchObject({ code: 'upstream' })
     expect((failure as Error).message).toContain('Monthly spend limit reached. Try again at 1:40 PM.')
     expect((failure as Error).message).not.toMatch(/[\n\u0000]/u)
-    expect(deltas).toEqual([])
+    expect(deltas).toEqual([{ internal_session_id: 'rate-limited-session' }])
     expect(stubSpawner.releaseCalls).toBe(1)
   })
 
