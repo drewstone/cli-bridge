@@ -1,3 +1,4 @@
+import type { DurableRunWriter } from '../sessions/durable-writer.js'
 /**
  * POST /v1/chat/completions — OpenAI-compatible.
  *
@@ -379,6 +380,7 @@ export function mountChatCompletions(
   deps: {
     registry: BackendRegistry
     sessions: SessionStore
+    durableWriter?: Pick<DurableRunWriter, 'commit'>
     retainedRuns?: Pick<SessionStore, 'getRetainedRun' | 'claimRetainedRun' | 'updateRetainedRun' | 'appendRetainedDelta' | 'retainedEventsAfterRun'>
     runs: RunRegistry
     admission?: AdmissionGate
@@ -778,9 +780,15 @@ export function mountChatCompletions(
         executionId: runExecutionId,
         ...(deps.retainedRuns ? {
           commitDelta: (input) => {
+            if (deps.durableWriter) return deps.durableWriter.commit({
+              method: 'appendRetainedDelta', args: [runSessionId, input],
+            })
             deps.retainedRuns!.appendRetainedDelta(runSessionId, input)
           },
           commitSnapshot: (snapshot) => {
+            if (deps.durableWriter) return deps.durableWriter.commit({
+              method: 'updateRetainedRun', args: [runId, requestDigest, snapshot],
+            })
             deps.retainedRuns!.updateRetainedRun(runId, requestDigest, snapshot)
           },
         } : {}),

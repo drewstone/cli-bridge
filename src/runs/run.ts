@@ -50,6 +50,7 @@ export class Run {
   private readonly ac = new AbortController()
   /** The one pump promise; its presence prevents duplicate backend consumption. */
   private settled?: Promise<void>
+  private finishing?: Promise<void>
   /** Typed failure raised before the backend produced any output. */
   private setupError: unknown
   /**
@@ -81,7 +82,7 @@ export class Run {
       retention,
       isClosed: () => this.isTerminal() || this.disposed,
       onIdentityExpired: () => onForget(id, this),
-      ...(commitSnapshot ? { onDeltaCommitted: () => this.persistSnapshot(false) } : {}),
+      ...(commitSnapshot ? { onDeltaCommitted: (checkpoint) => this.commitSnapshot!({ ...this.snapshot(), ...checkpoint }) } : {}),
       ...(commitDelta ? { commitDelta } : {}),
       ...(commitCanonicalEvent ? { commitCanonicalEvent } : {}),
       onCommitFailure: (error) => this.canonical.markDurabilityUnknown(error),
@@ -127,7 +128,7 @@ export class Run {
         }),
     })
     if (retention.maxLifetimeMs > 0) {
-      this.lifetimeTimer = setTimeout(() => this.expireLifetime(), retention.maxLifetimeMs)
+      this.lifetimeTimer = setTimeout(() => { void this.expireLifetime() }, retention.maxLifetimeMs)
       this.lifetimeTimer.unref?.()
     }
   }
@@ -207,7 +208,7 @@ export class Run {
 
   /** Claim one interaction so distinct operation ids cannot answer it twice. */
   claimInteraction(id: string): PendingRunInteraction | null {
-    if (this.isTerminal()) return null
+    if (this.isTerminal() || this.finishing) return null
     return this.interactions.claim(id)
   }
 
@@ -268,8 +269,7 @@ export class Run {
 
   failCanonicalSetup(error: unknown): void {
     if (this.settled || this.isTerminal()) return
-    this.canonical.failSetup(error)
-    this.settled = Promise.resolve()
+    this.settled = this.canonical.failSetup(error)
   }
 
   /** Consume one delta source to a terminal status, exactly once. */
@@ -285,8 +285,7 @@ export class Run {
   /** Commit a claimed run whose admission/backend setup failed before `pump()`. */
   failSetup(error: unknown): void {
     if (this.settled || this.isTerminal()) return
-    this.deltas.failSetup(error)
-    this.settled = Promise.resolve()
+    this.settled = this.deltas.failSetup(error)
   }
 
   isCancelling(): boolean {
@@ -351,7 +350,7 @@ export class Run {
 
   /** Signal cancellation once. Terminal proof comes later from `pump()`. */
   cancel(): boolean {
-    if (this.isTerminal() || this.cancelRequestedAt !== null) return false
+    if (this.isTerminal() || this.finishing || this.cancelRequestedAt !== null) return false
     if (this.native.current()) {
       if (this.nativeCancellationRequest) return false
       void this.requestNativeCancellation().catch((error) => {
@@ -382,7 +381,7 @@ export class Run {
     if (!native) return Promise.resolve(this.cancel())
 
     const request = this.native.lane(async (): Promise<boolean> => {
-      if (this.isTerminal() || this.cancelRequestedAt !== null || !this.native.owns(native)) {
+      if (this.isTerminal() || this.finishing || this.cancelRequestedAt !== null || !this.native.owns(native)) {
         return false
       }
       const finalization = Promise.resolve().then(() => this.native.finalizeControl(native, true))
@@ -435,49 +434,58 @@ export class Run {
     return cleanup
   }
 
-  private finish(status: Exclude<RunStatus, 'running'>): void {
+  private finish(status: Exclude<RunStatus, 'running'>): Promise<void> {
+    if (this.finishing) return this.finishing
+    this.finishing = this.commitTerminal(status)
+    return this.finishing
+  }
+
+  private async commitTerminal(status: Exclude<RunStatus, 'running'>): Promise<void> {
+    this.log.seal()
+    await this.log.flush()
     if (this.isTerminal() || this.disposed) return
-    // An interaction cannot remain answerable after its owning run reaches any
-    // terminal outcome, including a provider that ends without resolving its
-    // last dialog.  This also prevents a late response from reaching a native
-    // session after the canonical stream has already closed.
     try {
       this.cancelOutstandingInteractions(status === 'cancelled' ? 'run cancelled' : 'run ended')
     } catch (error) {
       this.canonical.markDurabilityUnknown(error)
     }
-    this.status = this.canonical.durabilityUnknown() ? 'unknown' : status
-    this.endedAt = Date.now()
-    if (this.lifetimeTimer) {
-      clearTimeout(this.lifetimeTimer)
-      this.lifetimeTimer = null
-    }
-    if (this.status !== 'done')
-      void this.native.finalize(false).catch((error) => {
-        console.error(`[cli-bridge] run ${this.id} finalization proof failed:`, error)
-      })
-    this.log.scheduleRetention(this.endedAt)
-    this.persistSnapshot(true)
-  }
-
-  private persistSnapshot(terminal: boolean): void {
-    if (!this.commitSnapshot) return
+    if (this.lifetimeTimer) clearTimeout(this.lifetimeTimer)
+    this.lifetimeTimer = null
+    const endedAt = Date.now()
+    let outcome: Exclude<RunStatus, 'running'> = this.canonical.durabilityUnknown()
+      ? 'unknown'
+      : this.failureError instanceof RunLifetimeExceededError ? 'error' : status
+    const terminalSnapshot = (): RunSnapshot => ({
+      ...this.snapshot(),
+      status: outcome,
+      state: 'terminal',
+      terminal: true,
+      endedAt,
+      lifetimeExpiresAt: null,
+      replay: { ...this.log.replayWindow(), expiresAt: endedAt + this.retention.replayRetentionMs },
+      identityExpiresAt: endedAt + this.retention.identityRetentionMs,
+    })
     try {
-      this.commitSnapshot(this.snapshot())
+      await this.commitSnapshot?.(terminalSnapshot())
     } catch (error) {
       this.failureError ??= error
       this.canonical.markDurabilityUnknown(error)
-      if (!terminal) throw error
-      this.status = 'unknown'
-      try {
-        this.commitSnapshot(this.snapshot())
-      } catch {
-        // The admission remains at its last durable snapshot.
+      outcome = 'unknown'
+      try { await this.commitSnapshot?.(terminalSnapshot()) } catch {
+        // The durable admission remains at its last acknowledged checkpoint.
       }
     }
+    if (this.disposed) return
+    this.status = outcome
+    this.endedAt = endedAt
+    if (outcome !== 'done' && !this.nativeCancellationRequest) void this.native.finalize(false).catch((error) => {
+      console.error(`[cli-bridge] run ${this.id} finalization proof failed:`, error)
+    })
+    this.log.scheduleRetention(endedAt)
+    this.log.wakeAll()
   }
 
-  private expireLifetime(): void {
+  private async expireLifetime(): Promise<void> {
     this.lifetimeTimer = null
     if (this.isTerminal() || this.disposed) return
     const error = new RunLifetimeExceededError(this.id, this.retention.maxLifetimeMs)
@@ -489,8 +497,12 @@ export class Run {
     } catch (failure) {
       this.canonical.markDurabilityUnknown(failure)
     }
-    this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
-    this.finish('error')
+    try {
+      await this.log.append({ finish_reason: 'error', error: describeRunFailure(error) })
+    } catch (failure) {
+      this.canonical.markDurabilityUnknown(failure)
+    }
+    await this.finish('error')
     console.error(`[cli-bridge] ${error.message}`)
   }
 

@@ -21,7 +21,7 @@ export interface CanonicalStreamHost {
   recordFailure(error: unknown): void
   /** Replace the recorded failure; a setup failure supersedes an earlier one. */
   setFailure(error: unknown): void
-  finish(status: Exclude<RunStatus, 'running'>): void
+  finish(status: Exclude<RunStatus, 'running'>): Promise<void>
 }
 
 export class CanonicalRunStream {
@@ -85,7 +85,7 @@ export class CanonicalRunStream {
         terminal = 'error'
         this.append({ event: { type: 'status', status: 'failed', detail: error.message } })
       }
-      this.host.finish(terminal)
+      await this.host.finish(terminal)
     } catch (error) {
       this.host.recordFailure(error)
       // Once a commit has failed, a later terminal event cannot repair the
@@ -114,12 +114,12 @@ export class CanonicalRunStream {
           }
         }
       }
-      this.host.finish(this.durabilityFailed ? 'unknown' : this.host.signal.aborted ? 'cancelled' : 'error')
+      await this.host.finish(this.durabilityFailed ? 'unknown' : this.host.signal.aborted ? 'cancelled' : 'error')
     }
   }
 
   /** Commit a claimed run whose setup failed before the source existed. */
-  failSetup(error: unknown): void {
+  async failSetup(error: unknown): Promise<void> {
     this.host.setFailure(error)
     const cancelled = this.host.signal.aborted
     try {
@@ -134,6 +134,6 @@ export class CanonicalRunStream {
       // A storage failure has no safe second persistence path; terminal state
       // still records that this run never became executable.
     }
-    this.host.finish(cancelled ? 'cancelled' : 'error')
+    await this.host.finish(cancelled ? 'cancelled' : 'error')
   }
 }

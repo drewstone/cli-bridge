@@ -1012,6 +1012,24 @@ export class SessionStore implements RetainedInteractionPersistence {
     }
   }
 
+  /** Group streamed writes behind one FULL WAL commit, isolating invalid requests with savepoints. */
+  commitRetainedRunWrites(writes: readonly (
+    | { method: 'appendRetainedDelta'; args: Parameters<SessionStore['appendRetainedDelta']> }
+    | { method: 'updateRetainedRun'; args: Parameters<SessionStore['updateRetainedRun']> }
+  )[]): Array<{ error?: string }> {
+    return this.db.transaction(() => writes.map((write) => {
+      try {
+        this.db.transaction(() => {
+          if (write.method === 'appendRetainedDelta') this.appendRetainedDelta(...write.args)
+          else this.updateRetainedRun(...write.args)
+        })()
+        return {}
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : String(error) }
+      }
+    })).immediate()
+  }
+
   updateRetainedRun(
     runId: string,
     requestDigest: string,

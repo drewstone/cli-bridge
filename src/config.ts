@@ -20,6 +20,8 @@ export interface Config {
   port: number
   bearer: string | null
   dataDir: string
+  /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
+  asyncDurableWrites: boolean
   backends: Set<string>
   claudeBin: string
   claudeTimeoutMs: number
@@ -285,6 +287,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port,
     bearer,
     dataDir,
+    asyncDurableWrites: parseOnOff('BRIDGE_ASYNC_DURABLE_WRITES', env.BRIDGE_ASYNC_DURABLE_WRITES, false),
     backends,
     claudeBin: env.CLAUDE_BIN ?? 'claude',
     claudeTimeoutMs: parseExecutionTimeoutMs('CLAUDE_TIMEOUT_MS', env.CLAUDE_TIMEOUT_MS, defaultTimeout),
