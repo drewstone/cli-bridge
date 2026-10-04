@@ -373,6 +373,24 @@ describe('PrimeBackend', () => {
     expect(deltas.at(-1)).toEqual({ finish_reason: 'tool_calls' })
   })
 
+  it('relays an output-capped turn as finish_reason length', async () => {
+    // stopReason 'length' on the fork's turn_end message is the output-cap
+    // cut; hiding it behind 'stop' left callers repairing a truncated reply
+    // as if it were complete (reproduced against a live bridge serving
+    // traces' prime engine).
+    const stream = HAPPY_STREAM.map((ev) =>
+      ev.type === 'turn_end'
+        ? { ...ev, message: { ...(ev.message as object), stopReason: 'length' } }
+        : ev)
+    const backend = newBackend(primeSpawner(stream, []))
+    const deltas = await collect(backend.chat(
+      { model: 'prime/tangle/glm-5.2', messages: [{ role: 'user', content: 'TASK' }] },
+      null,
+      new AbortController().signal,
+    ))
+    expect(deltas.at(-1)).toEqual({ finish_reason: 'length' })
+  })
+
   it('fails loudly when the rpc prompt command is rejected', async () => {
     const backend = newBackend(primeSpawner([
       { id: 'bridge-get-state', type: 'response', command: 'get_state', success: true, data: { sessionId: 's' } },

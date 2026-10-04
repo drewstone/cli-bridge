@@ -233,6 +233,30 @@ describe('PiBackend turn retry (#125)', () => {
     expect(deltas.at(-1)?.finish_reason).toBe('stop')
   })
 
+  it('relays an output-capped turn as finish_reason length', async () => {
+    const stream = [
+      { type: 'agent_start' },
+      { type: 'turn_start' },
+      { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'cut' } },
+      {
+        type: 'turn_end',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'cut' }],
+          usage: { input: 10, output: 2 },
+          stopReason: 'length',
+        },
+      },
+      { type: 'agent_end' },
+    ]
+    const backend = newTestPiBackend({ bin: 'pi', timeoutMs: 1000, spawner: piSpawner(stream) })
+    const deltas = await collect(backend.chat({
+      model: 'pi/tangle-router/gpt-5-mini',
+      messages: [{ role: 'user', content: 'say hi' }],
+    }, null, new AbortController().signal))
+    expect(deltas.at(-1)?.finish_reason).toBe('length')
+  })
+
   it('retries a persistent first turn with the same reserved native session id', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-retry-session-cwd-'))
     const sourceSessionDir = mkdtempSync(join(tmpdir(), 'pi-retry-session-source-'))

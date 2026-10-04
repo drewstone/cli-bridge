@@ -736,6 +736,12 @@ export class PiBackend implements NativeSessionBackend {
       // Only the LAST turn decides, because pi auto-retries a transient failure and the
       // retry's turn_end supersedes it (`auto_retry_start`/`auto_retry_end`).
       let turnFailure: string | null = null
+      // Pi's AssistantMessage carries stopReason ('stop' | 'length' | 'toolUse' |
+      // ...); 'length' is the output-cap cut the CALLER needs to see — a
+      // repair turn that mistakes a cut for a complete reply re-runs into the
+      // same wall. piAssistantFailure reads stopReason for errors only, so
+      // length is captured here.
+      let lengthStop = false
       const usageCost: PiUsageCost = {
         receipts: 0,
         total: 0,
@@ -832,6 +838,7 @@ export class PiBackend implements NativeSessionBackend {
         // calls when the outer run is cancelled.
         if (type === 'turn_end') {
           turnFailure = piAssistantFailure(ev.message)
+          lengthStop = (ev.message as { stopReason?: unknown } | undefined)?.stopReason === 'length'
           const receipts = piUsageReceiptsFromEvent(ev)
           if (receipts.length > 0) sawTurnUsage = true
           for (const receipt of receipts) {
@@ -1033,7 +1040,7 @@ export class PiBackend implements NativeSessionBackend {
 
       yield {
         ...piResponseIdentityDelta(responseIdentity),
-        finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
+        finish_reason: emittedToolCall ? 'tool_calls' : (lengthStop ? 'length' : 'stop'),
       }
     } finally {
       signal.removeEventListener('abort', onAbort)

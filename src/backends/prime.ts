@@ -601,6 +601,12 @@ export class PrimeBackend implements Backend {
       // Only the LAST turn decides: the fork auto-retries transient provider
       // failures and the retry's turn_end supersedes the failed one.
       let turnFailure: string | null = null
+      // The fork's AssistantMessage carries stopReason ('stop' | 'length' |
+      // 'toolUse' | ...); 'length' is the output-cap cut the CALLER needs to
+      // see — a repair turn that mistakes a cut for a complete reply re-runs
+      // into the same wall. piAssistantFailure reads stopReason for errors
+      // only, so length is captured here.
+      let lengthStop = false
       let kernelDeadMarker: string | undefined
       const usageCost: PiUsageCost = { receipts: 0, total: 0, complete: true }
       const toolCalls = new PiToolCallTracker()
@@ -679,6 +685,7 @@ export class PrimeBackend implements Backend {
         // agent_end loses completed calls when the outer run is cancelled.
         if (type === 'turn_end') {
           turnFailure = piAssistantFailure(ev.message)
+          lengthStop = (ev.message as { stopReason?: unknown } | undefined)?.stopReason === 'length'
           const receipts = piUsageReceiptsFromEvent(ev)
           if (receipts.length > 0) sawTurnUsage = true
           for (const receipt of receipts) {
@@ -800,7 +807,7 @@ export class PrimeBackend implements Backend {
         throw new BackendError(`prime error: ${sawError}`, 'upstream')
       }
 
-      yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }
+      yield { finish_reason: emittedToolCall ? 'tool_calls' : (lengthStop ? 'length' : 'stop') }
     } finally {
       signal.removeEventListener('abort', onAbort)
       await terminateSpawned(spawned)
