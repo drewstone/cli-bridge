@@ -731,19 +731,60 @@ describe('PrimeBackend', () => {
     cleanupDirs.push(modelsDir)
     const modelsJsonPath = join(modelsDir, 'models.json')
     writeFileSync(modelsJsonPath, JSON.stringify({ providers: { tangle: { apiKey: 'K' } } }))
+    const previous = process.env.K
+    process.env.K = 'k-value'
     const captures: SpawnCapture[] = []
     const backend = newBackend(primeSpawner(HAPPY_STREAM, captures), { modelsJsonPath })
-    await collect(backend.chat(
-      { model: 'prime/tangle/glm-5.2', messages: [{ role: 'user', content: 'TASK' }], session_id: 'models-mode' },
-      null,
-      new AbortController().signal,
-    ))
+    try {
+      await collect(backend.chat(
+        { model: 'prime/tangle/glm-5.2', messages: [{ role: 'user', content: 'TASK' }], session_id: 'models-mode' },
+        null,
+        new AbortController().signal,
+      ))
+    } finally {
+      if (previous === undefined) delete process.env.K
+      else process.env.K = previous
+    }
     // The fork reloads models.json at model-resolution time, and this copy
     // holds the operator's real credential material.
     const materialized = join(captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!, 'models.json')
     expect(statSync(materialized).mode & 0o777).toBe(0o600)
     expect(readdirSync(join(captures[0]!.env.PRIME_AGENT_CODING_AGENT_DIR!))
       .filter((name) => name.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('fails closed when the requested provider names an unset apiKey env var', async () => {
+    // Prime resolves apiKey env-var first and LITERAL second, so the unset
+    // name would silently become the credential string — reproduced against a
+    // live bridge as an upstream `401 … Your api key: ****_KEY is invalid`.
+    const modelsDir = mkdtempSync(join(tmpdir(), 'prime-models-missing-'))
+    cleanupDirs.push(modelsDir)
+    const modelsJsonPath = join(modelsDir, 'models.json')
+    writeFileSync(modelsJsonPath, JSON.stringify({
+      providers: {
+        funded: { apiKey: 'PRIME_TEST_FUNDED_KEY' },
+        broke: { apiKey: 'PRIME_TEST_UNSET_KEY' },
+      },
+    }))
+    const previous = process.env.PRIME_TEST_FUNDED_KEY
+    process.env.PRIME_TEST_FUNDED_KEY = 'sk-set'
+    const captures: SpawnCapture[] = []
+    const backend = newBackend(primeSpawner(HAPPY_STREAM, captures), { modelsJsonPath })
+    try {
+      await expect(collect(backend.chat(
+        { model: 'prime/broke/glm-5.2', messages: [{ role: 'user', content: 'TASK' }] },
+        null,
+        new AbortController().signal,
+      ))).rejects.toMatchObject({
+        code: 'not_configured',
+        message: expect.stringContaining('apiKey env var PRIME_TEST_UNSET_KEY'),
+      })
+      // The refusal is provider-scoped and happens before any spawn.
+      expect(captures).toHaveLength(0)
+    } finally {
+      if (previous === undefined) delete process.env.PRIME_TEST_FUNDED_KEY
+      else process.env.PRIME_TEST_FUNDED_KEY = previous
+    }
   })
 
   it('fails a run whose IPython kernel died instead of reporting a generic turn failure', async () => {
@@ -1388,9 +1429,12 @@ describe('PrimeBackend startup failure diagnostics (cli-bridge#194)', () => {
     const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
     const projectDir = mkdtempSync(join(tmpdir(), 'prime-jail-project-'))
     cleanupDirs.push(projectDir)
+    const runCwd = mkdtempSync(join(tmpdir(), 'prime-jail-cwd-'))
+    cleanupDirs.push(runCwd)
     const jailSpec: JailSpec = { root: join(projectDir, '.agent-home'), projectDir, readConfine: true }
     await collect(backend.chat({
       ...TASK,
+      cwd: runCwd,
       messages: [{ role: 'system', content: 'Be terse.' }, { role: 'user', content: 'TASK' }],
       jailSpec,
     }, null, new AbortController().signal))
@@ -1407,6 +1451,12 @@ describe('PrimeBackend startup failure diagnostics (cli-bridge#194)', () => {
     // The prompt file is outside HOME; an fs-jail that cannot see it would
     // hand the fork the path string as the prompt.
     expect(capture.jail?.extraReadablePaths).toContain(dirname(appendPath))
+    // A jail confines the request cwd, it must not revoke it: fs-jail replaces
+    // the filesystem, so without registration the agent cannot even read the
+    // directory it was told to run in (a file-delivered trajectory lives there).
+    expect(capture.jail?.extraReadablePaths).toContain(runCwd)
+    expect(capture.jail?.extraWritablePaths).toContain(runCwd)
+    expect(capture.cwd).toBe(runCwd)
   })
 })
 
