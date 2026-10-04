@@ -225,6 +225,46 @@ export function primeApiKeyEnv(
   return out
 }
 
+/** The env-shaped `apiKey` name a models.json provider declares as its
+ *  credential source, undefined when the provider is absent or uses a literal
+ *  or command form. Same env-shape predicate as the materialize package's
+ *  `primeApiKeyEnvNames`, scoped to one provider so an unrelated provider's
+ *  missing key never blocks a run. */
+export function primeProviderApiKeyEnvName(
+  modelsConfig: Record<string, unknown>,
+  provider: string,
+): string | undefined {
+  const providers = (modelsConfig as { providers?: Record<string, unknown> }).providers
+  const block = providers?.[provider]
+  if (!block || typeof block !== 'object') return undefined
+  const apiKey = (block as { apiKey?: unknown }).apiKey
+  return typeof apiKey === 'string' && /^[A-Z_][A-Z0-9_]*$/.test(apiKey) ? apiKey : undefined
+}
+
+/** Fail closed on a run whose provider names an apiKey env var the bridge
+ *  environment does not set. Prime resolves apiKey env-var first and LITERAL
+ *  second, so the unset name would silently fly as the credential string —
+ *  the provider answers `401 … Your api key: ****_KEY is invalid` and the
+ *  operator learns about a bridge-env gap from a confused upstream error
+ *  instead of a config error that names it. */
+export function assertPrimeProviderApiKeyForwarded(
+  modelsConfig: Record<string, unknown>,
+  provider: string,
+  env: NodeJS.ProcessEnv,
+  source: string,
+): void {
+  const name = primeProviderApiKeyEnvName(modelsConfig, provider)
+  if (name === undefined) return
+  const value = env[name]
+  if (typeof value === 'string' && value.length > 0) return
+  throw new BackendError(
+    `models.json (${source}) provider '${provider}' names apiKey env var ${name}, but it is not set in the `
+      + 'bridge environment; prime would send the variable NAME as the literal credential. '
+      + `Set ${name} for the bridge process or rotate the models.json entry.`,
+    'not_configured',
+  )
+}
+
 /**
  * One authority per run. The harness pin and the model agreement are both
  * enforced by the shared lowering, so this backend only renders the refusal in
@@ -400,7 +440,7 @@ export class PrimeBackend implements Backend {
     )
     if (thinking) args.push('--thinking', thinking)
 
-    const home = this.provisionHome(req.session_id)
+    const home = this.provisionHome(req.session_id, spec.provider)
     // The shared lowering writes the profile's prompt files and skills into
     // this run's prompt dir, its instructions and subagent roster into the
     // agent dir, and returns the flags that bind them. The prune runs even when
@@ -477,15 +517,23 @@ export class PrimeBackend implements Backend {
       // The prompt dir carries --append-system-prompt and profile files; an
       // fs-jail that cannot see the path makes the fork take it as literal
       // prompt text (resource-loader.ts resolves a path only when it exists).
+      //
+      // The request cwd is where the caller asked the agent to RUN; a jail
+      // confines it, it must not silently revoke it. An fs-jail without the
+      // cwd registered cannot even read the working directory — a
+      // file-delivered trajectory (traces' prime engine passes cwd with
+      // trajectory.otlp.jsonl inside) would vanish for the agent.
       req.jailSpec.extraWritablePaths = [
         ...new Set([
           ...(req.jailSpec.extraWritablePaths ?? []),
           home.home,
           home.sessionArtifactDir,
           home.socketDir,
+          ...(runCwd ? [runCwd] : []),
         ]),
       ]
       registerJailReadable(req.jailSpec, home.promptDir)
+      if (runCwd) registerJailReadable(req.jailSpec, runCwd)
     }
 
     let spawned: Awaited<ReturnType<Spawner>>
@@ -767,7 +815,7 @@ export class PrimeBackend implements Backend {
    * otherwise. The daemon socket lives in its own short tmp dir in both cases
    * because AF_UNIX socket paths cap near 104 bytes and stateDir may be deep.
    */
-  private provisionHome(sessionId: string | undefined): ProvisionedPrimeHome {
+  private provisionHome(sessionId: string | undefined, provider: string | undefined): ProvisionedPrimeHome {
     mkdirSync(this.opts.stateDir, { recursive: true })
     const ephemeral = sessionId === undefined
     const base = ephemeral
@@ -794,6 +842,9 @@ export class PrimeBackend implements Backend {
       // file carries the operator's real credentials.
       writePrimeAgentFile(join(agentDir, 'models.json'), text)
       apiKeyEnv = primeApiKeyEnv(parsed, process.env)
+      if (provider !== undefined) {
+        assertPrimeProviderApiKeyForwarded(parsed, provider, process.env, this.opts.modelsJsonPath)
+      }
     } else if (this.opts.persistentAgentDir) {
       // The operator dir's own models.json names the env vars its apiKeys
       // resolve from; forward exactly those, because prime resolves an apiKey
@@ -804,7 +855,11 @@ export class PrimeBackend implements Backend {
       const operatorModels = join(this.opts.persistentAgentDir, 'models.json')
       if (existsSync(operatorModels)) {
         const text = readFileSync(operatorModels, 'utf8')
-        apiKeyEnv = primeApiKeyEnv(parsePrimeModelsJson(text, operatorModels), process.env)
+        const parsed = parsePrimeModelsJson(text, operatorModels)
+        apiKeyEnv = primeApiKeyEnv(parsed, process.env)
+        if (provider !== undefined) {
+          assertPrimeProviderApiKeyForwarded(parsed, provider, process.env, operatorModels)
+        }
       }
     }
 
