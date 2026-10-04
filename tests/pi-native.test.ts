@@ -37,6 +37,10 @@ for line in sys.stdin:
     message = json.loads(line)
     kind = message.get("type")
     if kind == "prompt":
+        if message.get("message") == "handled":
+            send({"type": "extension_ui_request", "id": "handled-notification", "method": "notify", "message": "handled input"})
+            send({"id": message.get("id"), "type": "response", "command": "prompt", "success": True, "data": {"disposition": "handled"}})
+            continue
         turns += 1
         send({"id": message.get("id"), "type": "response", "command": "prompt", "success": True})
         send({"type": "session", "id": session_id})
@@ -326,7 +330,7 @@ describe('Pi native RPC adapter', () => {
     expect(privateRootCount(dir)).toBe(0)
   })
 
-  it('uses a real JSONL child for two HTTP turns, state proof, and canonical replay', async () => {
+  it.each([undefined, 'started', 'queued'])('uses a real JSONL child for two HTTP turns with disposition %s, state proof, and canonical replay', async (disposition) => {
     dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-`)
     store = new SessionStore(dir)
     runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
@@ -335,7 +339,9 @@ describe('Pi native RPC adapter', () => {
     const backend = new PiBackend({
       bin: 'pi',
       timeoutMs: 10_000,
-      spawner: makeChildSpawner(calls, lifecycle),
+      spawner: makeChildSpawner(calls, lifecycle, disposition
+        ? rpcChild.replace('"success": True})', `"success": True, "data": {"disposition": "${disposition}"}})`)
+        : rpcChild),
       transportResolver: testPiInferenceTransport(),
     })
     const registry = new BackendRegistry().register(backend)
@@ -403,6 +409,48 @@ describe('Pi native RPC adapter', () => {
     await runs.shutdown(1_000)
     expect(lifecycle.releases).toBe(1)
     expect(lifecycle.terminations).toBe(1)
+  })
+
+  it('completes a handled HTTP turn without settlement and keeps its events out of the next turn', async () => {
+    dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-handled-`)
+    store = new SessionStore(dir)
+    runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
+    const calls: Array<{ bin: string; args: string[] }> = []
+    const backend = new PiBackend({
+      bin: 'pi',
+      timeoutMs: 0,
+      spawner: makeChildSpawner(calls),
+      transportResolver: testPiInferenceTransport(),
+    })
+    const app = new Hono()
+    mountRetainedSessions(app, new RetainedSessionService({
+      store, registry: new BackendRegistry().register(backend), runs,
+    }))
+    expect((await app.request('/v1/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ id: 'handled-session', model: 'pi/test/model', cwd: dir }),
+    })).status).toBe(201)
+    for (const [index, message] of ['handled', 'normal'].entries()) {
+      expect((await app.request('/v1/sessions/handled-session/turns', {
+        method: 'POST',
+        body: JSON.stringify({ message, run_id: `handled-${index}`, execution_id: `handled-execution-${index}` }),
+      })).status).toBe(202)
+      await waitFor(() => store!.getRetained('handled-session')?.turns === index + 1)
+      expect(store!.getRetainedRun(`handled-${index}`)?.snapshot).toMatchObject({ status: 'done', terminal: true })
+    }
+    const byRun = (runId: string) => store!.retainedEventsAfter('handled-session')
+      .filter(item => item.envelope.runId === runId).map(item => item.envelope.event)
+    expect(byRun('handled-0')).toContainEqual(expect.objectContaining({
+      type: 'raw', event: expect.objectContaining({ type: 'extension_ui_request', message: 'handled input' }),
+    }))
+    expect(byRun('handled-0')).toContainEqual({ type: 'status', status: 'completed' })
+    expect(byRun('handled-0').some(event => event.type === 'message.part.updated')).toBe(false)
+    expect(byRun('handled-1')).not.toContainEqual(expect.objectContaining({
+      type: 'raw', event: expect.objectContaining({ type: 'extension_ui_request' }),
+    }))
+    const transcript = await readJson(await app.request('/v1/sessions/handled-session/transcript'))
+    expect(transcript.messages.flatMap((message: any) => message.parts.map((part: any) => part.text))).toEqual(['child-reply-1'])
+    expect(calls).toHaveLength(1)
   })
 
   it('keeps a retained child alive when the Pi RPC timeout is explicitly disabled', async () => {

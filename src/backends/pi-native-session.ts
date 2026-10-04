@@ -172,17 +172,20 @@ export class PiNativeSession implements NativeSession {
     }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
-      await this.request(
+      const response = await this.request(
         { id: requestId, type: 'prompt', message: prompt },
         { signal, timeoutMs: this.requestTimeoutMs },
       )
       while (!this.closed) {
         const event = await this.nextEvent(signal)
+        // A handled prompt starts no agent run. Its response is queued after
+        // any extension events it emitted, so those stay in this turn.
         if (event.type === 'session' && typeof event.id === 'string') this.providerSession = event.id
         yield event
+        if (event === response) return
         // `agent_end` closes one low-level model attempt and may be followed by
         // an automatic retry or compaction. `agent_settled` is Pi's documented
-        // session-level terminal boundary, so only it ends a retained turn.
+        // session-level terminal boundary for prompts that started a run.
         if (event.type === 'agent_settled') return
       }
       throw this.childError ?? new Error('pi native session ended before agent_settled')
@@ -386,7 +389,14 @@ export class PiNativeSession implements NativeSession {
         const waiter = this.pending.get(id)!
         this.pending.delete(id)
         if (message.success === false) waiter.reject(new Error(String(message.error ?? 'pi RPC command failed')))
-        else waiter.resolve(message as PiRpcResponse)
+        else {
+          if (message.command === 'prompt' && message.success === true && record(message.data)?.disposition === 'handled') {
+            // Pi's handled disposition is the terminal boundary when no
+            // agent_settled event will follow (Pi RPC run-lifecycle contract).
+            this.queue.push(message)
+          }
+          waiter.resolve(message as PiRpcResponse)
+        }
         continue
       }
       this.eventSequence += 1

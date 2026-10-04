@@ -218,7 +218,12 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
         yield { event: { type: 'raw', backend: backendName, event: raw } }
         continue
       }
-      if (type === 'agent_settled') {
+      // A successfully handled Pi prompt never starts an agent run and has
+      // no agent_settled event. Its response completes the admitted HTTP turn.
+      if (type === 'agent_settled' || (
+        type === 'response' && event.command === 'prompt' && event.success === true
+        && recordValue(event.data)?.disposition === 'handled'
+      )) {
         yield {
           event: {
             type: 'status',
