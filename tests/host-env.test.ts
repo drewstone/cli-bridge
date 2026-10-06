@@ -11,6 +11,11 @@ describe('sanitizeHostEnv PWD/cwd agreement', () => {
     expect(out?.PWD).toBe('/work/cell-1')
   })
 
+  it('turns off the host coding-agent memory hooks for every bridged harness', () => {
+    const out = sanitizeHostEnv({ HOME: '/home/x', PATH: '/bin' }, '/work/cell-3')
+    expect(out?.HINDSIGHT_DISABLE_HOOKS).toBe('1')
+  })
+
   it('sets PWD from cwd even when the parent env has none', () => {
     const out = sanitizeHostEnv({ HOME: '/home/x', PATH: '/bin' }, '/work/cell-2')
     expect(out?.PWD).toBe('/work/cell-2')

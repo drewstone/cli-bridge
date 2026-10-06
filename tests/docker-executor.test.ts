@@ -100,6 +100,7 @@ describe('hostSpawner', () => {
       OPENCODE_CONFIG: '/tmp/opencode.json',
       GEMINI_SYSTEM_MD: '1',
       GH_TOKEN: 'ghp_test',
+      HINDSIGHT_DISABLE_HOOKS: '1',
     })
   })
 
