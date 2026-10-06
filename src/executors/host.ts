@@ -334,6 +334,13 @@ export function sanitizeHostEnv(
   // request workspace, silently escaping every per-request cwd.
   if (cwd) out.PWD = cwd
 
+  // A bridged harness answers an API caller (a judge, a reviewer, a probe), not
+  // a person working in the bridge checkout. The host's coding-agent memory
+  // hooks would inject memory into every call and write every transcript into
+  // that checkout's memory bank: on 2026-10-06, 256 of the cli-bridge bank's
+  // 259 documents were trace-assess judge calls. The hooks honor this switch.
+  out.HINDSIGHT_DISABLE_HOOKS = '1'
+
   return out
 }
 
