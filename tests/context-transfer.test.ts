@@ -185,6 +185,21 @@ function withAllocation(
   })
 }
 
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((complete) => { resolve = complete })
+  return { promise, resolve: () => resolve() }
+}
+
+class BlockedReadyBackend extends ReadyBackend {
+  constructor(private readonly ready: Promise<void>, private readonly entered: () => void) { super() }
+  override async health(): Promise<BackendHealth> {
+    this.entered()
+    await this.ready
+    return super.health()
+  }
+}
+
 describe('portable context transfer', () => {
   it('accepts the exact portable profile through the public transfer route', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli-bridge-context-profile-'))
@@ -246,6 +261,34 @@ describe('portable context transfer', () => {
       })).toThrow(/destination does not match/)
     } finally {
       reopened.close()
+    }
+  })
+
+  it('replays one durable receipt across concurrent receiver instances', async () => {
+    const first = fixture()
+    const secondStore = new SessionStore(first.directory)
+    const firstReady = deferred()
+    const secondReady = deferred()
+    const firstEntered = deferred()
+    const secondEntered = deferred()
+    const receiver = (store: SessionStore, ready: ReturnType<typeof deferred>, entered: ReturnType<typeof deferred>) =>
+      new RetainedContextTransfers(store, new BackendRegistry().register(new BlockedReadyBackend(ready.promise, entered.resolve)), 1_000)
+    const request = unboundTransferRequest()
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    try {
+      const firstAdmission = receiver(first.store, firstReady, firstEntered).transfer(request, callerId)
+      const secondAdmission = receiver(secondStore, secondReady, secondEntered).transfer(request, callerId)
+      await Promise.all([firstEntered.promise, secondEntered.promise])
+      firstReady.resolve()
+      const accepted = await firstAdmission
+      if (accepted.status !== 'accepted') throw new Error('first transfer was not accepted')
+      secondReady.resolve()
+      await expect(secondAdmission).resolves.toEqual({ ...accepted, status: 'replayed' })
+    } finally {
+      firstReady.resolve()
+      secondReady.resolve()
+      secondStore.close()
+      first.store.close()
     }
   })
 
