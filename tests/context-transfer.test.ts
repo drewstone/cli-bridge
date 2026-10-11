@@ -166,20 +166,23 @@ describe('portable context transfer', () => {
     const material = { ...base, profile }
     const request = { ...material, requestDigest: contextTransferRequestDigest(material) }
 
-    const response = await app.request('/v1/context-transfers', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(request),
-    })
-    expect(response.status).toBe(200)
-    expect(await response.json()).toMatchObject({
-      status: 'accepted',
-      requestDigest: request.requestDigest,
-      environmentId: 'environment-destination',
-    })
-    await service.shutdown()
-    runs.dispose()
-    store.close()
+    try {
+      const response = await app.request('/v1/context-transfers', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      })
+      expect(response.status).toBe(200)
+      expect(await response.json()).toMatchObject({
+        status: 'accepted',
+        requestDigest: request.requestDigest,
+        environmentId: 'environment-destination',
+      })
+    } finally {
+      await runs.shutdown(1_000)
+      await service.shutdown(1_000)
+      store.close()
+    }
   })
 
   it('admits, replays, restarts, and consumes one exact fresh-session transfer', async () => {
