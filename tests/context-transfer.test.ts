@@ -275,9 +275,11 @@ describe('portable context transfer', () => {
       new RetainedContextTransfers(store, new BackendRegistry().register(new BlockedReadyBackend(ready.promise, entered.resolve)), 1_000)
     const request = unboundTransferRequest()
     const callerId = canonicalCandidateDigest('Bearer owner')
+    const pending: Promise<unknown>[] = []
     try {
       const firstAdmission = receiver(first.store, firstReady, firstEntered).transfer(request, callerId)
       const secondAdmission = receiver(secondStore, secondReady, secondEntered).transfer(request, callerId)
+      pending.push(firstAdmission, secondAdmission)
       await Promise.all([firstEntered.promise, secondEntered.promise])
       firstReady.resolve()
       const accepted = await firstAdmission
@@ -287,6 +289,7 @@ describe('portable context transfer', () => {
     } finally {
       firstReady.resolve()
       secondReady.resolve()
+      await Promise.allSettled(pending)
       secondStore.close()
       first.store.close()
     }
