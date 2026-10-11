@@ -153,6 +153,35 @@ function destination(request: ContextTransferRequest) {
 }
 
 describe('portable context transfer', () => {
+  it('accepts the exact portable profile through the public transfer route', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli-bridge-context-profile-'))
+    directories.push(directory)
+    const store = new SessionStore(directory)
+    const registry = new BackendRegistry().register(new ReadyBackend())
+    const runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
+    const service = new RetainedSessionService({ store, registry, runs, healthProbeTimeoutMs: 100 })
+    const app = new Hono()
+    mountRetainedSessions(app, service)
+    const { requestDigest: _digest, ...base } = transferRequest()
+    const material = { ...base, profile }
+    const request = { ...material, requestDigest: contextTransferRequestDigest(material) }
+
+    const response = await app.request('/v1/context-transfers', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      status: 'accepted',
+      requestDigest: request.requestDigest,
+      environmentId: 'environment-destination',
+    })
+    await service.shutdown()
+    runs.dispose()
+    store.close()
+  })
+
   it('admits, replays, restarts, and consumes one exact fresh-session transfer', async () => {
     const first = fixture()
     const request = transferRequest()
