@@ -284,6 +284,30 @@ Replay storage is explicitly bounded per process:
 A live run keeps its bounded replay buffer, registry entry, and execution slot until it ends or receives explicit cancellation.
 Set a positive `BRIDGE_RUN_MAX_LIFETIME_MS` only when the operator requires a hard process-lifetime policy.
 
+### Portable context transfer
+
+`POST /v1/context-transfers` accepts the canonical `ContextTransferRequest` from
+`@tangle-network/agent-interface`. The request digest binds its accepted plan,
+full inline profile, workspace, and allocation resources. The same operation and
+digest replay one receipt across restarts; changed input under that operation
+returns a conflict. Lookup is available through
+`GET /v1/context-transfers/:operationId?request_digest=…` and
+`GET /v1/context-transfer-environments/:environmentId` for the same authenticated caller.
+
+An unbound destination omits `plan.destination.environmentId` and supplies its
+exact profile. The bridge records a fresh local environment identity separately
+and returns it as `receipt.environmentId`, preserving the accepted destination
+unchanged. The subsequent one-shot or retained turn must use that environment,
+session, run, execution, model, and full profile. A declared
+`workspace.cwd` must use `base: "host"`; the turn must use the exact declared path.
+
+Local transfer currently supports an existing host workspace. It refuses cloud
+templates, images, repository cloning, checkpoint restoration, provider workspace
+options, and top-level allocation resources before recording a new admission.
+`profile.resources` continues through the normal profile materialization path.
+This transfers selected conversation context; it does not copy dirty or untracked
+workspace files into a fresh local directory.
+
 ### Memory
 
 `GET /health` reports `memory.heap_used_bytes`, `memory.heap_limit_bytes` and `memory.heap_used_pct`, plus `memory.runs_retained` and `memory.run_replay_bytes` for the run registry's own share.

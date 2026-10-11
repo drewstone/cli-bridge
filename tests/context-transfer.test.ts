@@ -49,7 +49,11 @@ class ReadyBackend implements Backend {
   }
 }
 
-const profile: AgentProfile = { name: 'destination', harness: 'codex' }
+const profile: AgentProfile = {
+  name: 'destination', harness: 'codex',
+  prompt: { instructions: ['Preserve the portable marker.'] },
+  resources: { instructions: 'Read the workspace before making changes.' },
+}
 
 function transferRequest(
   operationId = 'transfer-1',
@@ -143,13 +147,42 @@ function fixture(): {
 function destination(request: ContextTransferRequest) {
   return {
     provider: request.plan.destination.provider,
-    environmentId: request.plan.destination.environmentId,
+    environmentId: request.plan.destination.environmentId!,
     sessionId: request.plan.destination.sessionId,
     runId: request.plan.destination.runId,
     executionId: request.plan.destination.executionId,
     model: 'codex/gpt-5.6',
     profile,
   }
+}
+
+function unboundTransferRequest(operationId = 'transfer-unbound'): ContextTransferRequest {
+  const original = structuredClone(transferRequest(operationId))
+  Reflect.deleteProperty(original.plan.destination, 'environmentId')
+  const { digest: _digest, ...planMaterial } = original.plan
+  const plan = { ...planMaterial, digest: portableContextPlanDigest(planMaterial) }
+  const material = {
+    operationId,
+    plan,
+    acceptance: { ...original.acceptance, planDigest: plan.digest },
+    profile,
+  }
+  return ContextTransferRequestSchema.parse({
+    ...material,
+    requestDigest: contextTransferRequestDigest(material),
+  })
+}
+
+function withAllocation(
+  request: ContextTransferRequest,
+  allocation: Pick<ContextTransferRequest, 'workspace' | 'resources'>,
+): ContextTransferRequest {
+  const { requestDigest: _digest, ...base } = request
+  const material = { ...base, ...allocation }
+  return ContextTransferRequestSchema.parse({
+    ...material,
+    requestDigest: contextTransferRequestDigest(material),
+  })
 }
 
 describe('portable context transfer', () => {
@@ -182,6 +215,188 @@ describe('portable context transfer', () => {
       await runs.shutdown(1_000)
       await service.shutdown(1_000)
       store.close()
+    }
+  })
+
+  it('retains one allocated environment after an unbound admission and restart', async () => {
+    const first = fixture()
+    const request = unboundTransferRequest()
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    const accepted = await first.transfers.transfer(request, callerId)
+    if (accepted.status !== 'accepted') throw new Error('transfer was not accepted')
+    expect(accepted.destination).toEqual(request.plan.destination)
+    expect(accepted.destination.environmentId).toBeUndefined()
+    expect(accepted.environmentId).toMatch(/^[a-f0-9-]{36}$/u)
+    expect(accepted.environmentId).not.toBe(request.plan.source.source.environmentId)
+    expect(first.transfers.lookupByEnvironment(accepted.environmentId, callerId)).toMatchObject({
+      status: 'replayed', environmentId: accepted.environmentId,
+    })
+    first.store.close()
+    const reopened = new SessionStore(first.directory)
+    const restarted = new RetainedContextTransfers(reopened, new BackendRegistry().register(new ReadyBackend()), 100)
+    try {
+      await expect(restarted.transfer(request, callerId)).resolves.toMatchObject({
+        status: 'replayed', environmentId: accepted.environmentId,
+      })
+      expect(restarted.messagesForTurn(request, callerId, {
+        ...destination(request), environmentId: accepted.environmentId,
+      })).toHaveLength(2)
+      expect(() => restarted.messagesForTurn(request, callerId, {
+        ...destination(request), environmentId: 'unadmitted-environment',
+      })).toThrow(/destination does not match/)
+    } finally {
+      reopened.close()
+    }
+  })
+
+  it('rejects changed profile, workspace, and resource material under the same operation key', async () => {
+    const { store, transfers } = fixture()
+    const request = unboundTransferRequest()
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    try {
+      await transfers.transfer(request, callerId)
+      const changedProfile = { ...profile, name: 'different-profile' }
+      const { digest: _planDigest, ...planMaterial } = request.plan
+      const changedPlanMaterial = {
+        ...planMaterial,
+        destination: { ...planMaterial.destination, profileDigest: canonicalAgentProfileDigest(changedProfile) },
+      }
+      const changedPlan = { ...changedPlanMaterial, digest: portableContextPlanDigest(changedPlanMaterial) }
+      const { requestDigest: _digest, ...base } = request
+      const changedMaterial = {
+        ...base, profile: changedProfile, plan: changedPlan,
+        acceptance: { ...request.acceptance, planDigest: changedPlan.digest },
+      }
+      const changedRequests = [
+        ContextTransferRequestSchema.parse({ ...changedMaterial, requestDigest: contextTransferRequestDigest(changedMaterial) }),
+        withAllocation(request, { workspace: { cwd: { base: 'host', path: '/tmp/changed-portable-return' } } }),
+        withAllocation(request, { resources: { cpu: 2 } }),
+      ]
+      for (const changed of changedRequests) {
+        await expect(transfers.transfer(changed, callerId)).resolves.toMatchObject({
+          status: 'conflict', existingRequestDigest: request.requestDigest,
+        })
+      }
+    } finally {
+      store.close()
+    }
+  })
+
+  it('requires the exact declared host cwd when consuming admitted context', async () => {
+    const { store, transfers } = fixture()
+    const request = withAllocation(unboundTransferRequest(), {
+      workspace: { cwd: { base: 'host', path: '/tmp/portable-return' } },
+    })
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    try {
+      const receipt = await transfers.transfer(request, callerId)
+      if (receipt.status !== 'accepted') throw new Error('transfer was not accepted')
+      const actual = { ...destination(request), environmentId: receipt.environmentId, cwd: '/tmp/portable-return' }
+      expect(transfers.messagesForTurn(request, callerId, actual)).toHaveLength(2)
+      expect(() => transfers.messagesForTurn(request, callerId, { ...actual, cwd: '/tmp/other-return' })).toThrow(/destination does not match/)
+      expect(() => transfers.messagesForTurn(request, callerId, { ...actual, cwd: undefined })).toThrow(/destination does not match/)
+      expect(() => transfers.messagesForTurn(request, callerId, { ...actual, executionKind: 'sandbox' })).toThrow(/destination does not match/)
+    } finally {
+      store.close()
+    }
+  })
+
+  it.each([
+    { workspace: { environment: 'cloud-template' } },
+    { workspace: { image: 'cloud-image' } },
+    { workspace: { repoUrl: 'https://example.com/repository.git', gitRef: 'main' } },
+    { workspace: { providerOptions: { size: 'large' } } },
+    { workspace: { cwd: { base: 'repository' as const, path: 'src' } } },
+    { workspace: { checkpoint: {
+      checkpointId: 'checkpoint-cloud', provider: 'tangle',
+      source: { provider: 'tangle', environmentId: 'cloud-source', sessionId: 'source-session', runId: 'source-run', executionId: 'source-execution', requestDigest: `sha256:${'b'.repeat(64)}` as const },
+      idempotencyKey: 'checkpoint-operation', requestDigest: `sha256:${'c'.repeat(64)}` as const,
+      createdAt: '2026-08-01T20:00:00.000Z',
+    } } },
+    { resources: { cpu: 2 } },
+  ])('refuses unsupported local allocation before durable admission: %j', async (allocation) => {
+    const { store, transfers } = fixture()
+    const request = withAllocation(unboundTransferRequest(), allocation)
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    try {
+      await expect(transfers.transfer(request, callerId)).rejects.toMatchObject({ status: 400, code: 'capability_denied' })
+      expect(transfers.lookup(request.operationId, request.requestDigest, callerId)).toBeNull()
+    } finally {
+      store.close()
+    }
+  })
+
+  it('reads legacy stored destination bindings after restart', async () => {
+    const source = fixture()
+    const request = transferRequest()
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    const receipt = await source.transfers.transfer(request, callerId)
+    if (receipt.status !== 'accepted') throw new Error('transfer was not accepted')
+    source.store.close()
+    const legacy = fixture()
+    legacy.store.recordRetainedControlOperation({
+      operationId: request.operationId,
+      callerId,
+      kind: 'context_transfer',
+      runId: request.plan.destination.runId,
+      sessionId: request.plan.destination.sessionId,
+      requestDigest: request.requestDigest,
+      acknowledgement: {
+        status: 'accepted',
+        binding: {
+          operationId: request.operationId,
+          requestDigest: request.requestDigest,
+          planDigest: request.plan.digest,
+          contextDigest: request.plan.context.digest,
+          destination: request.plan.destination,
+        },
+        receipt,
+      },
+    })
+    legacy.store.close()
+    const reopened = new SessionStore(legacy.directory)
+    const restarted = new RetainedContextTransfers(reopened, new BackendRegistry().register(new ReadyBackend()), 100)
+    try {
+      expect(restarted.lookupByEnvironment(receipt.environmentId, callerId)).toMatchObject({
+        status: 'replayed', environmentId: receipt.environmentId,
+      })
+      await expect(restarted.transfer(request, callerId)).resolves.toMatchObject({ status: 'replayed' })
+      expect(restarted.messagesForTurn(request, callerId, destination(request))).toHaveLength(2)
+    } finally {
+      reopened.close()
+    }
+  })
+
+  it('resumes a pending admission with its recorded environment after restart', async () => {
+    const first = fixture()
+    const request = unboundTransferRequest()
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    const recordedEnvironmentId = 'environment-allocated-before-restart'
+    first.store.recordRetainedControlOperation({
+      operationId: request.operationId, callerId, kind: 'context_transfer',
+      runId: request.plan.destination.runId, sessionId: request.plan.destination.sessionId,
+      requestDigest: request.requestDigest,
+      acknowledgement: {
+        status: 'pending',
+        binding: {
+          operationId: request.operationId, requestDigest: request.requestDigest,
+          planDigest: request.plan.digest, contextDigest: request.plan.context.digest,
+          environmentId: recordedEnvironmentId, destination: request.plan.destination,
+        },
+      },
+    })
+    first.store.close()
+    const reopened = new SessionStore(first.directory)
+    const restarted = new RetainedContextTransfers(reopened, new BackendRegistry().register(new ReadyBackend()), 100)
+    try {
+      await expect(restarted.transfer(request, callerId)).resolves.toMatchObject({
+        status: 'accepted', environmentId: recordedEnvironmentId, destination: request.plan.destination,
+      })
+      expect(restarted.lookupByEnvironment(recordedEnvironmentId, callerId)).toMatchObject({
+        status: 'replayed', environmentId: recordedEnvironmentId,
+      })
+    } finally {
+      reopened.close()
     }
   })
 
@@ -263,7 +478,7 @@ describe('portable context transfer', () => {
     store.close()
   })
 
-  it('prepends admitted context to the real one-shot backend request', async () => {
+  it('checks the allocated environment and cwd before the public one-shot backend request', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli-bridge-context-route-'))
     directories.push(directory)
     const store = new SessionStore(directory)
@@ -280,7 +495,9 @@ describe('portable context transfer', () => {
       runs,
       contextTransfers: service,
     })
-    const request = transferRequest()
+    const request = withAllocation(unboundTransferRequest(), {
+      workspace: { cwd: { base: 'host', path: '/tmp/portable-return' } },
+    })
     const authorization = 'Bearer owner'
     const transferResponse = await app.request('/v1/context-transfers', {
       method: 'POST',
@@ -288,28 +505,45 @@ describe('portable context transfer', () => {
       body: JSON.stringify(request),
     })
     expect(transferResponse.status).toBe(200)
-    await expect(transferResponse.json()).resolves.toMatchObject({ status: 'accepted' })
+    const receipt = await transferResponse.json() as { status: string, environmentId: string }
+    expect(receipt.status).toBe('accepted')
+
+    const body = {
+      model: 'codex/gpt-5.6',
+      messages: [{ role: 'user', content: 'use the transferred marker' }],
+      agent_profile: profile,
+      context_transfer: request,
+      provider: request.plan.destination.provider,
+      environment_id: receipt.environmentId,
+      session_id: request.plan.destination.sessionId,
+      run_id: request.plan.destination.runId,
+      execution_id: request.plan.destination.executionId,
+      cwd: '/tmp/portable-return',
+    }
+    for (const invalid of [
+      { ...body, cwd: '/tmp/other-return' },
+      { ...body, environment_id: 'unadmitted-environment' },
+    ]) {
+      const rejected = await app.request('/v1/chat/completions', {
+        method: 'POST', headers: { authorization, 'content-type': 'application/json' },
+        body: JSON.stringify(invalid),
+      })
+      expect(rejected.status).toBe(409)
+      expect(backend.requests).toHaveLength(0)
+    }
 
     const response = await app.request('/v1/chat/completions', {
       method: 'POST',
       headers: { authorization, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'codex/gpt-5.6',
-        messages: [{ role: 'user', content: 'use the transferred marker' }],
-        agent_profile: profile,
-        context_transfer: request,
-        provider: request.plan.destination.provider,
-        environment_id: request.plan.destination.environmentId,
-        session_id: request.plan.destination.sessionId,
-        run_id: request.plan.destination.runId,
-        execution_id: request.plan.destination.executionId,
-      }),
+      body: JSON.stringify(body),
     })
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({
       choices: [{ message: { content: 'ok' } }],
     })
     expect(backend.requests).toHaveLength(1)
+    expect(backend.requests[0]?.cwd).toBe('/tmp/portable-return')
+    expect(backend.requests[0]?.agent_profile).toEqual(profile)
     expect(backend.requests[0]?.messages).toEqual([
       { role: 'user', content: [{ type: 'text', text: 'portable marker 74f2' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'source acknowledgement' }] },

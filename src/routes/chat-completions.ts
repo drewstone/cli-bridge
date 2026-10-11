@@ -707,6 +707,8 @@ export function mountChatCompletions(
             executionId: exactCoordinates.value.executionId,
             model: req.model,
             profile: profile ?? undefined,
+            ...(req.cwd ? { cwd: req.cwd } : {}),
+            executionKind: req.execution?.kind === 'sandbox' ? 'sandbox' : 'host',
           },
         )
         req.messages = [...messages, ...req.messages]

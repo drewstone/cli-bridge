@@ -98,4 +98,6 @@ export interface RetainedContextTransferDestination {
   executionId: string
   model: string
   profile: AgentProfile | undefined
+  cwd?: string
+  executionKind?: 'host' | 'sandbox'
 }

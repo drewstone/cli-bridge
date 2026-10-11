@@ -1228,7 +1228,10 @@ export class SessionStore implements RetainedInteractionPersistence {
          WHERE kind = 'context_transfer'
            AND (
              run_id = ? OR session_id = ?
-             OR json_extract(acknowledgement_json, '$.binding.destination.environmentId') = ?
+             OR COALESCE(
+               json_extract(acknowledgement_json, '$.binding.environmentId'),
+               json_extract(acknowledgement_json, '$.binding.destination.environmentId')
+             ) = ?
              OR json_extract(acknowledgement_json, '$.binding.destination.executionId') = ?
            )
          ORDER BY created_at ASC
@@ -1284,7 +1287,10 @@ export class SessionStore implements RetainedInteractionPersistence {
     const row = this.db.prepare(
       `SELECT * FROM retained_control_operations
        WHERE kind = 'context_transfer'
-         AND json_extract(acknowledgement_json, '$.binding.destination.environmentId') = ?
+         AND COALESCE(
+           json_extract(acknowledgement_json, '$.binding.environmentId'),
+           json_extract(acknowledgement_json, '$.binding.destination.environmentId')
+         ) = ?
        ORDER BY created_at DESC
        LIMIT 1`,
     ).get(environmentId) as Record<string, unknown> | undefined

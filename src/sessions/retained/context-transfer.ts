@@ -1,5 +1,6 @@
 /** Durable admission and consumption of portable context for one fresh session. */
 
+import { randomUUID } from 'node:crypto'
 import {
   ContextTransferReceiptSchema,
   ContextTransferRequestSchema,
@@ -8,6 +9,7 @@ import {
   canonicalCandidateDigest,
   contextTransferReceiptMatches,
   PortableContextDestinationSchema,
+  workspaceCwdPathForBase,
   type AgentProfile,
   type ContextTransferReceipt,
   type ContextTransferRequest,
@@ -27,6 +29,7 @@ interface StoredContextTransferBinding {
   requestDigest: Sha256Digest
   planDigest: Sha256Digest
   contextDigest: Sha256Digest
+  environmentId: string
   destination: PortableContextDestination
 }
 
@@ -44,6 +47,8 @@ export interface ContextTransferConsumption {
   executionId: string
   model: string
   profile: AgentProfile | undefined
+  cwd?: string
+  executionKind?: 'host' | 'sandbox'
 }
 
 export class RetainedContextTransfers {
@@ -94,7 +99,7 @@ export class RetainedContextTransfers {
     const operation = this.store.findContextTransferByEnvironmentId(environmentId)
     if (!operation || operation.callerId !== callerId) return null
     const stored = storedAcknowledgement(operation)
-    if (stored.binding.destination.environmentId !== environmentId) return null
+    if (stored.binding.environmentId !== environmentId) return null
     if (stored.status === 'pending') {
       return unknown(stored.binding, 'context transfer admission is pending', true)
     }
@@ -138,7 +143,7 @@ export class RetainedContextTransfers {
         'context_transfer_conflict',
       )
     }
-    assertDestination(request, destination)
+    assertDestination(request, destination, stored.binding.environmentId)
     return request.plan.context.messages.map((message): ChatMessage => ({
       role: message.role,
       content: message.parts.map(parsePortableInputPart),
@@ -150,7 +155,12 @@ export class RetainedContextTransfers {
     callerId: string,
     signal?: AbortSignal,
   ): Promise<ContextTransferResult> {
-    const binding = bindingFor(request)
+    // Preserve an existing operation's conflict/replay result, but never record
+    // a new admission for allocation fields this local provider cannot honor.
+    if (!this.store.getRetainedControlOperation(request.operationId)) {
+      assertSupportedAllocation(request)
+    }
+    let binding = bindingFor(request)
     const pendingAcknowledgement: StoredContextTransferAcknowledgement = {
       status: 'pending',
       binding,
@@ -164,7 +174,10 @@ export class RetainedContextTransfers {
       requestDigest: request.requestDigest,
       acknowledgement: pendingAcknowledgement as unknown as Record<string, unknown>,
     }
-    const claim = this.store.claimContextTransferOperation(operation, request.plan.destination)
+    const claim = this.store.claimContextTransferOperation(operation, {
+      environmentId: binding.environmentId,
+      executionId: request.plan.destination.executionId,
+    })
     if (claim.kind === 'coordinate_conflict') {
       return conflict(request.operationId, request.requestDigest, claim.operation.requestDigest)
     }
@@ -182,7 +195,11 @@ export class RetainedContextTransfers {
       if (stored.status === 'accepted') {
         return replayedReceipt(stored.binding, stored.receipt, request)
       }
+      // A prior pending admission owns the allocated ID across process restart.
+      binding = stored.binding
     }
+
+    assertSupportedAllocation(request)
 
     const acceptedAt = Date.parse(request.acceptance.acceptedAt)
     if (acceptedAt > Date.now()) {
@@ -213,7 +230,7 @@ export class RetainedContextTransfers {
       source: request.plan.source.source,
       destination: request.plan.destination,
       provider: request.plan.destination.provider,
-      environmentId: request.plan.destination.environmentId,
+      environmentId: binding.environmentId,
       sessionId: request.plan.destination.sessionId,
       runId: request.plan.destination.runId,
       executionId: request.plan.destination.executionId,
@@ -296,6 +313,7 @@ function bindingFor(request: ContextTransferRequest): StoredContextTransferBindi
     requestDigest: request.requestDigest,
     planDigest: request.plan.digest,
     contextDigest: request.plan.context.digest,
+    environmentId: request.plan.destination.environmentId ?? randomUUID(),
     destination: request.plan.destination,
   }
 }
@@ -309,6 +327,13 @@ function storedBinding(
   }
   const raw = value as Record<string, unknown>
   const destination = PortableContextDestinationSchema.safeParse(raw.destination)
+  // Older acknowledgements bound the environment directly in the accepted plan.
+  const environmentId = raw.environmentId === undefined
+    ? destination.success ? destination.data.environmentId : undefined
+    : typeof raw.environmentId === 'string' ? raw.environmentId : undefined
+  const allocatedDestination = destination.success && environmentId !== undefined
+    ? PortableContextDestinationSchema.safeParse({ ...destination.data, environmentId })
+    : undefined
   if (
     raw.operationId !== operation.operationId ||
     raw.requestDigest !== operation.requestDigest ||
@@ -316,6 +341,9 @@ function storedBinding(
     !isSha256Digest(raw.planDigest) ||
     !isSha256Digest(raw.contextDigest) ||
     !destination.success ||
+    !allocatedDestination?.success ||
+    environmentId === undefined ||
+    (destination.data.environmentId !== undefined && environmentId !== destination.data.environmentId) ||
     destination.data.runId !== operation.runId ||
     destination.data.sessionId !== operation.sessionId
   ) {
@@ -326,6 +354,7 @@ function storedBinding(
     requestDigest: raw.requestDigest,
     planDigest: raw.planDigest,
     contextDigest: raw.contextDigest,
+    environmentId,
     destination: destination.data,
   }
 }
@@ -368,7 +397,7 @@ function receiptMatchesBinding(
     receipt.contextDigest === binding.contextDigest &&
     canonicalCandidateDigest(receipt.destination) === canonicalCandidateDigest(destination) &&
     receipt.provider === destination.provider &&
-    receipt.environmentId === destination.environmentId &&
+    receipt.environmentId === binding.environmentId &&
     receipt.sessionId === destination.sessionId &&
     receipt.runId === destination.runId &&
     receipt.executionId === destination.executionId &&
@@ -430,23 +459,50 @@ function destinationModel(request: ContextTransferRequest): string {
   return `${runner}/${model}`
 }
 
+function assertSupportedAllocation(request: ContextTransferRequest): void {
+  const unsupported = ['environment', 'image', 'repoUrl', 'gitRef', 'checkpoint', 'providerOptions']
+    .filter((key) => request.workspace?.[key as keyof NonNullable<ContextTransferRequest['workspace']>] !== undefined)
+    .map((key) => `workspace.${key}`)
+  if (request.resources !== undefined) unsupported.push('resources')
+  if (unsupported.length > 0) {
+    throw new RetainedSessionError(
+      `local context transfer cannot represent ${unsupported.join(', ')}`,
+      400,
+      'capability_denied',
+    )
+  }
+  try {
+    workspaceCwdPathForBase(request.workspace?.cwd, 'host', 'CLI Bridge')
+  } catch (error) {
+    throw new RetainedSessionError(
+      error instanceof Error ? error.message : String(error),
+      400,
+      'capability_denied',
+    )
+  }
+}
+
 function assertDestination(
   request: ContextTransferRequest,
   destination: ContextTransferConsumption,
+  environmentId: string,
 ): void {
   const expected = request.plan.destination
+  const expectedCwd = workspaceCwdPathForBase(request.workspace?.cwd, 'host', 'CLI Bridge')
   if (
     destination.provider !== expected.provider ||
-    destination.environmentId !== expected.environmentId ||
+    destination.environmentId !== environmentId ||
     destination.sessionId !== expected.sessionId ||
     destination.runId !== expected.runId ||
     destination.executionId !== expected.executionId ||
     destination.model !== destinationModel(request) ||
+    (expectedCwd !== undefined && destination.cwd !== expectedCwd) ||
+    (expectedCwd !== undefined && destination.executionKind === 'sandbox') ||
     destination.profile === undefined ||
     canonicalAgentProfileDigest(destination.profile) !== expected.profileDigest
   ) {
     throw new RetainedSessionError(
-      'context transfer destination does not match the admitted provider, run, model, or profile',
+      'context transfer destination does not match the admitted provider, run, model, profile, or cwd',
       409,
       'context_transfer_destination_conflict',
     )

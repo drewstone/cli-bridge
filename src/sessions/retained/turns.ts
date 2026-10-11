@@ -217,6 +217,8 @@ export class RetainedTurnRunner {
             executionId,
             model: retained.model,
             profile: config.profile as AgentProfile | undefined,
+            ...(retained.cwd ? { cwd: retained.cwd } : {}),
+            executionKind: config.execution?.kind === 'sandbox' ? 'sandbox' : 'host',
           },
         )
     const requestDigest = canonicalCandidateDigest({
