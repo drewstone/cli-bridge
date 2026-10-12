@@ -297,9 +297,26 @@ returns a conflict. Lookup is available through
 An unbound destination omits `plan.destination.environmentId` and supplies its
 exact profile. The bridge records a fresh local environment identity separately
 and returns it as `receipt.environmentId`, preserving the accepted destination
-unchanged. The subsequent one-shot or retained turn must use that environment,
+unchanged. The subsequent turn must use that environment,
 session, run, execution, model, and full profile. A declared
 `workspace.cwd` must use `base: "host"`; the turn must use the exact declared path.
+
+The Codex host backend initializes a fresh native thread with selected text parts
+through the public app-server API, preserving message roles and part order. It
+uses the exact public profile and the existing profile materializer. The receiver
+records the native thread ID before import and the native checkpoint acknowledgement
+before returning an accepted receipt. The first turn resumes that native thread
+with only the new user input; it requires the exact transfer request. The
+installed protocol must be qualified as `codex-cli 0.162.1` and an explicit
+existing host cwd is required. Other backends and selected non-text or tool-role
+messages are unavailable until their native import path is implemented and proved.
+
+HTTP receipt loss can replay an acknowledged import after restart. An uncertain
+native create or inject acknowledgement remains pending and is never repeated.
+Codex's public history projections do not expose the selected raw import before
+a turn, so they cannot currently reconcile that uncertainty. The ordinary chat
+route cannot bypass this fence by reusing the session ID. Legacy receipts without
+native import proof also remain unavailable.
 
 Local transfer currently supports an existing host workspace. It refuses cloud
 templates, images, repository cloning, checkpoint restoration, provider workspace

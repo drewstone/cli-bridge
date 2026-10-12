@@ -15,7 +15,7 @@ import {
   type PortableConversationContext,
 } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
-import type { Backend, BackendHealth, ChatDelta, ChatRequest } from '../src/backends/types.js'
+import type { Backend, BackendHealth, ChatDelta, ChatRequest, PreparedContextTransfer } from '../src/backends/types.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
@@ -34,6 +34,27 @@ afterEach(() => {
 class ReadyBackend implements Backend {
   readonly name = 'codex'
   readonly requests: ChatRequest[] = []
+  creations = 0
+  imports = 0
+  failCreation = false
+  failImport = false
+
+  validateContextTransfer(): void {}
+
+  prepareContextTransfer(): Promise<PreparedContextTransfer> {
+    return Promise.resolve({
+      createSession: async () => {
+        this.creations += 1
+        if (this.failCreation) throw new Error('creation acknowledgement lost')
+        return { nativeSessionId: 'native-destination', createdAt: '2026-08-01T20:00:03.000Z' }
+      },
+      importHistory: async () => {
+        this.imports += 1
+        if (this.failImport) throw new Error('injection acknowledgement lost')
+      },
+      close: async () => {},
+    })
+  }
 
   matches(model: string): boolean {
     return model === this.name || model.startsWith(`${this.name}/`)
@@ -116,6 +137,7 @@ function transferRequest(
   const material = {
     operationId,
     plan,
+    profile,
     acceptance: {
       planDigest: plan.digest,
       acceptedAt: '2026-08-01T20:00:02.000Z',
@@ -164,8 +186,8 @@ function unboundTransferRequest(operationId = 'transfer-unbound'): ContextTransf
   const material = {
     operationId,
     plan,
-    acceptance: { ...original.acceptance, planDigest: plan.digest },
     profile,
+    acceptance: { ...original.acceptance, planDigest: plan.digest },
   }
   return ContextTransferRequestSchema.parse({
     ...material,
@@ -201,6 +223,103 @@ class BlockedReadyBackend extends ReadyBackend {
 }
 
 describe('portable context transfer', () => {
+  it.each(['create', 'inject'] as const)('holds an uncertain native %s acknowledgement across restart without another side effect', async (effect) => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli-bridge-native-unknown-'))
+    directories.push(directory)
+    const backend = new ReadyBackend()
+    backend.failCreation = effect === 'create'
+    backend.failImport = effect === 'inject'
+    const registry = new BackendRegistry().register(backend)
+    const first = new SessionStore(directory)
+    const request = unboundTransferRequest()
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    const transfers = new RetainedContextTransfers(first, registry, 100)
+    await expect(transfers.transfer(request, callerId)).resolves.toMatchObject({ status: 'unknown', retryable: false })
+    expect(first.getRetainedControlOperation(request.operationId)?.acknowledgement).toMatchObject({
+      status: 'pending', native: { phase: effect === 'create' ? 'allocation_started' : 'injection_started' },
+    })
+    if (effect === 'inject') {
+      expect(first.getRetainedControlOperation(request.operationId)?.acknowledgement.native).toMatchObject({ sessionId: 'native-destination' })
+    }
+    expect(() => transfers.assertSessionDispatch(request.plan.destination.sessionId, callerId)).toThrow(/not authoritative/)
+    expect(() => first.claimSessionIdentity(request.plan.destination.sessionId, 'legacy')).toThrow(/not authoritative/)
+    expect(() => first.claimSessionIdentity(request.plan.destination.sessionId, 'retained')).toThrow(/not authoritative/)
+    first.close()
+    const reopened = new SessionStore(directory)
+    try {
+      const restarted = new RetainedContextTransfers(reopened, registry, 100)
+      await expect(restarted.transfer(request, callerId)).resolves.toMatchObject({ status: 'unknown', retryable: false })
+      expect(restarted.lookup(request.operationId, request.requestDigest, callerId)).toMatchObject({ status: 'unknown', retryable: false })
+      expect(backend.creations).toBe(1)
+      expect(backend.imports).toBe(effect === 'create' ? 0 : 1)
+      expect(() => restarted.messagesForTurn(request, callerId, destination(request))).toThrow(/not complete/)
+    } finally { reopened.close() }
+  })
+
+  it('replays an acknowledged native import after a lost HTTP response and receiver restart', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'cli-bridge-native-http-ack-'))
+    directories.push(directory)
+    const backend = new ReadyBackend()
+    const registry = new BackendRegistry().register(backend)
+    const request = unboundTransferRequest()
+    const authorization = 'Bearer owner'
+    const first = new SessionStore(directory)
+    const firstRuns = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
+    const firstService = new RetainedSessionService({ store: first, registry, runs: firstRuns, healthProbeTimeoutMs: 100 })
+    const firstApp = new Hono()
+    mountRetainedSessions(firstApp, firstService)
+    // Discard the entire response: the receiver's durable native ACK is the only recovery authority.
+    await firstApp.request('/v1/context-transfers', { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: JSON.stringify(request) })
+    expect(first.getRetainedControlOperation(request.operationId)?.acknowledgement).toMatchObject({ status: 'accepted', native: { phase: 'imported', sessionId: 'native-destination' } })
+    await firstService.shutdown(1_000)
+    await firstRuns.shutdown(1_000)
+    first.close()
+    const reopened = new SessionStore(directory)
+    const runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
+    const service = new RetainedSessionService({ store: reopened, registry, runs, healthProbeTimeoutMs: 100 })
+    const app = new Hono()
+    mountRetainedSessions(app, service)
+    try {
+      const response = await app.request('/v1/context-transfers', { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: JSON.stringify(request) })
+      expect(response.status).toBe(200)
+      const replay = await response.json() as { status: string; environmentId: string }
+      expect(replay.status).toBe('replayed')
+      expect(backend.creations).toBe(1)
+      expect(backend.imports).toBe(1)
+      expect(reopened.get(request.plan.destination.sessionId, 'codex')?.internalId).toBe('native-destination')
+      expect(service.contextMessages(request, canonicalCandidateDigest(authorization), { ...destination(request), environmentId: replay.environmentId })).toEqual([])
+    } finally {
+      await service.shutdown(1_000)
+      await runs.shutdown(1_000)
+      reopened.close()
+    }
+  })
+
+  it('refuses a runner without a typed native import port before durable admission', async () => {
+    const { store, directory } = fixture()
+    const backend = new ReadyBackend()
+    const unsupported: Backend = {
+      name: backend.name, matches: (model) => backend.matches(model),
+      health: () => backend.health(), chat: (request) => backend.chat(request),
+    }
+    const transfers = new RetainedContextTransfers(store, new BackendRegistry().register(unsupported), 100)
+    const request = unboundTransferRequest()
+    try {
+      await expect(transfers.transfer(request, canonicalCandidateDigest('owner'))).rejects.toMatchObject({ status: 501, code: 'capability_denied' })
+      expect(store.getRetainedControlOperation(request.operationId)).toBeNull()
+    } finally { store.close() }
+  })
+
+  it('refuses to allocate over an existing logical session', async () => {
+    const { store, transfers } = fixture()
+    const request = unboundTransferRequest()
+    store.remember({ externalId: request.plan.destination.sessionId, backend: 'codex', model: 'codex/gpt-5.6', internalId: 'existing-native-thread' })
+    try {
+      await expect(transfers.transfer(request, canonicalCandidateDigest('owner'))).resolves.toMatchObject({ status: 'unknown', retryable: false })
+      expect(store.getRetainedControlOperation(request.operationId)).toBeNull()
+    } finally { store.close() }
+  })
+
   it('accepts the exact portable profile through the public transfer route', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'cli-bridge-context-profile-'))
     directories.push(directory)
@@ -255,7 +374,7 @@ describe('portable context transfer', () => {
       })
       expect(restarted.messagesForTurn(request, callerId, {
         ...destination(request), environmentId: accepted.environmentId,
-      })).toHaveLength(2)
+      })).toHaveLength(0)
       expect(() => restarted.messagesForTurn(request, callerId, {
         ...destination(request), environmentId: 'unadmitted-environment',
       })).toThrow(/destination does not match/)
@@ -338,7 +457,7 @@ describe('portable context transfer', () => {
       const receipt = await transfers.transfer(request, callerId)
       if (receipt.status !== 'accepted') throw new Error('transfer was not accepted')
       const actual = { ...destination(request), environmentId: receipt.environmentId, cwd: '/tmp/portable-return' }
-      expect(transfers.messagesForTurn(request, callerId, actual)).toHaveLength(2)
+      expect(transfers.messagesForTurn(request, callerId, actual)).toHaveLength(0)
       expect(() => transfers.messagesForTurn(request, callerId, { ...actual, cwd: '/tmp/other-return' })).toThrow(/destination does not match/)
       expect(() => transfers.messagesForTurn(request, callerId, { ...actual, cwd: undefined })).toThrow(/destination does not match/)
       expect(() => transfers.messagesForTurn(request, callerId, { ...actual, executionKind: 'sandbox' })).toThrow(/destination does not match/)
@@ -372,7 +491,7 @@ describe('portable context transfer', () => {
     }
   })
 
-  it('reads legacy stored destination bindings after restart', async () => {
+  it('holds legacy receipts without native import proof after restart', async () => {
     const source = fixture()
     const request = transferRequest()
     const callerId = canonicalCandidateDigest('Bearer owner')
@@ -404,10 +523,10 @@ describe('portable context transfer', () => {
     const restarted = new RetainedContextTransfers(reopened, new BackendRegistry().register(new ReadyBackend()), 100)
     try {
       expect(restarted.lookupByEnvironment(receipt.environmentId, callerId)).toMatchObject({
-        status: 'replayed', environmentId: receipt.environmentId,
+        status: 'unknown', retryable: false,
       })
-      await expect(restarted.transfer(request, callerId)).resolves.toMatchObject({ status: 'replayed' })
-      expect(restarted.messagesForTurn(request, callerId, destination(request))).toHaveLength(2)
+      await expect(restarted.transfer(request, callerId)).resolves.toMatchObject({ status: 'unknown', retryable: false })
+      expect(() => restarted.messagesForTurn(request, callerId, destination(request))).toThrow(/not complete/)
     } finally {
       reopened.close()
     }
@@ -461,10 +580,7 @@ describe('portable context transfer', () => {
     expect(first.transfers.lookup(request.operationId, request.requestDigest, callerId)).toMatchObject({
       status: 'replayed',
     })
-    expect(first.transfers.messagesForTurn(request, callerId, destination(request))).toEqual([
-      { role: 'user', content: [{ type: 'text', text: 'portable marker 74f2' }] },
-      { role: 'assistant', content: [{ type: 'text', text: 'source acknowledgement' }] },
-    ])
+    expect(first.transfers.messagesForTurn(request, callerId, destination(request))).toEqual([])
 
     first.store.close()
     const reopened = new SessionStore(first.directory)
@@ -476,7 +592,7 @@ describe('portable context transfer', () => {
     expect(restarted.lookup(request.operationId, request.requestDigest, callerId)).toMatchObject({
       status: 'replayed',
     })
-    expect(restarted.messagesForTurn(request, callerId, destination(request))).toHaveLength(2)
+    expect(restarted.messagesForTurn(request, callerId, destination(request))).toHaveLength(0)
     reopened.close()
     for (const file of readdirSync(first.directory).filter((entry) => entry.startsWith('sessions.sqlite'))) {
       expect(readFileSync(join(first.directory, file)).includes(Buffer.from('portable marker 74f2'))).toBe(false)
@@ -569,6 +685,8 @@ describe('portable context transfer', () => {
     for (const invalid of [
       { ...body, cwd: '/tmp/other-return' },
       { ...body, environment_id: 'unadmitted-environment' },
+      { ...body, context_transfer: undefined },
+      { ...body, execution: { kind: 'sandbox' } },
     ]) {
       const rejected = await app.request('/v1/chat/completions', {
         method: 'POST', headers: { authorization, 'content-type': 'application/json' },
@@ -591,8 +709,6 @@ describe('portable context transfer', () => {
     expect(backend.requests[0]?.cwd).toBe('/tmp/portable-return')
     expect(backend.requests[0]?.agent_profile).toEqual(profile)
     expect(backend.requests[0]?.messages).toEqual([
-      { role: 'user', content: [{ type: 'text', text: 'portable marker 74f2' }] },
-      { role: 'assistant', content: [{ type: 'text', text: 'source acknowledgement' }] },
       { role: 'user', content: 'use the transferred marker' },
     ])
 

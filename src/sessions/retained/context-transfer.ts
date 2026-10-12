@@ -14,12 +14,12 @@ import {
   type ContextTransferReceipt,
   type ContextTransferRequest,
   type ContextTransferResult,
-  type InputPart,
   type PortableContextDestination,
   type Sha256Digest,
 } from '@tangle-network/agent-interface'
 import type { BackendRegistry } from '../../backends/registry.js'
-import type { ChatMessage } from '../../backends/types.js'
+import type { Backend, ChatMessage, ProfileMaterializationReceipt } from '../../backends/types.js'
+import { exactSessionProfileBinding } from '../../backends/profile-support.js'
 import type { SessionStore, StoredRetainedControlOperation } from '../store.js'
 import { readyBackendCapabilities } from './capabilities.js'
 import { RetainedSessionError } from './types.js'
@@ -37,6 +37,13 @@ interface StoredContextTransferAcknowledgement {
   status: 'pending' | 'accepted'
   binding: StoredContextTransferBinding
   receipt?: ContextTransferReceipt
+  native?: {
+    backend: string
+    phase: 'allocation_started' | 'created' | 'injection_started' | 'imported'
+    sessionId?: string
+    createdAt?: string
+    profileMaterialization?: ProfileMaterializationReceipt
+  }
 }
 
 export interface ContextTransferConsumption {
@@ -89,8 +96,8 @@ export class RetainedContextTransfers {
       return conflict(operationId, requestDigest, operation.requestDigest)
     }
     const stored = storedAcknowledgement(operation)
-    if (stored.status === 'pending') {
-      return unknown(stored.binding, 'context transfer admission is pending', true)
+    if (stored.status === 'pending' || stored.native?.phase !== 'imported') {
+      return unknown(stored.binding, 'native context import is not acknowledged', nativeRetrySafe(stored))
     }
     return replayedReceipt(stored.binding, stored.receipt)
   }
@@ -100,8 +107,8 @@ export class RetainedContextTransfers {
     if (!operation || operation.callerId !== callerId) return null
     const stored = storedAcknowledgement(operation)
     if (stored.binding.environmentId !== environmentId) return null
-    if (stored.status === 'pending') {
-      return unknown(stored.binding, 'context transfer admission is pending', true)
+    if (stored.status === 'pending' || stored.native?.phase !== 'imported') {
+      return unknown(stored.binding, 'native context import is not acknowledged', nativeRetrySafe(stored))
     }
     return replayedReceipt(stored.binding, stored.receipt)
   }
@@ -126,7 +133,7 @@ export class RetainedContextTransfers {
       )
     }
     const stored = storedAcknowledgement(operation)
-    if (stored.status !== 'accepted' || !stored.receipt) {
+    if (stored.status !== 'accepted' || !stored.receipt || stored.native?.phase !== 'imported') {
       throw new RetainedSessionError(
         'context transfer admission is not complete',
         409,
@@ -144,10 +151,25 @@ export class RetainedContextTransfers {
       )
     }
     assertDestination(request, destination, stored.binding.environmentId)
-    return request.plan.context.messages.map((message): ChatMessage => ({
-      role: message.role,
-      content: message.parts.map(parsePortableInputPart),
-    }))
+    // The native session already owns the selected typed messages. Feeding them
+    // through the prompt path again would duplicate and flatten their history.
+    return []
+  }
+
+  assertSessionDispatch(sessionId: string, callerId: string, dispatch?: { backend: string; hasTransferRequest: boolean; executionKind: 'host' | 'sandbox' }): void {
+    const operation = this.store.findContextTransferBySessionId(sessionId)
+    if (!operation) return
+    const stored = storedAcknowledgement(operation)
+    if (operation.callerId !== callerId || stored.status !== 'accepted' || stored.native?.phase !== 'imported') {
+      throw new RetainedSessionError('native context import is not authoritative for this session and caller', 409, 'context_transfer_pending')
+    }
+    const session = this.store.get(sessionId, stored.native.backend)
+    if (session?.internalId !== stored.native.sessionId || (dispatch && (dispatch.backend !== stored.native.backend || dispatch.executionKind !== 'host'))) {
+      throw new RetainedSessionError('native context import is bound to a different session or executor', 409, 'context_transfer_destination_conflict')
+    }
+    if (dispatch && session.turns === 0 && !dispatch.hasTransferRequest) {
+      throw new RetainedSessionError('the first native turn requires its exact authoritative transfer receipt', 409, 'context_transfer_not_admitted')
+    }
   }
 
   private async admit(
@@ -159,6 +181,12 @@ export class RetainedContextTransfers {
     // a new admission for allocation fields this local provider cannot honor.
     if (!this.store.getRetainedControlOperation(request.operationId)) {
       assertSupportedAllocation(request)
+      if (!request.profile) throw new RetainedSessionError('typed native context import requires its exact frozen public profile', 400, 'capability_denied')
+      const backend = this.registry.resolve(destinationModel(request))
+      if (!backend?.validateContextTransfer || !backend.prepareContextTransfer) {
+        throw new RetainedSessionError('destination runner does not support typed native context import', 501, 'capability_denied')
+      }
+      backend.validateContextTransfer(request)
     }
     let binding = bindingFor(request)
     const pendingAcknowledgement: StoredContextTransferAcknowledgement = {
@@ -178,6 +206,9 @@ export class RetainedContextTransfers {
       environmentId: binding.environmentId,
       executionId: request.plan.destination.executionId,
     })
+    if (claim.kind === 'session_conflict') {
+      return unknown(request, 'context transfer requires a fresh logical session', false)
+    }
     if (claim.kind === 'coordinate_conflict') {
       return conflict(request.operationId, request.requestDigest, claim.operation.requestDigest)
     }
@@ -192,6 +223,9 @@ export class RetainedContextTransfers {
       if (!bindingMatchesRequest(stored.binding, request)) {
         return unknown(request, 'stored context transfer binding does not match the request', false)
       }
+      if (stored.status === 'accepted' && stored.native?.phase !== 'imported') {
+        return unknown(stored.binding, 'legacy receipt has no acknowledged native import', false)
+      }
       if (stored.status === 'accepted') {
         return replayedReceipt(stored.binding, stored.receipt, request)
       }
@@ -205,13 +239,19 @@ export class RetainedContextTransfers {
     if (acceptedAt > Date.now()) {
       return unknown(request, 'context transfer acceptance time is in the future', false)
     }
+    let backend: Backend
     try {
-      await readyBackendCapabilities({
+      const ready = await readyBackendCapabilities({
         registry: this.registry,
         model: destinationModel(request),
         healthProbeTimeoutMs: this.healthProbeTimeoutMs,
         signal,
       })
+      backend = ready.backend
+      if (!backend.validateContextTransfer || !backend.prepareContextTransfer || !request.profile || ready.capabilities.contextTransfer?.freshSession !== true) {
+        return unknown(binding, 'destination runner cannot import this exact public profile and typed context', false)
+      }
+      backend.validateContextTransfer(request)
     } catch (error) {
       return unknown(
         request,
@@ -220,7 +260,27 @@ export class RetainedContextTransfers {
       )
     }
 
-    const sessionCreatedAt = new Date().toISOString()
+    const imported = await this.importNative(request, binding, backend, signal ?? new AbortController().signal)
+    if (imported.status === 'accepted' && imported.native?.phase === 'imported') return replayedReceipt(binding, imported.receipt, request)
+    if (imported.status !== 'pending' || imported.native?.phase !== 'imported' || !imported.native.sessionId || !imported.native.createdAt) {
+      return unknown(binding, 'native import acknowledgement is pending; no native operation will be repeated', false)
+    }
+    const sessionCreatedAt = imported.native.createdAt
+    this.store.remember({
+      externalId: binding.destination.sessionId,
+      backend: imported.native.backend,
+      internalId: imported.native.sessionId,
+      model: destinationModel(request),
+      contextTransferAdmission: { operationId: request.operationId, requestDigest: request.requestDigest },
+      cwd: request.workspace?.cwd ? workspaceCwdPathForBase(request.workspace.cwd) : undefined,
+      metadata: {
+        agent_profile: request.profile,
+        agent_profile_binding: exactSessionProfileBinding({
+          model: destinationModel(request), messages: [], agent_profile: request.profile,
+        }, null),
+        ...(imported.native.profileMaterialization ? { profile_materialization: imported.native.profileMaterialization } : {}),
+      },
+    })
     const receipt = ContextTransferReceiptSchema.parse({
       status: 'accepted',
       operationId: request.operationId,
@@ -251,11 +311,13 @@ export class RetainedContextTransfers {
       status: 'accepted',
       binding,
       receipt,
+      native: imported.native,
     }
     if (
-      !this.store.updateRetainedControlOperation(
+      !this.store.compareContextTransferAcknowledgement(
         request.operationId,
         request.requestDigest,
+        imported as unknown as Record<string, unknown>,
         acknowledgement as unknown as Record<string, unknown>,
       )
     ) {
@@ -271,6 +333,63 @@ export class RetainedContextTransfers {
     }
     return receipt
   }
+
+  private async importNative(
+    request: ContextTransferRequest,
+    binding: StoredContextTransferBinding,
+    backend: Backend,
+    signal: AbortSignal,
+  ): Promise<StoredContextTransferAcknowledgement> {
+    let currentOperation = this.store.getRetainedControlOperation(request.operationId)!
+    let current = storedAcknowledgement(currentOperation)
+    if (current.status === 'accepted' || current.native?.phase === 'imported') return current
+    if (current.native?.phase === 'allocation_started' || current.native?.phase === 'injection_started') return current
+    const transition = (next: StoredContextTransferAcknowledgement): boolean => {
+      const won = this.store.compareContextTransferAcknowledgement(
+        request.operationId, request.requestDigest,
+        currentOperation.acknowledgement, next as unknown as Record<string, unknown>,
+      )
+      currentOperation = this.store.getRetainedControlOperation(request.operationId)!
+      current = storedAcknowledgement(currentOperation)
+      return won
+    }
+    const needsCreation = !current.native
+    if (needsCreation) {
+      if (!transition({ ...current, native: { backend: backend.name, phase: 'allocation_started' } })) return current
+    } else {
+      if (!transition({ ...current, native: { ...current.native!, phase: 'injection_started' } })) return current
+    }
+    let prepared: Awaited<ReturnType<NonNullable<Backend['prepareContextTransfer']>>> | undefined
+    try {
+      prepared = await backend.prepareContextTransfer!(request, binding.environmentId, signal)
+      if (needsCreation) {
+        const created = await prepared.createSession()
+        if (!created.nativeSessionId || !Number.isFinite(Date.parse(created.createdAt))) throw new Error('native creation returned an invalid identity')
+        if (!transition({ ...current, native: {
+          backend: backend.name, phase: 'created', sessionId: created.nativeSessionId, createdAt: created.createdAt,
+          ...(prepared.profileMaterialization ? { profileMaterialization: prepared.profileMaterialization } : {}),
+        } })) return current
+      }
+      if (current.native?.phase === 'created') {
+        if (!transition({ ...current, native: { ...current.native, phase: 'injection_started' } })) return current
+      }
+      if (current.native?.phase === 'injection_started') {
+        await prepared.importHistory(current.native.sessionId!)
+        transition({ ...current, native: { ...current.native!, phase: 'imported' } })
+      }
+      return current
+    } catch {
+      // An RPC failure does not prove absence. Retain the exact operation phase
+      // and owned native identity; never create or inject a second time.
+      return current
+    } finally {
+      await prepared?.close()
+    }
+  }
+}
+
+function nativeRetrySafe(stored: StoredContextTransferAcknowledgement): boolean {
+  return stored.status === 'pending' && (!stored.native || stored.native.phase === 'created' || stored.native.phase === 'imported')
 }
 
 function parseTransferRequest(value: unknown): ContextTransferRequest {
@@ -290,7 +409,8 @@ function storedAcknowledgement(
 ): StoredContextTransferAcknowledgement {
   const raw = operation.acknowledgement
   const binding = storedBinding(raw.binding, operation)
-  if (raw.status === 'pending') return { status: 'pending', binding }
+  const native = parseNativeAcknowledgement(raw.native)
+  if (raw.status === 'pending') return { status: 'pending', binding, ...(native ? { native } : {}) }
   const receipt = ContextTransferReceiptSchema.safeParse(raw.receipt)
   if (
     raw.status !== 'accepted' ||
@@ -304,7 +424,18 @@ function storedAcknowledgement(
       'context_transfer_unknown',
     )
   }
-  return { status: 'accepted', binding, receipt: receipt.data }
+  return { status: 'accepted', binding, receipt: receipt.data, ...(native ? { native } : {}) }
+}
+
+function parseNativeAcknowledgement(value: unknown): StoredContextTransferAcknowledgement['native'] {
+  if (value === undefined) return undefined
+  if (!value || typeof value !== 'object') throw invalidStoredBinding()
+  const native = value as NonNullable<StoredContextTransferAcknowledgement['native']>
+  if (typeof native.backend !== 'string' || !native.backend || !['allocation_started', 'created', 'injection_started', 'imported'].includes(native.phase)
+    || (native.phase !== 'allocation_started' && (typeof native.sessionId !== 'string' || !native.sessionId || !Number.isFinite(Date.parse(native.createdAt ?? ''))))) {
+    throw invalidStoredBinding()
+  }
+  return native
 }
 
 function bindingFor(request: ContextTransferRequest): StoredContextTransferBinding {
@@ -507,22 +638,4 @@ function assertDestination(
       'context_transfer_destination_conflict',
     )
   }
-}
-
-function parsePortableInputPart(value: unknown): InputPart {
-  if (!value || typeof value !== 'object' || !('type' in value)) {
-    throw new RetainedSessionError(
-      'stored context transfer contains an invalid input part',
-      409,
-      'context_transfer_unknown',
-    )
-  }
-  const part = value as Record<string, unknown>
-  if (part.type === 'text' && typeof part.text === 'string') return value as InputPart
-  if (part.type === 'file' || part.type === 'image') return value as InputPart
-  throw new RetainedSessionError(
-    'stored context transfer contains an unsupported input part',
-    409,
-    'context_transfer_unknown',
-  )
 }

@@ -82,7 +82,7 @@ export async function readyBackendCapabilities(input: {
   await assertReady(backend, input.healthProbeTimeoutMs, input.signal)
   return isNativeBackend(backend)
     ? { backend, capabilities: validatedNativeCapabilities(backend) }
-    : { backend, capabilities: genericCliBridgeCapabilities(backend.name) }
+    : { backend, capabilities: genericCliBridgeCapabilities(backend.name, supportsContextTransfer(backend)) }
 }
 
 /**
@@ -94,7 +94,7 @@ export async function readyBackendCapabilities(input: {
  * materialization, usage, placement, and lifecycle observation. Native process
  * continuation and native interactions remain exclusive to native backends.
  */
-export function genericCliBridgeCapabilities(_backendName?: string): AgentEnvironmentCapabilities {
+export function genericCliBridgeCapabilities(_backendName?: string, nativeContextTransfer = false): AgentEnvironmentCapabilities {
   const candidate: AgentEnvironmentCapabilities = {
     profile: {
       namedProfiles: false,
@@ -126,9 +126,9 @@ export function genericCliBridgeCapabilities(_backendName?: string): AgentEnviro
       cancellationIdempotency: true,
     },
     contextTransfer: {
-      freshSession: true,
-      requestIdempotency: true,
-      lookup: true,
+      freshSession: nativeContextTransfer,
+      requestIdempotency: nativeContextTransfer,
+      lookup: nativeContextTransfer,
     },
     workspace: {
       read: false,
@@ -173,10 +173,7 @@ function assertGenericDurableCapabilities(capabilities: AgentEnvironmentCapabili
     capabilities.retainedControl?.exactRunIdentity !== true ||
     capabilities.retainedControl.resultIdentity !== true ||
     capabilities.retainedControl.eventIdentity !== true ||
-    capabilities.retainedControl.cancellationIdempotency !== true ||
-    capabilities.contextTransfer?.freshSession !== true ||
-    capabilities.contextTransfer.requestIdempotency !== true ||
-    capabilities.contextTransfer.lookup !== true
+    capabilities.retainedControl.cancellationIdempotency !== true
   ) {
     throw new RetainedSessionError(
       'Bridge generic durable capabilities are incomplete',
@@ -213,9 +210,9 @@ function validatedNativeCapabilities(backend: NativeSessionBackend): AgentEnviro
   const validated = AgentEnvironmentCapabilitiesSchema.safeParse({
     ...nativeCapabilities(backend),
     contextTransfer: {
-      freshSession: true,
-      requestIdempotency: true,
-      lookup: true,
+      freshSession: supportsContextTransfer(backend),
+      requestIdempotency: supportsContextTransfer(backend),
+      lookup: supportsContextTransfer(backend),
     },
   })
   if (!validated.success) {
@@ -246,9 +243,6 @@ function assertRetainedCapabilities(capabilities: AgentEnvironmentCapabilities, 
     capabilities.retainedControl.resultIdentity !== true ||
     capabilities.retainedControl.eventIdentity !== true ||
     capabilities.retainedControl.cancellationIdempotency !== true ||
-    capabilities.contextTransfer?.freshSession !== true ||
-    capabilities.contextTransfer.requestIdempotency !== true ||
-    capabilities.contextTransfer.lookup !== true ||
     !capabilities.sessions.continue ||
     !capabilities.sessions.list ||
     !capabilities.sessions.messages ||
@@ -265,4 +259,9 @@ function assertRetainedCapabilities(capabilities: AgentEnvironmentCapabilities, 
       'capability_denied',
     )
   }
+}
+
+function supportsContextTransfer(backend: Backend): boolean {
+  return typeof backend.validateContextTransfer === 'function' && typeof backend.prepareContextTransfer === 'function'
+    && backend.contextTransferAvailable?.() !== false
 }

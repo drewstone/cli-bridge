@@ -19,6 +19,7 @@ import {
   type RetainedSessionRecord,
   type RetainedSessionStatus,
   SessionIdentityConflictError,
+  ContextTransferSessionPendingError,
   type SessionStore,
 } from './store.js'
 import { readyBackendCapabilities, readyNativeBackend } from './retained/capabilities.js'
@@ -264,6 +265,9 @@ export class RetainedSessionService {
         capabilities,
       })
     } catch (error) {
+      if (error instanceof ContextTransferSessionPendingError) {
+        throw new RetainedSessionError(error.message, 409, error.code)
+      }
       if (
         error instanceof SessionIdentityConflictError ||
         (error instanceof Error &&
@@ -323,6 +327,10 @@ export class RetainedSessionService {
     destination: RetainedContextTransferDestination,
   ): import('../backends/types.js').ChatMessage[] {
     return this.contextTransfers.messagesForTurn(value, callerId, destination)
+  }
+
+  assertContextSessionDispatch(sessionId: string, callerId: string, dispatch?: { backend: string; hasTransferRequest: boolean; executionKind: 'host' | 'sandbox' }): void {
+    this.contextTransfers.assertSessionDispatch(sessionId, callerId, dispatch)
   }
 
   continueNative(

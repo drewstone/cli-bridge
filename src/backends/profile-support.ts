@@ -30,7 +30,7 @@ import {
 } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
-import type { SessionRecord } from '../sessions/store.js'
+import type { SessionProfileBinding, SessionRecord } from '../sessions/store.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
 import {
   applyWorkspacePlan,
@@ -858,6 +858,27 @@ export function resolveRequestedReasoningEffort(
   }
   return profileEffort ?? req.effort ?? null
 }
+
+/** One profile binding shared by native import and the first resumed turn. */
+export function exactSessionProfileBinding(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): SessionProfileBinding | null {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return null
+  const parts = req.model.split('/')
+  const provider = parts.length >= 3 && parts[1]
+    ? parts[1]
+    : profile.model?.provider ?? null
+  return {
+    schema: 'cli-bridge.session-agent-profile.v1',
+    effectiveProfileDigest: canonicalAgentProfileDigest(profile),
+    provider,
+    model: req.model,
+    requestedReasoningEffort: resolveRequestedReasoningEffort(req, session),
+  }
+}
+
 
 /** Bind a receipt to the actual transport model/provider and native reasoning control. */
 export function profileExecutionIdentity(
