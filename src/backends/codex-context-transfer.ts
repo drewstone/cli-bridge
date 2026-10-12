@@ -27,7 +27,7 @@ export function validateCodexContextTransfer(request: ContextTransferRequest): v
   if (!request.workspace?.cwd || request.workspace.cwd.base !== 'host') {
     throw new BackendError('Codex native context import requires an explicit existing host workspace cwd', 'capability_denied')
   }
-  workspaceCwdPathForBase(request.workspace.cwd)
+  workspaceCwdPathForBase(request.workspace.cwd, 'host', 'Codex context transfer')
   codexContextItems(request)
 }
 
@@ -89,7 +89,7 @@ export class CodexContextTransfer implements PreparedContextTransfer {
 
   async createSession(): Promise<{ nativeSessionId: string; createdAt: string }> {
     const response = await this.rpc('thread/start', {
-      cwd: workspaceCwdPathForBase(this.request.workspace!.cwd!),
+      cwd: workspaceCwdPathForBase(this.request.workspace!.cwd!, 'host', 'Codex context transfer'),
       approvalPolicy: 'never', sandbox: 'read-only', ephemeral: false,
     })
     const thread = response.thread as Record<string, unknown> | undefined

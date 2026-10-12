@@ -610,7 +610,7 @@ function codexTransferChatRequest(request: ContextTransferRequest): ChatRequest 
   return {
     model: !model || model === 'codex' || model.startsWith('codex/') ? model ?? 'codex' : `codex/${model}`,
     messages: [], agent_profile: request.profile, session_id: request.plan.destination.sessionId,
-    cwd: workspaceCwdPathForBase(request.workspace!.cwd!), mode: 'byob',
+    cwd: workspaceCwdPathForBase(request.workspace!.cwd!, 'host', 'Codex context transfer'), mode: 'byob',
   }
 }
 

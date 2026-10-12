@@ -272,7 +272,7 @@ export class RetainedContextTransfers {
       internalId: imported.native.sessionId,
       model: destinationModel(request),
       contextTransferAdmission: { operationId: request.operationId, requestDigest: request.requestDigest },
-      cwd: request.workspace?.cwd ? workspaceCwdPathForBase(request.workspace.cwd) : undefined,
+      cwd: request.workspace?.cwd ? workspaceCwdPathForBase(request.workspace.cwd, 'host', 'Codex context transfer') : undefined,
       metadata: {
         agent_profile: request.profile,
         agent_profile_binding: exactSessionProfileBinding({
