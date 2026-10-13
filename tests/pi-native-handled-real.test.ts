@@ -158,7 +158,7 @@ export default function (pi) {
       })
       expect(admitted.status, await admitted.text()).toBe(202)
       const deadline = Date.now() + 12_000
-      while (!store.getRetainedRun(runId)?.snapshot.terminal && Date.now() < deadline) {
+      while (store.getRetained('real-handled-jail')?.turns !== index + 1 && Date.now() < deadline) {
         if (connections > 0) throw new Error('unexpected inference connection')
         await new Promise(resolve => setTimeout(resolve, 10))
       }
