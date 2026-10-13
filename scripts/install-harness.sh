@@ -50,7 +50,9 @@ install_gemini() {
 }
 
 install_pi() {
-  npm install -g @earendil-works/pi-coding-agent@latest
+  # Qualified by tests/pi-native-handled-real.test.ts: older RPC versions
+  # do not distinguish a handled prompt from an accepted model run.
+  npm install -g @earendil-works/pi-coding-agent@1.0.2
 }
 
 # prime-agent is a hard FORK of pi that reuses pi's npm name. The registry
