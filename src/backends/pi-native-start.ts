@@ -95,7 +95,12 @@ export async function startPiNativeSession(
   const runCwd = resolveSpawnerCwd(options.spawner, req.cwd ?? session?.cwd ?? undefined)
   if (options.spawner.executionEnvironment === 'host') {
     if (!req.jailSpec) {
-      req.jailSpec = resolveJailSpec({ cwd: runCwd ?? process.cwd(), env: process.env })
+      req.jailSpec = resolveJailSpec({
+        execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
+        execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
+        cwd: runCwd ?? process.cwd(),
+        env: process.env,
+      })
     }
     const jailBackend = selectJailBackend()
     if (!req.jailSpec?.readConfine || jailBackend.name !== 'bwrap' || !(await jailBackend.isAvailable())) {
