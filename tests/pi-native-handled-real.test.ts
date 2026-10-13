@@ -124,7 +124,9 @@ export default function (pi) {
     return { action: 'handled' };
   });
 }`)
-  const environmentKeys = ['BRIDGE_JAIL_MODE', 'WORKER_FS_JAIL', 'BRIDGE_JAIL_RO_PATHS', 'BRIDGE_JAIL_RW_PATHS', 'PI_OFFLINE', 'PI_TELEMETRY'] as const
+  // Preserve explicit operator read-only install binds (for Pi's jiti loader).
+  // The sibling fixture must remain unreadable with that real configuration.
+  const environmentKeys = ['BRIDGE_JAIL_MODE', 'WORKER_FS_JAIL', 'BRIDGE_JAIL_RW_PATHS', 'PI_OFFLINE', 'PI_TELEMETRY'] as const
   const previous = new Map(environmentKeys.map(key => [key, process.env[key]]))
   for (const key of environmentKeys) delete process.env[key]
   process.env.PI_OFFLINE = '1'
