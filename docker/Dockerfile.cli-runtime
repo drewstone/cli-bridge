@@ -46,7 +46,7 @@ RUN apt-get update \
        git ca-certificates dumb-init curl python3 iptables \
   && rm -rf /var/lib/apt/lists/*
 
-# --- CLI installs (latest at image-build time) ---
+# --- CLI installs (Pi is pinned to its qualified RPC version) ---
 # Source of truth lives in scripts/install-harness.sh so host installs,
 # subset images, and the all-in-one runtime cannot drift.
 COPY scripts/install-harness.sh /usr/local/share/cli-bridge/install-harness.sh
