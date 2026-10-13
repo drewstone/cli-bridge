@@ -124,17 +124,18 @@ export default function (pi) {
     return { action: 'handled' };
   });
 }`)
-  const environmentKeys = ['BRIDGE_JAIL_MODE', 'WORKER_FS_JAIL', 'BRIDGE_JAIL_RO_PATHS', 'BRIDGE_JAIL_RW_PATHS', 'PI_OFFLINE'] as const
+  const environmentKeys = ['BRIDGE_JAIL_MODE', 'WORKER_FS_JAIL', 'BRIDGE_JAIL_RO_PATHS', 'BRIDGE_JAIL_RW_PATHS', 'PI_OFFLINE', 'PI_TELEMETRY'] as const
   const previous = new Map(environmentKeys.map(key => [key, process.env[key]]))
   for (const key of environmentKeys) delete process.env[key]
   process.env.PI_OFFLINE = '1'
+  process.env.PI_TELEMETRY = '0'
   const store = new SessionStore(join(dir, 'store'))
   const runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
   const backend = new PiBackend({
     bin, timeoutMs: 10_000, spawner: hostSpawner,
     transportResolver: createPiInferenceTransportResolver({
       bin, agentDir, sessionDir: join(dir, 'sessions'),
-      env: { PATH: process.env.PATH, HOME: agentDir },
+      env: { PATH: process.env.PATH, HOME: agentDir, PI_OFFLINE: '1', PI_TELEMETRY: '0' },
     }),
   })
   const app = new Hono()
@@ -181,14 +182,21 @@ export default function (pi) {
     const closed = await app.request('/v1/sessions/real-handled-jail/close', { method: 'POST', body: '{}' })
     expect(closed.status, await closed.text()).toBe(200)
   } finally {
-    await runs.shutdown(2_000)
-    store.close()
-    endpoint.closeAllConnections()
-    await new Promise<void>((resolve, reject) => endpoint.close(error => error ? reject(error) : resolve()))
-    for (const [key, value] of previous) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
+    try {
+      // A failed assertion may leave the retained child idle or mid-turn.
+      // Close its exact session through the same owner boundary on every exit.
+      const closed = await app.request('/v1/sessions/real-handled-jail/close', { method: 'POST', body: '{}' })
+      expect([200, 404]).toContain(closed.status)
+    } finally {
+      await runs.shutdown(2_000)
+      store.close()
+      endpoint.closeAllConnections()
+      await new Promise<void>((resolve, reject) => endpoint.close(error => error ? reject(error) : resolve()))
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      rmSync(dir, { recursive: true, force: true })
     }
-    rmSync(dir, { recursive: true, force: true })
   }
 }, 35_000)
