@@ -138,6 +138,15 @@ Keep a shared environment file and other services' PATHs unchanged. If a
 wrapper also loads an environment file, check that it does not overwrite the
 service-specific `PI_BIN`.
 
+For a private npm install, add
+`$pi_prefix/lib/node_modules/@earendil-works/pi-coding-agent` to the service's
+existing `BRIDGE_JAIL_RO_PATHS` list. Pi's extension loader needs its installed
+`jiti` dependency beside the bundled CLI. Bind only this credential-free
+package tree read-only, never its parent home, provider configuration, or
+session directories. This operator bind is visible to every fs-jailed worker;
+it does not enable or lower the jail floor. A retained host request can raise
+its own confinement with `execution.jail.mode=fs-jail` and a scratch root.
+
 Use the registered deployer's idle check before replacing the service: admitted
 and queued requests, executor work, and retained sessions must be drained by
 their owner. Retain the prior binary and configuration for rollback. The
