@@ -135,7 +135,10 @@ export default function (pi) {
     bin, timeoutMs: 10_000, spawner: hostSpawner,
     transportResolver: createPiInferenceTransportResolver({
       bin, agentDir, sessionDir: join(dir, 'sessions'),
-      env: { PATH: process.env.PATH, HOME: agentDir, PI_OFFLINE: '1', PI_TELEMETRY: '0' },
+      env: {
+        PATH: process.env.PATH, HOME: agentDir, PI_OFFLINE: '1', PI_TELEMETRY: '0',
+        PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: join(dir, 'sessions'),
+      },
     }),
   })
   const app = new Hono()
