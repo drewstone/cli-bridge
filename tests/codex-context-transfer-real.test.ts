@@ -30,6 +30,8 @@ const frozenProfile: AgentProfile = {
   resources: { instructions: 'Materialized profile resource 18de.' },
 }
 
+// The pinned devDependency by default; set this to qualify an installed Codex at the same version.
+const codexBin = process.env.CLI_BRIDGE_CODEX_CONFORMANCE_BIN ?? resolve('node_modules/.bin/codex')
 const omittedMarker = 'Omitted source note 9d3f.'
 
 function nativeRequest(cwd: string): ContextTransferRequest {
@@ -124,7 +126,7 @@ describe('real Codex native context consumer', () => {
     const startReceiver = (): Hono => {
       store = new SessionStore(join(directory, 'store'))
       const registry = new BackendRegistry().register(new CodexBackend({
-        bin: resolve('node_modules/.bin/codex'), timeoutMs: 60_000, stateDir: join(directory, 'native'), spawner,
+        bin: codexBin, timeoutMs: 60_000, stateDir: join(directory, 'native'), spawner,
       }))
       runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
       service = new RetainedSessionService({ store, registry, runs, healthProbeTimeoutMs: 15_000 })
