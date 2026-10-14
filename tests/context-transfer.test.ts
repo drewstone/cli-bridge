@@ -182,9 +182,11 @@ function fixture(): {
   }
 }
 
-function destination(request: ContextTransferRequest) {
-  const { environmentId } = request.plan.destination
-  if (environmentId === undefined) throw new Error('fixture destination must bind its environment')
+/** First-turn coordinates; an unbound request needs the environment its receipt allocated. */
+function destination(
+  request: ContextTransferRequest,
+  environmentId = request.plan.destination.environmentId ?? 'unallocated-environment',
+) {
   return {
     provider: request.plan.destination.provider,
     environmentId,
