@@ -182,6 +182,37 @@ function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
   return (sanitized || fallback).slice(0, MAX_UPSTREAM_ERROR_DETAIL_CHARS)
 }
 
+/**
+ * The settings layers every bridged Claude turn loads.
+ *
+ * Leaving out `user` drops the host operator's `~/.claude` layer: its CLAUDE.md
+ * and everything that file imports, user skills, commands, subagents, rules,
+ * output style, enabled plugins, hooks and user-scope MCP servers. On
+ * 2026-10-14 a profile run on beelink2 loaded the host CLAUDE.md and called the
+ * host's own `operate` skill through this layer. `project` and `local` stay, so
+ * the run workspace's CLAUDE.md and `.claude/` files, where the AgentProfile is
+ * materialized, still load; `--settings` (the profile's generated settings)
+ * applies whatever this list says.
+ *
+ * `--bare` also drops this layer, but it never reads OAuth credentials or the
+ * keychain, which would sign every subscription seat out. This flag leaves auth
+ * alone: the Linux credentials file, the macOS keychain and
+ * `CLAUDE_CODE_OAUTH_TOKEN` keep working. Measured against Claude Code 2.1.299
+ * by tests/claude-host-isolation.real.test.ts.
+ */
+const HOST_ISOLATED_SETTING_SOURCES = 'project,local'
+
+/**
+ * Env every bridged Claude turn runs with, applied over the profile plan's env.
+ *
+ * Auto-memory lives in the host user's `~/.claude/projects/<cwd>/memory` and is
+ * injected whatever the setting sources say, so notes the host, or an earlier
+ * profile in the same directory, wrote there would reach every later turn.
+ */
+const HOST_ISOLATION_ENV: Readonly<Record<string, string>> = {
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+}
+
 export interface ClaudeBackendOptions {
   bin: string
   timeoutMs: number
@@ -326,7 +357,7 @@ export class ClaudeBackend implements Backend {
     // Argv mode: stdin is ignored. Stdin mode: stdin is piped (we
     // write the NDJSON payload below). The split here matches the
     // contract claude-code-cli expects for each --input-format.
-    Object.assign(childEnv, provisioned.env)
+    Object.assign(childEnv, provisioned.env, HOST_ISOLATION_ENV)
     args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
@@ -588,34 +619,34 @@ export class ClaudeBackend implements Backend {
     // rejects that second channel. Claude receives the selected set through
     // `--mcp-config <path>`, with its tools auto-allowed in byob mode.
     //
-    // We always pair with `--strict-mcp-config` so the operator's
-    // `~/.claude/` inherited servers (Google Drive, Linear, etc.) do
-    // NOT leak into the caller's request — the caller's MCP set is
-    // the entire MCP surface for this turn.
+    // `--strict-mcp-config` goes on every launch, with or without a
+    // request MCP set, so no other MCP source joins it: not the
+    // operator's user-scope servers, not the local-scope servers the
+    // host's `~/.claude.json` keeps for this directory (which
+    // `--setting-sources` below does not drop), and not a workspace
+    // `.mcp.json`. The caller's MCP set is the entire MCP surface.
     //
     // Custom tools come in via MCP — NOT via the OpenAI `tools[]`
     // emulation field. With MCP the caller's tools appear in
     // claude-code's native tool registry alongside Bash/Read/etc. and
     // get first-class calling semantics.
-    if (mcp) {
-      args.push('--mcp-config', mcp.configPath, '--strict-mcp-config')
-      if (mode !== 'hosted-safe') {
-        args.push('--allowedTools', buildMcpAllowList(mcp.serverNames))
-      }
+    if (mcp) args.push('--mcp-config', mcp.configPath)
+    args.push('--strict-mcp-config')
+    if (mcp && mode !== 'hosted-safe') {
+      args.push('--allowedTools', buildMcpAllowList(mcp.serverNames))
     }
+
+    // The host user's `~/.claude` layer never reaches a bridged turn; the
+    // caller provides every context source it wants (profile, system
+    // prompt, MCP servers, prompt content). See HOST_ISOLATED_SETTING_SOURCES
+    // for why this is not `--bare`, and HOST_ISOLATION_ENV for auto-memory.
+    args.push('--setting-sources', HOST_ISOLATED_SETTING_SOURCES)
 
     // Per-mode permission posture. Native tools (Bash/Read/Edit/etc.)
     // STAY ENABLED by design — the LLM should have full agentic
     // capability and pick the right tool (native or MCP-exposed) per
     // task. `--dangerously-skip-permissions` is the explicit ask:
     // full permissions, every tool, no interactive grant prompts.
-    //
-    // Also pass `--bare` in byob mode to suppress claude-code's
-    // operator-side defaults that leak into the request: LSP service
-    // probes, `~/.claude/projects/<dir>/memory/*.md` auto-discovery,
-    // CLAUDE.md auto-discovery, plugin sync, background prefetches,
-    // keychain reads. The caller provides every context source it
-    // wants explicitly (system prompt, MCP servers, prompt content).
     //
     // The "easily swappable with a real sandbox" property holds: when
     // the caller flips harness=sandbox, the same mcp config flows

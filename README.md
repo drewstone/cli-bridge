@@ -392,6 +392,16 @@ Existing Claude sessions retain their recorded plan when resumed after an upgrad
 Shared skills and task files still require identical bytes; conflicting content is refused before the CLI starts.
 If a caller derives session ids from a digest, the digest must include an attempt-scoped or run-scoped term.
 
+Every Claude turn runs without the host user's `~/.claude` layer, with or without a profile.
+The bridge passes `--setting-sources project,local` and `--strict-mcp-config` and sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
+The turn therefore loads no user CLAUDE.md or file it imports, no user skills, commands, subagents, rules, output style, plugins, hooks or auto-memory, and no MCP server outside the request.
+The run workspace's own CLAUDE.md and `.claude/` files still load, and so does the profile's generated `--settings` file.
+The bridge does not use `--bare`, because bare mode never reads OAuth credentials or the keychain and would sign subscription seats out.
+Login is unchanged: the Linux credentials file, the macOS keychain and `CLAUDE_CODE_OAUTH_TOKEN` all keep working.
+Host-wide policy belongs in Claude Code's managed settings, which still apply; auth, model or env defaults set in `~/.claude/settings.json` no longer reach bridged turns.
+CLAUDE.md files in directories above the workspace are still read as project memory, so keep run workspaces outside directories that hold one.
+`CLI_BRIDGE_REAL_CLAUDE_TESTS=1 pnpm exec vitest run tests/claude-host-isolation.real.test.ts` checks this against the installed `claude` without a login or any spend.
+
 OpenCode profiles can also share a task directory, and the bridge closes that directory as a channel into the process.
 OpenCode reads the project layer of its working directory on every model request, so a file written there changed the next profile's turn.
 The bridge no longer writes a profile's generated `opencode.json` into the directory; it passes that config to the one process through `OPENCODE_CONFIG_CONTENT`.

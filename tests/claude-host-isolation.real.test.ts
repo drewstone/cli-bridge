@@ -139,6 +139,8 @@ describeReal('Claude host isolation against the real CLI', () => {
       messages: [{ role: 'user', content: 'say ok' }],
       agent_profile: {
         name: 'host-isolation-canary',
+        // Reaches the CLI only through the profile's generated --settings file.
+        tools: { WebFetch: false },
         resources: {
           instructions: 'PROFILE_INSTRUCTIONS_CANARY: profile instructions.',
           skills: [{ kind: 'inline', name: 'profile-skill', content: '---\nname: profile-skill\ndescription: PROFILE_SKILL_CANARY profile skill\n---\nprofile skill\n' }],
@@ -171,19 +173,26 @@ describeReal('Claude host isolation against the real CLI', () => {
     for (const call of calls) expect(call.authorization).toBe('Bearer dummy-oauth-token')
   })
 
+  // Compared as lists so a failure names the canaries instead of printing the request.
   it('sends the profile and workspace context to the model', () => {
     const sent = modelRequests()
-    expect(sent).toContain('PROFILE_INSTRUCTIONS_CANARY')
-    expect(sent).toContain('PROFILE_SKILL_CANARY')
-    expect(sent).toContain('PROJECT_SKILL_CANARY')
+    const expected = ['PROFILE_INSTRUCTIONS_CANARY', 'PROFILE_SKILL_CANARY', 'PROJECT_SKILL_CANARY']
+    expect(expected.filter((canary) => !sent.includes(canary))).toEqual([])
+  })
+
+  it('applies the profile settings file', () => {
+    const turn = recorded.find((request) => request.path.startsWith('/v1/messages') && !request.path.includes('count_tokens'))
+    const tools = ((JSON.parse(turn!.body) as { tools?: Array<{ name?: string }> }).tools ?? []).map((tool) => tool.name)
+    expect(tools).toContain('Read')
+    expect(tools).not.toContain('WebFetch')
   })
 
   it('sends nothing from the host user layer', () => {
     const sent = modelRequests()
-    for (const canary of ['USER_MEMORY_CANARY', 'USER_AUTOMEMORY_CANARY', 'USER_SKILL_CANARY', 'USER_COMMAND_CANARY', 'USER_AGENT_CANARY']) {
-      expect(sent, canary).not.toContain(canary)
-    }
-    expect(sent).not.toContain('failOnError')
+    const hostOnly = ['USER_MEMORY_CANARY', 'USER_AUTOMEMORY_CANARY', 'USER_SKILL_CANARY', 'USER_COMMAND_CANARY', 'USER_AGENT_CANARY']
+    expect(hostOnly.filter((canary) => sent.includes(canary))).toEqual([])
+    // A materialization option the preamble used to present as a resource.
+    expect(sent.includes('failOnError')).toBe(false)
   })
 
   it('loads no host skill, subagent, MCP server or hook', () => {
