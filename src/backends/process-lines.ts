@@ -85,9 +85,29 @@ export async function* readProcessLines(
   }
 }
 
-export async function waitForProcessClose(child: ChildProcess): Promise<number | null> {
-  if (child.exitCode !== null) return child.exitCode
+/** How a child ended: its exit status, or `code: null` and the signal that killed it. */
+export interface ProcessExit {
+  code: number | null
+  signal: NodeJS.Signals | null
+}
+
+/**
+ * A `code: null` result is a process that never reported an exit status, so the
+ * turn it was running is incomplete. Callers must report it as a failure, never
+ * as a clean stop: the stream readers once skipped `null` beside `0`, and a
+ * Claude Code turn killed by a signal mid-tool reached clients as `stop`.
+ */
+export async function waitForProcessClose(child: ChildProcess): Promise<ProcessExit> {
+  // A signal death leaves `exitCode` null, so checking it alone waited forever
+  // for a 'close' that had already fired before the stream reader finished.
+  const signalCode = typeof child.signalCode === 'string' ? child.signalCode : null
+  if (child.exitCode !== null || signalCode !== null) {
+    return { code: child.exitCode, signal: signalCode }
+  }
   return await new Promise((resolve) => {
-    child.once('close', (code) => resolve(typeof code === 'number' ? code : null))
+    child.once('close', (code, signal) => resolve({
+      code: typeof code === 'number' ? code : null,
+      signal: typeof signal === 'string' ? signal : null,
+    }))
   })
 }

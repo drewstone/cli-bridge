@@ -96,7 +96,7 @@ pnpm install:harnesses      # all harnesses
 | `codex` | `brew install openai/homebrew-tap/codex` | `codex login` |
 | `opencode` | `brew install sst/tap/opencode` (+ [`opencode-kimi-full`](https://github.com/lemon07r/opencode-kimi-full) plugin for Kimi Code) | `opencode login` |
 | `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
-| `pi` | `npm install -g @earendil-works/pi-coding-agent` | Explicit provider/model config in `~/.pi/agent/models.json`; cli-bridge resolves its credential before spawn |
+| `pi` | `pnpm install:harness pi` (qualified Pi 1.0.2) | Explicit provider/model config in `~/.pi/agent/models.json`; cli-bridge resolves its credential before spawn |
 | `prime` | prime-agent, the PrimeIntellect fork of pi. It is **not installable from npm**: the registry serves the upstream pi line under the fork's own package name `@earendil-works/pi-coding-agent` (latest `0.84.x`; the fork's `0.7.x` does not exist there), and the two are wire-incompatible. Run `pnpm install:harness prime` — it builds from source at the pinned commit and installs the entrypoint as `prime-agent`, which is what `PRIME_BIN` defaults to. Do **not** install it as `pi` | Operator `models.json` named by `PRIME_MODELS_JSON`, materialized into an isolated per-run agent dir; only the apiKey env vars it names are forwarded |
 | `passthrough` | (none) | provider API keys in `.env` |
 
@@ -433,6 +433,18 @@ Existing Claude sessions retain their recorded plan when resumed after an upgrad
 Shared skills and task files still require identical bytes; conflicting content is refused before the CLI starts.
 If a caller derives session ids from a digest, the digest must include an attempt-scoped or run-scoped term.
 
+Every Claude turn runs without the host user's `~/.claude` layer, with or without a profile.
+The bridge passes `--setting-sources project,local` and `--strict-mcp-config` and sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
+The turn therefore loads no user CLAUDE.md or file it imports, no user skills, commands, subagents, rules, output style, plugins, hooks or auto-memory, and no MCP server outside the request.
+The run workspace's own CLAUDE.md and `.claude/` files still load, and so does the profile's generated `--settings` file.
+The bridge does not use `--bare`, because bare mode never reads OAuth credentials or the keychain and would sign subscription seats out.
+Login is unchanged: the Linux credentials file, the macOS keychain and `CLAUDE_CODE_OAUTH_TOKEN` all keep working.
+Host-wide policy belongs in Claude Code's managed settings, which still apply; auth, model, effort, output style, attribution or env defaults set in `~/.claude/settings.json` no longer reach bridged turns.
+A turn without a model or effort therefore uses Claude Code's defaults, and commit and pull request attribution follows Claude Code's default unless the profile's instructions or managed settings say otherwise.
+Retention cleanup does not run in these turns: Claude Code skips it when the user settings layer is off, so the host's transcripts keep the host's retention.
+CLAUDE.md files in directories above the workspace are still read as project memory, so keep run workspaces outside directories that hold one.
+`CLI_BRIDGE_REAL_CLAUDE_TESTS=1 pnpm exec vitest run tests/claude-host-isolation.real.test.ts` checks this against the installed `claude` without a login or any spend.
+
 OpenCode profiles can also share a task directory, and the bridge closes that directory as a channel into the process.
 OpenCode reads the project layer of its working directory on every model request, so a file written there changed the next profile's turn.
 The bridge no longer writes a profile's generated `opencode.json` into the directory; it passes that config to the one process through `OPENCODE_CONFIG_CONTENT`.
@@ -511,7 +523,7 @@ on success; `{ ok: false, error: string, durationMs }` on openscad
 compile failure or artifact-size overflow.
 
 **Dependencies:** `openscad` on `$PATH` (provided by the `hardware`
-nix profile in `tangle-network/agent-dev-container`). GLB output
+nix profile in `tangle-network/agent-container`). GLB output
 additionally requires `python3` + `trimesh`; if either is missing the
 endpoint omits `glb` from `artifacts` and adds a warning rather than
 failing. Configure the wall-clock budget via

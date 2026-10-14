@@ -475,6 +475,21 @@ describe('prompt intents reach each harness through its own control', () => {
       expect(preamble).not.toContain(REPLACEMENT)
       expect(preamble).not.toContain(ADDITION)
     })
+
+    it('names declared resource kinds and never the failOnError option', () => {
+      // failOnError is how materialization treats a failure, not a resource.
+      const preamble = renderLocalHarnessProfilePreamble({
+        resources: {
+          instructions: 'Read the brief.',
+          skills: [{ kind: 'inline', name: 'method', content: 'method' }],
+          files: [],
+          failOnError: true,
+        },
+      } as AgentProfile)
+
+      expect(preamble).toBe('Caller-declared resources for this session: instructions, skills')
+      expect(renderLocalHarnessProfilePreamble({ resources: { failOnError: true } } as AgentProfile)).toBeNull()
+    })
   })
 
   describe('the plan itself', () => {

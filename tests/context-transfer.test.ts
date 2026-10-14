@@ -4,10 +4,9 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import {
-  ContextTransferRequestSchema,
   canonicalAgentProfileDigest,
   canonicalCandidateDigest,
-  contextTransferRequestDigest,
+  createContextTransferRequest,
   portableContextPlanDigest,
   portableConversationContextDigest,
   type AgentProfile,
@@ -79,6 +78,7 @@ const profile: AgentProfile = {
 function transferRequest(
   operationId = 'transfer-1',
   acceptedBy: 'system' | 'policy' = 'system',
+  bound = true,
 ): ContextTransferRequest {
   const sourceMaterial = {
     source: {
@@ -114,7 +114,7 @@ function transferRequest(
   const destination = {
     runner: 'codex',
     provider: 'cli-bridge',
-    environmentId: 'environment-destination',
+    ...(bound ? { environmentId: 'environment-destination' } : {}),
     sessionId: 'session-destination',
     runId: 'run-destination',
     executionId: 'execution-destination',
@@ -134,7 +134,8 @@ function transferRequest(
     requiresAcceptance: false,
   }
   const plan = { ...planMaterial, digest: portableContextPlanDigest(planMaterial) }
-  const material = {
+  // The shared constructor projects the complete plan to the selected-only wire request.
+  return createContextTransferRequest({
     operationId,
     plan,
     profile,
@@ -143,10 +144,6 @@ function transferRequest(
       acceptedAt: '2026-08-01T20:00:02.000Z',
       acceptedBy,
     },
-  }
-  return ContextTransferRequestSchema.parse({
-    ...material,
-    requestDigest: contextTransferRequestDigest(material),
   })
 }
 
@@ -167,9 +164,11 @@ function fixture(): {
 }
 
 function destination(request: ContextTransferRequest) {
+  const { environmentId } = request.plan.destination
+  if (environmentId === undefined) throw new Error('fixture destination must bind its environment')
   return {
     provider: request.plan.destination.provider,
-    environmentId: request.plan.destination.environmentId!,
+    environmentId,
     sessionId: request.plan.destination.sessionId,
     runId: request.plan.destination.runId,
     executionId: request.plan.destination.executionId,
@@ -623,6 +622,20 @@ describe('portable context transfer', () => {
       ...destination(request),
       profile: { ...profile, name: 'wrong-profile' },
     })).toThrow(/destination does not match/)
+    store.close()
+  })
+
+  it('refuses an unbound destination before recording an admission', async () => {
+    const { store, transfers } = fixture()
+    const request = transferRequest('transfer-unbound', 'system', false)
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    expect(request.plan.kind).toBe('portable-context-transfer-plan')
+    expect(request.plan.destination.environmentId).toBeUndefined()
+    await expect(transfers.transfer(request, callerId)).rejects.toMatchObject({
+      status: 400,
+      code: 'capability_denied',
+    })
+    expect(transfers.lookup(request.operationId, request.requestDigest, callerId)).toBeNull()
     store.close()
   })
 

@@ -1,9 +1,17 @@
 import { expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Hono } from 'hono'
+import { BackendRegistry } from '../src/backends/registry.js'
+import { PiBackend } from '../src/backends/pi.js'
+import { createPiInferenceTransportResolver } from '../src/backends/pi-inference-transport.js'
+import { hostSpawner } from '../src/executors/host.js'
+import { RunRegistry } from '../src/runs/registry.js'
+import { SessionStore } from '../src/sessions/store.js'
+import { RetainedSessionService, mountRetainedSessions } from '../src/sessions/retained.js'
 import { PiNativeSession } from '../src/backends/pi-native-session.js'
 import { piNativeCapabilities } from '../src/backends/pi-native-start.js'
 
@@ -77,3 +85,123 @@ it.skipIf(process.env.CLI_BRIDGE_REAL_PI_NO_INFERENCE !== '1')('handles two real
     rmSync(dir, { recursive: true, force: true })
   }
 }, 15_000)
+
+// Exercise the retained wire contract with the production host executor and
+// actual Pi. A request must be able to raise confinement with no service floor.
+it.skipIf(process.env.CLI_BRIDGE_REAL_PI_NO_INFERENCE !== '1')('honors a retained per-session fs-jail for two real handled turns', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-pi-retained-jail-'))
+  const workspace = join(dir, 'workspace')
+  const agentDir = join(dir, 'agent')
+  const jailRoot = join(workspace, '.agent-home', 'requested')
+  mkdirSync(workspace)
+  mkdirSync(agentDir)
+  const outside = join(dir, 'sibling.txt')
+  writeFileSync(outside, 'owned fixture outside the requested workspace')
+  const bin = process.env.CLI_BRIDGE_PI_BIN ?? 'pi'
+  let connections = 0
+  const endpoint = createServer((_request, response) => response.writeHead(503).end('inference forbidden'))
+  endpoint.on('connection', () => { connections += 1 })
+  await new Promise<void>(resolve => endpoint.listen(0, '127.0.0.1', resolve))
+  const address = endpoint.address()
+  if (!address || typeof address === 'string') throw new Error('missing local endpoint')
+  writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers: {
+    'no-inference': {
+      baseUrl: `http://127.0.0.1:${address.port}/v1`, api: 'openai-completions', apiKey: 'unused-test-key',
+      models: [{ id: 'local-only', name: 'local-only', contextWindow: 8192, maxTokens: 128 }],
+    },
+  } }))
+  const extension = join(workspace, 'handled.mjs')
+  writeFileSync(extension, `import { readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+export default function (pi) {
+  let sequence = 0;
+  pi.on('input', async (event, ctx) => {
+    let outsideReadable = false;
+    try { readFileSync(${JSON.stringify(outside)}); outsideReadable = true; } catch {}
+    writeFileSync(join(homedir(), 'handled-count'), String(++sequence));
+    ctx.ui.notify(JSON.stringify({ pid: process.pid, sequence, input: event.text, home: homedir(), outsideReadable }));
+    return { action: 'handled' };
+  });
+}`)
+  // Preserve explicit operator read-only install binds (for Pi's jiti loader).
+  // The sibling fixture must remain unreadable with that real configuration.
+  const environmentKeys = ['BRIDGE_JAIL_MODE', 'WORKER_FS_JAIL', 'BRIDGE_JAIL_RW_PATHS', 'PI_OFFLINE', 'PI_TELEMETRY'] as const
+  const previous = new Map(environmentKeys.map(key => [key, process.env[key]]))
+  for (const key of environmentKeys) delete process.env[key]
+  process.env.PI_OFFLINE = '1'
+  process.env.PI_TELEMETRY = '0'
+  const store = new SessionStore(join(dir, 'store'))
+  const runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
+  const backend = new PiBackend({
+    bin, timeoutMs: 10_000, spawner: hostSpawner,
+    transportResolver: createPiInferenceTransportResolver({
+      bin, agentDir, sessionDir: join(dir, 'sessions'),
+      env: {
+        PATH: process.env.PATH, HOME: agentDir, PI_OFFLINE: '1', PI_TELEMETRY: '0',
+        PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: join(dir, 'sessions'),
+      },
+    }),
+  })
+  const app = new Hono()
+  mountRetainedSessions(app, new RetainedSessionService({
+    store, registry: new BackendRegistry().register(backend), runs,
+  }))
+  try {
+    const created = await app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({
+      id: 'real-handled-jail', model: 'pi/no-inference/local-only', cwd: workspace,
+      mode: 'byob', interaction_policy: 'interactive',
+      execution: { kind: 'host', jail: { mode: 'fs-jail', root: jailRoot }, acquireTimeoutMs: 1000 },
+      agent_profile: { name: 'handled-jail', extensions: { pi: { load: [extension] } } },
+    }) })
+    expect(created.status, await created.text()).toBe(201)
+    const pids: number[] = []
+    for (const [index, message] of ['first', 'second'].entries()) {
+      const runId = `real-handled-jail-${index}`
+      const admitted = await app.request('/v1/sessions/real-handled-jail/turns', {
+        method: 'POST', body: JSON.stringify({ message, run_id: runId, execution_id: runId }),
+      })
+      expect(admitted.status, await admitted.text()).toBe(202)
+      const deadline = Date.now() + 12_000
+      while (store.getRetained('real-handled-jail')?.turns !== index + 1 && Date.now() < deadline) {
+        if (connections > 0) throw new Error('unexpected inference connection')
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(store.getRetainedRun(runId)?.snapshot).toMatchObject({ status: 'done', terminal: true })
+      const events = store.retainedEventsAfter('real-handled-jail')
+        .filter(row => row.envelope.runId === runId).map(row => row.envelope.event)
+      expect(events).toContainEqual({ type: 'status', status: 'completed' })
+      expect(events.some(event => event.type === 'message.part.updated')).toBe(false)
+      const notifications = events.filter(event => event.type === 'raw')
+        .map(event => event.event as Record<string, unknown>)
+        .filter(event => event.type === 'extension_ui_request' && event.method === 'notify')
+      expect(notifications).toHaveLength(1)
+      const notification = JSON.parse(String(notifications[0]!.message)) as Record<string, unknown>
+      expect(notification).toMatchObject({ sequence: index + 1, input: message, home: jailRoot, outsideReadable: false })
+      expect(notification.pid).toEqual(expect.any(Number))
+      pids.push(Number(notification.pid))
+      expect(connections).toBe(0)
+    }
+    expect(pids[0]).toBe(pids[1])
+    expect(readFileSync(join(jailRoot, 'handled-count'), 'utf8')).toBe('2')
+    const closed = await app.request('/v1/sessions/real-handled-jail/close', { method: 'POST', body: '{}' })
+    expect(closed.status, await closed.text()).toBe(200)
+  } finally {
+    try {
+      // A failed assertion may leave the retained child idle or mid-turn.
+      // Close its exact session through the same owner boundary on every exit.
+      const closed = await app.request('/v1/sessions/real-handled-jail/close', { method: 'POST', body: '{}' })
+      expect([200, 404]).toContain(closed.status)
+    } finally {
+      await runs.shutdown(2_000)
+      store.close()
+      endpoint.closeAllConnections()
+      await new Promise<void>((resolve, reject) => endpoint.close(error => error ? reject(error) : resolve()))
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+}, 35_000)

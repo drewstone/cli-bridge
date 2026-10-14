@@ -113,3 +113,56 @@ sudo systemctl restart cli-bridge@$USER
 - **OAuth and headless hosts.** If the box has no browser, do `claude
   /login` from a laptop, then rsync `~/.claude` to the host. The token
   is portable across machines as long as the OS type matches.
+
+## Pi version and retained sessions
+
+The maintained Pi installer selects 1.0.2, the version exercised by
+`tests/pi-native-handled-real.test.ts`. Retained handled-input completion
+requires its explicit `data.disposition: "handled"` response. Pi 0.87.1 returns
+an ordinary success response for both handled and started inputs, so the
+bridge cannot safely interpret that response as completion. Never treat a
+missing disposition as handled.
+
+On a host with other Pi consumers, install into a service-owned prefix through
+the existing installer instead of replacing their shared executable:
+
+```bash
+pi_prefix=/srv/cli-bridge/harnesses/pi-1.0.2
+npm_config_prefix="$pi_prefix" pnpm install:harness pi
+"$pi_prefix/bin/pi" --version
+```
+
+Set `PI_BIN` to that absolute executable in this bridge's owning service
+configuration. A retained request cannot select a different service binary.
+Keep a shared environment file and other services' PATHs unchanged. If a
+wrapper also loads an environment file, check that it does not overwrite the
+service-specific `PI_BIN`.
+
+For a private npm install, add
+`$pi_prefix/lib/node_modules/@earendil-works/pi-coding-agent` to the service's
+existing `BRIDGE_JAIL_RO_PATHS` list. Pi's extension loader needs its installed
+`jiti` dependency beside the bundled CLI. Bind only this credential-free
+package tree read-only, never its parent home, provider configuration, or
+session directories. This operator bind is visible to every fs-jailed worker;
+it does not enable or lower the jail floor. A retained host request can raise
+its own confinement with `execution.jail.mode=fs-jail` and a scratch root.
+
+Use the registered deployer's idle check before replacing the service: admitted
+and queued requests, executor work, and retained sessions must be drained by
+their owner. Retain the prior binary and configuration for rollback. The
+checkout revision, selected binary, and `/health` version are deployment
+evidence; they do not prove a retained turn completed.
+
+Before claiming adoption, run two owned handled inputs through the retained
+HTTP API and retain terminal completion and same-child reuse. Use an explicit
+input extension that returns `action: "handled"`, preserving its extension
+events. Ordinary model responses do not qualify for this regression proof.
+The earlier zero-loopback-request native fixture is useful qualification, not
+a requirement to add an inference-free transport to the retained API.
+Use an authorized configured route with verified resource limits to initialize
+the native child. Handled input requires no model response, so a null served
+model is expected. Do not add a paid fallback or weaken the filesystem jail.
+Bound the proof to one owned session, two serial inputs, and 90 seconds; cancel
+unexpected model/tool activity and close only the proof session. Record
+observed usage and unknown counters honestly rather than infer zero billing
+from missing events.

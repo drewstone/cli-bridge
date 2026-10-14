@@ -269,7 +269,7 @@ describe('the runtime image the Dockerfile promises', () => {
     const installer = readFileSync(join(__dirname, '..', 'scripts', 'install-harness.sh'), 'utf8')
     const dockerfile = readFileSync(join(__dirname, '..', 'docker', 'Dockerfile.cli-runtime'), 'utf8')
 
-    expect(installer).toContain('npm install -g @earendil-works/pi-coding-agent@latest')
+    expect(installer).toContain('npm install -g @earendil-works/pi-coding-agent@1.0.2')
     expect(installer).toMatch(/pi\) install_pi/)
     expect(installer).toMatch(/for name in claude codex opencode kimi gemini pi/)
     expect(dockerfile).toContain('VOLUME /root/.pi/agent')

@@ -910,7 +910,7 @@ export class PiBackend implements NativeSessionBackend {
       const trailingReasoning = takeReasoning()
       if (trailingReasoning) yield trailingReasoning
 
-      const exitCode = await waitForProcessClose(child)
+      const { code: exitCode, signal: exitSignal } = await waitForProcessClose(child)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
 
@@ -1012,10 +1012,11 @@ export class PiBackend implements NativeSessionBackend {
       }
 
       if (exitCode !== 0) {
-        const detail = sawError ?? (stderr.render(300) || `exit ${exitCode ?? 'unknown'}`)
+        const status = exitCode ?? (exitSignal ? `signal ${exitSignal}` : 'unknown')
+        const detail = sawError ?? (stderr.render(300) || `exit ${status}`)
         const kind = piFailureKind(detail)
         throw piFailureError(
-          withPiCredentialSource(`pi exit ${exitCode ?? 'unknown'}: ${detail}`, kind, inference),
+          withPiCredentialSource(`pi exit ${status}: ${detail}`, kind, inference),
           kind,
           inference?.providerDispatchMarker,
         )

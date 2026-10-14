@@ -181,14 +181,14 @@ export class GeminiBackend implements Backend {
         }
       }
 
-      const exitCode = await waitForProcessClose(child)
+      const exit = await waitForProcessClose(child)
       if (signal.aborted) {
         yield { finish_reason: 'error' }
         return
       }
       if (sawError) throw new BackendError(`gemini: ${sawError}`, 'upstream')
-      if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(await describeCliExit(spawned, 'gemini', exitCode, stderr.render()), 'upstream')
+      if (exit.code !== 0) {
+        throw new BackendError(await describeCliExit(spawned, 'gemini', exit.code, stderr.render(), exit.signal), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`gemini produced no output: ${stderr.render(300)}`, 'upstream')
