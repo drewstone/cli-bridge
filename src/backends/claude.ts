@@ -202,17 +202,6 @@ function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
  */
 const HOST_ISOLATED_SETTING_SOURCES = 'project,local'
 
-/**
- * Env every bridged Claude turn runs with, applied over the profile plan's env.
- *
- * Auto-memory lives in the host user's `~/.claude/projects/<cwd>/memory` and is
- * injected whatever the setting sources say, so notes the host, or an earlier
- * profile in the same directory, wrote there would reach every later turn.
- */
-const HOST_ISOLATION_ENV: Readonly<Record<string, string>> = {
-  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-}
-
 export interface ClaudeBackendOptions {
   bin: string
   timeoutMs: number
@@ -357,7 +346,12 @@ export class ClaudeBackend implements Backend {
     // Argv mode: stdin is ignored. Stdin mode: stdin is piped (we
     // write the NDJSON payload below). The split here matches the
     // contract claude-code-cli expects for each --input-format.
-    Object.assign(childEnv, provisioned.env, HOST_ISOLATION_ENV)
+    Object.assign(childEnv, provisioned.env)
+    // Auto-memory lives in the host user's `~/.claude/projects/<cwd>/memory`
+    // and is injected whatever `--setting-sources` says, so notes the host, or
+    // an earlier profile in the same directory, wrote there would reach every
+    // later turn. Set after the plan env: it is host state, never profile input.
+    childEnv.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
     args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
@@ -639,7 +633,7 @@ export class ClaudeBackend implements Backend {
     // The host user's `~/.claude` layer never reaches a bridged turn; the
     // caller provides every context source it wants (profile, system
     // prompt, MCP servers, prompt content). See HOST_ISOLATED_SETTING_SOURCES
-    // for why this is not `--bare`, and HOST_ISOLATION_ENV for auto-memory.
+    // for why this is not `--bare`; chat() also turns off auto-memory.
     args.push('--setting-sources', HOST_ISOLATED_SETTING_SOURCES)
 
     // Per-mode permission posture. Native tools (Bash/Read/Edit/etc.)
