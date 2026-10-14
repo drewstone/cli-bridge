@@ -10,7 +10,7 @@
  *
  * Implementation notes:
  *   - `openscad` is expected on $PATH. In our usual setup it comes from
- *     the `hardware` profile in `tangle-network/agent-dev-container`
+ *     the `hardware` profile in `tangle-network/agent-container`
  *     (which also vendors `python` + `trimesh` for the GLB step). If
  *     the binary isn't present, the endpoint returns
  *     `{ok: false, error: "openscad not found on $PATH"}` rather than

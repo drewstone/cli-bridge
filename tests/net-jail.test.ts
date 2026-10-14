@@ -10,7 +10,7 @@
  *
  * That split is deliberate. A suite that asserted the policy was recorded and
  * stopped there is the exact defect this feature exists to remove, and it is
- * the defect filed against the sandbox API as tangle-network/agent-dev-container#4611.
+ * the defect filed against the sandbox API as tangle-network/agent-container#4611.
  */
 
 import { execFile } from 'node:child_process'
