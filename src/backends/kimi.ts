@@ -305,17 +305,22 @@ export class KimiBackend implements Backend {
         }
       }
 
-      const exitCode = await waitForProcessClose(child)
+      const exit = await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
       if (sawError) throw new BackendError(`kimi: ${sawError}`, 'upstream')
+      // A signal death interrupted the turn, so content already streamed is not
+      // a completed answer: Kimi itself never reported how the turn ended.
+      if (exit.code === null) {
+        throw new BackendError(await describeCliExit(spawned, 'kimi', null, stderr.render(), exit.signal), 'upstream')
+      }
       // If Kimi reports a non-zero exit after assistant content, preserve
       // the content because the process did complete a useful turn.
-      if (exitCode !== 0 && exitCode !== null && !emittedContent) {
-        throw new BackendError(await describeCliExit(spawned, 'kimi', exitCode, stderr.render()), 'upstream')
+      if (exit.code !== 0 && !emittedContent) {
+        throw new BackendError(await describeCliExit(spawned, 'kimi', exit.code, stderr.render()), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`kimi produced no stream output: ${stderr.render(300)}`, 'upstream')

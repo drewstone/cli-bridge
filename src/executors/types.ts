@@ -192,13 +192,15 @@ export interface SpawnResult {
  * <stderr>` — and that shape is exactly what turns an executor-level failure
  * into a CLI-level accusation. Routing all of them through one helper means a
  * new executor's diagnosis reaches every backend at once, and the fallback is
- * byte-identical to what each backend printed before.
+ * byte-identical to what each backend printed before. A `null` exit status is a
+ * signal death and names the signal instead of printing `exited null`.
  */
 export async function describeCliExit(
   spawned: Pick<SpawnResult, 'diagnoseExit'>,
   label: string,
   exitCode: number | null,
   stderr: string,
+  signal?: NodeJS.Signals | null,
 ): Promise<string> {
   let diagnosis: string | null = null
   try {
@@ -208,7 +210,8 @@ export async function describeCliExit(
     // own; fall through to the raw exit message.
   }
   if (diagnosis) return `${label} could not run: ${diagnosis}`
-  return `${label} exited ${exitCode}: ${stderr.slice(0, 300)}`
+  const status = exitCode === null ? `was killed by ${signal ?? 'a signal'}` : `exited ${exitCode}`
+  return `${label} ${status}: ${stderr.slice(0, 300)}`
 }
 
 /**

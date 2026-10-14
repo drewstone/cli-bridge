@@ -27,7 +27,7 @@ import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForFactory, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
-import type { Spawner } from '../executors/types.js'
+import { describeCliExit, type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
@@ -162,14 +162,14 @@ export class FactoryBackend implements Backend {
         }
       }
 
-      const exitCode = await waitForProcessClose(child)
+      const exit = await waitForProcessClose(child)
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
       if (sawError) throw new BackendError(`factory: ${sawError}`, 'upstream')
-      if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(`factory (droid exec) exited ${exitCode}: ${stderr.render(300)}`, 'upstream')
+      if (exit.code !== 0) {
+        throw new BackendError(await describeCliExit(spawned, 'factory (droid exec)', exit.code, stderr.render(), exit.signal), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`factory produced no output: ${stderr.render(300)}`, 'upstream')

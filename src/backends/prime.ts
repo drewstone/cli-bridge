@@ -735,7 +735,7 @@ export class PrimeBackend implements Backend {
         // additions — drop silently; the stream may gain event types.
       }
 
-      const exitCode = await waitForProcessClose(child)
+      const { code: exitCode, signal: exitSignal } = await waitForProcessClose(child)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
 
@@ -788,7 +788,7 @@ export class PrimeBackend implements Backend {
         throw new BackendError(
           describePrimeExit({
             exitCode,
-            signal: child.signalCode,
+            signal: exitSignal,
             detail,
             daemonSocketPath: home.daemonSocketPath,
           }),

@@ -461,21 +461,28 @@ export class ClaudeBackend implements Backend {
         }
       }
 
-      const exitCode = await waitForProcessClose(child)
+      const exit = await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
 
-      if (exitCode !== 0 && exitCode !== null) {
+      if (exit.code !== 0) {
         throw new BackendError(
-          await describeCliExit(spawned, 'claude', exitCode, stderr.render()),
+          await describeCliExit(spawned, 'claude', exit.code, stderr.render(), exit.signal),
           'upstream',
         )
       }
 
-      yield { finish_reason: 'stop', internal_session_id: internalSessionId }
+      // Claude Code ends every stream-json turn with a `result` event, success or
+      // failure, so a stream without one is a truncated turn whatever the exit
+      // status. Reporting it as `stop` let a client record a turn that ended on an
+      // unanswered tool_use as complete.
+      throw new BackendError(
+        `claude exited 0 without its result event, so the turn is incomplete: ${stderr.render(300)}`,
+        'upstream',
+      )
     } finally {
       signal.removeEventListener('abort', onAbort)
       // Always tear down the whole subtree before releasing the slot.
