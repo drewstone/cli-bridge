@@ -218,7 +218,8 @@ export class RetainedTurnRunner {
             model: retained.model,
             profile: config.profile as AgentProfile | undefined,
             ...(retained.cwd ? { cwd: retained.cwd } : {}),
-            executionKind: config.execution?.kind === 'sandbox' ? 'sandbox' : 'host',
+            // A sandbox execution was refused above; retained turns run on the host.
+            executionKind: 'host',
           },
         )
     const requestDigest = canonicalCandidateDigest({

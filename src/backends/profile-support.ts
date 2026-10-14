@@ -22,6 +22,7 @@ import type {
   AgentProfileConfigValue,
   AgentProfileMcpServer,
   AgentProfileModelHints,
+  ContextTransferRequest,
   ReasoningEffort,
 } from '@tangle-network/agent-interface'
 import {
@@ -859,6 +860,24 @@ export function resolveRequestedReasoningEffort(
   return profileEffort ?? req.effort ?? null
 }
 
+/**
+ * The Bridge route the first turn of an accepted transfer names.
+ *
+ * `agent-provider-cli-bridge` attaches the accepted environment with the
+ * destination model, else the profile default, qualified by the profile
+ * provider when the model names none. Native import, the session binding, and
+ * the first-turn check use this same route so the attached turn is admitted.
+ */
+export function contextTransferRoute(request: ContextTransferRequest): string {
+  const { runner } = request.plan.destination
+  const model = request.plan.destination.model ?? request.profile?.model?.default
+  const provider = request.profile?.model?.provider
+  if (!model || model === runner) return runner
+  if (model.startsWith(`${runner}/`)) return model
+  if (model.includes('/')) return `${runner}/${model}`
+  return provider ? `${runner}/${provider}/${model}` : `${runner}/${model}`
+}
+
 /** One profile binding shared by native import and the first resumed turn. */
 export function exactSessionProfileBinding(
   req: ChatRequest,
@@ -878,7 +897,6 @@ export function exactSessionProfileBinding(
     requestedReasoningEffort: resolveRequestedReasoningEffort(req, session),
   }
 }
-
 
 /** Bind a receipt to the actual transport model/provider and native reasoning control. */
 export function profileExecutionIdentity(

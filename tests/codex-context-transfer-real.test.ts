@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path'
 import { Hono } from 'hono'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  ContextTransferRequestSchema, canonicalAgentProfileDigest, contextTransferRequestDigest,
+  canonicalAgentProfileDigest, createContextTransferRequest,
   portableContextPlanDigest, portableConversationContextDigest,
   type AgentProfile, type ContextTransferRequest,
 } from '@tangle-network/agent-interface'
@@ -30,34 +30,41 @@ const frozenProfile: AgentProfile = {
   resources: { instructions: 'Materialized profile resource 18de.' },
 }
 
+const omittedMarker = 'Omitted source note 9d3f.'
+
 function nativeRequest(cwd: string): ContextTransferRequest {
-  const contextMaterial = {
-    source: {
-      runId: 'source-run', messageId: 'source-assistant', provider: 'tangle', environmentId: 'source-environment',
-      sessionId: 'source-session', executionId: 'source-execution', requestDigest: `sha256:${'a'.repeat(64)}` as const,
-    },
-    completeness: 'complete' as const,
-    messages: [
-      { id: 'source-user', role: 'user' as const, parts: [{ type: 'text' as const, text: 'Selected user part 74f2.' }, { type: 'text' as const, text: 'Second selected part b51a.' }], timestamp: '2026-08-01T20:00:00.000Z' },
-      { id: 'source-assistant', role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Selected assistant acknowledgement c184.' }], timestamp: '2026-08-01T20:00:01.000Z' },
-    ], attachments: [],
+  const boundary = {
+    runId: 'source-run', messageId: 'source-assistant', provider: 'tangle', environmentId: 'source-environment',
+    sessionId: 'source-session', executionId: 'source-execution', requestDigest: `sha256:${'a'.repeat(64)}` as const,
   }
+  const omitted = { id: 'source-omitted', role: 'user' as const, parts: [{ type: 'text' as const, text: omittedMarker }], timestamp: '2026-08-01T19:59:59.000Z' }
+  const selected = [
+    { id: 'source-user', role: 'user' as const, parts: [{ type: 'text' as const, text: 'Selected user part 74f2.' }, { type: 'text' as const, text: 'Second selected part b51a.' }], timestamp: '2026-08-01T20:00:00.000Z' },
+    { id: 'source-assistant', role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'Selected assistant acknowledgement c184.' }], timestamp: '2026-08-01T20:00:01.000Z' },
+  ]
+  const sourceMaterial = { source: boundary, completeness: 'complete' as const, messages: [omitted, ...selected], attachments: [] }
+  const source = { ...sourceMaterial, digest: portableConversationContextDigest(sourceMaterial) }
+  const contextMaterial = { source: boundary, completeness: 'partial' as const, messages: selected, attachments: [] }
   const context = { ...contextMaterial, digest: portableConversationContextDigest(contextMaterial) }
+  const reason = 'Not selected for this handoff.'
   const planMaterial = {
-    planId: 'native-plan', source: context, destination: {
+    planId: 'native-plan', source, destination: {
       runner: 'codex', provider: 'cli-bridge', sessionId: 'native-logical-session', runId: 'native-first-run',
       executionId: 'native-first-execution', model: 'fixture/gpt-5.4', profileDigest: canonicalAgentProfileDigest(frozenProfile),
     },
-    messages: context.messages.map((message) => ({ messageId: message.id, action: 'include' as const, parts: message.parts.map((_, partIndex) => ({ partIndex, action: 'include' as const })) })),
-    context, requiresAcceptance: false,
+    messages: [
+      { messageId: omitted.id, action: 'omit' as const, reason, parts: [{ partIndex: 0, action: 'omit' as const, reason }] },
+      ...selected.map((message) => ({ messageId: message.id, action: 'include' as const, parts: message.parts.map((_, partIndex) => ({ partIndex, action: 'include' as const })) })),
+    ],
+    context, requiresAcceptance: true,
   }
   const plan = { ...planMaterial, digest: portableContextPlanDigest(planMaterial) }
-  const material = {
+  // The consumer path: the shared constructor sends only the selected projection.
+  return createContextTransferRequest({
     operationId: 'native-import-operation', plan, profile: frozenProfile,
     workspace: { cwd: { base: 'host' as const, path: cwd } },
-    acceptance: { planDigest: plan.digest, acceptedAt: '2026-08-01T20:00:02.000Z', acceptedBy: 'system' as const },
-  }
-  return ContextTransferRequestSchema.parse({ ...material, requestDigest: contextTransferRequestDigest(material) })
+    acceptance: { planDigest: plan.digest, acceptedAt: new Date().toISOString(), acceptedBy: 'policy' as const },
+  })
 }
 
 describe('real Codex native context consumer', () => {
@@ -107,6 +114,8 @@ describe('real Codex native context consumer', () => {
       },
     })
     const request = nativeRequest(workspace)
+    expect(request.plan.kind).toBe('portable-context-transfer-plan')
+    expect(JSON.stringify(request)).not.toContain(omittedMarker)
     const authorization = 'Bearer fixture-owner'
     const headers = { authorization, 'content-type': 'application/json' }
     let store: SessionStore | undefined
@@ -139,8 +148,9 @@ describe('real Codex native context consumer', () => {
       const restarted = startReceiver()
       const replayResponse = await restarted.request('/v1/context-transfers', { method: 'POST', headers, body: JSON.stringify(request) })
       expect(replayResponse.status).toBe(200)
-      const receipt = await replayResponse.json() as { status: string; environmentId: string }
+      const receipt = await replayResponse.json() as { status: string; environmentId: string; omittedMessageIds: string[] }
       expect(receipt.status).toBe('replayed')
+      expect(receipt.omittedMessageIds).toEqual(['source-omitted'])
       expect(store!.get(request.plan.destination.sessionId, 'codex')?.internalId).toBe(nativeId)
       expect(modelRequests).toHaveLength(0)
       const result = await restarted.request('/v1/chat/completions', {
@@ -165,6 +175,7 @@ describe('real Codex native context consumer', () => {
       const firstUser = input.find((item) => JSON.stringify(item).includes('First destination user turn e083.'))!
       expect(firstUser.role).toBe('user')
       expect(JSON.stringify(firstUser)).not.toContain('Selected ')
+      expect(JSON.stringify(modelRequests[0])).not.toContain(omittedMarker)
       expect(JSON.stringify(modelRequests[0])).toContain('native context conformance assistant 284e')
       expect(JSON.stringify(modelRequests[0])).toContain('Native profile instruction 91ca')
       expect(JSON.stringify(modelRequests[0])).toContain('Materialized profile resource 18de')

@@ -287,7 +287,9 @@ Set a positive `BRIDGE_RUN_MAX_LIFETIME_MS` only when the operator requires a ha
 ### Portable context transfer
 
 `POST /v1/context-transfers` accepts the canonical `ContextTransferRequest` from
-`@tangle-network/agent-interface`. The request digest binds its accepted plan,
+`@tangle-network/agent-interface`: the selected-only transfer plan that
+`createContextTransferRequest` projects, so content the user omitted never
+reaches the bridge. The request digest binds its accepted plan,
 full inline profile, workspace, and allocation resources. The same operation and
 digest replay one receipt across restarts; changed input under that operation
 returns a conflict. Lookup is available through
@@ -298,8 +300,11 @@ An unbound destination omits `plan.destination.environmentId` and supplies its
 exact profile. The bridge records a fresh local environment identity separately
 and returns it as `receipt.environmentId`, preserving the accepted destination
 unchanged. The subsequent turn must use that environment,
-session, run, execution, model, and full profile. A declared
-`workspace.cwd` must use `base: "host"`; the turn must use the exact declared path.
+session, run, execution, model, and full profile. The model is the route
+`agent-provider-cli-bridge` attaches with: the destination model, else the
+profile default, qualified by the profile provider when the model names none.
+A declared `workspace.cwd` must use `base: "host"`; the turn must use the exact
+declared path.
 
 The Codex host backend initializes a fresh native thread with selected text parts
 through the public app-server API, preserving message roles and part order. It
@@ -307,9 +312,19 @@ uses the exact public profile and the existing profile materializer. The receive
 records the native thread ID before import and the native checkpoint acknowledgement
 before returning an accepted receipt. The first turn resumes that native thread
 with only the new user input; it requires the exact transfer request. The
-installed protocol must be qualified as `codex-cli 0.162.1` and an explicit
-existing host cwd is required. Other backends and selected non-text or tool-role
-messages are unavailable until their native import path is implemented and proved.
+installed Codex must report the version qualified in `CodexBackend.health`
+(`src/backends/codex.ts`), and an explicit existing host cwd is required. Other
+backends and selected non-text or tool-role messages are unavailable until their
+native import path is implemented and proved.
+
+`GET /v1/capabilities?model=…` reports `contextTransfer` with `freshSession`,
+`requestIdempotency`, `lookup`, and `attach` only for a route whose backend can
+perform that import, which today is a qualified Codex host backend with a
+retained state directory. Every other route omits `contextTransfer`. `attach`
+means a provider's `get(environmentId, { contextTransfer })` can verify the
+durable receipt here, and the bridge admits only the first turn that presents the
+exact transfer at the accepted coordinates; any other dispatch to that session is
+refused until that turn has completed.
 
 HTTP receipt loss can replay an acknowledged import after restart. An uncertain
 native create or inject acknowledgement remains pending and is never repeated.

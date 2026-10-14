@@ -8,6 +8,7 @@ import {
   ContextTransferRequestSchema,
   canonicalAgentProfileDigest,
   workspaceCwdPathForBase,
+  type AgentProfile,
   type ContextTransferRequest,
 } from '@tangle-network/agent-interface'
 import { BackendError, type PreparedContextTransfer, type ProfileMaterializationReceipt } from './types.js'
@@ -18,7 +19,8 @@ import { StringDecoder } from 'node:string_decoder'
 const MAX_RPC_LINE_BYTES = 8 * 1024 * 1024
 const RPC_TIMEOUT_MS = 30_000
 
-export function validateCodexContextTransfer(request: ContextTransferRequest): void {
+/** Returns the exact public profile the native thread will be created with. */
+export function validateCodexContextTransfer(request: ContextTransferRequest): AgentProfile {
   ContextTransferRequestSchema.parse(request)
   if (!request.profile || canonicalAgentProfileDigest(request.profile) !== request.plan.destination.profileDigest
     || request.plan.destination.runner !== 'codex' || (request.profile.harness !== undefined && request.profile.harness !== 'codex')) {
@@ -29,6 +31,7 @@ export function validateCodexContextTransfer(request: ContextTransferRequest): v
   }
   workspaceCwdPathForBase(request.workspace.cwd, 'host', 'Codex context transfer')
   codexContextItems(request)
+  return request.profile
 }
 
 /** Preserve roles and part order; unsupported parts are refused before native allocation. */
@@ -40,14 +43,20 @@ export function codexContextItems(request: ContextTransferRequest): Record<strin
     return {
       type: 'message',
       role: message.role,
-      content: message.parts.map((part) => {
-        if (part.type !== 'text') {
-          throw new BackendError('Codex native context import does not yet support selected non-text parts', 'capability_denied')
-        }
-        return { type: message.role === 'assistant' ? 'output_text' : 'input_text', text: part.text }
-      }),
+      content: message.parts.map((part) => (
+        { type: message.role === 'assistant' ? 'output_text' : 'input_text', text: selectedText(part) }
+      )),
     }
   })
+}
+
+/** The wire plan has already checked each selected part's bytes; Codex imports text parts only. */
+function selectedText(part: unknown): string {
+  if (typeof part === 'object' && part !== null && 'type' in part && part.type === 'text'
+    && 'text' in part && typeof part.text === 'string') {
+    return part.text
+  }
+  throw new BackendError('Codex native context import does not yet support selected non-text parts', 'capability_denied')
 }
 
 export class CodexContextTransfer implements PreparedContextTransfer {
@@ -88,24 +97,32 @@ export class CodexContextTransfer implements PreparedContextTransfer {
   }
 
   async createSession(): Promise<{ nativeSessionId: string; createdAt: string }> {
+    const cwd = this.request.workspace?.cwd
+    if (!cwd) throw new Error('Codex native import requires its validated host cwd')
     const response = await this.rpc('thread/start', {
-      cwd: workspaceCwdPathForBase(this.request.workspace!.cwd!, 'host', 'Codex context transfer'),
+      cwd: workspaceCwdPathForBase(cwd, 'host', 'Codex context transfer'),
       approvalPolicy: 'never', sandbox: 'read-only', ephemeral: false,
     })
-    const thread = response.thread as Record<string, unknown> | undefined
-    if (!thread || typeof thread.id !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(thread.id)
-      || typeof thread.createdAt !== 'number' || !Number.isFinite(thread.createdAt)) {
+    const thread = response.thread
+    if (typeof thread !== 'object' || thread === null || !('id' in thread) || typeof thread.id !== 'string'
+      || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(thread.id)
+      || !('createdAt' in thread) || typeof thread.createdAt !== 'number' || !Number.isFinite(thread.createdAt)) {
       throw new Error('Codex app-server creation acknowledgement has no exact identity')
     }
     this.createdSessionId = thread.id
-    return { nativeSessionId: thread.id, createdAt: new Date(thread.createdAt * 1000).toISOString() }
+    // Codex reports whole seconds, which can precede a same-second acceptance.
+    // The receipt needs created-after-acceptance ordering, so record when this
+    // receiver observed the creation acknowledgement.
+    return { nativeSessionId: thread.id, createdAt: new Date().toISOString() }
   }
 
   async importHistory(nativeSessionId: string): Promise<void> {
     if (this.createdSessionId !== nativeSessionId) {
       const response = await this.rpc('thread/resume', { threadId: nativeSessionId })
-      const thread = response.thread as Record<string, unknown> | undefined
-      if (thread?.id !== nativeSessionId) throw new Error('Codex resumed a different native thread')
+      const thread = response.thread
+      if (typeof thread !== 'object' || thread === null || !('id' in thread) || thread.id !== nativeSessionId) {
+        throw new Error('Codex resumed a different native thread')
+      }
     }
     const items = codexContextItems(this.request)
     if (items.length > 0) await this.rpc('thread/inject_items', { threadId: nativeSessionId, items })

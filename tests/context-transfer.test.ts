@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import {
+  AgentEnvironmentCapabilitiesSchema,
   canonicalAgentProfileDigest,
   canonicalCandidateDigest,
   createContextTransferRequest,
@@ -20,6 +21,8 @@ import { RunRegistry } from '../src/runs/registry.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { RetainedSessionService, mountRetainedSessions } from '../src/sessions/retained.js'
 import { RetainedContextTransfers } from '../src/sessions/retained/context-transfer.js'
+import { readyBackendCapabilities } from '../src/sessions/retained/capabilities.js'
+import { contextTransferRoute } from '../src/backends/profile-support.js'
 import { RetainedSessionError } from '../src/sessions/retained/types.js'
 
 const directories: string[] = []
@@ -75,11 +78,19 @@ const profile: AgentProfile = {
   resources: { instructions: 'Read the workspace before making changes.' },
 }
 
-function transferRequest(
-  operationId = 'transfer-1',
-  acceptedBy: 'system' | 'policy' = 'system',
-  bound = true,
-): ContextTransferRequest {
+interface TransferRequestOptions {
+  operationId?: string
+  acceptedBy?: 'system' | 'policy'
+  /** Bind the destination environment in the accepted plan instead of letting the receiver allocate it. */
+  bound?: boolean
+  destinationProfile?: AgentProfile
+  workspace?: ContextTransferRequest['workspace']
+  resources?: ContextTransferRequest['resources']
+}
+
+/** Build the complete local plan and project it through the shared constructor, as consumers do. */
+function buildTransferRequest(options: TransferRequestOptions = {}): ContextTransferRequest {
+  const destinationProfile = options.destinationProfile ?? profile
   const sourceMaterial = {
     source: {
       runId: 'run-source',
@@ -114,12 +125,12 @@ function transferRequest(
   const destination = {
     runner: 'codex',
     provider: 'cli-bridge',
-    ...(bound ? { environmentId: 'environment-destination' } : {}),
+    ...(options.bound === false ? {} : { environmentId: 'environment-destination' }),
     sessionId: 'session-destination',
     runId: 'run-destination',
     executionId: 'execution-destination',
     model: 'gpt-5.6',
-    profileDigest: canonicalAgentProfileDigest(profile),
+    profileDigest: canonicalAgentProfileDigest(destinationProfile),
   }
   const planMaterial = {
     planId: 'plan-transfer',
@@ -134,17 +145,25 @@ function transferRequest(
     requiresAcceptance: false,
   }
   const plan = { ...planMaterial, digest: portableContextPlanDigest(planMaterial) }
-  // The shared constructor projects the complete plan to the selected-only wire request.
   return createContextTransferRequest({
-    operationId,
+    operationId: options.operationId ?? 'transfer-1',
     plan,
-    profile,
+    profile: destinationProfile,
+    ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+    ...(options.resources === undefined ? {} : { resources: options.resources }),
     acceptance: {
       planDigest: plan.digest,
       acceptedAt: '2026-08-01T20:00:02.000Z',
-      acceptedBy,
+      acceptedBy: options.acceptedBy ?? 'system',
     },
   })
+}
+
+function transferRequest(
+  operationId = 'transfer-1',
+  acceptedBy: 'system' | 'policy' = 'system',
+): ContextTransferRequest {
+  return buildTransferRequest({ operationId, acceptedBy })
 }
 
 function fixture(): {
@@ -177,33 +196,11 @@ function destination(request: ContextTransferRequest) {
   }
 }
 
-function unboundTransferRequest(operationId = 'transfer-unbound'): ContextTransferRequest {
-  const original = structuredClone(transferRequest(operationId))
-  Reflect.deleteProperty(original.plan.destination, 'environmentId')
-  const { digest: _digest, ...planMaterial } = original.plan
-  const plan = { ...planMaterial, digest: portableContextPlanDigest(planMaterial) }
-  const material = {
-    operationId,
-    plan,
-    profile,
-    acceptance: { ...original.acceptance, planDigest: plan.digest },
-  }
-  return ContextTransferRequestSchema.parse({
-    ...material,
-    requestDigest: contextTransferRequestDigest(material),
-  })
-}
-
-function withAllocation(
-  request: ContextTransferRequest,
-  allocation: Pick<ContextTransferRequest, 'workspace' | 'resources'>,
+function unboundTransferRequest(
+  operationId = 'transfer-unbound',
+  allocation: Pick<TransferRequestOptions, 'workspace' | 'resources'> = {},
 ): ContextTransferRequest {
-  const { requestDigest: _digest, ...base } = request
-  const material = { ...base, ...allocation }
-  return ContextTransferRequestSchema.parse({
-    ...material,
-    requestDigest: contextTransferRequestDigest(material),
-  })
+  return buildTransferRequest({ operationId, bound: false, ...allocation })
 }
 
 function deferred() {
@@ -222,6 +219,52 @@ class BlockedReadyBackend extends ReadyBackend {
 }
 
 describe('portable context transfer', () => {
+  it('reports attachment only for a backend that imports into a fresh native session', async () => {
+    const native = new ReadyBackend()
+    const unavailable = Object.assign(new ReadyBackend(), { contextTransferAvailable: () => false })
+    const backend = new ReadyBackend()
+    const oneShot: Backend = {
+      name: backend.name, matches: (model) => backend.matches(model),
+      health: () => backend.health(), chat: (request) => backend.chat(request),
+    }
+    const document = async (candidate: Backend) => (await readyBackendCapabilities({
+      registry: new BackendRegistry().register(candidate), model: 'codex/gpt-5.6', healthProbeTimeoutMs: 100,
+    })).capabilities
+    const supported = await document(native)
+    expect(supported.contextTransfer).toEqual({ freshSession: true, requestIdempotency: true, lookup: true, attach: true })
+    expect(AgentEnvironmentCapabilitiesSchema.safeParse(supported).success).toBe(true)
+    for (const candidate of [unavailable, oneShot]) {
+      const refused = await document(candidate)
+      // Interface 5 requires lookup whenever the field is present, so an unsupported route omits it.
+      expect(refused.contextTransfer).toBeUndefined()
+      expect(AgentEnvironmentCapabilitiesSchema.safeParse(refused).success).toBe(true)
+    }
+  })
+
+  it('binds the first turn to the route the CLI Bridge provider attaches with', async () => {
+    const qualified: AgentProfile = { ...profile, model: { provider: 'openai', default: 'gpt-5.5' } }
+    const request = buildTransferRequest({ operationId: 'transfer-route', bound: false, destinationProfile: qualified })
+    expect(contextTransferRoute(request)).toBe('codex/openai/gpt-5.6')
+    const { store, transfers } = fixture()
+    const callerId = canonicalCandidateDigest('Bearer owner')
+    try {
+      const receipt = await transfers.transfer(request, callerId)
+      if (receipt.status !== 'accepted') throw new Error('transfer was not accepted')
+      expect(store.get(request.plan.destination.sessionId, 'codex')?.metadata.agent_profile_binding).toMatchObject({
+        model: 'codex/openai/gpt-5.6', provider: 'openai',
+      })
+      const attached = {
+        ...destination(transferRequest()), environmentId: receipt.environmentId,
+        model: 'codex/openai/gpt-5.6', profile: qualified,
+      }
+      expect(transfers.messagesForTurn(request, callerId, attached)).toEqual([])
+      expect(() => transfers.messagesForTurn(request, callerId, { ...attached, model: 'codex/gpt-5.6' }))
+        .toThrow(/destination does not match/)
+    } finally {
+      store.close()
+    }
+  })
+
   it.each(['create', 'inject'] as const)('holds an uncertain native %s acknowledgement across restart without another side effect', async (effect) => {
     const directory = mkdtempSync(join(tmpdir(), 'cli-bridge-native-unknown-'))
     directories.push(directory)
@@ -328,9 +371,8 @@ describe('portable context transfer', () => {
     const service = new RetainedSessionService({ store, registry, runs, healthProbeTimeoutMs: 100 })
     const app = new Hono()
     mountRetainedSessions(app, service)
-    const { requestDigest: _digest, ...base } = transferRequest()
-    const material = { ...base, profile }
-    const request = { ...material, requestDigest: contextTransferRequestDigest(material) }
+    const request = transferRequest()
+    expect(request.plan.kind).toBe('portable-context-transfer-plan')
 
     try {
       const response = await app.request('/v1/context-transfers', {
@@ -419,22 +461,13 @@ describe('portable context transfer', () => {
     const callerId = canonicalCandidateDigest('Bearer owner')
     try {
       await transfers.transfer(request, callerId)
-      const changedProfile = { ...profile, name: 'different-profile' }
-      const { digest: _planDigest, ...planMaterial } = request.plan
-      const changedPlanMaterial = {
-        ...planMaterial,
-        destination: { ...planMaterial.destination, profileDigest: canonicalAgentProfileDigest(changedProfile) },
-      }
-      const changedPlan = { ...changedPlanMaterial, digest: portableContextPlanDigest(changedPlanMaterial) }
-      const { requestDigest: _digest, ...base } = request
-      const changedMaterial = {
-        ...base, profile: changedProfile, plan: changedPlan,
-        acceptance: { ...request.acceptance, planDigest: changedPlan.digest },
-      }
       const changedRequests = [
-        ContextTransferRequestSchema.parse({ ...changedMaterial, requestDigest: contextTransferRequestDigest(changedMaterial) }),
-        withAllocation(request, { workspace: { cwd: { base: 'host', path: '/tmp/changed-portable-return' } } }),
-        withAllocation(request, { resources: { cpu: 2 } }),
+        buildTransferRequest({
+          operationId: request.operationId, bound: false,
+          destinationProfile: { ...profile, name: 'different-profile' },
+        }),
+        unboundTransferRequest(request.operationId, { workspace: { cwd: { base: 'host', path: '/tmp/changed-portable-return' } } }),
+        unboundTransferRequest(request.operationId, { resources: { cpu: 2 } }),
       ]
       for (const changed of changedRequests) {
         await expect(transfers.transfer(changed, callerId)).resolves.toMatchObject({
@@ -448,7 +481,7 @@ describe('portable context transfer', () => {
 
   it('requires the exact declared host cwd when consuming admitted context', async () => {
     const { store, transfers } = fixture()
-    const request = withAllocation(unboundTransferRequest(), {
+    const request = unboundTransferRequest('transfer-unbound', {
       workspace: { cwd: { base: 'host', path: '/tmp/portable-return' } },
     })
     const callerId = canonicalCandidateDigest('Bearer owner')
@@ -480,7 +513,7 @@ describe('portable context transfer', () => {
     { resources: { cpu: 2 } },
   ])('refuses unsupported local allocation before durable admission: %j', async (allocation) => {
     const { store, transfers } = fixture()
-    const request = withAllocation(unboundTransferRequest(), allocation)
+    const request = unboundTransferRequest('transfer-unbound', allocation)
     const callerId = canonicalCandidateDigest('Bearer owner')
     try {
       await expect(transfers.transfer(request, callerId)).rejects.toMatchObject({ status: 400, code: 'capability_denied' })
@@ -625,20 +658,6 @@ describe('portable context transfer', () => {
     store.close()
   })
 
-  it('refuses an unbound destination before recording an admission', async () => {
-    const { store, transfers } = fixture()
-    const request = transferRequest('transfer-unbound', 'system', false)
-    const callerId = canonicalCandidateDigest('Bearer owner')
-    expect(request.plan.kind).toBe('portable-context-transfer-plan')
-    expect(request.plan.destination.environmentId).toBeUndefined()
-    await expect(transfers.transfer(request, callerId)).rejects.toMatchObject({
-      status: 400,
-      code: 'capability_denied',
-    })
-    expect(transfers.lookup(request.operationId, request.requestDigest, callerId)).toBeNull()
-    store.close()
-  })
-
   it('does not disclose an operation to a different authenticated caller', async () => {
     const { store, transfers } = fixture()
     const request = transferRequest()
@@ -670,7 +689,7 @@ describe('portable context transfer', () => {
       runs,
       contextTransfers: service,
     })
-    const request = withAllocation(unboundTransferRequest(), {
+    const request = unboundTransferRequest('transfer-unbound', {
       workspace: { cwd: { base: 'host', path: '/tmp/portable-return' } },
     })
     const authorization = 'Bearer owner'

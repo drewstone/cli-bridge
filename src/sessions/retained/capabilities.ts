@@ -125,11 +125,7 @@ export function genericCliBridgeCapabilities(_backendName?: string, nativeContex
       eventIdentity: true,
       cancellationIdempotency: true,
     },
-    contextTransfer: {
-      freshSession: nativeContextTransfer,
-      requestIdempotency: nativeContextTransfer,
-      lookup: nativeContextTransfer,
-    },
+    ...contextTransferCapability(nativeContextTransfer),
     workspace: {
       read: false,
       write: false,
@@ -207,13 +203,10 @@ async function assertReady(backend: Backend, healthProbeTimeoutMs: number, signa
 }
 
 function validatedNativeCapabilities(backend: NativeSessionBackend): AgentEnvironmentCapabilities {
+  const { contextTransfer: _reported, ...native } = nativeCapabilities(backend)
   const validated = AgentEnvironmentCapabilitiesSchema.safeParse({
-    ...nativeCapabilities(backend),
-    contextTransfer: {
-      freshSession: supportsContextTransfer(backend),
-      requestIdempotency: supportsContextTransfer(backend),
-      lookup: supportsContextTransfer(backend),
-    },
+    ...native,
+    ...contextTransferCapability(supportsContextTransfer(backend)),
   })
   if (!validated.success) {
     throw new RetainedSessionError('backend advertised invalid Agent Interface capabilities', 500, 'server_error')
@@ -259,6 +252,21 @@ function assertRetainedCapabilities(capabilities: AgentEnvironmentCapabilities, 
       'capability_denied',
     )
   }
+}
+
+/**
+ * Portable context is offered only where the destination backend imports the
+ * accepted selection into a fresh native session before its first turn.
+ *
+ * `attach` follows the Interface definition: provider `get(id, { contextTransfer })`
+ * verifies this receiver's durable receipt, and the receiver admits only the
+ * first turn that presents the exact transfer at the accepted coordinates.
+ * Any other dispatch to that session is refused until that turn has completed.
+ */
+function contextTransferCapability(supported: boolean): Pick<AgentEnvironmentCapabilities, 'contextTransfer'> {
+  return supported
+    ? { contextTransfer: { freshSession: true, requestIdempotency: true, lookup: true, attach: true } }
+    : {}
 }
 
 function supportsContextTransfer(backend: Backend): boolean {

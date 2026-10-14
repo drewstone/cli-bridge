@@ -59,8 +59,11 @@ describe('Codex native import transport', () => {
     })
     try {
       await fixture.client.initialize()
+      const before = Date.now()
       const created = await fixture.client.createSession()
       expect(created.nativeSessionId).toBe(nativeId)
+      // Codex reports whole seconds; the receipt orders creation after acceptance with the observed ACK time.
+      expect(Date.parse(created.createdAt)).toBeGreaterThanOrEqual(before)
       await expect(fixture.client.importHistory(nativeId)).rejects.toThrow(/closed before acknowledgement/)
       expect(fixture.commands.map((command) => command.method)).toEqual(['initialize', 'initialized', 'thread/start', 'thread/inject_items'])
     } finally {

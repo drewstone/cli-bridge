@@ -36,6 +36,7 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   codexMcpConfigText,
+  contextTransferRoute,
   materializeMcpServersForCodex,
   profileExecutionIdentity,
   provisionProfileWorkspace,
@@ -103,11 +104,11 @@ export class CodexBackend implements Backend {
     if (!this.opts.stateDir || this.spawner.executionEnvironment === 'docker') {
       throw new BackendError('Codex native context import requires the retained host executor state directory', 'capability_denied')
     }
-    validateCodexContextTransfer(request)
+    const profile = validateCodexContextTransfer(request)
     const req = codexTransferChatRequest(request)
     const effort = nativeReasoningControl('codex', resolveRequestedReasoningEffort(req, null))
     profileExecutionIdentity(req, null, 'codex', effort)
-    assertWorkspacePlanSupported(materializeProfile(request.profile!, 'codex', { skip: ['mcp'] }))
+    assertWorkspacePlanSupported(materializeProfile(profile, 'codex', { skip: ['mcp'] }))
   }
 
   async prepareContextTransfer(
@@ -606,9 +607,8 @@ export class CodexBackend implements Backend {
 }
 
 function codexTransferChatRequest(request: ContextTransferRequest): ChatRequest {
-  const model = request.plan.destination.model
   return {
-    model: !model || model === 'codex' || model.startsWith('codex/') ? model ?? 'codex' : `codex/${model}`,
+    model: contextTransferRoute(request),
     messages: [], agent_profile: request.profile, session_id: request.plan.destination.sessionId,
     cwd: workspaceCwdPathForBase(request.workspace!.cwd!, 'host', 'Codex context transfer'), mode: 'byob',
   }
