@@ -2264,7 +2264,7 @@ export function renderLocalHarnessProfilePreamble(profile: AgentProfile | null):
     sections.push(`Caller-declared MCP servers for this session: ${mcpServers.join(', ')}`)
   }
 
-  const resources = pickNamedEntries((profile as Record<string, unknown>).resources)
+  const resources = pickDeclaredResources((profile as Record<string, unknown>).resources)
   if (resources.length) {
     sections.push(`Caller-declared resources for this session: ${resources.join(', ')}`)
   }
@@ -2304,6 +2304,27 @@ function pickNamedEntries(value: unknown): string[] {
     return Object.keys(value as Record<string, unknown>).filter(Boolean)
   }
   return []
+}
+
+/**
+ * The resource kinds a profile actually declares.
+ *
+ * `AgentProfileResources` mixes resource kinds (`files`, `skills`,
+ * `instructions`, ...) with materialization options such as `failOnError`.
+ * An option is a scalar, never content, so only a kind holding at least one
+ * resource is named; the model was being told `failOnError` was a resource.
+ */
+function pickDeclaredResources(value: unknown): string[] {
+  if (Array.isArray(value) || !value || typeof value !== 'object') return pickNamedEntries(value)
+  return Object.entries(value as Record<string, unknown>)
+    .filter(([, declared]) => holdsResource(declared))
+    .map(([kind]) => kind)
+}
+
+function holdsResource(declared: unknown): boolean {
+  if (Array.isArray(declared)) return declared.length > 0
+  if (typeof declared === 'string') return declared.trim().length > 0
+  return declared !== null && typeof declared === 'object'
 }
 
 function renderPermissions(value: unknown): string | null {

@@ -1084,6 +1084,36 @@ describe('ClaudeBackend stdin payload + buildArgs', () => {
     expect(args).not.toContain('--disallowed-tools')
   })
 
+  it('loads only the project and local settings layers on every launch', () => {
+    // The host user's ~/.claude layer (CLAUDE.md, skills, plugins, hooks) is not
+    // part of any request. `--bare` would drop it too, but it never reads OAuth
+    // or the keychain, so it would sign every subscription seat out.
+    for (const mode of ['byob', 'hosted-safe'] as const) {
+      for (const transport of [{ userTextForArgv: 'summarize' }, {}]) {
+        const args = b.buildArgs(baseReq, null, mode, null, transport)
+        const i = args.indexOf('--setting-sources')
+        expect(i, mode).toBeGreaterThan(-1)
+        expect(args[i + 1]).toBe('project,local')
+        expect(args).not.toContain('--bare')
+      }
+    }
+  })
+
+  it('makes the request MCP set the only MCP surface, including when it is empty', () => {
+    // Without --strict-mcp-config the CLI adds the operator's user-scope servers
+    // and the local-scope servers ~/.claude.json keeps for the workspace path.
+    expect(b.buildArgs(baseReq, null, 'byob')).toContain('--strict-mcp-config')
+    const args = b.buildArgs(baseReq, null, 'byob', {
+      configPath: '/tmp/request-mcp.json',
+      serverNames: ['request-server'],
+      cleanup() {},
+    })
+    const i = args.indexOf('--mcp-config')
+    expect(args.slice(i, i + 3)).toEqual(['--mcp-config', '/tmp/request-mcp.json', '--strict-mcp-config'])
+    expect(args.filter((arg) => arg === '--strict-mcp-config')).toHaveLength(1)
+    expect(args[args.indexOf('--allowedTools') + 1]).toContain('request-server')
+  })
+
   it('hosted-safe mode still uses plan + disallowed-tools, not bypass', () => {
     const args = b.buildArgs(baseReq, null, 'hosted-safe')
     const i = args.indexOf('--permission-mode')

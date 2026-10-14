@@ -99,4 +99,42 @@ describe('Claude profiles in a shared task workspace', () => {
       rmSync(cwd, { recursive: true, force: true })
     }
   })
+
+  it('launches a profile turn without the host user layer or auto-memory', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'claude-host-isolation-'))
+    const launches: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = []
+    const script = `
+      console.log(JSON.stringify({type:'system',subtype:'init',session_id:'native-session'}))
+      console.log(JSON.stringify({type:'result',subtype:'success',session_id:'native-session'}))
+    `
+    const spawner: Spawner = async (_bin, args, opts) => {
+      launches.push({ args, env: opts.env ?? {} })
+      const child = spawn(process.execPath, ['-e', script], { cwd: opts.cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+      return { child, release() {}, spawnError: () => null }
+    }
+    const backend = new ClaudeBackend({ bin: 'claude', harness: 'claude-code', timeoutMs: 0, spawner })
+    try {
+      const req: ChatRequest = {
+        cwd,
+        session_id: 'host-isolation',
+        mode: 'byob',
+        model: 'claude-code/anthropic/sonnet',
+        messages: [{ role: 'user', content: 'hello' }],
+        agent_profile: { name: 'isolated', tools: { Read: true }, resources: { instructions: 'Profile instructions.' } },
+      }
+      for await (const _delta of backend.chat(req, null, new AbortController().signal)) { /* drain */ }
+      const [launch] = launches
+      // The profile's own instructions are a project-layer file, which stays loaded.
+      expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toContain('Profile instructions.')
+      expect(launch!.args.slice(launch!.args.indexOf('--setting-sources'), launch!.args.indexOf('--setting-sources') + 2))
+        .toEqual(['--setting-sources', 'project,local'])
+      expect(launch!.args).toContain('--strict-mcp-config')
+      // The profile's generated settings ride --settings, which no setting source excludes.
+      expect(launch!.args).toContain('--settings')
+      expect(launch!.args).not.toContain('--bare')
+      expect(launch!.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
 })
