@@ -116,7 +116,9 @@ describe('resume re-materialization', () => {
     expect(context).not.toContain('STANDING BRIEF')
   })
 
-  it('still refuses to replace an agent-edited context file under a changed plan, naming both content digests', () => {
+  // agent-profile-materialize 0.25 replaces its generated section under a changed
+  // plan and keeps what the agent appended below it (the agent's memory).
+  it('replaces its generated context under a changed plan and keeps the agent-appended memory', () => {
     const cwd = root()
     const first = provisionProfileWorkspace(request(), null, 'claude-code', cwd)
     if (!first.workspacePlanDigest) throw new Error('turn 1 produced no plan digest')
@@ -126,21 +128,17 @@ describe('resume re-materialization', () => {
       ...PROFILE,
       prompt: { ...PROFILE.prompt, instructions: ['A DIFFERENT BRIEF'] },
     }
-    let message = ''
-    try {
-      provisionProfileWorkspace(
-        request(swapped),
-        sessionFor(cwd, first.workspacePlanDigest, swapped),
-        'claude-code',
-        cwd,
-      )
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error)
-    }
-    expect(message).toContain('Refusing to replace existing workspace file: CLAUDE.md')
-    expect(message).toMatch(/planned sha256:[0-9a-f]{64}/)
-    expect(message).toMatch(/existing sha256:[0-9a-f]{64}/)
-    expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toContain('codeword: heliotrope')
+    const second = provisionProfileWorkspace(
+      request(swapped),
+      sessionFor(cwd, first.workspacePlanDigest, swapped),
+      'claude-code',
+      cwd,
+    )
+    expect(second.workspacePlanDigest).not.toBe(first.workspacePlanDigest)
+    const context = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')
+    expect(context).toContain('A DIFFERENT BRIEF')
+    expect(context).not.toContain('STANDING BRIEF')
+    expect(context).toContain('codeword: heliotrope')
   })
   // agent-profile-materialize 0.17.1 wrote the context file without the marker,
   // and its plan digest for PROFILE differs from the 0.19.2 digest, so a session
