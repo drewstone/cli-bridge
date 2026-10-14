@@ -150,6 +150,17 @@ export class RetainedContextTransfers {
     callerId: string,
     signal?: AbortSignal,
   ): Promise<ContextTransferResult> {
+    const environmentId = request.plan.destination.environmentId
+    if (environmentId === undefined) {
+      // An unbound destination asks the provider to allocate its environment
+      // after acceptance. This receiver cannot allocate one, so it refuses
+      // before recording an admission that no turn could consume.
+      throw new RetainedSessionError(
+        'context transfer requires a bound destination environment',
+        400,
+        'capability_denied',
+      )
+    }
     const binding = bindingFor(request)
     const pendingAcknowledgement: StoredContextTransferAcknowledgement = {
       status: 'pending',
@@ -164,7 +175,10 @@ export class RetainedContextTransfers {
       requestDigest: request.requestDigest,
       acknowledgement: pendingAcknowledgement as unknown as Record<string, unknown>,
     }
-    const claim = this.store.claimContextTransferOperation(operation, request.plan.destination)
+    const claim = this.store.claimContextTransferOperation(operation, {
+      environmentId,
+      executionId: request.plan.destination.executionId,
+    })
     if (claim.kind === 'coordinate_conflict') {
       return conflict(request.operationId, request.requestDigest, claim.operation.requestDigest)
     }
@@ -213,7 +227,7 @@ export class RetainedContextTransfers {
       source: request.plan.source.source,
       destination: request.plan.destination,
       provider: request.plan.destination.provider,
-      environmentId: request.plan.destination.environmentId,
+      environmentId,
       sessionId: request.plan.destination.sessionId,
       runId: request.plan.destination.runId,
       executionId: request.plan.destination.executionId,
