@@ -1,11 +1,36 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { readProcessLines } from '../src/backends/process-lines.js'
+import { readProcessLines, waitForProcessClose } from '../src/backends/process-lines.js'
 
 class FakeChild extends EventEmitter {
   exitCode: number | null = null
+  signalCode: NodeJS.Signals | null = null
 }
+
+describe('waitForProcessClose', () => {
+  it('returns at once for a child that already closed after a signal death', async () => {
+    // Node leaves `exitCode` null after a signal. Checking only `exitCode` waited
+    // for another 'close' event, so this read never returned.
+    const child = new FakeChild()
+    child.signalCode = 'SIGKILL'
+    child.emit('close', null, 'SIGKILL')
+
+    await expect(waitForProcessClose(child as never)).resolves.toEqual({ code: null, signal: 'SIGKILL' })
+  })
+
+  it('reports the exit status or signal from a later close event', async () => {
+    const killed = new FakeChild()
+    const killedExit = waitForProcessClose(killed as never)
+    killed.emit('close', null, 'SIGTERM')
+    await expect(killedExit).resolves.toEqual({ code: null, signal: 'SIGTERM' })
+
+    const exited = new FakeChild()
+    const exitedExit = waitForProcessClose(exited as never)
+    exited.emit('close', 0, null)
+    await expect(exitedExit).resolves.toEqual({ code: 0, signal: null })
+  })
+})
 
 describe('readProcessLines', () => {
   afterEach(() => {

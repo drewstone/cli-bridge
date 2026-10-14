@@ -341,15 +341,15 @@ export class OpencodeBackend implements Backend {
         }
       }
 
-      const exitCode = await waitForProcessClose(child)
+      const exit = await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
       if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
-      if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(await describeCliExit(spawned, 'opencode', exitCode, stderr.render()), 'upstream')
+      if (exit.code !== 0) {
+        throw new BackendError(await describeCliExit(spawned, 'opencode', exit.code, stderr.render(), exit.signal), 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`opencode produced no stream output: ${stderr.render(300)}`, 'upstream')

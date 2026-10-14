@@ -445,7 +445,7 @@ export class CodexBackend implements Backend {
         }
       }
 
-      const exitCode = await waitForProcessClose(child)
+      const exit = await waitForProcessClose(child)
 
       if (signal.aborted) {
         await finishRecord()
@@ -464,8 +464,8 @@ export class CodexBackend implements Backend {
         yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId }
         return
       }
-      if (exitCode !== 0 && exitCode !== null) {
-        throw new BackendError(await describeCliExit(spawned, 'codex', exitCode, stderr.render()), 'upstream')
+      if (exit.code !== 0) {
+        throw new BackendError(await describeCliExit(spawned, 'codex', exit.code, stderr.render(), exit.signal), 'upstream')
       }
       if (record) {
         throw new BackendError('Codex receipt launch ended without a native terminal event', 'parse_error')
