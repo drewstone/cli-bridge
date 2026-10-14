@@ -29,13 +29,14 @@ import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
-import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth, PreparedContextTransfer } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, BRIDGE_RESERVED_FAILURE_CODES, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   codexMcpConfigText,
+  contextTransferRoute,
   materializeMcpServersForCodex,
   profileExecutionIdentity,
   provisionProfileWorkspace,
@@ -51,7 +52,9 @@ import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
-import { nativeReasoningControl } from '@tangle-network/agent-interface'
+import { nativeReasoningControl, workspaceCwdPathForBase, type ContextTransferRequest } from '@tangle-network/agent-interface'
+import { CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
+import { assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
 import {
   assertRouterCodexExecution,
   assertRouterCodexVersion,
@@ -74,6 +77,7 @@ export class CodexBackend implements Backend {
   readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
   private authPreparationTail: Promise<void> = Promise.resolve()
+  private nativeImportProtocolQualified = false
   constructor(private readonly opts: CodexBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.spawner = opts.spawner ?? scopedHostSpawner
@@ -85,7 +89,71 @@ export class CodexBackend implements Backend {
   }
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
-    return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
+    const health = await versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
+    // The actual installed public protocol and restart path were qualified at
+    // this version. A different binary needs its own proof before advertisement.
+    this.nativeImportProtocolQualified = health.state === 'ready' && health.version === 'codex-cli 0.162.1'
+    return health
+  }
+
+  contextTransferAvailable(): boolean {
+    return Boolean(this.opts.stateDir) && this.spawner.executionEnvironment !== 'docker' && this.nativeImportProtocolQualified
+  }
+
+  validateContextTransfer(request: ContextTransferRequest): void {
+    if (!this.opts.stateDir || this.spawner.executionEnvironment === 'docker') {
+      throw new BackendError('Codex native context import requires the retained host executor state directory', 'capability_denied')
+    }
+    const profile = validateCodexContextTransfer(request)
+    const req = codexTransferChatRequest(request)
+    const effort = nativeReasoningControl('codex', resolveRequestedReasoningEffort(req, null))
+    profileExecutionIdentity(req, null, 'codex', effort)
+    assertWorkspacePlanSupported(materializeProfile(profile, 'codex', { skip: ['mcp'] }))
+  }
+
+  async prepareContextTransfer(
+    request: ContextTransferRequest,
+    _environmentId: string,
+    signal: AbortSignal,
+  ): Promise<PreparedContextTransfer> {
+    this.validateContextTransfer(request)
+    if (!this.contextTransferAvailable()) throw new BackendError('installed Codex native import protocol has not been qualified (requires codex-cli 0.162.1)', 'capability_denied')
+    const stateDir = this.opts.stateDir
+    if (!stateDir) throw new BackendError('Codex native context import requires the retained host executor state directory', 'capability_denied')
+    const req = codexTransferChatRequest(request)
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd)
+    const effort = nativeReasoningControl('codex', resolveRequestedReasoningEffort(req, null))
+    const provisioned = provisionProfileWorkspace(req, null, 'codex', cwd, profileExecutionIdentity(req, null, 'codex', effort))
+    // The same per-session home the first `codex exec resume` turn uses.
+    const sessionId = request.plan.destination.sessionId
+    const nativeHome = ensurePrivateDataDirectory(join(stateDir, createHash('sha256').update(sessionId).digest('hex')))
+    const releasePreparation = await this.acquireAuthPreparation(signal)
+    let codexHome: ReturnType<typeof materializeMcpServersForCodex>
+    try {
+      codexHome = materializeMcpServersForCodex(resolveMcpServers(req, null), resolveCodexAuthPath(), nativeHome)
+    } finally {
+      releasePreparation()
+    }
+    const args = ['app-server', '--listen', 'stdio://', ...provisioned.flags]
+    const { provider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+    if (provider && provider !== this.name) args.push('-c', `model_provider=${JSON.stringify(provider)}`)
+    if (modelArg) args.push('-c', `model=${JSON.stringify(modelArg)}`)
+    if (effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(effort)}`)
+    let prepared: CodexContextTransfer | undefined
+    try {
+      signal.throwIfAborted()
+      const spawned = await this.spawner(this.opts.bin, args, {
+        signal, stdio: ['pipe', 'pipe', 'pipe'], cwd,
+        env: { ...process.env, ...provisioned.env, CODEX_HOME: nativeHome }, sessionId,
+      })
+      prepared = new CodexContextTransfer(spawned, request, signal, () => codexHome?.cleanup(), provisioned.receipt)
+      await prepared.initialize()
+      return prepared
+    } catch (error) {
+      if (prepared) await prepared.close()
+      else codexHome?.cleanup()
+      throw error
+    }
   }
 
   async *chat(
@@ -539,6 +607,16 @@ export class CodexBackend implements Backend {
       return rest.length > 0 ? rest : null
     }
     return null
+  }
+}
+
+function codexTransferChatRequest(request: ContextTransferRequest): ChatRequest {
+  const cwd = request.workspace?.cwd
+  if (!cwd) throw new BackendError('Codex native context import requires an explicit existing host workspace cwd', 'capability_denied')
+  return {
+    model: contextTransferRoute(request),
+    messages: [], agent_profile: request.profile, session_id: request.plan.destination.sessionId,
+    cwd: workspaceCwdPathForBase(cwd, 'host', 'Codex context transfer'), mode: 'byob',
   }
 }
 

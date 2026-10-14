@@ -31,6 +31,7 @@ import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
   SessionIdentityConflictError,
+  ContextTransferSessionPendingError,
   SessionProfileBindingConflictError,
   type SessionExecutionLease,
   type SessionProfileBinding,
@@ -64,8 +65,8 @@ import { withRawProcessCapture } from '../executors/raw-capture.js'
 import {
   assertPiOutputTokenRequest,
   assertProfileRequestAuthority,
+  exactSessionProfileBinding,
   resolveAgentProfile,
-  resolveRequestedReasoningEffort,
 } from '../backends/profile-support.js'
 import { resolveRunEventCursor, streamChatDeltaEvents, streamRunEvents } from './run-events.js'
 import { setRunIdentityHeaders } from '../runs/headers.js'
@@ -395,6 +396,7 @@ export function mountChatCompletions(
     trace?: TraceEmitter
     /** Durable context admission shared with retained-session execution. */
     contextTransfers?: {
+      assertContextSessionDispatch?: (sessionId: string, callerId: string, dispatch: { backend: string; hasTransferRequest: boolean; executionKind: 'host' | 'sandbox' }) => void
       contextMessages: (
         value: unknown,
         callerId: string,
@@ -406,6 +408,8 @@ export function mountChatCompletions(
           executionId: string
           model: string
           profile: import('@tangle-network/agent-interface').AgentProfile | undefined
+          cwd?: string
+          executionKind?: 'host' | 'sandbox'
         },
       ) => ChatRequest['messages']
     }
@@ -690,6 +694,16 @@ export function mountChatCompletions(
       },
     }
 
+    if (req.session_id) {
+      try {
+        deps.contextTransfers?.assertContextSessionDispatch?.(req.session_id, canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback'), {
+          backend: backend.name, hasTransferRequest: context_transfer !== undefined,
+          executionKind: req.execution?.kind === 'sandbox' ? 'sandbox' : 'host',
+        })
+      } catch (error) {
+        return errorResponse(c, error)
+      }
+    }
     if (context_transfer !== undefined) {
       if (!deps.contextTransfers || !exactCoordinates.value) {
         return invalidRequest(c, 'context transfer requires an exact provider, environment, session, run, and execution')
@@ -707,6 +721,8 @@ export function mountChatCompletions(
             executionId: exactCoordinates.value.executionId,
             model: req.model,
             profile: profile ?? undefined,
+            ...(req.cwd ? { cwd: req.cwd } : {}),
+            executionKind: req.execution?.kind === 'sandbox' ? 'sandbox' : 'host',
           },
         )
         req.messages = [...messages, ...req.messages]
@@ -721,6 +737,7 @@ export function mountChatCompletions(
         deps.sessions.claimSessionIdentity(req.session_id, 'legacy')
       } catch (error) {
         if (error instanceof SessionIdentityConflictError) return sessionIdentityConflict(c, error)
+        if (error instanceof ContextTransferSessionPendingError) return errorResponse(c, error)
         throw error
       }
     }
@@ -1552,24 +1569,6 @@ function canonicalProtectedModelBaseUrl(value: string): string | undefined {
   return target.toString().replace(/\/$/u, '')
 }
 
-function exactSessionProfileBinding(
-  req: ChatRequest,
-  session: SessionRecord | null,
-): SessionProfileBinding | null {
-  const profile = resolveAgentProfile(req, session)
-  if (!profile) return null
-  const parts = req.model.split('/')
-  const provider = parts.length >= 3 && parts[1]
-    ? parts[1]
-    : profile.model?.provider ?? null
-  return {
-    schema: 'cli-bridge.session-agent-profile.v1',
-    effectiveProfileDigest: canonicalAgentProfileDigest(profile),
-    provider,
-    model: req.model,
-    requestedReasoningEffort: resolveRequestedReasoningEffort(req, session),
-  }
-}
 
 /**
  * Refuse a session presented under a binding that is not the one it holds.
@@ -1751,6 +1750,7 @@ function errorResponse(c: Context, err: unknown): Response {
     )
   }
   if (err instanceof SessionIdentityConflictError) return sessionIdentityConflict(c, err)
+  if (err instanceof ContextTransferSessionPendingError) return c.json({ error: { message: err.message, type: err.code } }, 409)
   if (err instanceof SessionProfileBindingConflictError) return sessionProfileBindingConflict(c, err)
   if (err instanceof ExecutorSaturatedError) return executorSaturated(c, err)
   if (err instanceof RunReplayCursorError) return replayCursorError(c, err)

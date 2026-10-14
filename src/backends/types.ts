@@ -22,6 +22,7 @@ import type {
   AgentEnvironmentCapabilities,
   AgentProfile,
   AgentProfileMcpServer,
+  ContextTransferRequest,
   NativeContextBoundaryProof,
   ReasoningEffort,
   RequestedInteractions,
@@ -609,6 +610,16 @@ export interface Backend {
   /** Sync health check — exit-code probe on the CLI, etc. */
   health(signal?: AbortSignal): Promise<BackendHealth>
 
+  /** Validate the exact public request before the receiver reserves native work. */
+  validateContextTransfer?(request: ContextTransferRequest): void
+  contextTransferAvailable?(): boolean
+  /** Prepare the owner transport without allocating a native session or importing history. */
+  prepareContextTransfer?(
+    request: ContextTransferRequest,
+    environmentId: string,
+    signal: AbortSignal,
+  ): Promise<PreparedContextTransfer>
+
   /**
    * Stream a chat completion. Must be an async iterator of ChatDelta.
    * Implementations MUST tolerate `signal.aborted` and shut down the
@@ -619,6 +630,14 @@ export interface Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta>
+}
+
+/** Native side effects are separated so the receiver can persist each acknowledgement. */
+export interface PreparedContextTransfer {
+  readonly profileMaterialization?: ProfileMaterializationReceipt
+  createSession(): Promise<{ nativeSessionId: string; createdAt: string }>
+  importHistory(nativeSessionId: string): Promise<void>
+  close(): Promise<void>
 }
 
 /**

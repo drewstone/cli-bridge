@@ -22,6 +22,7 @@ import type {
   AgentProfileConfigValue,
   AgentProfileMcpServer,
   AgentProfileModelHints,
+  ContextTransferRequest,
   ReasoningEffort,
 } from '@tangle-network/agent-interface'
 import {
@@ -30,7 +31,7 @@ import {
 } from '@tangle-network/agent-interface'
 import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
 import { BackendError } from './types.js'
-import type { SessionRecord } from '../sessions/store.js'
+import type { SessionProfileBinding, SessionRecord } from '../sessions/store.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
 import {
   applyWorkspacePlan,
@@ -857,6 +858,44 @@ export function resolveRequestedReasoningEffort(
     )
   }
   return profileEffort ?? req.effort ?? null
+}
+
+/**
+ * The Bridge route the first turn of an accepted transfer names.
+ *
+ * `agent-provider-cli-bridge` attaches the accepted environment with the
+ * destination model, else the profile default, qualified by the profile
+ * provider when the model names none. Native import, the session binding, and
+ * the first-turn check use this same route so the attached turn is admitted.
+ */
+export function contextTransferRoute(request: ContextTransferRequest): string {
+  const { runner } = request.plan.destination
+  const model = request.plan.destination.model ?? request.profile?.model?.default
+  const provider = request.profile?.model?.provider
+  if (!model || model === runner) return runner
+  if (model.startsWith(`${runner}/`)) return model
+  if (model.includes('/')) return `${runner}/${model}`
+  return provider ? `${runner}/${provider}/${model}` : `${runner}/${model}`
+}
+
+/** One profile binding shared by native import and the first resumed turn. */
+export function exactSessionProfileBinding(
+  req: ChatRequest,
+  session: SessionRecord | null,
+): SessionProfileBinding | null {
+  const profile = resolveAgentProfile(req, session)
+  if (!profile) return null
+  const parts = req.model.split('/')
+  const provider = parts.length >= 3 && parts[1]
+    ? parts[1]
+    : profile.model?.provider ?? null
+  return {
+    schema: 'cli-bridge.session-agent-profile.v1',
+    effectiveProfileDigest: canonicalAgentProfileDigest(profile),
+    provider,
+    model: req.model,
+    requestedReasoningEffort: resolveRequestedReasoningEffort(req, session),
+  }
 }
 
 /** Bind a receipt to the actual transport model/provider and native reasoning control. */

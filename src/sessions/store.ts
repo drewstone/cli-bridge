@@ -128,6 +128,7 @@ export interface StoredRetainedControlOperation {
 export type ContextTransferOperationClaim =
   | { kind: 'created' | 'existing'; operation: StoredRetainedControlOperation }
   | { kind: 'coordinate_conflict'; operation: StoredRetainedControlOperation }
+  | { kind: 'session_conflict' }
 
 export interface SessionExecutionLease {
   release(): void
@@ -262,6 +263,14 @@ export class SessionIdentityConflictError extends Error {
       `session id ${JSON.stringify(sessionId)} is already owned by the ${existingKind} session API and cannot be used by the ${expectedKind} session API`,
     )
     this.name = 'SessionIdentityConflictError'
+  }
+}
+
+export class ContextTransferSessionPendingError extends Error {
+  readonly code = 'context_transfer_pending' as const
+  constructor() {
+    super('native context import is not authoritative for session dispatch')
+    this.name = 'ContextTransferSessionPendingError'
   }
 }
 
@@ -692,16 +701,27 @@ export class SessionStore implements RetainedInteractionPersistence {
     return rows.map(row => this.hydrate(row))
   }
 
-  claimSessionIdentity(id: string, kind: 'legacy' | 'retained'): void {
-    const existing = this.db.prepare('SELECT kind FROM session_identities WHERE id = ?').get(id) as { kind: 'legacy' | 'retained' } | undefined
-    if (existing && existing.kind !== kind) {
-      throw new SessionIdentityConflictError(id, kind, existing.kind)
-    }
-    if (!existing) {
-      this.db.prepare(
-        'INSERT INTO session_identities (id, kind, created_at) VALUES (?, ?, ?)',
-      ).run(id, kind, Date.now())
-    }
+  claimSessionIdentity(id: string, kind: 'legacy' | 'retained', imported?: { operationId: string; requestDigest: string }): void {
+    this.db.transaction(() => {
+      // This check and the ordinary identity claim share a writer transaction:
+      // a chat route that observed no transfer earlier cannot race native allocation.
+      const transfer = this.findContextTransferBySessionId(id)
+      if (transfer) {
+        const acknowledgement = transfer.acknowledgement
+        const native = acknowledgement.native as { phase?: string } | undefined
+        const acknowledged = native?.phase === 'imported'
+        const ownsImport = kind === 'legacy' && imported?.operationId === transfer.operationId
+          && imported.requestDigest === transfer.requestDigest && acknowledged
+        if (!ownsImport && (acknowledgement.status !== 'accepted' || !acknowledged)) {
+          throw new ContextTransferSessionPendingError()
+        }
+      }
+      const existing = this.db.prepare('SELECT kind FROM session_identities WHERE id = ?').get(id) as { kind: 'legacy' | 'retained' } | undefined
+      if (existing && existing.kind !== kind) throw new SessionIdentityConflictError(id, kind, existing.kind)
+      if (!existing) {
+        this.db.prepare('INSERT INTO session_identities (id, kind, created_at) VALUES (?, ?, ?)').run(id, kind, Date.now())
+      }
+    }).immediate()
   }
 
   /** Check the cross-API identity fence without reserving a legacy session. */
@@ -809,8 +829,10 @@ export class SessionStore implements RetainedInteractionPersistence {
     internalId?: string | null
     cwd?: string | null
     metadata?: Record<string, unknown>
+    /** Receiver-only authority after the native checkpoint ACK; never populated from a chat body. */
+    contextTransferAdmission?: { operationId: string; requestDigest: string }
   }): SessionRecord {
-    this.claimSessionIdentity(args.externalId, 'legacy')
+    this.claimSessionIdentity(args.externalId, 'legacy', args.contextTransferAdmission)
     const now = Date.now()
     const existing = this.get(args.externalId, args.backend)
     const metadata = sanitizeLegacySessionMetadata({
@@ -1228,7 +1250,10 @@ export class SessionStore implements RetainedInteractionPersistence {
          WHERE kind = 'context_transfer'
            AND (
              run_id = ? OR session_id = ?
-             OR json_extract(acknowledgement_json, '$.binding.destination.environmentId') = ?
+             OR COALESCE(
+               json_extract(acknowledgement_json, '$.binding.environmentId'),
+               json_extract(acknowledgement_json, '$.binding.destination.environmentId')
+             ) = ?
              OR json_extract(acknowledgement_json, '$.binding.destination.executionId') = ?
            )
          ORDER BY created_at ASC
@@ -1244,6 +1269,9 @@ export class SessionStore implements RetainedInteractionPersistence {
           kind: 'coordinate_conflict',
           operation: hydrateRetainedControlOperation(collision),
         }
+      }
+      if (this.db.prepare('SELECT id FROM session_identities WHERE id = ?').get(operation.sessionId)) {
+        return { kind: 'session_conflict' }
       }
       if (!this.recordRetainedControlOperation(operation)) {
         const raced = this.getRetainedControlOperation(operation.operationId)
@@ -1271,6 +1299,28 @@ export class SessionStore implements RetainedInteractionPersistence {
     return updated.changes === 1
   }
 
+  /** Cross-process ownership of one native phase; never repeat a native effect after a race. */
+  compareContextTransferAcknowledgement(
+    operationId: string,
+    requestDigest: string,
+    expected: Record<string, unknown>,
+    acknowledgement: Record<string, unknown>,
+  ): boolean {
+    return this.db.prepare(
+      `UPDATE retained_control_operations SET acknowledgement_json = ?
+       WHERE operation_id = ? AND request_digest = ? AND kind = 'context_transfer'
+         AND acknowledgement_json = ?`,
+    ).run(JSON.stringify(acknowledgement), operationId, requestDigest, JSON.stringify(expected)).changes === 1
+  }
+
+  findContextTransferBySessionId(sessionId: string): StoredRetainedControlOperation | null {
+    const row = this.db.prepare(
+      `SELECT * FROM retained_control_operations WHERE kind = 'context_transfer' AND session_id = ?
+       ORDER BY created_at DESC LIMIT 1`,
+    ).get(sessionId) as Record<string, unknown> | undefined
+    return row ? hydrateRetainedControlOperation(row) : null
+  }
+
   getRetainedControlOperation(operationId: string): StoredRetainedControlOperation | null {
     const row = this.db.prepare(
       'SELECT * FROM retained_control_operations WHERE operation_id = ?',
@@ -1284,7 +1334,10 @@ export class SessionStore implements RetainedInteractionPersistence {
     const row = this.db.prepare(
       `SELECT * FROM retained_control_operations
        WHERE kind = 'context_transfer'
-         AND json_extract(acknowledgement_json, '$.binding.destination.environmentId') = ?
+         AND COALESCE(
+           json_extract(acknowledgement_json, '$.binding.environmentId'),
+           json_extract(acknowledgement_json, '$.binding.destination.environmentId')
+         ) = ?
        ORDER BY created_at DESC
        LIMIT 1`,
     ).get(environmentId) as Record<string, unknown> | undefined
