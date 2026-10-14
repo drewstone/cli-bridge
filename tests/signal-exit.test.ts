@@ -22,41 +22,53 @@ import { BackendError, type Backend, type ChatDelta } from '../src/backends/type
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
 import { testPiInferenceTransport } from './pi-inference-fixture.js'
 
+/**
+ * How a child ends. `drain-first` is the order the Braid run hit: stdout drains,
+ * the reader finishes, then the reaped process reports `exitCode: null`.
+ * `close-first` reports the death before the reader has finished draining.
+ */
+interface Ending {
+  code: number | null
+  signal: NodeJS.Signals | null
+  order: 'drain-first' | 'close-first'
+}
+
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
   stderr = new PassThrough()
   stdin = new PassThrough()
   exitCode: number | null = null
   signalCode: NodeJS.Signals | null = null
+  private ended = false
 
   /** End the way Node reports it: `exitCode` stays null after a signal death. */
-  end(code: number | null, signal: NodeJS.Signals | null): void {
-    if (this.exitCode !== null || this.signalCode !== null) return
+  end({ code, signal, order }: Ending): void {
+    if (this.ended) return
+    this.ended = true
     this.stdout.end()
     this.stderr.end()
-    this.exitCode = code
-    this.signalCode = signal
-    this.emit('exit', code, signal)
-    this.emit('close', code, signal)
+    const reap = (): void => {
+      this.exitCode = code
+      this.signalCode = signal
+      this.emit('exit', code, signal)
+      this.emit('close', code, signal)
+    }
+    if (order === 'close-first') reap()
+    else setTimeout(reap, 10)
   }
 }
 
-interface Ending {
-  code: number | null
-  signal: NodeJS.Signals | null
-}
-
-/** Streams `lines`, then ends the child with `ending`; `terminate` ends it with SIGTERM. */
+/** Streams `lines`, then ends the child with `ending`; `terminate` kills it with SIGTERM. */
 function endingSpawner(lines: string[], ending: Ending | 'never'): Spawner {
   const spawner: Spawner = async (): Promise<SpawnResult> => {
     const child = new FakeChild()
     queueMicrotask(() => {
       for (const line of lines) child.stdout.write(`${line}\n`)
-      if (ending !== 'never') setTimeout(() => child.end(ending.code, ending.signal), 10)
+      if (ending !== 'never') setTimeout(() => child.end(ending), 10)
     })
     return {
       child: child as never,
-      terminate: async () => { child.end(null, 'SIGTERM') },
+      terminate: async () => { child.end({ code: null, signal: 'SIGTERM', order: 'drain-first' }) },
       release() {},
       spawnError: () => null,
     }
@@ -65,7 +77,7 @@ function endingSpawner(lines: string[], ending: Ending | 'never'): Spawner {
   return spawner
 }
 
-const KILLED: Ending = { code: null, signal: 'SIGKILL' }
+const KILLED: Ending = { code: null, signal: 'SIGKILL', order: 'drain-first' }
 const line = (value: Record<string, unknown>): string => JSON.stringify(value)
 
 /** Each backend's own partial turn: output it would stream before its terminal event. */
@@ -159,11 +171,21 @@ describe('a CLI killed by a signal before its terminal event', () => {
   }
 })
 
-describe('claude without its result event', () => {
+describe('claude turn endings without a result event', () => {
   const claude = cases.find((entry) => entry.name === 'claude')!
 
+  it('fails a turn whose death is reported before the reader finishes draining', async () => {
+    const ending: Ending = { ...KILLED, order: 'close-first' }
+    const { deltas, error } = await run(claude.make(endingSpawner(claude.lines, ending)), claude.model)
+
+    expect(error).toBeInstanceOf(BackendError)
+    expect((error as Error).message).toContain('claude was killed by SIGKILL')
+    expect(successfulFinish(deltas)).toBe(false)
+  })
+
   it('fails a turn that exits 0 without a result event', async () => {
-    const { deltas, error } = await run(claude.make(endingSpawner(claude.lines, { code: 0, signal: null })), claude.model)
+    const ending: Ending = { code: 0, signal: null, order: 'drain-first' }
+    const { deltas, error } = await run(claude.make(endingSpawner(claude.lines, ending)), claude.model)
 
     expect(error).toBeInstanceOf(BackendError)
     expect((error as Error).message).toContain('claude exited 0 without its result event')
