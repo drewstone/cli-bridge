@@ -470,7 +470,7 @@ on success; `{ ok: false, error: string, durationMs }` on openscad
 compile failure or artifact-size overflow.
 
 **Dependencies:** `openscad` on `$PATH` (provided by the `hardware`
-nix profile in `tangle-network/agent-dev-container`). GLB output
+nix profile in `tangle-network/agent-container`). GLB output
 additionally requires `python3` + `trimesh`; if either is missing the
 endpoint omits `glb` from `artifacts` and adds a warning rather than
 failing. Configure the wall-clock budget via
