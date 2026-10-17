@@ -160,6 +160,9 @@ export class OpencodeBackend implements Backend {
     try {
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
+        // Preserve the operator's existing proxy and trust roots. Keep the host
+        // sanitizer in force; these names are not request-controlled.
+        envPassthroughKeys: ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'],
         cwd,
         env: {
           ...process.env,
