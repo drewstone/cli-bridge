@@ -218,3 +218,4 @@ try { await main() } catch (error) {
     await save('receipt.json', receipt)
   }
   console.log(JSON.stringify({ ...receipt, evidenceDirectory: evidence ?? null }, null, 2))
+}
