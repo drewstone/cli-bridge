@@ -32,8 +32,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # Temporary qualification step: its generated manifest/lockfile must be
-      # committed before this PR is ready; then normal frozen installation owns it.
+      # Temporary qualification step: commit the generated files before readiness.
       - name: Qualify released Runtime and Eval cohort
         run: pnpm --filter cli-bridge-runtime-consumer-regression add --save-dev --save-exact --strict-peer-dependencies @tangle-network/agent-runtime@0.325.0 @tangle-network/agent-eval@0.214.0
       - name: Retain exact resolved dependency files
@@ -44,6 +43,38 @@ jobs:
             pnpm-lock.yaml
             tests/runtime-consumer/package.json
           retention-days: 14
+      - name: Diagnose host and actual filesystem-jail connectivity
+        shell: bash
+        run: |
+          node --import tsx --input-type=module <<'JS'
+          import { execFile } from 'node:child_process';
+          import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
+          import { tmpdir } from 'node:os';
+          import { join } from 'node:path';
+          import { promisify } from 'node:util';
+          import { LinuxBwrapJail } from './src/jail/linux-bwrap.ts';
+          const exec = promisify(execFile);
+          const root = await mkdtemp(join(tmpdir(), 'bridge-net-proof-'));
+          const task = join(root, 'task'); await mkdir(task);
+          const env = { PATH: process.env.PATH, HOME: root, LANG: 'C.UTF-8' };
+          const keys = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'];
+          for (const key of keys) if (process.env[key]) env[key] = process.env[key];
+          const clean = text => keys.reduce((value, key) => env[key] ? value.replaceAll(env[key], '[transport-setting]') : value, text);
+          console.log(JSON.stringify({ resolver: await realpath('/etc/resolv.conf'), transportKeys: keys.filter(key => env[key]) }));
+          try {
+            const jail = new LinuxBwrapJail();
+            if (!await jail.isAvailable()) throw new Error('Required Linux filesystem jail is unavailable');
+            for (const url of ['https://models.opencode.ai/api.json', 'https://opencode.ai']) {
+              const args = ['--head', '--silent', '--show-error', '--max-time', '10', '--output', '/dev/null', '--write-out', '%{http_code} %{remote_ip}', url];
+              for (const mode of ['host', 'fs-jail']) {
+                const command = mode === 'host' ? { bin: '/usr/bin/curl', args } : await jail.wrap('/usr/bin/curl', args, { root: join(task, '.agent-home'), projectDir: task, readConfine: true, requireEnforcement: true });
+                try { const result = await exec(command.bin, command.args, { env, cwd: task, timeout: 15000 }); console.log(JSON.stringify({ mode, url, status: 'connected', response: clean(result.stdout) })); }
+                catch (error) { console.log(JSON.stringify({ mode, url, status: 'failed', code: error.code, error: clean(error.stderr ?? error.message) })); }
+                finally { await command.cleanup?.(); }
+              }
+            }
+          } finally { await rm(root, { recursive: true, force: true }); }
+          JS
       - name: Install pinned OpenCode into this job only
         shell: bash
         run: |
