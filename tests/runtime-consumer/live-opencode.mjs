@@ -100,18 +100,17 @@ async function main() {
     BRIDGE_BACKENDS: 'opencode', OPENCODE_EXECUTOR: 'host', OPENCODE_BIN: opencode,
     OPENCODE_TIMEOUT_MS: '180000', OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_DISABLE_SHARE: '1',
     OPENCODE_INSTALL_DIR: dirname(dirname(opencode)),
-    BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_JAIL_ROOT: '.',
-    BRIDGE_JAIL_RW_PATHS: ['data', 'config', 'cache', 'state'].map(name => join(root, name)).join(','),
+    BRIDGE_JAIL_MODE: 'fs-jail',
     BRIDGE_RAW_CAPTURE_DIR: join(evidence, 'raw'),
   }
   for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']) {
     if (process.env[key]) env[key] = process.env[key]
   }
-  receipt.opencodeVersion = (await exec(opencode, ['--version'], { env, timeout: 20_000 })).stdout.trim()
+  receipt.opencodeVersion = (await exec(opencode, ['--version'], { env, cwd: join(root, 'task'), timeout: 20_000 })).stdout.trim()
   receipt.bridgeCommit = (await exec('git', ['rev-parse', 'HEAD'], { cwd: repository, timeout: 5_000 })).stdout.trim()
   receipt.nodeVersion = process.version
   // This is availability, not successful inference. The later filesystem checks prove execution.
-  const models = (await exec(opencode, ['models', 'opencode'], { env, timeout: 60_000, maxBuffer: 4 * 1024 * 1024 })).stdout
+  const models = (await exec(opencode, ['models', 'opencode'], { env, cwd: join(root, 'task'), timeout: 60_000, maxBuffer: 4 * 1024 * 1024 })).stdout
   assert.ok(models.split(/\r?\n/).map(value => value.trim()).includes(nativeModel), `Requested model is absent from OpenCode: ${nativeModel}`)
   receipt.stages.push({ name: 'model-discovery', status: 'passed' })
   const socket = createServer()
@@ -196,20 +195,22 @@ try { await main() } catch (error) {
     }
   }
   if (ownsEvidence) {
-    // Only this run's fresh native log directory, never the operator's HOME.
-    const logs = join(root, 'data/opencode/log')
+    // Read only this run's preflight and native jail HOME logs, never the operator's HOME.
     let retainedBytes = 0
-    for (const entry of await readdir(logs, { withFileTypes: true }).catch(error => {
-      if (error.code === 'ENOENT') return []
-      throw error
-    })) {
-      if (!entry.isFile()) continue
-      const path = join(logs, entry.name)
-      const size = (await stat(path)).size
-      if (size > 2 * 1024 * 1024 || retainedBytes + size > 4 * 1024 * 1024) continue
-      const bytes = await readFile(path, 'utf8')
-      retainedBytes += size
-      await save(`opencode-${hash(entry.name)}.log`, bytes.replaceAll(bearer || '\0', '[redacted]'))
+    for (const directory of ['data/opencode/log', 'task/.agent-home/.local/share/opencode/log']) {
+      const logs = join(root, directory)
+      for (const entry of await readdir(logs, { withFileTypes: true }).catch(error => {
+        if (error.code === 'ENOENT') return []
+        throw error
+      })) {
+        if (!entry.isFile()) continue
+        const path = join(logs, entry.name)
+        const size = (await stat(path)).size
+        if (size > 2 * 1024 * 1024 || retainedBytes + size > 4 * 1024 * 1024) continue
+        const bytes = await readFile(path, 'utf8')
+        retainedBytes += size
+        await save(`opencode-${hash(directory + '/' + entry.name)}.log`, bytes.replaceAll(bearer || '\0', '[redacted]'))
+      }
     }
     await save('bridge.log', bridgeLog.replaceAll(bearer || '\0', '[redacted]'))
     await save('receipt.json', receipt)
