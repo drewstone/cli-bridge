@@ -32,6 +32,18 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Temporary qualification step: its generated manifest/lockfile must be
+      # committed before this PR is ready; then normal frozen installation owns it.
+      - name: Qualify released Runtime 0.325.0
+        run: pnpm --filter cli-bridge-runtime-consumer-regression add --save-dev --save-exact @tangle-network/agent-runtime@0.325.0
+      - name: Retain exact resolved dependency files
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-dependency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            pnpm-lock.yaml
+            tests/runtime-consumer/package.json
+          retention-days: 14
       - name: Install pinned OpenCode into this job only
         shell: bash
         run: |
