@@ -157,6 +157,10 @@ describe('opencode profiles in a shared task workspace', () => {
       // A resumed session keeps its plan identity and its own instructions.
       const resumed = provisionProfileWorkspace({ ...root }, retained(root, cwd), 'opencode', cwd)
       expect(resumed.workspacePlanDigest).toBe(first.workspacePlanDigest)
+      // Its receipt is the first turn's, though each turn's private directory is new: Runtime
+      // refuses a session whose receipt changes between turns.
+      expect(configDir(resumed)).not.toBe(configDir(first))
+      expect(resumed.receipt).toEqual(first.receipt)
       expect(instructionBytes(resumed)).toContain('ROOT-MARKER')
       expect(instructionBytes(resumed)).not.toContain('DIRECTOR-MARKER')
 
