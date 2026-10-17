@@ -32,6 +32,21 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Install pinned OpenCode into this job only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          tool="$RUNNER_TEMP/opencode-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$tool"
+          mkdir -m 700 "$tool/bin"
+          curl --fail --silent --show-error --location --max-time 120 \
+            https://github.com/anomalyco/opencode/releases/download/v1.19.3/opencode-linux-x64-baseline.tar.gz \
+            --output "$tool/opencode.tar.gz"
+          printf '%s  %s\n' 531cff2441129c30f0edd5878af494108ad07f5feb46d7ee29a2a5b830a5765d "$tool/opencode.tar.gz" | sha256sum --check --status
+          tar --extract --gzip --no-same-owner --file "$tool/opencode.tar.gz" --directory "$tool/bin"
+          test -x "$tool/bin/opencode"
+          echo "OPENCODE_BIN=$tool/bin/opencode" >> "$GITHUB_ENV"
       - name: Real Runtime, local bridge, OpenCode, and GLM Flash
         run: pnpm test:local-inference
         env:
