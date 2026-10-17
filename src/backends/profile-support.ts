@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join, posix, resolve } from 'node:path'
+import { join, posix, resolve } from 'node:path'
 import type {
   AgentProfile,
   AgentProfileConfigValue,
@@ -264,6 +264,8 @@ const OPENCODE_PROJECT_CONFIG_FILE = 'opencode.json'
 
 /** Prefix of the private per-turn directory this bridge materializes a profile into. */
 const OPENCODE_PROFILE_ROOT_PREFIX = '.cli-bridge-opencode-profile-'
+/** The private directory's name in a materialization receipt, the same on every turn. */
+const OPENCODE_PROFILE_RECEIPT_ROOT = '.cli-bridge-opencode-profile'
 
 interface OpencodeProfileScope {
   /** Env this turn adds on top of the plan's own launch env. */
@@ -396,7 +398,10 @@ function scopeOpencodeProfileConfig(
         [OPENCODE_DISABLE_PROJECT_CONFIG_ENV]: '1',
         [OPENCODE_CONFIG_DIR_ENV]: configDir,
       },
-      written: applied.written.map((relPath) => posix.join(basename(root), relPath)),
+      // The receipt names what was applied, under one stable name: the private directory is fresh
+      // on every turn, and a resumed session's receipt must equal its first turn's, or Runtime
+      // refuses the turn ("profile materialization changed across session turns").
+      written: applied.written.map((relPath) => posix.join(OPENCODE_PROFILE_RECEIPT_ROOT, relPath)),
       workspaceFiles,
       cleanup: () => {
         if (cleaned) return
