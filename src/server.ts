@@ -171,6 +171,12 @@ function preflightTargetFor(cfg: BackendExecutorConfig, bin: string, slotIndex: 
  */
 async function buildExecutorForBackend(
   cfg: BackendExecutorConfig | undefined,
+  /**
+   * The name the chat route resolves this backend by (`backend.name`). It keys the net-jail
+   * registry, so it must equal the registered harness name, which differs from the executor
+   * config name for claude (`claude-code`) and kimi (`kimi-code`).
+   */
+  routeName: string,
   extras: BuildAppExtras,
   bin: string,
   config: Config,
@@ -310,7 +316,7 @@ async function buildExecutorForBackend(
   // Recorded only here: after the network was verified AND a pool of live slots
   // was actually created on it. Anything earlier would let the chat route
   // report a jail for containers that do not exist.
-  if (netJail) extras.netJail.set(cfg.name, { network: netJail.network, allow: netJail.allow })
+  if (netJail) extras.netJail.set(routeName, { network: netJail.network, allow: netJail.allow })
 
   return createDockerSpawner({
     pool,
@@ -367,11 +373,12 @@ export async function buildApp(config: Config): Promise<{
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
   if (config.backends.has('claude')) {
-    const spawner = await buildExecutorForBackend(config.executors.claude, extras, config.claudeBin, config)
+    const harness = 'claude-code'
+    const spawner = await buildExecutorForBackend(config.executors.claude, harness, extras, config.claudeBin, config)
     registry.register(new ClaudeBackend({
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
-      harness: 'claude-code',
+      harness,
       ...(spawner ? { spawner } : {}),
     }))
   }
@@ -386,7 +393,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('codex')) {
-    const spawner = await buildExecutorForBackend(config.executors.codex, extras, config.codexBin, config)
+    const spawner = await buildExecutorForBackend(config.executors.codex, 'codex', extras, config.codexBin, config)
     registry.register(new CodexBackend({
       bin: config.codexBin,
       timeoutMs: config.codexTimeoutMs,
@@ -395,7 +402,7 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('opencode')) {
-    const spawner = await buildExecutorForBackend(config.executors.opencode, extras, config.opencodeBin, config)
+    const spawner = await buildExecutorForBackend(config.executors.opencode, 'opencode', extras, config.opencodeBin, config)
     registry.register(new OpencodeBackend({
       bin: config.opencodeBin,
       timeoutMs: config.opencodeTimeoutMs,
@@ -403,16 +410,17 @@ export async function buildApp(config: Config): Promise<{
     }))
   }
   if (config.backends.has('kimi')) {
-    const spawner = await buildExecutorForBackend(config.executors.kimi, extras, config.kimiBin, config)
+    const harness = 'kimi-code'
+    const spawner = await buildExecutorForBackend(config.executors.kimi, harness, extras, config.kimiBin, config)
     registry.register(new KimiBackend({
       bin: config.kimiBin,
       timeoutMs: config.kimiTimeoutMs,
-      harness: 'kimi-code',
+      harness,
       ...(spawner ? { spawner } : {}),
     }))
   }
   if (config.backends.has('gemini')) {
-    const spawner = await buildExecutorForBackend(config.executors.gemini, extras, config.geminiBin, config)
+    const spawner = await buildExecutorForBackend(config.executors.gemini, 'gemini', extras, config.geminiBin, config)
     registry.register(new GeminiBackend({
       bin: config.geminiBin,
       timeoutMs: config.geminiTimeoutMs,
@@ -441,7 +449,7 @@ export async function buildApp(config: Config): Promise<{
     registry.register(new NanoclawBackend({ socketPath: config.nanoclawSocket, timeoutMs: config.cliTimeoutMsDefault }))
   }
   if (config.backends.has('pi')) {
-    const spawner = await buildExecutorForBackend(config.executors.pi, extras, config.piBin, config)
+    const spawner = await buildExecutorForBackend(config.executors.pi, 'pi', extras, config.piBin, config)
     registry.register(new PiBackend({
       bin: config.piBin,
       timeoutMs: config.piTimeoutMs,
