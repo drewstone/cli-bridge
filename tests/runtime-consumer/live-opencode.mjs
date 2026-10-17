@@ -2,7 +2,7 @@
 /** Real Runtime -> local cli-bridge -> OpenCode -> free inference. Never a mock or a fallback. */
 import assert from 'node:assert/strict'
 import { constants } from 'node:fs'
-import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { spawn, execFile } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
@@ -104,6 +104,9 @@ async function main() {
     BRIDGE_JAIL_RW_PATHS: ['data', 'config', 'cache', 'state'].map(name => join(root, name)).join(','),
     BRIDGE_RAW_CAPTURE_DIR: join(evidence, 'raw'),
   }
+  for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']) {
+    if (process.env[key]) env[key] = process.env[key]
+  }
   receipt.opencodeVersion = (await exec(opencode, ['--version'], { env, timeout: 20_000 })).stdout.trim()
   receipt.bridgeCommit = (await exec('git', ['rev-parse', 'HEAD'], { cwd: repository, timeout: 5_000 })).stdout.trim()
   receipt.nodeVersion = process.version
@@ -130,17 +133,25 @@ async function main() {
   async function turn(name, prompt) {
     const signal = AbortSignal.timeout(180_000)
     const events = []
+    const stage = { name, status: 'failed', eventCount: 0 }
+    receipt.stages.push(stage)
     const started = Date.now()
+    let artifact
+    try {
       const stream = executor.execute(prompt, signal)
       assert.ok(stream?.[Symbol.asyncIterator], 'Runtime must return a real streamed execution')
       for await (const event of stream) {
         assert.ok(events.length < 10_000, 'Live proof exceeded its event bound')
         events.push(event)
       }
-      const artifact = executor.resultArtifact()
-      await save(`${name}.json`, { events, artifact })
+      artifact = executor.resultArtifact()
       assert.notEqual(artifact.verdict?.valid, false, 'Runtime reported an invalid result')
-      receipt.stages.push({ name, status: 'executed', durationMs: Date.now() - started, eventCount: events.length })
+      stage.status = 'executed'
+    } finally {
+      stage.durationMs = Date.now() - started
+      stage.eventCount = events.length
+      await save(`${name}.json`, { events, artifact: artifact ?? null })
+    }
   }
   await turn('filesystem-task', `Work only in your current directory. Read input.txt with a tool and compute the SHA-256 of its exact bytes using a command. Create answer.txt containing only the 64-character hexadecimal digest and a newline. Do not change input.txt. Remember this conversation marker for our next turn: ${marker}. Do not write the marker to any file. Reply briefly when finished.`)
   assert.equal(await readFile(join(root, 'task/input.txt'), 'utf8'), input, 'The task input must remain unchanged')
@@ -177,8 +188,29 @@ try { await main() } catch (error) {
   receipt.error = String(error?.stack ?? error).replaceAll(bearer || '\0', '[redacted]')
   process.exitCode = 1
 } finally {
-  try { await executor?.teardown(); await stopBridge() } catch (error) { receipt.status = 'failed'; receipt.cleanupError = error.message; process.exitCode = 1 }
+  for (const cleanup of [() => executor?.teardown(), stopBridge]) {
+    try { await cleanup() } catch (error) {
+      receipt.status = 'failed'
+      ;(receipt.cleanupErrors ??= []).push(error.message)
+      process.exitCode = 1
+    }
+  }
   if (ownsEvidence) {
+    // Only this run's fresh native log directory, never the operator's HOME.
+    const logs = join(root, 'data/opencode/log')
+    let retainedBytes = 0
+    for (const entry of await readdir(logs, { withFileTypes: true }).catch(error => {
+      if (error.code === 'ENOENT') return []
+      throw error
+    })) {
+      if (!entry.isFile()) continue
+      const path = join(logs, entry.name)
+      const size = (await stat(path)).size
+      if (size > 2 * 1024 * 1024 || retainedBytes + size > 4 * 1024 * 1024) continue
+      const bytes = await readFile(path, 'utf8')
+      retainedBytes += size
+      await save(`opencode-${hash(entry.name)}.log`, bytes.replaceAll(bearer || '\0', '[redacted]'))
+    }
     await save('bridge.log', bridgeLog.replaceAll(bearer || '\0', '[redacted]'))
     await save('receipt.json', receipt)
   }
