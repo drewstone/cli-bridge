@@ -1,0 +1,54 @@
+# Temporary, PR-specific dependency preparation. Removed when its exact blobs are adopted.
+name: Prepare live proof pins
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  pins:
+    if: >-
+      github.event.pull_request.number == 263 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.event.pull_request.head.ref == 'test/local-opencode-runtime-proof'
+    runs-on: [self-hosted, beelink]
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter cli-bridge-runtime-consumer-regression add --save-dev --save-exact --strict-peer-dependencies @tangle-network/agent-runtime@0.325.0 @tangle-network/agent-eval@0.214.0
+      - name: Store only reviewed, digest-matched dependency blobs (no branch writes)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFile } from 'node:fs/promises';
+          import { createHash } from 'node:crypto';
+          const expected = {
+            'pnpm-lock.yaml': 'ae6a154c2ccc93b0a8f063fc59dbd70c1e6387bd',
+            'tests/runtime-consumer/package.json': '8aee5386c47dc452296a5b920072c0492c99bb4c',
+          };
+          for (const [path, sha] of Object.entries(expected)) {
+            const bytes = await readFile(path);
+            const actual = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+            assert.equal(actual, sha, `Generated dependency bytes changed: ${path}`);
+            const response = await fetch('https://api.github.com/repos/drewstone/cli-bridge/git/blobs', {
+              method: 'POST', redirect: 'error', signal: AbortSignal.timeout(30000),
+              headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+              body: JSON.stringify({ encoding: 'base64', content: bytes.toString('base64') }),
+            });
+            assert.equal(response.status, 201, `Blob write failed (${response.status})`);
+            assert.equal((await response.json()).sha, sha);
+            console.log(JSON.stringify({ path, sha, bytes: bytes.length }));
+          }
+          JS
