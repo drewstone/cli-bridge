@@ -1,0 +1,48 @@
+name: Local live inference
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-inference-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  opencode:
+    # Live inference is explicit, same-repository, owner-authored only. Never a merge gate.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner) ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login == github.repository_owner &&
+       contains(github.event.pull_request.labels.*.name, 'live-inference'))
+    runs-on: [self-hosted, beelink]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Real Runtime, local bridge, OpenCode, and GLM Flash
+        run: pnpm test:local-inference
+        env:
+          CLI_BRIDGE_REAL_OPENCODE_TESTS: '1'
+          CLI_BRIDGE_LIVE_MODEL: opencode/glm-5.3-flash-free
+          CLI_BRIDGE_LIVE_OUT: ${{ runner.temp }}/cli-bridge-live-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Retain the actual execution receipt (including failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-inference-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cli-bridge-live-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 14
