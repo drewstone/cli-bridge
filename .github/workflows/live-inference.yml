@@ -4,6 +4,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      model:
+        description: Explicit free OpenCode model; there is no fallback
+        default: opencode/glm-5.3-flash-free
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,7 +20,7 @@ concurrency:
 
 jobs:
   opencode:
-    # Live inference is explicit, same-repository, owner-authored only. Never a merge gate.
+    # Explicit owner-only live check, separate from the normal merge gate.
     if: >-
       (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
@@ -31,51 +37,13 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      # Temporary qualification step: commit the generated files before readiness.
-      - name: Qualify released Runtime and Eval cohort
-        run: pnpm --filter cli-bridge-runtime-consumer-regression add --save-dev --save-exact --strict-peer-dependencies @tangle-network/agent-runtime@0.325.0 @tangle-network/agent-eval@0.214.0
-      - name: Retain exact resolved dependency files
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-dependency-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            pnpm-lock.yaml
-            tests/runtime-consumer/package.json
-          retention-days: 14
-      - name: Diagnose host and actual filesystem-jail connectivity
-        shell: bash
-        run: |
-          node --import tsx --input-type=module <<'JS'
-          import { execFile } from 'node:child_process';
-          import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
-          import { tmpdir } from 'node:os';
-          import { join } from 'node:path';
-          import { promisify } from 'node:util';
-          import { LinuxBwrapJail } from './src/jail/linux-bwrap.ts';
-          const exec = promisify(execFile);
-          const root = await mkdtemp(join(tmpdir(), 'bridge-net-proof-'));
-          const task = join(root, 'task'); await mkdir(task);
-          const env = { PATH: process.env.PATH, HOME: root, LANG: 'C.UTF-8' };
-          const keys = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'];
-          for (const key of keys) if (process.env[key]) env[key] = process.env[key];
-          const clean = text => keys.reduce((value, key) => env[key] ? value.replaceAll(env[key], '[transport-setting]') : value, text);
-          console.log(JSON.stringify({ resolver: await realpath('/etc/resolv.conf'), transportKeys: keys.filter(key => env[key]) }));
-          try {
-            const jail = new LinuxBwrapJail();
-            if (!await jail.isAvailable()) throw new Error('Required Linux filesystem jail is unavailable');
-            for (const url of ['https://models.opencode.ai/api.json', 'https://opencode.ai']) {
-              const args = ['--head', '--silent', '--show-error', '--max-time', '10', '--output', '/dev/null', '--write-out', '%{http_code} %{remote_ip}', url];
-              for (const mode of ['host', 'fs-jail']) {
-                const command = mode === 'host' ? { bin: '/usr/bin/curl', args } : await jail.wrap('/usr/bin/curl', args, { root: join(task, '.agent-home'), projectDir: task, readConfine: true, requireEnforcement: true });
-                try { const result = await exec(command.bin, command.args, { env, cwd: task, timeout: 15000 }); console.log(JSON.stringify({ mode, url, status: 'connected', response: clean(result.stdout) })); }
-                catch (error) { console.log(JSON.stringify({ mode, url, status: 'failed', code: error.code, error: clean(error.stderr ?? error.message) })); }
-                finally { await command.cleanup?.(); }
-              }
-            }
-          } finally { await rm(root, { recursive: true, force: true }); }
-          JS
-      - name: Install pinned OpenCode into this job only
+      - run: pnpm install --frozen-lockfile --strict-peer-dependencies
+      - run: pnpm typecheck && pnpm test:runtime-consumer
+      - name: Prove DNS preservation and sibling-file isolation in the actual jail
+        run: pnpm exec vitest run tests/jail-resolver.test.ts
+        env:
+          CLI_BRIDGE_REAL_OPENCODE_TESTS: '1'
+      - name: Install checksum-pinned OpenCode into this job only
         shell: bash
         run: |
           set -euo pipefail
@@ -93,13 +61,15 @@ jobs:
           printf '%s\n' '#!/bin/sh' 'exec "$(dirname "$0")/opencode-native" --print-logs --log-level DEBUG "$@"' > "$tool/bin/opencode"
           chmod 700 "$tool/bin/opencode"
           echo "OPENCODE_BIN=$tool/bin/opencode" >> "$GITHUB_ENV"
-      - name: Real Runtime, local bridge, OpenCode, and GLM Flash
+      - name: Real Runtime, local bridge, OpenCode, and explicitly selected free inference
         run: pnpm test:local-inference
         env:
           CLI_BRIDGE_REAL_OPENCODE_TESTS: '1'
-          CLI_BRIDGE_LIVE_MODEL: opencode/glm-5.3-flash-free
+          # GLM was independently attempted and rate-limited. This is a separate
+          # explicitly named DeepSeek proof, never a silent or paid fallback.
+          CLI_BRIDGE_LIVE_MODEL: ${{ inputs.model || 'opencode/deepseek-v4.1-flash-free' }}
           CLI_BRIDGE_LIVE_OUT: ${{ runner.temp }}/cli-bridge-live-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Retain the actual execution receipt (including failures)
+      - name: Retain the actual execution receipt, including failures
         if: always()
         uses: actions/upload-artifact@v4
         with:

@@ -83,6 +83,8 @@ async function main() {
   assert.equal(process.env.CLI_BRIDGE_REAL_OPENCODE_TESTS, '1', 'Opt in with CLI_BRIDGE_REAL_OPENCODE_TESTS=1; this invokes a real external model.')
   assert.match(nativeModel, /^opencode\/[a-z0-9.-]+-free$/, 'Select an explicitly free OpenCode model. No paid model or silent fallback is allowed.')
   assert.equal(process.platform, 'linux', 'This proof requires the existing Linux filesystem jail; it never downgrades confinement.')
+  const [major, minor] = process.versions.node.split('.').map(Number)
+  assert.ok(major > 22 || (major === 22 && minor >= 19), 'The live Runtime proof requires Node 22.19 or newer')
   root = await mkdtemp(join(tmpdir(), 'cli-bridge-live-'))
   evidence = process.env.CLI_BRIDGE_LIVE_OUT ? resolve(process.env.CLI_BRIDGE_LIVE_OUT) : join(root, 'evidence')
   await mkdir(evidence, { mode: 0o700 }) // Existing evidence is never overwritten.
@@ -187,7 +189,7 @@ try { await main() } catch (error) {
   receipt.error = String(error?.stack ?? error).replaceAll(bearer || '\0', '[redacted]')
   process.exitCode = 1
 } finally {
-  for (const cleanup of [() => executor?.teardown(), stopBridge]) {
+  for (const cleanup of [() => executor?.teardown(5_000), stopBridge]) {
     try { await cleanup() } catch (error) {
       receipt.status = 'failed'
       ;(receipt.cleanupErrors ??= []).push(error.message)
@@ -216,4 +218,3 @@ try { await main() } catch (error) {
     await save('receipt.json', receipt)
   }
   console.log(JSON.stringify({ ...receipt, evidenceDirectory: evidence ?? null }, null, 2))
-}
