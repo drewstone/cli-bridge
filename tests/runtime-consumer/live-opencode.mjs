@@ -2,7 +2,7 @@
 /** Real Runtime -> local cli-bridge -> OpenCode -> free inference. Never a mock or a fallback. */
 import assert from 'node:assert/strict'
 import { constants } from 'node:fs'
-import { access, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { spawn, execFile } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
@@ -86,7 +86,7 @@ async function main() {
   const [major, minor] = process.versions.node.split('.').map(Number)
   assert.ok(major > 22 || (major === 22 && minor >= 19), 'The live Runtime proof requires Node 22.19 or newer')
   root = await mkdtemp(join(tmpdir(), 'cli-bridge-live-'))
-  evidence = process.env.CLI_BRIDGE_LIVE_OUT ? resolve(process.env.CLI_BRIDGE_LIVE_OUT) : join(root, 'evidence')
+  evidence = process.env.CLI_BRIDGE_LIVE_OUT ? resolve(process.env.CLI_BRIDGE_LIVE_OUT) : `${root}-evidence`
   await mkdir(evidence, { mode: 0o700 }) // Existing evidence is never overwritten.
   ownsEvidence = true
   for (const name of ['home', 'task', 'data', 'config', 'cache', 'state', 'bridge']) await mkdir(join(root, name), { mode: 0o700 })
@@ -216,6 +216,12 @@ try { await main() } catch (error) {
     }
     await save('bridge.log', bridgeLog.replaceAll(bearer || '\0', '[redacted]'))
     await save('receipt.json', receipt)
+  }
+  // Remove only owned scratch, after confirmed process cleanup and evidence capture.
+  if (root && !receipt.cleanupErrors?.length && (!evidence || (evidence !== root && !evidence.startsWith(root + '/')))) {
+    try { await rm(root, { recursive: true, force: true }); receipt.scratchRemoved = true }
+    catch (error) { receipt.status = 'failed'; receipt.cleanupErrors ??= []; receipt.cleanupErrors.push(error.message); process.exitCode = 1 }
+    if (ownsEvidence) await writeFile(join(evidence, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 })
   }
   console.log(JSON.stringify({ ...receipt, evidenceDirectory: evidence ?? null }, null, 2))
 }

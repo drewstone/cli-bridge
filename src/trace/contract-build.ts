@@ -107,22 +107,20 @@ export interface LockedTraceContract {
   integrity: string
 }
 
-/**
- * Read the repo's own pnpm-lock.yaml entry for this package.
- *
- * Fails closed on zero matching entries (nothing pinned means the provenance
- * check would silently verify nothing) and on more than one (two pinned builds
- * make "the locked build" ambiguous — a side-loaded `file:` variant is exactly
- * the shape that ambiguity hides).
- */
+/** Read the root producer's exact registry build. pnpm may write a separate
+ * package-manager document first; other workspace consumers may pin other builds. */
 export function lockedTraceContract(lockfilePath: string = defaultLockfilePath(import.meta.url)): LockedTraceContract {
   const text = readFileSync(lockfilePath, 'utf8')
-  const entryPattern = /^ {2}'@tangle-network\/agent-trace-contract@([^']+)':\r?\n {4}resolution: \{integrity: (sha512-[A-Za-z0-9+/]+={0,2})\}/gmu
-  const entries = [...text.matchAll(entryPattern)]
+  const roots = [...text.matchAll(/^ {2}\.:\r?\n((?:(?: {4}[^\r\n]*|)\r?\n)*)/gmu)]
+  const selections = roots.flatMap(root => [...root[1]!.matchAll(/^ {6}'@tangle-network\/agent-trace-contract':\r?\n {8}specifier: [^\r\n]+\r?\n {8}version: ([^\r\n]+)/gmu)].map(match => match[1]))
+  const selected = selections.length === 1 ? selections[0] : undefined
+  if (!selected || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(selected)) {
+    throw new Error(`${lockfilePath} must pin a registry ${PACKAGE} build for the root importer`)
+  }
+  const entries = [...text.matchAll(/^ {2}'@tangle-network\/agent-trace-contract@([^']+)':\r?\n {4}resolution: \{integrity: (sha512-[A-Za-z0-9+/]+={0,2})\}/gmu)].filter(match => match[1] === selected)
   const entry = entries[0]
   if (entries.length !== 1 || entry === undefined) {
-    const found = entries.map((match) => match[1]).join(', ') || 'none'
-    throw new Error(`${lockfilePath} must pin exactly one ${PACKAGE} build; found: ${found}`)
+    throw new Error(`${lockfilePath} must contain one integrity for the root importer's ${PACKAGE}@${selected}`)
   }
   const version = entry[1]
   const integrity = entry[2]
