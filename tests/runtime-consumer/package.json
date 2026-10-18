@@ -6,10 +6,10 @@
     "test": "tsx --test bridge-cache-accounting.consumer.ts"
   },
   "devDependencies": {
-    "@tangle-network/agent-eval": "0.213.0",
+    "@tangle-network/agent-eval": "0.214.0",
     "@tangle-network/agent-interface": "5.2.1",
     "@tangle-network/agent-profile-materialize": "0.25.2",
-    "@tangle-network/agent-runtime": "0.319.8",
+    "@tangle-network/agent-runtime": "0.325.0",
     "@tangle-network/sandbox": "0.60.51",
     "tsx": "^4.23.15"
   }
