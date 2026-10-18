@@ -174,6 +174,8 @@ describe('host executor — typed saturation refusal', () => {
   })
 
   it.skipIf(process.platform === 'win32')('holds the slot after leader exit while its helper survives', async () => {
+    // This checks process lifetime, not the 400ms admission cap tested above.
+    process.env.BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS = '5000'
     const { hostSpawner, hostExecutorSnapshot } = await import('../src/executors/host.js')
     const { terminateSpawned } = await import('../src/executors/process-tree.js')
     const helperCode = "process.on('SIGTERM',()=>{});process.stdout.write('ready');setInterval(()=>{},1000)"
@@ -190,7 +192,7 @@ describe('host executor — typed saturation refusal', () => {
       let admitted = false
       const waiting = hostSpawner('node', ['-e', 'setTimeout(()=>{},1000)'], {
         stdio: ['ignore', 'pipe', 'pipe'],
-        acquireDeadlineMs: 400,
+        acquireDeadlineMs: 5_000,
       }).then((spawned) => {
         admitted = true
         return spawned
