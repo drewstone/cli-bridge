@@ -17,7 +17,7 @@
  * right headers so Moonshot's backend accepts the call.
  */
 
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -241,7 +241,7 @@ export class OpencodeBackend implements Backend {
       if (!stdinResult.ok) {
         throw new BackendError(`opencode stdin write failed: ${stdinResult.error}`, 'upstream')
       }
-      let sawError: string | null = null
+      let sawError: BackendFailureReason | null = null
       let emittedContent = false
       let emittedToolCall = false
       let stepUsage: CollectedUsage | undefined
@@ -299,14 +299,23 @@ export class OpencodeBackend implements Backend {
           // fallback below fired on all of them — 16 of them in this host's bridge logs, each
           // one a readable provider message rendered as an unreadable JSON dump truncated at
           // 400 chars, which is where `data` was being cut off.
-          const errorObject = ev.error as { message?: unknown; name?: unknown; data?: { message?: unknown } } | undefined
-          sawError = String(
-            ev.message ??
-              errorObject?.data?.message ??
-              errorObject?.message ??
-              errorObject?.name ??
-              `opencode error event without a message: ${JSON.stringify(ev).slice(0, 400)}`,
-          )
+          const errorObject = ev.error as { message?: unknown; name?: unknown; data?: { message?: unknown; statusCode?: unknown } } | undefined
+          // opencode's APIError states the provider's HTTP status as `data.statusCode`. Without it a
+          // provider's 429 ("Rate limit reached for requests", "Usage limit reached") reached
+          // agent-runtime as bare prose, was classed a transient fault, and was retried every few
+          // seconds instead of paused: magnetar-rust-20261017c ended 636 driver attempts that way.
+          const status = providerStatus(errorObject?.data?.statusCode)
+          sawError = {
+            message: String(
+              ev.message ??
+                errorObject?.data?.message ??
+                errorObject?.message ??
+                errorObject?.name ??
+                `opencode error event without a message: ${JSON.stringify(ev).slice(0, 400)}`,
+            ),
+            type: 'upstream',
+            ...(status === undefined ? {} : { status }),
+          }
           continue
         }
 
@@ -350,7 +359,11 @@ export class OpencodeBackend implements Backend {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
-      if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
+      // Ended through the delta envelope, not a throw, so the provider's status reaches the caller.
+      if (sawError) {
+        yield { ...terminalOutcome('opencode', sawError, emittedToolCall), internal_session_id: internalSessionId }
+        return
+      }
       if (exit.code !== 0) {
         throw new BackendError(await describeCliExit(spawned, 'opencode', exit.code, stderr.render(), exit.signal), 'upstream')
       }
@@ -573,4 +586,11 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
+}
+
+/** A provider status stated as a field; the bridge never infers one from prose. */
+function providerStatus(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : undefined
 }
