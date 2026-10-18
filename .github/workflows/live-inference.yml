@@ -16,7 +16,7 @@ permissions:
 
 concurrency:
   group: live-inference-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   opencode:
@@ -26,8 +26,9 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.user.login == github.repository_owner &&
        contains(github.event.pull_request.labels.*.name, 'live-inference'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Pin the image rather than changing host namespace security policy.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -37,10 +38,16 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - name: Install the filesystem jail on this disposable runner
-        run: sudo apt-get update -qq && sudo apt-get install --no-install-recommends -y bubblewrap
+      - name: Install and probe the filesystem jail on this disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y bubblewrap
+          bwrap --unshare-user --ro-bind / / -- /bin/true
       - run: pnpm install --frozen-lockfile --strict-peer-dependencies
-      - run: pnpm typecheck && pnpm test:runtime-consumer
+      - name: Typecheck, complete suite, and published Runtime consumer
+        run: pnpm typecheck && pnpm test
       - name: Prove DNS preservation and sibling-file isolation in the actual jail
         run: pnpm exec vitest run tests/jail-resolver.test.ts
         env:
