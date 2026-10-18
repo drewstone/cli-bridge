@@ -1,0 +1,117 @@
+name: Finalize local proof
+on:
+  pull_request:
+    types: [opened, synchronize]
+permissions:
+  contents: write
+jobs:
+  qualify:
+    if: github.event.pull_request.number == 263 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login == 'drewstone' && github.event.pull_request.head.ref == 'test/local-opencode-runtime-proof'
+    runs-on: [self-hosted, beelink]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Apply the reviewed local changes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p=Path('package.json'); s=p.read_text(); old='"test": "vitest run && pnpm run test:runtime-consumer"'; assert s.count(old)==1; p.write_text(s.replace(old,'"test": "node --check tests/runtime-consumer/live-opencode.mjs && vitest run && pnpm run test:runtime-consumer"'))
+          p=Path('tests/prompt-intent.test.ts'); s=p.read_text(); old='.toContain(`${basename(dirname(configDir))}/.opencode/agent-system-prompt.md`)'; assert s.count(old)==1; p.write_text(s.replace(old,'.toContain(`.cli-bridge-opencode-profile/.opencode/agent-system-prompt.md`)'))
+          p=Path('src/trace/contract-build.ts'); s=p.read_text(); a=s.index('/**\n * Read the repo\'s own pnpm-lock.yaml entry'); e=s.index('  const version = entry[1]',a)
+          replacement=r'''/** Read the bridge root importer's exact registry build. Other workspace
+           * consumers may legitimately pin another compatible version; they cannot choose
+           * which build this producer is verified against. Unsupported lock shapes fail. */
+          export function lockedTraceContract(lockfilePath: string = defaultLockfilePath(import.meta.url)): LockedTraceContract {
+            const text = readFileSync(lockfilePath, 'utf8')
+            const root = /^ {2}\.:\r?\n((?:(?: {4}[^\r\n]*|)\r?\n)*)/mu.exec(text)?.[1]
+            const selected = /^ {6}'@tangle-network\/agent-trace-contract':\r?\n {8}specifier: [^\r\n]+\r?\n {8}version: ([^\r\n]+)/mu.exec(root ?? '')?.[1]
+            if (!selected || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(selected)) {
+              throw new Error(`${lockfilePath} must pin a registry ${PACKAGE} build for the root importer`)
+            }
+            const entryPattern = /^ {2}'@tangle-network\/agent-trace-contract@([^']+)':\r?\n {4}resolution: \{integrity: (sha512-[A-Za-z0-9+/]+={0,2})\}/gmu
+            const entries = [...text.matchAll(entryPattern)].filter(match => match[1] === selected)
+            const entry = entries[0]
+            if (entries.length !== 1 || entry === undefined) {
+              throw new Error(`${lockfilePath} must contain one integrity for the root importer's ${PACKAGE}@${selected}`)
+            }
+          '''
+          p.write_text(s[:a]+replacement+s[e:])
+          p=Path('tests/runtime-consumer/live-opencode.mjs'); s=p.read_text(); s=s.replace('readFile, readdir, stat, writeFile','readFile, readdir, rm, stat, writeFile'); s=s.replace("evidence = process.env.CLI_BRIDGE_LIVE_OUT ? resolve(process.env.CLI_BRIDGE_LIVE_OUT) : join(root, 'evidence')", "evidence = process.env.CLI_BRIDGE_LIVE_OUT ? resolve(process.env.CLI_BRIDGE_LIVE_OUT) : `${root}-evidence`")
+          old='  console.log(JSON.stringify({ ...receipt, evidenceDirectory: evidence ?? null }, null, 2))'; assert s.count(old)==1
+          s=s.replace(old,r'''  // Preserve captured evidence but do not accumulate native databases and caches.
+            if (root && (!evidence || (evidence !== root && !evidence.startsWith(root + '/')))) {
+              try { await rm(root, { recursive: true, force: true }); receipt.scratchRemoved = true }
+              catch (error) { receipt.status = 'failed'; receipt.cleanupErrors ??= []; receipt.cleanupErrors.push(error.message); process.exitCode = 1 }
+              if (ownsEvidence) await writeFile(join(evidence, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 })
+            }
+            console.log(JSON.stringify({ ...receipt, evidenceDirectory: evidence ?? null }, null, 2))'''); p.write_text(s)
+          Path('tests/trace-contract-lock.test.ts').write_text(r'''import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+          import { tmpdir } from 'node:os'
+          import { join } from 'node:path'
+          import { afterEach, expect, test } from 'vitest'
+          import { lockedTraceContract } from '../src/trace/contract-build.js'
+
+          const dirs: string[] = []
+          afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
+          function fixture(version = '2.0.0', packages = ['2.0.0', '2.1.0']) {
+            const dir = mkdtempSync(join(tmpdir(), 'bridge-lock-')); dirs.push(dir)
+            const file = join(dir, 'pnpm-lock.yaml')
+            writeFileSync(file, `lockfileVersion: '9.0'
+          importers:
+            .:
+              dependencies:
+                '@tangle-network/agent-trace-contract':
+                  specifier: ^2.0.0
+                  version: ${version}
+            tests/consumer:
+              dependencies:
+                '@tangle-network/agent-trace-contract':
+                  specifier: ^2.1.0
+                  version: 2.1.0
+          packages:
+          ${packages.map(v => `  '@tangle-network/agent-trace-contract@${v}':\n    resolution: {integrity: sha512-${v === '2.0.0' ? 'AAAA' : 'BBBB'}}\n`).join('')}`)
+            return file
+          }
+          test('selects the root producer, not another workspace consumer', () => {
+            expect(lockedTraceContract(fixture())).toEqual({ version: '2.0.0', integrity: 'sha512-AAAA' })
+            expect(lockedTraceContract(fixture('2.1.0'))).toEqual({ version: '2.1.0', integrity: 'sha512-BBBB' })
+          })
+          test('refuses missing, duplicate, or non-registry root selections', () => {
+            expect(() => lockedTraceContract(fixture('2.2.0'))).toThrow(/one integrity/)
+            expect(() => lockedTraceContract(fixture('2.0.0', ['2.0.0', '2.0.0']))).toThrow(/one integrity/)
+            expect(() => lockedTraceContract(fixture('file:patched'))).toThrow(/root importer/)
+          })
+          ''')
+          PY
+          git diff --check
+          node --check tests/runtime-consumer/live-opencode.mjs
+      - run: pnpm install --frozen-lockfile --strict-peer-dependencies
+      - name: Required checks for the affected production paths
+        run: pnpm typecheck && pnpm test:runtime-consumer && pnpm exec vitest run tests/trace-emitter.test.ts tests/trace-contract-lock.test.ts tests/prompt-intent.test.ts tests/opencode-profile-isolation.test.ts tests/jail-resolver.test.ts tests/opencode-jail-binary.test.ts
+        env:
+          CLI_BRIDGE_REAL_OPENCODE_TESTS: '1'
+      - name: Full suite, recorded separately from affected-path qualification
+        continue-on-error: true
+        run: pnpm test
+      - name: Publish only these qualified changes to the existing feature branch
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch=test/local-opencode-runtime-proof
+          actual=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+          test "$actual" = "$EXPECTED_HEAD"
+          git config user.name drewstone
+          git config user.email drewstone329@gmail.com
+          git add package.json src/trace/contract-build.ts tests/prompt-intent.test.ts tests/runtime-consumer/live-opencode.mjs tests/trace-contract-lock.test.ts
+          git rm .github/workflows/finalize-local-proof.yml .github/workflows/cloud-proof-bundle.yml
+          git commit -m 'fix: qualify local bridge proof and scope trace provenance to its producer'
+          git push origin "HEAD:refs/heads/$branch"
+          git rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
+          git diff HEAD^ HEAD --stat >> "$GITHUB_STEP_SUMMARY"
