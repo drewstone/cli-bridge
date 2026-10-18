@@ -26,7 +26,7 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.user.login == github.repository_owner &&
        contains(github.event.pull_request.labels.*.name, 'live-inference'))
-    runs-on: [self-hosted, beelink]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -37,6 +37,8 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Install the filesystem jail on this disposable runner
+        run: sudo apt-get update -qq && sudo apt-get install --no-install-recommends -y bubblewrap
       - run: pnpm install --frozen-lockfile --strict-peer-dependencies
       - run: pnpm typecheck && pnpm test:runtime-consumer
       - name: Prove DNS preservation and sibling-file isolation in the actual jail
@@ -65,9 +67,7 @@ jobs:
         run: pnpm test:local-inference
         env:
           CLI_BRIDGE_REAL_OPENCODE_TESTS: '1'
-          # GLM was independently attempted and rate-limited. This is a separate
-          # explicitly named DeepSeek proof, never a silent or paid fallback.
-          CLI_BRIDGE_LIVE_MODEL: ${{ inputs.model || 'opencode/deepseek-v4.1-flash-free' }}
+          CLI_BRIDGE_LIVE_MODEL: ${{ inputs.model || 'opencode/glm-5.3-flash-free' }}
           CLI_BRIDGE_LIVE_OUT: ${{ runner.temp }}/cli-bridge-live-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Retain the actual execution receipt, including failures
         if: always()
