@@ -1,0 +1,86 @@
+name: Local live inference
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Explicit free OpenCode model; there is no fallback
+        default: opencode/glm-5.3-flash-free
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-inference-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  opencode:
+    # Explicit owner-only live check, separate from the normal merge gate.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner) ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login == github.repository_owner &&
+       contains(github.event.pull_request.labels.*.name, 'live-inference'))
+    # Pin the image rather than changing host namespace security policy.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install and probe the filesystem jail on this disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y bubblewrap
+          bwrap --unshare-user --ro-bind / / -- /bin/true
+      - run: pnpm install --frozen-lockfile --strict-peer-dependencies
+      - name: Typecheck, complete suite, and published Runtime consumer
+        run: pnpm typecheck && pnpm test
+      - name: Prove DNS preservation and sibling-file isolation in the actual jail
+        run: pnpm exec vitest run tests/jail-resolver.test.ts
+        env:
+          CLI_BRIDGE_REAL_OPENCODE_TESTS: '1'
+      - name: Install checksum-pinned OpenCode into this job only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          tool="$RUNNER_TEMP/opencode-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$tool"
+          mkdir -m 700 "$tool/bin"
+          curl --fail --silent --show-error --location --max-time 120 \
+            https://github.com/anomalyco/opencode/releases/download/v1.19.3/opencode-linux-x64-baseline.tar.gz \
+            --output "$tool/opencode.tar.gz"
+          printf '%s  %s\n' 531cff2441129c30f0edd5878af494108ad07f5feb46d7ee29a2a5b830a5765d "$tool/opencode.tar.gz" | sha256sum --check --status
+          tar --extract --gzip --no-same-owner --file "$tool/opencode.tar.gz" --directory "$tool/bin"
+          test -x "$tool/bin/opencode"
+          mv "$tool/bin/opencode" "$tool/bin/opencode-native"
+          printf '%s\n' '#!/bin/sh' 'exec "$(dirname "$0")/opencode-native" --print-logs --log-level DEBUG "$@"' > "$tool/bin/opencode"
+          chmod 700 "$tool/bin/opencode"
+          echo "OPENCODE_BIN=$tool/bin/opencode" >> "$GITHUB_ENV"
+      - name: Real Runtime, local bridge, OpenCode, and explicitly selected free inference
+        run: pnpm test:local-inference
+        env:
+          CLI_BRIDGE_REAL_OPENCODE_TESTS: '1'
+          CLI_BRIDGE_LIVE_MODEL: ${{ inputs.model || 'opencode/glm-5.3-flash-free' }}
+          CLI_BRIDGE_LIVE_OUT: ${{ runner.temp }}/cli-bridge-live-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Retain the actual execution receipt, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-inference-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cli-bridge-live-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 14

@@ -134,7 +134,11 @@ function makeChildSpawner(
   const spawner: Spawner = Object.assign(async (bin: string, args: string[], options: Parameters<Spawner>[2]) => {
     const isRpc = args.includes('--mode') && args.includes('rpc')
     if (isRpc) calls.push({ bin, args: [...args] })
-    const source = isRpc ? childSource : 'print("pi 0.83.0-test", flush=True)'
+    // The short RPC deadline tests missing acknowledgements, not Python startup.
+    // Signal readiness on stderr so no protocol response is consumed here.
+    const source = isRpc
+      ? childSource.replace('for line in sys.stdin:', 'print("bridge-fixture-ready", file=sys.stderr, flush=True)\nfor line in sys.stdin:')
+      : 'print("pi 0.83.0-test", flush=True)'
     const child = spawn('python3', ['-u', '-c', source], {
       cwd: options.cwd,
       env: { ...options.env, CLI_BRIDGE_TEST_ARGS: JSON.stringify(args) },
@@ -144,6 +148,30 @@ function makeChildSpawner(
     let released = false
     let terminated = false
     const closed = new Promise<void>(resolve => child.once('close', () => resolve()))
+    if (isRpc) {
+      await new Promise<void>((resolve, reject) => {
+        let stderr = ''
+        const cleanup = () => {
+          clearTimeout(timer)
+          child.stderr?.off('data', onData)
+          child.off('error', onError)
+          child.off('close', onClose)
+        }
+        const onError = (error: Error) => { cleanup(); reject(error) }
+        const onClose = () => onError(new Error(`Pi fixture exited before readiness: ${stderr}`))
+        const onData = (chunk: Buffer) => {
+          stderr = (stderr + chunk.toString()).slice(-8192)
+          if (stderr.includes('bridge-fixture-ready\n')) { cleanup(); resolve() }
+        }
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL')
+          onError(new Error(`Pi fixture did not initialize: ${stderr}`))
+        }, 5_000)
+        child.stderr?.on('data', onData)
+        child.once('error', onError)
+        child.once('close', onClose)
+      })
+    }
     return {
       child,
       release: () => {
