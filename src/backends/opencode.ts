@@ -33,6 +33,7 @@ import {
 } from './profile-support.js'
 import { registerJailReadable } from '../jail/index.js'
 import { dirname, join } from 'node:path'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -96,6 +97,12 @@ export class OpencodeBackend implements Backend {
       cwd,
       profileExecutionIdentity(req, session, 'opencode', variant),
     )
+    try {
+      installRetrySignal(provisioned.env.OPENCODE_CONFIG_DIR)
+    } catch (error) {
+      provisioned.cleanup?.()
+      throw error
+    }
 
     // Materialize the one selected MCP source into a temporary OpenCode config.
     // opencode-cli has no per-invocation `--mcp-config-file` flag —
@@ -276,6 +283,13 @@ export class OpencodeBackend implements Backend {
         }
 
         const type = String(ev.type ?? '')
+        if (type === RETRY_SIGNAL_TYPE) {
+          const refusal = longRetryWait(ev)
+          if (refusal === null) continue
+          // The process is still asleep in its retry; the `finally` below stops it.
+          yield { ...terminalOutcome('opencode', refusal, emittedToolCall), internal_session_id: internalSessionId }
+          return
+        }
         const eventUsage = extractUsage(ev)
         if (eventUsage) {
           if (isStepReceipt(ev)) stepUsage = collectUsage(stepUsage, eventUsage)
@@ -593,4 +607,68 @@ function providerStatus(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
     ? value
     : undefined
+}
+
+/**
+ * A provider's retry wait, made visible.
+ *
+ * opencode retries a refused model call itself (`session/retry.ts`). A response with a
+ * `retry-after` header sets the wait, capped only at 2^31 ms, and `run --format json` prints
+ * nothing while it waits: it never emits the `session.status` retry event. The free seat answers
+ * a spent quota with `429` and `retry-after: 47331` (13.1 h), so magnetar-rust-20261019b's root
+ * slept in silence until this bridge's 4 h turn cap aborted it, and agent-runtime ended a 48 h run
+ * on that abort. The plugin below prints opencode's own retry status as one stdout line, which
+ * the event loop reads with the rest of the stream.
+ */
+const RETRY_SIGNAL_TYPE = 'cli-bridge.opencode-retry'
+const RETRY_SIGNAL_PLUGIN = `// Written by cli-bridge for this turn. Prints opencode's retry status, which \`run --format json\` omits.
+export const CliBridgeRetrySignal = async () => ({
+  event: async ({ event }) => {
+    const status = event?.properties?.status
+    if (event?.type !== 'session.status' || status?.type !== 'retry') return
+    process.stdout.write(JSON.stringify({
+      type: ${JSON.stringify(RETRY_SIGNAL_TYPE)},
+      sessionID: event.properties.sessionID,
+      attempt: status.attempt,
+      message: status.message,
+      next: status.next,
+      timestamp: Date.now(),
+    }) + '\\n')
+  },
+})
+`
+
+/**
+ * The longest retry wait a turn sits through. opencode's own backoff without a `retry-after`
+ * stays at or under 32 s; anything longer is the provider naming a reset, which agent-runtime
+ * holds for without spending the process or an attempt.
+ */
+const RETRY_WAIT_LIMIT_MS = Math.max(1_000, Number(process.env.OPENCODE_RETRY_WAIT_MAX_MS ?? 60_000))
+
+/**
+ * Put the plugin in the turn's private config directory. A turn without an AgentProfile has
+ * none: opencode would read the operator's own config directory, which this bridge never writes.
+ */
+function installRetrySignal(configDir: string | undefined): void {
+  if (configDir === undefined) return
+  const pluginDir = join(configDir, 'plugin')
+  mkdirSync(pluginDir, { recursive: true, mode: 0o755 })
+  writeFileSync(join(pluginDir, 'cli-bridge-retry-signal.js'), RETRY_SIGNAL_PLUGIN, { mode: 0o644 })
+}
+
+/**
+ * The refusal a retry wait longer than {@link RETRY_WAIT_LIMIT_MS} stands for, or `null` for a
+ * short wait opencode should sit out. It carries `upstream_unavailable` rather than a status:
+ * opencode's retry status names no HTTP status, and the bridge never infers one. agent-runtime
+ * pauses on that code, and a `reset at` time within its hold window holds the run until then.
+ */
+function longRetryWait(ev: Record<string, unknown>): BackendFailureReason | null {
+  const next = typeof ev.next === 'number' ? ev.next : NaN
+  const now = typeof ev.timestamp === 'number' ? ev.timestamp : Date.now()
+  if (!Number.isFinite(next) || next - now <= RETRY_WAIT_LIMIT_MS) return null
+  const message = typeof ev.message === 'string' && ev.message.length > 0 ? ev.message : 'the provider refused the call'
+  return {
+    message: `${message}; the provider asked opencode to wait ${Math.round((next - now) / 1000)} s before retrying, reset at ${new Date(next).toISOString()}`,
+    type: 'upstream_unavailable',
+  }
 }
