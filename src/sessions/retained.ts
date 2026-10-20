@@ -146,14 +146,17 @@ export class RetainedSessionService {
     return parseNativeContinuation(value)
   }
 
-  async capabilities(model: string, signal?: AbortSignal): Promise<AgentEnvironmentCapabilities> {
-    const { capabilities } = await readyBackendCapabilities({
+  async capabilities(
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<AgentEnvironmentCapabilities & { toolCallSpans?: true }> {
+    const { backend, capabilities } = await readyBackendCapabilities({
       registry: this.registry,
       model,
       healthProbeTimeoutMs: this.healthProbeTimeoutMs,
       signal,
     })
-    return capabilities
+    return backend.toolCallSpans ? { ...capabilities, toolCallSpans: true } : capabilities
   }
 
   async create(input: RetainedCreateInput, signal?: AbortSignal): Promise<RetainedSessionView> {
