@@ -57,6 +57,9 @@ export interface OpencodeBackendOptions {
 export class OpencodeBackend implements Backend {
   readonly name = 'opencode'
   readonly defaultExecutionTimeoutMs: number
+  // The signal plugin reports a call at its start; it is installed in the turn's private config
+  // directory, which every turn with an AgentProfile has (agent-runtime always sends one).
+  readonly toolCallSpans = true
   private readonly spawner: Spawner
   constructor(private readonly opts: OpencodeBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs

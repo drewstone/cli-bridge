@@ -1077,6 +1077,14 @@ describe('retained Agent Interface sessions', () => {
     })
     expect(capabilities).not.toHaveProperty('nativeContinuation')
     expect(capabilities).not.toHaveProperty('interactions')
+    expect(capabilities).not.toHaveProperty('toolCallSpans')
+  })
+
+  it('declares toolCallSpans only for a backend whose stream reports a call at its start and end', async () => {
+    fixture = setup(Object.assign(new OneShotBackend('opencode'), { toolCallSpans: true }))
+    const response = await fixture.app.request('/v1/capabilities?model=opencode%2Ftest')
+    expect(response.status).toBe(200)
+    expect(await json(response)).toMatchObject({ toolCallSpans: true, streaming: { live: true } })
   })
 
   it('refuses retained capability discovery and creation until native health is ready', async () => {
