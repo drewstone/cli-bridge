@@ -98,7 +98,7 @@ export class OpencodeBackend implements Backend {
       profileExecutionIdentity(req, session, 'opencode', variant),
     )
     try {
-      installRetrySignal(provisioned.env.OPENCODE_CONFIG_DIR)
+      installSignals(provisioned.env.OPENCODE_CONFIG_DIR)
     } catch (error) {
       provisioned.cleanup?.()
       throw error
@@ -251,6 +251,9 @@ export class OpencodeBackend implements Backend {
       let sawError: BackendFailureReason | null = null
       let emittedContent = false
       let emittedToolCall = false
+      // Calls already reported at their start, so their finished part carries only the outcome.
+      const startedTools = new Set<string>()
+      let toolSession: string | null = null
       let stepUsage: CollectedUsage | undefined
       let fallbackUsage: UsageReceipt | undefined
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
@@ -289,6 +292,21 @@ export class OpencodeBackend implements Backend {
           // The process is still asleep in its retry; the `finally` below stops it.
           yield { ...terminalOutcome('opencode', refusal, emittedToolCall), internal_session_id: internalSessionId }
           return
+        }
+        if (type === TOOL_START_SIGNAL_TYPE) {
+          // The plugin sees every session's parts; `run` prints only its own session's, so a
+          // subagent's tool would open a call that no finished part ever closes. The first start
+          // can precede `run`'s first event, and it is the run's own: a subagent's tool starts
+          // only inside a root tool that started before it.
+          toolSession ??= internalSessionId ?? (typeof ev.partSession === 'string' ? ev.partSession : null)
+          if (ev.partSession !== toolSession) continue
+          const started = extractToolUse(ev)
+          if (started && !startedTools.has(started.id)) {
+            startedTools.add(started.id)
+            yield { tool_calls: [started] }
+            emittedToolCall = true
+          }
+          continue
         }
         const eventUsage = extractUsage(ev)
         if (eventUsage) {
@@ -346,9 +364,9 @@ export class OpencodeBackend implements Backend {
           emittedContent = true
         }
         const toolCall = extractToolUse(ev)
-        if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
-        // opencode announces a tool part only once it has finished, so the outcome is on the
-        // same event as the call and can be forwarded beside it.
+        // `run` prints a tool part only once it has finished. A call the plugin reported at its
+        // start gets only its outcome here; one it missed is reported whole, call and outcome.
+        if (toolCall && !startedTools.has(toolCall.id)) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
         const toolResult = extractToolResult(ev)
         if (toolResult) yield { tool_results: [toolResult] }
 
@@ -619,23 +637,46 @@ function providerStatus(value: unknown): number | undefined {
  * slept in silence until this bridge's 4 h turn cap aborted it, and agent-runtime ended a 48 h run
  * on that abort. The plugin below prints opencode's own retry status as one stdout line, which
  * the event loop reads with the rest of the stream.
+ *
+ * It prints each tool call's start the same way. `run` prints a tool part only once it has
+ * finished (`part.state.status` completed or error), so a 32-minute test battery read as 32 minutes
+ * of model silence (magnetar-rust-20261018b), and agent-runtime could not bound a silent model
+ * call on this backend. The part is on opencode's bus as `message.part.updated` with status
+ * `running` from the moment the tool starts.
  */
 const RETRY_SIGNAL_TYPE = 'cli-bridge.opencode-retry'
-const RETRY_SIGNAL_PLUGIN = `// Written by cli-bridge for this turn. Prints opencode's retry status, which \`run --format json\` omits.
-export const CliBridgeRetrySignal = async () => ({
-  event: async ({ event }) => {
-    const status = event?.properties?.status
-    if (event?.type !== 'session.status' || status?.type !== 'retry') return
-    process.stdout.write(JSON.stringify({
-      type: ${JSON.stringify(RETRY_SIGNAL_TYPE)},
-      sessionID: event.properties.sessionID,
-      attempt: status.attempt,
-      message: status.message,
-      next: status.next,
-      timestamp: Date.now(),
-    }) + '\\n')
-  },
-})
+const TOOL_START_SIGNAL_TYPE = 'cli-bridge.opencode-tool-start'
+const SIGNAL_PLUGIN = `// Written by cli-bridge for this turn. Prints what \`run --format json\` omits: opencode's retry
+// status, and each tool call when it starts.
+export const CliBridgeSignals = async () => {
+  const started = new Set()
+  return {
+    event: async ({ event }) => {
+      const props = event?.properties
+      if (event?.type === 'session.status' && props?.status?.type === 'retry') {
+        process.stdout.write(JSON.stringify({
+          type: ${JSON.stringify(RETRY_SIGNAL_TYPE)},
+          sessionID: props.sessionID,
+          attempt: props.status.attempt,
+          message: props.status.message,
+          next: props.status.next,
+          timestamp: Date.now(),
+        }) + '\\n')
+        return
+      }
+      const part = props?.part
+      if (event?.type !== 'message.part.updated' || part?.type !== 'tool') return
+      if (part.state?.status !== 'running' || started.has(part.id)) return
+      started.add(part.id)
+      process.stdout.write(JSON.stringify({
+        type: ${JSON.stringify(TOOL_START_SIGNAL_TYPE)},
+        partSession: part.sessionID,
+        part: { type: 'tool', id: part.id, callID: part.callID, tool: part.tool, state: { status: 'running', input: part.state.input } },
+        timestamp: Date.now(),
+      }) + '\\n')
+    },
+  }
+}
 `
 
 /**
@@ -649,11 +690,11 @@ const RETRY_WAIT_LIMIT_MS = Math.max(1_000, Number(process.env.OPENCODE_RETRY_WA
  * Put the plugin in the turn's private config directory. A turn without an AgentProfile has
  * none: opencode would read the operator's own config directory, which this bridge never writes.
  */
-function installRetrySignal(configDir: string | undefined): void {
+function installSignals(configDir: string | undefined): void {
   if (configDir === undefined) return
   const pluginDir = join(configDir, 'plugin')
   mkdirSync(pluginDir, { recursive: true, mode: 0o755 })
-  writeFileSync(join(pluginDir, 'cli-bridge-retry-signal.js'), RETRY_SIGNAL_PLUGIN, { mode: 0o644 })
+  writeFileSync(join(pluginDir, 'cli-bridge-signals.js'), SIGNAL_PLUGIN, { mode: 0o644 })
 }
 
 /**
