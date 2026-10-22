@@ -4,6 +4,7 @@ WORKDIR /app
 # Build toolchain + CLI-install prereqs. curl is needed for the opencode
 # installer; git + python3 + make + g++ are for native addon compiles.
 RUN apt-get update \
+  && apt-get upgrade -y \
   && apt-get install -y --no-install-recommends \
        python3 make g++ curl git ca-certificates unzip xz-utils \
   && rm -rf /var/lib/apt/lists/*
