@@ -49,6 +49,9 @@ RUN corepack enable && corepack prepare pnpm@12.6.0 --activate \
 COPY . .
 RUN pnpm typecheck
 
+# Native addons are built; keep only the runtime libraries in the serving image.
+RUN apt-get purge -y --auto-remove make g++
+
 ENV BRIDGE_HOST=0.0.0.0
 ENV BRIDGE_PORT=3344
 ENV BRIDGE_DATA_DIR=/data
