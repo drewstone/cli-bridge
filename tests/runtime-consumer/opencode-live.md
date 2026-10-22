@@ -1,41 +1,61 @@
-# Real local OpenCode check
+# Three-turn local evidence proof
 
-Use the existing stack, not a new server or simulated model:
+The opt-in `evidence` scenario uses the maintained live proof's authenticated
+loopback HTTP bridge, fresh HOME/XDG directories, Linux filesystem jail, evidence
+capture and owned-process cleanup. It does not use host model credentials or an
+externally started daemon. The default `filesystem` scenario still makes its
+existing two turns; selecting `evidence` runs only the three turns below.
 
-```
-Runtime bridge executor -> localhost:3344 -> OpenCode -> selected provider/model
-```
+Use a supported Linux host with working bubblewrap and the checksum-pinned
+OpenCode installer in `.github/workflows/live-inference.yml`. That workflow owns
+the executable version and checksum. `OPENCODE_BIN` selects the installed binary;
+the scenario checks its reported version against that pin before inference.
+Install this repository's pinned dependencies through the admitted gate path.
 
-Run on the same machine as CLI-Bridge. Install the repo's pinned dependencies and OpenCode normally. Select an exact model from `opencode models` and verify its access and pricing in your own account. There is no default model and no fallback. Hosting the harness locally does not host its model weights locally.
+The source supports the named anonymous `opencode/glm-5.3-flash-free` route only.
+Before executing it, obtain the operator's supported-host and centralized-slot
+admission and retain current [OpenCode pricing](https://opencode.ai/v2/docs/console/models/)
+showing that the route and every token category are free. If that evidence is
+unavailable or the provider changes its price, stop before inference. A model
+name or catalogue listing alone does not establish the permitted cost.
 
-From the repo root, in the first terminal:
+After those admissions, from the repository root:
 
 ```sh
-pnpm install --frozen-lockfile
-opencode models
-BRIDGE_HOST=127.0.0.1 BRIDGE_PORT=3344 BRIDGE_BACKENDS=opencode \
-  OPENCODE_EXECUTOR=host BRIDGE_DATA_DIR="$(mktemp -d)" pnpm start
+CLI_BRIDGE_REAL_OPENCODE_TESTS=1 \
+CLI_BRIDGE_LIVE_SCENARIO=evidence \
+CLI_BRIDGE_LIVE_MODEL=opencode/glm-5.3-flash-free \
+pnpm test:local-inference
 ```
 
-In a second terminal, select the same exact `provider/model` shown by OpenCode:
+`CLI_BRIDGE_LIVE_OUT` selects a new private evidence directory. Each turn has a
+120-second deadline. This is a three-user-turn allowance, not permission for the
+default scenario as an additional run. Main, small, title, summary and compaction
+models are pinned to the same selected route, and the provider model whitelist
+contains only that model. There is no paid fallback. These config fields and
+agent overrides were checked against the installer's pinned OpenCode
+[schema](https://github.com/anomalyco/opencode/tree/e3c4eb242585dcd77be1a867391b7c25fd47ce52/packages/core/src/v1/config)
+and [agent implementation](https://github.com/anomalyco/opencode/blob/e3c4eb242585dcd77be1a867391b7c25fd47ce52/packages/opencode/src/agent/agent.ts#L267).
+The scenario checks the effective config and available model list before starting
+the bridge. Auxiliary work, when OpenCode performs it, uses that same route.
 
-```sh
-export OPENCODE_MODEL='opencode/glm-5.3-flash' # example; verify access/price first
-# Supply BRIDGE_BEARER here if the bridge requires it. Never commit that value.
-node tests/runtime-consumer/opencode-live.mjs
-node tests/runtime-consumer/opencode-live.mjs --run
-```
+1. Read synthetic evidence through the native read tool, returning its random
+   matter code, claimed amount, possible cap and unverified applicability.
+2. After restarting the actual bridge, resume the same native session and return
+   the matter code without tools, source replay or the code in the new prompt.
+3. Read amended evidence with a new random revision code, distinguishing the
+   previous cap, amended cap and still-unassessed recovery.
 
-The first command checks prerequisites without model inference. Only `--run` authorizes inference, and the selected account may be charged. Each turn has a 120-second deadline, configurable with `--timeout-ms`; this is not a hard dollar cap. Existing operator jail and credential policy is not disabled or modified. No production service is contacted except the selected model provider through OpenCode. Run in a dedicated development account/environment, never against client matters.
+Every turn requires nonzero measured input/output tokens, matching reported model
+identity and a nonempty parseable answer. Turns one and three require observed
+tool calls; turn two requires zero. Every turn tears down its owned Runtime run
+and asserts `destroyed`. The receipt also verifies native session continuity,
+retains fixture hashes and Runtime artifacts, then cleans owned scratch after
+process shutdown. Unknown billed cost stays unknown rather than being invented
+from model selection. A health check, blocked preflight or catalogue listing
+never counts as a successful proof.
 
-The live path imports the Runtime already pinned by this consumer workspace. It makes three real turns with no transport interception or fake backend:
-
-1. Read a temporary synthetic matter through OpenCode's native read tool. The file contains a random matter code not supplied in the prompt.
-2. Resume the same bridge session and return that code without calling tools or replaying the file in the new prompt.
-3. Read updated evidence containing another random code. Report the old and amended caps separately, leaving recovery unassessed.
-
-A pass requires matching answers, actual tool-call counts, nonzero measured input/output tokens, and a matching reported model. Unknown dollar cost stays unknown. Gateway-reported identity is not independent verification of provider model weights. A successful `/health` alone never passes the test. Errors, missing dependencies, model substitutions, and blocked prerequisites return nonzero.
-
-The command prints its private evidence directory with a `proof.json`, full Runtime artifacts, fixture hashes, script hash, and package/CLI identity. It preserves the synthetic working directory and bridge session for inspection; remove them after review. Run `--help` for options. The script does not install dependencies, modify credentials, start an extra execution framework, or run on ordinary CI automatically.
-
-This proves a narrow local execution path when successful. It does **not** prove the authenticated Casework app, background reassessment, browser streaming/reload/stop, a managed sandbox, or the design preview's backend integration. Those must use the application's real producers and case tools; changing a model URL alone does not move a sandbox-owned workflow onto the local bridge.
+This qualifies only synthetic local Runtime/CLI-Bridge/OpenCode execution when
+it passes. It does not qualify Casework, authenticated Agent App browser flows,
+legal calibration, managed sandboxes, cloud trace custody or design preview.
+The source integration itself is not evidence that inference has completed.
