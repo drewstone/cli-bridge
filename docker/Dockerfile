@@ -1,9 +1,10 @@
-FROM node:24-slim AS base
+FROM node:24.22.1-trixie-slim AS base
 WORKDIR /app
 
 # Build toolchain + CLI-install prereqs. curl is needed for the opencode
 # installer; git + python3 + make + g++ are for native addon compiles.
 RUN apt-get update \
+  && apt-get upgrade -y \
   && apt-get install -y --no-install-recommends \
        python3 make g++ curl git ca-certificates unzip xz-utils \
   && rm -rf /var/lib/apt/lists/*
@@ -34,10 +35,8 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 # install with an absolute path. Symlink both into /usr/local/bin so
 # they're on PATH at runtime AND survive the /root/.kimi volume mount
 # (which only covers auth state).
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-  && /root/.local/bin/uv tool install --python 3.13 kimi-cli \
-  && ln -sf /root/.local/bin/kimi /usr/local/bin/kimi \
-  && ln -sf /root/.local/bin/uv /usr/local/bin/uv
+COPY scripts/install-harness.sh scripts/python-security-overrides.txt /usr/local/share/cli-bridge/
+RUN sh /usr/local/share/cli-bridge/install-harness.sh kimi
 
 # Factory droid, Sourcegraph amp, Forge left out by default — install
 # manually on hosts that need them. They change rapidly.
@@ -49,6 +48,9 @@ RUN corepack enable && corepack prepare pnpm@12.6.0 --activate \
   && pnpm install --frozen-lockfile --prod=false
 COPY . .
 RUN pnpm typecheck
+
+# Native addons are built; keep only the runtime libraries in the serving image.
+RUN apt-get purge -y --auto-remove make g++
 
 ENV BRIDGE_HOST=0.0.0.0
 ENV BRIDGE_PORT=3344
