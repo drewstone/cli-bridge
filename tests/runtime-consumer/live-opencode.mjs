@@ -160,7 +160,7 @@ async function main() {
     model: { provider: 'opencode', default: nativeModel.slice('opencode/'.length) },
     ...(evidenceScenario ? {
       tools: { '*': false, read: true },
-      prompt: { systemPrompt: 'You are checking fictional test evidence. Use only the read tool and only files in the supplied working directory. Never use shell, network tools, or other directories. Follow the requested JSON response exactly. A figure stated in a source is not a recovery forecast. Do not accept a case or invent outcomes.' },
+      prompt: { instructions: 'You are checking fictional test evidence. Use only the read tool and only files in the supplied working directory. Never use shell, network tools, or other directories. Follow the requested JSON response exactly. A figure stated in a source is not a recovery forecast. Do not accept a case or invent outcomes.' },
     } : {}),
   }
   await startBridge()
