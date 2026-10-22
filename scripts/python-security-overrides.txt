@@ -1,0 +1,2 @@
+# Kimi pins an older Pillow; this image owns the audited security override.
+pillow==13.0.0

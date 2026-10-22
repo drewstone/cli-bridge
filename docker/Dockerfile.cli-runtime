@@ -31,7 +31,7 @@
 # The bridge's container-pool config bind-mounts only the dirs the
 # active backend needs.
 
-FROM node:24.22.1-slim
+FROM node:24.22.1-trixie-slim
 
 ARG CLI_BRIDGE_HARNESSES=all
 
@@ -50,7 +50,7 @@ RUN apt-get update \
 # --- CLI installs (Pi is pinned to its qualified RPC version) ---
 # Source of truth lives in scripts/install-harness.sh so host installs,
 # subset images, and the all-in-one runtime cannot drift.
-COPY scripts/install-harness.sh /usr/local/share/cli-bridge/install-harness.sh
+COPY scripts/install-harness.sh scripts/python-security-overrides.txt /usr/local/share/cli-bridge/
 RUN set -eu; \
   if [ "$CLI_BRIDGE_HARNESSES" = "all" ]; then \
     sh /usr/local/share/cli-bridge/install-harness.sh all; \

@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
+harness_script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 harness="${1:-}"
 if [ -z "$harness" ]; then
   echo "usage: scripts/install-harness.sh <claude|codex|opencode|kimi|gemini|pi|prime|all>" >&2
@@ -37,7 +38,7 @@ install_kimi() {
     echo "uv install did not produce a uv binary on PATH or ~/.local/bin" >&2
     exit 1
   fi
-  "$uv_bin" tool install --python 3.13 kimi-cli
+  "$uv_bin" tool install --python 3.13 --overrides "$harness_script_dir/python-security-overrides.txt" kimi-cli
   if [ -x "${HOME:-/root}/.local/bin/kimi" ]; then
     mkdir -p /usr/local/bin 2>/dev/null || true
     ln -sf "${HOME:-/root}/.local/bin/kimi" /usr/local/bin/kimi 2>/dev/null || true

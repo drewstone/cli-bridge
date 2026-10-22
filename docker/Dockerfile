@@ -1,4 +1,4 @@
-FROM node:24.22.1-slim AS base
+FROM node:24.22.1-trixie-slim AS base
 WORKDIR /app
 
 # Build toolchain + CLI-install prereqs. curl is needed for the opencode
@@ -35,10 +35,8 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 # install with an absolute path. Symlink both into /usr/local/bin so
 # they're on PATH at runtime AND survive the /root/.kimi volume mount
 # (which only covers auth state).
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-  && /root/.local/bin/uv tool install --python 3.13 kimi-cli \
-  && ln -sf /root/.local/bin/kimi /usr/local/bin/kimi \
-  && ln -sf /root/.local/bin/uv /usr/local/bin/uv
+COPY scripts/install-harness.sh scripts/python-security-overrides.txt /usr/local/share/cli-bridge/
+RUN sh /usr/local/share/cli-bridge/install-harness.sh kimi
 
 # Factory droid, Sourcegraph amp, Forge left out by default — install
 # manually on hosts that need them. They change rapidly.
