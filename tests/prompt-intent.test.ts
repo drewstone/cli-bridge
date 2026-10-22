@@ -408,7 +408,7 @@ describe('prompt intents reach each harness through its own control', () => {
       ])
       expect(readFileSync(join(configDir, 'agent-system-prompt.md'), 'utf8')).toBe(`${ADDITION}\n`)
       expect(req.profile_materialization_receipt!.files.map((file) => file.path))
-        .toContain(`${basename(dirname(configDir))}/.opencode/agent-system-prompt.md`)
+        .toContain(`.cli-bridge-opencode-profile/.opencode/agent-system-prompt.md`)
       expect(readdirSync(cwd)).toEqual([basename(dirname(configDir))])
       provisioned.cleanup?.()
       expect(readdirSync(cwd)).toEqual([])

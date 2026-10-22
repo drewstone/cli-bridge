@@ -603,6 +603,12 @@ export interface Backend {
   readonly name: string
   /** Operator-selected fallback used only when `execution.timeoutMs` is absent. Zero/absent means no deadline. */
   readonly defaultExecutionTimeoutMs?: number
+  /**
+   * The stream reports each tool call when it starts and its outcome when it ends, so a caller can
+   * tell a silent model from a running tool. Served as `toolCallSpans` on `/v1/capabilities`;
+   * agent-runtime runs `modelSilenceMs` only on a route that declares it.
+   */
+  readonly toolCallSpans?: boolean
 
   /** Does this backend want to handle requests for `model`? */
   matches(model: string): boolean

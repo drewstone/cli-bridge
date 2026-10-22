@@ -17,7 +17,7 @@
  * right headers so Moonshot's backend accepts the call.
  */
 
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -33,6 +33,7 @@ import {
 } from './profile-support.js'
 import { registerJailReadable } from '../jail/index.js'
 import { dirname, join } from 'node:path'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -56,6 +57,9 @@ export interface OpencodeBackendOptions {
 export class OpencodeBackend implements Backend {
   readonly name = 'opencode'
   readonly defaultExecutionTimeoutMs: number
+  // The signal plugin reports a call at its start; it is installed in the turn's private config
+  // directory, which every turn with an AgentProfile has (agent-runtime always sends one).
+  readonly toolCallSpans = true
   private readonly spawner: Spawner
   constructor(private readonly opts: OpencodeBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
@@ -96,6 +100,12 @@ export class OpencodeBackend implements Backend {
       cwd,
       profileExecutionIdentity(req, session, 'opencode', variant),
     )
+    try {
+      installSignals(provisioned.env.OPENCODE_CONFIG_DIR)
+    } catch (error) {
+      provisioned.cleanup?.()
+      throw error
+    }
 
     // Materialize the one selected MCP source into a temporary OpenCode config.
     // opencode-cli has no per-invocation `--mcp-config-file` flag —
@@ -160,6 +170,9 @@ export class OpencodeBackend implements Backend {
     try {
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
+        // Preserve the operator's existing proxy and trust roots. Keep the host
+        // sanitizer in force; these names are not request-controlled.
+        envPassthroughKeys: ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'],
         cwd,
         env: {
           ...process.env,
@@ -238,9 +251,12 @@ export class OpencodeBackend implements Backend {
       if (!stdinResult.ok) {
         throw new BackendError(`opencode stdin write failed: ${stdinResult.error}`, 'upstream')
       }
-      let sawError: string | null = null
+      let sawError: BackendFailureReason | null = null
       let emittedContent = false
       let emittedToolCall = false
+      // Calls already reported at their start, so their finished part carries only the outcome.
+      const startedTools = new Set<string>()
+      let toolSession: string | null = null
       let stepUsage: CollectedUsage | undefined
       let fallbackUsage: UsageReceipt | undefined
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
@@ -273,6 +289,28 @@ export class OpencodeBackend implements Backend {
         }
 
         const type = String(ev.type ?? '')
+        if (type === RETRY_SIGNAL_TYPE) {
+          const refusal = longRetryWait(ev)
+          if (refusal === null) continue
+          // The process is still asleep in its retry; the `finally` below stops it.
+          yield { ...terminalOutcome('opencode', refusal, emittedToolCall), internal_session_id: internalSessionId }
+          return
+        }
+        if (type === TOOL_START_SIGNAL_TYPE) {
+          // The plugin sees every session's parts; `run` prints only its own session's, so a
+          // subagent's tool would open a call that no finished part ever closes. The first start
+          // can precede `run`'s first event, and it is the run's own: a subagent's tool starts
+          // only inside a root tool that started before it.
+          toolSession ??= internalSessionId ?? (typeof ev.partSession === 'string' ? ev.partSession : null)
+          if (ev.partSession !== toolSession) continue
+          const started = extractToolUse(ev)
+          if (started && !startedTools.has(started.id)) {
+            startedTools.add(started.id)
+            yield { tool_calls: [started] }
+            emittedToolCall = true
+          }
+          continue
+        }
         const eventUsage = extractUsage(ev)
         if (eventUsage) {
           if (isStepReceipt(ev)) stepUsage = collectUsage(stepUsage, eventUsage)
@@ -296,14 +334,23 @@ export class OpencodeBackend implements Backend {
           // fallback below fired on all of them — 16 of them in this host's bridge logs, each
           // one a readable provider message rendered as an unreadable JSON dump truncated at
           // 400 chars, which is where `data` was being cut off.
-          const errorObject = ev.error as { message?: unknown; name?: unknown; data?: { message?: unknown } } | undefined
-          sawError = String(
-            ev.message ??
-              errorObject?.data?.message ??
-              errorObject?.message ??
-              errorObject?.name ??
-              `opencode error event without a message: ${JSON.stringify(ev).slice(0, 400)}`,
-          )
+          const errorObject = ev.error as { message?: unknown; name?: unknown; data?: { message?: unknown; statusCode?: unknown } } | undefined
+          // opencode's APIError states the provider's HTTP status as `data.statusCode`. Without it a
+          // provider's 429 ("Rate limit reached for requests", "Usage limit reached") reached
+          // agent-runtime as bare prose, was classed a transient fault, and was retried every few
+          // seconds instead of paused: magnetar-rust-20261017c ended 636 driver attempts that way.
+          const status = providerStatus(errorObject?.data?.statusCode)
+          sawError = {
+            message: String(
+              ev.message ??
+                errorObject?.data?.message ??
+                errorObject?.message ??
+                errorObject?.name ??
+                `opencode error event without a message: ${JSON.stringify(ev).slice(0, 400)}`,
+            ),
+            type: 'upstream',
+            ...(status === undefined ? {} : { status }),
+          }
           continue
         }
 
@@ -320,9 +367,9 @@ export class OpencodeBackend implements Backend {
           emittedContent = true
         }
         const toolCall = extractToolUse(ev)
-        if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
-        // opencode announces a tool part only once it has finished, so the outcome is on the
-        // same event as the call and can be forwarded beside it.
+        // `run` prints a tool part only once it has finished. A call the plugin reported at its
+        // start gets only its outcome here; one it missed is reported whole, call and outcome.
+        if (toolCall && !startedTools.has(toolCall.id)) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
         const toolResult = extractToolResult(ev)
         if (toolResult) yield { tool_results: [toolResult] }
 
@@ -347,7 +394,11 @@ export class OpencodeBackend implements Backend {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
-      if (sawError) throw new BackendError(`opencode: ${sawError}`, 'upstream')
+      // Ended through the delta envelope, not a throw, so the provider's status reaches the caller.
+      if (sawError) {
+        yield { ...terminalOutcome('opencode', sawError, emittedToolCall), internal_session_id: internalSessionId }
+        return
+      }
       if (exit.code !== 0) {
         throw new BackendError(await describeCliExit(spawned, 'opencode', exit.code, stderr.render(), exit.signal), 'upstream')
       }
@@ -570,4 +621,98 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
+}
+
+/** A provider status stated as a field; the bridge never infers one from prose. */
+function providerStatus(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : undefined
+}
+
+/**
+ * A provider's retry wait, made visible.
+ *
+ * opencode retries a refused model call itself (`session/retry.ts`). A response with a
+ * `retry-after` header sets the wait, capped only at 2^31 ms, and `run --format json` prints
+ * nothing while it waits: it never emits the `session.status` retry event. The free seat answers
+ * a spent quota with `429` and `retry-after: 47331` (13.1 h), so magnetar-rust-20261019b's root
+ * slept in silence until this bridge's 4 h turn cap aborted it, and agent-runtime ended a 48 h run
+ * on that abort. The plugin below prints opencode's own retry status as one stdout line, which
+ * the event loop reads with the rest of the stream.
+ *
+ * It prints each tool call's start the same way. `run` prints a tool part only once it has
+ * finished (`part.state.status` completed or error), so a 32-minute test battery read as 32 minutes
+ * of model silence (magnetar-rust-20261018b), and agent-runtime could not bound a silent model
+ * call on this backend. The part is on opencode's bus as `message.part.updated` with status
+ * `running` from the moment the tool starts.
+ */
+const RETRY_SIGNAL_TYPE = 'cli-bridge.opencode-retry'
+const TOOL_START_SIGNAL_TYPE = 'cli-bridge.opencode-tool-start'
+const SIGNAL_PLUGIN = `// Written by cli-bridge for this turn. Prints what \`run --format json\` omits: opencode's retry
+// status, and each tool call when it starts.
+export const CliBridgeSignals = async () => {
+  const started = new Set()
+  return {
+    event: async ({ event }) => {
+      const props = event?.properties
+      if (event?.type === 'session.status' && props?.status?.type === 'retry') {
+        process.stdout.write(JSON.stringify({
+          type: ${JSON.stringify(RETRY_SIGNAL_TYPE)},
+          sessionID: props.sessionID,
+          attempt: props.status.attempt,
+          message: props.status.message,
+          next: props.status.next,
+          timestamp: Date.now(),
+        }) + '\\n')
+        return
+      }
+      const part = props?.part
+      if (event?.type !== 'message.part.updated' || part?.type !== 'tool') return
+      if (part.state?.status !== 'running' || started.has(part.id)) return
+      started.add(part.id)
+      process.stdout.write(JSON.stringify({
+        type: ${JSON.stringify(TOOL_START_SIGNAL_TYPE)},
+        partSession: part.sessionID,
+        part: { type: 'tool', id: part.id, callID: part.callID, tool: part.tool, state: { status: 'running', input: part.state.input } },
+        timestamp: Date.now(),
+      }) + '\\n')
+    },
+  }
+}
+`
+
+/**
+ * The longest retry wait a turn sits through. opencode's own backoff without a `retry-after`
+ * stays at or under 32 s; anything longer is the provider naming a reset, which agent-runtime
+ * holds for without spending the process or an attempt.
+ */
+const RETRY_WAIT_LIMIT_MS = Math.max(1_000, Number(process.env.OPENCODE_RETRY_WAIT_MAX_MS ?? 60_000))
+
+/**
+ * Put the plugin in the turn's private config directory. A turn without an AgentProfile has
+ * none: opencode would read the operator's own config directory, which this bridge never writes.
+ */
+function installSignals(configDir: string | undefined): void {
+  if (configDir === undefined) return
+  const pluginDir = join(configDir, 'plugin')
+  mkdirSync(pluginDir, { recursive: true, mode: 0o755 })
+  writeFileSync(join(pluginDir, 'cli-bridge-signals.js'), SIGNAL_PLUGIN, { mode: 0o644 })
+}
+
+/**
+ * The refusal a retry wait longer than {@link RETRY_WAIT_LIMIT_MS} stands for, or `null` for a
+ * short wait opencode should sit out. It carries `upstream_unavailable` rather than a status:
+ * opencode's retry status names no HTTP status, and the bridge never infers one. agent-runtime
+ * pauses on that code, and a `reset at` time within its hold window holds the run until then.
+ */
+function longRetryWait(ev: Record<string, unknown>): BackendFailureReason | null {
+  const next = typeof ev.next === 'number' ? ev.next : NaN
+  const now = typeof ev.timestamp === 'number' ? ev.timestamp : Date.now()
+  if (!Number.isFinite(next) || next - now <= RETRY_WAIT_LIMIT_MS) return null
+  const message = typeof ev.message === 'string' && ev.message.length > 0 ? ev.message : 'the provider refused the call'
+  return {
+    message: `${message}; the provider asked opencode to wait ${Math.round((next - now) / 1000)} s before retrying, reset at ${new Date(next).toISOString()}`,
+    type: 'upstream_unavailable',
+  }
 }

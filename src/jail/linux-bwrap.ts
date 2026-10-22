@@ -26,7 +26,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, realpathSync } from 'node:fs'
+import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
@@ -51,8 +51,8 @@ const BWRAP_BIN = 'bwrap'
  *     follows the symlink to the target dir), so `#!/bin/sh` shebangs and
  *     PATH lookups work without assuming a layout.
  *   - /etc supplies resolv.conf, TLS trust (ssl/ca-certificates), passwd/nss.
- *   - /run/systemd/resolve is the stub-resolv.conf target on systemd-resolved
- *     hosts (where /etc/resolv.conf is a symlink into it), needed for DNS.
+ *     A resolver symlink's exact target is bound separately, not its parent
+ *     directory: WSL and other hosts may keep it outside /etc.
  *
  * Deliberately absent: /home, /root, /tmp, /var, /mnt, /media — the host repo
  * (task defs / grader keys) and sibling run scratch dirs live under those and
@@ -64,7 +64,6 @@ const SYSTEM_RO_PATHS: readonly string[] = [
   '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32',
   '/etc',
   '/opt',
-  '/run/systemd/resolve',
 ]
 
 export class LinuxBwrapJail implements JailBackend {
@@ -99,6 +98,10 @@ export class LinuxBwrapJail implements JailBackend {
         throw new Error('a copy-writable jail auth source requires envVar')
       }
     }
+    // Resolve before copying credentials. Only a regular DNS configuration
+    // file is admitted, never an extra /mnt or /run directory mount.
+    const resolver = spec.readConfine ? tryRealpath('/etc/resolv.conf') : null
+    if (resolver && !statSync(resolver).isFile()) throw new Error('DNS resolver is not a regular file')
     await removeStaleAuthCopies(root)
     const copiedWritableAuth = await copyAuthIntoJail(
       root,
@@ -173,6 +176,9 @@ export class LinuxBwrapJail implements JailBackend {
     }
     // Writable root last so it wins over any read-only mount above it.
     bwrapArgs.push('--bind', root, root)
+    if (resolver && resolver !== '/etc/resolv.conf') {
+      bwrapArgs.push('--ro-bind', resolver, resolver)
+    }
 
     // Make backend config available at its stable path inside the jail.
     // Read-only sources are bound after the writable root so they stay
