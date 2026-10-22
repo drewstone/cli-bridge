@@ -1,4 +1,4 @@
-FROM node:24-slim AS base
+FROM node:24.22.1-slim AS base
 WORKDIR /app
 
 # Build toolchain + CLI-install prereqs. curl is needed for the opencode
