@@ -352,6 +352,9 @@ export async function buildApp(config: Config): Promise<{
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
+  // Validate the durable maintenance owner before any backend provisions Docker slots.
+  const poolMaintenance = new PoolMaintenance(config.dataDir)
+  extras.shutdownHooks.push(async () => await poolMaintenance.close())
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
     await durableWriter.open()
@@ -537,8 +540,6 @@ export async function buildApp(config: Config): Promise<{
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)
-  const poolMaintenance = new PoolMaintenance(config.dataDir)
-  extras.shutdownHooks.push(async () => await poolMaintenance.close())
   mountPoolMaintenance(app, poolMaintenance, Boolean(config.bearer))
 
   app.get('/', (c) => c.json({

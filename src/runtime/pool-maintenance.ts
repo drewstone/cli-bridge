@@ -2,7 +2,8 @@
 import { randomBytes } from 'node:crypto'
 import { closeSync, constants, fsyncSync, fstatSync, openSync, readFileSync, renameSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { createConnection } from 'node:net'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { z } from 'zod'
 import { ContainerPool } from '../executors/container-pool.js'
 import { inspectIdle, replaceRuntime, type RollReceipt } from '../executors/docker-runtime-roll.js'
@@ -23,17 +24,15 @@ const rollSchema = z.object({ oldId: identity, imageId: z.string().regex(/^sha25
 const recordSchema = adoptionRequest.extend({ rolls: z.record(z.string(), rollSchema), image: z.string() }).strict()
 type Record = z.infer<typeof recordSchema>
 
+/** Linux's kernel socket inventory covers IPv4, IPv6 and non-loopback binds. */
 async function requireNoListener(port: number): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const socket = createConnection({ host: '127.0.0.1', port })
-    socket.setTimeout(1000)
-    socket.once('connect', () => { socket.destroy(); reject(new Error('legacy controller still listens')) })
-    socket.once('timeout', () => { socket.destroy(); reject(new Error('legacy controller state unknown')) })
-    socket.once('error', (error: NodeJS.ErrnoException) => {
-      if (error.code === 'ECONNREFUSED') resolve()
-      else reject(new Error('legacy controller state unknown'))
-    })
-  })
+  if (process.platform !== 'linux') throw new Error('pool adoption requires Linux listener inventory')
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid legacy port')
+  // Missing ss, timeout, nonzero exit, or excessive output all reject adoption.
+  const { stdout, stderr } = await promisify(execFile)('ss', ['-H', '-ltn', `sport = :${port}`],
+    { timeout: 2000, maxBuffer: 65536, killSignal: 'SIGKILL' })
+  if (stderr.trim()) throw new Error('legacy listener inventory is ambiguous')
+  if (stdout.trim()) throw new Error('legacy controller still listens on a declared port')
 }
 
 export class PoolMaintenance {
