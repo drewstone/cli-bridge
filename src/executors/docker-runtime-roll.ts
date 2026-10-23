@@ -128,6 +128,17 @@ export async function replaceRuntime(receipt: RollReceipt, save: () => void, arm
   const image = await dockerEngine('GET', `/images/${receipt.imageId}/json`)
   if (image.Id !== receipt.imageId) throw new Error('candidate image identity changed')
   const old = await dockerEngine('GET', `/containers/${receipt.oldId}/json`)
+  let verifiedStart = ''
+  const verify = async (id: string): Promise<void> => {
+    const before = await dockerEngine('GET', `/containers/${id}/json`)
+    if (!before.State.Running) throw new Error('candidate is no longer running')
+    if (verifiedStart && verifiedStart === before.State.StartedAt) return
+    await arm(id)
+    receipt.node = await verifyRuntime(id, image.Id, old)
+    const after = await dockerEngine('GET', `/containers/${id}/json`)
+    if (!after.State.Running || after.State.StartedAt !== before.State.StartedAt) throw new Error('candidate restarted during preflight')
+    verifiedStart = after.State.StartedAt
+  }
   if (receipt.phase === 'intent') {
     await inspectIdle(receipt.oldId, receipt.name)
     const oldImage = await dockerEngine('GET', `/images/${old.Image}/json`)
@@ -149,13 +160,11 @@ export async function replaceRuntime(receipt: RollReceipt, save: () => void, arm
       candidate.Config.Labels?.['cli-bridge.maintenance.old-id'] !== receipt.oldId || candidate.Image !== image.Id) throw new Error('candidate image mismatch')
   if (receipt.phase === 'candidate') {
     if (!candidate.State.Running) await dockerEngine('POST', `/containers/${id}/start`)
-    await arm(id)
-    receipt.node = await verifyRuntime(id, image.Id, old)
+    await verify(id)
     receipt.phase = 'verified'; save()
   }
   if (receipt.phase === 'verified') {
-    await arm(id)
-    await verifyRuntime(id, image.Id, old)
+    await verify(id)
     if (old.State.Running) {
       await inspectIdle(receipt.oldId, receipt.name)
       await dockerEngine('POST', `/containers/${receipt.oldId}/stop?t=10`)
@@ -170,14 +179,12 @@ export async function replaceRuntime(receipt: RollReceipt, save: () => void, arm
     receipt.phase = 'retained'; save()
   }
   if (receipt.phase === 'retained') {
-    await arm(id)
-    await verifyRuntime(id, image.Id, old)
+    await verify(id)
     const current = await dockerEngine('GET', `/containers/${id}/json`)
     if (current.Name !== `/${receipt.name}`) await dockerEngine('POST', `/containers/${id}/rename?name=${receipt.name}`)
     receipt.phase = 'promoted'; save()
   }
-  await arm(id)
-  await verifyRuntime(id, image.Id, old)
+  await verify(id)
   await inspectIdle(id, receipt.name)
   const retained = await dockerEngine('GET', `/containers/${receipt.oldId}/json`)
   if (retained.State.Running) throw new Error('retained old container unexpectedly running')
