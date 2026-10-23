@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 
@@ -20,12 +21,17 @@ overrides = dict(line.strip().split('==') for line in
 
 
 def run(entrypoint, arguments, source=None):
-    result = subprocess.run(['docker', 'run', '--rm', '-i', '--entrypoint', entrypoint,
-                             image, *arguments], input=source, capture_output=True,
-                            text=True, timeout=120)
-    if result.returncode:
-        raise RuntimeError(f'image proof failed ({entrypoint}): {result.stderr[-2000:]}')
-    return result.stdout.strip()
+    name = 'cli-security-proof-' + secrets.token_hex(8)
+    try:
+        result = subprocess.run(['docker', 'run', '--rm', '-i', '--name', name,
+                                 '--network', 'none', '--entrypoint', entrypoint,
+                                 image, *arguments], input=source, capture_output=True,
+                                text=True, timeout=120)
+        if result.returncode:
+            raise RuntimeError(f'image proof failed ({entrypoint}): {result.stderr[-2000:]}')
+        return result.stdout.strip()
+    finally:
+        subprocess.run(['docker', 'rm', '-f', '-v', name], capture_output=True, timeout=30)
 
 
 harnesses = ['claude', 'codex', 'opencode', 'kimi']
