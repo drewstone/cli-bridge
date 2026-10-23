@@ -1240,7 +1240,8 @@ Retained native-session API jobs do not yet enter this one-shot capture scope.
 ### Individually maintained Docker pool slots
 
 The bearer-protected `/admin/pools/status` endpoint reports explicit adopted pool
-identities and durable roll receipts. Maintenance requires `BRIDGE_BEARER`, even
+identities, per-slot immutable image bindings, and durable roll receipts/history.
+Maintenance requires `BRIDGE_BEARER`, even
 on loopback. Adoption requires Linux with the existing `ss` socket inventory tool;
 unavailable or ambiguous listener evidence refuses ownership transfer. Run adoption
 from a native Linux bridge service in the same host network namespace as the
@@ -1270,7 +1271,12 @@ No image is pulled and no volume is deleted by this interface.
 
 `pool-maintenance.json` under the bridge data directory records exact old and
 candidate identities before each Docker transition. After an interrupted roll,
-retry the same original ID and image; a different intent is refused. After owner
+retry the same original ID and image; a different unfinished intent is refused.
+Once a transaction is promoted, drain its current candidate ID and request a
+different immutable local image to begin the next transaction. The owner appends
+the completed receipt to history before recording the new intent, retaining the
+original adoption identities and every stopped predecessor. Missing local images
+refuse without changing the completed journal. After owner
 restart, adopted slots remain drained until the same roll request verifies and
 re-admits each completed candidate. The journal contains no credential values.
 Use the registered service deployer to activate merged source; an unchanged

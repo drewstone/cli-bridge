@@ -27,6 +27,7 @@ const owned = new Set<string>()
 const volumes = new Set<string>()
 const checks: string[] = []
 let oldImage = ''
+let nextImage = ''
 let pool: ContainerPool | undefined
 let appOwner: Awaited<ReturnType<typeof buildApp>> | undefined
 let server: ReturnType<typeof serve> | undefined
@@ -64,6 +65,7 @@ try {
   const seed = await command(['create', '--name', `${prefix}-seed`, image])
   owned.add(seed)
   oldImage = await command(['commit', '--change', `LABEL cli-bridge.proof=${suffix}`, seed])
+  nextImage = await command(['commit', '--change', `LABEL cli-bridge.proof-next=${suffix}`, seed])
   await command(['rm', '-v', seed]); owned.delete(seed)
 
   pool = await ContainerPool.create({ size: 2, image: oldImage, namePrefix: `${prefix}-leases`,
@@ -144,7 +146,36 @@ try {
   assert.ok(status.pools[0]!.slots.every((slot) => !slot.draining))
   assert.equal(readFileSync(join(data, 'pool-maintenance.json'), 'utf8').includes(token), false)
   checks.push('actual HTTP owner restart reconciles completed receipts and re-admits verified slots without secrets in journal')
+  const firstRoll = JSON.parse(readFileSync(join(data, 'pool-maintenance.json'), 'utf8')).pools[0].rolls['0'] as RollReceipt
+  const currentId = firstRoll.candidateId!
+  assert.equal((await api(`/admin/pools/${prefix}/slots/0/drain`, { expectedId: currentId })).status, 200)
+  const completedJournal = readFileSync(join(data, 'pool-maintenance.json'), 'utf8')
+  assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: `sha256:${'0'.repeat(64)}` })).status, 409)
+  assert.equal(readFileSync(join(data, 'pool-maintenance.json'), 'utf8'), completedJournal)
+  const secondResponse = await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: nextImage })
+  assert.equal(secondResponse.status, 200)
+  const second = (await secondResponse.json() as { receipt: RollReceipt }).receipt
+  owned.add(second.candidateId!)
+  assert.notEqual(second.nonce, firstRoll.nonce)
+  assert.equal(second.oldId, currentId)
+  assert.equal((await dockerEngine('GET', `/containers/${currentId}/json`)).State.Running, false)
+  assert.equal((await dockerEngine('GET', `/containers/${slots[0]!.id}/json`)).State.Running, false)
+  assert.equal(await command(['exec', second.candidateId!, 'cat', '/root/.config/opencode/proof-marker']), 'retained')
+  await stopApp()
+  await startApp()
+  assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: nextImage })).status, 200)
+  assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: slots[0]!.id, imageId: image })).status, 409)
+  const journal = JSON.parse(readFileSync(join(data, 'pool-maintenance.json'), 'utf8')).pools[0]
+  assert.deepEqual(journal.slots, slots)
+  assert.deepEqual(journal.history['0'], [firstRoll])
+  assert.equal(journal.rolls['0'].candidateId, second.candidateId)
+  const repeatedStatus = await (await api('/admin/pools/status')).json() as { pools: Array<{ slots: Array<{ containerId: string; draining: boolean }> }> }
+  assert.equal(repeatedStatus.pools[0]!.slots[0]!.containerId, second.candidateId)
+  assert.equal(repeatedStatus.pools[0]!.slots[0]!.draining, false)
+  checks.push('second immutable artifact appends prior receipt, preserves original identities and volumes, rejects stale intent, and reconciles after owner restart')
+  checks.push('missing second artifact refuses without changing completed journal')
   const result = { complete: true, checks, old_fixture_image: oldImage, candidate_image: image,
+    second_candidate_image: nextImage,
     production_node_upgrade_proven: false, no_model_calls: true }
   const output = process.env.CLI_ROLL_PROOF_OUTPUT
   if (output) writeFileSync(output, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 })
@@ -156,5 +187,6 @@ try {
   for (const id of owned) await dockerCli(['rm', '-f', '-v', id])
   for (const volume of volumes) await dockerCli(['volume', 'rm', volume])
   if (oldImage) await dockerCli(['image', 'rm', oldImage])
+  if (nextImage) await dockerCli(['image', 'rm', nextImage])
   rmSync(root, { recursive: true, force: true })
 }
