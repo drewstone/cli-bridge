@@ -34,11 +34,16 @@ export async function inspectIdle(id: string, expectedName?: string): Promise<Js
       JSON.stringify(info.Config.Entrypoint) !== JSON.stringify(['dumb-init', '--'])) {
     throw new Error('container is not the expected idle CLI slot')
   }
-  const top = await dockerCli(['top', id, '-eo', 'comm'])
-  const commands = top.stdout.trim().split('\n').slice(1).map((line) => line.trim())
-  if (top.code !== 0 || commands.length !== 2 || commands.sort().join(',') !== 'dumb-init,tail') {
+  // Docker itself requires PID in ps output to filter the container's tasks.
+  const top = await dockerCli(['top', id, '-eo', 'pid,ppid,comm'])
+  const rows = top.stdout.trim().split('\n').slice(1).map((line) => line.trim().split(/\s+/u))
+  const commands = rows.map((row) => row[2] ?? '')
+  const init = rows.find((row) => row[2] === 'dumb-init')
+  const tail = rows.find((row) => row[2] === 'tail')
+  if (top.code !== 0 || rows.length !== 2 || rows.some((row) => row.length !== 3 || !/^\d+$/u.test(row[0]!) || !/^\d+$/u.test(row[1]!)) ||
+      !init || !tail || Number(init[0]) !== info.State.Pid || tail[1] !== init[0]) {
     const observed = commands.map((name) => /^[a-zA-Z0-9._-]{1,64}$/u.test(name) ? name : '<unsupported>')
-    throw new Error(`slot contains unexpected processes (${JSON.stringify(observed)}, init=${String(info.HostConfig.Init)}); leave it drained until its work finishes`)
+    throw new Error(`slot contains unexpected processes (${JSON.stringify(observed)}); leave it drained until its work finishes`)
   }
   return info
 }
