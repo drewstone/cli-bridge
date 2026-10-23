@@ -1241,7 +1241,8 @@ Retained native-session API jobs do not yet enter this one-shot capture scope.
 
 The bearer-protected `/admin/pools/status` endpoint reports explicit adopted pool
 identities and durable roll receipts. Maintenance requires `BRIDGE_BEARER`, even
-on loopback. It does not restart other bridge services or stop their jobs.
+on loopback. Adoption requires Linux with the existing `ss` socket inventory tool;
+unavailable or ambiguous listener evidence refuses ownership transfer. It does not restart other bridge services or stop their jobs.
 
 For an inactive historical pool, `POST /admin/pools/adopt` accepts `prefix`,
 `legacyDataDir`, `legacyPorts`, immutable `expectedImage`, and ordered contiguous
