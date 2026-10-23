@@ -1255,7 +1255,7 @@ starts every slot drained; it never provisions, removes, or resets credentials.
 `POST /admin/pools/:prefix/slots/:index/drain` takes `expectedId` and prevents new
 leases for that slot. Existing leases finish normally; other slots remain
 available. `POST .../roll` takes the same `expectedId` and immutable local
-`imageId` (`sha256:...`); an occupied slot returns409. An idle candidate retains
+`imageId` (`sha256:...`); an occupied slot returns 409. An idle candidate retains
 all existing named/anonymous volumes, binds, process configuration, operator
 environment overrides, and resource settings. Unsupported namespace/device/port
 layouts refuse before replacement. The candidate must pass the maintained Node

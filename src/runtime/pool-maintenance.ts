@@ -150,17 +150,17 @@ export class PoolMaintenance {
     if (!slot || slot.index !== index) throw new Error('unknown slot')
     const previous = record.rolls[String(index)]
     if (previous && (previous.oldId !== expectedId || previous.imageId !== imageId)) throw new Error('roll intent differs from durable receipt')
-    if (previous?.phase === 'promoted') {
-      const current = pool.slotSnapshot()[index]!
-      pool.drainSlot(index, current.containerId)
-      await pool.rollSlot(index, current.containerId, imageId, async (_id, arm) =>
-        await replaceRuntime(previous, () => this.save(), arm))
-      return previous
-    }
     const receipt: RollReceipt = previous ?? { oldId: expectedId, imageId,
       name: `${name}-${index}`, nonce: randomBytes(16).toString('hex'), phase: 'intent' }
     this.operating.add(name)
     try {
+      if (previous?.phase === 'promoted') {
+        const current = pool.slotSnapshot()[index]!
+        pool.drainSlot(index, current.containerId)
+        await pool.rollSlot(index, current.containerId, imageId, async (_id, arm) =>
+          await replaceRuntime(previous, () => this.save(), arm))
+        return previous
+      }
       // Persist the identity before the first Docker write; failures stay drained.
       record.rolls[String(index)] = receipt
       this.save()

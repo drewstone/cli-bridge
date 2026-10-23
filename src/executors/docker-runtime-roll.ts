@@ -37,7 +37,8 @@ export async function inspectIdle(id: string, expectedName?: string): Promise<Js
   const top = await dockerCli(['top', id, '-eo', 'comm'])
   const commands = top.stdout.trim().split('\n').slice(1).map((line) => line.trim())
   if (top.code !== 0 || commands.length !== 2 || commands.sort().join(',') !== 'dumb-init,tail') {
-    throw new Error('slot contains unexpected processes; leave it drained until its work finishes')
+    const observed = commands.map((name) => /^[a-zA-Z0-9._-]{1,64}$/u.test(name) ? name : '<unsupported>')
+    throw new Error(`slot contains unexpected processes (${JSON.stringify(observed)}, init=${String(info.HostConfig.Init)}); leave it drained until its work finishes`)
   }
   return info
 }
@@ -59,7 +60,9 @@ function replacementEnvironment(old: Json, oldImage: Json, image: Json): string[
 function cloneConfiguration(old: Json, oldImage: Json, image: Json): Json {
   const host = structuredClone(old.HostConfig)
   // Sharing another container's namespaces or devices is outside pool ownership.
-  if (!['default', 'bridge'].includes(host.NetworkMode) || host.Privileged ||
+  if (!['default', 'bridge'].includes(host.NetworkMode) || host.Privileged || host.AutoRemove ||
+      host.ContainerIDFile || host.VolumesFrom?.length || host.Links?.length ||
+      Object.keys(old.NetworkSettings.Networks ?? {}).some((name) => name !== 'bridge') ||
       old.Config.Domainname || host.PidMode || host.IpcMode === 'host' || host.Devices?.length ||
       Object.keys(host.PortBindings ?? {}).length || old.Mounts.some((m: Json) => !['bind', 'volume'].includes(m.Type))) {
     throw new Error('unsupported slot namespace, device, port or mount topology')
