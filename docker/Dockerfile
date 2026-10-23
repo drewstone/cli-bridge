@@ -35,8 +35,8 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 # install with an absolute path. Symlink both into /usr/local/bin so
 # they're on PATH at runtime AND survive the /root/.kimi volume mount
 # (which only covers auth state).
-COPY scripts/install-harness.sh scripts/python-security-overrides.txt /usr/local/share/cli-bridge/
-RUN sh /usr/local/share/cli-bridge/install-harness.sh kimi
+COPY scripts/install-harness.sh scripts/python-security-overrides.txt scripts/npm-security.json /usr/local/share/cli-bridge/
+RUN CLI_BRIDGE_UPGRADE_IMAGE_NPM=1 sh /usr/local/share/cli-bridge/install-harness.sh kimi
 
 # Factory droid, Sourcegraph amp, Forge left out by default — install
 # manually on hosts that need them. They change rapidly.

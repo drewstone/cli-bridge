@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import { ContainerPool } from '../executors/container-pool.js'
-import { inspectIdle, replaceRuntime, type RollReceipt } from '../executors/docker-runtime-roll.js'
+import { dockerEngine, inspectIdle, replaceRuntime, type RollReceipt } from '../executors/docker-runtime-roll.js'
 import { registeredPools } from '../routes/metrics.js'
 import { acquireDataDirectoryLock, type DataDirectoryLock } from './single-instance.js'
 
@@ -21,7 +21,8 @@ const rollSchema = z.object({ oldId: identity, imageId: z.string().regex(/^sha25
   nonce: z.string().regex(/^[a-f0-9]{32}$/u), candidateId: identity.optional(), retainedName: z.string().optional(),
   phase: z.enum(['intent', 'candidate', 'verified', 'stopped', 'retained', 'promoted']), node: z.string().optional(),
 }).strict()
-const recordSchema = adoptionRequest.extend({ rolls: z.record(z.string(), rollSchema), image: z.string() }).strict()
+const recordSchema = adoptionRequest.extend({ rolls: z.record(z.string(), rollSchema), image: z.string(),
+  history: z.record(z.string(), z.array(rollSchema)).default({}), }).strict()
 type Record = z.infer<typeof recordSchema>
 
 /** Linux's kernel socket inventory covers IPv4, IPv6 and non-loopback binds. */
@@ -71,7 +72,7 @@ export class PoolMaintenance {
     if (this.pools.has(record.prefix)) return this.pools.get(record.prefix)!
     const ids = record.slots.map((slot) => {
       const roll = record.rolls[String(slot.index)]
-      return roll?.phase === 'promoted' ? roll.candidateId! : slot.id
+      return roll ? (roll.phase === 'promoted' ? roll.candidateId! : roll.oldId) : slot.id
     })
     const pool = ContainerPool.adopt({ size: ids.length, image: record.image,
       namePrefix: record.prefix, oauthMode: 'share', slotMaxHoldMs: 0 }, ids)
@@ -91,8 +92,16 @@ export class PoolMaintenance {
   }
 
   snapshot() {
-    return [...this.pools].map(([name, pool]) => ({ prefix: name, slots: pool.slotSnapshot(),
-      rolls: Object.values(this.records.find((r) => r.prefix === name)!.rolls) }))
+    return [...this.pools].map(([name, pool]) => {
+      const record = this.records.find((r) => r.prefix === name)!
+      const slots = pool.slotSnapshot().map((slot) => {
+        const transactions = [...(record.history[String(slot.index)] ?? []), record.rolls[String(slot.index)]]
+        const receipt = transactions.find((roll) => roll?.candidateId === slot.containerId)
+        const imageId = receipt?.imageId ?? (record.slots[slot.index]?.id === slot.containerId ? record.expectedImage : null)
+        return { ...slot, imageId }
+      })
+      return { prefix: name, slots, rolls: Object.values(record.rolls), history: record.history }
+    })
   }
 
   async adopt(input: z.infer<typeof adoptionRequest>) {
@@ -119,7 +128,7 @@ export class PoolMaintenance {
         if (image && image !== info.Image) throw new Error('adoption requires one known runtime image')
         image = info.Image
       }
-      const record = { ...input, legacyDataDir: realpathSync(input.legacyDataDir), image, rolls: {} }
+      const record = { ...input, legacyDataDir: realpathSync(input.legacyDataDir), image, rolls: {}, history: {} }
       this.records.push(record)
       this.save()
       this.restore(record)
@@ -148,17 +157,30 @@ export class PoolMaintenance {
     const slot = record.slots[index]
     if (!slot || slot.index !== index) throw new Error('unknown slot')
     const previous = record.rolls[String(index)]
-    if (previous && (previous.oldId !== expectedId || previous.imageId !== imageId)) throw new Error('roll intent differs from durable receipt')
-    const receipt: RollReceipt = previous ?? { oldId: expectedId, imageId,
+    const retry = previous?.oldId === expectedId && previous.imageId === imageId
+    if (previous && !retry && (previous.phase !== 'promoted' || previous.candidateId !== expectedId || previous.imageId === imageId)) {
+      throw new Error('new roll requires the completed transaction current identity and a different image')
+    }
+    const receipt: RollReceipt = retry ? previous! : { oldId: expectedId, imageId,
       name: `${name}-${index}`, nonce: randomBytes(16).toString('hex'), phase: 'intent' }
     this.operating.add(name)
     try {
-      if (previous?.phase === 'promoted') {
+      if (retry && previous?.phase === 'promoted') {
         const current = pool.slotSnapshot()[index]!
         pool.drainSlot(index, current.containerId)
         await pool.rollSlot(index, current.containerId, imageId, async (_id, arm) =>
           await replaceRuntime(previous, () => this.save(), arm))
         return previous
+      }
+      if (!retry) {
+        const current = pool.slotSnapshot()[index]!
+        if (current.containerId !== expectedId || !current.draining || current.busy || current.maintenance) {
+          throw new Error('new roll requires the drained idle current slot')
+        }
+        // Missing local artifacts never replace a completed durable receipt.
+        const image = await dockerEngine('GET', `/images/${imageId}/json`)
+        if (image.Id !== imageId) throw new Error('runtime image identity differs')
+        if (previous) (record.history[String(index)] ??= []).push(structuredClone(previous))
       }
       // Persist the identity before the first Docker write; failures stay drained.
       record.rolls[String(index)] = receipt

@@ -50,8 +50,8 @@ RUN apt-get update \
 # --- CLI installs (Pi is pinned to its qualified RPC version) ---
 # Source of truth lives in scripts/install-harness.sh so host installs,
 # subset images, and the all-in-one runtime cannot drift.
-COPY scripts/install-harness.sh scripts/python-security-overrides.txt /usr/local/share/cli-bridge/
-RUN set -eu; \
+COPY scripts/install-harness.sh scripts/python-security-overrides.txt scripts/npm-security.json /usr/local/share/cli-bridge/
+RUN set -eu; export CLI_BRIDGE_UPGRADE_IMAGE_NPM=1; \
   if [ "$CLI_BRIDGE_HARNESSES" = "all" ]; then \
     sh /usr/local/share/cli-bridge/install-harness.sh all; \
   else \

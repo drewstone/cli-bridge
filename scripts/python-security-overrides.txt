@@ -1,2 +1,6 @@
-# Kimi pins an older Pillow; this image owns the audited security override.
+# Audited Kimi dependency overrides; shared by both shipped image recipes.
 pillow==13.0.0
+aiohttp==3.14.4
+asyncssh==2.23.1
+lxml==6.1.0
+lxml_html_clean==0.4.5

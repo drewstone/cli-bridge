@@ -8,6 +8,27 @@ if [ -z "$harness" ]; then
   exit 2
 fi
 
+# Image-only npm self-upgrade; host harness installation keeps its existing npm.
+# The descriptor owns the qualified publisher version and archive integrity.
+if [ "${CLI_BRIDGE_UPGRADE_IMAGE_NPM:-0}" = "1" ]; then
+  npm_security_tmp="$(mktemp -d)"
+  trap 'rm -rf "$npm_security_tmp"' EXIT HUP INT TERM
+  npm_security_version="$(node -p 'require(process.argv[1]).version' "$harness_script_dir/npm-security.json")"
+  curl --fail --silent --show-error --location --max-time 120 \
+    "https://registry.npmjs.org/npm/-/npm-$npm_security_version.tgz" --output "$npm_security_tmp/npm.tgz"
+  node --input-type=module - "$harness_script_dir/npm-security.json" "$npm_security_tmp/npm.tgz" <<'VERIFY_NPM'
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+const descriptor = JSON.parse(readFileSync(process.argv[2], 'utf8'))
+const actual = 'sha512-' + createHash('sha512').update(readFileSync(process.argv[3])).digest('base64')
+if (actual !== descriptor.integrity) throw new Error('npm security archive integrity mismatch')
+VERIFY_NPM
+  npm install --global --ignore-scripts --no-audit --no-fund "$npm_security_tmp/npm.tgz"
+  test "$(npm --version)" = "$npm_security_version"
+  rm -rf "$npm_security_tmp"
+  trap - EXIT HUP INT TERM
+fi
+
 install_claude() {
   npm install -g @anthropic-ai/claude-code@latest
 }
