@@ -2,13 +2,17 @@
 """Real shipped-image npm/Python/native proof. Uses no credentials or model calls."""
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 
 image = sys.argv[1]
-if not image.startswith('sha256:') or len(image) != 71:
+kind = sys.argv[2]
+if not re.fullmatch(r'sha256:[a-f0-9]{64}', image):
     raise SystemExit('an existing immutable Docker image ID is required')
+if kind not in ('runtime', 'bridge'):
+    raise SystemExit('the producer must specify runtime (all harnesses) or bridge')
 descriptor = json.loads((Path(__file__).parent / 'npm-security.json').read_text())
 overrides = dict(line.strip().split('==') for line in
                  (Path(__file__).parent / 'python-security-overrides.txt').read_text().splitlines()
@@ -24,7 +28,10 @@ def run(entrypoint, arguments, source=None):
     return result.stdout.strip()
 
 
-versions = {cli: run(cli, ['--version']) for cli in ('node', 'npm', 'claude', 'codex', 'opencode', 'kimi', 'gemini', 'pi')}
+harnesses = ['claude', 'codex', 'opencode', 'kimi']
+if kind == 'runtime':
+    harnesses += ['gemini', 'pi']
+versions = {cli: run(cli, ['--version']) for cli in ['node', 'npm', *harnesses]}
 if versions['npm'] != descriptor['version']:
     raise SystemExit('the image npm version does not match its security owner')
 npm_dependencies = json.loads(run('node', ['-e', "console.log(JSON.stringify(Object.fromEntries(['brace-expansion','undici'].map(n=>[n,require('/usr/local/lib/node_modules/npm/node_modules/'+n+'/package.json').version]))))"]))
@@ -88,5 +95,5 @@ print(json.dumps({'installed': installed, 'uv_archives': cache,
     'native': ['aiohttp-loopback', 'asyncssh-ed25519', 'lxml-parse-clean', 'Pillow-PNG-JPEG-WEBP']}))
 '''
 python = json.loads(run('/root/.local/share/uv/tools/kimi-cli/bin/python', ['-', json.dumps(overrides)], python_source))
-print(json.dumps({'image_id': image, 'cli_versions': versions, 'npm_bundled_packages': npm_dependencies,
+print(json.dumps({'image_id': image, 'recipe': kind, 'cli_versions': versions, 'npm_bundled_packages': npm_dependencies,
                   'python': python, 'model_calls': 0}, indent=2))
