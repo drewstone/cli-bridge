@@ -4,8 +4,17 @@ import json
 from pathlib import Path
 import re
 import secrets
+import signal
 import subprocess
 import sys
+
+
+def interrupted(number, _frame):
+    raise SystemExit(128 + number)
+
+
+for interrupt in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(interrupt, interrupted)
 
 
 image = sys.argv[1]
