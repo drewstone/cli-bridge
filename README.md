@@ -1236,3 +1236,50 @@ Normalized event replay remains separate.
 Native CLI stores remain in their configured private homes and require independent retention with credential files excluded.
 The process manifest does not claim native-store completeness, trusted image identity, or coverage of native subprocess stores.
 Retained native-session API jobs do not yet enter this one-shot capture scope.
+
+### Individually maintained Docker pool slots
+
+The bearer-protected `/admin/pools/status` endpoint reports explicit adopted pool
+identities and durable roll receipts. Maintenance requires `BRIDGE_BEARER`, even
+on loopback. It does not restart other bridge services or stop their jobs.
+
+For an inactive historical pool, `POST /admin/pools/adopt` accepts `prefix`,
+`legacyDataDir`, `legacyPorts`, immutable `expectedImage`, and ordered contiguous
+`slots: [{index, id}]` with full container IDs. The bridge takes the existing
+legacy data-directory ownership lock, requires the old listener ports to be
+unused, and verifies every named slot has no Docker execs and only its idle
+`dumb-init`/`tail` processes. Each slot must have a bind associated with that
+legacy directory. Refused adoption leaves the containers untouched. Adoption
+starts every slot drained; it never provisions, removes, or resets credentials.
+
+`POST /admin/pools/:prefix/slots/:index/drain` takes `expectedId` and prevents new
+leases for that slot. Existing leases finish normally; other slots remain
+available. `POST .../roll` takes the same `expectedId` and immutable local
+`imageId` (`sha256:...`); an occupied slot returns409. An idle candidate retains
+all existing named/anonymous volumes, binds, process configuration, operator
+environment overrides, and resource settings. Unsupported namespace/device/port
+layouts refuse before replacement. The candidate must pass the maintained Node
+version policy in `docker/Dockerfile.cli-runtime`, per-start setup, and normal
+Docker preflight before the old container stops. The old container remains
+stopped under a retained name, with its data and image available for inspection.
+No image is pulled and no volume is deleted by this interface.
+
+`pool-maintenance.json` under the bridge data directory records exact old and
+candidate identities before each Docker transition. After an interrupted roll,
+retry the same original ID and image; a different intent is refused. After owner
+restart, adopted slots remain drained until the same roll request verifies and
+re-admits each completed candidate. The journal contains no credential values.
+Use the registered service deployer to activate merged source; an unchanged
+lockfile and matching installed lock marker allow its existing source-only path.
+
+Run the affected real Docker/HTTP proof on an admitted build host with an
+already-present immutable runtime image:
+
+```sh
+CLI_ROLL_IMAGE=sha256:<existing-image-id> pnpm exec tsx scripts/verify-pool-runtime-roll.ts
+```
+
+This fixture proves ownership, drain, configuration preservation and restart
+reconciliation using local containers; it makes no model requests. Production
+completion additionally requires the actual eight slot IDs to report the patched
+Node version and their active immutable image's retained vulnerability scan.

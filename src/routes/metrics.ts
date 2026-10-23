@@ -15,7 +15,7 @@ import { hostExecutorSnapshot } from '../executors/host.js'
 import { scopedHostExecutorSnapshot } from '../executors/scoped-host.js'
 import type { ContainerPool } from '../executors/container-pool.js'
 
-const registeredPools = new Map<string, ContainerPool>()
+export const registeredPools = new Map<string, ContainerPool>()
 
 export function registerPoolForMetrics(name: string, pool: ContainerPool): void {
   registeredPools.set(name, pool)

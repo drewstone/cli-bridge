@@ -39,6 +39,8 @@ import { RetainedSessionService, mountRetainedSessions } from './sessions/retain
 import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
 import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
+import { mountPoolMaintenance } from './routes/pool-maintenance.js'
+import { PoolMaintenance } from './runtime/pool-maintenance.js'
 import { ContainerPool } from './executors/container-pool.js'
 import { provisionNetJail } from './executors/net-jail-network.js'
 import { modelEndpointsFor, parseAllowList } from './jail/net-allowlist.js'
@@ -535,6 +537,9 @@ export async function buildApp(config: Config): Promise<{
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)
+  const poolMaintenance = new PoolMaintenance(config.dataDir)
+  extras.shutdownHooks.push(async () => await poolMaintenance.close())
+  mountPoolMaintenance(app, poolMaintenance, Boolean(config.bearer))
 
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
