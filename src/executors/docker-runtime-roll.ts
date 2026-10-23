@@ -3,14 +3,14 @@ import { request } from 'node:http'
 import { readFileSync } from 'node:fs'
 import { dockerCli } from './docker-cli.js'
 import { preflightDockerSlot } from './docker-preflight.js'
+import { runtimeDockerHost, type RuntimeDefaultPromotion } from './runtime-image.js'
 
 type Json = Record<string, any>
-export async function dockerEngine(method: string, path: string, body?: unknown): Promise<any> {
-  const host = process.env.DOCKER_HOST ?? 'unix:///var/run/docker.sock'
-  if (!host.startsWith('unix://')) throw new Error('maintenance requires a local Docker socket')
+export async function dockerEngine(method: string, path: string, body?: unknown, timeoutMs = 120_000): Promise<any> {
+  const host = runtimeDockerHost()
   return await new Promise((resolve, reject) => {
     const req = request({ socketPath: host.slice(7), path, method,
-      headers: { 'content-type': 'application/json' }, timeout: 120_000 }, (res) => {
+      headers: { 'content-type': 'application/json' }, timeout: timeoutMs }, (res) => {
       let data = ''
       res.setEncoding('utf8')
       res.on('data', (part: string) => { data += part; if (data.length > 8 * 1024 * 1024) req.destroy() })
@@ -120,6 +120,7 @@ export interface RollReceipt {
   phase: 'intent' | 'candidate' | 'verified' | 'stopped' | 'retained' | 'promoted'
   node?: string
   nonce: string
+  defaultPromotion?: RuntimeDefaultPromotion
 }
 
 /** Each irreversible boundary is journaled; retries use exact recorded IDs. */

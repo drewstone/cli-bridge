@@ -353,7 +353,7 @@ export async function buildApp(config: Config): Promise<{
   })
   const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
   // Validate the durable maintenance owner before any backend provisions Docker slots.
-  const poolMaintenance = new PoolMaintenance(config.dataDir)
+  const poolMaintenance = new PoolMaintenance(config.dataDir, config.runtimeImage)
   extras.shutdownHooks.push(async () => await poolMaintenance.close())
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {

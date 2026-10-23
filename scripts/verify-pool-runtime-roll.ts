@@ -10,6 +10,8 @@ import { ContainerPool } from '../src/executors/container-pool.js'
 import { dockerCli } from '../src/executors/docker-cli.js'
 import { dockerEngine, replaceRuntime, type RollReceipt } from '../src/executors/docker-runtime-roll.js'
 import { acquireDataDirectoryLock } from '../src/runtime/single-instance.js'
+import { acquireRuntimeImageLock } from '../src/executors/runtime-image.js'
+import { spawnSync } from 'node:child_process'
 import { loadConfig } from '../src/config.js'
 import { buildApp } from '../src/server.js'
 
@@ -18,6 +20,7 @@ if (!image || !/^sha256:[a-f0-9]{64}$/u.test(image)) throw new Error('CLI_ROLL_I
 const token = randomBytes(24).toString('hex')
 const suffix = randomBytes(5).toString('hex')
 const prefix = `cli-bridge-proof-${suffix}`
+const defaultReference = `${prefix}:default`
 const root = mkdtempSync(join(tmpdir(), `${prefix}-`))
 const legacy = join(root, 'legacy', 'data')
 const ws = join(root, 'legacy', 'ws')
@@ -38,14 +41,16 @@ async function command(args: string[]): Promise<string> {
   if (result.code) throw new Error(`fixture Docker command failed: ${args[0]}`)
   return result.stdout.trim()
 }
-async function api(path: string, body?: unknown, auth = true) {
+async function api(path: string, body?: unknown, auth = true, signal?: AbortSignal) {
   return await fetch(`${base}${path}`, { method: body === undefined ? 'GET' : 'POST',
+    signal,
     headers: { ...(auth ? { authorization: `Bearer ${token}` } : {}), 'content-type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
 }
 async function startApp() {
   appOwner = await buildApp(loadConfig({ BRIDGE_BACKENDS: 'codex', CODEX_EXECUTOR: 'host',
-    BRIDGE_DATA_DIR: data, BRIDGE_BEARER: token, BRIDGE_HOST: '127.0.0.1' }))
+    BRIDGE_DATA_DIR: data, BRIDGE_BEARER: token, BRIDGE_HOST: '127.0.0.1',
+    BRIDGE_DEFAULT_DOCKER_IMAGE: defaultReference }))
   server = serve({ fetch: appOwner.app.fetch, hostname: '127.0.0.1', port: 0 })
   await new Promise<void>((resolve) => server!.listening ? resolve() : server!.once('listening', resolve))
   base = `http://127.0.0.1:${(server.address() as { port: number }).port}`
@@ -67,6 +72,7 @@ try {
   oldImage = await command(['commit', '--change', `LABEL cli-bridge.proof=${suffix}`, seed])
   nextImage = await command(['commit', '--change', `LABEL cli-bridge.proof-next=${suffix}`, seed])
   await command(['rm', '-v', seed]); owned.delete(seed)
+  await command(['image', 'tag', oldImage, defaultReference])
 
   pool = await ContainerPool.create({ size: 2, image: oldImage, namePrefix: `${prefix}-leases`,
     oauthMode: 'share', workspaceRoot: ws, slotMaxHoldMs: 0 })
@@ -148,22 +154,43 @@ try {
   checks.push('actual HTTP owner restart reconciles completed receipts and re-admits verified slots without secrets in journal')
   const firstRoll = JSON.parse(readFileSync(join(data, 'pool-maintenance.json'), 'utf8')).pools[0].rolls['0'] as RollReceipt
   const currentId = firstRoll.candidateId!
+  const defaultBefore = await (await api('/admin/pools/status')).json() as { runtimeDefault: { reference: string; imageId: string } }
+  assert.deepEqual(defaultBefore.runtimeDefault, { reference: defaultReference, imageId: oldImage })
+  const journalBeforeCas = readFileSync(join(data, 'pool-maintenance.json'), 'utf8')
+  assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: slots[0]!.id, imageId: image,
+    promoteDefault: { expectedImageId: `sha256:${'0'.repeat(64)}` } })).status, 409)
+  assert.equal(readFileSync(join(data, 'pool-maintenance.json'), 'utf8'), journalBeforeCas)
+  assert.equal((await dockerEngine('GET', `/images/${encodeURIComponent(defaultReference)}/json`)).Id, oldImage)
   assert.equal((await api(`/admin/pools/${prefix}/slots/0/drain`, { expectedId: currentId })).status, 200)
   const completedJournal = readFileSync(join(data, 'pool-maintenance.json'), 'utf8')
   assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: `sha256:${'0'.repeat(64)}` })).status, 409)
   assert.equal(readFileSync(join(data, 'pool-maintenance.json'), 'utf8'), completedJournal)
-  const secondResponse = await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: nextImage })
-  assert.equal(secondResponse.status, 200)
-  const second = (await secondResponse.json() as { receipt: RollReceipt }).receipt
+  const lostResponse = new AbortController()
+  const pendingResponse = api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: nextImage,
+    promoteDefault: { expectedImageId: oldImage } }, true, lostResponse.signal)
+  const acceptedDeadline = Date.now() + 5000
+  while (true) {
+    const observed = await (await api('/admin/pools/status')).json() as { pools: Array<{ slots: Array<{ maintenance: boolean }> }> }
+    if (observed.pools[0]!.slots[0]!.maintenance) break
+    if (Date.now() >= acceptedDeadline) throw new Error('real second roll did not enter maintenance')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  lostResponse.abort()
+  await assert.rejects(pendingResponse, { name: 'AbortError' })
+  await stopApp() // Owner shutdown waits for the accepted operation to settle.
+  const second = JSON.parse(readFileSync(join(data, 'pool-maintenance.json'), 'utf8')).pools[0].rolls['0'] as RollReceipt
+  assert.equal(second.phase, 'promoted')
   owned.add(second.candidateId!)
   assert.notEqual(second.nonce, firstRoll.nonce)
   assert.equal(second.oldId, currentId)
+  assert.deepEqual(second.defaultPromotion, { reference: defaultReference, expectedImageId: oldImage,
+    imageId: nextImage, phase: 'published' })
   assert.equal((await dockerEngine('GET', `/containers/${currentId}/json`)).State.Running, false)
   assert.equal((await dockerEngine('GET', `/containers/${slots[0]!.id}/json`)).State.Running, false)
   assert.equal(await command(['exec', second.candidateId!, 'cat', '/root/.config/opencode/proof-marker']), 'retained')
-  await stopApp()
   await startApp()
-  assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: nextImage })).status, 200)
+  assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: nextImage,
+    promoteDefault: { expectedImageId: oldImage } })).status, 200)
   assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: slots[0]!.id, imageId: image })).status, 409)
   const journal = JSON.parse(readFileSync(join(data, 'pool-maintenance.json'), 'utf8')).pools[0]
   assert.deepEqual(journal.slots, slots)
@@ -174,18 +201,56 @@ try {
   assert.equal(repeatedStatus.pools[0]!.slots[0]!.draining, false)
   checks.push('second immutable artifact appends prior receipt, preserves original identities and volumes, rejects stale intent, and reconciles after owner restart')
   checks.push('missing second artifact refuses without changing completed journal')
+  const afterDefault = await (await api('/admin/pools/status')).json() as { runtimeDefault: { reference: string; imageId: string } }
+  assert.deepEqual(afterDefault.runtimeDefault, { reference: defaultReference, imageId: nextImage })
+  // The real existing build command must share the API's publication lease.
+  const buildEnvironment = { ...process.env, BRIDGE_DEFAULT_DOCKER_IMAGE: defaultReference }
+  const lease = acquireRuntimeImageLock(defaultReference)
+  try {
+    const refused = spawnSync('pnpm', ['run', 'docker:build:runtime', '--help'], { env: buildEnvironment, encoding: 'utf8', timeout: 15_000 })
+    assert.notEqual(refused.status, 0)
+    assert.match(refused.stderr, /already owned/u)
+  } finally { lease.release() }
+  const builder = spawnSync('pnpm', ['run', 'docker:build:runtime', '--help'], { env: buildEnvironment, encoding: 'utf8', timeout: 15_000 })
+  assert.equal(builder.status, 0, builder.stderr)
+  // A new pool follows normal config, rather than the old explicit roll image.
+  const freshConfig = loadConfig({ BRIDGE_DEFAULT_DOCKER_IMAGE: defaultReference,
+    OPENCODE_EXECUTOR: 'docker', BRIDGE_DATA_DIR: join(root, 'fresh-config') })
+  assert.equal(freshConfig.executors.opencode!.image, defaultReference)
+  pool = await ContainerPool.create({ size: 1, image: freshConfig.executors.opencode!.image!,
+    namePrefix: `${prefix}-future`, oauthMode: 'share', workspaceRoot: ws, slotMaxHoldMs: 0 })
+  for (const id of pool.liveContainerIds()) {
+    owned.add(id)
+    assert.equal((await dockerEngine('GET', `/containers/${id}/json`)).Image, nextImage)
+    assert.equal(await command(['exec', id, 'node', '--version']), second.node)
+  }
+  await pool.destroy(); pool = undefined
+  checks.push('default publication survives a real lost HTTP response and owner restart; stale CAS refuses, the existing builder shares its lease and a new real pool boots the published image')
   const result = { complete: true, checks, old_fixture_image: oldImage, candidate_image: image,
     second_candidate_image: nextImage,
+    default_reference: defaultReference,
     production_node_upgrade_proven: false, no_model_calls: true }
   const output = process.env.CLI_ROLL_PROOF_OUTPUT
   if (output) writeFileSync(output, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 })
   console.log(JSON.stringify(result))
 } finally {
   await stopApp()
+  // Accepted operations can complete after their HTTP response is lost. Read
+  // only this invocation's journal to retain cleanup ownership of their IDs.
+  try {
+    const journal = JSON.parse(readFileSync(join(data, 'pool-maintenance.json'), 'utf8'))
+    for (const record of journal.pools) {
+      if (record.prefix !== prefix) continue
+      for (const receipt of Object.values(record.rolls) as RollReceipt[]) {
+        if (receipt.name.startsWith(`${prefix}-`) && receipt.candidateId) owned.add(receipt.candidateId)
+      }
+    }
+  } catch { /* The fixture may fail before creating its journal. */ }
   if (pool) await pool.destroy()
   // All names/IDs below were created by this invocation. No shared pruning.
   for (const id of owned) await dockerCli(['rm', '-f', '-v', id])
   for (const volume of volumes) await dockerCli(['volume', 'rm', volume])
+  await dockerCli(['image', 'rm', defaultReference])
   if (oldImage) await dockerCli(['image', 'rm', oldImage])
   if (nextImage) await dockerCli(['image', 'rm', nextImage])
   rmSync(root, { recursive: true, force: true })

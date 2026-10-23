@@ -4,15 +4,16 @@ import { z } from 'zod'
 import { adoptionRequest, PoolMaintenance } from '../runtime/pool-maintenance.js'
 
 const rollRequest = z.object({ expectedId: z.string().regex(/^[a-f0-9]{64}$/u),
-  imageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u) }).strict()
-const drainRequest = rollRequest.omit({ imageId: true })
+  imageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  promoteDefault: z.object({ expectedImageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u) }).strict().optional(), }).strict()
+const drainRequest = rollRequest.omit({ imageId: true, promoteDefault: true })
 
 export function mountPoolMaintenance(app: Hono, owner: PoolMaintenance, authenticated: boolean): void {
   app.use('/admin/pools/*', async (c, next) => {
     if (!authenticated) return c.json({ error: 'pool maintenance requires configured bearer authentication' }, 403)
     return next()
   })
-  app.get('/admin/pools/status', (c) => c.json({ pools: owner.snapshot() }))
+  app.get('/admin/pools/status', async (c) => c.json(await owner.status()))
   app.post('/admin/pools/adopt', async (c) => {
     try {
       const text = await c.req.text()
@@ -33,7 +34,7 @@ export function mountPoolMaintenance(app: Hono, owner: PoolMaintenance, authenti
       }
       if (c.req.param('operation') !== 'roll') return c.json({ error: 'unknown operation' }, 404)
       const input = rollRequest.parse(JSON.parse(text))
-      return c.json({ receipt: await owner.roll(name, index, input.expectedId, input.imageId) })
+      return c.json({ receipt: await owner.roll(name, index, input.expectedId, input.imageId, input.promoteDefault) })
     } catch { return c.json({ error: 'slot maintenance refused; inspect drain, active work and durable receipt' }, 409) }
   })
 }

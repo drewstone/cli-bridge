@@ -12,6 +12,7 @@ import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import { assertDockerNetworkName } from './executors/docker-network.js'
 import { formatAllowEntry, parseAllowList } from './jail/net-allowlist.js'
+import { runtimeImageReference } from './executors/runtime-image.js'
 
 const maxExecutionTimeoutMs = 2_147_483_647
 
@@ -20,6 +21,8 @@ export interface Config {
   port: number
   bearer: string | null
   dataDir: string
+  /** Named default shared by Docker configuration, the builder and admin publication. */
+  runtimeImage: string
   /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
   asyncDurableWrites: boolean
   backends: Set<string>
@@ -287,6 +290,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port,
     bearer,
     dataDir,
+    runtimeImage: runtimeImageReference(env),
     asyncDurableWrites: parseOnOff('BRIDGE_ASYNC_DURABLE_WRITES', env.BRIDGE_ASYNC_DURABLE_WRITES, false),
     backends,
     claudeBin: env.CLAUDE_BIN ?? 'claude',
@@ -564,16 +568,6 @@ function parseExecutionTimeoutMs(
   return parsed
 }
 
-/**
- * Per-backend executor defaults. All subprocess backends share the
- * same default runtime image (`cli-bridge-cli-runtime`) — that image
- * has every CLI installed. Per-backend `<NAME>_DOCKER_IMAGE` env
- * overrides if you want a leaner per-backend image. The OAuth/config
- * mount target differs per backend because each CLI stores auth state
- * in a different path.
- */
-const SHARED_RUNTIME_IMAGE = 'cli-bridge-cli-runtime:latest'
-
 /** HOME the container runs with when no non-root identity is configured. */
 const DEFAULT_CONTAINER_HOME = '/root'
 
@@ -590,7 +584,6 @@ const DEFAULT_CONTAINER_HOME = '/root'
  * mismatch impossible to express instead of something to detect later.
  */
 interface BackendExecutorDefaults {
-  image: string
   /** Primary config dir, HOME-relative. The one <NAME>_DOCKER_*_CONFIG_DIR overrides. */
   configRel: string
   /**
@@ -616,17 +609,16 @@ interface BackendExecutorDefaults {
 }
 
 const BACKEND_EXECUTOR_DEFAULTS: Record<string, BackendExecutorDefaults> = {
-  claude: { image: SHARED_RUNTIME_IMAGE, configRel: '.claude', credentialFile: '.claude/.credentials.json' },
-  kimi: { image: SHARED_RUNTIME_IMAGE, configRel: '.kimi', credentialFile: '.kimi/credentials' },
-  gemini: { image: SHARED_RUNTIME_IMAGE, configRel: '.gemini' },
-  codex: { image: SHARED_RUNTIME_IMAGE, configRel: '.codex', credentialFile: '.codex/auth.json' },
+  claude: { configRel: '.claude', credentialFile: '.claude/.credentials.json' },
+  kimi: { configRel: '.kimi', credentialFile: '.kimi/credentials' },
+  gemini: { configRel: '.gemini' },
+  codex: { configRel: '.codex', credentialFile: '.codex/auth.json' },
   opencode: {
-    image: SHARED_RUNTIME_IMAGE,
     configRel: '.config/opencode',
     extraRels: ['.local/share/opencode'],
     credentialFile: '.local/share/opencode/auth.json',
   },
-  pi: { image: SHARED_RUNTIME_IMAGE, configRel: '.pi/agent', credentialFile: '.pi/agent/auth.json' },
+  pi: { configRel: '.pi/agent', credentialFile: '.pi/agent/auth.json' },
 }
 
 const SUPPORTED_EXECUTOR_BACKENDS = Object.keys(BACKEND_EXECUTOR_DEFAULTS)
@@ -684,7 +676,7 @@ function parseAllExecutors(env: NodeJS.ProcessEnv, dataDir: string): Record<stri
     }
     const cfg: BackendExecutorConfig = { name, kind }
     if (kind === 'docker') {
-      cfg.image = env[`${upper}_DOCKER_IMAGE`] ?? defaults.image
+      cfg.image = env[`${upper}_DOCKER_IMAGE`] ?? runtimeImageReference(env)
       cfg.poolSize = parsePositiveInt(env[`${upper}_DOCKER_POOL_SIZE`], 4)
       cfg.oauthMode = parseOauthMode(`${upper}_DOCKER_OAUTH_MOUNT`, env[`${upper}_DOCKER_OAUTH_MOUNT`], 'share')
       cfg.namePrefix = env[`${upper}_DOCKER_NAME_PREFIX`] ?? `cli-bridge-${name}-pool`

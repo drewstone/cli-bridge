@@ -35,6 +35,7 @@ import { mkdirSync, statSync, writeFileSync, rmSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { containerShell, dockerCli, type DockerCli } from './docker-cli.js'
+import { runtimeImageReference } from './runtime-image.js'
 import type { ExecutorFinding } from './types.js'
 
 export interface DockerPreflightMount {
@@ -116,9 +117,8 @@ export function formatPreflightFailure(backend: string, findings: PreflightFindi
 export const RUNTIME_IMAGE_BUILD_COMMAND = 'pnpm run docker:build:runtime'
 
 export function buildCommandFor(image: string): string {
-  const DEFAULT_IMAGE = 'cli-bridge-cli-runtime:latest'
-  if (image === DEFAULT_IMAGE) return RUNTIME_IMAGE_BUILD_COMMAND
-  return `docker build -f docker/Dockerfile.cli-runtime -t ${image} .`
+  if (image === runtimeImageReference()) return RUNTIME_IMAGE_BUILD_COMMAND
+  return `BRIDGE_DEFAULT_DOCKER_IMAGE='${image.replace(/'/gu, "'\\''")}' ${RUNTIME_IMAGE_BUILD_COMMAND}`
 }
 
 /**

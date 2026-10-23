@@ -9,6 +9,7 @@ import { ContainerPool } from '../executors/container-pool.js'
 import { dockerEngine, inspectIdle, replaceRuntime, type RollReceipt } from '../executors/docker-runtime-roll.js'
 import { registeredPools } from '../routes/metrics.js'
 import { acquireDataDirectoryLock, type DataDirectoryLock } from './single-instance.js'
+import { acquireRuntimeImageLock, runtimeDefaultPromotionSchema, runtimeImageReference } from '../executors/runtime-image.js'
 
 const identity = z.string().regex(/^[a-f0-9]{64}$/u)
 const prefix = z.string().regex(/^cli-bridge-[a-zA-Z0-9_-]{1,64}$/u)
@@ -20,6 +21,7 @@ export const adoptionRequest = z.object({ prefix, legacyDataDir: z.string().star
 const rollSchema = z.object({ oldId: identity, imageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u), name: z.string(),
   nonce: z.string().regex(/^[a-f0-9]{32}$/u), candidateId: identity.optional(), retainedName: z.string().optional(),
   phase: z.enum(['intent', 'candidate', 'verified', 'stopped', 'retained', 'promoted']), node: z.string().optional(),
+  defaultPromotion: runtimeDefaultPromotionSchema.optional(),
 }).strict()
 const recordSchema = adoptionRequest.extend({ rolls: z.record(z.string(), rollSchema), image: z.string(),
   history: z.record(z.string(), z.array(rollSchema)).default({}), }).strict()
@@ -44,7 +46,7 @@ export class PoolMaintenance {
   private closing = false
   private path: string
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, private defaultImage = runtimeImageReference()) {
     this.path = join(dataDir, 'pool-maintenance.json')
     try {
       const fd = openSync(this.path, constants.O_RDONLY | constants.O_NOFOLLOW)
@@ -104,6 +106,42 @@ export class PoolMaintenance {
     })
   }
 
+  async status() {
+    let imageId: string | null = null
+    try {
+      const image = await dockerEngine('GET', `/images/${encodeURIComponent(this.defaultImage)}/json`, undefined, 3000)
+      if (/^sha256:[a-f0-9]{64}$/u.test(image.Id)) imageId = image.Id
+    } catch { /* Explicit unknown; hosts using native executors may have no Docker daemon. */ }
+    return { pools: this.snapshot(), runtimeDefault: { reference: this.defaultImage, imageId } }
+  }
+
+  private async publishDefault(receipt: RollReceipt, expectedImageId: string): Promise<void> {
+    const lock = acquireRuntimeImageLock(this.defaultImage)
+    try {
+      const previous = receipt.defaultPromotion
+      if (previous && (previous.reference !== this.defaultImage || previous.expectedImageId !== expectedImageId || previous.imageId !== receipt.imageId)) {
+        throw new Error('default publication intent differs from durable receipt')
+      }
+      const read = async () => (await dockerEngine('GET', `/images/${encodeURIComponent(this.defaultImage)}/json`)).Id as string
+      const current = await read()
+      if (previous?.phase === 'published') {
+        if (current !== receipt.imageId) throw new Error('published runtime default drifted; do not overwrite another publisher')
+        return
+      }
+      if (current !== expectedImageId && !(previous && current === receipt.imageId)) throw new Error('runtime default compare-and-swap refused')
+      receipt.defaultPromotion ??= { reference: this.defaultImage, expectedImageId, imageId: receipt.imageId, phase: 'intent' }
+      this.save()
+      if (current !== receipt.imageId) {
+        const colon = this.defaultImage.lastIndexOf(':')
+        const query = new URLSearchParams({ repo: this.defaultImage.slice(0, colon), tag: this.defaultImage.slice(colon + 1) })
+        await dockerEngine('POST', `/images/${receipt.imageId}/tag?${query}`)
+      }
+      if (await read() !== receipt.imageId) throw new Error('runtime default publication readback differs')
+      receipt.defaultPromotion.phase = 'published'
+      this.save()
+    } finally { lock.release() }
+  }
+
   async adopt(input: z.infer<typeof adoptionRequest>) {
     if (this.closing || this.operating.size) throw new Error('another maintenance operation is active')
     this.operating.add(input.prefix)
@@ -150,7 +188,7 @@ export class PoolMaintenance {
     return pool.slotSnapshot()
   }
 
-  async roll(name: string, index: number, expectedId: string, imageId: string) {
+  async roll(name: string, index: number, expectedId: string, imageId: string, promoteDefault?: { expectedImageId: string }) {
     const pool = this.pools.get(name)
     const record = this.records.find((r) => r.prefix === name)
     if (this.closing || !pool || !record || this.operating.size) throw new Error('pool unavailable or maintenance is active')
@@ -170,6 +208,7 @@ export class PoolMaintenance {
         pool.drainSlot(index, current.containerId)
         await pool.rollSlot(index, current.containerId, imageId, async (_id, arm) =>
           await replaceRuntime(previous, () => this.save(), arm))
+        if (promoteDefault) await this.publishDefault(previous, promoteDefault.expectedImageId)
         return previous
       }
       if (!retry) {
@@ -189,6 +228,7 @@ export class PoolMaintenance {
         await replaceRuntime(receipt, () => this.save(), arm))
       record.image = imageId
       this.save()
+      if (promoteDefault) await this.publishDefault(receipt, promoteDefault.expectedImageId)
       return receipt
     } finally { this.operating.delete(name) }
   }

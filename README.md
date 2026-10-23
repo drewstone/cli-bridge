@@ -1241,6 +1241,11 @@ Retained native-session API jobs do not yet enter this one-shot capture scope.
 
 The bearer-protected `/admin/pools/status` endpoint reports explicit adopted pool
 identities, per-slot immutable image bindings, and durable roll receipts/history.
+Status also reports `runtimeDefault.reference` and its live local `imageId` (null
+when the daemon/reference cannot be read). `BRIDGE_DEFAULT_DOCKER_IMAGE` selects
+the named default reference for configuration, the existing runtime build command,
+and admin publication. Its portable default lives in `src/executors/runtime-image.ts`;
+per-backend image overrides retain precedence.
 Maintenance requires `BRIDGE_BEARER`, even
 on loopback. Adoption requires Linux with the existing `ss` socket inventory tool;
 unavailable or ambiguous listener evidence refuses ownership transfer. Run adoption
@@ -1268,6 +1273,19 @@ version policy in `docker/Dockerfile.cli-runtime`, per-start setup, and normal
 Docker preflight before the old container stops. The old container remains
 stopped under a retained name, with its data and image available for inspection.
 No image is pulled and no volume is deleted by this interface.
+
+An explicit `promoteDefault: {expectedImageId: "sha256:..."}` on the same roll
+request publishes its verified candidate as the configured default for future
+Docker pools. The expected ID must match the current default. Only that configured
+reference may change; arbitrary tags are not accepted by the API. Publication
+records intent before tagging and readback before completion, so a lost response
+can replay the same receipt. A different intent or a drifted published default
+refuses. Default publication never recreates other pools or deletes old images.
+The existing `pnpm run docker:build:runtime` publisher and admin API share the
+same local socket/reference lease. Use that build command for the default,
+including `BRIDGE_DEFAULT_DOCKER_IMAGE` for a custom reference. It requires local
+Unix Docker and Node's `process.execve` capability so Docker retains the lease's
+process identity throughout a build; alternate tag/output/push flags refuse.
 
 `pool-maintenance.json` under the bridge data directory records exact old and
 candidate identities before each Docker transition. After an interrupted roll,

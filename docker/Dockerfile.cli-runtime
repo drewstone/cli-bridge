@@ -15,7 +15,7 @@
 #     own Node base
 #
 # Build:
-#   docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest .
+#   pnpm run docker:build:runtime
 #   docker build -f docker/Dockerfile.cli-runtime --build-arg CLI_BRIDGE_HARNESSES=codex,gemini -t cli-bridge-cli-runtime:codex-gemini .
 #
 # OAuth state lives at:
