@@ -115,31 +115,34 @@ export class PoolMaintenance {
     return { pools: this.snapshot(), runtimeDefault: { reference: this.defaultImage, imageId } }
   }
 
+  private async defaultBinding(receipt: RollReceipt, expectedImageId: string): Promise<string> {
+    const previous = receipt.defaultPromotion
+    if (previous && (previous.reference !== this.defaultImage || previous.expectedImageId !== expectedImageId || previous.imageId !== receipt.imageId)) {
+      throw new Error('default publication intent differs from durable receipt')
+    }
+    const current = (await dockerEngine('GET', `/images/${encodeURIComponent(this.defaultImage)}/json`)).Id as string
+    if (previous?.phase === 'published') {
+      if (current !== receipt.imageId) throw new Error('published runtime default drifted; do not overwrite another publisher')
+    } else if (current !== expectedImageId && !(previous && current === receipt.imageId)) {
+      throw new Error('runtime default compare-and-swap refused')
+    }
+    return current
+  }
+
+  /** Caller holds the default-reference lease from admission through readback. */
   private async publishDefault(receipt: RollReceipt, expectedImageId: string): Promise<void> {
-    const lock = acquireRuntimeImageLock(this.defaultImage)
-    try {
-      const previous = receipt.defaultPromotion
-      if (previous && (previous.reference !== this.defaultImage || previous.expectedImageId !== expectedImageId || previous.imageId !== receipt.imageId)) {
-        throw new Error('default publication intent differs from durable receipt')
-      }
-      const read = async () => (await dockerEngine('GET', `/images/${encodeURIComponent(this.defaultImage)}/json`)).Id as string
-      const current = await read()
-      if (previous?.phase === 'published') {
-        if (current !== receipt.imageId) throw new Error('published runtime default drifted; do not overwrite another publisher')
-        return
-      }
-      if (current !== expectedImageId && !(previous && current === receipt.imageId)) throw new Error('runtime default compare-and-swap refused')
-      receipt.defaultPromotion ??= { reference: this.defaultImage, expectedImageId, imageId: receipt.imageId, phase: 'intent' }
-      this.save()
-      if (current !== receipt.imageId) {
-        const colon = this.defaultImage.lastIndexOf(':')
-        const query = new URLSearchParams({ repo: this.defaultImage.slice(0, colon), tag: this.defaultImage.slice(colon + 1) })
-        await dockerEngine('POST', `/images/${receipt.imageId}/tag?${query}`)
-      }
-      if (await read() !== receipt.imageId) throw new Error('runtime default publication readback differs')
-      receipt.defaultPromotion.phase = 'published'
-      this.save()
-    } finally { lock.release() }
+    const current = await this.defaultBinding(receipt, expectedImageId)
+    if (receipt.defaultPromotion?.phase === 'published') return
+    receipt.defaultPromotion ??= { reference: this.defaultImage, expectedImageId, imageId: receipt.imageId, phase: 'intent' }
+    this.save()
+    if (current !== receipt.imageId) {
+      const colon = this.defaultImage.lastIndexOf(':')
+      const query = new URLSearchParams({ repo: this.defaultImage.slice(0, colon), tag: this.defaultImage.slice(colon + 1) })
+      await dockerEngine('POST', `/images/${receipt.imageId}/tag?${query}`)
+    }
+    if (await this.defaultBinding(receipt, expectedImageId) !== receipt.imageId) throw new Error('runtime default publication readback differs')
+    receipt.defaultPromotion.phase = 'published'
+    this.save()
   }
 
   async adopt(input: z.infer<typeof adoptionRequest>) {
@@ -199,10 +202,14 @@ export class PoolMaintenance {
     if (previous && !retry && (previous.phase !== 'promoted' || previous.candidateId !== expectedId || previous.imageId === imageId)) {
       throw new Error('new roll requires the completed transaction current identity and a different image')
     }
+    if (previous?.defaultPromotion?.phase === 'intent' && !retry) throw new Error('finish the pending default publication before another artifact')
     const receipt: RollReceipt = retry ? previous! : { oldId: expectedId, imageId,
       name: `${name}-${index}`, nonce: randomBytes(16).toString('hex'), phase: 'intent' }
+    const defaultLease = promoteDefault ? acquireRuntimeImageLock(this.defaultImage) : undefined
     this.operating.add(name)
     try {
+      // A stale publication request must not drain, journal or roll a slot.
+      if (promoteDefault) await this.defaultBinding(receipt, promoteDefault.expectedImageId)
       if (retry && previous?.phase === 'promoted') {
         const current = pool.slotSnapshot()[index]!
         pool.drainSlot(index, current.containerId)
@@ -230,7 +237,7 @@ export class PoolMaintenance {
       this.save()
       if (promoteDefault) await this.publishDefault(receipt, promoteDefault.expectedImageId)
       return receipt
-    } finally { this.operating.delete(name) }
+    } finally { defaultLease?.release(); this.operating.delete(name) }
   }
 
   async close(): Promise<void> {

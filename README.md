@@ -1286,6 +1286,10 @@ same local socket/reference lease. Use that build command for the default,
 including `BRIDGE_DEFAULT_DOCKER_IMAGE` for a custom reference. It requires local
 Unix Docker and Node's `process.execve` capability so Docker retains the lease's
 process identity throughout a build; alternate tag/output/push flags refuse.
+Supported publishers run natively under the same OS account for a local daemon.
+Their lease directory is under that account's durable `.local/state/cli-bridge`
+owner, independent of HOME/XDG/TMPDIR overrides or systemd PrivateTmp. Service
+sandboxes must permit writes there; otherwise publication fails closed.
 
 `pool-maintenance.json` under the bridge data directory records exact old and
 candidate identities before each Docker transition. After an interrupted roll,

@@ -8,7 +8,7 @@ const reference = runtimeImageReference()
 const host = runtimeDockerHost()
 const args = process.argv.slice(2)
 if (args.some((arg) => arg.startsWith('-t') || arg === '--tag' || arg.startsWith('--tag=') ||
-    arg.startsWith('-o') || arg === '--output' || arg.startsWith('--output=') || arg === '--push')) {
+    arg.startsWith('-o') || arg === '--output' || arg.startsWith('--output=') || arg === '--push' || arg.startsWith('--push='))) {
   throw new Error('the runtime builder publishes only BRIDGE_DEFAULT_DOCKER_IMAGE; alternate tag/output/push flags are unsupported')
 }
 const docker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim()

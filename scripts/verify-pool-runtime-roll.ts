@@ -10,7 +10,7 @@ import { ContainerPool } from '../src/executors/container-pool.js'
 import { dockerCli } from '../src/executors/docker-cli.js'
 import { dockerEngine, replaceRuntime, type RollReceipt } from '../src/executors/docker-runtime-roll.js'
 import { acquireDataDirectoryLock } from '../src/runtime/single-instance.js'
-import { acquireRuntimeImageLock } from '../src/executors/runtime-image.js'
+import { acquireRuntimeImageLock, runtimeImageReference } from '../src/executors/runtime-image.js'
 import { spawnSync } from 'node:child_process'
 import { loadConfig } from '../src/config.js'
 import { buildApp } from '../src/server.js'
@@ -20,7 +20,7 @@ if (!image || !/^sha256:[a-f0-9]{64}$/u.test(image)) throw new Error('CLI_ROLL_I
 const token = randomBytes(24).toString('hex')
 const suffix = randomBytes(5).toString('hex')
 const prefix = `cli-bridge-proof-${suffix}`
-const defaultReference = `${prefix}:default`
+const defaultReference = runtimeImageReference({ BRIDGE_DEFAULT_DOCKER_IMAGE: `${prefix}:default` })
 const root = mkdtempSync(join(tmpdir(), `${prefix}-`))
 const legacy = join(root, 'legacy', 'data')
 const ws = join(root, 'legacy', 'ws')
@@ -162,6 +162,15 @@ try {
   assert.equal(readFileSync(join(data, 'pool-maintenance.json'), 'utf8'), journalBeforeCas)
   assert.equal((await dockerEngine('GET', `/images/${encodeURIComponent(defaultReference)}/json`)).Id, oldImage)
   assert.equal((await api(`/admin/pools/${prefix}/slots/0/drain`, { expectedId: currentId })).status, 200)
+  const beforeFreshCas = await (await api('/admin/pools/status')).json()
+  const freshJournal = readFileSync(join(data, 'pool-maintenance.json'), 'utf8')
+  assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: nextImage,
+    promoteDefault: { expectedImageId: `sha256:${'0'.repeat(64)}` } })).status, 409)
+  assert.deepEqual(await (await api('/admin/pools/status')).json(), beforeFreshCas)
+  assert.equal(readFileSync(join(data, 'pool-maintenance.json'), 'utf8'), freshJournal)
+  assert.equal((await dockerEngine('GET', `/containers/${currentId}/json`)).Image, image)
+  assert.equal((await dockerEngine('GET', `/containers/${currentId}/json`)).State.Running, true)
+  assert.equal((await dockerEngine('GET', `/images/${encodeURIComponent(defaultReference)}/json`)).Id, oldImage)
   const completedJournal = readFileSync(join(data, 'pool-maintenance.json'), 'utf8')
   assert.equal((await api(`/admin/pools/${prefix}/slots/0/roll`, { expectedId: currentId, imageId: `sha256:${'0'.repeat(64)}` })).status, 409)
   assert.equal(readFileSync(join(data, 'pool-maintenance.json'), 'utf8'), completedJournal)
@@ -204,7 +213,9 @@ try {
   const afterDefault = await (await api('/admin/pools/status')).json() as { runtimeDefault: { reference: string; imageId: string } }
   assert.deepEqual(afterDefault.runtimeDefault, { reference: defaultReference, imageId: nextImage })
   // The real existing build command must share the API's publication lease.
-  const buildEnvironment = { ...process.env, BRIDGE_DEFAULT_DOCKER_IMAGE: defaultReference }
+  const builderTmp = join(root, 'builder-tmp')
+  mkdirSync(builderTmp, { mode: 0o700 })
+  const buildEnvironment = { ...process.env, BRIDGE_DEFAULT_DOCKER_IMAGE: `${prefix}:default`, TMPDIR: builderTmp }
   const lease = acquireRuntimeImageLock(defaultReference)
   try {
     const refused = spawnSync('pnpm', ['run', 'docker:build:runtime', '--help'], { env: buildEnvironment, encoding: 'utf8', timeout: 15_000 })
@@ -213,6 +224,9 @@ try {
   } finally { lease.release() }
   const builder = spawnSync('pnpm', ['run', 'docker:build:runtime', '--help'], { env: buildEnvironment, encoding: 'utf8', timeout: 15_000 })
   assert.equal(builder.status, 0, builder.stderr)
+  const pushRefused = spawnSync('pnpm', ['run', 'docker:build:runtime', '--push=true'], { env: buildEnvironment, encoding: 'utf8', timeout: 15_000 })
+  assert.notEqual(pushRefused.status, 0)
+  assert.match(pushRefused.stderr, /alternate tag\/output\/push flags are unsupported/u)
   // A new pool follows normal config, rather than the old explicit roll image.
   const freshConfig = loadConfig({ BRIDGE_DEFAULT_DOCKER_IMAGE: defaultReference,
     OPENCODE_EXECUTOR: 'docker', BRIDGE_DATA_DIR: join(root, 'fresh-config') })
@@ -225,7 +239,7 @@ try {
     assert.equal(await command(['exec', id, 'node', '--version']), second.node)
   }
   await pool.destroy(); pool = undefined
-  checks.push('default publication survives a real lost HTTP response and owner restart; stale CAS refuses, the existing builder shares its lease and a new real pool boots the published image')
+  checks.push('default publication survives a real lost HTTP response and owner restart; fresh-artifact stale CAS is inert, publishers with different TMPDIR share a lease, and a new real pool boots the published image')
   const result = { complete: true, checks, old_fixture_image: oldImage, candidate_image: image,
     second_candidate_image: nextImage,
     default_reference: defaultReference,
