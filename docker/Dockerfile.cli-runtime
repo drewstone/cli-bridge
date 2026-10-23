@@ -32,6 +32,7 @@
 # active backend needs.
 
 FROM node:24.22.1-trixie-slim
+LABEL org.opencontainers.image.source="https://github.com/drewstone/cli-bridge"
 
 ARG CLI_BRIDGE_HARNESSES=all
 

@@ -14,6 +14,11 @@ if not re.fullmatch(r'sha256:[a-f0-9]{64}', image):
     raise SystemExit('an existing immutable Docker image ID is required')
 if kind not in ('runtime', 'bridge'):
     raise SystemExit('the producer must specify runtime (all harnesses) or bridge')
+source = subprocess.run(['docker', 'image', 'inspect', image, '--format',
+                         '{{index .Config.Labels "org.opencontainers.image.source"}}'],
+                        check=True, capture_output=True, text=True, timeout=30).stdout.strip()
+if source != 'https://github.com/drewstone/cli-bridge':
+    raise SystemExit('the image is missing its maintained source ownership label')
 descriptor = json.loads((Path(__file__).parent / 'npm-security.json').read_text())
 overrides = dict(line.strip().split('==') for line in
                  (Path(__file__).parent / 'python-security-overrides.txt').read_text().splitlines()
@@ -101,5 +106,5 @@ print(json.dumps({'installed': installed, 'uv_archives': cache,
     'native': ['aiohttp-loopback', 'asyncssh-ed25519', 'lxml-parse-clean', 'Pillow-PNG-JPEG-WEBP']}))
 '''
 python = json.loads(run('/root/.local/share/uv/tools/kimi-cli/bin/python', ['-', json.dumps(overrides)], python_source))
-print(json.dumps({'image_id': image, 'recipe': kind, 'cli_versions': versions, 'npm_bundled_packages': npm_dependencies,
+print(json.dumps({'image_id': image, 'source': source, 'recipe': kind, 'cli_versions': versions, 'npm_bundled_packages': npm_dependencies,
                   'python': python, 'model_calls': 0}, indent=2))

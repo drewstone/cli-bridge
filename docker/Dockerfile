@@ -1,4 +1,5 @@
 FROM node:24.22.1-trixie-slim AS base
+LABEL org.opencontainers.image.source="https://github.com/drewstone/cli-bridge"
 WORKDIR /app
 
 # Build toolchain + CLI-install prereqs. curl is needed for the opencode
