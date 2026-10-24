@@ -2128,8 +2128,7 @@ function stableTmpRoot(): string {
   if (home) {
     try {
       const cache = join(home, '.cache')
-      // Don't mkdir — cli-bridge runs on hosts that always have
-      // ~/.cache (we don't ship a polyfill for first-boot Linux).
+      mkdirSync(cache, { recursive: true, mode: 0o700 })
       return cache
     } catch {
       // fallthrough
