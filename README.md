@@ -64,6 +64,10 @@ bridge/gemini/gemini-2.5-pro
 
 The router's short-circuit strips the leading `bridge/` and forwards the `<harness>/<model>` as-is.
 
+## Local checks
+
+Local Beelink gate (set `TOUCHED_INTEGRATION_TEST` to the affected integration test file; the gate installs from the frozen pnpm lockfile): `beelink-gate auto https://github.com/drewstone/cli-bridge.git "$(git rev-parse HEAD)" -- sh -c 'pnpm typecheck && pnpm exec vitest run "$1"' _ "${TOUCHED_INTEGRATION_TEST:?set touched integration test path}"`. Live inference still runs locally through `pnpm test:local-inference` with its explicit model and filesystem-jail prerequisites.
+
 ## Install
 
 ```bash
