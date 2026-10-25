@@ -7,7 +7,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "packageManager": "pnpm@12.6.0",
+  "packageManager": "pnpm@12.15.0",
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
@@ -26,20 +26,20 @@
     "docker:build:runtime": "docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest ."
   },
   "dependencies": {
-    "@hono/node-server": "^2.1.1",
-    "@tangle-network/agent-interface": "5.2.1",
-    "@tangle-network/agent-profile-materialize": "0.25.2",
-    "@tangle-network/agent-trace-contract": "^2.0.0",
+    "@hono/node-server": "^2.1.5",
+    "@tangle-network/agent-interface": "5.7.1",
+    "@tangle-network/agent-profile-materialize": "0.27.5",
+    "@tangle-network/agent-trace-contract": "^2.1.0",
     "better-sqlite3": "^13.0.3",
-    "hono": "^4.13.9",
-    "zod": "^4.6.5"
+    "hono": "^4.13.14",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@openai/codex": "0.162.1",
+    "@openai/codex": "0.164.0",
     "@types/better-sqlite3": "^9.6.0",
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.5",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.5"
   }
 }
