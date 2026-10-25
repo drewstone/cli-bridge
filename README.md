@@ -1117,6 +1117,9 @@ chat <backend>   (LLM)    gen_ai.request.model, gen_ai.system,
 ```
 
 Spans land as JSON lines in `<BRIDGE_DATA_DIR>/traces/spans.jsonl`.
+Each span is written once. A tool span lands the moment the model asks for the call (as soon as the
+request's agent is named), so a reader tailing the file sees an agent working before its turn ends; the
+`chat` span, which carries the turn's tokens and status, lands when the request closes.
 `BRIDGE_TRACE=off` disables emission. A sink failure is logged and swallowed —
 tracing never fails a request.
 

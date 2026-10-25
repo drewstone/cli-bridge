@@ -206,7 +206,12 @@ interface RecorderOptions {
 }
 
 /**
- * Accumulates one request's observations and writes its spans exactly once.
+ * Accumulates one request's observations and writes each span exactly once.
+ *
+ * A tool span is written the moment the model asks for the call, once the
+ * agent's identity is known, so a live reader sees an agent working long before
+ * its turn ends; the request span, whose tokens and status only exist at the
+ * end, is written when the request closes.
  *
  * Lives for the duration of the durable run, not the HTTP connection: a client
  * that disconnects mid-stream still gets a complete span, because the run keeps
@@ -219,6 +224,8 @@ export class RequestSpanRecorder {
   private readonly options: RecorderOptions
   private readonly startedAtMs: number
   private readonly toolSpans: ContractSpan[] = []
+  /** Tool spans not yet written: held only until the agent's identity is known. */
+  private pendingToolSpans: ContractSpan[] = []
   private usage: CollectedUsage | undefined
   private sawInputTokens = false
   private sawOutputTokens = false
@@ -274,6 +281,7 @@ export class RequestSpanRecorder {
     try {
       if (node.profileDigest.length === 0) return
       this.node = node
+      if (!this.ended) this.flushToolSpans()
     } catch (error) {
       this.report(error)
     }
@@ -298,19 +306,31 @@ export class RequestSpanRecorder {
   private writeSpans(): void {
     this.ended = true
     try {
-      // Applied here rather than in `recordToolCall` because a tool span is
-      // built the moment the model asks for the call, and nothing guarantees
-      // the profile was resolved before the first delta arrived. At write time
-      // the identity is whatever the turn finally established, so every span of
-      // one turn names the same agent or none of them does.
-      const node = this.nodeAttributes()
-      const toolSpans = Object.keys(node).length === 0
-        ? this.toolSpans
-        : this.toolSpans.map((span) => ({ ...span, attributes: { ...span.attributes, ...node } }))
-      this.options.sink.write([this.buildRequestSpan(), ...toolSpans])
+      // Tool spans wait in `pendingToolSpans` until the identity is known (the
+      // route records it once, before the backend streams), so every span of one
+      // turn names the same agent or none of them does. A request that never
+      // names an agent writes its tool spans here, with the request span.
+      const pending = this.withNode(this.pendingToolSpans)
+      this.pendingToolSpans = []
+      this.options.sink.write([this.buildRequestSpan(), ...pending])
     } catch (error) {
       this.report(error)
     }
+  }
+
+  /** Write held tool spans now that every span of the turn can name the same agent. */
+  private flushToolSpans(): void {
+    if (this.pendingToolSpans.length === 0) return
+    const spans = this.withNode(this.pendingToolSpans)
+    this.pendingToolSpans = []
+    this.options.sink.write(spans)
+  }
+
+  private withNode(spans: readonly ContractSpan[]): ContractSpan[] {
+    const node = this.nodeAttributes()
+    return Object.keys(node).length === 0
+      ? [...spans]
+      : spans.map((span) => ({ ...span, attributes: { ...span.attributes, ...node } }))
   }
 
   /** The node identity as span attributes — empty when the request named no agent. */
@@ -335,7 +355,7 @@ export class RequestSpanRecorder {
     // `call.arguments` is deliberately dropped: it carries prompts, file contents
     // and paths, and a trace file must not become a second copy of everything the
     // agent read.
-    this.toolSpans.push(toolSpan({
+    const span = toolSpan({
       traceId: this.traceId,
       spanId: this.options.mintSpanId(),
       parentSpanId: this.spanId,
@@ -348,7 +368,10 @@ export class RequestSpanRecorder {
       endTime: at,
       toolName: name,
       ...(call.id ? { attributes: { [BRIDGE_ATTR.toolCallId]: truncate(call.id, MAX_ATTR_CHARS) } } : {}),
-    }))
+    })
+    this.toolSpans.push(span)
+    this.pendingToolSpans.push(span)
+    if (this.node !== undefined) this.flushToolSpans()
   }
 
   private buildRequestSpan(): ContractSpan {
