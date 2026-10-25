@@ -80,16 +80,17 @@ export const BRIDGE_ATTR = Object.freeze({
   toolCallId: 'gen_ai.tool.call.id',
   /**
    * `sum_of_children` on the request span when its usage is exactly the sum of
-   * its model-call child spans. A reader that sums usage over every LLM span
+   * its model-call child spans (its whole-prompt input = the children's fresh
+   * input + cache reads + cache writes). A reader that sums usage over every LLM span
    * skips a span carrying it; one that reads only the request span keeps its
    * total. Absent when the request span's usage is its own measurement.
    */
   usageScope: 'cli_bridge.usage.scope',
   /** Model the provider says served one call, when the backend reported it (GenAI semconv). */
   responseModel: 'gen_ai.response.model',
-  /** Of the call's input tokens, those read from the provider's cache (GenAI semconv; included in input). */
+  /** Prompt tokens one call read from the provider's cache; not part of that call span's `gen_ai.usage.input_tokens`. */
   cacheReadInputTokens: 'gen_ai.usage.cache_read.input_tokens',
-  /** Of the call's input tokens, those written to the provider's cache (GenAI semconv; included in input). */
+  /** Prompt tokens one call wrote to the provider's cache; not part of that call span's `gen_ai.usage.input_tokens`. */
   cacheWriteInputTokens: 'gen_ai.usage.cache_creation.input_tokens',
   /** Of the call's output tokens, those spent reasoning (GenAI semconv; included in output). */
   reasoningOutputTokens: 'gen_ai.usage.reasoning.output_tokens',
@@ -390,7 +391,11 @@ export class RequestSpanRecorder {
       endTime: isoTime(endMs),
       model: truncate(init.model, MAX_ATTR_CHARS),
       system: truncate(init.backend, MAX_ATTR_CHARS),
-      ...(call.inputTokensKnown ? { inputTokens: call.inputTokens } : {}),
+      // FRESH input only, per the span contract's owner (tangle-network/traces): a
+      // per-call reader prices the prompt as fresh + cache read + cache write, so
+      // input that already held the cache would count it twice. Absent when the
+      // backend did not report the fresh/cache split, rather than guessed.
+      ...(call.freshInputTokensKnown ? { inputTokens: call.freshInputTokens } : {}),
       ...(call.outputTokensKnown ? { outputTokens: call.outputTokens } : {}),
       ...(call.costComplete ? { costUsd: call.cost } : {}),
       attributes,

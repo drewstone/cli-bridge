@@ -164,7 +164,13 @@ describe.skipIf(!ENABLED)('a real opencode tool call', () => {
       expect(span.parent_span_id).toBe(recorder.spanId)
       expect(span.attributes[BRIDGE_ATTR.profileDigest]).toBe('sha256:worker')
     }
-    // The request keeps the turn total and says it is the children's sum.
+    // A call span's input is fresh only; the whole prompt is fresh + cache read + cache write.
+    const wholePrompt = modelCalls.reduce((sum, span) => sum
+      + Number(span.attributes['gen_ai.usage.input_tokens'])
+      + Number(span.attributes[BRIDGE_ATTR.cacheReadInputTokens])
+      + Number(span.attributes[BRIDGE_ATTR.cacheWriteInputTokens]), 0)
+    // The request keeps the turn total (whole prompt) and says it is the children's sum.
+    expect(request.attributes['gen_ai.usage.input_tokens']).toBe(wholePrompt)
     expect(request.attributes['gen_ai.usage.input_tokens']).toBe(TOOL_STEP.prompt_tokens + ANSWER_STEP.prompt_tokens)
     expect(request.attributes['gen_ai.usage.output_tokens']).toBe(TOOL_STEP.completion_tokens + ANSWER_STEP.completion_tokens)
     expect(request.attributes[BRIDGE_ATTR.usageScope]).toBe('sum_of_children')

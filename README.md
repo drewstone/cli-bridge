@@ -1115,7 +1115,7 @@ chat <backend>   (LLM)    gen_ai.request.model, gen_ai.system,
   │                       gen_ai.usage.input_tokens / output_tokens / cost_usd,
   │                       cli_bridge.usage.scope (only when model-call children exist)
   ├─ model call  (LLM)    gen_ai.request.model, gen_ai.response.model (when reported),
-  │                       gen_ai.usage.input_tokens / output_tokens,
+  │                       gen_ai.usage.input_tokens (fresh only) / output_tokens,
   │                       gen_ai.usage.cache_read.input_tokens / cache_creation.input_tokens,
   │                       gen_ai.usage.reasoning.output_tokens
   └─ <tool name> (TOOL)   gen_ai.tool.name, gen_ai.tool.call.id
@@ -1129,15 +1129,19 @@ request's agent is named), so a reader tailing the file sees an agent working be
 **Per-call usage.** When a backend reports each provider call's usage as it finishes (opencode's
 per-step receipts), each call gets a `model call` child span the moment its receipt arrives, so a
 reader can sum a long run's tokens while it runs. A call span runs from the previous call's end (or
-the request start) to the receipt. Token keys follow GenAI semconv: `input_tokens` includes the
-cache-read and cache-write tokens, and `output_tokens` includes the reasoning tokens. A count the
-backend did not report is absent, never `0`. cli-bridge writes raw tokens only, no prices.
+the request start) to the receipt. On a call span `gen_ai.usage.input_tokens` is FRESH input only;
+cache reads and cache writes are their own keys, so the whole prompt is their sum (the span contract
+of tangle-network/traces). `output_tokens` includes the reasoning tokens. The `chat` span's
+`input_tokens` is unchanged: the whole prompt, cache included. A count the backend did not report is
+absent, never `0`. cli-bridge writes raw tokens only, no prices.
 
 The `chat` span keeps the turn's total, so a reader of that span alone is unchanged. When every
 token-bearing record of the turn was a model call, it also carries
-`cli_bridge.usage.scope = "sum_of_children"`: its usage is the sum of its `model call` children. A
-reader that sums usage over every LLM span must skip a span carrying it, or it counts the turn twice.
+`cli_bridge.usage.scope = "sum_of_children"`: its usage is the sum of its `model call` children
+(its `input_tokens` equals the children's fresh input plus their cache reads and writes). A reader
+that sums usage over every LLM span must skip a span carrying it, or it counts the turn twice.
 Backends that report one usage record per turn write no children and no marker.
+
 `BRIDGE_TRACE=off` disables emission. A sink failure is logged and swallowed —
 tracing never fails a request.
 
