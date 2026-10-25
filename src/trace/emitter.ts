@@ -8,6 +8,7 @@
  * Shape emitted per request:
  *
  *     chat <backend>  (LLM)      gen_ai.request.model, gen_ai.system, usage, status
+ *       ├─ model call (LLM)      one per provider call the backend reported, with that call's usage
  *       └─ <tool>     (TOOL)     gen_ai.tool.name, gen_ai.tool.call.id
  *
  * Both spans carry the effective AgentProfile digest when the request named one
@@ -15,10 +16,15 @@
  * agent. On the tool span too, not only on its parent: a reader that filters
  * this file to one agent's work must not have to reassemble the tree first.
  *
- * The LLM span is the whole request because that is the granularity the bridge
- * can actually see: a CLI harness reports ONE usage record for the turn, not one
- * per model call, so splitting it into per-call spans would mean inventing
- * boundaries and dividing tokens that were never reported separately.
+ * The request span is the whole turn and always carries the turn's total usage.
+ * A model-call child span exists only when the backend reported that call on
+ * its own (`usage.model_call`, e.g. opencode's per-step receipt): it is written
+ * the moment the call's receipt arrives, so a reader can sum a long run's spend
+ * while it runs. A backend that reports one record for the whole turn gets no
+ * child, because splitting it would invent boundaries and divide tokens that
+ * were never reported separately. When children exist, the request span says
+ * its usage is their sum (`cli_bridge.usage.scope`), so a reader that sums
+ * every LLM span can skip it instead of counting the tokens twice.
  *
  * Tool spans are instants (`end_time === start_time`) and carry no status,
  * because the backends report the model's DECISION to call a tool and never
@@ -72,6 +78,21 @@ export const BRIDGE_ATTR = Object.freeze({
   toolCallsDropped: 'cli_bridge.tool_calls.dropped',
   /** Tool call id, so a span joins to the caller's matching tool result. */
   toolCallId: 'gen_ai.tool.call.id',
+  /**
+   * `sum_of_children` on the request span when its usage is exactly the sum of
+   * its model-call child spans. A reader that sums usage over every LLM span
+   * skips a span carrying it; one that reads only the request span keeps its
+   * total. Absent when the request span's usage is its own measurement.
+   */
+  usageScope: 'cli_bridge.usage.scope',
+  /** Model the provider says served one call, when the backend reported it (GenAI semconv). */
+  responseModel: 'gen_ai.response.model',
+  /** Of the call's input tokens, those read from the provider's cache (GenAI semconv; included in input). */
+  cacheReadInputTokens: 'gen_ai.usage.cache_read.input_tokens',
+  /** Of the call's input tokens, those written to the provider's cache (GenAI semconv; included in input). */
+  cacheWriteInputTokens: 'gen_ai.usage.cache_creation.input_tokens',
+  /** Of the call's output tokens, those spent reasoning (GenAI semconv; included in output). */
+  reasoningOutputTokens: 'gen_ai.usage.reasoning.output_tokens',
   /**
    * Digest of the EFFECTIVE AgentProfile this request ran under — WHICH AGENT
    * did this work.
@@ -224,9 +245,15 @@ export class RequestSpanRecorder {
   private readonly options: RecorderOptions
   private readonly startedAtMs: number
   private readonly toolSpans: ContractSpan[] = []
-  /** Tool spans not yet written: held only until the agent's identity is known. */
-  private pendingToolSpans: ContractSpan[] = []
+  /** Tool and model-call spans not yet written: held only until the agent's identity is known. */
+  private pendingSpans: ContractSpan[] = []
   private usage: CollectedUsage | undefined
+  /** Model-call child spans built; each is written exactly once. */
+  private modelCallSpans = 0
+  /** End of the last model call, which is where the next one starts. */
+  private lastModelCallEndMs: number | undefined
+  /** A token-bearing usage record that was not one model call, so the children are not the whole total. */
+  private sawTurnLevelTokens = false
   private sawInputTokens = false
   private sawOutputTokens = false
   private toolCallsObserved = 0
@@ -258,6 +285,8 @@ export class RequestSpanRecorder {
         this.usage = addUsage(this.usage, delta.usage)
         this.sawInputTokens = this.usage.inputTokensKnown
         this.sawOutputTokens = this.usage.outputTokensKnown
+        if (delta.usage.model_call === true) this.recordModelCall(delta.usage, delta.model)
+        else if (addUsage(undefined, delta.usage).hasTokenUsage) this.sawTurnLevelTokens = true
       }
       if (delta.internal_session_id) this.backendSessionId = delta.internal_session_id
       if (delta.finish_reason) this.finishReason = delta.finish_reason
@@ -281,7 +310,7 @@ export class RequestSpanRecorder {
     try {
       if (node.profileDigest.length === 0) return
       this.node = node
-      if (!this.ended) this.flushToolSpans()
+      if (!this.ended) this.flushPendingSpans()
     } catch (error) {
       this.report(error)
     }
@@ -306,24 +335,70 @@ export class RequestSpanRecorder {
   private writeSpans(): void {
     this.ended = true
     try {
-      // Tool spans wait in `pendingToolSpans` until the identity is known (the
-      // route records it once, before the backend streams), so every span of one
-      // turn names the same agent or none of them does. A request that never
-      // names an agent writes its tool spans here, with the request span.
-      const pending = this.withNode(this.pendingToolSpans)
-      this.pendingToolSpans = []
+      // Tool and model-call spans wait in `pendingSpans` until the identity is
+      // known (the route records it once, before the backend streams), so every
+      // span of one turn names the same agent or none of them does. A request
+      // that never names an agent writes them here, with the request span.
+      const pending = this.withNode(this.pendingSpans)
+      this.pendingSpans = []
       this.options.sink.write([this.buildRequestSpan(), ...pending])
     } catch (error) {
       this.report(error)
     }
   }
 
-  /** Write held tool spans now that every span of the turn can name the same agent. */
-  private flushToolSpans(): void {
-    if (this.pendingToolSpans.length === 0) return
-    const spans = this.withNode(this.pendingToolSpans)
-    this.pendingToolSpans = []
+  /** Write held spans now that every span of the turn can name the same agent. */
+  private flushPendingSpans(): void {
+    if (this.pendingSpans.length === 0) return
+    const spans = this.withNode(this.pendingSpans)
+    this.pendingSpans = []
     this.options.sink.write(spans)
+  }
+
+  /**
+   * One provider call finished and the backend reported its usage: write its
+   * span now, so live usage is readable before the turn ends. It runs from the
+   * previous call's end (or the request start) to now, which is when the bridge
+   * learned the call was over.
+   */
+  private recordModelCall(receipt: NonNullable<ChatDelta['usage']>, responseModel: string | undefined): void {
+    // The request span is already written without this call in its total;
+    // a child written now would claim usage its parent never counted.
+    if (this.ended) return
+    const startMs = this.lastModelCallEndMs ?? this.startedAtMs
+    const endMs = Math.max(startMs, this.options.now())
+    this.lastModelCallEndMs = endMs
+    // The same arithmetic the request total uses, applied to one record, so a
+    // field is present here exactly when it counts toward that total.
+    const call = addUsage(undefined, receipt)
+    const { init } = this.options
+    const attributes: Record<string, unknown> = {}
+    if (responseModel) attributes[BRIDGE_ATTR.responseModel] = truncate(responseModel, MAX_ATTR_CHARS)
+    // Absent, never zero, as on the request span.
+    if (call.cacheReadInputTokensKnown) attributes[BRIDGE_ATTR.cacheReadInputTokens] = call.cacheReadInputTokens
+    if (call.cacheWriteInputTokensKnown) attributes[BRIDGE_ATTR.cacheWriteInputTokens] = call.cacheWriteInputTokens
+    if (isCount(receipt.reasoning_output_tokens)) {
+      attributes[BRIDGE_ATTR.reasoningOutputTokens] = receipt.reasoning_output_tokens
+    }
+    if (call.estimated) attributes[BRIDGE_ATTR.usageEstimated] = true
+    const span = llmSpan({
+      traceId: this.traceId,
+      spanId: this.options.mintSpanId(),
+      parentSpanId: this.spanId,
+      name: 'model call',
+      startTime: isoTime(startMs),
+      endTime: isoTime(endMs),
+      model: truncate(init.model, MAX_ATTR_CHARS),
+      system: truncate(init.backend, MAX_ATTR_CHARS),
+      ...(call.inputTokensKnown ? { inputTokens: call.inputTokens } : {}),
+      ...(call.outputTokensKnown ? { outputTokens: call.outputTokens } : {}),
+      ...(call.costComplete ? { costUsd: call.cost } : {}),
+      attributes,
+      resource: { attributes: { 'service.name': 'cli-bridge' } },
+    })
+    this.modelCallSpans += 1
+    this.pendingSpans.push(span)
+    if (this.node !== undefined) this.flushPendingSpans()
   }
 
   private withNode(spans: readonly ContractSpan[]): ContractSpan[] {
@@ -370,8 +445,8 @@ export class RequestSpanRecorder {
       ...(call.id ? { attributes: { [BRIDGE_ATTR.toolCallId]: truncate(call.id, MAX_ATTR_CHARS) } } : {}),
     })
     this.toolSpans.push(span)
-    this.pendingToolSpans.push(span)
-    if (this.node !== undefined) this.flushToolSpans()
+    this.pendingSpans.push(span)
+    if (this.node !== undefined) this.flushPendingSpans()
   }
 
   private buildRequestSpan(): ContractSpan {
@@ -390,6 +465,9 @@ export class RequestSpanRecorder {
     }
     if (this.finishReason) attributes[BRIDGE_ATTR.finishReason] = this.finishReason
     if (this.usage?.estimated) attributes[BRIDGE_ATTR.usageEstimated] = true
+    if (this.modelCallSpans > 0 && !this.sawTurnLevelTokens) {
+      attributes[BRIDGE_ATTR.usageScope] = 'sum_of_children'
+    }
     const contractBuild = traceContractBuildIdOrNull()
     if (contractBuild !== null) attributes[BRIDGE_ATTR.traceContractBuild] = contractBuild
     const dropped = this.toolCallsObserved - this.toolSpans.length
@@ -446,6 +524,10 @@ export class RequestSpanRecorder {
       `(tracing degraded, request unaffected): ${describe(error)}`,
     )
   }
+}
+
+function isCount(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value >= 0
 }
 
 function isoTime(ms: number): string {

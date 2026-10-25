@@ -1112,7 +1112,12 @@ all three agree on the span shape without sharing code.
 
 ```
 chat <backend>   (LLM)    gen_ai.request.model, gen_ai.system,
-  │                       gen_ai.usage.input_tokens / output_tokens / cost_usd
+  │                       gen_ai.usage.input_tokens / output_tokens / cost_usd,
+  │                       cli_bridge.usage.scope (only when model-call children exist)
+  ├─ model call  (LLM)    gen_ai.request.model, gen_ai.response.model (when reported),
+  │                       gen_ai.usage.input_tokens / output_tokens,
+  │                       gen_ai.usage.cache_read.input_tokens / cache_creation.input_tokens,
+  │                       gen_ai.usage.reasoning.output_tokens
   └─ <tool name> (TOOL)   gen_ai.tool.name, gen_ai.tool.call.id
 ```
 
@@ -1120,6 +1125,19 @@ Spans land as JSON lines in `<BRIDGE_DATA_DIR>/traces/spans.jsonl`.
 Each span is written once. A tool span lands the moment the model asks for the call (as soon as the
 request's agent is named), so a reader tailing the file sees an agent working before its turn ends; the
 `chat` span, which carries the turn's tokens and status, lands when the request closes.
+
+**Per-call usage.** When a backend reports each provider call's usage as it finishes (opencode's
+per-step receipts), each call gets a `model call` child span the moment its receipt arrives, so a
+reader can sum a long run's tokens while it runs. A call span runs from the previous call's end (or
+the request start) to the receipt. Token keys follow GenAI semconv: `input_tokens` includes the
+cache-read and cache-write tokens, and `output_tokens` includes the reasoning tokens. A count the
+backend did not report is absent, never `0`. cli-bridge writes raw tokens only, no prices.
+
+The `chat` span keeps the turn's total, so a reader of that span alone is unchanged. When every
+token-bearing record of the turn was a model call, it also carries
+`cli_bridge.usage.scope = "sum_of_children"`: its usage is the sum of its `model call` children. A
+reader that sums usage over every LLM span must skip a span carrying it, or it counts the turn twice.
+Backends that report one usage record per turn write no children and no marker.
 `BRIDGE_TRACE=off` disables emission. A sink failure is logged and swallowed —
 tracing never fails a request.
 

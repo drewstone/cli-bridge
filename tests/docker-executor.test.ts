@@ -21,6 +21,7 @@ import { BackendError, type ChatDelta, type ChatRequest } from '../src/backends/
 import { CodexBackend } from '../src/backends/codex.js'
 import { KimiBackend } from '../src/backends/kimi.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
+import { addUsage, type CollectedUsage } from '../src/usage.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
 import { PiBackend } from '../src/backends/pi.js'
 import { buildContainerRunArgs, ContainerPool } from '../src/executors/container-pool.js'
@@ -1868,17 +1869,19 @@ describe('Spawner injection works across all subprocess backends', () => {
     const tool = deltas.flatMap((d) => d.tool_calls ?? []).find((tc) => tc.id === 'call_abc123')
     expect(tool?.name).toBe('write')
     expect(JSON.parse(tool?.arguments ?? '{}')).toEqual({ filePath: '/tmp/hello.txt', content: 'hello' })
-    expect(deltas.at(-1)?.usage).toEqual({
+    // The step's own receipt, yielded when the step finished; nothing repeats it at the end.
+    expect(deltas.flatMap((d) => (d.usage ? [d.usage] : []))).toEqual([{
       input_tokens: 26945,
       fresh_input_tokens: 25153,
       cache_read_input_tokens: 1792,
       cache_write_input_tokens: 0,
       output_tokens: 100,
+      reasoning_output_tokens: 23,
       estimated_cost: 0.04437406,
       cost_known: false,
       cost_provenance: 'catalog-estimate',
-      cost_scope: 'total',
-    })
+      model_call: true,
+    }])
   })
 
   it('OpencodeBackend aggregates every step receipt across a multi-step run', async () => {
@@ -1933,20 +1936,23 @@ describe('Spawner injection works across all subprocess backends', () => {
       new AbortController().signal,
     )) deltas.push(delta)
 
-    const receipt = deltas.at(-1)?.usage
-    expect(receipt).toMatchObject({
-      input_tokens: 190,
-      fresh_input_tokens: 140,
-      cache_read_input_tokens: 38,
-      cache_write_input_tokens: 12,
-      output_tokens: 32,
-      cost_known: false,
-      cost_provenance: 'catalog-estimate',
-      cost_scope: 'total',
+    // One receipt per step, each yielded as its step finished; every consumer folds
+    // them with `addUsage`, so the turn total is the same sum the backend used to send.
+    const receipts = deltas.flatMap((delta) => (delta.usage ? [delta.usage] : []))
+    expect(receipts).toHaveLength(2)
+    expect(receipts.every((receipt) => receipt.model_call === true)).toBe(true)
+    const total = receipts.reduce<CollectedUsage | undefined>((sum, receipt) => addUsage(sum, receipt), undefined)
+    expect(total).toMatchObject({
+      inputTokens: 190,
+      freshInputTokens: 140,
+      cacheReadInputTokens: 38,
+      cacheWriteInputTokens: 12,
+      outputTokens: 32,
+      costComplete: false,
+      estimatedCostComplete: true,
+      estimated: false,
     })
-    expect(receipt?.estimated_cost).toBeCloseTo(0.03, 12)
-    expect(receipt).not.toHaveProperty('cost')
-    expect(receipt?.estimated).toBeUndefined()
+    expect(total?.estimatedCost).toBeCloseTo(0.03, 12)
     expect(deltas.filter((delta) => delta.finish_reason)).toHaveLength(1)
     expect(stub.releaseCalls).toBe(1)
   })
@@ -1992,13 +1998,17 @@ describe('Spawner injection works across all subprocess backends', () => {
       new AbortController().signal,
     )) deltas.push(delta)
 
-    expect(deltas.at(-1)?.usage).toEqual({
-      input_tokens: 190,
-      fresh_input_tokens: 140,
-      cache_read_input_tokens: 38,
-      cache_write_input_tokens: 12,
-      output_tokens: 25,
-      cost_known: false,
+    const total = deltas
+      .flatMap((delta) => (delta.usage ? [delta.usage] : []))
+      .reduce<CollectedUsage | undefined>((sum, receipt) => addUsage(sum, receipt), undefined)
+    expect(total).toMatchObject({
+      inputTokens: 190,
+      freshInputTokens: 140,
+      cacheReadInputTokens: 38,
+      cacheWriteInputTokens: 12,
+      outputTokens: 25,
+      costComplete: false,
+      estimatedCostComplete: false,
     })
   })
 
