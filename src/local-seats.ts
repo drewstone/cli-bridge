@@ -1,12 +1,15 @@
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { findGitDir } from './jail/types.js'
 import { loadConfig, localHarnesses, type Config } from './config.js'
 import { backendHome } from './jail/auth-preserve.js'
 import { probeNativeStatus } from './lib/native-status.js'
-import { nativeObject as object, nativeJson as decode, readNativeState as state } from './lib/native-state.js'
+import { nativeObject as object, nativeJson as decode, nativeIdentifier, readNativeState as state } from './lib/native-state.js'
 
 export interface LocalSeat {
   harness: typeof localHarnesses[number][1]
   provider: string | null
+  /** Native configured default, never a served model identity. */
+  defaultModel?: string
   status: 'authenticated' | 'configured' | 'signed_out' | 'missing' | 'unknown'
   authMode: 'subscription' | 'api_key' | 'unknown'
   source: 'native_status' | 'native_store'
@@ -33,14 +36,28 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
   const config = options.config ?? loadConfig(env)
   const timeout = options.timeoutMs ?? 10_000
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 30_000) throw new Error('seat inventory timeoutMs must be between 1 and 30000')
-  const probe = (bin: string, args: readonly string[]) => probeNativeStatus(bin, args, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd, env })
+  const probe = (bin: string, args: readonly string[], nativeEnv = env) => probeNativeStatus(bin, args, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd, env: nativeEnv })
   const results = await Promise.allSettled(localHarnesses.filter(([, harness]) => !options.harnesses || options.harnesses.includes(harness)).map(async ([key, harness, fix, args, provider]): Promise<LocalSeat> => {
     const bin = config[`${key}Bin`]
     const nativeArgs = key === 'pi' && options.provider
       ? ['auth', 'check', '--provider', options.provider, ...(options.model ? ['--model', options.model] : []), '--json', '--no-refresh'] : args
-    const result = await probe(bin, key === 'claude' ? [...(options.flags ?? []), ...nativeArgs] : nativeArgs)
     const fact: LocalSeat = { harness, provider: null, status: 'unknown', authMode: 'unknown',
       source: key === 'kimi' || key === 'gemini' ? 'native_store' : 'native_status', fix }
+    const native = await (key === 'claude' ? readClaudeNativeContext({ cwd: options.cwd ?? process.cwd(), env, flags: options.flags ?? [] }) : Promise.resolve({ env, flags: [], settings: [] as Record<string, unknown>[] })).catch(() => null)
+    if (!native) return fact
+    if (key === 'claude') {
+      const { env, settings } = native
+      fact.defaultModel = nativeIdentifier(env.ANTHROPIC_MODEL ?? settings.map((item) => item.model).findLast((value) => typeof value === 'string'))
+      const fixFor = (key: string): string => settings.some((item) => object(item.env)[key] !== undefined) || process.env[key] !== env[key] ? 'claude auth status --json' : `unset ${key}`
+      const credential = env.ANTHROPIC_AUTH_TOKEN ? 'ANTHROPIC_AUTH_TOKEN' : env.ANTHROPIC_API_KEY?.trim() ? 'ANTHROPIC_API_KEY' : null
+      const override = ['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'].find((key) => env[key]?.trim() && !['0', 'false', 'off'].includes(env[key]!.toLowerCase()))
+      if (credential || override || settings.some((item) => typeof item.apiKeyHelper === 'string' && item.apiKeyHelper.trim())) return {
+        ...fact, provider: override ? null : provider, status: 'configured', source: 'native_store',
+        authMode: !override && credential === 'ANTHROPIC_API_KEY' ? 'api_key' : 'unknown',
+        fix: credential ? fixFor(credential) : override ? fixFor(override) : 'claude auth status --json',
+      }
+    }
+    const result = await probe(bin, [...native.flags, ...nativeArgs], native.env)
     if (result.code === 'ENOENT') { delete fact.fix; return { ...fact, status: 'missing' } }
     try {
       if (key === 'claude' && (result.code === 0 || result.code === 1)) {
@@ -49,7 +66,8 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
         if (auth.loggedIn === false) fact.status = 'signed_out'
         if (result.code === 0 && auth.loggedIn === true) {
           fact.status = 'authenticated'
-          fact.authMode = auth.authMethod === 'claude.ai' || auth.authMethod === 'oauth_token' ? 'subscription'
+          fact.authMode = native.env.ANTHROPIC_AUTH_TOKEN ? 'unknown'
+            : auth.authMethod === 'claude.ai' || auth.authMethod === 'oauth_token' && !!native.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() ? 'subscription'
             : auth.authMethod === 'api_key' ? 'api_key' : 'unknown'
         }
       } else if (key === 'codex') {
@@ -106,4 +124,19 @@ export async function geminiLoginState(home: string, env: NodeJS.ProcessEnv): Pr
   const auth = await state(join(root, 'oauth_creds.json'))
   const stored = typeof auth.refresh_token === 'string' && !!auth.refresh_token
   return { status: stored ? 'configured' : 'signed_out', authMode: stored ? 'subscription' : 'unknown' }
+}
+
+/** Project exactly the read-only native settings selectors, then resolve their effective environment once. */
+async function readClaudeNativeContext(options: { cwd: string; env: NodeJS.ProcessEnv; flags: readonly string[] }) {
+  const flags = options.flags.flatMap((flag, index) => flag === '--settings' || flag === '--setting-sources' ? [flag, options.flags[index + 1] ?? ''] : [])
+  const root = findGitDir(options.cwd)?.repoRoot ?? options.cwd
+  const index = flags.lastIndexOf('--setting-sources')
+  const sources = (index < 0 ? 'user,project,local' : flags[index + 1] ?? '').split(',')
+  const paths = [sources.includes('user') ? join(options.env.CLAUDE_CONFIG_DIR || join(options.env.HOME || backendHome(), '.claude'), 'settings.json') : null,
+    sources.includes('project') ? join(root, '.claude/settings.json') : null, sources.includes('local') ? join(root, '.claude/settings.local.json') : null,
+    ...flags.flatMap((flag, index) => flag === '--settings' && !flags[index + 1]!.trimStart().startsWith('{') ? [resolve(options.cwd, flags[index + 1]!)] : [])]
+  const settings = await Promise.all(paths.filter((path): path is string => path !== null).map(state))
+  for (let index = 0; index < flags.length; index++) if (flags[index] === '--settings' && flags[index + 1]!.trimStart().startsWith('{')) settings.push(object(JSON.parse(flags[index + 1]!)))
+  if (settings.some((item) => Object.entries(object(item.env)).some(([key, value]) => key.includes('\0') || typeof value !== 'string' || value.includes('\0')))) throw new Error('Native settings environment contains an invalid entry')
+  return { settings, flags, env: Object.assign({}, options.env, ...settings.map((item) => object(item.env))) as NodeJS.ProcessEnv }
 }

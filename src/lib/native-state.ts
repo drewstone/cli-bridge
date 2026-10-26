@@ -13,3 +13,6 @@ export async function readNativeState(path: string): Promise<Record<string, unkn
     throw error
   }
 }
+
+export const nativeIdentifier = (value: unknown): string | undefined =>
+  typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u.test(value) ? value : undefined

@@ -2,6 +2,8 @@ import { localHarnesses, type Config } from './config.js';
 export interface LocalSeat {
     harness: typeof localHarnesses[number][1];
     provider: string | null;
+    /** Native configured default, never a served model identity. */
+    defaultModel?: string;
     status: 'authenticated' | 'configured' | 'signed_out' | 'missing' | 'unknown';
     authMode: 'subscription' | 'api_key' | 'unknown';
     source: 'native_status' | 'native_store';
