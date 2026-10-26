@@ -1,11 +1,8 @@
-import { join, resolve } from 'node:path'
 import { parseSeatSpec } from '@tangle-network/agent-interface'
 import { BackendError, type ChatRequest, type NativeSubscriptionInvocation } from './backends/types.js'
 import { localHarnesses, type Config } from './config.js'
 import { detectLocalSeats } from './local-seats.js'
-import { backendHome } from './jail/auth-preserve.js'
-import { findGitDir } from './jail/types.js'
-import { nativeObject as object, readNativeState as state } from './lib/native-state.js'
+import { nativeObject as object, readClaudeNativeContext } from './lib/native-state.js'
 import type { ModelEntry } from './model-entry.js'
 
 type Authentication = ModelEntry['authentication']
@@ -23,35 +20,28 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader) 
       const key = `${row.backend}:${row.provider ?? ''}:${row.backend === 'codex' || row.backend === 'pi' ? row.id : ''}`
       let pending = cache.get(key)
       if (!pending) {
+        const descriptor = localHarnesses.find(([, harness]) => harness === row.backend)
         pending = (async (): Promise<NativeModelFacts> => {
-          const descriptor = localHarnesses.find(([, harness]) => harness === row.backend)
           if (!descriptor) return { provider: row.provider, authentication: unknown() }
           const [name, harness, fix] = descriptor
           if (name === 'codex') return codex ? await codex({ model: row.id, cwd, env: sourceEnv, flags, signal }) : { provider: null, authentication: unknown('codex login status') }
-          const seat = (await detectLocalSeats({ config, harnesses: [harness], provider: row.provider ?? undefined, model: nativeModel(row.id), env: sourceEnv, flags: claudeSettingsFlags(flags), cwd, signal }))[0]!
+          const { env, settings, flags: authFlags } = name === 'claude'
+            ? await readClaudeNativeContext({ cwd, env: sourceEnv, flags }) : { env: sourceEnv, settings: [], flags: [] }
+          const seat = (await detectLocalSeats({ config, harnesses: [harness], provider: row.provider ?? undefined, model: nativeModel(row.id), env, flags: authFlags, cwd, signal }))[0]!
           const { status, authMode, source } = seat
           let facts: NativeModelFacts = { provider: seat.provider, authentication: { status, authMode, source, ...(seat.fix ? { fix: seat.fix } : {}) } }
           if (name === 'claude') {
-            const root = findGitDir(cwd)?.repoRoot ?? cwd
-            const authFlags = claudeSettingsFlags(flags)
-            const sourcesIndex = authFlags.lastIndexOf('--setting-sources')
-            const sources = (sourcesIndex < 0 ? 'user,project,local' : authFlags[sourcesIndex + 1] ?? '').split(',')
-            const paths = [sources.includes('user') ? join(sourceEnv.CLAUDE_CONFIG_DIR || join(sourceEnv.HOME || backendHome(), '.claude'), 'settings.json') : null,
-              sources.includes('project') ? join(root, '.claude/settings.json') : null, sources.includes('local') ? join(root, '.claude/settings.local.json') : null,
-              ...authFlags.flatMap((flag, index) => flag === '--settings' && !authFlags[index + 1]!.trimStart().startsWith('{') ? [resolve(cwd, authFlags[index + 1]!)] : [])]
-            const settings = await Promise.all(paths.filter((path): path is string => path !== null).map(state))
-            for (let index = 0; index < authFlags.length; index++) if (authFlags[index] === '--settings' && authFlags[index + 1]!.trimStart().startsWith('{')) settings.push(object(JSON.parse(authFlags[index + 1]!)))
-            const env = Object.assign({}, sourceEnv, ...settings.map((item) => object(item.env))) as NodeJS.ProcessEnv
             facts.model = text(env.ANTHROPIC_MODEL) ?? settings.map((item) => text(item.model)).findLast(Boolean)
-            const api = ['ANTHROPIC_API_KEY'].find((key) => env[key]?.trim())
-            if (api) facts.authentication = { status: 'configured', authMode: 'api_key', source: 'native_store', fix: process.env[api]?.trim() === env[api]?.trim() ? `unset ${api}` : 'claude auth status --json' }
+            const fixFor = (key: string): string => settings.some((item) => object(item.env)[key] !== undefined) || process.env[key] !== env[key] ? 'claude auth status --json' : `unset ${key}`
+            const credential = env.ANTHROPIC_AUTH_TOKEN?.trim() ? 'ANTHROPIC_AUTH_TOKEN' : env.ANTHROPIC_API_KEY?.trim() ? 'ANTHROPIC_API_KEY' : null
+            if (credential) facts.authentication = { status: 'configured', authMode: credential === 'ANTHROPIC_API_KEY' ? 'api_key' : 'unknown', source: 'native_store', fix: fixFor(credential) }
             const override = ['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']
               .find((key) => env[key]?.trim() && !['0', 'false', 'off'].includes(env[key]!.toLowerCase()))
             if (override) facts = { ...facts, provider: null, authentication: { ...facts.authentication,
-              fix: process.env[override]?.trim() === env[override]?.trim() ? `unset ${override}` : 'claude auth status --json' } }
+              fix: fixFor(override) } }
           }
           return facts
-        })().catch((error) => { signal?.throwIfAborted(); return { provider: null, authentication: unknown(descriptorFix(row.backend)) } })
+        })().catch((error) => { signal?.throwIfAborted(); return { provider: null, authentication: unknown(descriptor?.[2]) } })
         cache.set(key, pending)
       }
       return pending
@@ -113,12 +103,7 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader) 
     },
   }
 }
-const descriptorFix = (backend: string): string | undefined => localHarnesses.find(([, harness]) => harness === backend)?.[2]
 
 function nativeModel(id: string): string | undefined {
   try { const seat = parseSeatSpec(id); return seat.provider && seat.model.startsWith(`${seat.provider}/`) ? seat.model.slice(seat.provider.length + 1) : seat.model } catch { return undefined }
-}
-/** Only read-only native configuration selectors can reach an authentication probe. */
-function claudeSettingsFlags(flags: readonly string[]): string[] {
-  return flags.flatMap((flag, index) => flag === '--settings' || flag === '--setting-sources' ? [flag, flags[index + 1] ?? ''] : [])
 }

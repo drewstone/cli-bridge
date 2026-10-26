@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os'
 import test from 'node:test'
 import { tsImport } from 'tsx/esm/api'
 
-const { loadConfig, startServer } = await tsImport('../src/server.ts', import.meta.url)
+const { loadConfig, startServer, detectLocalSeats } = await tsImport('../src/server.ts', import.meta.url)
+const { createNativeCatalog } = await tsImport('../src/native-catalog.ts', import.meta.url)
+const { describeRunFailure } = await tsImport('../src/runs/error-shape.ts', import.meta.url)
 const nativeCodex = resolve('node_modules/.bin/codex')
 
 // Delegate metadata to the installed real Codex. Any inference launch is an OS-visible failure,
@@ -74,7 +76,7 @@ test('real native catalog and HTTP/SSE admission refuse API, signed-out and chan
   }
 })
 
-test('Claude admission uses the final project/local settings sources and refuses project API overrides', { timeout: 40_000 }, async () => {
+test('Claude admission binds settings sources and refuses winning API and bearer overrides', { timeout: 80_000 }, async () => {
   const previous = { ...process.env }
   const nativeClaude = join(previous.HOME, '.local/bin/claude')
   await access(nativeClaude)
@@ -101,6 +103,38 @@ test('Claude admission uses the final project/local settings sources and refuses
     const error = (await selected.json()).error
     assert.equal(error.cause, 'api_key_selected')
     assert.equal(error.provider_dispatch, 'not_started')
+    await writeFile(join(project, 'settings.json'), '{}')
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'public-native-oauth-canary'
+    const inventoryConfig = loadConfig({ BRIDGE_BACKENDS: '', CLAUDE_BIN: wrapper, BRIDGE_DATA_DIR: join(root, 'unused') })
+    const inventory = (flags = ['--setting-sources', 'project,local']) => detectLocalSeats({ config: inventoryConfig, harnesses: ['claude-code'], cwd: workspace, flags })
+    assert.equal((await inventory())[0].authMode, 'subscription', 'native setup-token path remains distinguishable')
+    process.env.ANTHROPIC_AUTH_TOKEN = 'public-native-bearer-canary'
+    const bearer = await request()
+    assert.equal(bearer.status, 403)
+    const bearerError = (await bearer.json()).error
+    assert.equal(bearerError.cause, 'subscription_unverified')
+    assert.equal(bearerError.fix, 'unset ANTHROPIC_AUTH_TOKEN')
+    assert.equal((await inventory())[0].authMode, 'unknown')
+    delete process.env.ANTHROPIC_AUTH_TOKEN
+    await writeFile(join(project, 'settings.json'), JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'public-selected-settings-bearer' } }))
+    const projectBearer = await request()
+    assert.equal(projectBearer.status, 403)
+    assert.equal((await projectBearer.json()).error.fix, 'claude auth status --json')
+    assert.equal((await inventory())[0].authMode, 'unknown')
+    await writeFile(join(project, 'settings.json'), '{}')
+    const helper = await inventory(['--setting-sources', 'project,local', '--settings', JSON.stringify({ apiKeyHelper: 'printf public-native-helper-canary' })])
+    assert.equal(helper[0].authMode, 'unknown', 'a dynamic credential helper is not subscription evidence')
+    const native = createNativeCatalog({ ...inventoryConfig, subscriptionsOnly: true })
+    const inlineRequest = { model: 'claude-code/opus', cwd: workspace, messages: [] }
+    await native.admit(inlineRequest, 'claude-code', new AbortController().signal)
+    await assert.rejects(inlineRequest.subscriptionAdmission.check({ model: inlineRequest.model, cwd: workspace, env: { ...process.env }, executor: 'host',
+      flags: ['--setting-sources', 'project,local', '--settings', JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'public-inline-bearer-canary' } })] }), (failure) => {
+      const error = describeRunFailure(failure)
+      assert.equal(error.status, 403)
+      assert.equal(error.cause, 'subscription_unverified')
+      assert.equal(error.fix, 'claude auth status --json')
+      return true
+    })
     await assert.rejects(readFile(attempted), { code: 'ENOENT' })
   } finally {
     await server?.close()

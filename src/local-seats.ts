@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import { loadConfig, localHarnesses, type Config } from './config.js'
 import { backendHome } from './jail/auth-preserve.js'
 import { probeNativeStatus } from './lib/native-status.js'
-import { nativeObject as object, nativeJson as decode, readNativeState as state } from './lib/native-state.js'
+import { nativeObject as object, nativeJson as decode, readNativeState as state, readClaudeNativeContext } from './lib/native-state.js'
 
 export interface LocalSeat {
   harness: typeof localHarnesses[number][1]
@@ -33,14 +33,16 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
   const config = options.config ?? loadConfig(env)
   const timeout = options.timeoutMs ?? 10_000
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 30_000) throw new Error('seat inventory timeoutMs must be between 1 and 30000')
-  const probe = (bin: string, args: readonly string[]) => probeNativeStatus(bin, args, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd, env })
+  const probe = (bin: string, args: readonly string[], nativeEnv = env) => probeNativeStatus(bin, args, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd, env: nativeEnv })
   const results = await Promise.allSettled(localHarnesses.filter(([, harness]) => !options.harnesses || options.harnesses.includes(harness)).map(async ([key, harness, fix, args, provider]): Promise<LocalSeat> => {
     const bin = config[`${key}Bin`]
     const nativeArgs = key === 'pi' && options.provider
       ? ['auth', 'check', '--provider', options.provider, ...(options.model ? ['--model', options.model] : []), '--json', '--no-refresh'] : args
-    const result = await probe(bin, key === 'claude' ? [...(options.flags ?? []), ...nativeArgs] : nativeArgs)
     const fact: LocalSeat = { harness, provider: null, status: 'unknown', authMode: 'unknown',
       source: key === 'kimi' || key === 'gemini' ? 'native_store' : 'native_status', fix }
+    const native = await (key === 'claude' ? readClaudeNativeContext({ cwd: options.cwd ?? process.cwd(), env, flags: options.flags ?? [] }) : Promise.resolve({ env, flags: [] })).catch(() => null)
+    if (!native) return fact
+    const result = await probe(bin, [...native.flags, ...nativeArgs], native.env)
     if (result.code === 'ENOENT') { delete fact.fix; return { ...fact, status: 'missing' } }
     try {
       if (key === 'claude' && (result.code === 0 || result.code === 1)) {
@@ -49,7 +51,8 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
         if (auth.loggedIn === false) fact.status = 'signed_out'
         if (result.code === 0 && auth.loggedIn === true) {
           fact.status = 'authenticated'
-          fact.authMode = auth.authMethod === 'claude.ai' || auth.authMethod === 'oauth_token' ? 'subscription'
+          fact.authMode = native.env.ANTHROPIC_AUTH_TOKEN?.trim() ? 'unknown'
+            : auth.authMethod === 'claude.ai' || auth.authMethod === 'oauth_token' && !!native.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() ? 'subscription'
             : auth.authMethod === 'api_key' ? 'api_key' : 'unknown'
         }
       } else if (key === 'codex') {
