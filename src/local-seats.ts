@@ -1,0 +1,96 @@
+import { execFile } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { loadConfig, localHarnesses, type Config } from './config.js'
+import { backendHome } from './jail/auth-preserve.js'
+
+export interface LocalSeat {
+  harness: typeof localHarnesses[number][1]
+  status: 'authenticated' | 'configured' | 'signed_out' | 'missing' | 'unknown'
+  authMode: 'subscription' | 'api_key' | 'unknown'
+  source: 'native_status' | 'native_store'
+  fix?: string
+}
+
+export interface LocalSeatOptions {
+  config?: Config
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+const object = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+const decode = (text: string): Record<string, unknown> => object(JSON.parse(text))
+const state = async (path: string): Promise<Record<string, unknown>> => {
+  try { return decode(await readFile(path, 'utf8')) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    throw error
+  }
+}
+
+/** Query local login state without an inference, refresh, or credential in the returned value. */
+export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<LocalSeat[]> {
+  const config = options.config ?? loadConfig()
+  const timeout = options.timeoutMs ?? 5000
+  if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 30_000) throw new Error('seat inventory timeoutMs must be between 1 and 30000')
+  const probe = (bin: string, args: readonly string[]) => new Promise<{ code: number | string; stdout: string; stderr: string }>((resolve) => {
+    const child = execFile(bin, [...args], { timeout, signal: options.signal, maxBuffer: 65536, encoding: 'utf8', windowsHide: true },
+      (error, stdout, stderr) => resolve({ code: error ? error.code ?? 'unknown' : 0, stdout, stderr }))
+    child.stdin?.end()
+  })
+  return await Promise.all(localHarnesses.map(async ([key, harness, fix, args]): Promise<LocalSeat> => {
+    const bin = config[`${key}Bin`]
+    const result = await probe(bin, args)
+    const fact: LocalSeat = { harness, status: 'unknown', authMode: 'unknown',
+      source: key === 'kimi' || key === 'gemini' ? 'native_store' : 'native_status', fix }
+    if (result.code === 'ENOENT') { delete fact.fix; return { ...fact, status: 'missing' } }
+    try {
+      if (key === 'claude') {
+        const auth = decode(result.stdout)
+        if (auth.loggedIn === false) fact.status = 'signed_out'
+        if (result.code === 0 && auth.loggedIn === true) {
+          fact.status = 'authenticated'
+          fact.authMode = auth.authMethod === 'claude.ai' || auth.authMethod === 'oauth_token' ? 'subscription'
+            : auth.authMethod === 'api_key' ? 'api_key' : 'unknown'
+        }
+      } else if (key === 'codex') {
+        const output = result.stdout + result.stderr
+        if (result.code === 0 && /Logged in using ChatGPT\b/u.test(output)) {
+          fact.status = 'authenticated'; fact.authMode = 'subscription'
+        } else if (result.code === 0 && /Logged in using an API key\b/u.test(output)) {
+          fact.status = 'authenticated'; fact.authMode = 'api_key'
+        } else if (/Not logged in\b/u.test(output)) fact.status = 'signed_out'
+      } else if (key === 'opencode' && result.code === 0) {
+        const output = (result.stdout + result.stderr).replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
+        fact.authMode = /\boauth\b/iu.test(output) ? 'subscription' : /\bapi\b/iu.test(output) ? 'api_key' : 'unknown'
+        fact.status = fact.authMode !== 'unknown' ? 'authenticated' : /\b0 credentials?\b/iu.test(output) ? 'signed_out' : 'unknown'
+      } else if (key === 'pi') {
+        const checks = [result, ...await Promise.all(['anthropic', 'github-copilot', 'google-gemini-cli'].map((provider) =>
+          probe(bin, ['auth', 'check', '--provider', provider, '--json', '--no-refresh'])))]
+        const auth: Array<Record<string, unknown>> = checks.flatMap((check) => { try { return [{ ...decode(check.stdout), exit: check.code }] } catch { return [] } })
+        const ready = auth.filter((item) => item.exit === 0 && item.status === 'ready')
+        fact.authMode = ready.some((item) => item.authType === 'oauth') ? 'subscription'
+          : ready.some((item) => item.authType === 'api_key' || item.authType === 'apiKey') ? 'api_key' : 'unknown'
+        fact.status = ready.length ? 'authenticated' : auth.length === checks.length && auth.every((item) => item.status === 'not_ready') ? 'signed_out' : 'unknown'
+      } else if (result.code === 0 && key === 'kimi') {
+        const root = process.env.KIMI_CODE_HOME?.trim() || join(backendHome(), '.kimi-code')
+        const auth = await Promise.all(['kimi-code.json', 'managed:kimi-code.json'].map((file) => state(join(root, 'credentials', file))))
+        const stored = auth.some((item) => typeof item.refresh_token === 'string' && !!item.refresh_token)
+        fact.status = stored ? 'configured' : 'signed_out'; fact.authMode = stored ? 'subscription' : 'unknown'
+      } else if (result.code === 0 && key === 'gemini') {
+        const root = join(backendHome(), '.gemini')
+        const settings = await state(join(root, 'settings.json'))
+        const selected = object(object(settings.security).authentication).selectedType ?? settings.selectedAuthType
+          ?? (process.env.GEMINI_API_KEY ? 'gemini-api-key' : undefined)
+        const auth = await state(join(root, 'oauth_creds.json'))
+        if ((selected === undefined || selected === 'oauth-personal') && typeof auth.refresh_token === 'string' && auth.refresh_token) {
+          fact.status = 'configured'; fact.authMode = 'subscription'
+        } else if (selected === 'gemini-api-key' || process.env.GEMINI_API_KEY) {
+          fact.status = 'configured'; fact.authMode = 'api_key'
+        } else fact.status = selected === undefined || selected === 'oauth-personal' ? 'signed_out' : 'unknown'
+      }
+    } catch { /* Unrecognized or unsupported native output remains unknown. */ }
+    if (fact.status === 'authenticated' || fact.status === 'configured') delete fact.fix
+    return fact
+  }))
+}

@@ -15,7 +15,21 @@ import { formatAllowEntry, parseAllowList } from './jail/net-allowlist.js'
 
 const maxExecutionTimeoutMs = 2_147_483_647
 
-export interface Config {
+/** Native harness identities only; model selection and seat syntax belong to agent-interface. */
+export const localHarnesses = [
+  ['claude', 'claude-code', 'claude auth login', ['auth', 'status', '--json']],
+  ['codex', 'codex', 'codex login', ['login', 'status']],
+  ['opencode', 'opencode', 'opencode auth login', ['auth', 'list', '--pure']],
+  ['kimi', 'kimi-code', 'kimi login', ['--version']],
+  ['gemini', 'gemini', 'gemini', ['--version']],
+  ['pi', 'pi', 'pi', ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh']],
+] as const
+
+type NativeHarnessConfig = {
+  [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string
+} & { [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number }
+
+export interface Config extends NativeHarnessConfig {
   host: string
   port: number
   bearer: string | null
@@ -23,16 +37,6 @@ export interface Config {
   /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
   asyncDurableWrites: boolean
   backends: Set<string>
-  claudeBin: string
-  claudeTimeoutMs: number
-  codexBin: string
-  codexTimeoutMs: number
-  opencodeBin: string
-  opencodeTimeoutMs: number
-  kimiBin: string
-  kimiTimeoutMs: number
-  geminiBin: string
-  geminiTimeoutMs: number
   factoryBin: string
   ampBin: string
   forgeBin: string
@@ -41,8 +45,6 @@ export interface Config {
   openclawBin: string
   /** NanoClaw daemon CLI-channel Unix socket (NanoclawBackend connects as a client). */
   nanoclawSocket: string
-  piBin: string
-  piTimeoutMs: number
   primeBin: string
   primeTimeoutMs: number
   /** Operator models.json materialized into every isolated prime agent dir. Null = none configured. */
@@ -296,24 +298,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir,
     asyncDurableWrites: parseOnOff('BRIDGE_ASYNC_DURABLE_WRITES', env.BRIDGE_ASYNC_DURABLE_WRITES, false),
     backends,
-    claudeBin: env.CLAUDE_BIN ?? 'claude',
-    claudeTimeoutMs: parseExecutionTimeoutMs('CLAUDE_TIMEOUT_MS', env.CLAUDE_TIMEOUT_MS, defaultTimeout),
-    codexBin: env.CODEX_BIN ?? 'codex',
-    codexTimeoutMs: parseExecutionTimeoutMs('CODEX_TIMEOUT_MS', env.CODEX_TIMEOUT_MS, defaultTimeout),
-    opencodeBin: env.OPENCODE_BIN ?? 'opencode',
-    opencodeTimeoutMs: parseExecutionTimeoutMs('OPENCODE_TIMEOUT_MS', env.OPENCODE_TIMEOUT_MS, defaultTimeout),
-    kimiBin: env.KIMI_BIN ?? 'kimi',
-    kimiTimeoutMs: parseExecutionTimeoutMs('KIMI_TIMEOUT_MS', env.KIMI_TIMEOUT_MS, defaultTimeout),
-    geminiBin: env.GEMINI_BIN ?? 'gemini',
-    geminiTimeoutMs: parseExecutionTimeoutMs('GEMINI_TIMEOUT_MS', env.GEMINI_TIMEOUT_MS, defaultTimeout),
+    ...Object.fromEntries(localHarnesses.flatMap(([name]) => [
+      [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? name],
+      [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], defaultTimeout)],
+    ])) as NativeHarnessConfig,
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
     forgeBin: env.FORGE_BIN ?? 'forge',
     hermesBin: env.HERMES_BIN ?? 'hermes',
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     nanoclawSocket: env.NANOCLAW_SOCKET ?? '',
-    piBin: env.PI_BIN ?? 'pi',
-    piTimeoutMs: parseExecutionTimeoutMs('PI_TIMEOUT_MS', env.PI_TIMEOUT_MS, defaultTimeout),
     primeBin: env.PRIME_BIN ?? 'prime-agent',
     primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),
     ...parsePrimeStateConfig(env, backends),
@@ -571,54 +565,17 @@ function parseExecutionTimeoutMs(
   return parsed
 }
 
-/**
- * Per-backend executor defaults. All subprocess backends share the
- * same default runtime image (`cli-bridge-cli-runtime`) — that image
- * has every CLI installed. Per-backend `<NAME>_DOCKER_IMAGE` env
- * overrides if you want a leaner per-backend image. The OAuth/config
- * mount target differs per backend because each CLI stores auth state
- * in a different path.
- */
+/** Every executor uses the maintained runtime image unless the operator overrides it. */
 const SHARED_RUNTIME_IMAGE = 'cli-bridge-cli-runtime:latest'
-
-/** HOME the container runs with when no non-root identity is configured. */
 const DEFAULT_CONTAINER_HOME = '/root'
 
-/**
- * Per-backend defaults. `configRel` is HOME-relative and serves BOTH sides:
- * the host default (`$HOME/.config/opencode`) and the container mount target
- * (`<container HOME>/.config/opencode`).
- *
- * It is deliberately relative. A hardcoded absolute `/root/.config/opencode`
- * kept pointing at root's home after the operator asked for a uid-1000
- * container with HOME=/home/node, so the credential volumes landed somewhere
- * the CLI never reads and the CLI failed with EACCES on an unrelated path.
- * Resolving the same relative path against the CONFIGURED home makes that
- * mismatch impossible to express instead of something to detect later.
- */
+/** Resolve HOME-relative paths against the actual host/container HOME. */
 interface BackendExecutorDefaults {
   image: string
-  /** Primary config dir, HOME-relative. The one <NAME>_DOCKER_*_CONFIG_DIR overrides. */
   configRel: string
-  /**
-   * Further HOME-relative directories the CLI needs mounted. Measured on this
-   * host: `opencode auth login` writes ~/.local/share/opencode/auth.json, and
-   * ~/.config/opencode holds no credentials at all — so a pool that mounts only
-   * the config dir has nothing to authenticate with.
-   */
+  /** Additional native state, such as OpenCode's separate credential directory. */
   extraRels?: string[]
-  /**
-   * HOME-relative path of the file that proves authentication, measured on this
-   * host rather than assumed:
-   *   ~/.local/share/opencode/auth.json   (opencode)
-   *   ~/.claude/.credentials.json         (claude)
-   *   ~/.codex/auth.json                  (codex)
-   *   ~/.kimi/credentials                 (kimi, a directory)
-   *   ~/.pi/agent/auth.json               (pi)
-   * gemini is omitted: it authenticates by API key or a browser flow whose
-   * artifact is not a stable file on this host, so claiming one would invent a
-   * check. An omitted entry falls back to "the mount is empty".
-   */
+  /** Native authentication evidence; absent means preflight requires a nonempty mount. */
   credentialFile?: string
 }
 

@@ -31,10 +31,12 @@ test('packed production install embeds isolated HTTP services and runs the exist
   assert.ok(manifest.dependencies.tsx, 'the existing loader must be installed in production')
   assert.equal(manifest.devDependencies?.tsx, undefined)
   await writeFile(join(root, 'consumer.mts'), `
-    import { loadConfig, startServer, type BridgeServer } from 'cli-bridge';
+    import { loadConfig, startServer, detectLocalSeats, type LocalSeat, type BridgeServer } from 'cli-bridge';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
     const run = async (): Promise<BridgeServer> => startServer({ config, handleSignals: false, quiet: true });
     void run;
+    const seats: Promise<LocalSeat[]> = detectLocalSeats({ config });
+    void seats;
   `)
   await command(join(repo, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--skipLibCheck', 'false',
     '--module', 'nodenext', '--moduleResolution', 'nodenext', '--target', 'es2022',
@@ -46,7 +48,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
     import { createServer } from 'node:net';
     import { once } from 'node:events';
     import { join } from 'node:path';
-    import { loadConfig, startServer } from 'cli-bridge';
+    import { loadConfig, startServer, detectLocalSeats } from 'cli-bridge';
     const bearer = randomBytes(32).toString('hex');
     const events = ['SIGINT', 'SIGTERM', 'exit', 'uncaughtException', 'unhandledRejection'];
     const before = events.map((event) => process.listeners(event));
@@ -56,6 +58,20 @@ test('packed production install embeds isolated HTTP services and runs the exist
     }), port }, handleSignals: false, quiet: true });
     const directory = join(process.cwd(), 'state');
     const base = loadConfig({ BRIDGE_DATA_DIR: directory, BRIDGE_BACKENDS: '', BRIDGE_TRACE: 'off' });
+    const missingConfig = { ...base };
+    for (const name of ['claude', 'codex', 'opencode', 'kimi', 'gemini', 'pi']) missingConfig[name + 'Bin'] = join(process.cwd(), 'not-installed-' + name);
+    const missing = await detectLocalSeats({ config: missingConfig });
+    assert.equal(missing.length, 6);
+    assert.ok(missing.every((seat) => seat.status === 'missing' && seat.authMode === 'unknown'));
+    assert.equal(existsSync(directory), false);
+    const nativeCodexHome = join(process.cwd(), 'codex-login-check');
+    mkdirSync(nativeCodexHome, { mode: 0o700 });
+    process.env.CODEX_HOME = nativeCodexHome;
+    delete process.env.CODEX_API_KEY; delete process.env.CODEX_ACCESS_TOKEN; delete process.env.OPENAI_API_KEY;
+    const native = await detectLocalSeats({ config: { ...missingConfig, codexBin: process.env.PACKAGE_NATIVE_CODEX } });
+    assert.deepEqual(native.find((seat) => seat.harness === 'codex'), {
+      harness: 'codex', status: 'signed_out', authMode: 'unknown', source: 'native_status', fix: 'codex login',
+    });
     await assert.rejects(startServer({ config: { ...base, host: '0.0.0.0' }, handleSignals: false }), /BRIDGE_BEARER/);
     assert.equal(existsSync(directory), false);
     const partialDirectory = join(process.cwd(), 'partial');
@@ -134,7 +150,10 @@ test('packed production install embeds isolated HTTP services and runs the exist
     } finally { await first.close(); await sibling.close(); }
     process.stdout.write('packed embedding PASS\\n');
   `)
-  const embedded = await command(process.execPath, [join(root, 'consumer.mjs')], root)
+  const embedded = await execute(process.execPath, [join(root, 'consumer.mjs')], {
+    cwd: root, timeout: 180_000, maxBuffer: 4 * 1024 * 1024,
+    env: { ...process.env, PACKAGE_NATIVE_CODEX: join(repo, 'node_modules/.bin/codex') },
+  })
   assert.equal(embedded.stdout.trim(), 'packed embedding PASS')
 
   const listener = createServer()
@@ -143,6 +162,13 @@ test('packed production install embeds isolated HTTP services and runs the exist
   const port = listener.address().port
   await new Promise((accept, reject) => listener.close((error) => error ? reject(error) : accept()))
   const state = join(root, 'standalone')
+  const inventory = await execute(process.execPath, [join(root, 'node_modules/cli-bridge', manifest.bin['cli-bridge']), '--seats', '--json'], {
+    cwd: root, timeout: 30_000, maxBuffer: 65536,
+    env: { ...process.env, BRIDGE_DATA_DIR: state, ...Object.fromEntries(
+      ['CLAUDE', 'CODEX', 'OPENCODE', 'KIMI', 'GEMINI', 'PI'].map((name) => [name + '_BIN', join(root, 'missing-' + name)]),
+    ) },
+  })
+  assert.ok(JSON.parse(inventory.stdout).every((seat) => seat.status === 'missing'))
   const child = spawn(process.execPath, [join(root, 'node_modules/cli-bridge', manifest.bin['cli-bridge'])], {
     cwd: root, env: { ...process.env, BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: '',
       BRIDGE_PORT: String(port), BRIDGE_HOST: '127.0.0.1', BRIDGE_TRACE: 'off',

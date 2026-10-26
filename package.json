@@ -7,7 +7,7 @@
   "exports": {
     ".": { "types": "./types/package.d.ts", "import": "./index.mjs" }
   },
-  "files": ["index.mjs", "bin", "src", "types/package.d.ts", "types/config.d.ts", "types/server-options.d.ts", "profiles", "docker", "pnpm-lock.yaml", "README.md", "LICENSE"],
+  "files": ["index.mjs", "bin", "src", "types/package.d.ts", "types/config.d.ts", "types/server-options.d.ts", "types/local-seats.d.ts", "profiles", "docker", "pnpm-lock.yaml", "README.md", "LICENSE"],
   "license": "MIT",
   "engines": {
     "node": ">=22.13.0"

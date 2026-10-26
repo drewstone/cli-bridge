@@ -10,7 +10,7 @@ import { DurableRunWriter } from './sessions/durable-writer.js'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, type Config } from './config.js'
+import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { BackendRegistry } from './backends/registry.js'
 import { ClaudeBackend } from './backends/claude.js'
@@ -379,15 +379,15 @@ export async function buildApp(config: Config): Promise<{
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
-  if (config.backends.has('claude')) {
-    const harness = 'claude-code'
-    const spawner = await buildExecutorForBackend(config.executors.claude, harness, extras, config.claudeBin, config)
-    registry.register(new ClaudeBackend({
-      bin: config.claudeBin,
-      timeoutMs: config.claudeTimeoutMs,
-      harness,
-      ...(spawner ? { spawner } : {}),
-    }))
+  const nativeBackends = { claude: ClaudeBackend, codex: CodexBackend, opencode: OpencodeBackend,
+    kimi: KimiBackend, gemini: GeminiBackend, pi: PiBackend }
+  for (const [name, harness] of localHarnesses) {
+    if (!config.backends.has(name)) continue
+    const bin = config[`${name}Bin`]
+    const Backend = nativeBackends[name]
+    const spawner = await buildExecutorForBackend(config.executors[name], harness, extras, bin, config)
+    registry.register(new Backend({ bin, harness, timeoutMs: config[`${name}TimeoutMs`],
+      stateDir: join(config.dataDir, name), ...(spawner ? { spawner } : {}) }))
   }
   if (config.backends.has('claudish')) {
     if (!config.claudishUrl) {
@@ -399,69 +399,17 @@ export async function buildApp(config: Config): Promise<{
       claudishUrl: config.claudishUrl,
     }))
   }
-  if (config.backends.has('codex')) {
-    const spawner = await buildExecutorForBackend(config.executors.codex, 'codex', extras, config.codexBin, config)
-    registry.register(new CodexBackend({
-      bin: config.codexBin,
-      timeoutMs: config.codexTimeoutMs,
-      stateDir: join(config.dataDir, 'codex'),
-      ...(spawner ? { spawner } : {}),
-    }))
-  }
-  if (config.backends.has('opencode')) {
-    const spawner = await buildExecutorForBackend(config.executors.opencode, 'opencode', extras, config.opencodeBin, config)
-    registry.register(new OpencodeBackend({
-      bin: config.opencodeBin,
-      timeoutMs: config.opencodeTimeoutMs,
-      ...(spawner ? { spawner } : {}),
-    }))
-  }
-  if (config.backends.has('kimi')) {
-    const harness = 'kimi-code'
-    const spawner = await buildExecutorForBackend(config.executors.kimi, harness, extras, config.kimiBin, config)
-    registry.register(new KimiBackend({
-      bin: config.kimiBin,
-      timeoutMs: config.kimiTimeoutMs,
-      harness,
-      ...(spawner ? { spawner } : {}),
-    }))
-  }
-  if (config.backends.has('gemini')) {
-    const spawner = await buildExecutorForBackend(config.executors.gemini, 'gemini', extras, config.geminiBin, config)
-    registry.register(new GeminiBackend({
-      bin: config.geminiBin,
-      timeoutMs: config.geminiTimeoutMs,
-      ...(spawner ? { spawner } : {}),
-    }))
-  }
-  if (config.backends.has('factory')) {
-    registry.register(new FactoryBackend({ bin: config.factoryBin, timeoutMs: config.cliTimeoutMsDefault }))
-  }
-  if (config.backends.has('amp')) {
-    registry.register(new AmpBackend({ bin: config.ampBin, timeoutMs: config.cliTimeoutMsDefault }))
-  }
-  if (config.backends.has('forge')) {
-    registry.register(new ForgeBackend({ bin: config.forgeBin, timeoutMs: config.cliTimeoutMsDefault }))
+  for (const [name, Backend] of [['factory', FactoryBackend], ['amp', AmpBackend], ['forge', ForgeBackend]] as const) {
+    if (config.backends.has(name)) registry.register(new Backend({ bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
   }
   // ACP-protocol agents (driven via `<bin> acp`): hermes, openclaw. Registered when
   // BRIDGE_BACKENDS lists them; health reports `unavailable` if the binary is absent.
-  if (config.backends.has('hermes')) {
-    registry.register(new AcpBackend({ name: 'hermes', bin: config.hermesBin, timeoutMs: config.cliTimeoutMsDefault }))
-  }
-  if (config.backends.has('openclaw')) {
-    registry.register(new AcpBackend({ name: 'openclaw', bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault }))
+  for (const name of ['hermes', 'openclaw'] as const) {
+    if (config.backends.has(name)) registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
   }
   // NanoClaw: a Unix-socket client to the running NanoClaw daemon (not a spawned CLI).
   if (config.backends.has('nanoclaw')) {
     registry.register(new NanoclawBackend({ socketPath: config.nanoclawSocket, timeoutMs: config.cliTimeoutMsDefault }))
-  }
-  if (config.backends.has('pi')) {
-    const spawner = await buildExecutorForBackend(config.executors.pi, 'pi', extras, config.piBin, config)
-    registry.register(new PiBackend({
-      bin: config.piBin,
-      timeoutMs: config.piTimeoutMs,
-      ...(spawner ? { spawner } : {}),
-    }))
   }
   // prime-agent (the pi fork) — host-spawned `--mode rpc` with a bridge-owned
   // isolated HOME per run; see PrimeBackend for the daemon-avoidance contract.
@@ -595,6 +543,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 export type { BridgeServer, StartServerOptions } from './server-options.js'
 export { loadConfig }
+export { detectLocalSeats } from './local-seats.js'
 
 class UnconfirmedBridgeCleanup extends AggregateError {}
 
