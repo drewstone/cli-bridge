@@ -7,6 +7,7 @@ await writeFile(new URL('../types/package.d.ts', import.meta.url), [
   "import type { BridgeServer, StartServerOptions } from './server-options.js';",
   "export { loadConfig } from './config.js';",
   "export type { BridgeServer, StartServerOptions } from './server-options.js';",
+  "export { detectLocalSeats, type LocalSeat, type LocalSeatOptions } from './local-seats.js';",
   signature,
   '',
 ].join('\n'))

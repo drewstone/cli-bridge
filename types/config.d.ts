@@ -6,7 +6,14 @@
  * not a warning — an accidental open proxy to your personal subscription
  * keys is the failure mode we refuse to allow.
  */
-export interface Config {
+/** Native harness identities only; model selection and seat syntax belong to agent-interface. */
+export declare const localHarnesses: readonly [readonly ['claude', 'claude-code', 'claude auth login', readonly ['auth', 'status', '--json']], readonly ['codex', 'codex', 'codex login', readonly ['login', 'status']], readonly ['opencode', 'opencode', 'opencode auth login', readonly ['auth', 'list', '--pure']], readonly ['kimi', 'kimi-code', 'kimi login', readonly ['--version']], readonly ['gemini', 'gemini', 'gemini', readonly ['--version']], readonly ['pi', 'pi', 'pi', readonly ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh']]];
+type NativeHarnessConfig = {
+    [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string;
+} & {
+    [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number;
+};
+export interface Config extends NativeHarnessConfig {
     host: string;
     port: number;
     bearer: string | null;
@@ -14,16 +21,6 @@ export interface Config {
     /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
     asyncDurableWrites: boolean;
     backends: Set<string>;
-    claudeBin: string;
-    claudeTimeoutMs: number;
-    codexBin: string;
-    codexTimeoutMs: number;
-    opencodeBin: string;
-    opencodeTimeoutMs: number;
-    kimiBin: string;
-    kimiTimeoutMs: number;
-    geminiBin: string;
-    geminiTimeoutMs: number;
     factoryBin: string;
     ampBin: string;
     forgeBin: string;
@@ -32,8 +29,6 @@ export interface Config {
     openclawBin: string;
     /** NanoClaw daemon CLI-channel Unix socket (NanoclawBackend connects as a client). */
     nanoclawSocket: string;
-    piBin: string;
-    piTimeoutMs: number;
     primeBin: string;
     primeTimeoutMs: number;
     /** Operator models.json materialized into every isolated prime agent dir. Null = none configured. */
@@ -223,3 +218,4 @@ export declare function anyBackendSpawnsOnHost(backends: Iterable<string>, execu
 /** Shared listener safety for environment and embedded callers; only embedding permits port 0. */
 export declare function assertListenerConfig({ host, port, bearer }: Pick<Config, 'host' | 'port' | 'bearer'>, ephemeral?: boolean): void;
 export declare function loadConfig(env?: NodeJS.ProcessEnv): Config;
+export {};
