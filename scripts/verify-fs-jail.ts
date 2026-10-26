@@ -38,7 +38,8 @@ const built = await buildApp(config)
 let observed: ChatRequest['jailSpec']
 const nativeRequest: ChatRequest = { model: 'pi', messages: [], cwd: workspace }
 await assert.rejects((built.registry.byName('pi') as NativeSessionBackend).startNativeSession(
-  nativeRequest, null, new AbortController().signal), /requires an explicit pi\/<provider>\/<model>/)
+  nativeRequest, null, new AbortController().signal), process.platform === 'linux'
+  ? /requires an explicit pi\/<provider>\/<model>/ : /requires an enforced Linux fs-jail/)
 assert.equal(nativeRequest.jailSpec?.readConfine, true)
 assert.equal(nativeRequest.jailSpec?.root, join(workspace, '.agent-home/captured'))
 assert.deepEqual(nativeRequest.jailSpec?.extraReadablePaths, [readable])
