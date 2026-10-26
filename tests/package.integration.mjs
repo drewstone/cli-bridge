@@ -107,13 +107,16 @@ test('packed production install embeds isolated HTTP services and runs the exist
       assert.equal(new URL(first.url).hostname, '127.0.0.1');
       assert.notEqual(first.url, sibling.url);
       assert.equal(statSync(directory).mode & 0o777, 0o700);
-      assert.equal((await fetch(first.url + '/health')).status, 200);
+      // No backend was enabled or invoked: the listener is live and readiness is degraded.
+      const health = await fetch(first.url + '/health');
+      assert.equal(health.status, 503);
+      assert.deepEqual((await health.json()).backends, []);
       assert.equal((await fetch(first.url + '/v1/models')).status, 401);
       assert.equal((await fetch(first.url + '/v1/models', { headers: { authorization: 'Bearer ' + bearer } })).status, 200);
       await first.close();
       await first.close();
       await assert.rejects(fetch(first.url + '/health'));
-      assert.equal((await fetch(sibling.url + '/health')).status, 200);
+      assert.equal((await fetch(sibling.url + '/health')).status, 503);
       assert.equal(existsSync(join(directory, '.cli-bridge-data-directory.pid')), false);
       const reopened = await open(directory);
       await reopened.close();
@@ -160,7 +163,9 @@ test('packed production install embeds isolated HTTP services and runs the exist
     child.once('error', (error) => { clearTimeout(timer); reject(error) })
     child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`packed binary exited ${code}: ${diagnostics}`)) })
   })
-  assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200)
+  const health = await fetch(`http://127.0.0.1:${port}/health`)
+  assert.equal(health.status, 503)
+  assert.deepEqual((await health.json()).backends, [])
   child.kill('SIGTERM')
   assert.deepEqual(await exited, [0, null], diagnostics)
 })
