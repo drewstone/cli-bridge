@@ -37,7 +37,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
   await writeFile(join(root, 'consumer.mts'), `
     import { loadConfig, startServer, detectLocalSeats, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
-    const run = async (): Promise<BridgeServer> => startServer({ config, handleSignals: false, quiet: true });
+    const run = async (): Promise<BridgeServer> => startServer({ config, cwd: process.cwd(), handleSignals: false, quiet: true });
     void run;
     const seats: Promise<LocalSeat[]> = detectLocalSeats({ config });
     void seats;
