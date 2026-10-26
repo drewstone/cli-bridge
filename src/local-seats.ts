@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { loadConfig, localHarnesses, type Config } from './config.js'
@@ -44,17 +44,26 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
     let interrupted: string | undefined
     const stop = (cause: string) => { interrupted = cause; killTreeSync(child, 'SIGKILL') }
     const onAbort = () => stop('ABORT_ERR')
-    const child = execFile(bin, [...args], { timeout, killSignal: 'SIGKILL', detached: process.platform !== 'win32',
-      maxBuffer: 65536, encoding: 'utf8', windowsHide: true }, (error, stdout, stderr) => {
+    const child = spawn(bin, [...args], { detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    let stdout = '', stderr = '', bytes = 0, spawnError: string | undefined
+    const collect = (text: string, error: boolean) => {
+      bytes += Buffer.byteLength(text)
+      if (bytes > 65536) { stop('OUTPUT_LIMIT'); return }
+      if (error) stderr += text
+      else stdout += text
+    }
+    child.stdout.setEncoding('utf8').on('data', (text: string) => collect(text, false))
+    child.stderr.setEncoding('utf8').on('data', (text: string) => collect(text, true))
+    child.once('error', (error: NodeJS.ErrnoException) => { spawnError = error.code ?? 'unknown' })
+    child.once('close', (code) => {
       clearTimeout(timer)
       options.signal?.removeEventListener('abort', onAbort)
       void killTree(child, { gracefulMs: 0 }).then(() =>
-        resolve({ code: interrupted ?? (error ? error.code ?? 'unknown' : 0), stdout, stderr }), reject)
+        resolve({ code: interrupted ?? spawnError ?? code ?? 'unknown', stdout, stderr }), reject)
     })
     const timer = setTimeout(() => stop('ETIMEDOUT'), timeout)
     options.signal?.addEventListener('abort', onAbort, { once: true })
     if (options.signal?.aborted) onAbort()
-    child.stdin?.end()
   })
   const results = await Promise.allSettled(localHarnesses.map(async ([key, harness, fix, args]): Promise<LocalSeat> => {
     const bin = config[`${key}Bin`]
