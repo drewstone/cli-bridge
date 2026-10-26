@@ -180,7 +180,7 @@ Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
 - local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`, `prime`) persist the full profile and reject profile dimensions they cannot execute
-- `codex/default` selects the Codex CLI configured default without a model override.
+- `codex/default` and `codex/<provider>/default` select the Codex CLI configured model without a model override; the qualified form retains the explicit provider.
   Its exact profile may omit `model.provider` or name the harness as the provider.
   A harness name is never passed to a CLI as its model provider. The backend drops a provider
   segment equal to its own name when it builds the arguments, so the rule also holds for a

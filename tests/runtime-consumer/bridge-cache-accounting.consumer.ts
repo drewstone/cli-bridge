@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -85,4 +85,56 @@ for (const event of ${JSON.stringify(native)}) console.log(JSON.stringify(event)
   assert.equal(remaining.tokensKnown, true)
   assert.equal(remaining.cacheBreakdownKnown, true)
   assert.equal(remaining.iterationsLeft, 0)
+})
+
+test('published Runtime preserves Codex configured defaults and explicit provider models', async context => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-codex-default-consumer-'))
+  const previousHome = process.env.CODEX_HOME
+  process.env.CODEX_HOME = join(directory, 'codex-home')
+  await mkdir(process.env.CODEX_HOME)
+  let bridge: Awaited<ReturnType<typeof startServer>> | undefined
+  context.after(async () => {
+    await bridge?.close()
+    if (previousHome === undefined) delete process.env.CODEX_HOME
+    else process.env.CODEX_HOME = previousHome
+    await rm(directory, { recursive: true, force: true })
+  })
+  const argvPath = join(directory, 'argv.json')
+  const bin = join(directory, 'codex-protocol.cjs')
+  await writeFile(bin, `#!${process.execPath}
+if (process.argv.includes('--version')) { console.log('protocol fixture'); process.exit(0) }
+require('node:fs').writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)))
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'default-route-proof' }))
+console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"ok":true}' } }))
+console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }))
+`, { mode: 0o755 })
+  bridge = await startServer({
+    config: { ...loadConfig({
+      BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(directory, 'state'), BRIDGE_BACKENDS: 'codex',
+      BRIDGE_BEARER: 'test-only', BRIDGE_TRACE: 'off', CODEX_BIN: bin,
+    }), port: 0 },
+    handleSignals: false,
+    quiet: true,
+  })
+  for (const [provider, model] of [
+    ['openai', 'default'], ['custom', 'default'], ['custom', 'private-model'], ['custom', 'nested/model'],
+  ]) {
+    await context.test(`${provider}/${model}`, async () => {
+      const executor = createExecutor({
+        backend: 'bridge', bridgeUrl: bridge!.url, bridgeBearer: 'test-only',
+        sessionId: `codex-default-${provider}-${model.replaceAll('/', '-')}`,
+      })(
+        { profile: { name: 'codex-default-proof', harness: 'codex', model: { provider, default: `${provider}/${model}` } }, harness: null },
+        { signal: new AbortController().signal, seams: {} },
+      )
+      const run = executor.execute('prove the configured route', new AbortController().signal)
+      if (!isAsyncIterable(run)) throw new Error('bridge execution did not stream')
+      const events: unknown[] = []
+      for await (const event of run) events.push(event)
+      assert.ok(!events.some(event => (event as { kind?: string }).kind === 'failure'), JSON.stringify(events))
+      const argv: string[] = JSON.parse(await readFile(argvPath, 'utf8'))
+      assert.ok(argv.includes(`model_provider="${provider}"`), JSON.stringify(argv))
+      assert.deepEqual(argv.filter(arg => arg.startsWith('model=')), model === 'default' ? [] : [`model="${model}"`])
+    })
+  }
 })

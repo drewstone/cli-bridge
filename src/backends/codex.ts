@@ -562,18 +562,8 @@ export class CodexBackend implements Backend {
   }
 
   private extractModel(fullModel: string): string | null {
-    const lower = fullModel.toLowerCase()
-    if (lower === 'codex') return null
-    // `codex/default` is the alias for "no model override; let codex
-    // CLI use whatever ~/.codex/config.toml resolves to". Returning
-    // null here suppresses the `-c model="..."` flag in chat() so the
-    // call works on accounts without entitlement for the gated alias.
-    if (lower === 'codex/default') return null
-    if (lower.startsWith('codex/')) {
-      const rest = fullModel.slice('codex/'.length)
-      return rest.length > 0 ? rest : null
-    }
-    return null
+    if (!fullModel.toLowerCase().startsWith('codex/')) return null
+    return fullModel.slice('codex/'.length) || null
   }
 }
 
@@ -589,18 +579,17 @@ function codexTransferChatRequest(request: ContextTransferRequest): ChatRequest 
 
 /**
  * Split a provider-qualified codex model remainder (`openai/gpt-5.1-codex`)
- * into its `model_provider` / `model` config pair. A remainder with no slash
- * is a bare model id under the account's default provider. Codex model ids
- * themselves never contain `/` (OSS variants use `:`), so the first segment
- * is always the provider when a slash is present.
+ * into its `model_provider` / `model` config pair, preserving nested model ids.
+ * `default` omits only the model override, retaining an explicit provider.
  */
 export function splitCodexModel(
   remainder: string | null,
 ): { provider: string | null; model: string | null } {
   if (!remainder) return { provider: null, model: null }
   const slash = remainder.indexOf('/')
-  if (slash <= 0) return { provider: null, model: remainder }
-  return { provider: remainder.slice(0, slash), model: remainder.slice(slash + 1) }
+  const provider = slash > 0 ? remainder.slice(0, slash) : null
+  const model = slash > 0 ? remainder.slice(slash + 1) : remainder
+  return { provider, model: model.toLowerCase() === 'default' ? null : model }
 }
 
 /**
