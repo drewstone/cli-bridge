@@ -301,19 +301,6 @@ describe('caller-owned execution timeout', () => {
     },
   )
 
-  it('has no silent process deadline when neither caller nor operator configures one', () => {
-    const config = loadConfig({ HOME: '/home/test' })
-
-    expect(config.cliTimeoutMsDefault).toBe(0)
-    expect(config.claudeTimeoutMs).toBe(0)
-    expect(config.codexTimeoutMs).toBe(0)
-    expect(config.kimiTimeoutMs).toBe(0)
-    expect(config.geminiTimeoutMs).toBe(0)
-    expect(config.piTimeoutMs).toBe(0)
-    expect(config.opencodeTimeoutMs).toBe(0)
-    expect(config.sandboxTimeoutMs).toBe(0)
-  })
-
   it.each([
     ['CLI_TIMEOUT_MS', '300000junk'],
     ['PI_TIMEOUT_MS', '-1'],

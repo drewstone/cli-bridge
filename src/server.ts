@@ -7,7 +7,7 @@ import { DurableRunWriter } from './sessions/durable-writer.js'
  * trusts the caller is authorized if it got this far.
  */
 
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
@@ -324,7 +324,7 @@ async function buildExecutorForBackend(
   })
 }
 
-export async function buildApp(config: Config): Promise<{
+export async function buildApp(config: Config, cwd = process.cwd()): Promise<{
   app: Hono
   sessions: SessionStore
   registry: BackendRegistry
@@ -433,7 +433,7 @@ export async function buildApp(config: Config): Promise<{
   // is created only after every backend is registered so capability discovery
   // and model routing use the same registry as one-shot chat.
   const codexBackend = registry.byName('codex')
-  const nativeCatalog = createNativeCatalog(config, codexBackend instanceof CodexBackend ? codexBackend.readCatalog : undefined)
+  const nativeCatalog = createNativeCatalog(config, codexBackend instanceof CodexBackend ? codexBackend.readCatalog : undefined, cwd)
   const retained = new RetainedSessionService({ store: sessions, registry, runs, admitSubscription: nativeCatalog.admit })
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
 
@@ -547,6 +547,7 @@ async function disposeApp(built: Pick<Awaited<ReturnType<typeof buildApp>>, 'ses
 
 export async function startServer(options: StartServerOptions = {}): Promise<BridgeServer> {
   const config = structuredClone(options.config ?? loadConfig())
+  const cwd = resolve(options.cwd ?? process.cwd())
   assertListenerConfig(config, true)
   const jailFloor = config.jailMode
   if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends, config.executors) && !(await selectJailBackend().isAvailable())) {
@@ -564,7 +565,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     // The OS owns ephemeral listener allocation; a shared port-0 pidfile would serialize unrelated embedded servers.
     if (config.port !== 0) instanceLock = acquireInstanceLock(config.port)
     reapStalePrivateTemporaryRoots()
-    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir })
+    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir }, cwd)
   } catch (error) {
     if (!(error instanceof UnconfirmedBridgeCleanup)) release()
     throw error

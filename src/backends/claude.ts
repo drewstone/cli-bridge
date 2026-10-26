@@ -201,7 +201,7 @@ function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
  * `CLAUDE_CODE_OAUTH_TOKEN` keep working. Measured against Claude Code 2.1.299
  * by tests/claude-host-isolation.real.test.ts.
  */
-const HOST_ISOLATED_SETTING_SOURCES = 'project,local'
+export const CLAUDE_SETTING_SOURCE_FLAGS = ['--setting-sources', 'project,local'] as const
 
 export interface ClaudeBackendOptions {
   bin: string
@@ -640,9 +640,9 @@ export class ClaudeBackend implements Backend {
 
     // The host user's `~/.claude` layer never reaches a bridged turn; the
     // caller provides every context source it wants (profile, system
-    // prompt, MCP servers, prompt content). See HOST_ISOLATED_SETTING_SOURCES
+    // prompt, MCP servers, prompt content). See CLAUDE_SETTING_SOURCE_FLAGS
     // for why this is not `--bare`; chat() also turns off auto-memory.
-    args.push('--setting-sources', HOST_ISOLATED_SETTING_SOURCES)
+    args.push(...CLAUDE_SETTING_SOURCE_FLAGS)
 
     // Per-mode permission posture. Native tools (Bash/Read/Edit/etc.)
     // STAY ENABLED by design — the LLM should have full agentic

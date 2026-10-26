@@ -3,6 +3,7 @@ import { BackendError, type ChatRequest, type NativeSubscriptionInvocation } fro
 import { localHarnesses, type Config } from './config.js'
 import { detectLocalSeats, type LocalSeat } from './local-seats.js'
 import type { ModelEntry } from './model-entry.js'
+import { CLAUDE_SETTING_SOURCE_FLAGS } from './backends/claude.js'
 
 export type CatalogRow = Omit<ModelEntry, 'authentication'>
 export type NativeModelFacts = Omit<LocalSeat, 'harness'>
@@ -10,22 +11,21 @@ export type CodexCatalogReader = (options: { model: string; cwd: string; env: No
 const unknown = (fix?: string): NativeModelFacts => ({ provider: null, status: 'unknown', authMode: 'unknown', source: 'native_status', ...(fix ? { fix } : {}) })
 
 /** Native configuration/auth facts stay on the Bridge host. Each context is fresh for admission. */
-export function createNativeCatalog(config: Config, codex?: CodexCatalogReader) {
-  const context = (cwd: string, signal?: AbortSignal, sourceEnv: NodeJS.ProcessEnv = process.env, flags: readonly string[] = []) => {
+export function createNativeCatalog(config: Config, codex?: CodexCatalogReader, cwd = process.cwd()) {
+  const context = (cwd: string, signal?: AbortSignal, sourceEnv: NodeJS.ProcessEnv = process.env, flags?: readonly string[]) => {
     const cache = new Map<string, Promise<NativeModelFacts>>()
     return (row: CatalogRow): Promise<NativeModelFacts> => {
       const key = `${row.backend}:${row.provider ?? ''}:${row.backend === 'codex' || row.backend === 'pi' ? row.id : ''}`
-      let pending = cache.get(key)
-      if (!pending) {
-        const descriptor = localHarnesses.find(([, harness]) => harness === row.backend)
-        pending = (async (): Promise<NativeModelFacts> => {
-          if (!descriptor) return { ...unknown(), provider: row.provider }
-          if (descriptor[0] === 'codex') return codex ? await codex({ model: row.id, cwd, env: sourceEnv, flags, signal }) : unknown('codex login status')
-          return (await detectLocalSeats({ config, harnesses: [descriptor[1]], provider: row.provider ?? undefined, model: nativeModel(row.id), env: sourceEnv, flags, cwd, signal }))[0]!
-        })().catch((error) => { signal?.throwIfAborted(); return unknown(descriptor?.[2]) })
-        cache.set(key, pending)
-      }
-      return pending
+      const pending = cache.get(key)
+      if (pending) return pending
+      const descriptor = localHarnesses.find(([, harness]) => harness === row.backend)
+      const facts = (async (): Promise<NativeModelFacts> => {
+        if (!descriptor) return { ...unknown(), provider: row.provider }
+        if (descriptor[0] === 'codex') return codex ? await codex({ model: row.id, cwd, env: sourceEnv, flags: flags ?? [], signal }) : unknown('codex login status')
+        return (await detectLocalSeats({ config, harnesses: [descriptor[1]], provider: row.provider ?? undefined, model: nativeModel(row.id), env: sourceEnv, flags: flags ?? (row.backend === 'claude-code' ? CLAUDE_SETTING_SOURCE_FLAGS : []), cwd, signal }))[0]!
+      })().catch((error) => { signal?.throwIfAborted(); return unknown(descriptor?.[2]) })
+      cache.set(key, facts)
+      return facts
     }
   }
   return {
@@ -67,7 +67,7 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader) 
       } }
     },
     async describe(rows: readonly CatalogRow[]): Promise<ModelEntry[]> {
-      const read = context(process.cwd())
+      const read = context(cwd)
       const output: ModelEntry[] = []
       for (const row of rows) {
         const facts = await read(row)

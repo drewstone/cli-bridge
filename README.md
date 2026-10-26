@@ -26,7 +26,8 @@ includes the existing TypeScript server and its runtime loader, so it needs no
 repository build or development dependencies. `cli-bridge` starts the normal server.
 
 Applications may import `{ loadConfig, startServer }` from `cli-bridge` and call
-`await startServer({ config: { ...loadConfig(env), port: 0 }, handleSignals: false, quiet: true })`.
+`await startServer({ config: { ...loadConfig(env), port: 0 }, cwd: workspace, handleSignals: false, quiet: true })`.
+`cwd` pins baseline model discovery to that workspace and the backend's default settings policy. Fresh admission uses each final invocation's cwd, environment and flags.
 The returned `{ url, close }` is ready to serve; `await close()` stops only that
 server and its owned work. Embedded mode leaves process signals and error handlers
 with the caller. Use a private data directory and a generated bearer in `env`.
@@ -240,7 +241,7 @@ Only `POST /v1/runs/:id/cancel` sends the backend abort signal.
 
 Set `execution.timeoutMs` to a positive integer up to `2147483647` to bound the backend process in milliseconds.
 The deadline belongs to the durable run, so disconnecting and replaying do not stop or restart it.
-If the field is omitted, the matching backend's timeout environment setting is an operator fallback; all timeout fallbacks default to `0`, which means no deadline.
+If omitted, the matching backend's timeout environment setting applies. Codex defaults to the bounded native launch policy in [`src/config.ts`](src/config.ts); other backends retain their existing defaults. Explicit operator values, including zero, and request overrides keep precedence. This bounds each launch, independently of a workflow's total horizon; a timed-out graph leaf does not automatically renew.
 An explicit request value always wins over that fallback and is also forwarded to sandbox tasks and the OpenCode wrapper.
 `CLI_BRIDGE_SCOPE_RUNTIME_MAX_SEC` and `BRIDGE_SLOT_MAX_HOLD_MS` are separate operator safety caps; both default to disabled and may preempt a longer request only when an operator explicitly configures them.
 

@@ -3,6 +3,7 @@ import type { Config } from './config.js'
 export interface StartServerOptions {
   /** Omit to use environment configuration. Port 0 selects an ephemeral listener. */
   config?: Config
+  cwd?: string
   /** Embedded callers retain ownership of signals and process-wide error handlers. */
   handleSignals?: boolean
   quiet?: boolean
