@@ -102,7 +102,9 @@ export class CodexContextTransfer implements PreparedContextTransfer {
 
   /** Read configuration and account metadata without creating a thread, refreshing auth, or starting a turn. */
   async readNativeFacts(cwd: string): Promise<NativeModelFacts> {
-    const configuration = nativeObject((await this.rpc('config/read', { cwd, includeLayers: false })).config)
+    const response = await this.rpc('config/read', { cwd, includeLayers: false })
+    const configuration = nativeObject(response.config)
+    const origins = nativeObject(response.origins)
     const account = await this.rpc('account/read', { refreshToken: false })
     // Codex's native config reference defines the omitted provider as openai.
     const provider = configuration.model_provider == null ? 'openai' : safeNativeId(configuration.model_provider) ?? null
@@ -124,11 +126,13 @@ export class CodexContextTransfer implements PreparedContextTransfer {
     const type = nativeObject(account.account).type
     const overrides = nativeObject(nativeObject(configuration.model_providers)[provider ?? ''])
     const builtin = provider === 'openai' && Object.keys(overrides).length === 0
-      && !configuration.openai_base_url && !configuration.chatgpt_base_url && !configuration.profile
+      && !origins.openai_base_url && !origins.chatgpt_base_url && !configuration.profile
+    const subscription = type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true
+    const signedOut = account.account === null && builtin && account.requiresOpenaiAuth === true
     return { provider, ...(model && model !== 'default' ? { model } : {}), authentication: {
-      status: type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true ? 'authenticated' : type === 'apiKey' ? 'configured' : account.account === null && builtin && account.requiresOpenaiAuth === true ? 'signed_out' : 'unknown',
-      authMode: type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true ? 'subscription' : type === 'apiKey' ? 'api_key' : 'unknown',
-      source: 'native_status', ...(type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true ? {} : { fix: 'codex login status' }),
+      status: subscription ? 'authenticated' : type === 'apiKey' ? 'configured' : signedOut ? 'signed_out' : 'unknown',
+      authMode: subscription ? 'subscription' : type === 'apiKey' ? 'api_key' : 'unknown',
+      source: 'native_status', ...(subscription ? {} : { fix: signedOut ? 'codex login' : 'codex login status' }),
     } }
   }
 

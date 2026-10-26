@@ -356,7 +356,7 @@ export class ClaudeBackend implements Backend {
     args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
+      await admitNativeSubscription(req, { env: childEnv, args, flags: args,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.bin, args, {
         stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],

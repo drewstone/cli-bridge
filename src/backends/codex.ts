@@ -91,7 +91,7 @@ export class CodexBackend implements Backend {
     try {
       await native.initialize()
       const facts = await native.readNativeFacts(cwd)
-      const key = ['CODEX_API_KEY', 'OPENAI_API_KEY'].find((name) => effectiveEnv[name]?.trim())
+      const key = effectiveEnv.CODEX_API_KEY?.trim() ? 'CODEX_API_KEY' : undefined
       if (key) facts.authentication = { status: 'configured', authMode: 'api_key', source: 'native_status', fix: process.env[key] === effectiveEnv[key] ? `unset ${key}` : 'codex login status' }
       if (effectiveEnv.OPENAI_BASE_URL || effectiveEnv.CODEX_ACCESS_TOKEN) facts.authentication = { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' }
       return facts
