@@ -17,12 +17,12 @@ const maxExecutionTimeoutMs = 2_147_483_647
 
 /** Native harness identities only; model selection and seat syntax belong to agent-interface. */
 export const localHarnesses = [
-  ['claude', 'claude-code', 'claude auth login', ['auth', 'status', '--json']],
-  ['codex', 'codex', 'codex login', ['login', 'status']],
-  ['opencode', 'opencode', 'opencode auth login', ['auth', 'list', '--pure']],
-  ['kimi', 'kimi-code', 'kimi login', ['--version']],
-  ['gemini', 'gemini', 'gemini', ['--version']],
-  ['pi', 'pi', 'pi', ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh']],
+  ['claude', 'claude-code', 'claude auth login', ['auth', 'status', '--json'], 'anthropic'],
+  ['codex', 'codex', 'codex login', ['login', 'status'], 'openai'],
+  ['opencode', 'opencode', 'opencode auth login', ['auth', 'list', '--pure'], null],
+  ['kimi', 'kimi-code', 'kimi login', ['--version'], null],
+  ['gemini', 'gemini', 'gemini', ['--version'], 'google'],
+  ['pi', 'pi', 'pi', ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null],
 ] as const
 
 type NativeHarnessConfig = {
@@ -37,6 +37,8 @@ export interface Config extends NativeHarnessConfig {
   /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
   asyncDurableWrites: boolean
   backends: Set<string>
+  /** Dedicated subscription consumers refuse API and unverified native routes. */
+  subscriptionsOnly: boolean
   factoryBin: string
   ampBin: string
   forgeBin: string
@@ -300,6 +302,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir,
     asyncDurableWrites: parseOnOff('BRIDGE_ASYNC_DURABLE_WRITES', env.BRIDGE_ASYNC_DURABLE_WRITES, false),
     backends,
+    subscriptionsOnly: parseOnOff('BRIDGE_SUBSCRIPTIONS_ONLY', env.BRIDGE_SUBSCRIPTIONS_ONLY, false),
     ...Object.fromEntries(localHarnesses.flatMap(([name]) => [
       [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? name],
       [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], defaultTimeout)],

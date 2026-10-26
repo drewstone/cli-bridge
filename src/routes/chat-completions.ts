@@ -43,6 +43,7 @@ import type { Backend, ChatDelta, ChatRequest, ProtectedModelCredential } from '
 import { ExecutorConfigurationError, ExecutorSaturatedError } from '../executors/types.js'
 import { resolveHostAcquireDeadlineMs } from '../executors/host.js'
 import { BackendError } from '../backends/types.js'
+import { describeRunFailure } from '../runs/error-shape.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
@@ -381,6 +382,7 @@ export function mountChatCompletions(
   app: Hono,
   deps: {
     registry: BackendRegistry
+    admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void>
     /** Captured operator jail defaults; standalone mounts retain process defaults. */
     jailEnv?: NodeJS.ProcessEnv
     sessions: SessionStore
@@ -937,18 +939,13 @@ export function mountChatCompletions(
         req.cwd = session.cwd
       }
       const profile = assertProfileRequestAuthority(req, session)
+      await deps.admitSubscription?.(req, backend.name, run.signal)
       if (backend.name === 'pi') assertPiOutputTokenRequest(req, profile)
       const sessionProfileBinding = exactSessionProfileBinding(req, session)
       if (session) {
         assertSessionProfileBinding(session, sessionProfileBinding)
       }
-      // Name the agent on this run's span. Placed here because this is the
-      // first point where the effective profile is settled for BOTH sources
-      // that can supply it — the request body and the session being resumed —
-      // and it costs nothing: the binding already hashed the profile, and
-      // `resolveAgentProfile` memoizes per request, so the digest stamped here
-      // is the same string as the run's `effectiveProfileDigest`, not a second
-      // computation that could disagree with it.
+      // Record the same effective profile binding that owns this invocation.
       if (sessionProfileBinding) {
         recorder?.recordNode({
           profileDigest: sessionProfileBinding.effectiveProfileDigest,
@@ -1765,11 +1762,7 @@ function errorResponse(c: Context, err: unknown): Response {
   if (err instanceof ExecutorConfigurationError) {
     return c.json({ error: { message: err.message, type: err.code } }, 501)
   }
-  // A failure the backend YIELDED as a terminal error delta rather than throwing.
-  // It reaches here through `run.failure()`, and it is an upstream fault by
-  // construction — the CLI ran and ended badly — so 502, or 504 when the reason
-  // is a timeout. Falling through to the generic 500 below would have relabelled
-  // every upstream fault as a bridge fault.
+  // Yielded native failures are upstream faults: 504 on timeout, otherwise 502.
   if (err instanceof BackendReportedFailureError) {
     return c.json(
       { error: { message: err.message, type: err.code, ...providerDispatchMetadata(err) } },
@@ -1777,6 +1770,10 @@ function errorResponse(c: Context, err: unknown): Response {
     )
   }
   if (err instanceof BackendError) {
+    if (err.code === 'subscription_required') {
+      const error = describeRunFailure(err)
+      return c.json({ error }, error.status === 403 ? 403 : 500)
+    }
     if (err.code === 'parse_error') {
       return c.json(
         { error: { message: err.message, type: err.code, ...providerDispatchMetadata(err) } },

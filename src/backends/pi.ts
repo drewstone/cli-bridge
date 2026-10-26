@@ -1,56 +1,7 @@
-/**
- * Pi CLI backend — `pi --print --mode json` from @mariozechner/pi-coding-agent.
- *
- * Pi is a multi-provider coding agent (anthropic / openai / google / deepseek /
- * moonshot / zai-glm / custom-extension providers). The bridge fronts it the
- * same way it fronts opencode/kimi: spawn the CLI per-request, translate the
- * NDJSON event stream to OpenAI chat deltas.
- *
- * Model id scheme: `pi/<provider>/<model>` — callers select pi as the harness
- * and a provider+model registered in pi's settings (see `pi --list-models`).
- * Provider and model are both required so the bridge can pin the exact
- * credential-free child configuration before Pi starts.
- *
- * Auth: the bridge resolves provider auth before Pi starts and forwards model
- * traffic through a request-scoped loopback endpoint. Pi and every tool it
- * launches receive neither the daemon credential nor ambient GitHub/provider
- * variables.
- *
- * MCP: MCP support comes from the `pi-mcp-adapter` extension. A profile-less
- * request may use X-Mcp-Config/body `mcp.mcpServers`; an exact profile uses
- * `agent_profile.mcp`. The bridge writes the selected set to a unique config and
- * passes it through the adapter's `--mcp-config` flag. Concurrent Pi agents may
- * therefore share a task cwd without sharing control config. If the adapter is NOT
- * installed the request is REJECTED (`not_configured`) instead of
- * silently dropping the servers — a run whose tools never existed must
- * fail loudly, not score zero structurally. Detection: `pi-mcp-adapter`
- * in the pi agent dir's npm node_modules or `settings.json` packages
- * (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`);
- * `CLI_BRIDGE_PI_MCP_ADAPTER=0` can disable it explicitly.
- *
- * Event shapes we parse (from `pi --print --mode json`):
- *
- *   {"type":"session","id":"<uuid>",...}
- *   {"type":"agent_start"}
- *   {"type":"turn_start"}
- *   {"type":"message_update","assistantMessageEvent":{
- *      "type":"thinking_delta"|"text_delta"|"tool_call_start"|...,
- *      "delta":"...", "contentIndex":N, ... }}
- *   {"type":"message_update","assistantMessageEvent":{
- *      "type":"toolcall_start"|"toolcall_end",
- *      "partial":{"content":[{"type":"toolCall",...}]},
- *      "toolCall":{...} }}
- *   {"type":"tool_execution_start","toolCallId":"...","toolName":"...","args":{...}}
- *   {"type":"turn_end","message":{"usage":{...}}}
- *   {"type":"agent_end","messages":[...]}
- *
- * We surface text_delta as ChatDelta.content, pi tool-call lifecycle events
- * as OpenAI-shaped tool_calls, and thinking_delta as ChatDelta.reasoning, so
- * downstream consumers (SSE, retained_events, traces) keep both the visible
- * output and the model's reasoning. Reasoning deltas are coalesced — see
- * REASONING_FLUSH_CHARS / REASONING_FLUSH_MS below. thinking_start and
- * thinking_end are boundary markers and are dropped; a reasoning block ends
- * when the next non-reasoning delta arrives.
+/** Pi native JSON/RPC transport for explicit pi/<provider>/<model> routes.
+ * Provider credentials stay in a trusted proxy; agents/tools receive only a scoped loopback token.
+ * MCP requires the installed pi-mcp-adapter and exact profile/request configuration, otherwise refuse.
+ * Native text/thinking/tool/usage events retain their OpenAI and canonical event projections below.
  */
 
 import { existsSync, readFileSync } from 'node:fs'
@@ -609,7 +560,9 @@ export class PiBackend implements NativeSessionBackend {
       const resolvedInference = await this.transportResolver({
         provider: spec.provider,
         model: spec.model,
-      }, signal, req.protectedModelCredential, prestartId)
+      }, signal, req.protectedModelCredential, prestartId, req.subscriptionAdmission?.check)
+      req.subscriptionAdmission?.require()
+      if (req.subscriptionAdmission) Object.freeze(resolvedInference)
       advancePhase('provision_transport')
       inference = await provisionPiInferenceTransport(
         resolvedInference,
@@ -672,10 +625,7 @@ export class PiBackend implements NativeSessionBackend {
         env: {
           ...piToolProcessEnvironment(process.env, req.env ?? {}),
           PI_CODING_AGENT_DIR: inference.agentDir,
-          // Request-owned, never inherited: adding TRACEPARENT to the
-          // allowlist above would leak the bridge DAEMON's own ambient trace
-          // context into every child and mis-parent its spans. Absent caller
-          // correlation contributes no keys, so the env is unchanged.
+          // Only request-owned trace context may parent the child; daemon ambient context stays stripped.
           ...traceContextToChildEnv(req.childTrace),
           ...(provisioned?.env ?? {}),
           ...(requestedMcpNames.length > 0

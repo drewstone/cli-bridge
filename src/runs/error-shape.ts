@@ -1,18 +1,5 @@
-/**
- * One place that turns a thrown failure into the `{ message, type }` pair a
- * caller sees, so a reason cannot be lost between the run buffer and the HTTP
- * response.
- *
- * Kept free of route and backend imports on purpose: the run registry owns the
- * buffered stream and must be able to attach the reason to the terminal delta
- * itself. The mapping is therefore structural — a `code` string on the error, or
- * the class name — rather than a list of `instanceof` checks, which also means a
- * new typed error surfaces its own code without touching this file.
- *
- * `type` is advisory metadata for the caller. HTTP status selection stays with
- * the route's `errorResponse`, which maps the real error object, so a failure
- * before the first delta and the same failure after it produce the same status.
- */
+/** Shared allowlisted failure description for HTTP, SSE and durable replay. */
+import { BackendError, type SubscriptionFailureMetadata } from '../backends/types.js'
 
 /** Error classes whose name alone determines the reported type. */
 const TYPE_BY_ERROR_NAME: Record<string, string> = {
@@ -20,7 +7,7 @@ const TYPE_BY_ERROR_NAME: Record<string, string> = {
   RunReplayCursorError: 'invalid_replay_cursor',
 }
 
-export interface RunFailureDescription {
+export interface RunFailureDescription extends Partial<SubscriptionFailureMetadata> {
   message: string
   type: string
   provider_dispatch?: 'not_started'
@@ -39,6 +26,18 @@ export interface RunFailureDescription {
 }
 
 export function describeRunFailure(error: unknown): RunFailureDescription {
+  if (error instanceof BackendError && error.code === 'subscription_required' && error.providerDispatch === 'not_started') {
+    const candidate = error
+    const metadata = candidate.subscription
+    if (metadata && ['api_key_selected', 'provider_unresolved', 'subscription_unverified', 'not_authenticated'].includes(metadata.cause)
+      && typeof metadata.fix === 'string' && metadata.fix.trim().length > 0 && metadata.fix.length <= 256
+      && typeof metadata.harness === 'string' && /^[A-Za-z0-9._-]{1,64}$/u.test(metadata.harness)
+      && (metadata.provider === null || typeof metadata.provider === 'string' && /^[A-Za-z0-9._-]{1,128}$/u.test(metadata.provider))) {
+      return { type: 'subscription_required', message: String(candidate.message ?? 'Subscription authentication is required').slice(0, 512),
+        cause: metadata.cause, fix: metadata.fix, harness: metadata.harness, provider: metadata.provider,
+        provider_dispatch: 'not_started', status: 403 }
+    }
+  }
   const message = error instanceof Error ? error.message : String(error)
   const providerDispatch = providerDispatchFromError(error)
   return {
@@ -49,18 +48,7 @@ export function describeRunFailure(error: unknown): RunFailureDescription {
   }
 }
 
-/**
- * The failure a backend ENDED a run with by yielding a terminal error delta
- * rather than throwing.
- *
- * It exists so `Run.failure()` is populated for both routes into a terminal
- * error, because the reader turns exactly that value into an HTTP status.
- * Measured on af03d59: opencode yields `{ finish_reason: 'error' }` with no
- * reason on abort and after an error event, the registry's catch block never
- * ran, and the caller received HTTP 200 with `content: ""` and no `error` key —
- * which a benchmark harness scores 0.000, indistinguishable from a model that
- * answered nothing.
- */
+/** A yielded provider failure becomes a recorded run failure for HTTP/replay status selection. */
 export class BackendReportedFailureError extends Error {
   readonly providerDispatch?: 'not_started'
 
@@ -75,19 +63,13 @@ export class BackendReportedFailureError extends Error {
   }
 }
 
-/**
- * The reason for a terminal error/timeout delta, guaranteed non-empty.
- *
- * A backend that knows its reason attaches it and this preserves it verbatim.
- * One that does not gets a reason that says so plainly and names where to look,
- * because "the bridge cannot attribute this" is honest and an empty message is
- * not. `label` is the backend/CLI name when known.
- */
+/** Yielded worker failures cannot claim Bridge admission authority; unclassified terminals stay explicit. */
 export function reasonForTerminalDelta(
   finishReason: 'error' | 'timeout',
   existing: RunFailureDescription | undefined,
   label: string,
 ): RunFailureDescription {
+  if (existing?.type === 'subscription_required') return { message: existing.message, type: 'upstream', status: 502 }
   if (existing && existing.message.length > 0) return existing
   if (finishReason === 'timeout') {
     return {
@@ -112,14 +94,7 @@ function failureType(error: unknown): string {
   return 'server_error'
 }
 
-/**
- * Lift a capacity refusal's own fields onto the reported failure.
- *
- * Structural, like `failureType`: an executor error declares `httpStatus`,
- * `capacity` and a snapshot, and this file stays free of executor imports. A
- * frame without these fields forced clients to sniff the message text to tell
- * "queue was full, nothing ran, retry costs nothing" from a mid-stream fault.
- */
+/** Preserve the executor's typed capacity/status counts without interpreting prose. */
 function capacityFromError(error: unknown): Pick<RunFailureDescription, 'status' | 'capacity' | 'executor'> {
   if (typeof error !== 'object' || error === null) return {}
   const candidate = error as {

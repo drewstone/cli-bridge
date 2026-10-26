@@ -208,7 +208,28 @@ export interface NetJailRequest {
   allow?: string[]
 }
 
+/** Final native execution inputs, after profile and credential configuration. Never a wire field. */
+export interface NativeSubscriptionInvocation {
+  env: NodeJS.ProcessEnv
+  cwd: string
+  model: string
+  args?: string[]
+  flags?: readonly string[]
+  envPassthroughKeys?: readonly string[]
+  provider?: string | null
+  endpoint?: string
+  credentialOverride?: boolean
+  executor?: 'host' | 'docker' | 'test-double'
+}
+
+export interface NativeSubscriptionAdmission {
+  check(invocation: NativeSubscriptionInvocation): Promise<void>
+  require(): void
+}
+
 export interface ChatRequest {
+  /** Bound only by Bridge admission; caller JSON and worker deltas cannot supply authority. */
+  subscriptionAdmission?: NativeSubscriptionAdmission
   model: string
   messages: ChatMessage[]
   stream?: boolean
@@ -418,6 +439,7 @@ export interface BackendFailureReason {
  */
 export const BRIDGE_RESERVED_FAILURE_CODES: ReadonlySet<string> = new Set([
   'not_configured',
+  'subscription_required',
   'cli_missing',
   'timeout',
   'aborted',
@@ -671,6 +693,7 @@ export interface NativeSession {
   onClose(listener: (reason: Error) => void): () => void
   whenClosed(): Promise<void>
   providerSessionId(): string | null
+  admitSubscription?(admission: NativeSubscriptionAdmission): Promise<void>
   turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown>
   steer?(prompt: string): Promise<void>
   abort(): Promise<void>
@@ -712,17 +735,26 @@ export function wantsJsonObject(req: ChatRequest): boolean {
   return req.responseFormat?.type === 'json_object'
 }
 
+export interface SubscriptionFailureMetadata {
+  cause: 'api_key_selected' | 'provider_unresolved' | 'subscription_unverified' | 'not_authenticated'
+  fix: string
+  harness: string
+  provider: string | null
+}
+
 export class BackendError extends Error {
   readonly providerDispatch?: 'not_started'
+  readonly subscription?: SubscriptionFailureMetadata
 
   constructor(
     message: string,
-    public readonly code: 'not_configured' | 'cli_missing' | 'upstream' | 'timeout' | 'aborted' | 'parse_error' | 'capability_denied',
+    public readonly code: 'subscription_required' | 'not_configured' | 'cli_missing' | 'upstream' | 'timeout' | 'aborted' | 'parse_error' | 'capability_denied',
     public readonly cause?: unknown,
-    options?: { providerDispatch?: 'not_started' },
+    options?: { providerDispatch?: 'not_started'; subscription?: SubscriptionFailureMetadata },
   ) {
     super(message)
     this.name = 'BackendError'
     this.providerDispatch = options?.providerDispatch
+    this.subscription = options?.subscription
   }
 }

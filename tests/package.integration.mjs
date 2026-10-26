@@ -31,12 +31,14 @@ test('packed production install embeds isolated HTTP services and runs the exist
   assert.ok(manifest.dependencies.tsx, 'the existing loader must be installed in production')
   assert.equal(manifest.devDependencies?.tsx, undefined)
   await writeFile(join(root, 'consumer.mts'), `
-    import { loadConfig, startServer, detectLocalSeats, type LocalSeat, type BridgeServer } from 'cli-bridge';
+    import { loadConfig, startServer, detectLocalSeats, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
     const run = async (): Promise<BridgeServer> => startServer({ config, handleSignals: false, quiet: true });
     void run;
     const seats: Promise<LocalSeat[]> = detectLocalSeats({ config });
     void seats;
+    const model: ModelEntry = { id: 'codex/native', object: 'model', backend: 'codex', provider: 'openai', authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status' } };
+    void model;
   `)
   await command(join(repo, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--skipLibCheck', 'false',
     '--module', 'nodenext', '--moduleResolution', 'nodenext', '--target', 'es2022',
@@ -70,7 +72,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
     delete process.env.CODEX_API_KEY; delete process.env.CODEX_ACCESS_TOKEN; delete process.env.OPENAI_API_KEY;
     const native = await detectLocalSeats({ config: { ...missingConfig, codexBin: process.env.PACKAGE_NATIVE_CODEX } });
     assert.deepEqual(native.find((seat) => seat.harness === 'codex'), {
-      harness: 'codex', status: 'signed_out', authMode: 'unknown', source: 'native_status', fix: 'codex login',
+      harness: 'codex', provider: null, status: 'signed_out', authMode: 'unknown', source: 'native_status', fix: 'codex login',
     });
     await assert.rejects(startServer({ config: { ...base, host: '0.0.0.0' }, handleSignals: false }), /BRIDGE_BEARER/);
     assert.equal(existsSync(directory), false);

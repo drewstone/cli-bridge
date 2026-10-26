@@ -26,6 +26,7 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
+  admitNativeSubscription,
   buildMcpAllowList,
   writeMcpConfigFile,
   renderLocalHarnessProfilePreamble,
@@ -355,6 +356,8 @@ export class ClaudeBackend implements Backend {
     args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
+      await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
+        cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.bin, args, {
         stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
         cwd,

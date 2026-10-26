@@ -12,19 +12,17 @@ import type { BackendRegistry } from '../backends/registry.js'
 import type { ProfileCatalog } from '../profiles/loader.js'
 import { discoverModels, parseOpencodeModels, parsePiModels, type ModelSpec } from '../lib/model-discovery.js'
 
-interface ModelEntry {
-  id: string
-  object: 'model'
-  backend: string
-  note?: string
-}
+import type { ModelEntry } from '../model-entry.js'
+type CatalogRow = Omit<ModelEntry, 'authentication'>
 
-const CODEX_MODELS = [
-  'default',
-  'gpt-5-codex',
-  'gpt-5.4',
-  'gpt-5.5',
-] as const
+const ALIASES: Record<string, readonly ModelSpec[]> = {
+  'claude-code': ['sonnet', 'opus', 'haiku'].map((id) => ({ id })),
+  'kimi-code': ['kimi-for-coding', 'kimi-k2.6'].map((id) => ({ id })),
+  claudish: ['openrouter@deepseek/deepseek-r1', 'google@gemini-2.0-flash', 'zai@glm-4.6'].map((id) => ({ id })),
+  codex: [{ id: 'default', note: 'native no-override wire route; concrete native model required for a canonical seat' }],
+  factory: [{ id: 'droid', note: 'stubbed' }], amp: [{ id: 'default', note: 'stubbed' }],
+  forge: [{ id: 'anthropic/claude-sonnet-4-5', note: 'stubbed' }],
+}
 
 // The opencode/pi catalogs are discovered live from each CLI's own model list
 // (see lib/model-discovery.ts). These curated arrays are the never-empty
@@ -73,116 +71,40 @@ const PI_PROVIDERS = providersOf(PI_MODELS)
 
 export function mountModels(
   app: Hono,
-  deps: { registry: BackendRegistry; catalog?: ProfileCatalog; opencodeBin?: string; piBin?: string },
+  deps: { registry: BackendRegistry; catalog?: ProfileCatalog; opencodeBin?: string; piBin?: string;
+    describe?: (rows: readonly CatalogRow[]) => Promise<ModelEntry[]> },
 ): void {
   app.get('/v1/models', async (c) => {
-    const data: ModelEntry[] = []
-
-    for (const b of deps.registry.all()) {
-      const health = await b.health()
-      if (health.state !== 'ready') continue
-
-      switch (b.name) {
-        case 'claude-code':
-          for (const model of ['sonnet', 'opus', 'haiku']) {
-            data.push({ id: `claude-code/${model}`, object: 'model', backend: b.name })
-          }
-          break
-        case 'kimi-code':
-          for (const model of ['kimi-for-coding', 'kimi-k2.6']) {
-            data.push({ id: `kimi-code/${model}`, object: 'model', backend: b.name })
-          }
-          break
-        case 'claudish':
-          // claudish accepts any <provider>@<model> string — just document
-          // a couple of examples; opencode/claudish's own docs list more.
-          for (const model of ['openrouter@deepseek/deepseek-r1', 'google@gemini-2.0-flash', 'zai@glm-4.6']) {
-            data.push({ id: `claudish/${model}`, object: 'model', backend: b.name })
-          }
-          break
-        case 'codex':
-          // `codex/default` ⇒ no `-c model=...` override; codex CLI uses
-          // whatever the user's local config specifies. Works on any
-          // codex subscription tier — including ChatGPT accounts that
-          // don't have entitlement for the gated `gpt-5-codex` alias.
-          for (const model of CODEX_MODELS) {
-            data.push({ id: `codex/${model}`, object: 'model', backend: b.name })
-          }
-          break
-        case 'opencode': {
-          const models = await discoverModels('opencode', {
-            bin: deps.opencodeBin ?? 'opencode',
-            args: ['models'],
-            providers: OPENCODE_PROVIDERS,
-            parse: parseOpencodeModels,
-            fallback: OPENCODE_MODELS,
-          })
-          for (const model of models) {
-            data.push({
-              id: `opencode/${model.id}`,
-              object: 'model',
-              backend: b.name,
-              ...(model.note ? { note: model.note } : {}),
-            })
-          }
-          break
-        }
-        case 'pi': {
-          const models = await discoverModels('pi', {
-            bin: deps.piBin ?? 'pi',
-            // Model discovery reads Pi's local catalog. Offline mode avoids
-            // unrelated startup network checks that can exceed our timeout.
-            args: ['--offline', '--list-models'],
-            providers: PI_PROVIDERS,
-            parse: parsePiModels,
-            fallback: PI_MODELS,
-          })
-          for (const model of models) {
-            data.push({
-              id: `pi/${model.id}`,
-              object: 'model',
-              backend: b.name,
-              ...(model.note ? { note: model.note } : {}),
-            })
-          }
-          break
-        }
-        case 'factory':
-          data.push({ id: 'factory/droid', object: 'model', backend: b.name, note: 'stubbed' })
-          break
-        case 'amp':
-          data.push({ id: 'amp/default', object: 'model', backend: b.name, note: 'stubbed' })
-          break
-        case 'forge':
-          data.push({ id: 'forge/anthropic/claude-sonnet-4-5', object: 'model', backend: b.name, note: 'stubbed' })
-          break
-        case 'passthrough':
-          for (const id of ['openai/gpt-4o', 'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'moonshot/kimi-k2-0905-preview', 'zai/glm-4.6']) {
-            data.push({ id, object: 'model', backend: b.name, note: 'forwards to vendor API — requires key' })
-          }
-          break
-        case 'sandbox':
-          // Cataloged AgentProfiles — each becomes an addressable model id.
-          // Inline profiles are also accepted via `model: "sandbox"` + body
-          // field `agent_profile`, but those don't appear in the listing.
-          for (const e of deps.catalog?.list() ?? []) {
-            data.push({
-              id: `sandbox/${e.id}`,
-              object: 'model',
-              backend: b.name,
-              note: e.profile.description ?? 'sandbox AgentProfile',
-            })
-          }
-          data.push({
-            id: 'sandbox',
-            object: 'model',
-            backend: b.name,
-            note: 'inline profile mode — pass full AgentProfile in body field `agent_profile`',
-          })
-          break
-      }
+    const data: CatalogRow[] = []
+    const add = (backend: string, models: readonly ModelSpec[], prefix = `${backend}/`, providerSeparator?: '/' | '@'): void => {
+      for (const model of models) data.push({ id: prefix + model.id, object: 'model', backend,
+        provider: providerSeparator ? model.id.split(providerSeparator)[0]! : null,
+        ...(model.note ? { note: model.note } : {}) })
     }
-
-    return c.json({ object: 'list', data })
+    for (const backend of deps.registry.all()) {
+      if ((await backend.health()).state !== 'ready') continue
+      const name = backend.name
+      if (name === 'opencode' || name === 'pi') {
+        const isPi = name === 'pi'
+        add(name, await discoverModels(name, {
+          bin: (isPi ? deps.piBin : deps.opencodeBin) ?? name,
+          args: isPi ? ['--offline', '--list-models'] : ['models'],
+          providers: isPi ? PI_PROVIDERS : OPENCODE_PROVIDERS,
+          parse: isPi ? parsePiModels : parseOpencodeModels,
+          fallback: isPi ? PI_MODELS : OPENCODE_MODELS,
+        }), undefined, '/')
+      } else if (name === 'passthrough') {
+        add(name, ['openai/gpt-4o', 'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'moonshot/kimi-k2-0905-preview', 'zai/glm-4.6']
+          .map((id) => ({ id, note: 'forwards to vendor API — requires key' })), '', '/')
+      } else if (name === 'sandbox') {
+        add(name, (deps.catalog?.list() ?? []).map((entry) => ({ id: entry.id,
+          note: entry.profile.description ?? 'sandbox AgentProfile' })))
+        data.push({ id: 'sandbox', object: 'model', backend: name, provider: null,
+          note: 'inline profile mode — pass full AgentProfile in body field `agent_profile`' })
+      } else add(name, ALIASES[name] ?? [], undefined, name === 'forge' ? '/' : name === 'claudish' ? '@' : undefined)
+    }
+    const described = deps.describe ? await deps.describe(data) : data.map((row): ModelEntry => ({ ...row,
+      authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status' } }))
+    return c.json({ object: 'list', data: described })
   })
 }

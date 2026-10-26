@@ -33,6 +33,7 @@ import { createProfileCatalog, type ProfileCatalog } from './profiles/loader.js'
 import { mountChatCompletions } from './routes/chat-completions.js'
 import { mountHealth } from './routes/health.js'
 import { mountModels } from './routes/models.js'
+import { createNativeCatalog } from './native-catalog.js'
 import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
 import { mountRuns } from './routes/runs.js'
@@ -431,7 +432,9 @@ export async function buildApp(config: Config): Promise<{
   // Retained sessions own one provider-native child across turns. The service
   // is created only after every backend is registered so capability discovery
   // and model routing use the same registry as one-shot chat.
-  const retained = new RetainedSessionService({ store: sessions, registry, runs })
+  const codexBackend = registry.byName('codex')
+  const nativeCatalog = createNativeCatalog(config, codexBackend instanceof CodexBackend ? codexBackend.readCatalog : undefined)
+  const retained = new RetainedSessionService({ store: sessions, registry, runs, admitSubscription: nativeCatalog.admit })
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
 
   const app = new Hono()
@@ -451,7 +454,7 @@ export async function buildApp(config: Config): Promise<{
   }
 
   mountHealth(app, { registry, admission, runs })
-  mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin })
+  mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin, describe: nativeCatalog.describe })
   mountSessions(app, { sessions, retained })
   mountRetainedSessions(app, retained, { includeSessionList: false, includeRunEvents: false })
   mountRuns(app, { runs, retainedRuns: retained, retainedStore: sessions })
@@ -466,6 +469,7 @@ export async function buildApp(config: Config): Promise<{
     admission,
     admissionReservedClients: config.admissionReservedClients,
     jailEnv,
+    admitSubscription: nativeCatalog.admit,
     netJail: extras.netJail,
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,

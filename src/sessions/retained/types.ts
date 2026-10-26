@@ -82,6 +82,7 @@ export interface RetainedSessionView {
 }
 
 export interface RetainedSessionServiceOptions {
+  admitSubscription?: (request: import('../../backends/types.js').ChatRequest, backend: string, signal: AbortSignal) => Promise<void>
   store: SessionStore
   registry: BackendRegistry
   runs: RunRegistry

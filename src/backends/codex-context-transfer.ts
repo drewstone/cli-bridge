@@ -15,6 +15,8 @@ import { BackendError, type PreparedContextTransfer, type ProfileMaterialization
 import type { SpawnResult } from '../executors/types.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { StringDecoder } from 'node:string_decoder'
+import type { NativeModelFacts } from '../native-catalog.js'
+import { nativeObject } from '../lib/native-state.js'
 
 export const CODEX_NATIVE_IMPORT_VERSION = 'codex-cli 0.164.0'
 
@@ -77,7 +79,7 @@ export class CodexContextTransfer implements PreparedContextTransfer {
 
   constructor(
     private readonly spawned: SpawnResult,
-    private readonly request: ContextTransferRequest,
+    private readonly request: ContextTransferRequest | undefined,
     private readonly signal: AbortSignal,
     private readonly cleanup: () => void,
     profileMaterialization?: ProfileMaterializationReceipt,
@@ -98,8 +100,40 @@ export class CodexContextTransfer implements PreparedContextTransfer {
     this.write({ method: 'initialized', params: {} })
   }
 
+  /** Read configuration and account metadata without creating a thread, refreshing auth, or starting a turn. */
+  async readNativeFacts(cwd: string): Promise<NativeModelFacts> {
+    const configuration = nativeObject((await this.rpc('config/read', { cwd, includeLayers: false })).config)
+    const account = await this.rpc('account/read', { refreshToken: false })
+    // Codex's native config reference defines the omitted provider as openai.
+    const provider = configuration.model_provider == null ? 'openai' : safeNativeId(configuration.model_provider) ?? null
+    let model = configuration.profile ? undefined : safeNativeId(configuration.model)
+    if (!model && !configuration.profile) {
+      let cursor: string | undefined
+      for (let page = 0; page < 4; page++) {
+        const catalog = await this.rpc('model/list', { limit: 100, includeHidden: false, ...(cursor ? { cursor } : {}) })
+        if (!Array.isArray(catalog.data) || catalog.data.length > 100) throw new Error('Codex returned an invalid bounded model catalog')
+        const defaults = catalog.data.map(nativeObject).filter((entry) => entry.isDefault === true)
+        if (defaults.length > 1 || defaults.length === 1 && model) throw new Error('Codex returned ambiguous native model defaults')
+        if (defaults[0]) model = safeNativeId(defaults[0].model)
+        const next = catalog.nextCursor
+        if (next === null || next === undefined) break
+        if (typeof next !== 'string' || !next || next.length > 4096 || next === cursor || page === 3) throw new Error('Codex model catalog exceeds the bounded discovery window')
+        cursor = next
+      }
+    }
+    const type = nativeObject(account.account).type
+    const overrides = nativeObject(nativeObject(configuration.model_providers)[provider ?? ''])
+    const builtin = provider === 'openai' && Object.keys(overrides).length === 0
+      && !configuration.openai_base_url && !configuration.chatgpt_base_url && !configuration.profile
+    return { provider, ...(model && model !== 'default' ? { model } : {}), authentication: {
+      status: type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true ? 'authenticated' : type === 'apiKey' ? 'configured' : account.account === null && builtin && account.requiresOpenaiAuth === true ? 'signed_out' : 'unknown',
+      authMode: type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true ? 'subscription' : type === 'apiKey' ? 'api_key' : 'unknown',
+      source: 'native_status', ...(type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true ? {} : { fix: 'codex login status' }),
+    } }
+  }
+
   async createSession(): Promise<{ nativeSessionId: string; createdAt: string }> {
-    const cwd = this.request.workspace?.cwd
+    const cwd = this.request?.workspace?.cwd
     if (!cwd) throw new Error('Codex native import requires its validated host cwd')
     const response = await this.rpc('thread/start', {
       cwd: workspaceCwdPathForBase(cwd, 'host', 'Codex context transfer'),
@@ -126,6 +160,7 @@ export class CodexContextTransfer implements PreparedContextTransfer {
         throw new Error('Codex resumed a different native thread')
       }
     }
+    if (!this.request) throw new Error('Codex history import requires its validated request')
     const items = codexContextItems(this.request)
     if (items.length > 0) await this.rpc('thread/inject_items', { threadId: nativeSessionId, items })
     // The public inject ACK awaits Codex's preparation checkpoint. There is no
@@ -217,4 +252,8 @@ export class CodexContextTransfer implements PreparedContextTransfer {
     }
     this.pending.clear()
   }
+}
+
+function safeNativeId(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u.test(value) ? value : undefined
 }

@@ -29,7 +29,7 @@ import {
   canonicalAgentProfileDigest,
   snapshotAgentProfile,
 } from '@tangle-network/agent-interface'
-import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt } from './types.js'
+import type { ChatMessage, ChatRequest, McpServerSpec, ProfileMaterializationReceipt, NativeSubscriptionInvocation } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionProfileBinding, SessionRecord } from '../sessions/store.js'
 import { ExecutorConfigurationError } from '../executors/types.js'
@@ -48,7 +48,7 @@ import {
   type WorkspacePlanConfigValue,
   type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
-import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES } from '../executors/host.js'
+import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES, sanitizeHostEnv } from '../executors/host.js'
 import { scopeCodexTurnConfig } from '../codex-config.js'
 
 export interface ProfileExecutionIdentity {
@@ -60,41 +60,7 @@ export interface ProfileExecutionIdentity {
   }
 }
 
-/**
- * The host directory request-scoped files are written into.
- *
- * `undefined` means the executor mounts NO host directory into the container, so
- * a profile or MCP file written here would land where the CLI cannot read it.
- * Refusing with the setting that fixes it is the only honest answer: writing it
- * anyway is the silent-corruption path where the caller's files are discarded
- * with no error at all.
- */
-function requireMaterializationCwd(cwd: string | undefined, what: string): string {
-  if (cwd !== undefined) return cwd
-  throw new ExecutorConfigurationError(
-    `${what} needs a host directory mounted into the container, and this executor mounts none. Set the backend's ` +
-      `<NAME>_DOCKER_WORKSPACE_ROOT to an absolute host directory — the pool bind-mounts it into every container at ` +
-      `the identical path — or send the request without an agent_profile/mcp block.`,
-  )
-}
-
-/**
- * Read one applied-plan launch value as the public string a spawn needs.
- *
- * Interface 0.40 made a plan's env values and launch arguments either public bytes or an opaque
- * `AgentProfileSecretRef` that only a private executor's `AgentProfileSecretProvider` may resolve.
- * cli-bridge holds no such provider: it spawns the harness itself and applies plans through
- * `applyWorkspacePlan`, the public-only entry point, which already rejects a plan carrying any
- * reference before its first write. So a non-string reaching here means the value arrived by a
- * route that skipped that check, and the only safe answer is refusal.
- *
- * Refusal, not rendering. `JSON.stringify`-ing a reference into argv or an env value would hand the
- * harness a nonsense token — and argv is world-readable through `/proc/<pid>/cmdline` and sits
- * outside every redaction channel, so a value that later DID carry a secret would leak with no
- * recall path. This mirrors agent-runtime's `publicConfigString`
- * (`src/runtime/supervise/pi-mcp.ts`), which refuses for the same reason on the same no-provider
- * path.
- */
+/** A public-only plan must not render a secret reference into argv, files, or the child environment. */
 function requirePublicPlanValue(
   value: WorkspacePlanConfigValue | WorkspacePlanArgument,
   where: string,
@@ -121,14 +87,15 @@ function requirePublicPlanEnv(
   )
 }
 
-/**
- * Provision an AgentProfile's CWD-NATIVE dimensions (skills, context, hooks, subagents,
- * commands) into the run workspace before the harness spawns — the shared Phase-2 host
- * wiring. MCP is SKIPPED here so cli-bridge's existing per-harness MCP path (config-dir +
- * env) stays the source of truth (additive, can't regress MCP). Purely writes files into
- * `cwd`; returns env/flags (empty for the non-MCP dimensions, which are all cwd-native)
- * for the caller to apply if present. No-op only when there is no profile.
- */
+/** Enforce subscription policy on final native inputs, then seal the values passed to the existing spawner. */
+export async function admitNativeSubscription(req: ChatRequest, invocation: NativeSubscriptionInvocation): Promise<void> {
+  if (!req.subscriptionAdmission) return
+  await req.subscriptionAdmission.check({ ...invocation, env: sanitizeHostEnv(invocation.env, invocation.cwd, invocation.envPassthroughKeys) ?? invocation.env })
+  Object.freeze(invocation.env)
+  if (invocation.args) Object.freeze(invocation.args)
+}
+
+/** Apply cwd-native resources and return env/flags; existing backend MCP controls remain authoritative. */
 export function provisionProfileWorkspace(
   req: ChatRequest,
   session: SessionRecord | null,
@@ -234,27 +201,12 @@ export function provisionProfileWorkspace(
 /** The environment variable opencode merges as its final local config layer. */
 const OPENCODE_PROFILE_CONFIG_ENV = 'OPENCODE_CONFIG_CONTENT'
 
-/**
- * Stops opencode from reading the project layer of the directory it runs in:
- * `<cwd>/opencode.json`, `<cwd>/.opencode/opencode.json`, every agent, skill,
- * command and custom tool under `<cwd>/.opencode`, and the project context
- * files `AGENTS.md`, `CLAUDE.md` and `CONTEXT.md`.
- *
- * Measured against opencode 1.18.30 with `opencode debug config` and
- * `opencode debug agent`: with this set, a planted `<cwd>/opencode.json` no
- * longer contributes `instructions` or `agent.<name>.prompt`, a planted
- * `<cwd>/.opencode/agents/<name>.md` no longer defines that subagent, and a
- * planted `<cwd>/.opencode/tools/<name>.js` no longer appears in the tool list.
- * The operator's own global config still loads, so provider, model and plugin
- * wiring is untouched.
+/** Disable cwd opencode config/context, agents, skills, commands and tools while preserving global config.
+ * Qualified through opencode debug config/agent; external skill directories have a separate control.
  */
 const OPENCODE_DISABLE_PROJECT_CONFIG_ENV = 'OPENCODE_DISABLE_PROJECT_CONFIG'
 
-/**
- * One more directory opencode reads config, agents, skills, commands and tools
- * from. Additive, measured the same way: the operator's global directory keeps
- * loading beside it.
- */
+/** Add an isolated profile config/resource directory beside the operator's global directory. */
 const OPENCODE_CONFIG_DIR_ENV = 'OPENCODE_CONFIG_DIR'
 
 /** The cwd-relative directory the shared materializer writes opencode-native files into. */
@@ -279,46 +231,13 @@ interface OpencodeProfileScope {
   cleanup(): void
 }
 
-/**
- * Give one opencode process its own configuration, and close the shared task
- * directory as a channel into it.
- *
- * Runtime gives a root and every manager it spawns one cwd. opencode reads the
- * project layer of that cwd on every model request, so profiles sharing a
- * directory ran under each other's instructions, subagents and tool grants, and
- * an agent that wrote `opencode.json` or `.opencode/agents/<name>.md` into its
- * own workspace changed the next profile's turn — measured end to end, with the
- * later director quoting the earlier one's file, while each receipt still named
- * its own profile.
- *
- * Three moves, each measured against opencode 1.18.30 rather than inferred:
- *
- *   1. The generated `opencode.json` never enters the workspace. It reaches this
- *      process through `OPENCODE_CONFIG_CONTENT`; `OPENCODE_CONFIG` already
- *      carries the request's MCP file, which may hold credentials.
- *   2. `OPENCODE_DISABLE_PROJECT_CONFIG` closes the project layer, so no file in
- *      the shared directory — this bridge's own earlier output, a repository's
- *      config, or one an agent wrote mid-run — reaches the process at all. No
- *      file is deleted to achieve that: a user's config is indistinguishable
- *      from a stale generated one, and it is now harmless either way.
- *   3. The profile's own `.opencode/**` files are applied into a private
- *      per-turn directory under the cwd, named by `OPENCODE_CONFIG_DIR`. The
- *      directory is fresh on every turn, so an edited or re-rendered file can
- *      never refuse a later session, and it is removed when the turn ends.
- *
- * Instruction paths are made absolute in the value handed to the spawn, because
- * with the project layer closed a relative one resolves from the config
- * directory rather than the cwd. The plan keeps the materializer's relative
- * form, so the plan digest stays independent of where the workspace sits.
- *
- * The project context files — `<cwd>/AGENTS.md`, `CLAUDE.md`, `CONTEXT.md` —
- * are gated behind the same flag, so they are closed too.
- *
- * What this does NOT close, and what the README says plainly: skills under
- * `<cwd>/.claude/skills` and `<cwd>/.agents/skills`, which opencode gates on a
- * separate `OPENCODE_DISABLE_EXTERNAL_SKILLS`; and a co-resident agent WRITING
- * into a running turn's private directory, which no mode can prevent while both
- * run as the same user.
+/** Isolate each profile from the shared task directory.
+ * Config travels in OPENCODE_CONFIG_CONTENT; OPENCODE_CONFIG remains the MCP credential channel.
+ * Disable the whole project layer, including AGENTS.md/CLAUDE.md/CONTEXT.md. Apply profile resources
+ * into a fresh OPENCODE_CONFIG_DIR per turn, with absolute instruction paths, and remove it on close.
+ * The materialization plan retains relative paths for stable digests. No workspace files are deleted.
+ * External .claude/.agents skill directories require OPENCODE_DISABLE_EXTERNAL_SKILLS separately.
+ * Same-user co-residents can still write a running process's private directory.
  */
 function scopeOpencodeProfileConfig(
   plan: WorkspacePlan,
@@ -416,23 +335,8 @@ function scopeOpencodeProfileConfig(
   }
 }
 
-/**
- * Serialize the config this process receives, merged under the operator's own.
- *
- * The spawn merges provisioned env over `process.env`, so an operator who set
- * `OPENCODE_CONFIG_CONTENT` for the daemon — a custom provider, a base URL —
- * had it replaced by the profile's config with nothing reported. That value
- * reached the child untouched before the bridge used this variable, so it
- * becomes the BASE here and every key the profile declares replaces it. The
- * profile stays the authority for `instructions`, `tools`, `permission` and
- * `mcp`; the operator's unrelated keys survive.
- *
- * The result is refused when the host executor's sanitizer would drop it. That
- * sanitizer discards an oversize value silently, which leaves opencode running
- * on the headless defaults — no instructions, no tool restrictions, bash
- * allowed — while the receipt still commits to the profile. `buildDockerExecArgs`
- * applies no such ceiling, so refusing here is also what makes one profile mean
- * the same thing on both executors.
+/** Merge profile config over the operator's OPENCODE_CONFIG_CONTENT without losing unrelated provider keys.
+ * Reject values the host sanitizer would discard; an oversize config must never silently remove grants.
  */
 function opencodeProcessConfigValue(config: Record<string, unknown>): string {
   const ambient = process.env[OPENCODE_PROFILE_CONFIG_ENV]
@@ -474,21 +378,9 @@ export interface ProvisionedPiProfile {
   cleanup(): void
 }
 
-/**
- * Apply the canonical Pi profile plan without writing profile resources to the
- * task's conventional context, skill, or prompt-template paths.
- *
- * Pi has explicit per-process loaders for every native file this function
- * accepts. The files live in a unique directory under the resolved workspace
- * root so host and Docker executors see the same absolute path. Ambient context,
- * skills, and prompt templates are disabled whenever a profile is present; only
- * the exact plan files are opted back in. Generic workspace files fail closed:
- * moving one into the private directory would make its declared path invisible
- * to the agent, while writing it into the shared task directory reintroduces the
- * cross-run collision this path exists to remove.
- *
- * MCP and `extensions.pi` are handled by PiBackend's native controls, so they
- * are skipped here only after that caller has validated and prepared them.
+/** Apply Pi's exact profile through private per-process loaders under the workspace.
+ * Disable ambient context/skills/templates; reject generic files whose declared workspace paths would change.
+ * The caller validates and mounts MCP/extensions.pi separately. Host and Docker use identical paths.
  */
 export function provisionPiProfile(
   req: ChatRequest,
@@ -689,16 +581,8 @@ function retainProfileMaterializationReceipt(
   return receipt
 }
 
-/**
- * The `workspacePlanDigest` this session already applied into its own cwd,
- * shaped as `applyWorkspacePlan` options.
- *
- * A resumed session's workspace is the running agent's live state — claude-code
- * stores session memory in CLAUDE.md — so re-application must key on what the
- * session proved it applied, not on the current file bytes. The digest is
- * passed only when the materialization target IS the session's recorded cwd; a
- * caller that reuses a session id against a different directory gets a full
- * materialization there.
+/** Reuse a session's proved plan digest only when applying into its recorded cwd.
+ * Live session memory is not a materialization digest; a different cwd always receives the full plan.
  */
 function sessionAppliedPlanDigest(
   session: SessionRecord | null,
@@ -757,12 +641,7 @@ export function assertProfileRequestAuthority(
   return profile
 }
 
-/**
- * Enforce the Pi limits that have a proven native lowering.
- *
- * Pi's catalog exposes one completion cap that includes hidden reasoning.
- * Visible-only and reasoning-only ceilings have no independent Pi control.
- */
+/** Pi can lower its total completion cap; independent visible/reasoning ceilings are unsupported. */
 export function assertPiOutputTokenRequest(
   req: ChatRequest,
   profile: AgentProfile | null,
@@ -805,12 +684,7 @@ export function assertPiOutputTokenRequest(
   }
 }
 
-/**
- * Accept one redundant legacy cap only when the canonical field already owns it.
- *
- * Some older profile authors emitted both fields. The legacy value never becomes
- * authority: a missing canonical value, a conflict, or any extra key still fails.
- */
+/** Legacy maxTokens is redundant only: require the same canonical total cap and no other metadata key. */
 export function assertPiModelMetadataCompatibility(
   model: AgentProfileModelHints | undefined,
 ): void {

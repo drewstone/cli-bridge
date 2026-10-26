@@ -54,11 +54,12 @@ export async function resolvePiAuthCredential(options: {
   env: NodeJS.ProcessEnv
   signal: AbortSignal
   diagnosticId?: string
+  subscriptionOnly?: boolean
 }): Promise<PiAuthCredential> {
   const diagnosticId = options.diagnosticId && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(options.diagnosticId)
     ? options.diagnosticId
     : randomUUID()
-  if (options.apiMode === 'openai-codex-responses') {
+  if (options.subscriptionOnly || options.apiMode === 'openai-codex-responses') {
     try {
       return await bearerCredential(options, diagnosticId)
     } catch (error) {

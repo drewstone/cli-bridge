@@ -10,6 +10,7 @@ import { BackendError, BRIDGE_RESERVED_FAILURE_CODES, terminalOutcome } from './
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
+  admitNativeSubscription,
   codexMcpConfigText,
   contextTransferRoute,
   materializeMcpServersForCodex,
@@ -22,6 +23,8 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
+import { sanitizeHostEnv } from '../executors/host.js'
+import type { CodexCatalogReader, NativeModelFacts } from '../native-catalog.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
@@ -69,6 +72,30 @@ export class CodexBackend implements Backend {
     // this version. A different binary needs its own proof before advertisement.
     this.nativeImportProtocolQualified = health.state === 'ready' && health.version === CODEX_NATIVE_IMPORT_VERSION
     return health
+  }
+
+  /** The existing app-server transport reads the exact native route; it never creates a thread or turn. */
+  readonly readCatalog: CodexCatalogReader = async ({ model, cwd, env, flags, signal }): Promise<NativeModelFacts> => {
+    if (this.spawner.executionEnvironment !== 'host') return { provider: null, authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' } }
+    const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10_000)])
+    const args = ['app-server', '--listen', 'stdio://']
+    const selection = splitCodexModel(this.extractModel(model))
+    if (selection.provider && selection.provider !== this.name) args.push('-c', `model_provider=${JSON.stringify(selection.provider)}`)
+    if (selection.model) args.push('-c', `model=${JSON.stringify(selection.model)}`)
+    args.push(...codexConfigFlags(flags))
+    const effectiveEnv = sanitizeHostEnv(env, cwd)!
+    // Pin the same native home as execution; a PATH wrapper must not allocate another account for a probe.
+    effectiveEnv.CODEX_HOME ??= effectiveEnv.HOME ? join(effectiveEnv.HOME, '.codex') : undefined
+    const spawned = await this.spawner(this.opts.bin, args, { signal: bounded, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: effectiveEnv })
+    const native = new CodexContextTransfer(spawned, undefined, bounded, () => {})
+    try {
+      await native.initialize()
+      const facts = await native.readNativeFacts(cwd)
+      const key = ['CODEX_API_KEY', 'OPENAI_API_KEY'].find((name) => effectiveEnv[name]?.trim())
+      if (key) facts.authentication = { status: 'configured', authMode: 'api_key', source: 'native_status', fix: process.env[key] === effectiveEnv[key] ? `unset ${key}` : 'codex login status' }
+      if (effectiveEnv.OPENAI_BASE_URL || effectiveEnv.CODEX_ACCESS_TOKEN) facts.authentication = { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' }
+      return facts
+    } finally { await native.close() }
   }
 
   contextTransferAvailable(): boolean {
@@ -159,18 +186,8 @@ export class CodexBackend implements Backend {
     }
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
-    // The canonical wire id is `codex/<provider>/<model>` (agent-runtime's
-    // profileBridgeWireModel). Codex config keys the two separately: the
-    // provider segment selects `model_provider` (endpoint identity, 'openai'
-    // is the builtin default) and only the remainder is the `model` id —
-    // passing the qualified form verbatim was rejected by the API as a
-    // nonexistent model, killing every profile-declared codex lead.
+    // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
     const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
-    // #161: the harness name is never a codex provider. A caller composes one harness prefix
-    // and spends a provider equal to the harness there, so a second `codex/` segment restates
-    // the harness rather than naming a `[model_providers.*]` key — passing it on made codex
-    // resolve a provider that no config.toml defines. Dropped here, where the argv is built,
-    // so the rule holds for an unprofiled request too; a profile comparison never sees one.
     const providerArg = splitProvider === this.name ? null : splitProvider
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
@@ -201,6 +218,7 @@ export class CodexBackend implements Backend {
       args.splice(1, 0, 'resume', session.internalId)
       // codex exec resume <id> [prompt]
     }
+    const nativeConfigFlags = codexConfigFlags(args)
     if (!router) args.push(prompt)
 
     // Reject unsupported profile plans before copying auth or writing MCP
@@ -213,7 +231,9 @@ export class CodexBackend implements Backend {
       profileExecutionIdentity(req, session, 'codex', reasoningEffort),
     )
     const launchEnv = { ...process.env, ...provisioned.env }
+    if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
     args.push(...provisioned.flags)
+    nativeConfigFlags.push(...codexConfigFlags(provisioned.flags))
     let routerVersion: string | undefined
     if (router) {
       try {
@@ -281,6 +301,9 @@ export class CodexBackend implements Backend {
     }
     let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
     try {
+      // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
+      await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
+        cwd, model: req.model, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
       if (req.jailSpec && !dockerExecution) {
         // Only canonical auth preparation can rotate the account. Access-only
         // jailed turns may run concurrently after their private seeds exist.
@@ -303,6 +326,7 @@ export class CodexBackend implements Backend {
         // The jail seed has no refresh capability. File storage must win over
         // an account config that would otherwise select an unrelated keyring.
         args.splice(1, 0, '-c', 'cli_auth_credentials_store="file"')
+        nativeConfigFlags.unshift('-c', 'cli_auth_credentials_store="file"')
       }
     } catch (error) {
       try { codexHome?.cleanup() } finally { releaseHostAuth?.() }
@@ -349,11 +373,7 @@ export class CodexBackend implements Backend {
         signal.throwIfAborted()
       }
       signal.throwIfAborted()
-      spawned = await this.spawner(this.opts.bin, args, {
-        signal,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd,
-        env: {
+      const finalEnv = {
           ...launchEnv,
           ...(dockerExecution ? {
             CODEX_HOME: undefined,
@@ -370,7 +390,13 @@ export class CodexBackend implements Backend {
           } : {}),
           ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
           ...(router ? { TANGLE_ROUTER_CREDENTIAL: router.key } : {}),
-        },
+        }
+      await admitNativeSubscription(req, { env: finalEnv, cwd, model: req.model, args, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
+      spawned = await this.spawner(this.opts.bin, args, {
+        signal,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd,
+        env: finalEnv,
         ...(externalId ? { sessionId: externalId } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
@@ -397,10 +423,7 @@ export class CodexBackend implements Backend {
     const child = spawned.child
     const releaseSpawner = spawned.release
 
-    // The spawner registers a synchronous 'error' listener so the spawn
-    // failure event doesn't crash the process before our own listener
-    // can attach. We consult the captured value here (and double-attach
-    // for safety against future spawner refactors).
+    // Capture both errors already observed by the spawner and errors emitted after this listener attaches.
     let spawnErrorMessage = ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
     const earlySpawnError = spawned.spawnError?.()
@@ -577,11 +600,7 @@ function codexTransferChatRequest(request: ContextTransferRequest): ChatRequest 
   }
 }
 
-/**
- * Split a provider-qualified codex model remainder (`openai/gpt-5.1-codex`)
- * into its `model_provider` / `model` config pair, preserving nested model ids.
- * `default` omits only the model override, retaining an explicit provider.
- */
+/** Preserve nested model ids while separating the provider; default omits only the model override. */
 export function splitCodexModel(
   remainder: string | null,
 ): { provider: string | null; model: string | null } {
@@ -605,28 +624,7 @@ function resolveCodexAuthPath(): string | undefined {
   return home ? join(home, 'auth.json') : undefined
 }
 
-/**
- * Read one codex failure event as a reason a caller can branch on.
- *
- * Codex states the same refusal in two places and the bridge sees both. It sets
- * its own `CodexErrorInfo` discriminant — `server_overloaded` (410),
- * `response_too_many_failed_attempts` (309), `other` (164),
- * `usage_limit_exceeded` (92) and `unauthorized` (8) across the 983 refusals
- * recorded on this machine — and where the refusal came over the wire it quotes
- * the provider's JSON body inside the message text, which is where
- * `invalid_request_error` and its `code` live.
- *
- * Both were flattened into one opaque `upstream` string, which made a capacity
- * refusal that clears on its own indistinguishable from a request that will
- * fail identically forever — the difference between waiting and giving up.
- * agent-runtime reads the relayed `type` as `upstreamCode` and the relayed
- * `status` through its own classifier, which is what ends the retry loop on a
- * malformed request instead of re-driving it to the attempt ceiling.
- *
- * Permissive on shape for the same reason `extractText` is: codex's field
- * naming has drifted across versions, and a reason with no code is still a
- * reason. An unrecognized payload keeps `upstream` and the CLI's own words.
- */
+/** Preserve only native structured error discriminants and provider JSON; prose never grants authority. */
 export function codexFailureReason(ev: Record<string, unknown>): BackendFailureReason {
   const message = firstString(ev.message) ?? 'codex error'
   const codexCode = codexErrorDiscriminant(ev.codex_error_info)
@@ -870,4 +868,18 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
+}
+
+/** Forward only effective native configuration selectors to the read-only app-server. */
+function codexConfigFlags(args: readonly string[]): string[] {
+  const result: string[] = []
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index]!
+    if (['-c', '--config', '-p', '--profile', '--enable', '--disable'].includes(flag)) {
+      const value = args[++index]
+      if (value === undefined) throw new Error('Codex native configuration selector has no value')
+      result.push(flag === '-p' ? '--profile' : flag, value)
+    } else if (/^--(?:config|profile|enable|disable)=/u.test(flag)) result.push(flag)
+  }
+  return result
 }

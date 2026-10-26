@@ -111,6 +111,7 @@ export class RetainedSessionService {
       isClosing: (id) => this.closures.has(id),
       denyUnrequestedInteraction: (input) => this.interactions.denyUnrequestedInteraction(input),
       contextTransfers: this.contextTransfers,
+      admitSubscription: options.admitSubscription,
     })
     this.control = new RetainedControl(this.store, this.runs, this.state)
     this.events = new RetainedEvents(this.store, this.runs, this.state)
