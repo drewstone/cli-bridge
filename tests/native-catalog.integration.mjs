@@ -87,7 +87,7 @@ test('Claude catalog and admission bind the supplied workspace and effective set
   try {
     const home = join(root, 'home'), workspace = join(root, 'workspace'), user = join(home, '.claude'), project = join(workspace, '.claude')
     await Promise.all([mkdir(user, { recursive: true }), mkdir(project, { recursive: true })])
-    for (const key of ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) delete process.env[key]
+    for (const key of ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_MODEL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) delete process.env[key]
     process.env.HOME = home
     assert.notEqual(workspace, process.cwd(), 'the embedded discovery workspace must differ from the Bridge process cwd')
     await writeFile(join(user, 'settings.json'), JSON.stringify({ model: 'sonnet', env: { ANTHROPIC_API_KEY: 'public-user-api-canary', ANTHROPIC_BASE_URL: 'https://example.invalid/v1' } }))
