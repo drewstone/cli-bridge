@@ -134,8 +134,8 @@ export function resolveJailRoot(root: string, base: string): string {
   // Canonicalize BOTH paths (resolve symlinks on the existing prefix) before
   // comparing, so a repo-local symlink (e.g. scratch -> /tmp) cannot look
   // in-base lexically while physically pointing outside it.
-  const resolvedBase = canonicalize(resolve(base))
-  const resolvedRoot = canonicalize(isAbsolute(root) ? resolve(root) : resolve(resolvedBase, root))
+  const resolvedBase = canonicalizeJailPath(resolve(base))
+  const resolvedRoot = canonicalizeJailPath(isAbsolute(root) ? resolve(root) : resolve(resolvedBase, root))
   const rel = relative(resolvedBase, resolvedRoot)
   // Must be a STRICT descendant of base: never the base itself (rel === '',
   // which would make the whole working tree writable) and never an escape.
@@ -149,7 +149,7 @@ export function resolveJailRoot(root: string, base: string): string {
 /** Resolve symlinks on the deepest EXISTING ancestor of `p`, then re-append the
  * not-yet-created tail. Lets us canonicalize a jail root that does not exist
  * yet while still catching a symlinked ancestor that points outside the base. */
-function canonicalize(p: string): string {
+export function canonicalizeJailPath(p: string): string {
   const tail: string[] = []
   let cur = p
   for (;;) {

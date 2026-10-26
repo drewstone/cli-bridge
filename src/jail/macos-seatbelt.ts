@@ -19,7 +19,7 @@
 import { accessSync, constants, existsSync } from 'node:fs'
 import { lstat, mkdir, mkdtemp, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import {
   backendHome,
   copyAuthIntoJail,
@@ -28,8 +28,8 @@ import {
   seedAuthIntoJail,
 } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
-import { toolchainReadPaths } from './linux-bwrap.js'
+import { canonicalizeJailPath, ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { isSafeReadPath, toolchainReadPaths } from './linux-bwrap.js'
 
 const SANDBOX_EXEC_BIN = 'sandbox-exec'
 // Device nodes a normal process writes to (output redirection, RNG, tracing,
@@ -110,7 +110,7 @@ export class MacosSeatbeltJail implements JailBackend {
     try {
       const writable = [root]
       for (const path of spec.extraWritablePaths ?? []) {
-        writable.push(await canonicalize(path))
+        writable.push(canonicalizeJailPath(path))
       }
 
       // Point any backend env var (e.g. CODEX_HOME) at the in-jail copy. Done
@@ -121,12 +121,18 @@ export class MacosSeatbeltJail implements JailBackend {
         authEnv[envVar] = resolveJailRoot(jailRel, root)
       }
 
-      const readable = spec.readConfine ? await Promise.all([
+      const readOnly = (spec.extraReadablePaths ?? []).map(canonicalizeJailPath)
+      const extras = [...writable.slice(1), ...readOnly]
+      const home = canonicalizeJailPath(homedir())
+      for (const path of extras) {
+        if (!isSafeReadPath(path, home, canonicalizeJailPath(spec.projectDir))) throw new Error(`unsafe jail bind ${path}`)
+      }
+      const readable = spec.readConfine ? [
         '/System', '/usr', '/bin', '/sbin', '/private/etc', '/private/var/db/dyld', '/dev',
         spec.projectDir, ...writable, ...toolchainReadPaths(bin, spec.projectDir),
-        ...(spec.extraReadablePaths ?? []), ...fixedPaths,
-      ].map((path) => realpath(path).catch(() => path))) : undefined
-      const profile = buildProfile(writable, fixedPaths, readable)
+        ...readOnly, ...fixedPaths,
+      ].map(canonicalizeJailPath) : undefined
+      const profile = buildProfile(writable, fixedPaths, readable, readOnly.filter((path) => !writable.includes(path)))
       const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
       const profilePath = join(dir, 'profile.sb')
       await writeFile(profilePath, profile, { mode: 0o600 })
@@ -194,14 +200,15 @@ async function linkHostKeychains(root: string): Promise<string[]> {
   return [library, target]
 }
 
-export function buildProfile(writable: string[], fixed: string[] = [], readable?: string[]): string {
+export function buildProfile(writable: string[], fixed: string[] = [], readable?: string[], readOnly: string[] = []): string {
   const allowSubpaths = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
   const allowDevices = DEVICE_WRITABLE.map((path) => `  (literal "${sbplEscape(path)}")`).join('\n')
-  const denyFixed = fixed.length === 0 ? [] : [
+  const denyFixed = fixed.length + readOnly.length === 0 ? [] : [
     '; The keychain link and its parent stay fixed, so a confined run cannot',
     '; point them at host paths the unsandboxed bridge later touches.',
     '(deny file-write*',
     ...fixed.map((path) => `  (literal "${sbplEscape(path)}")`),
+    ...readOnly.map((path) => `  (subpath "${sbplEscape(path)}")`),
     ')',
     '',
   ]

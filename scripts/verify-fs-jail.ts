@@ -59,7 +59,7 @@ const backend: Backend = {
       const [code] = await once(spawned.child, 'close')
       assert.equal(code, 0, stderr)
       yield { content: stdout, finish_reason: 'stop' }
-    } finally { await spawned.terminate(); spawned.release() }
+    } finally { await spawned.terminate?.(); spawned.release() }
   },
 }
 built.registry.register(backend)
