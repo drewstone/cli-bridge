@@ -15,7 +15,15 @@ const command = (program, args, cwd) => execute(program, args, { cwd, timeout: 1
 
 test('packed production install embeds isolated HTTP services and runs the existing binary', { timeout: 300_000 }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), 'cli-bridge-package-'))
-  context.after(() => rm(root, { recursive: true, force: true }))
+  let binary
+  let binaryExit
+  context.after(async () => {
+    if (binary && binary.exitCode === null && binary.signalCode === null) {
+      binary.kill('SIGKILL')
+      await binaryExit
+    }
+    await rm(root, { recursive: true, force: true })
+  })
   const packed = JSON.parse((await command(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', root], repo)).stdout)[0]
   await writeFile(join(root, 'package.json'), '{"private":true,"type":"module"}\n')
   await command(npm, ['install', '--omit=dev', '--no-audit', '--no-fund', '--package-lock=false', join(root, packed.filename)], root)
@@ -120,9 +128,8 @@ test('packed production install embeds isolated HTTP services and runs the exist
   let diagnostics = ''
   child.stderr.on('data', (chunk) => { diagnostics += chunk })
   const exited = once(child, 'exit')
-  context.after(async () => {
-    if (child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); await exited }
-  })
+  binary = child
+  binaryExit = exited
   await new Promise((accept, reject) => {
     const timer = setTimeout(() => reject(new Error(`packed binary did not become ready: ${diagnostics}`)), 20_000)
     let output = ''
