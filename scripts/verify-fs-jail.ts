@@ -1,132 +1,101 @@
-/**
- * End-to-end proof of the worker filesystem jail (fs-jail / WORKER_FS_JAIL).
- *
- * Unlike tests/jail.test.ts (which only inspects the rewritten argv), this
- * ACTUALLY spawns a jailed `bash` through the real bwrap wrapper and asserts,
- * against a live sandbox:
- *
- *   BLOCKED  — a jailed shell cannot read a host "secret" file outside its
- *              workspace (stand-in for the benchmark repo's task defs / grader
- *              answer keys) nor list the host repo tree.
- *   ALLOWED  — a jailed shell can still write in its workspace and run
- *              node / python3 / curl-to-localhost (the model + twin path).
- *
- * Run:  pnpm tsx scripts/verify-fs-jail.ts
- * Exit: 0 = all checks passed (or SKIP when bwrap can't run here), 1 = a check
- *       failed (a leak, or a legitimate capability broke).
- *
- * SKIPs (exit 0, loud) when unprivileged bwrap is unavailable on this host, so
- * CI on a locked-down runner does not go red for an environment reason.
- */
-
-import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { createServer } from 'node:http'
+/** Real request → OS filesystem confinement proof. No harness or model request. */
+import assert from 'node:assert/strict'
+import { once } from 'node:events'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { LinuxBwrapJail } from '../src/jail/linux-bwrap.js'
-import { resolveJailSpec } from '../src/jail/resolve-spec.js'
-import type { JailSpec } from '../src/jail/types.js'
+import { serve } from '@hono/node-server'
+import { loadConfig } from '../src/config.js'
+import { buildApp } from '../src/server.js'
+import { hostSpawner } from '../src/executors/host.js'
+import { selectJailBackend } from '../src/jail/index.js'
+import { applyJail } from '../src/executors/jail-support.js'
+import type { Backend, ChatRequest, NativeSessionBackend } from '../src/backends/types.js'
 
-const jail = new LinuxBwrapJail()
-
-interface Check {
-  name: string
-  /** Shell command run inside the jail. */
-  cmd: string
-  /** 'block' expects a NON-zero exit (access denied); 'allow' expects zero. */
-  expect: 'block' | 'allow'
-  /** Optional substring the stdout must contain (allow checks only). */
-  wants?: string
-}
-
-async function runInJail(spec: JailSpec, cmd: string): Promise<{ status: number; out: string; err: string }> {
-  const wrap = await jail.wrap('bash', ['-c', cmd], spec)
-  // Async spawn (not spawnSync): the localhost twin is served by THIS process's
-  // event loop, which spawnSync would block — leaving the jailed curl to hang.
-  return await new Promise((resolve) => {
-    const child = spawn(wrap.bin, wrap.args, { stdio: ['ignore', 'pipe', 'pipe'] })
-    let out = ''
-    let err = ''
-    child.stdout.on('data', (d) => { out += d })
-    child.stderr.on('data', (d) => { err += d })
-    const timer = setTimeout(() => child.kill('SIGKILL'), 60_000)
-    child.on('close', (status) => {
-      clearTimeout(timer)
-      resolve({ status: status ?? -1, out: out.trim(), err: err.trim() })
+assert.ok(await selectJailBackend().isAvailable(), 'A real OS jail is required; this proof cannot skip')
+const directory = await mkdtemp(join(tmpdir(), 'bridge-jail-snapshot-'))
+const workspace = join(directory, 'workspace')
+const secret = join(directory, 'outside', 'canary')
+const readable = join(directory, 'readable')
+const writable = join(directory, 'writable')
+await Promise.all([workspace, join(directory, 'outside'), readable, writable].map((path) => mkdir(path)))
+await Promise.all([
+  writeFile(secret, 'outside-canary'),
+  writeFile(join(workspace, 'allowed'), 'workspace-allowed'),
+  writeFile(join(readable, 'allowed'), 'extra-allowed'),
+])
+// Deliberately conflicting ambient defaults must not replace the embedded snapshot.
+process.env.BRIDGE_JAIL_MODE = 'off'
+process.env.WORKER_FS_JAIL = ''
+process.env.BRIDGE_JAIL_ROOT = '.agent-home/ambient'
+process.env.BRIDGE_JAIL_RO_PATHS = join(directory, 'outside')
+process.env.BRIDGE_JAIL_RW_PATHS = ''
+process.env.BRIDGE_JAIL_FALLBACK = 'warn'
+const config = loadConfig({ BRIDGE_BACKENDS: 'pi', PI_EXECUTOR: 'host', BRIDGE_DATA_DIR: join(directory, 'state'), BRIDGE_TRACE: 'off',
+  BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_JAIL_ROOT: '.agent-home/captured',
+  BRIDGE_JAIL_RO_PATHS: readable, BRIDGE_JAIL_RW_PATHS: writable, BRIDGE_JAIL_FALLBACK: 'deny' })
+const built = await buildApp(config)
+let observed: ChatRequest['jailSpec']
+const nativeRequest: ChatRequest = { model: 'pi', messages: [], cwd: workspace }
+await assert.rejects((built.registry.byName('pi') as NativeSessionBackend).startNativeSession(
+  nativeRequest, null, new AbortController().signal), process.platform === 'linux'
+  ? /requires an explicit pi\/<provider>\/<model>/ : /requires an enforced Linux fs-jail/)
+assert.equal(nativeRequest.jailSpec?.readConfine, true)
+assert.equal(nativeRequest.jailSpec?.root, join(workspace, '.agent-home/captured'))
+assert.deepEqual(nativeRequest.jailSpec?.extraReadablePaths, [readable])
+const backend: Backend = {
+  name: 'filesystem-probe', matches: (model) => model === 'filesystem-probe',
+  health: async () => ({ name: 'filesystem-probe', state: 'ready' }),
+  async *chat(request, _session, signal) {
+    observed = request.jailSpec
+    const program = `
+      const fs = require('node:fs');
+      const [secret, workspace, readable, writable, root] = process.argv.slice(1);
+      const read = path => { try { return fs.readFileSync(path, 'utf8') } catch { return null } };
+      fs.writeFileSync(writable + '/written', 'extra-writable');
+      console.log(JSON.stringify({ outside: read(secret), workspace: read(workspace + '/allowed'),
+        readable: read(readable + '/allowed'), root: process.env.HOME }));
+    `
+    const spawned = await hostSpawner(process.execPath, ['-e', program, secret, workspace, readable, writable], {
+      cwd: workspace, env: { ...process.env }, jail: request.jailSpec ?? undefined, signal,
     })
+    let stdout = '', stderr = ''
+    spawned.child.stdout!.setEncoding('utf8').on('data', (text) => { stdout += text })
+    spawned.child.stderr!.setEncoding('utf8').on('data', (text) => { stderr += text })
+    try {
+      const [code] = await once(spawned.child, 'close')
+      assert.equal(code, 0, stderr)
+      yield { content: stdout, finish_reason: 'stop' }
+    } finally { await spawned.terminate?.(); spawned.release() }
+  },
+}
+built.registry.register(backend)
+const server = serve({ fetch: built.app.fetch, hostname: '127.0.0.1', port: 0 })
+try {
+  if (!server.listening) await once(server, 'listening')
+  const address = server.address()
+  assert.ok(address && typeof address !== 'string')
+  const response = await fetch(`http://127.0.0.1:${address.port}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: backend.name, messages: [{ role: 'user', content: 'filesystem probe' }],
+      cwd: workspace, execution: { kind: 'host', jail: { mode: 'off' } } }),
   })
+  const body = await response.json() as { choices?: Array<{ message: { content: string } }> }
+  assert.equal(response.status, 200, JSON.stringify(body))
+  const result = JSON.parse(body.choices![0]!.message.content)
+  assert.equal(result.outside, null, 'embedded fs-jail must deny the outside canary despite ambient off/RO defaults')
+  assert.equal(result.workspace, 'workspace-allowed')
+  assert.equal(result.readable, 'extra-allowed')
+  assert.equal(result.root, join(workspace, '.agent-home/captured'))
+  assert.equal(await readFile(join(writable, 'written'), 'utf8'), 'extra-writable')
+  assert.equal(observed?.readConfine, true)
+  assert.equal(observed?.root, result.root)
+  assert.equal(loadConfig({ WORKER_FS_JAIL: '1' }).jailMode, 'fs-jail')
+  await assert.rejects(applyJail('/bin/true', [], { jail: observed! }, selectJailBackend('win32')), /refusing to run unconfined/)
+  console.log('PASS real HTTP snapshot mode/root/read paths/write paths/fallback and outside-read denial')
+} finally {
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+  for (const close of built.extras.shutdownHooks) await close()
+  built.sessions.close()
+  await rm(directory, { recursive: true, force: true })
 }
-
-async function main(): Promise<void> {
-  if (!jail.isAvailable()) {
-    console.log('SKIP: unprivileged bwrap is unavailable on this host — cannot prove the fs-jail here.')
-    console.log('      Enable with `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`')
-    console.log('      or `sudo chmod u+s /usr/bin/bwrap`, then re-run.')
-    process.exit(0)
-  }
-
-  // A clean workspace (as VB hands the coder) + a host "secret" OUTSIDE it that
-  // the jail must hide — the stand-in for the benchmark task defs + grader keys.
-  const workspace = mkdtempSync(join(tmpdir(), 'fsjail-verify-ws-'))
-  const secretDir = mkdtempSync(join(tmpdir(), 'fsjail-verify-secret-'))
-  const secretFile = join(secretDir, 'grader-answer-key.ts')
-  writeFileSync(secretFile, 'export const ANSWER = "42-cheating"\n')
-
-  // A localhost "twin" the jailed worker must still reach over the network.
-  const twin = createServer((_q, s) => s.end('twin-ok')).listen(0)
-  await new Promise((r) => twin.once('listening', r))
-  const twinPort = (twin.address() as { port: number }).port
-
-  // The real production path: an operator sets WORKER_FS_JAIL=1; the spec is
-  // resolved exactly as the chat route resolves it.
-  const spec = resolveJailSpec({ cwd: workspace, env: { WORKER_FS_JAIL: '1' } })
-  if (!spec?.readConfine) {
-    console.error('FAIL: resolveJailSpec(WORKER_FS_JAIL=1) did not produce a read-confined spec')
-    process.exit(1)
-  }
-
-  // Real host repo tree, if present, gets an extra explicit block check.
-  const hostRepo = '/home/drew/code'
-  const ghostAdmin = '/home/drew/code/blueprint-agent/scripts/experiments/scenarios/verticals/infra/api-ghost-admin.ts'
-
-  const checks: Check[] = [
-    { name: 'BLOCK read host secret file (grader key stand-in)', cmd: `cat ${secretFile}`, expect: 'block' },
-    { name: 'BLOCK list the secret dir', cmd: `ls ${secretDir}`, expect: 'block' },
-    ...(existsSync(hostRepo) ? [{ name: `BLOCK list host repo ${hostRepo}`, cmd: `ls ${hostRepo}`, expect: 'block' as const }] : []),
-    ...(existsSync(ghostAdmin) ? [{ name: 'BLOCK cat the real ghost-admin task/grader file', cmd: `cat ${ghostAdmin}`, expect: 'block' as const }] : []),
-    { name: 'ALLOW write a file in the workspace', cmd: 'echo built > solution.txt && cat solution.txt', expect: 'allow', wants: 'built' },
-    { name: 'ALLOW run node', cmd: 'node -e "console.log(2+2)"', expect: 'allow', wants: '4' },
-    { name: 'ALLOW run python3', cmd: 'python3 -c "print(6*7)"', expect: 'allow', wants: '42' },
-    { name: 'ALLOW curl the localhost twin', cmd: `curl -s http://127.0.0.1:${twinPort}`, expect: 'allow', wants: 'twin-ok' },
-  ]
-
-  let failed = 0
-  for (const c of checks) {
-    const { status, out, err } = await runInJail(spec, c.cmd)
-    let ok: boolean
-    if (c.expect === 'block') ok = status !== 0
-    else ok = status === 0 && (c.wants ? out.includes(c.wants) : true)
-    if (!ok) failed++
-    const tag = ok ? 'PASS' : 'FAIL'
-    const detail = c.expect === 'block'
-      ? `exit=${status} (want non-zero)`
-      : `exit=${status} out=${JSON.stringify(out)}${c.wants ? ` want~=${JSON.stringify(c.wants)}` : ''}`
-    console.log(`[${tag}] ${c.name} — ${detail}${!ok && err ? ` err=${JSON.stringify(err.slice(0, 200))}` : ''}`)
-  }
-
-  twin.close()
-  rmSync(workspace, { recursive: true, force: true })
-  rmSync(secretDir, { recursive: true, force: true })
-
-  if (failed) {
-    console.error(`\n${failed} check(s) FAILED — the fs-jail is NOT holding.`)
-    process.exit(1)
-  }
-  console.log('\nAll fs-jail checks PASSED: reads outside the workspace are blocked; build + node + python + curl-localhost work.')
-}
-
-main().catch((err) => {
-  console.error('verify-fs-jail crashed:', err)
-  process.exit(1)
-})

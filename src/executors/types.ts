@@ -107,7 +107,7 @@ export interface SpawnOpts {
   sessionId?: string
   /**
    * Resolved write-jail spec for this spawn. When set, the host and
-   * scoped-host spawners wrap `(bin, args)` via `wrapInJail` before
+   * scoped-host spawners wrap `(bin, args)` via `applyJail` before
    * spawning and run the wrap's cleanup in `release()`. Absent/null = no
    * jail; the spawn is byte-identical to the unjailed path. Resolved by
    * the chat route (see `resolveJailSpec`); ignored by the Docker spawner,

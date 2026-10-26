@@ -355,6 +355,13 @@ export async function buildApp(config: Config): Promise<{
   const admission = new AdmissionGate(config.admission)
   extras.shutdownHooks.push(async () => admission.close())
 
+  const jailEnv = {
+    BRIDGE_JAIL_MODE: config.jailMode,
+    BRIDGE_JAIL_ROOT: config.jailRoot ?? undefined,
+    BRIDGE_JAIL_RO_PATHS: config.jailReadablePaths.join(','),
+    BRIDGE_JAIL_RW_PATHS: config.jailWritablePaths.join(','),
+    BRIDGE_JAIL_FALLBACK: config.jailFallback,
+  }
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
@@ -366,7 +373,7 @@ export async function buildApp(config: Config): Promise<{
     const Backend = nativeBackends[name]
     const spawner = await buildExecutorForBackend(config.executors[name], harness, extras, bin, config)
     registry.register(new Backend({ bin, harness, timeoutMs: config[`${name}TimeoutMs`],
-      stateDir: join(config.dataDir, name), ...(spawner ? { spawner } : {}) }))
+      stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}), ...(spawner ? { spawner } : {}) }))
   }
   if (config.backends.has('claudish')) {
     if (!config.claudishUrl) {
@@ -458,6 +465,7 @@ export async function buildApp(config: Config): Promise<{
     runs,
     admission,
     admissionReservedClients: config.admissionReservedClients,
+    jailEnv,
     netJail: extras.netJail,
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
@@ -536,10 +544,9 @@ async function disposeApp(built: Pick<Awaited<ReturnType<typeof buildApp>>, 'ses
 export async function startServer(options: StartServerOptions = {}): Promise<BridgeServer> {
   const config = structuredClone(options.config ?? loadConfig())
   assertListenerConfig(config, true)
-  const fsJailFlag = ['1', 'true', 'yes', 'on'].includes((process.env.WORKER_FS_JAIL ?? '').trim().toLowerCase())
-  const jailFloor = fsJailFlag ? 'fs-jail' : config.jailMode
-  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends, config.executors) && !selectJailBackend().isAvailable()) {
-    if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
+  const jailFloor = config.jailMode
+  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends, config.executors) && !(await selectJailBackend().isAvailable())) {
+    if (config.jailFallback === 'warn') {
       console.warn(`[cli-bridge] WARNING: jail floor '${jailFloor}' is unavailable; requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).`)
     } else {
       throw new Error(`CLI Bridge jail floor '${jailFloor}' is unavailable. Enable a supported jail backend, or unset the jail floor.`)

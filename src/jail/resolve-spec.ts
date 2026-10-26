@@ -21,7 +21,7 @@
 
 import { homedir } from 'node:os'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
-import { resolveJailRoot } from './types.js'
+import { canonicalizeJailPath, resolveJailRoot } from './types.js'
 import type { JailSpec } from './types.js'
 
 export type JailMode = 'off' | 'write-jail' | 'fs-jail'
@@ -58,8 +58,8 @@ export function parseJailPathList(value: string | undefined, name: string, home:
     const p = raw.trim()
     if (!p) continue
     if (!isAbsolute(p)) throw new Error(`${name}: "${p}" is not an absolute path`)
-    const norm = resolve(p)
-    if (norm === sep || norm === resolve('/home') || norm === resolve(home)) {
+    const norm = canonicalizeJailPath(p)
+    if (norm === sep || norm === resolve('/home') || isWithin(norm, canonicalizeJailPath(home))) {
       throw new Error(`${name}: "${p}" would re-open the home tree the fs-jail exists to hide`)
     }
     if (!out.includes(norm)) out.push(norm)
@@ -86,7 +86,7 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   const mode = maxMode(floor, normalizeMode(input.execMode))
   if (mode === 'off') return null
 
-  const projectDir = resolve(input.cwd)
+  const projectDir = canonicalizeJailPath(input.cwd)
   const scratchBase = resolveJailRoot(DEFAULT_JAIL_ROOT, projectDir)
   const requested = input.execRoot ?? env.BRIDGE_JAIL_ROOT ?? DEFAULT_JAIL_ROOT
   // The writable root must be a dedicated scratch dir INSIDE <cwd>/.agent-home,
@@ -113,6 +113,7 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   return {
     root,
     projectDir,
+    fallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     ...(mode === 'fs-jail' ? { readConfine: true } : {}),
     ...(readable.length ? { extraReadablePaths: readable } : {}),
     ...(writable.length ? { extraWritablePaths: writable } : {}),

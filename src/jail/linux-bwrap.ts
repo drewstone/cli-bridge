@@ -36,7 +36,7 @@ import {
   seedAuthIntoJail,
 } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { canonicalizeJailPath, ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
 const BWRAP_BIN = 'bwrap'
 
@@ -222,9 +222,8 @@ export class LinuxBwrapJail implements JailBackend {
  *   - the wrapped CLI's own location — both its on-PATH entry dir (so a bare
  *     `bin` name resolves) and its realpath install root (so a bundled runtime
  *     a level up, e.g. `~/.opencode`, is readable);
- *   - the operator's `~/.cache` (tokenizer / model caches some CLIs read);
- *   - any extra dirs an operator lists in `BRIDGE_JAIL_RO_PATHS` (a PATH-style
- *     list) for a runtime whose location auto-derivation misses.
+ *   - the operator's `~/.cache` (tokenizer / model caches some CLIs read).
+ * Explicit operator extras come only from the resolved JailSpec.
  *
  * Every candidate passes through {@link isSafeReadPath}: `/`, `/home`, the
  * operator HOME itself, and any ANCESTOR of the workspace are refused, so a
@@ -232,7 +231,7 @@ export class LinuxBwrapJail implements JailBackend {
  * scratch dirs the jail exists to hide.
  */
 export function toolchainReadPaths(bin: string, projectDir: string): string[] {
-  const home = homedir()
+  const home = canonicalizeJailPath(homedir())
   const candidates: string[] = []
 
   // Node install prefix: <prefix>/bin/node → <prefix>. Also covers npm/pnpm and
@@ -254,15 +253,11 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
 
   candidates.push(join(home, '.cache'))
 
-  for (const p of (process.env.BRIDGE_JAIL_RO_PATHS ?? '').split(delimiter)) {
-    if (p.trim()) candidates.push(resolve(p.trim()))
-  }
-
-  const base = resolve(projectDir)
+  const base = canonicalizeJailPath(projectDir)
   const seen = new Set<string>()
   const out: string[] = []
   for (const c of candidates) {
-    const p = resolve(c)
+    const p = canonicalizeJailPath(c)
     if (seen.has(p)) continue
     seen.add(p)
     if (isSafeReadPath(p, home, base)) out.push(p)
@@ -278,11 +273,12 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
  * `/tmp/vb-live-<id>/ws` scratch dir) would re-expose the workspace's siblings,
  * which is exactly the leak the fs-jail closes.
  */
-function isSafeReadPath(p: string, home: string, base: string): boolean {
-  if (!isAbsolute(p) || p === '/' || p === '/home' || p === home) return false
-  const relToBase = relative(p, base)
-  const isBaseOrAncestor = relToBase === '' || (!relToBase.startsWith(`..${sep}`) && relToBase !== '..' && !isAbsolute(relToBase))
-  return !isBaseOrAncestor
+export function isSafeReadPath(p: string, home: string, base: string): boolean {
+  if (!isAbsolute(p) || p === '/home') return false
+  return [home, base].every((denied) => {
+    const rel = relative(p, denied)
+    return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)
+  })
 }
 
 /** Absolute on-PATH location of `bin` (or `bin` itself if absolute), else null. */

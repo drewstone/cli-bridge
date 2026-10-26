@@ -45,7 +45,7 @@ export async function applyJail(
     // unconfined would be a silent security downgrade, so fail closed by
     // default. Operators who knowingly accept unconfined execution can opt out
     // with BRIDGE_JAIL_FALLBACK=warn.
-    if (process.env.BRIDGE_JAIL_FALLBACK === 'warn' && !opts.jail.requireEnforcement) {
+    if (opts.jail.fallback === 'warn' && !opts.jail.requireEnforcement) {
       if (!warnedFallback) {
         warnedFallback = true
         console.warn(

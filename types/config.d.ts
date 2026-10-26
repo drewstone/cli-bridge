@@ -104,6 +104,8 @@ export interface Config extends NativeHarnessConfig {
      * macOS via sandbox-exec; no-op elsewhere).
      */
     jailMode: 'off' | 'write-jail' | 'fs-jail';
+    /** Explicit policy when the configured OS jail is unavailable. */
+    jailFallback: 'deny' | 'warn';
     /**
      * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
      * resolve under the request cwd; absolute paths must stay inside it.

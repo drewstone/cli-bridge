@@ -34,12 +34,14 @@ export interface JailSpec {
    * empty tmpfs at `/tmp`, and the workspace (`projectDir`) read-WRITE. A
    * jailed CLI then cannot read the host repo (benchmark task definitions /
    * grader answer keys) or sibling run scratch trees under `/tmp` — only the
-   * paths its runtimes legitimately need. Linux-only: the macOS seatbelt and
-   * noop backends confine writes only and ignore this flag.
+   * paths its runtimes legitimately need. macOS applies the same read
+   * allowlist through seatbelt. Unsupported hosts refuse confinement.
    */
   readConfine?: boolean
   /** Refuse the operator's unconfined warn fallback for this request. */
   requireEnforcement?: boolean
+  /** Captured operator fallback; absent means refuse unconfined execution. */
+  fallback?: 'deny' | 'warn'
   /** Host auth/config sources made available inside the jail so a confined run
    * still authenticates as the operator. Each source explicitly declares
    * whether Linux may read-only bind it or must make an ephemeral writable
@@ -132,8 +134,8 @@ export function resolveJailRoot(root: string, base: string): string {
   // Canonicalize BOTH paths (resolve symlinks on the existing prefix) before
   // comparing, so a repo-local symlink (e.g. scratch -> /tmp) cannot look
   // in-base lexically while physically pointing outside it.
-  const resolvedBase = canonicalize(resolve(base))
-  const resolvedRoot = canonicalize(isAbsolute(root) ? resolve(root) : resolve(resolvedBase, root))
+  const resolvedBase = canonicalizeJailPath(resolve(base))
+  const resolvedRoot = canonicalizeJailPath(isAbsolute(root) ? resolve(root) : resolve(resolvedBase, root))
   const rel = relative(resolvedBase, resolvedRoot)
   // Must be a STRICT descendant of base: never the base itself (rel === '',
   // which would make the whole working tree writable) and never an escape.
@@ -147,7 +149,7 @@ export function resolveJailRoot(root: string, base: string): string {
 /** Resolve symlinks on the deepest EXISTING ancestor of `p`, then re-append the
  * not-yet-created tail. Lets us canonicalize a jail root that does not exist
  * yet while still catching a symlinked ancestor that points outside the base. */
-function canonicalize(p: string): string {
+export function canonicalizeJailPath(p: string): string {
   const tail: string[] = []
   let cur = p
   for (;;) {

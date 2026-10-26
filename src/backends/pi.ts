@@ -115,6 +115,7 @@ const REASONING_FLUSH_CHARS = 256
 const REASONING_FLUSH_MS = 250
 
 export interface PiBackendOptions {
+  jailEnv?: NodeJS.ProcessEnv
   bin: string
   timeoutMs: number
   /** Overrides the high finite request-inspection boundary for isolated Pi traffic. */
@@ -381,12 +382,8 @@ export class PiBackend implements NativeSessionBackend {
   }
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
-    // Report the same precondition chat() enforces, or health lies. On a host executor pi
-    // refuses every turn unless an enforced Linux fs-jail (bubblewrap) is available, because
-    // pi's Bash can otherwise read host credentials and sibling sessions. `pi --version`
-    // succeeds regardless, so a version probe alone reported `ready` on macOS — where the
-    // only jail is a write-only seatbelt — while every request failed with `not_configured`.
-    // Measured 2026-09-11: /health said `pi -> ready` and the first real turn returned 501.
+    // Retained Pi currently requires its Linux inference-isolation path.
+    // Availability must enforce the same precondition as actual startup.
     if (this.spawner.executionEnvironment === 'host') {
       const jailBackend = selectJailBackend()
       if (jailBackend.name !== 'bwrap' || !(await jailBackend.isAvailable())) {
@@ -410,6 +407,7 @@ export class PiBackend implements NativeSessionBackend {
       timeoutMs: this.opts.timeoutMs,
       spawner: this.spawner,
       transportResolver: this.transportResolver,
+      jailEnv: this.opts.jailEnv,
     }, req, session, signal)
   }
 

@@ -120,6 +120,8 @@ export interface Config extends NativeHarnessConfig {
    * macOS via sandbox-exec; no-op elsewhere).
    */
   jailMode: 'off' | 'write-jail' | 'fs-jail'
+  /** Explicit policy when the configured OS jail is unavailable. */
+  jailFallback: 'deny' | 'warn'
   /**
    * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
    * resolve under the request cwd; absolute paths must stay inside it.
@@ -324,7 +326,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
     executors,
-    jailMode: parseJailMode(env.BRIDGE_JAIL_MODE),
+    jailMode: jailFloor({ ...env, BRIDGE_JAIL_MODE: parseJailMode(env.BRIDGE_JAIL_MODE) }),
+    jailFallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
     ...resolveJailPathLists(env),
     netJailMode,

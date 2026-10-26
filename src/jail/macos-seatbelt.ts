@@ -1,10 +1,10 @@
 /**
- * macOS write-jail via sandbox-exec (SBPL).
+ * macOS filesystem jail via sandbox-exec (SBPL).
  *
  * Modeled on holtwick/bx-mac. The profile starts permissive — reads,
  * exec, and network are allowed — then denies ALL file writes and
- * re-allows them only under the jail root (HOME), the system temp dirs,
- * and any caller-supplied writable paths. SBPL is last-match-wins, so the
+ * re-allows them only under the jail root (HOME) and explicit writable paths.
+ * An fs-jail also denies reads outside system, toolchain, workspace and auth paths. SBPL is last-match-wins, so the
  * narrow `allow` rules after the broad `deny` carve out the writable set.
  *
  * Symlinks: macOS routes /tmp and /var through /private, so subpath rules
@@ -17,9 +17,9 @@
  */
 
 import { accessSync, constants, existsSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readlink, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import {
   backendHome,
   copyAuthIntoJail,
@@ -28,7 +28,8 @@ import {
   seedAuthIntoJail,
 } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
-import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { canonicalizeJailPath, ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { isSafeReadPath, toolchainReadPaths } from './linux-bwrap.js'
 
 const SANDBOX_EXEC_BIN = 'sandbox-exec'
 // Device nodes a normal process writes to (output redirection, RNG, tracing,
@@ -54,7 +55,7 @@ export class MacosSeatbeltJail implements JailBackend {
   }
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
-    const root = await canonicalize(resolveJailRoot(spec.root, spec.projectDir))
+    const root = resolveJailRoot(spec.root, spec.projectDir)
     // Create the redirected HOME/XDG dirs under the (canonical) root so the CLI
     // can write to them; they sit inside `root`, already in the writable set.
     await prepareJailHome(root)
@@ -109,7 +110,7 @@ export class MacosSeatbeltJail implements JailBackend {
     try {
       const writable = [root]
       for (const path of spec.extraWritablePaths ?? []) {
-        writable.push(await canonicalize(path))
+        writable.push(canonicalizeJailPath(path))
       }
 
       // Point any backend env var (e.g. CODEX_HOME) at the in-jail copy. Done
@@ -120,7 +121,18 @@ export class MacosSeatbeltJail implements JailBackend {
         authEnv[envVar] = resolveJailRoot(jailRel, root)
       }
 
-      const profile = buildProfile(writable, fixedPaths)
+      const readOnly = (spec.extraReadablePaths ?? []).map(canonicalizeJailPath)
+      const extras = [...writable.slice(1), ...readOnly]
+      const home = canonicalizeJailPath(homedir())
+      for (const path of extras) {
+        if (!isSafeReadPath(path, home, canonicalizeJailPath(spec.projectDir))) throw new Error(`unsafe jail bind ${path}`)
+      }
+      const readable = spec.readConfine ? [
+        '/System', '/usr', '/bin', '/sbin', '/private/etc', '/private/var/db/dyld', '/dev',
+        spec.projectDir, ...writable, ...toolchainReadPaths(bin, spec.projectDir),
+        ...readOnly, ...fixedPaths,
+      ].map(canonicalizeJailPath) : undefined
+      const profile = buildProfile(writable, fixedPaths, readable, readOnly.filter((path) => !writable.includes(path)))
       const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
       const profilePath = join(dir, 'profile.sb')
       await writeFile(profilePath, profile, { mode: 0o600 })
@@ -188,20 +200,28 @@ async function linkHostKeychains(root: string): Promise<string[]> {
   return [library, target]
 }
 
-function buildProfile(writable: string[], fixed: string[] = []): string {
+export function buildProfile(writable: string[], fixed: string[] = [], readable?: string[], readOnly: string[] = []): string {
   const allowSubpaths = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
   const allowDevices = DEVICE_WRITABLE.map((path) => `  (literal "${sbplEscape(path)}")`).join('\n')
-  const denyFixed = fixed.length === 0 ? [] : [
-    '; The keychain link and its parent stay fixed, so a confined run cannot',
-    '; point them at host paths the unsandboxed bridge later touches.',
+  const denyFixed = fixed.length + readOnly.length === 0 ? [] : [
+    '; Preserve fixed credential links and read-only carveouts under writable parents.',
     '(deny file-write*',
     ...fixed.map((path) => `  (literal "${sbplEscape(path)}")`),
+    ...readOnly.map((path) => `  (subpath "${sbplEscape(path)}")`),
     ')',
     '',
   ]
   return [
     '(version 1)',
     '(allow default)',
+    ...(readable ? [
+      '(deny file-read*)',
+      '(allow file-read-metadata)',
+      '(allow file-read* (literal "/"))', // dyld needs the root vnode, never its subtrees
+      '(allow file-read*',
+      ...[...new Set(readable)].map((path) => `  (subpath "${sbplEscape(path)}")`),
+      ')',
+    ] : []),
     '',
     '; Deny all writes, then re-allow only the jail root + explicit writable paths',
     '; (subpaths) and standard device nodes (literals). Shared temp trees stay',
@@ -214,22 +234,6 @@ function buildProfile(writable: string[], fixed: string[] = []): string {
     '',
     ...denyFixed,
   ].join('\n')
-}
-
-/** Resolve symlinks so subpath rules match macOS /private aliases; tolerate
- * a not-yet-existing path by creating it (the jail root) or returning it
- * unchanged (a writable path the CLI will create later). */
-async function canonicalize(path: string): Promise<string> {
-  try {
-    return await realpath(path)
-  } catch {
-    try {
-      await mkdir(path, { recursive: true })
-      return await realpath(path)
-    } catch {
-      return path
-    }
-  }
 }
 
 function sbplEscape(value: string): string {
