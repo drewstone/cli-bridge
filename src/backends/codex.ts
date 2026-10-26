@@ -1,29 +1,4 @@
-/**
- * Codex CLI backend — spawns `codex exec --json` and translates its
- * JSONL event stream to OpenAI chat deltas.
- *
- * Model id scheme: `codex/<model>` where `<model>` is the Codex model
- * alias. Passed via `-c model="<model>"` config override. Bare `codex`
- * uses the subscription's default.
- *
- * Session resume: the external session id maps (via SessionStore) to a
- * Codex thread_id (UUID, reported on the `thread.started` event).
- * Subsequent calls invoke `codex exec resume <thread_id>` so Codex
- * loads prior context.
- *
- * Event shapes we parse (from `codex exec --json` JSONL):
- *   {"type":"thread.started","thread_id":"<uuid>"}
- *   {"type":"turn.started"}
- *   {"type":"message","content":{"text":"..."}}         — best-effort
- *   {"type":"item.completed","item":{"type":"message",…}} — best-effort
- *   {"type":"turn.completed","usage":{...}}
- *   {"type":"error","message":"..."}
- *
- * The message-content field names vary across codex versions. We
- * defensively pull `.content`, `.text`, `.message`, `.item.content`,
- * `.item.text` etc — whatever has a string. If Codex changes the shape
- * again, adjust `extractText` below rather than the whole pipeline.
- */
+/** Codex native execution and retained context import; cli-bridge owns the JSONL and app-server transports. */
 
 import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
