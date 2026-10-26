@@ -23,6 +23,7 @@ import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
+  admitNativeSubscription,
   materializeMcpServersForOpencode,
   profileExecutionIdentity,
   provisionProfileWorkspace,
@@ -167,33 +168,24 @@ export class OpencodeBackend implements Backend {
     args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
+      const envPassthroughKeys = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']
+      const childEnv = {
+        ...process.env,
+        OPENCODE_RUN_TIMEOUT_SECONDS: String(Math.ceil((req.execution?.timeoutMs ?? this.defaultExecutionTimeoutMs) / 1000)),
+        // Keep one native wrapper store for the entire resumable session.
+        ...(req.session_id ? { OPENCODE_RUNTIME_ID: req.session_id.replace(/[^A-Za-z0-9_.-]/g, '-') } : {}),
+        ...provisioned.env,
+        ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
+      }
+      await admitNativeSubscription(req, { env: childEnv, args, envPassthroughKeys, flags: provisioned.flags,
+        cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         // Preserve the operator's existing proxy and trust roots. Keep the host
         // sanitizer in force; these names are not request-controlled.
-        envPassthroughKeys: ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS'],
+        envPassthroughKeys,
         cwd,
-        env: {
-          ...process.env,
-          // The PATH wrapper has its own `timeout` invocation. Give it the same
-          // effective deadline as the durable run; zero disables that wrapper cap.
-          OPENCODE_RUN_TIMEOUT_SECONDS: String(Math.ceil(
-            (req.execution?.timeoutMs ?? this.defaultExecutionTimeoutMs) / 1000,
-          )),
-          // Name the SERIES for the isolating wrapper. It keeps non-interactive runs
-          // out of the user's shared opencode store by redirecting XDG_DATA_HOME into a
-          // temp dir it deletes on exit — but disposability is a property of the series,
-          // not of one call. The first shot of a resumable loop carries no `-s` (the
-          // session does not exist yet), so it was isolated and wiped, and the next shot
-          // resumed a session that was gone: `opencode exited 1: Session not found`,
-          // which ended every multi-round run at round 2. The caller's session id is
-          // stable across shots, so it names the series and the store persists for it.
-          ...(req.session_id
-            ? { OPENCODE_RUNTIME_ID: req.session_id.replace(/[^A-Za-z0-9_.-]/g, '-') }
-            : {}),
-          ...provisioned.env,
-          ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
-        },
+        env: childEnv,
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),

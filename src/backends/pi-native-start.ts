@@ -152,6 +152,7 @@ export async function startPiNativeSession(
   let provisioned: ReturnType<typeof provisionPiProfile> = null
   let inference: Awaited<ReturnType<typeof provisionPiInferenceTransport>> | null = null
   let spawned: Awaited<ReturnType<Spawner>> | null = null
+  let admittedInvocation: Parameters<NonNullable<ChatRequest['subscriptionAdmission']>['check']>[0] | undefined
   const prestartId = randomUUID()
   const phaseDurations: string[] = []
   let phase = 'interaction_root'
@@ -187,7 +188,12 @@ export async function startPiNativeSession(
     const resolvedInference = await options.transportResolver({
       provider: spec.provider,
       model: spec.model,
-    }, signal ?? new AbortController().signal, req.protectedModelCredential, prestartId)
+    }, signal ?? new AbortController().signal, req.protectedModelCredential, prestartId, req.subscriptionAdmission ? async (invocation) => {
+      await req.subscriptionAdmission!.check(invocation)
+      admittedInvocation = invocation
+    } : undefined)
+    req.subscriptionAdmission?.require()
+    if (req.subscriptionAdmission) Object.freeze(resolvedInference)
     advancePhase('provision_transport')
     inference = await provisionPiInferenceTransport(resolvedInference, {
       sessionId: req.session_id,
@@ -273,7 +279,12 @@ export async function startPiNativeSession(
     })
     advancePhase('started')
     console.info(`[pi-native-prestart] id=${prestartId} outcome=ok code=none phases_ms=${phaseDurations.join(',')}`)
-    return native
+    return Object.assign(native, {
+      async admitSubscription(admission: NonNullable<ChatRequest['subscriptionAdmission']>): Promise<void> {
+        if (admittedInvocation) await admission.check(admittedInvocation)
+        admission.require()
+      },
+    })
   } catch (error) {
     advancePhase('failed')
     console.warn(

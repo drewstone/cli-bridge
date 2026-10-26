@@ -7,7 +7,7 @@
   "exports": {
     ".": { "types": "./types/package.d.ts", "import": "./index.mjs" }
   },
-  "files": ["index.mjs", "bin", "src", "types/package.d.ts", "types/config.d.ts", "types/server-options.d.ts", "types/local-seats.d.ts", "profiles", "docker", "pnpm-lock.yaml", "README.md", "LICENSE"],
+  "files": ["index.mjs", "bin", "src", "types/package.d.ts", "types/config.d.ts", "types/server-options.d.ts", "types/local-seats.d.ts", "types/model-entry.d.ts", "profiles", "docker", "pnpm-lock.yaml", "README.md", "LICENSE"],
   "license": "MIT",
   "engines": {
     "node": ">=22.13.0"
@@ -34,7 +34,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^2.1.5",
-    "@tangle-network/agent-interface": "5.7.1",
+    "@tangle-network/agent-interface": "5.8.0",
     "@tangle-network/agent-profile-materialize": "0.27.5",
     "@tangle-network/agent-trace-contract": "^2.1.0",
     "better-sqlite3": "^13.0.3",

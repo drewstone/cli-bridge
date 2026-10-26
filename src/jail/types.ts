@@ -213,7 +213,7 @@ export function ignoreJailRoot(projectDir: string, root: string): void {
 /** Find the git dir + repo root for `start`, walking up parents. Handles a `.git`
  * directory (normal repo) and a `.git` FILE (`gitdir: <path>` for worktrees /
  * submodules). Returns null outside any repo. */
-function findGitDir(start: string): { gitDir: string; repoRoot: string } | null {
+export function findGitDir(start: string): { gitDir: string; repoRoot: string } | null {
   let dir = start
   for (;;) {
     const dotgit = join(dir, '.git')

@@ -4,6 +4,7 @@ import { streamSSE } from 'hono/streaming'
 import type { Context, Hono } from 'hono'
 import { canonicalCandidateDigest } from '@tangle-network/agent-interface'
 import { BackendError } from '../../backends/types.js'
+import { describeRunFailure } from '../../runs/error-shape.js'
 import { ExecutorSaturatedError } from '../../executors/types.js'
 import { setExactRunIdentityHeaders } from '../../runs/headers.js'
 import { lineageChildEnv } from '../../trace/lineage.js'
@@ -370,13 +371,13 @@ function retainedError(c: Context, error: unknown): Response {
     error instanceof RetainedSessionError
       ? error.status
       : error instanceof BackendError
-        ? error.code === 'capability_denied' || error.code === 'not_configured'
+        ? error.code === 'subscription_required' ? (describeRunFailure(error).status === 403 ? 403 : 500) : error.code === 'capability_denied' || error.code === 'not_configured'
           ? 501
           : error.code === 'parse_error'
             ? 400
             : 502
         : 500
-  return c.json({ error: body }, status as 400 | 408 | 409 | 413 | 429 | 500 | 501 | 502 | 503)
+  return c.json({ error: body }, status as 403 | 400 | 408 | 409 | 413 | 429 | 500 | 501 | 502 | 503)
 }
 
 /** Same fixed backoff the chat surface and the admission gate advertise. */
@@ -384,7 +385,7 @@ const RETAINED_EXECUTOR_RETRY_AFTER_SECONDS = 5
 
 function errorBody(error: unknown): { message: string; type: string } {
   if (error instanceof RetainedSessionError) return { message: error.message, type: error.code }
-  if (error instanceof BackendError) return { message: error.message, type: error.code }
+  if (error instanceof BackendError) return describeRunFailure(error)
   if (error instanceof Error) return { message: error.message, type: 'server_error' }
   return { message: String(error), type: 'server_error' }
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -24,19 +24,25 @@ test('packed production install embeds isolated HTTP services and runs the exist
     }
     await rm(root, { recursive: true, force: true })
   })
-  const packed = JSON.parse((await command(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', root], repo)).stdout)[0]
+  const source = join(root, 'source')
+  await mkdir(source)
+  await command('git', ['archive', '--format=tar', '--output', join(root, 'source.tar'), 'HEAD'], repo)
+  await command('tar', ['-xf', join(root, 'source.tar'), '-C', source], repo)
+  const packed = JSON.parse((await command(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', root], source)).stdout)[0]
   await writeFile(join(root, 'package.json'), '{"private":true,"type":"module"}\n')
   await command(npm, ['install', '--omit=dev', '--no-audit', '--no-fund', '--package-lock=false', join(root, packed.filename)], root)
   const manifest = JSON.parse(await readFile(join(root, 'node_modules/cli-bridge/package.json'), 'utf8'))
   assert.ok(manifest.dependencies.tsx, 'the existing loader must be installed in production')
   assert.equal(manifest.devDependencies?.tsx, undefined)
   await writeFile(join(root, 'consumer.mts'), `
-    import { loadConfig, startServer, detectLocalSeats, type LocalSeat, type BridgeServer } from 'cli-bridge';
+    import { loadConfig, startServer, detectLocalSeats, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
     const run = async (): Promise<BridgeServer> => startServer({ config, handleSignals: false, quiet: true });
     void run;
     const seats: Promise<LocalSeat[]> = detectLocalSeats({ config });
     void seats;
+    const model: ModelEntry = { id: 'codex/native', object: 'model', backend: 'codex', provider: 'openai', authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status' } };
+    void model;
   `)
   await command(join(repo, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--skipLibCheck', 'false',
     '--module', 'nodenext', '--moduleResolution', 'nodenext', '--target', 'es2022',
@@ -70,7 +76,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
     delete process.env.CODEX_API_KEY; delete process.env.CODEX_ACCESS_TOKEN; delete process.env.OPENAI_API_KEY;
     const native = await detectLocalSeats({ config: { ...missingConfig, codexBin: process.env.PACKAGE_NATIVE_CODEX } });
     assert.deepEqual(native.find((seat) => seat.harness === 'codex'), {
-      harness: 'codex', status: 'signed_out', authMode: 'unknown', source: 'native_status', fix: 'codex login',
+      harness: 'codex', provider: null, status: 'signed_out', authMode: 'unknown', source: 'native_status', fix: 'codex login',
     });
     await assert.rejects(startServer({ config: { ...base, host: '0.0.0.0' }, handleSignals: false }), /BRIDGE_BEARER/);
     assert.equal(existsSync(directory), false);

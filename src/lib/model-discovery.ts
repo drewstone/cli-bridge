@@ -15,7 +15,7 @@
  * the static seed — never an empty array.
  */
 
-import { execFile } from 'node:child_process'
+import { probeNativeStatus } from './native-status.js'
 
 export interface ModelSpec {
   id: string
@@ -68,17 +68,11 @@ export function parsePiModels(stdout: string, providers: readonly string[]): str
   return out
 }
 
-function runList(spec: DiscoverySpec): Promise<string[]> {
-  return new Promise((resolvePromise, reject) => {
-    execFile(spec.bin, spec.args, { timeout: EXEC_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
-      // Some CLIs print the table to stdout while exiting non-zero on an unrelated
-      // auth probe; trust stdout if it parsed to anything, else surface the error.
-      const ids = stdout ? spec.parse(stdout, spec.providers) : []
-      if (ids.length) return resolvePromise(ids)
-      if (err) return reject(err)
-      reject(new Error('discovery returned no models'))
-    })
-  })
+async function runList(spec: DiscoverySpec): Promise<string[]> {
+  const result = await probeNativeStatus(spec.bin, spec.args, { timeoutMs: EXEC_TIMEOUT_MS })
+  const ids = result.stdout ? spec.parse(result.stdout, spec.providers) : []
+  if (ids.length) return ids
+  throw new Error(`native model discovery failed (${result.code})`)
 }
 
 /**
@@ -87,18 +81,19 @@ function runList(spec: DiscoverySpec): Promise<string[]> {
  * static fallback (never empty).
  */
 export async function discoverModels(harness: string, spec: DiscoverySpec): Promise<readonly ModelSpec[]> {
-  const cached = cache.get(harness)
+  const key = JSON.stringify([harness, spec.bin, spec.args, spec.providers])
+  const cached = cache.get(key)
   if (cached && Date.now() - cached.at < TTL_MS) return cached.models
 
   try {
     const ids = await runList(spec)
     const models: ModelSpec[] = ids.map((id) => ({ id }))
-    cache.set(harness, { at: Date.now(), models })
+    cache.set(key, { at: Date.now(), models })
     return models
   } catch {
     const models = cached?.models ?? spec.fallback
     // Age the cache so the next request retries after FAILURE_RETRY_MS, not TTL_MS.
-    cache.set(harness, { at: Date.now() - TTL_MS + FAILURE_RETRY_MS, models })
+    cache.set(key, { at: Date.now() - TTL_MS + FAILURE_RETRY_MS, models })
     return models
   }
 }

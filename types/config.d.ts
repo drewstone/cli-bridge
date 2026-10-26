@@ -7,7 +7,7 @@
  * keys is the failure mode we refuse to allow.
  */
 /** Native harness identities only; model selection and seat syntax belong to agent-interface. */
-export declare const localHarnesses: readonly [readonly ['claude', 'claude-code', 'claude auth login', readonly ['auth', 'status', '--json']], readonly ['codex', 'codex', 'codex login', readonly ['login', 'status']], readonly ['opencode', 'opencode', 'opencode auth login', readonly ['auth', 'list', '--pure']], readonly ['kimi', 'kimi-code', 'kimi login', readonly ['--version']], readonly ['gemini', 'gemini', 'gemini', readonly ['--version']], readonly ['pi', 'pi', 'pi', readonly ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh']]];
+export declare const localHarnesses: readonly [readonly ['claude', 'claude-code', 'claude auth login', readonly ['auth', 'status', '--json'], 'anthropic'], readonly ['codex', 'codex', 'codex login', readonly ['login', 'status'], 'openai'], readonly ['opencode', 'opencode', 'opencode auth login', readonly ['auth', 'list', '--pure'], null], readonly ['kimi', 'kimi-code', 'kimi login', readonly ['--version'], null], readonly ['gemini', 'gemini', 'gemini', readonly ['--version'], 'google'], readonly ['pi', 'pi', 'pi', readonly ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null]];
 type NativeHarnessConfig = {
     [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string;
 } & {
@@ -21,6 +21,8 @@ export interface Config extends NativeHarnessConfig {
     /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
     asyncDurableWrites: boolean;
     backends: Set<string>;
+    /** Dedicated subscription consumers refuse API and unverified native routes. */
+    subscriptionsOnly: boolean;
     factoryBin: string;
     ampBin: string;
     forgeBin: string;

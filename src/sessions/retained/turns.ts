@@ -43,6 +43,7 @@ import { ENVIRONMENT_ID, RetainedSessionError, type RetainedTurnResult } from '.
 import type { RetainedContextTransfers } from './context-transfer.js'
 
 export interface RetainedTurnRunnerOptions {
+  admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void>
   store: SessionStore
   registry: BackendRegistry
   runs: RunRegistry
@@ -80,6 +81,7 @@ export class RetainedTurnRunner {
   private readonly isClosing: (id: string) => boolean
   private readonly denyUnrequestedInteraction: RetainedTurnRunnerOptions['denyUnrequestedInteraction']
   private readonly contextTransfers: RetainedContextTransfers
+  private readonly admitSubscription: RetainedTurnRunnerOptions['admitSubscription']
   /** In-flight durable commits, keyed by run id. */
   private readonly finalizations = new Map<string, Promise<void>>()
 
@@ -92,6 +94,7 @@ export class RetainedTurnRunner {
     this.isClosing = options.isClosing
     this.denyUnrequestedInteraction = options.denyUnrequestedInteraction
     this.contextTransfers = options.contextTransfers
+    this.admitSubscription = options.admitSubscription
   }
 
   async beginTurn(id: string, input: RetainedTurnInput, options: RetainedBeginTurnOptions = {}): Promise<RetainedTurnResult> {
@@ -381,22 +384,14 @@ export class RetainedTurnRunner {
       releaseNativeAttachment = run.reserveNativeControlAttachment()
       const request = this.requestFor(retained, input, prompt, interactions, config, contextMessages,
         options.childLineage)
+      await this.admitSubscription?.(request, backend.name, run.signal)
       try {
         if (!native) {
           native = await backend.startNativeSession(request, sessionRecordFor(retained), run.signal)
           run.setNativeControl(native)
           nativeOwnedByRun = true
         } else {
-          if (!existingControl) {
-            throw new RetainedSessionError(
-              'native session ownership disappeared before continuation',
-              409,
-              'invalid_state',
-            )
-          }
-          if (!(await existingControl.run.takeNativeControl(native))) {
-            throw new RetainedSessionError('native session ownership changed before continuation', 409, 'invalid_state')
-          }
+          await admitNativeContinuation(request, native, existingControl)
           run.setNativeControl(native)
           nativeOwnedByRun = true
         }
@@ -762,4 +757,14 @@ function sessionRecordFor(record: RetainedSessionRecord): {
     lastUsedAt: record.lastUsedAt,
     metadata: record.metadata,
   }
+}
+
+/** Recheck the exact retained invocation before transferring its live process into a new run. */
+async function admitNativeContinuation(request: ChatRequest, native: NativeSession, control: ReturnType<RunRegistry['nativeSession']>): Promise<void> {
+  if (request.subscriptionAdmission) {
+    await native.admitSubscription?.(request.subscriptionAdmission)
+    request.subscriptionAdmission.require()
+  }
+  if (!control) throw new RetainedSessionError('native session ownership disappeared before continuation', 409, 'invalid_state')
+  if (!(await control.run.takeNativeControl(native))) throw new RetainedSessionError('native session ownership changed before continuation', 409, 'invalid_state')
 }

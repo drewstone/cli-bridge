@@ -17,6 +17,7 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
+  admitNativeSubscription,
   materializeMcpServersForGemini,
   profileExecutionIdentity,
   provisionProfileWorkspace,
@@ -91,10 +92,13 @@ export class GeminiBackend implements Backend {
 
     let spawned: Awaited<ReturnType<Spawner>>
     try {
+      const childEnv = { ...process.env, ...provisioned.env }
+      await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
+        cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         cwd,
-        env: { ...process.env, ...provisioned.env },
+        env: childEnv,
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),

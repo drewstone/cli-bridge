@@ -36,6 +36,7 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
+  admitNativeSubscription,
   materializeMcpServersForKimi,
   profileExecutionIdentity,
   provisionProfileWorkspace,
@@ -128,10 +129,13 @@ export class KimiBackend implements Backend {
       // after this process exits and serializes overlapping runs.
       mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session), cwd)
 
+      const childEnv = { ...process.env, ...provisioned.env }
+      await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
+        cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
-        env: { ...process.env, ...provisioned.env },
+        env: childEnv,
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),

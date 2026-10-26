@@ -24,7 +24,7 @@ import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
 import { assertPiModelMetadataCompatibility } from './profile-support.js'
 import { PiAuthResolutionError, resolvePiAuthCredential } from './pi-auth-credential.js'
 import { readPiSelectedModel, type PiCatalogModel } from './pi-catalog-rpc.js'
-import { BackendError } from './types.js'
+import { BackendError, type NativeSubscriptionAdmission } from './types.js'
 
 export const PI_API_MODES = [
   'anthropic-messages',
@@ -92,6 +92,7 @@ export type PiInferenceTransportResolver = (
   signal: AbortSignal,
   credential?: PiInferenceCredentialOverride,
   diagnosticId?: string,
+  admitSubscription?: NativeSubscriptionAdmission['check'],
 ) => Promise<ResolvedPiInferenceTransport>
 
 export interface ProvisionedPiInferenceTransport {
@@ -393,7 +394,7 @@ export function createPiInferenceTransportResolver(options: {
       ?? join(sourceAgentDir, 'sessions'),
   )
 
-  return async (selection, signal, credential, diagnosticId) => {
+  return async (selection, signal, credential, diagnosticId, admitSubscription) => {
     const config = readConfiguredTransport(sourceAgentDir, selection)
       ?? await readCatalogTransport({
         bin: options.bin,
@@ -401,6 +402,10 @@ export function createPiInferenceTransportResolver(options: {
         env: trustedEnv,
         signal,
       })
+    const credentialEnv = { ...trustedEnv, PI_CODING_AGENT_DIR: sourceAgentDir }
+    await admitSubscription?.({ env: credentialEnv, cwd: process.cwd(), model: `pi/${selection.provider}/${selection.model}`,
+      provider: selection.provider, endpoint: config.upstreamBaseUrl, credentialOverride: credential !== undefined, executor: 'host' })
+    if (admitSubscription) Object.freeze(credentialEnv)
     if (credential !== undefined) {
       const expectedDigest = `sha256:${createHash('sha256').update(credential.token).digest('hex')}` as const
       const expectedBaseUrlDigest = `sha256:${createHash('sha256').update(credential.baseUrl).digest('hex')}` as const
@@ -436,7 +441,8 @@ export function createPiInferenceTransportResolver(options: {
         provider: selection.provider,
         model: selection.model,
         apiMode: config.apiMode,
-        env: trustedEnv,
+        env: credentialEnv,
+        subscriptionOnly: admitSubscription !== undefined,
         signal,
         diagnosticId,
       })
@@ -473,22 +479,9 @@ export function createPiInferenceTransportResolver(options: {
 export const PI_REQUEST_SCOPED_CREDENTIAL_SOURCE =
   'request-scoped protected model credential (x-cli-bridge-model-credential header)'
 
-/**
- * Name where `pi auth print-api-key` takes the provider credential from, so a
- * provider 401 reads as the file or variable to fix instead of as a bad key.
- *
- * Mirrors pi's own precedence (core/provider-composer.ts): a stored credential
- * for the provider in the agent dir's auth.json wins over the provider's
- * `apiKey` in models.json, which pi resolves as a `!command`, a `$VAR` /
- * `${VAR}` template, or a literal — and a bare identifier is an env var name
- * in the pi line the prime fork descends from but a literal in the upstream
- * 0.8x line, so a bare identifier is reported with the presence of a variable
- * of that name and left for the operator to read against their pi build.
- * Only paths, pi's own credential type names, and the env var names pi itself
- * reads are rendered, never the apiKey string or any part of it: the message
- * crosses the HTTP boundary, a bare identifier may BE the key (an
- * identifier-shaped literal such as a hex or `sk_live_` token), and the
- * literal text of a template is key material too.
+/** Describe native credential precedence without rendering credential material.
+ * Stored provider auth wins over models.json apiKey, then Pi built-ins. Config keys may be commands,
+ * templates, or bare literals/env names depending on Pi version; expose paths and presence only.
  */
 export function describePiCredentialSource(
   sourceAgentDir: string,
