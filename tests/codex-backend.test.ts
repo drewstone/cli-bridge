@@ -53,35 +53,9 @@ function request(): ChatRequest {
   } as ChatRequest
 }
 
-// Event lines captured from a real `codex exec --json` run; the tool-call
-// items exercise every branch of extractToolCall.
+// Captured native event shapes retained for the session/resume boundary checks.
+// Real-process tool translation lives in harness-terminal.integration.test.ts.
 const THREAD = { type: 'thread.started', thread_id: '019f3889-c05e-70c3-ae9f-3077da9454c4' }
-const COMMAND_ITEM = {
-  type: 'item.completed',
-  item: {
-    id: 'item_1',
-    type: 'command_execution',
-    command: "/bin/bash -lc 'echo bridge-probe-42'",
-    aggregated_output: 'bridge-probe-42\n',
-    exit_code: 0,
-    status: 'completed',
-  },
-}
-const MCP_ITEM = {
-  type: 'item.completed',
-  item: {
-    id: 'item_2',
-    type: 'mcp_tool_call',
-    server: 'tangle-search',
-    tool: 'web_search',
-    arguments: { query: 'vercel ai sdk v5 streamText' },
-    status: 'completed',
-  },
-}
-const WEBSEARCH_ITEM = {
-  type: 'item.completed',
-  item: { id: 'item_3', type: 'web_search', query: 'hono v4 middleware' },
-}
 const MESSAGE_ITEM = {
   type: 'item.completed',
   item: { id: 'item_4', type: 'agent_message', text: 'done' },
@@ -220,28 +194,6 @@ describe('CodexBackend tool-call translation', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
-  })
-
-  it('surfaces command/mcp/web_search items as tool_calls deltas', async () => {
-    const backend = new CodexBackend({
-      bin: 'codex',
-      timeoutMs: 5_000,
-      spawner: codexSpawner([THREAD, COMMAND_ITEM, MCP_ITEM, WEBSEARCH_ITEM, MESSAGE_ITEM, TURN_DONE]),
-    })
-    const deltas = await collect(backend.chat(request(), null, new AbortController().signal))
-
-    const toolCalls = deltas.flatMap((d) => d.tool_calls ?? [])
-    expect(toolCalls.map((t) => t.name)).toEqual(['bash', 'tangle-search_web_search', 'websearch'])
-    expect(JSON.parse(toolCalls[0]!.arguments)).toEqual({ command: "/bin/bash -lc 'echo bridge-probe-42'" })
-    expect(JSON.parse(toolCalls[1]!.arguments)).toEqual({ query: 'vercel ai sdk v5 streamText' })
-    expect(toolCalls.map((t) => t.id)).toEqual(['item_1', 'item_2', 'item_3'])
-
-    const finish = deltas.find((d) => d.finish_reason)
-    expect(finish?.finish_reason).toBe('tool_calls')
-    expect(finish?.usage).toEqual({ input_tokens: 45929, output_tokens: 103 })
-
-    // Assistant text still flows.
-    expect(deltas.some((d) => d.content === 'done')).toBe(true)
   })
 
   it('reports finish_reason stop when no tool item appears', async () => {
