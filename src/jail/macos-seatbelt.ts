@@ -217,6 +217,7 @@ export function buildProfile(writable: string[], fixed: string[] = [], readable?
     ...(readable ? [
       '(deny file-read*)',
       '(allow file-read-metadata)',
+      '(allow file-read* (literal "/"))', // dyld needs the root vnode, never its subtrees
       '(allow file-read*',
       ...[...new Set(readable)].map((path) => `  (subpath "${sbplEscape(path)}")`),
       ')',
