@@ -3,6 +3,11 @@
   "version": "0.3.0",
   "description": "Expose your local coding-CLI subscriptions (Claude Code, Codex, Kimi via opencode, \u2026) as an OpenAI-compatible HTTP API with persistent session resume. Personal tool \u2014 single-user by default.",
   "type": "module",
+  "bin": { "cli-bridge": "./bin/cli-bridge.mjs" },
+  "exports": {
+    ".": { "types": "./types/package.d.ts", "import": "./index.mjs" }
+  },
+  "files": ["index.mjs", "bin", "src", "types/package.d.ts", "types/config.d.ts", "types/server-options.d.ts", "profiles", "docker", "pnpm-lock.yaml", "README.md", "LICENSE"],
   "license": "MIT",
   "engines": {
     "node": ">=22.13.0"
@@ -11,7 +16,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
-    "build": "tsc --noEmit",
+    "build": "tsc --project tsconfig.package.json && node scripts/package-types.mjs",
+    "test:package": "node --test tests/package.integration.mjs",
     "test": "node --check tests/runtime-consumer/live-opencode.mjs && vitest run && pnpm run test:runtime-consumer",
     "test:runtime-consumer": "pnpm --filter cli-bridge-runtime-consumer-regression test",
     "test:local-inference": "node tests/runtime-consumer/live-opencode.mjs",
@@ -32,13 +38,13 @@
     "@tangle-network/agent-trace-contract": "^2.1.0",
     "better-sqlite3": "^13.0.3",
     "hono": "^4.13.14",
-    "zod": "^4.6.7"
+    "zod": "^4.6.7",
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@openai/codex": "0.164.0",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.5",
-    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   }

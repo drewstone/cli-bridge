@@ -57,9 +57,15 @@ export class PoolMaintenance {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('maintenance journal needs operator reconciliation')
     }
-    for (const record of this.records) {
-      this.lock(record.legacyDataDir)
-      this.restore(record)
+    try {
+      for (const record of this.records) {
+        this.lock(record.legacyDataDir)
+        this.restore(record)
+      }
+    } catch (error) {
+      for (const [name, pool] of this.pools) if (registeredPools.get(name) === pool) registeredPools.delete(name)
+      for (const lock of this.locks.values()) lock.release()
+      throw error
     }
   }
 
