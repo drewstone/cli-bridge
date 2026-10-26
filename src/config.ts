@@ -516,14 +516,14 @@ function assertNetJailEnforceable(
  * use — past that, a rejection stops being a typed 503 and becomes a hang.
  */
 function admissionConfig(env: NodeJS.ProcessEnv): Config['admission'] {
-  const maxActive = parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8)
+  const maxActive = parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8)
   return {
     maxActive,
     maxQueue: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_QUEUE, 16),
     queueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_QUEUE_TIMEOUT_MS, 30_000),
     reservedActive: parseNonNegativeInt(
       env.BRIDGE_HOST_CHAT_RESERVED_ACTIVE,
-      Math.min(2, maxActive - 1),
+      maxActive === 0 ? 0 : Math.min(2, maxActive - 1),
     ),
     bulkQueueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_BULK_QUEUE_TIMEOUT_MS, 240_000),
   }
@@ -539,8 +539,8 @@ const parseNonNegativeInt = (value: string | undefined, fallback: number): numbe
 
 function parseInteger(value: string | undefined, fallback: number, minimum: 0 | 1): number {
   if (value === undefined || value === '') return fallback
-  const parsed = Number.parseInt(value, 10)
-  if (!Number.isInteger(parsed) || parsed < minimum) {
+  const parsed = /^(0|[1-9][0-9]*)$/u.test(value) ? Number(value) : NaN
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
     throw new Error(`invalid ${minimum ? 'positive' : 'non-negative'} integer: ${value}`)
   }
   return parsed

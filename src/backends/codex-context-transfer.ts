@@ -1,7 +1,7 @@
 /**
  * Backend-owned typed history import through Codex's public app-server API.
- * Protocol checked against codex-cli 0.162.1 and openai/codex rust-v0.162.1
- * (7a078f6bb4ce0dc2a81408b334ce52979d92c603). No native session files are read.
+ * Exact binary qualification is owned by tests/codex-context-transfer-real.test.ts.
+ * No native session files are read.
  * https://developers.openai.com/codex/app-server
  */
 import {
@@ -15,6 +15,8 @@ import { BackendError, type PreparedContextTransfer, type ProfileMaterialization
 import type { SpawnResult } from '../executors/types.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { StringDecoder } from 'node:string_decoder'
+
+export const CODEX_NATIVE_IMPORT_VERSION = 'codex-cli 0.164.0'
 
 const MAX_RPC_LINE_BYTES = 8 * 1024 * 1024
 const RPC_TIMEOUT_MS = 30_000

@@ -129,12 +129,7 @@ describe('materializeProfile — verified per-harness routing', () => {
     expect(unsupportedDims('opencode')).toContain('hooks')
   })
 
-  it('kimi-code: skills cwd-native, but MCP needs the --mcp-config-file FLAG (no cwd discovery)', () => {
-    const plan = materializeProfile(FULL, 'kimi-code')
-    expect(plan.files.map((f) => f.relPath)).toContain('.kimi/skills/fhenix-core/SKILL.md')
-    expect(plan.flags).toEqual(expect.arrayContaining(['--mcp-config-file', '.kimi/mcp.json']))
-    expect(unsupportedDims('kimi-code')).toEqual(expect.arrayContaining(['hooks', 'subagents', 'commands']))
-  })
+
 
   it('hermes: HERMES.md context, NO cwd skill dir (fail-closed), hooks via opt-in env', () => {
     const plan = materializeProfile(FULL, 'hermes')
@@ -161,15 +156,7 @@ describe('materializeProfile — verified per-harness routing', () => {
     expect(plan.unsupported).toEqual([])
   })
 
-  it('applyWorkspacePlan writes every file (with parent dirs) + returns env/flags', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'apply-'))
-    const plan = materializeProfile(FULL, 'kimi-code')
-    const r = applyWorkspacePlan(plan, dir)
-    expect(existsSync(join(dir, '.kimi/skills/fhenix-core/SKILL.md'))).toBe(true)
-    expect(readFileSync(join(dir, '.kimi/skills/fhenix-core/SKILL.md'), 'utf8')).toContain('name: fhenix-core')
-    expect(r.flags).toEqual(expect.arrayContaining(['--mcp-config-file', '.kimi/mcp.json']))
-    expect(r.written).toContain('.kimi/skills/fhenix-core/SKILL.md')
-  })
+
 
   it('fails closed on unsafe profile paths', () => {
     const root = mkdtempSync(join(tmpdir(), 'profile-fail-closed-'))

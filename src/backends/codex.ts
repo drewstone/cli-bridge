@@ -1,29 +1,4 @@
-/**
- * Codex CLI backend — spawns `codex exec --json` and translates its
- * JSONL event stream to OpenAI chat deltas.
- *
- * Model id scheme: `codex/<model>` where `<model>` is the Codex model
- * alias. Passed via `-c model="<model>"` config override. Bare `codex`
- * uses the subscription's default.
- *
- * Session resume: the external session id maps (via SessionStore) to a
- * Codex thread_id (UUID, reported on the `thread.started` event).
- * Subsequent calls invoke `codex exec resume <thread_id>` so Codex
- * loads prior context.
- *
- * Event shapes we parse (from `codex exec --json` JSONL):
- *   {"type":"thread.started","thread_id":"<uuid>"}
- *   {"type":"turn.started"}
- *   {"type":"message","content":{"text":"..."}}         — best-effort
- *   {"type":"item.completed","item":{"type":"message",…}} — best-effort
- *   {"type":"turn.completed","usage":{...}}
- *   {"type":"error","message":"..."}
- *
- * The message-content field names vary across codex versions. We
- * defensively pull `.content`, `.text`, `.message`, `.item.content`,
- * `.item.text` etc — whatever has a string. If Codex changes the shape
- * again, adjust `extractText` below rather than the whole pipeline.
- */
+/** Codex native execution and retained context import; cli-bridge owns the JSONL and app-server transports. */
 
 import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -53,7 +28,7 @@ import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
 import { nativeReasoningControl, workspaceCwdPathForBase, type ContextTransferRequest } from '@tangle-network/agent-interface'
-import { CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
+import { CODEX_NATIVE_IMPORT_VERSION, CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
 import { assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
 import {
   assertRouterCodexExecution,
@@ -92,7 +67,7 @@ export class CodexBackend implements Backend {
     const health = await versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
     // The actual installed public protocol and restart path were qualified at
     // this version. A different binary needs its own proof before advertisement.
-    this.nativeImportProtocolQualified = health.state === 'ready' && health.version === 'codex-cli 0.162.1'
+    this.nativeImportProtocolQualified = health.state === 'ready' && health.version === CODEX_NATIVE_IMPORT_VERSION
     return health
   }
 
@@ -117,7 +92,7 @@ export class CodexBackend implements Backend {
     signal: AbortSignal,
   ): Promise<PreparedContextTransfer> {
     this.validateContextTransfer(request)
-    if (!this.contextTransferAvailable()) throw new BackendError('installed Codex native import protocol has not been qualified (requires codex-cli 0.162.1)', 'capability_denied')
+    if (!this.contextTransferAvailable()) throw new BackendError(`installed Codex native import protocol has not been qualified (requires ${CODEX_NATIVE_IMPORT_VERSION})`, 'capability_denied')
     const stateDir = this.opts.stateDir
     if (!stateDir) throw new BackendError('Codex native context import requires the retained host executor state directory', 'capability_denied')
     const req = codexTransferChatRequest(request)
@@ -587,18 +562,8 @@ export class CodexBackend implements Backend {
   }
 
   private extractModel(fullModel: string): string | null {
-    const lower = fullModel.toLowerCase()
-    if (lower === 'codex') return null
-    // `codex/default` is the alias for "no model override; let codex
-    // CLI use whatever ~/.codex/config.toml resolves to". Returning
-    // null here suppresses the `-c model="..."` flag in chat() so the
-    // call works on accounts without entitlement for the gated alias.
-    if (lower === 'codex/default') return null
-    if (lower.startsWith('codex/')) {
-      const rest = fullModel.slice('codex/'.length)
-      return rest.length > 0 ? rest : null
-    }
-    return null
+    if (!fullModel.toLowerCase().startsWith('codex/')) return null
+    return fullModel.slice('codex/'.length) || null
   }
 }
 
@@ -614,18 +579,17 @@ function codexTransferChatRequest(request: ContextTransferRequest): ChatRequest 
 
 /**
  * Split a provider-qualified codex model remainder (`openai/gpt-5.1-codex`)
- * into its `model_provider` / `model` config pair. A remainder with no slash
- * is a bare model id under the account's default provider. Codex model ids
- * themselves never contain `/` (OSS variants use `:`), so the first segment
- * is always the provider when a slash is present.
+ * into its `model_provider` / `model` config pair, preserving nested model ids.
+ * `default` omits only the model override, retaining an explicit provider.
  */
 export function splitCodexModel(
   remainder: string | null,
 ): { provider: string | null; model: string | null } {
   if (!remainder) return { provider: null, model: null }
   const slash = remainder.indexOf('/')
-  if (slash <= 0) return { provider: null, model: remainder }
-  return { provider: remainder.slice(0, slash), model: remainder.slice(slash + 1) }
+  const provider = slash > 0 ? remainder.slice(0, slash) : null
+  const model = slash > 0 ? remainder.slice(slash + 1) : remainder
+  return { provider, model: model.toLowerCase() === 'default' ? null : model }
 }
 
 /**

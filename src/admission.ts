@@ -157,7 +157,7 @@ export class AdmissionGate {
   private reclaimed = 0
 
   constructor(private readonly opts: AdmissionGateOptions) {
-    if (!Number.isInteger(opts.maxActive) || opts.maxActive < 1) {
+    if (!Number.isInteger(opts.maxActive) || opts.maxActive < 0) {
       throw new Error(`invalid maxActive: ${opts.maxActive}`)
     }
     if (!Number.isInteger(opts.maxQueue) || opts.maxQueue < 0) {
@@ -169,9 +169,8 @@ export class AdmissionGate {
     if (!Number.isInteger(opts.bulkQueueTimeoutMs) || opts.bulkQueueTimeoutMs < 0) {
       throw new Error(`invalid bulkQueueTimeoutMs: ${opts.bulkQueueTimeoutMs}`)
     }
-    // reservedActive === maxActive would leave bulk with a zero ceiling and
-    // block the fleet forever, so the lane must leave at least one bulk slot.
-    if (!Number.isInteger(opts.reservedActive) || opts.reservedActive < 0 || opts.reservedActive >= opts.maxActive) {
+    // Uncapped admission has no reserved lane; bounded admission leaves bulk at least one slot.
+    if (!Number.isInteger(opts.reservedActive) || opts.reservedActive < 0 || (opts.maxActive === 0 ? opts.reservedActive !== 0 : opts.reservedActive >= opts.maxActive)) {
       throw new Error(
         `invalid reservedActive: ${opts.reservedActive} — expected an integer in [0, ${opts.maxActive - 1}]`,
       )
@@ -330,6 +329,7 @@ export class AdmissionGate {
   }
 
   private canAdmit(admissionClass: AdmissionClass): boolean {
+    if (this.opts.maxActive === 0) return true
     if (this.activeTotal() >= this.opts.maxActive) return false
     if (admissionClass === 'bulk') return this.active.bulk < this.bulkMaxActive()
     return true

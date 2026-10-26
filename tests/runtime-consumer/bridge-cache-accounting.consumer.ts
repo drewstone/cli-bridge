@@ -1,160 +1,52 @@
 import assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
-import { createServer } from 'node:http'
-import { PassThrough } from 'node:stream'
-import { afterEach, test } from 'node:test'
-import { canonicalAgentProfileDigest } from '@tangle-network/agent-interface'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { test } from 'node:test'
 import { createBudgetPool, createExecutor } from '@tangle-network/agent-runtime/kernel'
-import { ClaudeBackend } from '../../src/backends/claude.js'
-import type { ChatDelta, ChatRequest } from '../../src/backends/types.js'
-import type { SpawnResult, Spawner } from '../../src/executors/types.js'
-import { deltaToOpenAIChunk, makeChunkMeta } from '../../src/streaming/sse.js'
-
-class FakeChild extends EventEmitter {
-  stdout = new PassThrough()
-  stderr = new PassThrough()
-  stdin = new PassThrough()
-  exitCode: number | null = null
-}
+import { loadConfig, startServer } from '../../src/server.js'
 
 const PROFILE = {
   name: 'cache-accounting-consumer-proof',
   harness: 'claude-code',
   model: { provider: 'anthropic', default: 'sonnet' },
 } as const
-// This loopback fixture tests the wire contract, not the deployed bridge.
-// Its model is claude-code/anthropic/sonnet.
-// The native production probe used claude-code/anthropic/claude-sonnet-5.
-const MODEL = 'claude-code/anthropic/sonnet'
-
-function claudeSpawner(lines: Array<Record<string, unknown>>): Spawner {
-  return async (): Promise<SpawnResult> => {
-    const child = new FakeChild()
-    queueMicrotask(() => {
-      for (const line of lines) child.stdout.write(`${JSON.stringify(line)}\n`)
-      child.stdout.end()
-      child.stderr.end()
-      setTimeout(() => {
-        child.exitCode = 0
-        child.emit('close', 0)
-      }, 10)
-    })
-    return { child: child as never, release() {}, spawnError: () => null }
-  }
-}
-
-async function collect(deltas: AsyncIterable<ChatDelta>): Promise<ChatDelta[]> {
-  const result: ChatDelta[] = []
-  for await (const delta of deltas) result.push(delta)
-  return result
-}
-
-async function normalizedClaudeUsageFrame(): Promise<string> {
-  const backend = new ClaudeBackend({
-    bin: 'claude',
-    harness: 'claude-code',
-    timeoutMs: 5_000,
-    spawner: claudeSpawner([
-      { type: 'system', subtype: 'init', session_id: 'sess-1' },
-      { type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'done' }] } },
-      {
-        type: 'result',
-        subtype: 'success',
-        session_id: 'sess-1',
-        usage: {
-          input_tokens: 2,
-          cache_creation_input_tokens: 10_753,
-          cache_read_input_tokens: 15_269,
-          output_tokens: 4,
-        },
-        total_cost_usd: 0.0470478,
-      },
-    ]),
-  })
-  const request: ChatRequest = {
-    model: MODEL,
-    messages: [{ role: 'user', content: 'account this native Claude receipt' }],
-    mode: 'byob',
-  }
-  const terminal = (await collect(backend.chat(request, null, new AbortController().signal))).at(-1)
-  const frame = terminal && deltaToOpenAIChunk(terminal, makeChunkMeta(MODEL))
-  assert.ok(frame, 'Claude backend must serialize a terminal usage frame')
-  return frame
-}
-
-const servers: ReturnType<typeof createServer>[] = []
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-  return value !== null
-    && typeof value === 'object'
+  return value !== null && typeof value === 'object'
     && typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function'
 }
 
-afterEach(async () => {
-  await Promise.all(
-    servers.splice(0).map(
-      server => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
-    ),
-  )
-})
-
-test('published Runtime debits Claude cache writes without charging cache reads twice', async () => {
-  const usageFrame = await normalizedClaudeUsageFrame()
-  let requestModel: string | undefined
-  const server = createServer(async (request, response) => {
-    if (request.method === 'GET' && request.url === '/') {
-      response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({
-        capabilities: {
-          profileMaterialization: 'cli-bridge.profile-materialization.v2',
-          usageCostProvenance: 'cli-bridge.usage-cost.v1',
-        },
-      }))
-      return
-    }
-    if (request.method === 'GET' && (request.url?.startsWith('/v1/capabilities') || request.url === '/health')) {
-      response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(request.url === '/health' ? JSON.stringify({ ok: true }) : JSON.stringify({}))
-      return
-    }
-
-    assert.equal(request.method, 'POST')
-    assert.equal(request.url, '/v1/chat/completions')
-    let body = ''
-    for await (const chunk of request) body += chunk
-    const requestBody = JSON.parse(body) as { agent_profile: unknown; model: string; run_id: string }
-    requestModel = requestBody.model
-    assert.deepEqual(requestBody.agent_profile, PROFILE)
-    assert.equal(requestBody.model, MODEL)
-    response.writeHead(200, {
-      'content-type': 'text/event-stream',
-      'x-run-id': requestBody.run_id,
-      'x-run-request-digest': `sha256:${'a'.repeat(64)}`,
-    })
-    response.write(`id: 1\n${usageFrame}`)
-    response.write(`id: 2\ndata: ${JSON.stringify({
-      profile_materialization: {
-        schema: 'cli-bridge.profile-materialization.v2',
-        effectiveProfileDigest: canonicalAgentProfileDigest(PROFILE),
-        harness: PROFILE.harness,
-        provider: PROFILE.model.provider,
-        model: requestBody.model,
-        reasoningEffort: { requested: null, applied: null },
-        workspacePlanDigest: `sha256:${'b'.repeat(64)}`,
-        files: [],
-        unsupported: [],
-      },
-    })}\n\n`)
-    response.end('data: [DONE]\n\n')
+// A real process emits the native wire protocol; no model or account service is called.
+// The public Bridge listener and published Runtime consume the complete stream, including exit.
+test('published Runtime debits Claude cache writes without charging cache reads twice', async context => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-accounting-consumer-'))
+  let bridge: Awaited<ReturnType<typeof startServer>> | undefined
+  context.after(async () => { await bridge?.close(); await rm(directory, { recursive: true, force: true }) })
+  const bin = join(directory, 'claude-protocol.cjs')
+  const answer = JSON.stringify({ ok: true })
+  const native = [
+    { type: 'system', subtype: 'init', session_id: 'cache-accounting-proof' },
+    { type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: answer }] } },
+    { type: 'result', subtype: 'success', session_id: 'cache-accounting-proof', result: answer, is_error: false,
+      usage: { input_tokens: 2, cache_creation_input_tokens: 10_753, cache_read_input_tokens: 15_269, output_tokens: 4 },
+      total_cost_usd: 0.0470478 },
+  ]
+  await writeFile(bin, `#!${process.execPath}
+if (process.argv.includes('--version')) { console.log('protocol fixture'); process.exit(0) }
+for (const event of ${JSON.stringify(native)}) console.log(JSON.stringify(event))
+`, { mode: 0o755 })
+  bridge = await startServer({
+    config: { ...loadConfig({
+      BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(directory, 'state'), BRIDGE_BACKENDS: 'claude',
+      BRIDGE_BEARER: 'test-only', BRIDGE_TRACE: 'off', CLAUDE_BIN: bin,
+    }), port: 0 },
+    handleSignals: false,
+    quiet: true,
   })
-  servers.push(server)
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
-  const address = server.address()
-  if (!address || typeof address === 'string') throw new Error('consumer test did not bind a loopback port')
-
   const executor = createExecutor({
     backend: 'bridge',
-    bridgeUrl: `http://127.0.0.1:${address.port}`,
+    bridgeUrl: bridge.url,
     bridgeBearer: 'test-only',
     sessionId: 'cache-accounting-proof',
   })(
@@ -169,7 +61,6 @@ test('published Runtime debits Claude cache writes without charging cache reads 
   }
   const spent = executor.resultArtifact().spent
 
-  assert.equal(requestModel, MODEL)
   assert.deepEqual(events.find(event => (event as { kind?: unknown }).kind === 'tokens'), {
     kind: 'tokens',
     input: 26_024,
@@ -194,4 +85,85 @@ test('published Runtime debits Claude cache writes without charging cache reads 
   assert.equal(remaining.tokensKnown, true)
   assert.equal(remaining.cacheBreakdownKnown, true)
   assert.equal(remaining.iterationsLeft, 0)
+})
+
+// Qualified defaults exercise current wire compatibility, not canonical concrete-model authority.
+// Runtime intentionally rejects a bare profile model.default='default' before HTTP.
+test('published Runtime qualified Codex routes preserve native config and explicit provider models', async context => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-codex-default-consumer-'))
+  const previousHome = process.env.CODEX_HOME
+  process.env.CODEX_HOME = join(directory, 'codex-home')
+  await mkdir(process.env.CODEX_HOME)
+  const nativeConfig = 'model = "configured-model"\nmodel_provider = "custom"\n'
+    + '[model_providers.custom]\nname = "Fixture provider"\nbase_url = "http://127.0.0.1:1/inert"\n'
+    + '[mcp_servers.ambient]\ncommand = "must-not-be-inherited"\n'
+    + '[projects."/untrusted"]\ntrust_level = "trusted"\n'
+  await writeFile(join(process.env.CODEX_HOME, 'config.toml'), nativeConfig)
+  let bridge: Awaited<ReturnType<typeof startServer>> | undefined
+  context.after(async () => {
+    await bridge?.close()
+    if (previousHome === undefined) delete process.env.CODEX_HOME
+    else process.env.CODEX_HOME = previousHome
+    await rm(directory, { recursive: true, force: true })
+  })
+  const argvPath = join(directory, 'argv.json')
+  const bin = join(directory, 'codex-protocol.cjs')
+  await writeFile(bin, `#!${process.execPath}
+if (process.argv.includes('--version')) { console.log('protocol fixture'); process.exit(0) }
+const fs = require('node:fs')
+const marker = require('node:path').join(process.env.CODEX_HOME, 'fixture-turn-count')
+const turn = fs.existsSync(marker) ? Number(fs.readFileSync(marker, 'utf8')) + 1 : 1
+fs.writeFileSync(marker, String(turn))
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify({ argv: process.argv.slice(2), home: process.env.CODEX_HOME,
+  turn, config: fs.readFileSync(require('node:path').join(process.env.CODEX_HOME, 'config.toml'), 'utf8') }))
+console.log(JSON.stringify({ type: 'thread.started', thread_id: 'default-route-proof' }))
+console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"ok":true}' } }))
+console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }))
+`, { mode: 0o755 })
+  bridge = await startServer({
+    config: { ...loadConfig({
+      BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(directory, 'state'), BRIDGE_BACKENDS: 'codex',
+      BRIDGE_BEARER: 'test-only', BRIDGE_TRACE: 'off', CODEX_BIN: bin,
+    }), port: 0 },
+    handleSignals: false,
+    quiet: true,
+  })
+  const homes = new Set<string>()
+  for (const [provider, model] of [
+    ['openai', 'default'], ['custom', 'default'], ['custom', 'private-model'], ['custom', 'nested/model'],
+  ] as const) {
+    await context.test(`${provider}/${model}`, async () => {
+      let initialHome: string | undefined
+      for (const turn of [1, 2]) {
+        const executor = createExecutor({
+          backend: 'bridge', bridgeUrl: bridge!.url, bridgeBearer: 'test-only',
+          sessionId: `codex-default-${provider}-${model.replaceAll('/', '-')}`,
+        })(
+          { profile: { name: 'codex-default-proof', harness: 'codex', model: { provider, default: `${provider}/${model}` },
+            mcp: { requested: { command: process.execPath } } }, harness: null },
+          { signal: new AbortController().signal, seams: {} },
+        )
+        const run = executor.execute(`prove the configured route turn ${turn}`, new AbortController().signal)
+        if (!isAsyncIterable(run)) throw new Error('bridge execution did not stream')
+        const events: unknown[] = []
+        for await (const event of run) events.push(event)
+        assert.ok(!events.some(event => (event as { kind?: string }).kind === 'failure'), JSON.stringify(events))
+        const receipt: { argv: string[]; config: string; home: string; turn: number } = JSON.parse(await readFile(argvPath, 'utf8'))
+        const { argv, config, home } = receipt
+        assert.equal(receipt.turn, turn, 'native state must survive between actual subprocesses')
+        assert.equal(argv.includes('resume'), turn === 2)
+        if (turn === 1) { assert.ok(!homes.has(home)); homes.add(home); initialHome = home }
+        else assert.equal(home, initialHome)
+        assert.ok(argv.includes(`model_provider="${provider}"`), JSON.stringify(argv))
+        assert.deepEqual(argv.filter(arg => arg.startsWith('model=')), model === 'default' ? [] : [`model="${model}"`])
+        assert.notEqual(home, process.env.CODEX_HOME, 'retained execution must use its own native home')
+        assert.match(config, /model = "configured-model"/)
+        assert.match(config, /\[model_providers\.custom\]/)
+        assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:1\/inert"/)
+        assert.match(config, /\[mcp_servers\.requested\]/)
+        assert.doesNotMatch(config, /ambient|must-not-be-inherited|projects|untrusted/)
+      }
+    })
+  }
+  assert.equal(await readFile(join(process.env.CODEX_HOME, 'config.toml'), 'utf8'), nativeConfig)
 })

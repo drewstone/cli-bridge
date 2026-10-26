@@ -180,7 +180,7 @@ Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
 - local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`, `prime`) persist the full profile and reject profile dimensions they cannot execute
-- `codex/default` selects the Codex CLI configured default without a model override.
+- `codex/default` and `codex/<provider>/default` select the Codex CLI configured model without a model override; the qualified form retains the explicit provider.
   Its exact profile may omit `model.provider` or name the harness as the provider.
   A harness name is never passed to a CLI as its model provider. The backend drops a provider
   segment equal to its own name when it builds the arguments, so the rule also holds for a
@@ -818,7 +818,7 @@ The semaphore is the box-protection layer: each `claude --print` is 500 MB to 2 
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `BRIDGE_HOST_MAX_CONCURRENCY` | `4` | Concurrent host spawns. |
+| `BRIDGE_HOST_MAX_CONCURRENCY` | `4` | Concurrent host spawns; `0` removes the bound. |
 | `BRIDGE_HOST_ACQUIRE_DEADLINE_MS` | `60000` | Default wait for a slot before the bridge answers 429. |
 | `BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS` | `900000` | Ceiling on a request-supplied acquire deadline. |
 | `CLI_BRIDGE_SCOPE_MAX_CONCURRENCY` | `4` | The same cap for the systemd-scoped executor on Linux. |
@@ -846,7 +846,7 @@ failures are never cached.
 
 **A slot is held per live SESSION on a retained backend, not per turn.**
 For `pi`, the RPC child holds its slot from spawn to session termination, including the idle time between turns.
-Size `BRIDGE_HOST_MAX_CONCURRENCY` against peak concurrent live sessions — leads plus workers — not against peak concurrent turns.
+Size `BRIDGE_HOST_MAX_CONCURRENCY` against peak concurrent live sessions — leads plus workers — not against peak concurrent turns. An account-admitted fleet can set both `BRIDGE_HOST_MAX_CONCURRENCY=0` and `BRIDGE_HOST_CHAT_MAX_ACTIVE=0` to admit every turn; uncapped admission uses `BRIDGE_HOST_CHAT_RESERVED_ACTIVE=0` (also its default in that mode). Actual process lifetimes and cancellation still own release.
 A fleet of one lead and three workers holds four slots for the whole run, so the default cap of 4 is already full and a fifth session waits.
 One-shot backends (`claude`, `codex`, `opencode`, `kimi-code`, `gemini`) hold a slot only for the turn.
 
