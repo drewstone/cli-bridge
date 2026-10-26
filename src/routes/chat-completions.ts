@@ -58,6 +58,7 @@ import {
   type RunRegistry,
 } from '../runs/registry.js'
 import { BackendReportedFailureError } from '../runs/error-shape.js'
+import { chatCompletionDeltaOptions } from '../runs/delta-stream.js'
 import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
 import { lineageChildEnv } from '../trace/lineage.js'
@@ -1197,9 +1198,7 @@ export function mountChatCompletions(
       // receipt on `req` during materialization (before spawn), so a thrown
       // subprocess failure still acknowledges the profile instead of letting
       // the caller misread the whole run as a missing-receipt transport fault.
-      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd)), {
-        terminalReceipt: () => req.profile_materialization_receipt,
-      })
+      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd)), chatCompletionDeltaOptions(req))
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)

@@ -32,7 +32,7 @@
 import { type AgentProfile, nativeReasoningControl } from '@tangle-network/agent-interface'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
-import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
+import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
@@ -45,8 +45,8 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
@@ -229,6 +229,8 @@ export class KimiBackend implements Backend {
         // Claude Code's stream-json. Generic extractText is a fallback
         // for events whose content is just a string.
         const role = String(ev.role ?? '').toLowerCase()
+        let assistantText = ''
+        let assistantTools = false
         const contentField = ev.content
         if (role === 'assistant' && Array.isArray(contentField)) {
           for (const block of contentField as Array<Record<string, unknown>>) {
@@ -236,8 +238,10 @@ export class KimiBackend implements Backend {
             const blockType = String(block.type ?? '')
             if (blockType === 'text' && typeof block.text === 'string' && block.text) {
               yield { content: block.text }
+              assistantText += block.text
               emittedContent = true
             } else if (blockType === 'tool_use') {
+              assistantTools = true
               const id = String(block.id ?? block.tool_use_id ?? '')
               const name = String(block.name ?? block.tool ?? '')
               const input = block.input ?? {}
@@ -261,6 +265,7 @@ export class KimiBackend implements Backend {
           // so a consumer's idle-cap fires before the agent ever emits a text block:
           // the agentic-streaming dead-air bug (#50). Map to the same flat shape.
           if (Array.isArray(ev.tool_calls)) {
+            assistantTools ||= ev.tool_calls.length > 0
             for (const tc of ev.tool_calls as Array<Record<string, unknown>>) {
               if (!tc || typeof tc !== 'object') continue
               const fn = (tc.function ?? {}) as Record<string, unknown>
@@ -279,49 +284,30 @@ export class KimiBackend implements Backend {
               }
             }
           }
+          if (assistantText && !assistantTools) yield { final_text: assistantText }
         } else if (role === '' || role === 'assistant') {
           const text = extractText(ev)
           if (text) {
-            yield { content: text }
+            yield { content: text, ...(role === 'assistant' ? { final_text: text } : {}) }
             emittedContent = true
           }
           const toolCall = extractToolUse(ev)
           if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
         }
 
-        if (
-          type === 'result'
-          || type === 'turn.completed'
-          || type === 'session.completed'
-          || type === 'completed'
-        ) {
-          const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
-          yield {
-            ...terminalOutcome('kimi', sawError, emittedToolCall),
-            usage,
-            internal_session_id: internalSessionId,
-          }
-          return
-        }
+        const usage = ev.usage as ChatDelta['usage']
+        if (usage) yield { usage }
+
       }
 
-      const exit = await waitForProcessClose(child)
+      await waitForProcessClose(child)
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
+      await assertSuccessfulHarnessExit(spawned, 'kimi', () => stderr.render())
       if (sawError) throw new BackendError(`kimi: ${sawError}`, 'upstream')
-      // A signal death interrupted the turn, so content already streamed is not
-      // a completed answer: Kimi itself never reported how the turn ended.
-      if (exit.code === null) {
-        throw new BackendError(await describeCliExit(spawned, 'kimi', null, stderr.render(), exit.signal), 'upstream')
-      }
-      // If Kimi reports a non-zero exit after assistant content, preserve
-      // the content because the process did complete a useful turn.
-      if (exit.code !== 0 && !emittedContent) {
-        throw new BackendError(await describeCliExit(spawned, 'kimi', exit.code, stderr.render()), 'upstream')
-      }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`kimi produced no stream output: ${stderr.render(300)}`, 'upstream')
       }

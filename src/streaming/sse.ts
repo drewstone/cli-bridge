@@ -24,6 +24,7 @@ export interface ChunkMeta {
  * OpenAI-visible delta stream.
  */
 export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | null {
+  const hasFinalOutput = Object.hasOwn(delta, 'final_output')
   const hasContent = delta.content !== undefined
   const hasReasoning = delta.reasoning !== undefined
   const hasIdentity = delta.model !== undefined || delta.system_fingerprint !== undefined
@@ -38,14 +39,14 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   // comments via `deltaToSseComment` instead. `internal_session_id`-only
   // deltas are also non-OpenAI metadata (consumed by the session store)
   // and are intentionally skipped here.
-  if (!hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (!hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization && !hasFinalOutput) {
     return null
   }
   // internal_session_id-only deltas: the session id is bookkeeping for
   // the bridge's own store, not OpenAI surface area. Skip to avoid
   // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
   // some agent harnesses) reject as malformed.
-  if (hasSessionId && !hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization) {
+  if (hasSessionId && !hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization && !hasFinalOutput) {
     return null
   }
 
@@ -68,7 +69,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   // Usage/profile metadata without content/reasoning/tool_calls/finish carries
   // `choices: []`, not an empty choice, so strict OpenAI clients do not parse
   // it as output.
-  const metadataOnly = (hasIdentity || hasUsage || hasProfileMaterialization) && !hasContent && !hasReasoning && !hasToolCalls && !hasToolResults && !hasFinish
+  const metadataOnly = (hasIdentity || hasUsage || hasProfileMaterialization || hasFinalOutput) && !hasContent && !hasReasoning && !hasToolCalls && !hasToolResults && !hasFinish
   const usage = delta.usage
   const trustedCostProvenance = usage?.cost_provenance === 'provider-receipt'
     || usage?.cost_provenance === 'billing-receipt'
@@ -135,6 +136,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     ...(delta.profile_materialization
       ? { profile_materialization: delta.profile_materialization }
       : {}),
+    ...(hasFinalOutput ? { final_output: delta.final_output } : {}),
     ...(delta.system_fingerprint ? { system_fingerprint: delta.system_fingerprint } : {}),
   }
   return `data: ${JSON.stringify(payload)}\n\n`
@@ -176,6 +178,7 @@ export async function collectNonStreaming(
   iter: AsyncIterable<ChatDelta>,
   model: string,
 ): Promise<unknown> {
+  let finalOutput: { value: unknown } | undefined
   let content = ''
   const toolCalls: Array<{ id: string; name: string; arguments: string }> = []
   let finishReason: string | null = null
@@ -188,6 +191,7 @@ export async function collectNonStreaming(
   for await (const d of iter) {
     // Backend-liveness signals are transport-layer and have no place in
     // the non-streaming response body. Drop them silently.
+    if (Object.hasOwn(d, 'final_output')) finalOutput = { value: d.final_output }
     if (d.keepalive) continue
     // Reasoning deltas never fold into `message.content` — the non-streaming
     // body keeps the plain OpenAI shape and drops them.
@@ -261,6 +265,7 @@ export async function collectNonStreaming(
         finish_reason: finishReason ?? 'stop',
       },
     ],
+    ...(finalOutput && !error ? { final_output: finalOutput.value } : {}),
     ...(usageOut ? { usage: usageOut } : {}),
     ...(profileMaterialization ? { profile_materialization: profileMaterialization } : {}),
     ...(systemFingerprint ? { system_fingerprint: systemFingerprint } : {}),
