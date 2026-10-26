@@ -37,8 +37,8 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -363,7 +363,9 @@ export class OpencodeBackend implements Backend {
         }
         const text = extractText(ev)
         if (text) {
-          yield { content: text }
+          const assistant = (type === 'text' && ev.role !== 'user') ||
+            (['message', 'message.completed'].includes(type) && ev.role === 'assistant')
+          yield { content: text, ...(assistant ? { final_text: text } : {}) }
           emittedContent = true
         }
         const toolCall = extractToolUse(ev)
@@ -373,22 +375,11 @@ export class OpencodeBackend implements Backend {
         const toolResult = extractToolResult(ev)
         if (toolResult) yield { tool_results: [toolResult] }
 
-        if (
-          type === 'message.completed'
-          || type === 'turn.completed'
-          || type === 'session.completed'
-          || type === 'run.completed'
-        ) {
-          yield {
-            ...terminalOutcome('opencode', sawError, emittedToolCall),
-            usage: stepUsage ? completeUsage(stepUsage) : fallbackUsage,
-            internal_session_id: internalSessionId,
-          }
-          return
-        }
       }
 
-      const exit = await waitForProcessClose(child)
+      await waitForProcessClose(child)
+      const usage = stepUsage ? completeUsage(stepUsage) : fallbackUsage
+      if (usage) yield { usage }
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
@@ -399,15 +390,12 @@ export class OpencodeBackend implements Backend {
         yield { ...terminalOutcome('opencode', sawError, emittedToolCall), internal_session_id: internalSessionId }
         return
       }
-      if (exit.code !== 0) {
-        throw new BackendError(await describeCliExit(spawned, 'opencode', exit.code, stderr.render(), exit.signal), 'upstream')
-      }
+      await assertSuccessfulHarnessExit(spawned, 'opencode', () => stderr.render())
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`opencode produced no stream output: ${stderr.render(300)}`, 'upstream')
       }
       yield {
         finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
-        usage: stepUsage ? completeUsage(stepUsage) : fallbackUsage,
         internal_session_id: internalSessionId,
       }
     } finally {
@@ -440,7 +428,6 @@ export class OpencodeBackend implements Backend {
     return null
   }
 }
-
 
 function pickSessionId(ev: Record<string, unknown>): string | null {
   for (const k of ['session_id', 'sessionId', 'sessionID', 'session']) {

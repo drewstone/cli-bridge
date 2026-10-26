@@ -13,7 +13,7 @@
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
-import { BackendError, JSON_MODE_DIRECTIVE, terminalOutcome, wantsJsonObject } from './types.js'
+import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
@@ -24,9 +24,9 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -141,6 +141,8 @@ export class GeminiBackend implements Backend {
 
       const progressIntervalMs = Math.max(10, Number(process.env.GEMINI_PROGRESS_MS ?? 30_000))
       let sawError: string | null = null
+      let assistantText = ''
+      let incremental = false
 
       for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (next.kind === 'progress') {
@@ -163,33 +165,34 @@ export class GeminiBackend implements Backend {
           }
           const text = extractText(parsed)
           if (text) {
-            yield { content: text }
+            if (parsed.role === 'assistant' && type === 'message') {
+              assistantText = parsed.delta === true && incremental ? assistantText + text : text
+              incremental = parsed.delta === true
+              yield { content: text, final_text: assistantText }
+            } else yield { content: text }
             emittedContent = true
           }
           const toolCall = extractToolCall(parsed)
           if (toolCall) {
             yield { tool_calls: [toolCall] }
+            assistantText = ''
+            incremental = false
             emittedToolCall = true
           }
-          if (type === 'completed' || type === 'turn.completed' || type === 'result') {
-            yield terminalOutcome('gemini', sawError, emittedToolCall)
-            return
-          }
+
         } else {
           yield { content: `${line}\n` }
           emittedContent = true
         }
       }
 
-      const exit = await waitForProcessClose(child)
+      await waitForProcessClose(child)
       if (signal.aborted) {
         yield { finish_reason: 'error' }
         return
       }
+      await assertSuccessfulHarnessExit(spawned, 'gemini', () => stderr.render())
       if (sawError) throw new BackendError(`gemini: ${sawError}`, 'upstream')
-      if (exit.code !== 0) {
-        throw new BackendError(await describeCliExit(spawned, 'gemini', exit.code, stderr.render(), exit.signal), 'upstream')
-      }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`gemini produced no output: ${stderr.render(300)}`, 'upstream')
       }

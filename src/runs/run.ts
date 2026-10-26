@@ -275,7 +275,7 @@ export class Run {
   /** Consume one delta source to a terminal status, exactly once. */
   pump(
     source: AsyncIterable<ChatDelta>,
-    options: { terminalReceipt?: () => ProfileMaterializationReceipt | undefined } = {},
+    options: { terminalReceipt?: () => ProfileMaterializationReceipt | undefined; requireFinalOutput?: boolean } = {},
   ): Promise<void> {
     if (this.settled) return this.settled
     this.settled = this.deltas.pump(source, options)

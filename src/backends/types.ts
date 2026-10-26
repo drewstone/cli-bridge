@@ -465,6 +465,10 @@ export function terminalOutcome(
 }
 
 export interface ChatDelta {
+  /** Native final assistant candidate, distinct from progress/tool text. Never parsed by adapters. */
+  final_text?: string
+  /** Bridge-owned JSON value, published only after successful source drain and process close. */
+  final_output?: unknown
   /** Incremental text appended to the assistant message. */
   content?: string
   /**

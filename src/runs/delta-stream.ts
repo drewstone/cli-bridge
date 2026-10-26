@@ -7,10 +7,11 @@
  * failure the reader can turn into a real HTTP status.
  */
 
-import type { ChatDelta } from '../backends/types.js'
+import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { BackendReportedFailureError, describeRunFailure, reasonForTerminalDelta } from './error-shape.js'
 import type { RunReplayLog } from './replay-log.js'
 import type { RunStatus } from './types.js'
+import { FinalOutput } from './final-output.js'
 
 export interface DeltaStreamHost {
   readonly runId: string
@@ -29,6 +30,17 @@ export interface DeltaStreamHost {
 
 export interface DeltaStreamOptions {
   terminalReceipt?: () => ChatDelta['profile_materialization'] | undefined
+  requireFinalOutput?: boolean
+}
+
+/** Bind the chat request's terminal evidence and JSON contract at the common stream boundary. */
+export function chatCompletionDeltaOptions(
+  request: Pick<ChatRequest, 'profile_materialization_receipt' | 'responseFormat'>,
+): DeltaStreamOptions {
+  return {
+    terminalReceipt: () => request.profile_materialization_receipt,
+    requireFinalOutput: request.responseFormat?.type === 'json_object',
+  }
 }
 
 export class DeltaRunStream {
@@ -51,11 +63,23 @@ export class DeltaRunStream {
   async pump(source: AsyncIterable<ChatDelta>, options: DeltaStreamOptions = this.options): Promise<void> {
     try {
       let outcome: 'done' | 'error' = 'done'
+      const final = new FinalOutput()
+      let terminal: Pick<ChatDelta, 'finish_reason'> | undefined
       for await (const delta of source) {
-        await this.log.append(this.withTerminalReason(delta))
+        final.observe(delta)
+        const failed = delta.finish_reason === 'error' || delta.finish_reason === 'timeout'
+        if (delta.finish_reason && !failed) {
+          const { finish_reason, ...evidence } = delta
+          terminal = { finish_reason }
+          if (Object.keys(evidence).length) await this.log.append(evidence)
+        } else await this.log.append(this.withTerminalReason(delta))
         if (delta.finish_reason === 'error' || delta.finish_reason === 'timeout') {
           outcome = 'error'
         }
+      }
+      if (outcome === 'done' && !this.host.signal.aborted) {
+        const output = final.result(options.requireFinalOutput === true)
+        if (terminal || output) await this.log.append({ ...terminal, ...output })
       }
       await this.host.finish(this.host.signal.aborted ? 'cancelled' : outcome)
     } catch (error) {
