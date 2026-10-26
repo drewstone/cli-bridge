@@ -34,7 +34,7 @@ with the caller. Use a private data directory and a generated bearer in `env`.
 `cli-bridge --seats --json` or `await detectLocalSeats({ config })` reports native
 login facts for Claude Code, Codex, OpenCode, Kimi Code, Gemini, and Pi. No model
 turn is sent; no credential or account identity appears in the result. Each fact
-has `harness`, `status`, `authMode`, `source`, and an optional login `fix` command.
+has `harness`, `provider` (or null), `status`, `authMode`, `source`, and an optional `fix` command.
 Model selection, ranking, and seat syntax belong to the consuming seat resolver.
 
 `authenticated` means the native status command recognizes a login, not that an
@@ -414,6 +414,18 @@ Changing its digest returns `409`, and a run id that differs from the URL return
 The `wait_ms` query is an integer from `0` through `30000` on both endpoints.
 
 ### `GET /v1/models`
+
+Catalog entries include configured `provider`, route-scoped `authentication` facts, and optional
+`default`/`recommended` hints. Import their `ModelEntry` type from the package root. Unknown routes
+keep `provider: null`; configured credentials remain distinct from authenticated native status.
+These fields describe native configuration; served model identity comes from a completed turn.
+`codex/default` remains a no-override route; use a concrete native default row when one is reported.
+
+Set `BRIDGE_SUBSCRIPTIONS_ONLY=1` (or captured `Config.subscriptionsOnly`) to require authenticated
+subscription evidence at every new native invocation and retained continuation. Replay, reads and
+cancellation remain available. Admission refusals use HTTP403 and the same SSE/durable error:
+`type: subscription_required`, `status: 403`, `cause`, `fix`, `harness`, `provider`, and
+`provider_dispatch: not_started`. The fix names the native command or observed environment override.
 
 Lists model ids each ready backend claims, with which harness serves them.
 

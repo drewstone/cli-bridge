@@ -31,7 +31,7 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
   options.signal?.throwIfAborted()
   const env = options.env ?? process.env
   const config = options.config ?? loadConfig(env)
-  const timeout = options.timeoutMs ?? 5000
+  const timeout = options.timeoutMs ?? 10_000
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 30_000) throw new Error('seat inventory timeoutMs must be between 1 and 30000')
   const probe = (bin: string, args: readonly string[]) => probeNativeStatus(bin, args, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd, env })
   const results = await Promise.allSettled(localHarnesses.filter(([, harness]) => !options.harnesses || options.harnesses.includes(harness)).map(async ([key, harness, fix, args, provider]): Promise<LocalSeat> => {
