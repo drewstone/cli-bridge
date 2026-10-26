@@ -13,3 +13,5 @@ export interface LocalSeatOptions {
 }
 /** Query local login state without an inference, refresh, or credential in the returned value. */
 export declare function detectLocalSeats(options?: LocalSeatOptions): Promise<LocalSeat[]>;
+/** Read Gemini's selected native auth mode without retrieving a key from its keychain. */
+export declare function geminiLoginState(home: string, env: NodeJS.ProcessEnv): Promise<Pick<LocalSeat, 'status' | 'authMode'>>;

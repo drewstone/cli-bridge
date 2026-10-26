@@ -18,6 +18,7 @@
     "start": "tsx src/server.ts",
     "build": "tsc --project tsconfig.package.json && node scripts/package-types.mjs",
     "test:package": "node --test tests/package.integration.mjs",
+    "test:seats": "node --test tests/local-seats.integration.mjs",
     "test": "node --check tests/runtime-consumer/live-opencode.mjs && vitest run && pnpm run test:runtime-consumer",
     "test:runtime-consumer": "pnpm --filter cli-bridge-runtime-consumer-regression test",
     "test:local-inference": "node tests/runtime-consumer/live-opencode.mjs",

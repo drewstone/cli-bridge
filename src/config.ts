@@ -531,20 +531,14 @@ function parseClientList(value: string | undefined, fallback: string[]): string[
   return value.split(',').map((entry) => entry.trim().toLowerCase()).filter((entry) => entry !== '')
 }
 
-function parsePositiveInt(value: string | undefined, fallback: number): number {
-  if (value === undefined || value === '') return fallback
-  const parsed = Number.parseInt(value, 10)
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    throw new Error(`invalid positive integer: ${value}`)
-  }
-  return parsed
-}
+const parsePositiveInt = (value: string | undefined, fallback: number): number => parseInteger(value, fallback, 1)
+const parseNonNegativeInt = (value: string | undefined, fallback: number): number => parseInteger(value, fallback, 0)
 
-function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+function parseInteger(value: string | undefined, fallback: number, minimum: 0 | 1): number {
   if (value === undefined || value === '') return fallback
   const parsed = Number.parseInt(value, 10)
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new Error(`invalid non-negative integer: ${value}`)
+  if (!Number.isInteger(parsed) || parsed < minimum) {
+    throw new Error(`invalid ${minimum ? 'positive' : 'non-negative'} integer: ${value}`)
   }
   return parsed
 }
