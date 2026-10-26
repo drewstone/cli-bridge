@@ -18,7 +18,7 @@
  * not at peak concurrent turns.
  *
  * Tunables:
- *   BRIDGE_HOST_MAX_CONCURRENCY (default 4)
+ *   BRIDGE_HOST_MAX_CONCURRENCY (default 4; 0 admits every turn)
  *   BRIDGE_HOST_ACQUIRE_DEADLINE_MS (default 60_000)
  *   BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS (default 900_000) — ceiling on the
  *   per-request `execution.acquireTimeoutMs`.
@@ -70,7 +70,7 @@ class HostSemaphore {
     this.acquires += 1
     signal?.throwIfAborted()
     const deadlineMs = this.resolveDeadline(requestedDeadlineMs)
-    if (this.inFlight < this.max) {
+    if (this.max === 0 || this.inFlight < this.max) {
       this.inFlight += 1
       return
     }
@@ -176,15 +176,15 @@ export interface HostExecutorSnapshot {
 /** Shared by the scoped-host executor, whose refusal is the same condition. */
 export { saturated as executorSaturatedError }
 
-function readEnvInt(name: string, fallback: number): number {
+function readEnvInt(name: string, fallback: number, allowZero = false): number {
   const raw = process.env[name]
   if (!raw) return fallback
   const n = parseInt(raw, 10)
-  return Number.isFinite(n) && n > 0 ? n : fallback
+  return Number.isFinite(n) && (n > 0 || (allowZero && n === 0)) ? n : fallback
 }
 
 const hostSemaphore = new HostSemaphore(
-  readEnvInt('BRIDGE_HOST_MAX_CONCURRENCY', DEFAULT_MAX),
+  readEnvInt('BRIDGE_HOST_MAX_CONCURRENCY', DEFAULT_MAX, true),
   readEnvInt('BRIDGE_HOST_ACQUIRE_DEADLINE_MS', DEFAULT_ACQUIRE_DEADLINE_MS),
   readEnvInt('BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS', DEFAULT_MAX_ACQUIRE_DEADLINE_MS),
 )

@@ -512,14 +512,14 @@ function assertNetJailEnforceable(
  * use — past that, a rejection stops being a typed 503 and becomes a hang.
  */
 function admissionConfig(env: NodeJS.ProcessEnv): Config['admission'] {
-  const maxActive = parsePositiveInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8)
+  const maxActive = parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_ACTIVE, 8)
   return {
     maxActive,
     maxQueue: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_MAX_QUEUE, 16),
     queueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_QUEUE_TIMEOUT_MS, 30_000),
     reservedActive: parseNonNegativeInt(
       env.BRIDGE_HOST_CHAT_RESERVED_ACTIVE,
-      Math.min(2, maxActive - 1),
+      maxActive === 0 ? 0 : Math.min(2, maxActive - 1),
     ),
     bulkQueueTimeoutMs: parseNonNegativeInt(env.BRIDGE_HOST_CHAT_BULK_QUEUE_TIMEOUT_MS, 240_000),
   }
