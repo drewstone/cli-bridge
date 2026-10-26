@@ -110,7 +110,7 @@ describe('real Codex native context consumer', () => {
     ], {
       ...options,
       env: {
-        ...options.env, HOME: fixtureHome,
+        PATH: process.env.PATH, ...options.env, HOME: fixtureHome,
         CODEX_API_KEY: 'public-loopback-fixture', OPENAI_API_KEY: 'public-loopback-fixture',
         CODEX_ACCESS_TOKEN: undefined, OPENAI_BASE_URL: endpoint,
       },
@@ -137,8 +137,10 @@ describe('real Codex native context consumer', () => {
     }
     try {
       const first = startReceiver()
-      // Receiver completes, but the caller discards the HTTP receipt.
-      await first.request('/v1/context-transfers', { method: 'POST', headers, body: JSON.stringify(request) })
+      // Check receiver success, then discard its receipt before caller recovery.
+      const discarded = await first.request('/v1/context-transfers', { method: 'POST', headers, body: JSON.stringify(request) })
+      expect(discarded.status).toBe(200)
+      expect(await discarded.json()).toMatchObject({ status: 'accepted', operationId: request.operationId })
       expect(store!.getRetainedControlOperation(request.operationId)?.acknowledgement).toMatchObject({ status: 'accepted', native: { phase: 'imported' } })
       const nativeId = store!.get(request.plan.destination.sessionId, 'codex')!.internalId
       expect(nativeId).toMatch(/^[a-f0-9-]{36}$/u)
