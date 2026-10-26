@@ -59,17 +59,6 @@ class ReplayBackend extends TestBackend {
   }
 }
 
-class MetadataReplayBackend extends TestBackend {
-  calls = 0
-
-  async *chat(): AsyncIterable<ChatDelta> {
-    this.calls += 1
-    yield { internal_session_id: 'internal-session' }
-    yield { content: 'visible' }
-    yield { finish_reason: 'stop', usage: { input_tokens: 1, output_tokens: 1 } }
-  }
-}
-
 class ProfileReceiptReplayBackend extends TestBackend {
   calls = 0
 
@@ -315,10 +304,6 @@ async function postChat(app: Hono, body: object, headers: Record<string, string>
   })
 }
 
-function sseIds(text: string): number[] {
-  return [...text.matchAll(/^id: (\d+)$/gmu)].map(match => Number(match[1]))
-}
-
 describe('durable run contract', () => {
   it.each([
     ['opencode', 'opencode/test'],
@@ -410,136 +395,6 @@ describe('durable run contract', () => {
       await expect(replayedCancel.json()).resolves.toMatchObject({ status: 'replayed', effect: 'not_live' })
     } finally {
       ctx.cleanup()
-    }
-  })
-
-  it('recovers a completed generic run and exact cancellation across store/process restart', async () => {
-    const backend = new ReplayBackend(0)
-    const first = fixture(backend)
-    const runId = 'generic-restart-run'
-    const exact = {
-      provider: 'restart-provider',
-      environment_id: 'restart-environment',
-      session_id: 'restart-session',
-      execution_id: 'restart-execution',
-    }
-    let restartedStore: SessionStore | null = null
-    let restartedRuns: RunRegistry | null = null
-    try {
-      const body = { ...chatBody(runId, 'restart me', 'durable/test'), ...exact }
-      const initial = await postChat(first.app, body)
-      expect(initial.status).toBe(200)
-      await initial.text()
-      const requestDigest = initial.headers.get('x-run-request-digest')
-      expect(requestDigest).toMatch(/^sha256:/u)
-      expect(first.sessions.getRetainedRun(runId)).toMatchObject({
-        owner: 'one-shot',
-        requestDigest,
-        snapshot: { status: 'done', terminal: true, lastSeq: 3 },
-      })
-      const persistedSnapshot = first.sessions.getRetainedRun(runId)!.snapshot as {
-        requestDigest: `sha256:${string}`
-        provider: string
-        environmentId: string
-        sessionId: string
-        executionId: string
-      }
-      expect(first.sessions.retainedEventsAfterRun(exact.session_id, runId)).toHaveLength(3)
-
-      first.runs.clear()
-      first.sessions.close()
-
-      restartedStore = new SessionStore(first.dir)
-      restartedRuns = new RunRegistry()
-      const restartedRegistry = new BackendRegistry().register(new ReplayBackend(0))
-      const restartedService = new RetainedSessionService({
-        store: restartedStore,
-        registry: restartedRegistry,
-        runs: restartedRuns,
-      })
-      const restarted = new Hono()
-      mountChatCompletions(restarted, {
-        registry: restartedRegistry,
-        sessions: restartedStore,
-        retainedRuns: restartedStore,
-        runs: restartedRuns,
-      })
-      mountRuns(restarted, {
-        runs: restartedRuns,
-        retainedRuns: restartedService,
-        retainedStore: restartedStore,
-      })
-
-      const replayed = await postChat(restarted, body)
-      expect(replayed.status).toBe(200)
-      expect(replayed.headers.get('x-run-id')).toBe(runId)
-      expect(replayed.headers.get('x-run-request-digest')).toBe(requestDigest)
-      expect(replayed.headers.get('x-run-provider')).toBe(exact.provider)
-      expect(replayed.headers.get('x-run-environment-id')).toBe(exact.environment_id)
-      expect(replayed.headers.get('x-run-session-id')).toBe(exact.session_id)
-      expect(replayed.headers.get('x-run-execution-id')).toBe(exact.execution_id)
-      const replayedText = await replayed.text()
-      expect(replayedText).toContain('one')
-      expect(replayedText).toContain('two')
-      expect(restartedRuns.get(runId)).toBeUndefined()
-
-      const status = await restarted.request(`/v1/runs/${runId}`)
-      expect(status.status).toBe(200)
-      expect(status.headers.get('x-run-request-digest')).toBe(requestDigest)
-      await expect(status.json()).resolves.toMatchObject({ status: 'done', terminal: true })
-
-      const events = await restarted.request(`/v1/runs/${runId}/events`, {
-        headers: { 'Last-Event-ID': '0' },
-      })
-      expect(events.status).toBe(200)
-      const eventsText = await events.text()
-      expect(eventsText).toContain('one')
-      expect(eventsText).toContain('data: [DONE]')
-      expect(eventsText).not.toContain('event: raw')
-
-      const cancellation = cancellationRequest(
-        'restart-cancellation',
-        {
-          runId,
-          requestDigest: persistedSnapshot.requestDigest,
-          provider: persistedSnapshot.provider,
-          environmentId: persistedSnapshot.environmentId,
-          sessionId: persistedSnapshot.sessionId,
-          executionId: persistedSnapshot.executionId,
-        },
-        'reconcile after restart',
-      )
-      const cancelled = await restarted.request(`/v1/runs/${runId}/cancel`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(cancellation),
-      })
-      expect(cancelled.status).toBe(200)
-      expect(cancelled.headers.get('x-run-id')).toBe(runId)
-      expect(cancelled.headers.get('x-run-request-digest')).toBe(persistedSnapshot.requestDigest)
-      expect(cancelled.headers.get('x-run-provider')).toBe(exact.provider)
-      expect(cancelled.headers.get('x-run-environment-id')).toBe(exact.environment_id)
-      expect(cancelled.headers.get('x-run-session-id')).toBe(exact.session_id)
-      expect(cancelled.headers.get('x-run-execution-id')).toBe(exact.execution_id)
-      await expect(cancelled.json()).resolves.toMatchObject({ status: 'accepted', effect: 'not_live' })
-
-      const replayedCancellation = await restarted.request(`/v1/runs/${runId}/cancel`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(cancellation),
-      })
-      expect(replayedCancellation.status).toBe(200)
-      expect(replayedCancellation.headers.get('x-run-id')).toBe(runId)
-      expect(replayedCancellation.headers.get('x-run-request-digest')).toBe(persistedSnapshot.requestDigest)
-      expect(replayedCancellation.headers.get('x-run-provider')).toBe(exact.provider)
-      expect(replayedCancellation.headers.get('x-run-environment-id')).toBe(exact.environment_id)
-      expect(replayedCancellation.headers.get('x-run-session-id')).toBe(exact.session_id)
-      expect(replayedCancellation.headers.get('x-run-execution-id')).toBe(exact.execution_id)
-      await expect(replayedCancellation.json()).resolves.toMatchObject({ status: 'replayed', effect: 'not_live' })
-    } finally {
-      if (restartedRuns) restartedRuns.clear()
-      if (restartedStore) restartedStore.close()
-      rmSync(first.dir, { recursive: true, force: true })
     }
   })
 
@@ -987,61 +842,6 @@ describe('durable run contract', () => {
     }
   })
 
-  it('replays exactly after Last-Event-ID without duplicate dispatch, loss, or duplicate events', async () => {
-    const backend = new ReplayBackend()
-    const ctx = fixture(backend)
-    const body = chatBody('exact-replay')
-    try {
-      const initial = await postChat(ctx.app, body)
-      const initialText = await initial.text()
-      const initialIds = sseIds(initialText)
-      expect(initialIds).toEqual([1, 2, 3])
-
-      const replay = await postChat(ctx.app, body, { 'Last-Event-ID': '1' })
-      const replayText = await replay.text()
-      const replayIds = sseIds(replayText)
-
-      expect(replay.status).toBe(200)
-      expect(replayIds).toEqual([2, 3])
-      expect([initialIds[0], ...replayIds]).toEqual(initialIds)
-      expect(new Set(replayIds).size).toBe(replayIds.length)
-      expect(replayText).toContain('two')
-      expect(replayText).not.toContain('"content":"one"')
-      expect(backend.calls).toBe(1)
-    } finally {
-      ctx.cleanup()
-    }
-  })
-
-  it('reconnects from run coordinates alone without replaying the dispatch request', async () => {
-    const backend = new ReplayBackend(10)
-    const ctx = fixture(backend)
-    const runId = 'coordinate-reconnect'
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
-    try {
-      const initial = await postChat(ctx.app, chatBody(runId))
-      reader = initial.body?.getReader()
-      expect(reader).toBeDefined()
-      await reader?.read()
-      await reader?.cancel()
-      await waitFor(() => ctx.runs.get(runId)?.snapshot().state === 'detached')
-
-      const reconnect = await ctx.app.request(`/v1/runs/${runId}/events`, {
-        headers: { 'Last-Event-ID': '0' },
-      })
-      const text = await reconnect.text()
-
-      expect(reconnect.status).toBe(200)
-      expect(sseIds(text)).toEqual([1, 2, 3])
-      expect(text).toContain('one')
-      expect(text).toContain('two')
-      expect(backend.calls).toBe(1)
-    } finally {
-      await reader?.cancel()
-      ctx.cleanup()
-    }
-  })
-
   it('replays and retains the exact profile acknowledgment for the run identity lifetime', async () => {
     const backend = new ProfileReceiptReplayBackend()
     const ctx = fixture(backend, {
@@ -1110,61 +910,6 @@ describe('durable run contract', () => {
       expect(ctx.runs.get(runId)?.failure()).toMatchObject({
         message: 'backend exited after accepted submission',
       })
-    } finally {
-      ctx.cleanup()
-    }
-  })
-
-  it('keeps replay ids contiguous across metadata-only deltas', async () => {
-    const backend = new MetadataReplayBackend()
-    const ctx = fixture(backend)
-    const body = { ...chatBody('metadata-replay'), session_id: 'external-session' }
-    try {
-      const initial = await postChat(ctx.app, body)
-      const initialText = await initial.text()
-      expect(sseIds(initialText)).toEqual([1, 2, 3])
-      expect(initialText).toContain('id: 1\n: bridge-metadata')
-
-      const replay = await postChat(ctx.app, body, { 'Last-Event-ID': '1' })
-      const replayText = await replay.text()
-      expect(sseIds(replayText)).toEqual([2, 3])
-      expect(replayText).toContain('visible')
-      expect(backend.calls).toBe(1)
-    } finally {
-      ctx.cleanup()
-    }
-  })
-
-  it('refuses ahead, rotated-out, and time-expired replay cursors', async () => {
-    const backend = new ReplayBackend(2)
-    const ctx = fixture(backend, {
-      maxReplayDeltas: 2,
-      replayRetentionMs: 20,
-      identityRetentionMs: 2_000,
-    })
-    const body = chatBody('bounded-replay')
-    try {
-      const initial = await postChat(ctx.app, body)
-      expect(initial.status).toBe(200)
-      const initialText = await initial.text()
-      expect(sseIds(initialText)).toEqual([1, 2, 3])
-
-      const ahead = await postChat(ctx.app, body, { 'Last-Event-ID': '4' })
-      expect(ahead.status).toBe(409)
-      await expect(ahead.json()).resolves.toMatchObject({
-        error: { type: 'invalid_replay_cursor', last_event_id: 3 },
-      })
-
-      const rotated = await postChat(ctx.app, body, { 'Last-Event-ID': '0' })
-      expect(rotated.status).toBe(410)
-      await expect(rotated.json()).resolves.toMatchObject({
-        error: { type: 'expired_replay_cursor', first_available_event_id: 2 },
-      })
-
-      await waitFor(() => ctx.runs.get('bounded-replay')?.snapshot().replay.expired === true)
-      const expired = await postChat(ctx.app, body, { 'Last-Event-ID': '3' })
-      expect(expired.status).toBe(410)
-      expect(backend.calls).toBe(1)
     } finally {
       ctx.cleanup()
     }

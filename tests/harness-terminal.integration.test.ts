@@ -26,9 +26,11 @@ interface Scenario {
   failureType?: string
   finalText?: string
   nativeError?: string
+  signal?: NodeJS.Signals
 }
 const scenarios: Scenario[] = [
   { name: 'success', terminal: true, exitCode: 0 },
+  { name: 'signal-death', terminal: false, exitCode: 0, signal: 'SIGKILL', failureType: 'NODE_DOWN' },
   { name: 'late-native-error', terminal: true, exitCode: 0, nativeError: 'late native failure after a provisional result' },
   { name: 'late-process-failure', terminal: true, exitCode: 7, diagnostic: 'native process failed after reporting its result', failureType: 'NODE_DOWN' },
   { name: 'truncated-native-stream', terminal: false, exitCode: 0 },
@@ -52,6 +54,9 @@ function nativeEvents(harness: Harness, finalText: string, terminal: boolean): u
   if (harness === 'codex') return [
     { type: 'thread.started', thread_id: 'fixture-codex-thread' },
     { type: 'item.completed', item: { id: 'progress', type: 'agent_message', text: progress } },
+    { type: 'item.completed', item: { id: 'command', type: 'command_execution', command: 'echo protocol-fixture', status: 'completed', exit_code: 0 } },
+    { type: 'item.completed', item: { id: 'mcp', type: 'mcp_tool_call', server: 'fixture', tool: 'lookup', arguments: { key: 'fixture' }, status: 'completed' } },
+    { type: 'item.completed', item: { id: 'search', type: 'web_search', query: 'protocol fixture' } },
     { type: 'item.completed', item: { id: 'answer', type: 'agent_message', text: finalText } },
     ...(terminal ? [{ type: 'turn.completed', usage: { ...usage, cached_input_tokens: 7 } }] : []),
   ]
@@ -76,7 +81,7 @@ const executable = `#!${process.execPath}
 const fs = require('node:fs');
 const spec = JSON.parse(fs.readFileSync('native-case.json', 'utf8'));
 for (const event of spec.events) process.stdout.write(JSON.stringify(event) + '\\n');
-if (!spec.terminal) process.stdout.write('{"type":');
+if (!spec.terminal && !spec.signal) process.stdout.write('{"type":');
 // A terminal stdout event is deliberately provisional: diagnostics and actual exit come later.
 setTimeout(() => {
   if (spec.nativeError) process.stdout.write(JSON.stringify({ type: 'error', message: spec.nativeError }) + '\\n');
@@ -84,7 +89,8 @@ setTimeout(() => {
   fs.writeFileSync('exit-receipt.json', JSON.stringify({
     pid: process.pid, exitCode: spec.exitCode, argv: process.argv.slice(2),
   }));
-  process.exitCode = spec.exitCode;
+  if (spec.signal) process.kill(process.pid, spec.signal);
+  else process.exitCode = spec.exitCode;
 }, 45);
 `
 
@@ -107,7 +113,7 @@ describe('native harness terminal result followed by actual process exit', () =>
   for (const harness of ['claude', 'codex', 'factory', 'gemini', 'kimi', 'opencode'] as const) {
     const selected = harness === 'claude' || harness === 'codex'
       ? scenarios
-      : scenarios.filter((scenario) => ['success', 'late-native-error', 'late-process-failure'].includes(scenario.name))
+      : scenarios.filter((scenario) => ['success', 'late-native-error', 'late-process-failure', 'signal-death'].includes(scenario.name))
     const cases: Scenario[] = harness === 'kimi'
       ? [...selected, { name: 'json-content-nonzero-without-terminal', terminal: false, exitCode: 7,
           diagnostic: 'native Kimi process failed without a completion event', failureType: 'NODE_DOWN' }]
@@ -167,7 +173,9 @@ describe('native harness terminal result followed by actual process exit', () =>
             expect(run.failure()).toBeUndefined()
             expect(deltas.filter((delta) => Object.hasOwn(delta, 'final_output'))
               .map((delta) => delta.final_output)).toEqual([finalOutput])
-            expect(deltas.filter((delta) => delta.finish_reason === 'stop')).toHaveLength(1)
+            expect(deltas.filter((delta) => delta.finish_reason === (harness === 'codex' ? 'tool_calls' : 'stop'))).toHaveLength(1)
+            if (harness === 'codex') expect(deltas.flatMap((delta) => delta.tool_calls ?? [])
+              .map((call) => call.name)).toEqual(['bash', 'fixture_lookup', 'websearch'])
           } else {
             expect(run.snapshot().status).toBe('error')
             expect(run.failure()).toBeDefined()
@@ -178,6 +186,7 @@ describe('native harness terminal result followed by actual process exit', () =>
             if (scenario.failureType) expect(reason?.type).toBe(scenario.failureType)
             if (scenario.diagnostic) expect(reason?.message).toContain(scenario.diagnostic)
             if (scenario.nativeError) expect(reason?.message).toContain(scenario.nativeError)
+            if (scenario.signal) expect(reason?.message).toContain(scenario.signal)
           }
           const replay: ChatDelta[] = []
           for await (const { delta } of run.attach()) replay.push(delta)
