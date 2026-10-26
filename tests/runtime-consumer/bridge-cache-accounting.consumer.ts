@@ -87,11 +87,18 @@ for (const event of ${JSON.stringify(native)}) console.log(JSON.stringify(event)
   assert.equal(remaining.iterationsLeft, 0)
 })
 
-test('published Runtime preserves Codex configured defaults and explicit provider models', async context => {
+// Qualified defaults exercise current wire compatibility, not canonical concrete-model authority.
+// Runtime intentionally rejects a bare profile model.default='default' before HTTP.
+test('published Runtime qualified Codex routes preserve native config and explicit provider models', async context => {
   const directory = await mkdtemp(join(tmpdir(), 'bridge-codex-default-consumer-'))
   const previousHome = process.env.CODEX_HOME
   process.env.CODEX_HOME = join(directory, 'codex-home')
   await mkdir(process.env.CODEX_HOME)
+  const nativeConfig = 'model = "configured-model"\nmodel_provider = "custom"\n'
+    + '[model_providers.custom]\nname = "Fixture provider"\nbase_url = "http://127.0.0.1:1/inert"\n'
+    + '[mcp_servers.ambient]\ncommand = "must-not-be-inherited"\n'
+    + '[projects."/untrusted"]\ntrust_level = "trusted"\n'
+  await writeFile(join(process.env.CODEX_HOME, 'config.toml'), nativeConfig)
   let bridge: Awaited<ReturnType<typeof startServer>> | undefined
   context.after(async () => {
     await bridge?.close()
@@ -103,7 +110,9 @@ test('published Runtime preserves Codex configured defaults and explicit provide
   const bin = join(directory, 'codex-protocol.cjs')
   await writeFile(bin, `#!${process.execPath}
 if (process.argv.includes('--version')) { console.log('protocol fixture'); process.exit(0) }
-require('node:fs').writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)))
+const fs = require('node:fs')
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify({ argv: process.argv.slice(2), home: process.env.CODEX_HOME,
+  config: fs.readFileSync(require('node:path').join(process.env.CODEX_HOME, 'config.toml'), 'utf8') }))
 console.log(JSON.stringify({ type: 'thread.started', thread_id: 'default-route-proof' }))
 console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"ok":true}' } }))
 console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }))
@@ -124,7 +133,8 @@ console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, o
         backend: 'bridge', bridgeUrl: bridge!.url, bridgeBearer: 'test-only',
         sessionId: `codex-default-${provider}-${model.replaceAll('/', '-')}`,
       })(
-        { profile: { name: 'codex-default-proof', harness: 'codex', model: { provider, default: `${provider}/${model}` } }, harness: null },
+        { profile: { name: 'codex-default-proof', harness: 'codex', model: { provider, default: `${provider}/${model}` },
+          mcp: { requested: { command: process.execPath } } }, harness: null },
         { signal: new AbortController().signal, seams: {} },
       )
       const run = executor.execute('prove the configured route', new AbortController().signal)
@@ -132,9 +142,16 @@ console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, o
       const events: unknown[] = []
       for await (const event of run) events.push(event)
       assert.ok(!events.some(event => (event as { kind?: string }).kind === 'failure'), JSON.stringify(events))
-      const argv: string[] = JSON.parse(await readFile(argvPath, 'utf8'))
+      const { argv, config, home }: { argv: string[]; config: string; home: string } = JSON.parse(await readFile(argvPath, 'utf8'))
       assert.ok(argv.includes(`model_provider="${provider}"`), JSON.stringify(argv))
       assert.deepEqual(argv.filter(arg => arg.startsWith('model=')), model === 'default' ? [] : [`model="${model}"`])
+      assert.notEqual(home, process.env.CODEX_HOME, 'retained execution must use its own native home')
+      assert.match(config, /model = "configured-model"/)
+      assert.match(config, /\[model_providers\.custom\]/)
+      assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:1\/inert"/)
+      assert.match(config, /\[mcp_servers\.requested\]/)
+      assert.doesNotMatch(config, /ambient|must-not-be-inherited|projects|untrusted/)
     })
   }
+  assert.equal(await readFile(join(process.env.CODEX_HOME, 'config.toml'), 'utf8'), nativeConfig)
 })

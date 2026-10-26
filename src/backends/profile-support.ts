@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, posix, resolve } from 'node:path'
+import { dirname, join, posix, resolve } from 'node:path'
 import type {
   AgentProfile,
   AgentProfileConfigValue,
@@ -49,6 +49,7 @@ import {
   type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
 import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES } from '../executors/host.js'
+import { scopeCodexTurnConfig } from '../codex-config.js'
 
 export interface ProfileExecutionIdentity {
   provider: string | null
@@ -1993,25 +1994,11 @@ export function materializeEmptyMcpConfig(): MaterializedMcpConfig {
 }
 
 /**
- * Materialize a `McpServerSpec` map into a temp `CODEX_HOME` directory
- * containing a synthetic `config.toml`. Codex CLI accepts MCP servers
- * via the `[mcp_servers.<name>]` TOML stanza in `$CODEX_HOME/config.toml`
- * — there is no `--mcp-config` flag. We point codex at a temp HOME so
- * the passthrough is per-invocation and never mutates the user's real
- * `~/.codex/config.toml`.
- *
- * `authSourcePath` is the path to the user's persistent `auth.json`
- * (default `~/.codex/auth.json`). Codex looks up the session's bearer
- * token here. The host turn links to this file so a native token refresh
- * persists immediately. Confined turns use a separate access-only seed.
- *
- * stdio servers — written as `command = "..."` + optional `args`/`env`.
- * http servers (spec.type === 'http' with `url`) — written as
- * `url = "..."` + optional `headers`/`bearer_token_env_var`.
- *
- * A supplied sessionHome retains native state under the bridge data directory.
- * Cleanup removes only this turn's config and auth link; one-shot homes are removed entirely.
- * Returns null when no usable servers remain and no session home was supplied.
+ * A private CODEX_HOME preserves operator model/provider settings and replaces
+ * ambient MCP/projects with this turn's MCP servers. The source is the resolved
+ * operator auth home's config, never a request-supplied workspace path.
+ * Host auth links retain native refresh; confined turns use access-only seeds.
+ * Session cleanup retains native state; one-shot cleanup removes the home.
  */
 export interface MaterializedCodexHome {
   /** Directory to pass via `CODEX_HOME` env. */
@@ -2030,13 +2017,16 @@ export function materializeMcpServersForCodex(
 
   const { lines, serverNames } = codexMcpConfig(specs)
   if (serverNames.length === 0 && !sessionHome) return null
+  const configPath = authSourcePath && join(dirname(authSourcePath), 'config.toml')
+  const base = configPath && existsSync(configPath) ? readFileSync(configPath, 'utf8') : ''
+  const config = scopeCodexTurnConfig(base, lines.join('\n\n') + '\n')
 
   // Codex aborts if CODEX_HOME is under the system tmpdir on some
   // platforms — use the user's HOME/.cache as a stable parent.
   const baseDir = sessionHome ?? mkdtempSync(join(stableTmpRoot(), 'cli-bridge-codex-'))
   // A session keeps native rollouts and indexes, never the previous turn's auth link.
   for (const name of ['config.toml', 'auth.json']) rmSync(join(baseDir, name), { force: true })
-  writeFileSync(join(baseDir, 'config.toml'), lines.join('\n\n') + '\n', { mode: 0o600 })
+  writeFileSync(join(baseDir, 'config.toml'), config, { mode: 0o600 })
 
   if (authSourcePath) {
     try {
