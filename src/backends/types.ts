@@ -558,6 +558,15 @@ export interface ChatDelta {
     /** Input tokens written into a provider cache. */
     cache_write_input_tokens?: number
     output_tokens?: number
+    /** Of `output_tokens`, the tokens the model spent reasoning, when the backend reports the split. */
+    reasoning_output_tokens?: number
+    /**
+     * True when this record is exactly ONE provider model call, emitted as that
+     * call finished. The trace writes one model-call span per such record. Its
+     * tokens are still incremental like any other record's, so a backend that
+     * emits these must not also emit a total covering the same calls.
+     */
+    model_call?: true
     /**
      * Billed USD cost. Valid only with `cost_known: true` and trusted provenance;
      * serializers refuse to promote an unclassified number to billed spend.

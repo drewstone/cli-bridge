@@ -42,7 +42,6 @@ import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } fr
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
-import { addUsage as collectUsage, type CollectedUsage } from '../usage.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
@@ -257,7 +256,8 @@ export class OpencodeBackend implements Backend {
       // Calls already reported at their start, so their finished part carries only the outcome.
       const startedTools = new Set<string>()
       let toolSession: string | null = null
-      let stepUsage: CollectedUsage | undefined
+      // Steps yield their own usage as they finish; a non-step usage event is the fallback only for a stream with no step receipt.
+      let sawStepUsage = false
       let fallbackUsage: UsageReceipt | undefined
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
 
@@ -312,10 +312,8 @@ export class OpencodeBackend implements Backend {
           continue
         }
         const eventUsage = extractUsage(ev)
-        if (eventUsage) {
-          if (isStepReceipt(ev)) stepUsage = collectUsage(stepUsage, eventUsage)
-          else fallbackUsage = eventUsage
-        }
+        if (eventUsage && !isStepReceipt(ev)) fallbackUsage = eventUsage
+        else if (eventUsage) { sawStepUsage = true; yield { usage: { ...eventUsage, model_call: true } } }
         if (type === 'error' || ev.error) {
           // When the event carries no message field, surface the raw event instead of the
           // constant string 'opencode error'. That constant reached run ledgers verbatim:
@@ -378,8 +376,8 @@ export class OpencodeBackend implements Backend {
       }
 
       await waitForProcessClose(child)
-      const usage = stepUsage ? completeUsage(stepUsage) : fallbackUsage
-      if (usage) yield { usage }
+      // Each step's usage already went out as its own model call; a run that printed no step receipts reports its total.
+      if (!sawStepUsage && fallbackUsage) yield { usage: fallbackUsage }
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
@@ -489,6 +487,7 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
       cache_read_input_tokens: direct.cache_read_input_tokens ?? direct.cacheRead,
       cache_write_input_tokens: direct.cache_write_input_tokens ?? direct.cacheWrite,
       output_tokens: direct.output_tokens ?? direct.output,
+      reasoning_output_tokens: direct.reasoning_output_tokens ?? direct.reasoning,
       cost: direct.cost ?? ev.cost,
     })
   }
@@ -512,6 +511,7 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
       tokens?.output_tokens ?? tokens?.output,
       tokens?.reasoning,
     ]),
+    reasoning_output_tokens: tokens?.reasoning,
     cost: part?.cost ?? ev.cost,
   })
 }
@@ -522,6 +522,7 @@ function usageFromValues(values: Record<string, unknown>): UsageReceipt | null {
   const cacheReadInputTokens = nonnegativeFinite(values.cache_read_input_tokens)
   const cacheWriteInputTokens = nonnegativeFinite(values.cache_write_input_tokens)
   const outputTokens = nonnegativeFinite(values.output_tokens)
+  const reasoningOutputTokens = nonnegativeFinite(values.reasoning_output_tokens)
   const cost = nonnegativeFinite(values.cost)
   if (
     inputTokens === undefined
@@ -537,6 +538,7 @@ function usageFromValues(values: Record<string, unknown>): UsageReceipt | null {
     ...(cacheReadInputTokens !== undefined ? { cache_read_input_tokens: cacheReadInputTokens } : {}),
     ...(cacheWriteInputTokens !== undefined ? { cache_write_input_tokens: cacheWriteInputTokens } : {}),
     ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+    ...(reasoningOutputTokens !== undefined ? { reasoning_output_tokens: reasoningOutputTokens } : {}),
     cost_known: false,
     ...(cost !== undefined
       ? {
@@ -554,28 +556,6 @@ function isStepReceipt(ev: Record<string, unknown>): boolean {
     || type === 'step-finish'
     || partType === 'step_finish'
     || partType === 'step-finish'
-}
-
-function completeUsage(total: CollectedUsage): UsageReceipt {
-  return {
-    ...(total.inputTokensKnown ? { input_tokens: total.inputTokens } : {}),
-    ...(total.freshInputTokensKnown ? { fresh_input_tokens: total.freshInputTokens } : {}),
-    ...(total.cacheReadInputTokensKnown
-      ? { cache_read_input_tokens: total.cacheReadInputTokens }
-      : {}),
-    ...(total.cacheWriteInputTokensKnown
-      ? { cache_write_input_tokens: total.cacheWriteInputTokens }
-      : {}),
-    ...(total.outputTokensKnown ? { output_tokens: total.outputTokens } : {}),
-    cost_known: false,
-    ...(total.estimatedCostComplete
-      ? {
-          estimated_cost: total.estimatedCost,
-          cost_provenance: 'catalog-estimate' as const,
-          cost_scope: 'total' as const,
-        }
-      : {}),
-  }
 }
 
 function nonnegativeFinite(value: unknown): number | undefined {
