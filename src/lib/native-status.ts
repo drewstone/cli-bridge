@@ -30,7 +30,6 @@ export function probeNativeStatus(bin: string, args: readonly string[], options:
     })
     const timer = setTimeout(() => stop('ETIMEDOUT'), options.timeoutMs)
     options.signal?.addEventListener('abort', onAbort, { once: true })
-    if (Object.entries(options.env ?? {}).some(([key, value]) => key.includes('\0') || value !== undefined && (typeof value !== 'string' || value.includes('\0')))) { resolve({ code: 'INVALID_NATIVE_ENV', stdout: '', stderr: '' }); return }
     if (options.signal?.aborted) onAbort()
   })
 }
