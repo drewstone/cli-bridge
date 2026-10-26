@@ -127,7 +127,7 @@ console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, o
   })
   for (const [provider, model] of [
     ['openai', 'default'], ['custom', 'default'], ['custom', 'private-model'], ['custom', 'nested/model'],
-  ]) {
+  ] as const) {
     await context.test(`${provider}/${model}`, async () => {
       const executor = createExecutor({
         backend: 'bridge', bridgeUrl: bridge!.url, bridgeBearer: 'test-only',
