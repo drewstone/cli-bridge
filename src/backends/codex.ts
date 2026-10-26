@@ -76,7 +76,7 @@ export class CodexBackend implements Backend {
 
   /** The existing app-server transport reads the exact native route; it never creates a thread or turn. */
   readonly readCatalog: CodexCatalogReader = async ({ model, cwd, env, flags, signal }): Promise<NativeModelFacts> => {
-    if (this.spawner.executionEnvironment !== 'host') return { provider: null, authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' } }
+    if (this.spawner.executionEnvironment !== 'host') return { provider: null, status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' }
     const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10_000)])
     const args = ['app-server', '--listen', 'stdio://']
     const selection = splitCodexModel(this.extractModel(model))
@@ -91,9 +91,8 @@ export class CodexBackend implements Backend {
     try {
       await native.initialize()
       const facts = await native.readNativeFacts(cwd)
-      const key = effectiveEnv.CODEX_API_KEY?.trim() ? 'CODEX_API_KEY' : undefined
-      if (key) facts.authentication = { status: 'configured', authMode: 'api_key', source: 'native_status', fix: process.env[key] === effectiveEnv[key] ? `unset ${key}` : 'codex login status' }
-      if (effectiveEnv.OPENAI_BASE_URL || effectiveEnv.CODEX_ACCESS_TOKEN) facts.authentication = { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' }
+      if (effectiveEnv.CODEX_API_KEY?.trim()) Object.assign(facts, { status: 'configured', authMode: 'api_key', fix: process.env.CODEX_API_KEY === effectiveEnv.CODEX_API_KEY ? 'unset CODEX_API_KEY' : 'codex login status' })
+      if (effectiveEnv.OPENAI_BASE_URL || effectiveEnv.CODEX_ACCESS_TOKEN) Object.assign(facts, { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' })
       return facts
     } finally { await native.close() }
   }

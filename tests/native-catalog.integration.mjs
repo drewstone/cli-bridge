@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import assert from 'node:assert/strict'
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
@@ -7,8 +9,8 @@ import { tsImport } from 'tsx/esm/api'
 
 const { loadConfig, startServer, detectLocalSeats } = await tsImport('../src/server.ts', import.meta.url)
 const { createNativeCatalog } = await tsImport('../src/native-catalog.ts', import.meta.url)
-const { describeRunFailure } = await tsImport('../src/runs/error-shape.ts', import.meta.url)
 const nativeCodex = resolve('node_modules/.bin/codex')
+const execute = promisify(execFile)
 
 // Delegate metadata to the installed real Codex. Any inference launch is an OS-visible failure,
 // never a fabricated model response or an opportunity to spend a user's account.
@@ -122,19 +124,29 @@ test('Claude admission binds settings sources and refuses winning API and bearer
     assert.equal((await projectBearer.json()).error.fix, 'claude auth status --json')
     assert.equal((await inventory())[0].authMode, 'unknown')
     await writeFile(join(project, 'settings.json'), '{}')
-    const helper = await inventory(['--setting-sources', 'project,local', '--settings', JSON.stringify({ apiKeyHelper: 'printf public-native-helper-canary' })])
+    const helperMarker = join(root, 'helper-executed')
+    const helper = await inventory(['--setting-sources', 'project,local', '--settings', JSON.stringify({ apiKeyHelper: `printf invoked > '${helperMarker}'` })])
     assert.equal(helper[0].authMode, 'unknown', 'a dynamic credential helper is not subscription evidence')
+    await assert.rejects(readFile(helperMarker), { code: 'ENOENT' })
     const native = createNativeCatalog({ ...inventoryConfig, subscriptionsOnly: true })
     const inlineRequest = { model: 'claude-code/opus', cwd: workspace, messages: [] }
     await native.admit(inlineRequest, 'claude-code', new AbortController().signal)
     await assert.rejects(inlineRequest.subscriptionAdmission.check({ model: inlineRequest.model, cwd: workspace, env: { ...process.env }, executor: 'host',
       flags: ['--setting-sources', 'project,local', '--settings', JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'public-inline-bearer-canary' } })] }), (failure) => {
-      const error = describeRunFailure(failure)
-      assert.equal(error.status, 403)
-      assert.equal(error.cause, 'subscription_unverified')
-      assert.equal(error.fix, 'claude auth status --json')
+      assert.equal(failure.code, 'subscription_required')
+      assert.equal(failure.providerDispatch, 'not_started')
+      assert.equal(failure.subscription.cause, 'subscription_unverified')
+      assert.equal(failure.subscription.fix, 'claude auth status --json')
       return true
     })
+    for (const malformed of [{ ANTHROPIC_AUTH_TOKEN: 'private-native-canary\0suffix' }, { ['private-native-canary\0key']: 'value' }]) {
+      await writeFile(join(project, 'settings.json'), JSON.stringify({ env: malformed }))
+      const output = await execute(process.execPath, [resolve('bin/cli-bridge.mjs'), '--seats', '--json'], { cwd: workspace,
+        env: { ...process.env, BRIDGE_BACKENDS: '', CLAUDE_BIN: wrapper, CODEX_BIN: '/native-missing-codex', OPENCODE_BIN: '/native-missing-opencode',
+          KIMI_BIN: '/native-missing-kimi', GEMINI_BIN: '/native-missing-gemini', PI_BIN: '/native-missing-pi' }, timeout: 20_000 })
+      assert.ok(!`${output.stdout}${output.stderr}`.includes('private-native-canary'), 'public inventory must never include malformed credential bytes')
+      assert.equal(JSON.parse(output.stdout).find((seat) => seat.harness === 'claude-code').status, 'unknown')
+    }
     await assert.rejects(readFile(attempted), { code: 'ENOENT' })
   } finally {
     await server?.close()

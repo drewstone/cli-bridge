@@ -6,6 +6,7 @@ export interface NativeStatus { code: number | string; stdout: string; stderr: s
 /** Bounded native status/list process; never invokes a model or returns credentials publicly. */
 export function probeNativeStatus(bin: string, args: readonly string[], options: { timeoutMs: number; signal?: AbortSignal; cwd?: string; env?: NodeJS.ProcessEnv }): Promise<NativeStatus> {
   return new Promise<NativeStatus>((resolve, reject) => {
+    if (Object.entries(options.env ?? {}).some(([key, value]) => key.includes('\0') || value !== undefined && (typeof value !== 'string' || value.includes('\0')))) { resolve({ code: 'INVALID_NATIVE_ENV', stdout: '', stderr: '' }); return }
     if (options.signal?.aborted) { resolve({ code: 'ABORT_ERR', stdout: '', stderr: '' }); return }
     let interrupted: string | undefined
     const stop = (cause: string) => { interrupted = cause; killTreeSync(child, 'SIGKILL') }
@@ -29,6 +30,7 @@ export function probeNativeStatus(bin: string, args: readonly string[], options:
     })
     const timer = setTimeout(() => stop('ETIMEDOUT'), options.timeoutMs)
     options.signal?.addEventListener('abort', onAbort, { once: true })
+    if (Object.entries(options.env ?? {}).some(([key, value]) => key.includes('\0') || value !== undefined && (typeof value !== 'string' || value.includes('\0')))) { resolve({ code: 'INVALID_NATIVE_ENV', stdout: '', stderr: '' }); return }
     if (options.signal?.aborted) onAbort()
   })
 }

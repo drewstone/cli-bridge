@@ -16,7 +16,7 @@ import type { SpawnResult } from '../executors/types.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { StringDecoder } from 'node:string_decoder'
 import type { NativeModelFacts } from '../native-catalog.js'
-import { nativeObject } from '../lib/native-state.js'
+import { nativeObject, nativeIdentifier as safeNativeId } from '../lib/native-state.js'
 
 export const CODEX_NATIVE_IMPORT_VERSION = 'codex-cli 0.164.0'
 
@@ -129,11 +129,11 @@ export class CodexContextTransfer implements PreparedContextTransfer {
       && !origins.openai_base_url && !origins.chatgpt_base_url && !configuration.profile
     const subscription = type === 'chatgpt' && builtin && account.requiresOpenaiAuth === true
     const signedOut = account.account === null && builtin && account.requiresOpenaiAuth === true
-    return { provider, ...(model && model !== 'default' ? { model } : {}), authentication: {
+    return { provider, ...(model && model !== 'default' ? { defaultModel: model } : {}),
       status: subscription ? 'authenticated' : type === 'apiKey' ? 'configured' : signedOut ? 'signed_out' : 'unknown',
       authMode: subscription ? 'subscription' : type === 'apiKey' ? 'api_key' : 'unknown',
       source: 'native_status', ...(subscription ? {} : { fix: signedOut ? 'codex login' : 'codex login status' }),
-    } }
+    }
   }
 
   async createSession(): Promise<{ nativeSessionId: string; createdAt: string }> {
@@ -256,8 +256,4 @@ export class CodexContextTransfer implements PreparedContextTransfer {
     }
     this.pending.clear()
   }
-}
-
-function safeNativeId(value: unknown): string | undefined {
-  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u.test(value) ? value : undefined
 }
