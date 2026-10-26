@@ -111,8 +111,11 @@ test('published Runtime qualified Codex routes preserve native config and explic
   await writeFile(bin, `#!${process.execPath}
 if (process.argv.includes('--version')) { console.log('protocol fixture'); process.exit(0) }
 const fs = require('node:fs')
+const marker = require('node:path').join(process.env.CODEX_HOME, 'fixture-turn-count')
+const turn = fs.existsSync(marker) ? Number(fs.readFileSync(marker, 'utf8')) + 1 : 1
+fs.writeFileSync(marker, String(turn))
 fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify({ argv: process.argv.slice(2), home: process.env.CODEX_HOME,
-  config: fs.readFileSync(require('node:path').join(process.env.CODEX_HOME, 'config.toml'), 'utf8') }))
+  turn, config: fs.readFileSync(require('node:path').join(process.env.CODEX_HOME, 'config.toml'), 'utf8') }))
 console.log(JSON.stringify({ type: 'thread.started', thread_id: 'default-route-proof' }))
 console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"ok":true}' } }))
 console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }))
@@ -125,32 +128,41 @@ console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, o
     handleSignals: false,
     quiet: true,
   })
+  const homes = new Set<string>()
   for (const [provider, model] of [
     ['openai', 'default'], ['custom', 'default'], ['custom', 'private-model'], ['custom', 'nested/model'],
   ] as const) {
     await context.test(`${provider}/${model}`, async () => {
-      const executor = createExecutor({
-        backend: 'bridge', bridgeUrl: bridge!.url, bridgeBearer: 'test-only',
-        sessionId: `codex-default-${provider}-${model.replaceAll('/', '-')}`,
-      })(
-        { profile: { name: 'codex-default-proof', harness: 'codex', model: { provider, default: `${provider}/${model}` },
-          mcp: { requested: { command: process.execPath } } }, harness: null },
-        { signal: new AbortController().signal, seams: {} },
-      )
-      const run = executor.execute('prove the configured route', new AbortController().signal)
-      if (!isAsyncIterable(run)) throw new Error('bridge execution did not stream')
-      const events: unknown[] = []
-      for await (const event of run) events.push(event)
-      assert.ok(!events.some(event => (event as { kind?: string }).kind === 'failure'), JSON.stringify(events))
-      const { argv, config, home }: { argv: string[]; config: string; home: string } = JSON.parse(await readFile(argvPath, 'utf8'))
-      assert.ok(argv.includes(`model_provider="${provider}"`), JSON.stringify(argv))
-      assert.deepEqual(argv.filter(arg => arg.startsWith('model=')), model === 'default' ? [] : [`model="${model}"`])
-      assert.notEqual(home, process.env.CODEX_HOME, 'retained execution must use its own native home')
-      assert.match(config, /model = "configured-model"/)
-      assert.match(config, /\[model_providers\.custom\]/)
-      assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:1\/inert"/)
-      assert.match(config, /\[mcp_servers\.requested\]/)
-      assert.doesNotMatch(config, /ambient|must-not-be-inherited|projects|untrusted/)
+      let initialHome: string | undefined
+      for (const turn of [1, 2]) {
+        const executor = createExecutor({
+          backend: 'bridge', bridgeUrl: bridge!.url, bridgeBearer: 'test-only',
+          sessionId: `codex-default-${provider}-${model.replaceAll('/', '-')}`,
+        })(
+          { profile: { name: 'codex-default-proof', harness: 'codex', model: { provider, default: `${provider}/${model}` },
+            mcp: { requested: { command: process.execPath } } }, harness: null },
+          { signal: new AbortController().signal, seams: {} },
+        )
+        const run = executor.execute(`prove the configured route turn ${turn}`, new AbortController().signal)
+        if (!isAsyncIterable(run)) throw new Error('bridge execution did not stream')
+        const events: unknown[] = []
+        for await (const event of run) events.push(event)
+        assert.ok(!events.some(event => (event as { kind?: string }).kind === 'failure'), JSON.stringify(events))
+        const receipt: { argv: string[]; config: string; home: string; turn: number } = JSON.parse(await readFile(argvPath, 'utf8'))
+        const { argv, config, home } = receipt
+        assert.equal(receipt.turn, turn, 'native state must survive between actual subprocesses')
+        assert.equal(argv.includes('resume'), turn === 2)
+        if (turn === 1) { assert.ok(!homes.has(home)); homes.add(home); initialHome = home }
+        else assert.equal(home, initialHome)
+        assert.ok(argv.includes(`model_provider="${provider}"`), JSON.stringify(argv))
+        assert.deepEqual(argv.filter(arg => arg.startsWith('model=')), model === 'default' ? [] : [`model="${model}"`])
+        assert.notEqual(home, process.env.CODEX_HOME, 'retained execution must use its own native home')
+        assert.match(config, /model = "configured-model"/)
+        assert.match(config, /\[model_providers\.custom\]/)
+        assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:1\/inert"/)
+        assert.match(config, /\[mcp_servers\.requested\]/)
+        assert.doesNotMatch(config, /ambient|must-not-be-inherited|projects|untrusted/)
+      }
     })
   }
   assert.equal(await readFile(join(process.env.CODEX_HOME, 'config.toml'), 'utf8'), nativeConfig)
