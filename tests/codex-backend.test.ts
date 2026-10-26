@@ -53,8 +53,8 @@ function request(): ChatRequest {
   } as ChatRequest
 }
 
-// Event lines captured from a real `codex exec --json` run; the tool-call
-// items exercise every branch of extractToolCall.
+// Captured native event shapes retained for the session/resume boundary checks.
+// Real-process tool translation lives in harness-terminal.integration.test.ts.
 const THREAD = { type: 'thread.started', thread_id: '019f3889-c05e-70c3-ae9f-3077da9454c4' }
 const MESSAGE_ITEM = {
   type: 'item.completed',
