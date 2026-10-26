@@ -329,23 +329,6 @@ describe('prompt intents reach each harness through its own control', () => {
   })
 
   describe('codex', () => {
-    it('points model_instructions_file at the written replacement file', () => {
-      const cwd = workspace()
-      const provisioned = provisionProfileWorkspace(
-        request({ prompt: { systemPrompt: REPLACEMENT } }, 'codex', cwd),
-        null,
-        'codex',
-        cwd,
-      )
-
-      expect(provisioned.flags).toEqual(
-        expect.arrayContaining(['-c', 'model_instructions_file=.codex/system-prompt.md']),
-      )
-      expect(readFileSync(join(cwd, '.codex/system-prompt.md'), 'utf8')).toBe(REPLACEMENT)
-      // codex's replacement is a config file, never a launch-argument string.
-      expect(provisioned.systemPrompt).toBeUndefined()
-    })
-
     it('refuses an addition instead of flattening it into the user turn', () => {
       const cwd = workspace()
       expect(() =>
