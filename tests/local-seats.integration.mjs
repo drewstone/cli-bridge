@@ -53,7 +53,7 @@ setInterval(() => {}, 1000);
   config.claudeBin = executable
   const controller = new AbortController()
   const started = Date.now()
-  const pending = detectLocalSeats({ config, timeoutMs: abort ? 5000 : 750, signal: controller.signal })
+  const pending = detectLocalSeats({ config, cwd: root, env: { HOME: root, PATH: process.env.PATH }, flags: ['--setting-sources', ''], timeoutMs: abort ? 5000 : 750, signal: controller.signal })
   // Attach the rejection observer before aborting to keep native AbortError handled.
   const outcome = pending.then((value) => ({ value }), (error) => ({ error }))
   await until(async () => (await pids(pidFile)).length === 2, 'the real readonly tree did not start')
