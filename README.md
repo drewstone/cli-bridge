@@ -31,6 +31,19 @@ The returned `{ url, close }` is ready to serve; `await close()` stops only that
 server and its owned work. Embedded mode leaves process signals and error handlers
 with the caller. Use a private data directory and a generated bearer in `env`.
 
+`cli-bridge --seats --json` or `await detectLocalSeats({ config })` reports native
+login facts for Claude Code, Codex, OpenCode, Kimi Code, Gemini, and Pi. No model
+turn is sent; no credential or account identity appears in the result. Each fact
+has `harness`, `status`, `authMode`, `source`, and an optional login `fix` command.
+Model selection, ranking, and seat syntax belong to the consuming seat resolver.
+
+`authenticated` means the native status command recognizes a login, not that an
+inference was verified. Where inventory reads Kimi/Gemini's own OAuth stores,
+the result is `configured` rather than a verified live login. Missing or malformed
+state stays `signed_out` or `unknown`; OAuth and API-key state stay distinct.
+Pi checks use `--no-refresh`. `CLAUDE_BIN`, `CODEX_BIN`, `OPENCODE_BIN`, `KIMI_BIN`,
+`GEMINI_BIN`, and `PI_BIN` select the same binaries for inventory and execution.
+
 ---
 
 ## The idea in two sentences
