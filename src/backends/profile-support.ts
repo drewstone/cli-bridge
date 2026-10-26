@@ -60,6 +60,16 @@ export interface ProfileExecutionIdentity {
   }
 }
 
+/** Materialization requires a host directory visible at the same path inside the executor. */
+function requireMaterializationCwd(cwd: string | undefined, what: string): string {
+  if (cwd !== undefined) return cwd
+  throw new ExecutorConfigurationError(
+    `${what} needs a host directory mounted into the container, and this executor mounts none. Set the backend's ` +
+      `<NAME>_DOCKER_WORKSPACE_ROOT to an absolute host directory — the pool bind-mounts it into every container at ` +
+      `the identical path — or send the request without an agent_profile/mcp block.`,
+  )
+}
+
 /** A public-only plan must not render a secret reference into argv, files, or the child environment. */
 function requirePublicPlanValue(
   value: WorkspacePlanConfigValue | WorkspacePlanArgument,
@@ -134,11 +144,7 @@ export function provisionProfileWorkspace(
   let scoped: OpencodeProfileScope | undefined
   try {
     const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
-    // Claude loads this generated file through --settings, so its path need not
-    // occupy the shared task workspace's one conventional settings name.
-    // Bind it to the exact profile; resumed sessions retain the same plan path.
-    // A persisted session keeps its already-applied plan so an upgrade cannot
-    // change the materialization identity halfway through a conversation.
+    // Bind generated --settings to this exact profile. A resumed session retains its already-applied plan.
     if (harness === 'claude-code' && sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest !== hashWorkspacePlan(plan)) {
       const settingsPath = '.tangle/claude-settings.json'
       const settings = plan.files.find((file) => file.relPath === settingsPath && file.source === 'generated')
@@ -151,10 +157,7 @@ export function provisionProfileWorkspace(
       }
     }
     assertWorkspacePlanSupported(plan)
-    // The materialization identity of the WHOLE plan, fixed before opencode
-    // moves its harness-native half out of the shared directory. It is what the
-    // receipt reports and what a resumed session compares against, so where the
-    // bridge puts the bytes cannot change the identity of what it applied.
+    // Freeze the complete identity before moving native resources; receipts and resumes use this digest.
     const planDigest = hashWorkspacePlan(plan)
     const resumesSamePlan = sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest === planDigest
     if (harness === 'opencode') {
@@ -260,15 +263,7 @@ function scopeOpencodeProfileConfig(
   const nativePaths = new Set(nativeFiles)
   const workspaceFiles = plan.files.filter((file) => file !== configFile && !nativePaths.has(file))
 
-  // A profile with no instructions, no prompt addition, no tools and no
-  // permissions generates no config at all — a manager whose only declared
-  // tools were coordination tools arrives exactly like that, because the caller
-  // strips those before sending. Returning early for it would hand that turn
-  // the whole open project layer: its own subagent in the shared
-  // `.opencode/agents/`, and the directory's instructions, `agent.<name>.prompt`,
-  // custom tools and skills resolved into its process. An empty config is still
-  // a config, and the isolation is a property of the turn, not of the profile's
-  // contents.
+  // Empty profiles still require isolated config; returning early would expose the shared project layer.
   const config = (configFile === undefined ? {} : JSON.parse(configFile.content)) as Record<string, unknown>
   const instructions = config.instructions
   if (instructions !== undefined) {

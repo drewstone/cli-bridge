@@ -303,7 +303,7 @@ export class CodexBackend implements Backend {
     try {
       // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
       await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
-        cwd, model: req.model, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
+        cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
       if (req.jailSpec && !dockerExecution) {
         // Only canonical auth preparation can rotate the account. Access-only
         // jailed turns may run concurrently after their private seeds exist.
@@ -391,7 +391,7 @@ export class CodexBackend implements Backend {
           ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
           ...(router ? { TANGLE_ROUTER_CREDENTIAL: router.key } : {}),
         }
-      await admitNativeSubscription(req, { env: finalEnv, cwd, model: req.model, args, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
+      await admitNativeSubscription(req, { env: finalEnv, cwd: cwd ?? process.cwd(), model: req.model, args, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
         signal,
         stdio: ['ignore', 'pipe', 'pipe'],

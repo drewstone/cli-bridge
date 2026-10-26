@@ -71,6 +71,7 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader) 
         throw new BackendError(`${detail ?? `Subscription authentication is required for the selected ${backend} route (${cause}).`} Run: ${fix}`,
           'subscription_required', undefined, { providerDispatch: 'not_started', subscription: { cause, fix, harness: backend, provider: facts.provider && /^[A-Za-z0-9._-]{1,128}$/u.test(facts.provider) ? facts.provider : null } })
       }
+      if (!descriptor || request.execution && request.execution.kind !== 'host') refuse({ provider: null, authentication: unknown('tangle graph run --help') }, 'Subscription admission requires a configured native backend on the actual Bridge host.')
       if (request.protectedModelCredential) refuse({ provider: null, authentication: unknown('tangle graph run --help') }, 'A request-scoped model credential replaces native subscription authentication; remove that caller override.')
       let checked = false
       const check = async (invocation: NativeSubscriptionInvocation): Promise<void> => {
