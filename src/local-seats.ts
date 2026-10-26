@@ -51,7 +51,7 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
         if (auth.loggedIn === false) fact.status = 'signed_out'
         if (result.code === 0 && auth.loggedIn === true) {
           fact.status = 'authenticated'
-          fact.authMode = native.env.ANTHROPIC_AUTH_TOKEN?.trim() ? 'unknown'
+          fact.authMode = native.env.ANTHROPIC_AUTH_TOKEN ? 'unknown'
             : auth.authMethod === 'claude.ai' || auth.authMethod === 'oauth_token' && !!native.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() ? 'subscription'
             : auth.authMethod === 'api_key' ? 'api_key' : 'unknown'
         }

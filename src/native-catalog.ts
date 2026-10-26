@@ -33,7 +33,7 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader) 
           if (name === 'claude') {
             facts.model = text(env.ANTHROPIC_MODEL) ?? settings.map((item) => text(item.model)).findLast(Boolean)
             const fixFor = (key: string): string => settings.some((item) => object(item.env)[key] !== undefined) || process.env[key] !== env[key] ? 'claude auth status --json' : `unset ${key}`
-            const credential = env.ANTHROPIC_AUTH_TOKEN?.trim() ? 'ANTHROPIC_AUTH_TOKEN' : env.ANTHROPIC_API_KEY?.trim() ? 'ANTHROPIC_API_KEY' : null
+            const credential = env.ANTHROPIC_AUTH_TOKEN ? 'ANTHROPIC_AUTH_TOKEN' : env.ANTHROPIC_API_KEY?.trim() ? 'ANTHROPIC_API_KEY' : null
             if (credential) facts.authentication = { status: 'configured', authMode: credential === 'ANTHROPIC_API_KEY' ? 'api_key' : 'unknown', source: 'native_store', fix: fixFor(credential) }
             const override = ['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']
               .find((key) => env[key]?.trim() && !['0', 'false', 'off'].includes(env[key]!.toLowerCase()))

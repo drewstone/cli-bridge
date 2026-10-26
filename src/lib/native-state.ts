@@ -28,5 +28,6 @@ export async function readClaudeNativeContext(options: { cwd: string; env: NodeJ
     ...flags.flatMap((flag, index) => flag === '--settings' && !flags[index + 1]!.trimStart().startsWith('{') ? [resolve(options.cwd, flags[index + 1]!)] : [])]
   const settings = await Promise.all(paths.filter((path): path is string => path !== null).map(readNativeState))
   for (let index = 0; index < flags.length; index++) if (flags[index] === '--settings' && flags[index + 1]!.trimStart().startsWith('{')) settings.push(nativeObject(JSON.parse(flags[index + 1]!)))
+  if (settings.some((item) => Object.values(nativeObject(item.env)).some((value) => typeof value !== 'string'))) throw new Error('Native settings environment must contain strings')
   return { settings, flags, env: Object.assign({}, options.env, ...settings.map((item) => nativeObject(item.env))) as NodeJS.ProcessEnv }
 }
