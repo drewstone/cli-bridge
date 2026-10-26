@@ -53,7 +53,7 @@ import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
 import { nativeReasoningControl, workspaceCwdPathForBase, type ContextTransferRequest } from '@tangle-network/agent-interface'
-import { CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
+import { CODEX_NATIVE_IMPORT_VERSION, CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
 import { assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
 import {
   assertRouterCodexExecution,
@@ -92,7 +92,7 @@ export class CodexBackend implements Backend {
     const health = await versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
     // The actual installed public protocol and restart path were qualified at
     // this version. A different binary needs its own proof before advertisement.
-    this.nativeImportProtocolQualified = health.state === 'ready' && health.version === 'codex-cli 0.162.1'
+    this.nativeImportProtocolQualified = health.state === 'ready' && health.version === CODEX_NATIVE_IMPORT_VERSION
     return health
   }
 
@@ -117,7 +117,7 @@ export class CodexBackend implements Backend {
     signal: AbortSignal,
   ): Promise<PreparedContextTransfer> {
     this.validateContextTransfer(request)
-    if (!this.contextTransferAvailable()) throw new BackendError('installed Codex native import protocol has not been qualified (requires codex-cli 0.162.1)', 'capability_denied')
+    if (!this.contextTransferAvailable()) throw new BackendError(`installed Codex native import protocol has not been qualified (requires ${CODEX_NATIVE_IMPORT_VERSION})`, 'capability_denied')
     const stateDir = this.opts.stateDir
     if (!stateDir) throw new BackendError('Codex native context import requires the retained host executor state directory', 'capability_denied')
     const req = codexTransferChatRequest(request)
