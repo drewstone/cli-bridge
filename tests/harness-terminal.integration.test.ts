@@ -81,7 +81,7 @@ const executable = `#!${process.execPath}
 const fs = require('node:fs');
 const spec = JSON.parse(fs.readFileSync('native-case.json', 'utf8'));
 for (const event of spec.events) process.stdout.write(JSON.stringify(event) + '\\n');
-if (!spec.terminal) process.stdout.write('{"type":');
+if (!spec.terminal && !spec.signal) process.stdout.write('{"type":');
 // A terminal stdout event is deliberately provisional: diagnostics and actual exit come later.
 setTimeout(() => {
   if (spec.nativeError) process.stdout.write(JSON.stringify({ type: 'error', message: spec.nativeError }) + '\\n');

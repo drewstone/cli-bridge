@@ -12,6 +12,7 @@ import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountRuns } from '../src/routes/runs.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { SessionStore } from '../src/sessions/store.js'
+import { RetainedSessionService } from '../src/sessions/retained.js'
 
 const nativeProcess = `#!${process.execPath}
 const fs = require('node:fs');
@@ -37,7 +38,8 @@ async function startServer(root: string, bin: string, bounded = false) {
   }))
   const app = new Hono()
   mountChatCompletions(app, { registry, sessions: store, retainedRuns: store, runs })
-  mountRuns(app, { runs, retainedStore: store })
+  const retainedRuns = new RetainedSessionService({ store, registry, runs })
+  mountRuns(app, { runs, retainedRuns, retainedStore: store })
   const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 })
   if (!server.listening) await new Promise<void>((resolve) => server.once('listening', resolve))
   const address = server.address()
@@ -46,6 +48,7 @@ async function startServer(root: string, bin: string, bounded = false) {
     url: `http://127.0.0.1:${address.port}`, runs,
     async stop() {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      await retainedRuns.shutdown()
       await runs.shutdown()
       store.close()
     },
