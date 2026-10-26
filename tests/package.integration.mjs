@@ -128,6 +128,8 @@ test('packed production install embeds isolated HTTP services and runs the exist
       assert.equal(health.status, 503);
       assert.deepEqual((await health.json()).backends, []);
       assert.equal((await fetch(first.url + '/v1/models')).status, 401);
+      assert.equal((await fetch(first.url + '/v1/models', { headers: { authorization:
+        'Bearer ' + (bearer[0] === 'a' ? 'b' : 'a') + bearer.slice(1) } })).status, 401);
       assert.equal((await fetch(first.url + '/v1/models', { headers: { authorization: 'Bearer ' + bearer } })).status, 200);
       await first.close();
       await first.close();

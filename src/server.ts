@@ -8,6 +8,7 @@ import { DurableRunWriter } from './sessions/durable-writer.js'
  */
 
 import { join } from 'node:path'
+import { timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
@@ -122,18 +123,13 @@ function preflightTargetFor(cfg: BackendExecutorConfig, bin: string, slotIndex: 
   const containerHome = cfg.containerHome ?? '/root'
   // The mount the credential file belongs to, so the check runs against the
   // directory that actually holds auth rather than the first one configured.
-  const credentialTargetFor = (containerTarget: string): string | undefined => {
-    if (!cfg.credentialFile) return undefined
-    const full = `${containerHome}/${cfg.credentialFile}`
-    if (!full.startsWith(`${containerTarget}/`)) return undefined
-    return full.slice(containerTarget.length + 1)
-  }
-  const pairs: Array<{ host: string; container: string }> = [
+  const credentialPath = cfg.credentialFile ? `${containerHome}/${cfg.credentialFile}` : undefined
+  const mounts: DockerPreflightMount[] = [
     { host: cfg.hostConfigDir!, container: cfg.containerConfigDir! },
     ...(cfg.extraMounts ?? []),
-  ]
-  const mounts: DockerPreflightMount[] = pairs.map((pair, i) => {
-    const credentialFile = credentialTargetFor(pair.container)
+  ].map((pair, i) => {
+    const credentialFile = credentialPath?.startsWith(`${pair.container}/`)
+      ? credentialPath.slice(pair.container.length + 1) : undefined
     return {
       // Per-slot mode gives THIS slot its own volumes, so the probe must name
       // this slot's volumes — probing slot 0's for every slot was evidence
@@ -217,24 +213,21 @@ async function buildExecutorForBackend(
   const target = preflightTargetFor(cfg, bin, 0)
   const imageFindings = await preflightDockerImage(target)
   if (imageFindings.length > 0) throw new DockerPreflightError(cfg.name, imageFindings)
-  const memory = process.env.BRIDGE_POOL_MEMORY || '4g'
-  const cpus = process.env.BRIDGE_POOL_CPUS || '2'
-  const maxQueueDepth = parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4)
-  const acquireDeadlineMs = parseEnvPositiveInt('BRIDGE_POOL_ACQUIRE_DEADLINE_MS', 60_000)
-  const maxAcquireDeadlineMs = parseEnvPositiveInt('BRIDGE_POOL_MAX_ACQUIRE_DEADLINE_MS', 900_000)
-  const slotMaxHoldMs = parseEnvNonNegativeInt('BRIDGE_SLOT_MAX_HOLD_MS', 0)
+  const caps = {
+    memory: process.env.BRIDGE_POOL_MEMORY || '4g',
+    cpus: process.env.BRIDGE_POOL_CPUS || '2',
+    maxQueueDepth: parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4),
+    acquireDeadlineMs: parseEnvPositiveInt('BRIDGE_POOL_ACQUIRE_DEADLINE_MS', 60_000),
+    maxAcquireDeadlineMs: parseEnvPositiveInt('BRIDGE_POOL_MAX_ACQUIRE_DEADLINE_MS', 900_000),
+    slotMaxHoldMs: parseEnvNonNegativeInt('BRIDGE_SLOT_MAX_HOLD_MS', 0),
+  }
   const pool = await ContainerPool.create({
     size: cfg.poolSize,
     image: cfg.image,
     namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
     oauthMode: cfg.oauthMode ?? 'share',
     strictSessionAffinity: cfg.name === 'codex' && cfg.oauthMode === 'per-slot',
-    memory,
-    cpus,
-    maxQueueDepth,
-    acquireDeadlineMs,
-    maxAcquireDeadlineMs,
-    slotMaxHoldMs,
+    ...caps,
     ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
     ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),
     ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
@@ -266,11 +259,7 @@ async function buildExecutorForBackend(
         }),
     onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
   })
-  console.log(
-    `[${cfg.name}-pool] caps memory=${memory} cpus=${cpus} queue=${maxQueueDepth} ` +
-      `acquire-deadline=${acquireDeadlineMs}ms ` +
-        `slot-hold=${slotMaxHoldMs === 0 ? 'disabled' : `${slotMaxHoldMs}ms`}`,
-  )
+  console.log(`[${cfg.name}-pool] caps`, caps)
   registerPoolForMetrics(cfg.name, pool)
   extras.shutdownHooks.push(() => pool.destroy())
 
@@ -365,16 +354,6 @@ export async function buildApp(config: Config): Promise<{
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)
   extras.shutdownHooks.push(async () => admission.close())
-  const trace = new TraceEmitter({
-    sink: config.trace.enabled
-      ? new JsonlSpanSink({
-          file: config.trace.file,
-          maxBytes: config.trace.maxBytes,
-          maxFiles: config.trace.maxFiles,
-        })
-      : nullSpanSink,
-    maxToolSpans: config.trace.maxToolSpans,
-  })
 
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
@@ -452,11 +431,12 @@ export async function buildApp(config: Config): Promise<{
 
   // Bearer guard — only active when BRIDGE_BEARER is set.
   if (config.bearer) {
+    const expected = Buffer.from(config.bearer)
     app.use('*', async (c, next) => {
       if (c.req.path === '/health') return next()
       const header = c.req.header('authorization') ?? ''
-      const tok = header.startsWith('Bearer ') ? header.slice(7) : ''
-      if (!constantTimeEqual(tok, config.bearer!)) {
+      const supplied = Buffer.from(header.startsWith('Bearer ') ? header.slice(7) : '')
+      if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
         return c.json({ error: { message: 'Unauthorized', type: 'invalid_authentication_error' } }, 401)
       }
       return next()
@@ -479,7 +459,10 @@ export async function buildApp(config: Config): Promise<{
     admission,
     admissionReservedClients: config.admissionReservedClients,
     netJail: extras.netJail,
-    trace,
+    trace: new TraceEmitter({
+      sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
+      maxToolSpans: config.trace.maxToolSpans,
+    }),
   })
   mountCadRender(app)
   mountImagesGenerate(app)
@@ -534,13 +517,6 @@ export async function buildApp(config: Config): Promise<{
   }
 }
 
-function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
-  let acc = 0
-  for (let i = 0; i < a.length; i++) acc |= a.charCodeAt(i) ^ b.charCodeAt(i)
-  return acc === 0
-}
-
 export type { BridgeServer, StartServerOptions } from './server-options.js'
 export { loadConfig }
 export { detectLocalSeats } from './local-seats.js'
@@ -582,14 +558,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     if (!(error instanceof UnconfirmedBridgeCleanup)) release()
     throw error
   }
-  const { app } = built
   let server: ReturnType<typeof serve>
   try {
     server = serve({
     fetch: ((request: Request, info?: { incoming?: import('node:http').IncomingMessage }) => {
       if (info?.incoming) bindIncomingRequest(request, info.incoming)
-      return app.fetch(request)
-    }) as typeof app.fetch,
+      return built.app.fetch(request)
+    }) as typeof built.app.fetch,
     hostname: config.host,
     port: config.port,
     // Native run policy owns the execution deadline, including long streaming turns.
