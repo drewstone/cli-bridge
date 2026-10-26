@@ -14,6 +14,7 @@ import { assertDockerNetworkName } from './executors/docker-network.js'
 import { formatAllowEntry, parseAllowList } from './jail/net-allowlist.js'
 
 const maxExecutionTimeoutMs = 2_147_483_647
+export const maxCodexSubscriptionTurnMs = 4 * 60 * 60 * 1000
 
 /** Native harness identities only; model selection and seat syntax belong to agent-interface. */
 export const localHarnesses = [
@@ -288,8 +289,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   assertListenerConfig({ host, port, bearer })
 
   // A caller may own the process deadline through `execution.timeoutMs`.
-  // Operator values are fallbacks only when the request omits that field; no
-  // implicit wall-clock deadline is safer than silently killing valid long work.
+  // Codex defaults to its bounded native subscription policy; explicit operator/request values win.
   const defaultTimeout = parseExecutionTimeoutMs('CLI_TIMEOUT_MS', env.CLI_TIMEOUT_MS, 0)
   const executors = parseAllExecutors(env, dataDir)
   const netJailMode = parseNetJailMode(env)
@@ -305,7 +305,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     subscriptionsOnly: parseOnOff('BRIDGE_SUBSCRIPTIONS_ONLY', env.BRIDGE_SUBSCRIPTIONS_ONLY, false),
     ...Object.fromEntries(localHarnesses.flatMap(([name]) => [
       [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? name],
-      [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], defaultTimeout)],
+      [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], name === 'codex' && !env.CLI_TIMEOUT_MS ? maxCodexSubscriptionTurnMs : defaultTimeout)],
     ])) as NativeHarnessConfig,
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
     ampBin: env.AMP_BIN ?? 'amp',
@@ -555,10 +555,7 @@ function parseExecutionTimeoutMs(
   fallback: number,
 ): number {
   if (value === undefined || value === '') return fallback
-  if (!/^\d+$/.test(value)) {
-    throw new Error(`invalid ${key}: expected an integer from 0 to ${maxExecutionTimeoutMs}`)
-  }
-  const parsed = Number(value)
+  const parsed = /^\d+$/.test(value) ? Number(value) : NaN
   if (!Number.isSafeInteger(parsed) || parsed > maxExecutionTimeoutMs) {
     throw new Error(`invalid ${key}: expected an integer from 0 to ${maxExecutionTimeoutMs}`)
   }

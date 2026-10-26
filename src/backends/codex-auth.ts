@@ -6,6 +6,7 @@ import { hostSpawner } from '../executors/host.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { BackendError } from './types.js'
 import { scopeCodexTurnConfig } from '../codex-config.js'
+import { maxCodexSubscriptionTurnMs } from '../config.js'
 
 interface FileAuth {
   auth_mode?: unknown
@@ -175,7 +176,7 @@ export async function prepareCodexJailAuth(
     if (process.platform !== 'linux' || !readConfine) {
       throw new BackendError('Jailed Codex subscription turns require Linux fs-jail read confinement', 'not_configured')
     }
-    if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs < 1 || turnTimeoutMs > 4 * 60 * 60 * 1000) {
+    if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs < 1 || turnTimeoutMs > maxCodexSubscriptionTurnMs) {
       throw new BackendError('Jailed Codex subscription turns require a bounded deadline', 'not_configured')
     }
     if (typeof accountId !== 'string' || !accountId || typeof auth.tokens?.refresh_token !== 'string'
