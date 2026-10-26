@@ -10,7 +10,7 @@ import { buildApp } from '../src/server.js'
 import { hostSpawner } from '../src/executors/host.js'
 import { selectJailBackend } from '../src/jail/index.js'
 import { applyJail } from '../src/executors/jail-support.js'
-import type { Backend, ChatRequest } from '../src/backends/types.js'
+import type { Backend, ChatRequest, NativeSessionBackend } from '../src/backends/types.js'
 
 assert.ok(await selectJailBackend().isAvailable(), 'A real OS jail is required; this proof cannot skip')
 const directory = await mkdtemp(join(tmpdir(), 'bridge-jail-snapshot-'))
@@ -31,11 +31,17 @@ process.env.BRIDGE_JAIL_ROOT = '.agent-home/ambient'
 process.env.BRIDGE_JAIL_RO_PATHS = join(directory, 'outside')
 process.env.BRIDGE_JAIL_RW_PATHS = ''
 process.env.BRIDGE_JAIL_FALLBACK = 'warn'
-const config = loadConfig({ BRIDGE_BACKENDS: '', BRIDGE_DATA_DIR: join(directory, 'state'), BRIDGE_TRACE: 'off',
+const config = loadConfig({ BRIDGE_BACKENDS: 'pi', PI_EXECUTOR: 'host', BRIDGE_DATA_DIR: join(directory, 'state'), BRIDGE_TRACE: 'off',
   BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_JAIL_ROOT: '.agent-home/captured',
   BRIDGE_JAIL_RO_PATHS: readable, BRIDGE_JAIL_RW_PATHS: writable, BRIDGE_JAIL_FALLBACK: 'deny' })
 const built = await buildApp(config)
 let observed: ChatRequest['jailSpec']
+const nativeRequest: ChatRequest = { model: 'pi', messages: [], cwd: workspace }
+await assert.rejects((built.registry.byName('pi') as NativeSessionBackend).startNativeSession(
+  nativeRequest, null, new AbortController().signal), /requires an explicit pi\/<provider>\/<model>/)
+assert.equal(nativeRequest.jailSpec?.readConfine, true)
+assert.equal(nativeRequest.jailSpec?.root, join(workspace, '.agent-home/captured'))
+assert.deepEqual(nativeRequest.jailSpec?.extraReadablePaths, [readable])
 const backend: Backend = {
   name: 'filesystem-probe', matches: (model) => model === 'filesystem-probe',
   health: async () => ({ name: 'filesystem-probe', state: 'ready' }),

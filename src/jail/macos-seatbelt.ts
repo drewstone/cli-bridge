@@ -17,7 +17,7 @@
  */
 
 import { accessSync, constants, existsSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readlink, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { delimiter, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import {
@@ -55,7 +55,7 @@ export class MacosSeatbeltJail implements JailBackend {
   }
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
-    const root = await canonicalize(resolveJailRoot(spec.root, spec.projectDir))
+    const root = resolveJailRoot(spec.root, spec.projectDir)
     // Create the redirected HOME/XDG dirs under the (canonical) root so the CLI
     // can write to them; they sit inside `root`, already in the writable set.
     await prepareJailHome(root)
@@ -204,8 +204,7 @@ export function buildProfile(writable: string[], fixed: string[] = [], readable?
   const allowSubpaths = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
   const allowDevices = DEVICE_WRITABLE.map((path) => `  (literal "${sbplEscape(path)}")`).join('\n')
   const denyFixed = fixed.length + readOnly.length === 0 ? [] : [
-    '; The keychain link and its parent stay fixed, so a confined run cannot',
-    '; point them at host paths the unsandboxed bridge later touches.',
+    '; Preserve fixed credential links and read-only carveouts under writable parents.',
     '(deny file-write*',
     ...fixed.map((path) => `  (literal "${sbplEscape(path)}")`),
     ...readOnly.map((path) => `  (subpath "${sbplEscape(path)}")`),
@@ -234,22 +233,6 @@ export function buildProfile(writable: string[], fixed: string[] = [], readable?
     '',
     ...denyFixed,
   ].join('\n')
-}
-
-/** Resolve symlinks so subpath rules match macOS /private aliases; tolerate
- * a not-yet-existing path by creating it (the jail root) or returning it
- * unchanged (a writable path the CLI will create later). */
-async function canonicalize(path: string): Promise<string> {
-  try {
-    return await realpath(path)
-  } catch {
-    try {
-      await mkdir(path, { recursive: true })
-      return await realpath(path)
-    } catch {
-      return path
-    }
-  }
 }
 
 function sbplEscape(value: string): string {

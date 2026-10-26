@@ -222,9 +222,8 @@ export class LinuxBwrapJail implements JailBackend {
  *   - the wrapped CLI's own location — both its on-PATH entry dir (so a bare
  *     `bin` name resolves) and its realpath install root (so a bundled runtime
  *     a level up, e.g. `~/.opencode`, is readable);
- *   - the operator's `~/.cache` (tokenizer / model caches some CLIs read);
- *   - any extra dirs an operator lists in `BRIDGE_JAIL_RO_PATHS` (a PATH-style
- *     list) for a runtime whose location auto-derivation misses.
+ *   - the operator's `~/.cache` (tokenizer / model caches some CLIs read).
+ * Explicit operator extras come only from the resolved JailSpec.
  *
  * Every candidate passes through {@link isSafeReadPath}: `/`, `/home`, the
  * operator HOME itself, and any ANCESTOR of the workspace are refused, so a

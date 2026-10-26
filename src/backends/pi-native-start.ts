@@ -45,6 +45,7 @@ import { traceContextToChildEnv } from '../trace/ids.js'
 const PI_RPC_REQUEST_TIMEOUT_CAP_MS = 30_000
 
 export interface PiNativeStartOptions {
+  jailEnv?: NodeJS.ProcessEnv
   bin: string
   timeoutMs: number
   spawner: Spawner
@@ -99,7 +100,7 @@ export async function startPiNativeSession(
         execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
         execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
         cwd: runCwd ?? process.cwd(),
-        env: process.env,
+        env: options.jailEnv ?? process.env,
       })
     }
     const jailBackend = selectJailBackend()
