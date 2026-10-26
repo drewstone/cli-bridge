@@ -124,57 +124,69 @@ test('real native catalog and HTTP/SSE admission refuse API, signed-out and chan
   }
 })
 
-test('Claude catalog and admission bind the supplied workspace and effective settings sources', { timeout: 80_000 }, async () => {
+test('Claude listeners isolate their supplied workspaces and effective settings sources', { timeout: 80_000 }, async () => {
   const previous = { ...process.env }
   const nativeClaude = join(previous.HOME, '.local/bin/claude')
   await access(nativeClaude)
   const root = await mkdtemp(join(tmpdir(), 'bridge-native-claude-'))
-  let server
+  let server, sibling
   try {
     const home = join(root, 'home'), workspace = join(root, 'workspace'), user = join(home, '.claude'), project = join(workspace, '.claude')
-    await Promise.all([mkdir(user, { recursive: true }), mkdir(project, { recursive: true })])
+    const siblingWorkspace = join(root, 'sibling-workspace'), siblingProject = join(siblingWorkspace, '.claude')
+    await Promise.all([mkdir(user, { recursive: true }), mkdir(project, { recursive: true }), mkdir(siblingProject, { recursive: true })])
     for (const key of ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_MODEL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY']) delete process.env[key]
     process.env.HOME = home
     assert.notEqual(workspace, process.cwd(), 'the embedded discovery workspace must differ from the Bridge process cwd')
     await writeFile(join(user, 'settings.json'), JSON.stringify({ model: 'sonnet', env: { ANTHROPIC_API_KEY: 'public-user-api-canary', ANTHROPIC_BASE_URL: 'https://example.invalid/v1' } }))
     await writeFile(join(project, 'settings.json'), JSON.stringify({ model: 'opus' }))
     await writeFile(join(project, 'settings.local.json'), JSON.stringify({ model: 'haiku' }))
+    await writeFile(join(siblingProject, 'settings.json'), JSON.stringify({ model: 'sonnet', env: { ANTHROPIC_API_KEY: 'public-sibling-api-canary' } }))
+    await writeFile(join(siblingProject, 'settings.local.json'), JSON.stringify({ model: 'opus' }))
     const attempted = join(root, 'inference-attempted'), wrapper = join(root, 'claude-readonly')
     await writeFile(wrapper, `#!/bin/sh\ncase " $* " in\n*' auth status '*|*' --version '*) exec '${nativeClaude.replaceAll("'", "'\\''")}' "$@" ;;\n*) printf attempted > '${attempted}'; exit 125 ;;\nesac\n`, { mode: 0o700 })
     server = await startServer({ config: { ...loadConfig({ BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'claude', CLAUDE_BIN: wrapper,
       BRIDGE_BEARER: 'native-claude-public-test-bearer', BRIDGE_TRACE: 'off', BRIDGE_SUBSCRIPTIONS_ONLY: '1' }), port: 0 }, cwd: workspace, quiet: true, handleSignals: false })
+    sibling = await startServer({ config: { ...loadConfig({ BRIDGE_DATA_DIR: join(root, 'sibling-state'), BRIDGE_BACKENDS: 'claude', CLAUDE_BIN: wrapper,
+      BRIDGE_BEARER: 'native-claude-public-test-bearer', BRIDGE_TRACE: 'off', BRIDGE_SUBSCRIPTIONS_ONLY: '1' }), port: 0 }, cwd: siblingWorkspace, quiet: true, handleSignals: false })
+    assert.notEqual(server.url, sibling.url, 'both independently owned listeners must be live')
     const headers = { authorization: 'Bearer native-claude-public-test-bearer', 'content-type': 'application/json' }
-    const catalog = async (authMode, status, source) => {
-      const response = await fetch(`${server.url}/v1/models`, { headers })
+    const secrets = ['public-user-api-canary', 'public-project-api-canary', 'public-local-bearer-canary', 'public-sibling-api-canary']
+    const catalog = async (authMode, status, source, instance = server, model = 'haiku') => {
+      const response = await fetch(`${instance.url}/v1/models`, { headers })
       assert.equal(response.status, 200)
       const wire = await response.text()
-      for (const secret of ['public-user-api-canary', 'public-project-api-canary', 'public-local-bearer-canary']) assert.ok(!wire.includes(secret))
+      for (const secret of secrets) assert.ok(!wire.includes(secret))
       const { data } = JSON.parse(wire)
-      assert.deepEqual(data.filter((entry) => entry.default).map((entry) => entry.id), ['claude-code/haiku'], 'local model wins over project and excluded user defaults')
-      const selected = data.find((entry) => entry.id === 'claude-code/haiku')
+      assert.deepEqual(data.filter((entry) => entry.default).map((entry) => entry.id), [`claude-code/${model}`], 'each listener resolves its own local model over project and excluded user defaults')
+      const selected = data.find((entry) => entry.id === `claude-code/${model}`)
       assert.equal(selected.provider, 'anthropic', 'the excluded user endpoint must not poison discovery')
       assert.deepEqual({ authMode: selected.authentication.authMode, status: selected.authentication.status, source: selected.authentication.source }, { authMode, status, source })
+      return selected
     }
-    const request = () => fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers,
-      body: JSON.stringify({ model: 'claude-code/haiku', cwd: workspace, messages: [{ role: 'user', content: 'must never run' }] }) })
-    await catalog('unknown', 'signed_out', 'native_status')
-    const excluded = await request()
-    assert.equal(excluded.status, 403)
-    assert.equal((await excluded.json()).error.cause, 'not_authenticated')
+    const request = (instance = server, cwd = workspace, model = 'haiku') => fetch(`${instance.url}/v1/chat/completions`, { method: 'POST', headers,
+      body: JSON.stringify({ model: `claude-code/${model}`, cwd, messages: [{ role: 'user', content: 'must never run' }] }) })
+    const refusal = async (response, cause) => {
+      assert.equal(response.status, 403)
+      const wire = await response.text()
+      for (const secret of secrets) assert.ok(!wire.includes(secret))
+      const { error } = JSON.parse(wire)
+      assert.deepEqual({ type: error.type, cause: error.cause, provider: error.provider, harness: error.harness, dispatch: error.provider_dispatch, status: error.status },
+        { type: 'subscription_required', cause, provider: 'anthropic', harness: 'claude-code', dispatch: 'not_started', status: 403 })
+      assert.ok(error.fix.length > 0 && error.fix.length <= 256)
+    }
+    const [, siblingBefore] = await Promise.all([catalog('unknown', 'signed_out', 'native_status'), catalog('api_key', 'configured', 'native_store', sibling, 'opus')])
+    await Promise.all([request().then((response) => refusal(response, 'not_authenticated')),
+      request(sibling, siblingWorkspace, 'opus').then((response) => refusal(response, 'api_key_selected'))])
     await writeFile(join(project, 'settings.json'), JSON.stringify({ env: { ANTHROPIC_API_KEY: 'public-project-api-canary' } }))
-    await catalog('api_key', 'configured', 'native_store')
-    const selected = await request()
-    assert.equal(selected.status, 403)
-    const error = (await selected.json()).error
-    assert.equal(error.cause, 'api_key_selected')
-    assert.equal(error.provider_dispatch, 'not_started')
-    await writeFile(join(project, 'settings.local.json'), JSON.stringify({ model: 'haiku', env: { ANTHROPIC_AUTH_TOKEN: 'public-local-bearer-canary' } }))
-    await catalog('unknown', 'configured', 'native_store')
-    const localBearer = await request()
-    assert.equal(localBearer.status, 403)
-    const localError = (await localBearer.json()).error
-    assert.equal(localError.cause, 'subscription_unverified', 'local bearer wins over the project API key just as discovery reported')
-    assert.equal(localError.provider_dispatch, 'not_started')
+    const [siblingAfterProject] = await Promise.all([catalog('api_key', 'configured', 'native_store', sibling, 'opus'), catalog('api_key', 'configured', 'native_store')])
+    assert.deepEqual(siblingAfterProject, siblingBefore, 'mutating the first workspace must leave the sibling catalog unchanged')
+    await Promise.all([request(sibling, siblingWorkspace, 'opus').then((response) => refusal(response, 'api_key_selected')),
+      request().then((response) => refusal(response, 'api_key_selected'))])
+    await writeFile(join(project, 'settings.local.json'), JSON.stringify({ model: 'sonnet', env: { ANTHROPIC_AUTH_TOKEN: 'public-local-bearer-canary' } }))
+    const [, siblingAfterLocal] = await Promise.all([catalog('unknown', 'configured', 'native_store', server, 'sonnet'), catalog('api_key', 'configured', 'native_store', sibling, 'opus')])
+    assert.deepEqual(siblingAfterLocal, siblingBefore, 'local model and credential changes must not bleed across listeners')
+    await Promise.all([request(server, workspace, 'sonnet').then((response) => refusal(response, 'subscription_unverified')),
+      request(sibling, siblingWorkspace, 'opus').then((response) => refusal(response, 'api_key_selected'))])
     await writeFile(join(project, 'settings.local.json'), JSON.stringify({ model: 'haiku' }))
     await writeFile(join(project, 'settings.json'), '{}')
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'public-native-oauth-canary'
@@ -220,10 +232,15 @@ test('Claude catalog and admission bind the supplied workspace and effective set
     }
     await assert.rejects(readFile(attempted), { code: 'ENOENT' })
   } finally {
-    await server?.close()
-    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key]
-    Object.assign(process.env, previous)
-    await rm(root, { recursive: true, force: true })
+    try {
+      const closed = await Promise.allSettled([server?.close(), sibling?.close()])
+      const failure = closed.find((result) => result.status === 'rejected')
+      if (failure) throw failure.reason
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key]
+      Object.assign(process.env, previous)
+      await rm(root, { recursive: true, force: true })
+    }
   }
 })
 
