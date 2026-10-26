@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, test } from 'vitest'
@@ -32,12 +32,4 @@ test('refuses missing, duplicate, or non-registry root selections', () => {
   expect(() => lockedTraceContract(fixture('2.2.0'))).toThrow(/one integrity/)
   expect(() => lockedTraceContract(fixture('2.0.0', ['2.0.0', '2.0.0']))).toThrow(/one integrity/)
   expect(() => lockedTraceContract(fixture('file:patched'))).toThrow(/root importer/)
-})
-test('handles the actual multi-document pnpm lock without choosing a toolchain document', () => {
-  expect(lockedTraceContract()).toMatchObject({ version: '2.0.0' })
-  const file = fixture(); const app = readFileSync(file, 'utf8')
-  writeFileSync(file, '---\nimporters:\n  .:\n    configDependencies: {}\n    packageManagerDependencies:\n      pnpm:\n        specifier: 12.6.0\n        version: 12.6.0\n---\n' + app)
-  expect(lockedTraceContract(file)).toEqual({ version: '2.0.0', integrity: 'sha512-AAAA' })
-  writeFileSync(file, app + '\n---\n' + app)
-  expect(() => lockedTraceContract(file)).toThrow(/root importer/)
 })

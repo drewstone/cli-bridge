@@ -1,5 +1,8 @@
 import type { ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
+import { finished } from 'node:stream/promises'
+import { describeCliExit, type SpawnResult } from '../executors/types.js'
+import { classifyHarnessFailure, throwHarnessFailure } from './harness-failure.js'
 
 export type ProcessLineEvent =
   | { kind: 'line'; line: string }
@@ -102,6 +105,9 @@ export async function waitForProcessClose(child: ChildProcess): Promise<ProcessE
   // for a 'close' that had already fired before the stream reader finished.
   const signalCode = typeof child.signalCode === 'string' ? child.signalCode : null
   if (child.exitCode !== null || signalCode !== null) {
+    await Promise.all([child.stdout, child.stderr].filter((stream) => stream !== null).map(
+      (stream) => finished(stream!, { readable: true, writable: false, cleanup: true }),
+    ))
     return { code: child.exitCode, signal: signalCode }
   }
   return await new Promise((resolve) => {
@@ -110,4 +116,18 @@ export async function waitForProcessClose(child: ChildProcess): Promise<ProcessE
       signal: typeof signal === 'string' ? signal : null,
     }))
   })
+}
+
+/** Called only after the native protocol reader reaches EOF; never drain over unread frames. */
+export async function assertSuccessfulHarnessExit(
+  spawned: SpawnResult,
+  label: string,
+  diagnostics: () => string,
+): Promise<void> {
+  const exit = await waitForProcessClose(spawned.child)
+  const failure = classifyHarnessFailure(exit, diagnostics())
+  if (failure) {
+    const message = await describeCliExit(spawned, label, exit.code, failure.message, exit.signal)
+    throwHarnessFailure({ ...failure, message })
+  }
 }

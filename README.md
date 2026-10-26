@@ -20,6 +20,30 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 
 Personal productivity tool. Single-user by default. Loopback-only by default. No ambition to be a shared proxy.
 
+Install a reviewed source revision with `npm install https://github.com/drewstone/cli-bridge/archive/<commit>.tar.gz`;
+the npm registry package named `cli-bridge` belongs to another project. The artifact
+includes the existing TypeScript server and its runtime loader, so it needs no
+repository build or development dependencies. `cli-bridge` starts the normal server.
+
+Applications may import `{ loadConfig, startServer }` from `cli-bridge` and call
+`await startServer({ config: { ...loadConfig(env), port: 0 }, handleSignals: false, quiet: true })`.
+The returned `{ url, close }` is ready to serve; `await close()` stops only that
+server and its owned work. Embedded mode leaves process signals and error handlers
+with the caller. Use a private data directory and a generated bearer in `env`.
+
+`cli-bridge --seats --json` or `await detectLocalSeats({ config })` reports native
+login facts for Claude Code, Codex, OpenCode, Kimi Code, Gemini, and Pi. No model
+turn is sent; no credential or account identity appears in the result. Each fact
+has `harness`, `status`, `authMode`, `source`, and an optional login `fix` command.
+Model selection, ranking, and seat syntax belong to the consuming seat resolver.
+
+`authenticated` means the native status command recognizes a login, not that an
+inference was verified. Where inventory reads Kimi/Gemini's own OAuth stores,
+the result is `configured` rather than a verified live login. Missing or malformed
+state stays `signed_out` or `unknown`; OAuth and API-key state stay distinct.
+Pi checks use `--no-refresh`. `CLAUDE_BIN`, `CODEX_BIN`, `OPENCODE_BIN`, `KIMI_BIN`,
+`GEMINI_BIN`, and `PI_BIN` select the same binaries for inventory and execution.
+
 ---
 
 ## The idea in two sentences

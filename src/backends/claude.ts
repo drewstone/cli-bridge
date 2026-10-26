@@ -39,8 +39,8 @@ import {
 import { contentToText } from './content.js'
 import { registerJailReadable } from '../jail/index.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -389,6 +389,9 @@ export class ClaudeBackend implements Backend {
     let emittedAnyToolCall = false
     try {
       let internalSessionId: string | undefined
+      let terminal: ClaudeStreamResult | undefined
+      let sawError: string | undefined
+      let usage: ChatDelta['usage']
       const stderr = new BoundedDiagnosticBuffer()
       child.stderr?.on('data', (b) => { stderr.append(b) })
 
@@ -467,37 +470,39 @@ export class ClaudeBackend implements Backend {
           continue
         }
 
+        if (msg.type === 'error') {
+          const error = msg as { message?: string; error?: { message?: string } }
+          sawError ??= sanitizeUpstreamErrorDetail(error.error?.message ?? error.message)
+          continue
+        }
         if (msg.type === 'result') {
-          const r = msg as ClaudeStreamResult
-          if (r.is_error) {
-            const detail = sanitizeUpstreamErrorDetail(r.result)
-            throw new BackendError(`claude upstream error: ${detail}`, 'upstream')
-          } else {
-            // tool_calls wins over stop when the model emitted at least
-            // one tool_use block during this turn (native or MCP).
-            const usage = claudeResultUsage(r)
-            yield {
-              finish_reason: emittedAnyToolCall ? 'tool_calls' : 'stop',
-              ...(usage ? { usage } : {}),
-              internal_session_id: r.session_id ?? internalSessionId,
-            }
-          }
-          return
+          const result = msg as ClaudeStreamResult
+          terminal = result
+          usage = claudeResultUsage(result) ?? usage
+          if (result.is_error || result.subtype !== 'success')
+            sawError ??= sanitizeUpstreamErrorDetail(result.result)
+          // The native result is provisional. Continue parsing trailing usage and errors.
+          continue
         }
       }
 
-      const exit = await waitForProcessClose(child)
+      await waitForProcessClose(child)
+      if (usage) yield { usage }
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
 
-      if (exit.code !== 0) {
-        throw new BackendError(
-          await describeCliExit(spawned, 'claude', exit.code, stderr.render(), exit.signal),
-          'upstream',
-        )
+      await assertSuccessfulHarnessExit(spawned, 'claude', () => stderr.render())
+      if (sawError) throw new BackendError(`claude upstream error: ${sawError}`, 'upstream')
+      if (terminal) {
+        yield {
+          finish_reason: emittedAnyToolCall ? 'tool_calls' : 'stop',
+          ...(typeof terminal.result === 'string' ? { final_text: terminal.result } : {}),
+          internal_session_id: terminal.session_id ?? internalSessionId,
+        }
+        return
       }
 
       // Claude Code ends every stream-json turn with a `result` event, success or

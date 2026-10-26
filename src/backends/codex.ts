@@ -47,8 +47,8 @@ import {
 } from './profile-support.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { describeCliExit, resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
@@ -459,6 +459,8 @@ export class CodexBackend implements Backend {
         throw new BackendError('codex subprocess has no stdout pipe', 'upstream')
       }
       let sawError: BackendFailureReason | null = null
+      let sawTerminal = false
+      let usage: ChatDelta['usage']
 
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
@@ -492,28 +494,19 @@ export class CodexBackend implements Backend {
 
         const text = extractText(ev)
         if (text) {
-          yield { content: text }
+          const item = ev.item as { type?: unknown } | undefined
+          yield { content: text, ...(item?.type === 'agent_message' ? { final_text: text } : {}) }
         }
 
         if (type === 'turn.completed' || type === 'thread.completed') {
-          if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
-          record?.terminal(sawError ? 'error' : 'completed')
-          recordOutcome = sawError ? 'failed' : 'closed'
-          const usage = ev.usage as { input_tokens?: number; output_tokens?: number } | undefined
-          if (await finishRecord() !== 'stopped') {
-            throw new BackendError('Codex process termination is unconfirmed', 'upstream')
-          }
-          if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
-          yield {
-            ...terminalOutcome('codex', sawError, emittedToolCall),
-            usage,
-            internal_session_id: internalSessionId,
-          }
-          return
+          sawTerminal = true
+          usage = ev.usage as ChatDelta['usage'] ?? usage
+          continue
         }
       }
 
-      const exit = await waitForProcessClose(child)
+      await waitForProcessClose(child)
+      if (usage) yield { usage }
 
       if (signal.aborted) {
         await finishRecord()
@@ -521,6 +514,7 @@ export class CodexBackend implements Backend {
         return
       }
       if (sawError) {
+        recordOutcome = 'failed'
         // Ended through the delta envelope, not a throw: `BackendError.code` is the
         // bridge's own closed taxonomy and cannot carry a provider discriminant, while
         // the terminal error delta reaches the caller with it. The route answers both
@@ -532,15 +526,13 @@ export class CodexBackend implements Backend {
         yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId }
         return
       }
-      if (exit.code !== 0) {
-        throw new BackendError(await describeCliExit(spawned, 'codex', exit.code, stderr.render(), exit.signal), 'upstream')
-      }
-      if (record) {
-        throw new BackendError('Codex receipt launch ended without a native terminal event', 'parse_error')
-      }
-      if (await finishRecord() !== 'stopped') {
+      await assertSuccessfulHarnessExit(spawned, 'codex', () => stderr.render())
+      if (!sawTerminal)
+        throw new BackendError('Codex launch ended without a native terminal event', 'parse_error')
+      record?.terminal('completed')
+      recordOutcome = 'closed'
+      if (await finishRecord() !== 'stopped')
         throw new BackendError('Codex process termination is unconfirmed', 'upstream')
-      }
       if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
@@ -635,7 +627,6 @@ export function splitCodexModel(
   if (slash <= 0) return { provider: null, model: remainder }
   return { provider: remainder.slice(0, slash), model: remainder.slice(slash + 1) }
 }
-
 
 /**
  * Path to the user's persistent codex auth.json. cli-bridge points

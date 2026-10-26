@@ -27,9 +27,9 @@ import type { SessionRecord } from '../sessions/store.js'
 import { materializeMcpServersForFactory, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
-import { describeCliExit, type Spawner } from '../executors/types.js'
+import { type Spawner } from '../executors/types.js'
 import { versionHealth } from './health.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 
@@ -148,29 +148,22 @@ export class FactoryBackend implements Backend {
         // Skip the `role:'user'` echo of our own prompt.
         if (type === 'message' && ev.role === 'assistant') {
           const text = extractMessageText(ev)
-          if (text) { yield { content: text }; emittedContent = true }
+          if (text) { yield { content: text, final_text: text }; emittedContent = true }
         }
         const toolCall = extractToolCall(ev)
         if (toolCall) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
 
-        if (type === 'result') {
-          yield {
-            ...terminalOutcome('factory', sawError, emittedToolCall),
-            internal_session_id: internalSessionId,
-          }
-          return
-        }
+        // EOF, not an intermediate native result frame, owns terminal publication.
+
       }
 
-      const exit = await waitForProcessClose(child)
+      await waitForProcessClose(child)
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
+      await assertSuccessfulHarnessExit(spawned, 'factory (droid exec)', () => stderr.render())
       if (sawError) throw new BackendError(`factory: ${sawError}`, 'upstream')
-      if (exit.code !== 0) {
-        throw new BackendError(await describeCliExit(spawned, 'factory (droid exec)', exit.code, stderr.render(), exit.signal), 'upstream')
-      }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`factory produced no output: ${stderr.render(300)}`, 'upstream')
       }

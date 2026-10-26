@@ -1,6 +1,11 @@
 node_modules/
 dist/
 build/
+types/*
+!types/package.d.ts
+!types/config.d.ts
+!types/server-options.d.ts
+!types/local-seats.d.ts
 coverage/
 *.log
 .DS_Store
