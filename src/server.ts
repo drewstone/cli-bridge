@@ -10,7 +10,7 @@ import { DurableRunWriter } from './sessions/durable-writer.js'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { anyBackendSpawnsOnHost, loadConfig, type Config } from './config.js'
+import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { BackendRegistry } from './backends/registry.js'
 import { ClaudeBackend } from './backends/claude.js'
@@ -77,11 +77,11 @@ import {
   acquireDataDirectoryLock,
   acquireInstanceLock,
   InstanceLockError,
-  type DataDirectoryLock,
   type InstanceLock,
 } from './runtime/single-instance.js'
 import { reapStalePrivateTemporaryRoots } from './runtime/private-temporary.js'
 import { bindIncomingRequest } from './http/request-source.js'
+import type { BridgeServer, StartServerOptions } from './server-options.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -343,6 +343,8 @@ export async function buildApp(config: Config): Promise<{
   extras: BuildAppExtras
 }> {
   const sessions = new SessionStore(config.dataDir)
+  const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
+  try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
     replayRetentionMs: parseEnvPositiveInt('BRIDGE_RUN_REPLAY_RETENTION_MS', 60_000),
@@ -351,14 +353,14 @@ export async function buildApp(config: Config): Promise<{
     maxReplayBytes: parseEnvPositiveInt('BRIDGE_RUN_MAX_REPLAY_BYTES', 32 * 1024 * 1024),
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
-  const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
+  extras.shutdownHooks.push(async () => await runs.shutdown())
   // Validate the durable maintenance owner before any backend provisions Docker slots.
   const poolMaintenance = new PoolMaintenance(config.dataDir)
   extras.shutdownHooks.push(async () => await poolMaintenance.close())
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
-    await durableWriter.open()
     extras.shutdownHooks.push(() => durableWriter.close())
+    await durableWriter.open()
   }
   const catalog = createProfileCatalog(config.sandboxProfilesDir)
   const admission = new AdmissionGate(config.admission)
@@ -496,13 +498,7 @@ export async function buildApp(config: Config): Promise<{
   // is created only after every backend is registered so capability discovery
   // and model routing use the same registry as one-shot chat.
   const retained = new RetainedSessionService({ store: sessions, registry, runs })
-  extras.shutdownHooks.unshift(async () => {
-    try {
-      await retained.shutdown()
-    } finally {
-      await runs.shutdown()
-    }
-  })
+  extras.shutdownHooks.unshift(async () => await retained.shutdown())
 
   const app = new Hono()
 
@@ -582,6 +578,12 @@ export async function buildApp(config: Config): Promise<{
   }))
 
   return { app, sessions, registry, runs, catalog, extras }
+  } catch (error) {
+    try { await disposeApp({ sessions, extras }) } catch (cleanup) {
+      throw new UnconfirmedBridgeCleanup([error, cleanup], 'CLI Bridge startup failed and cleanup was not confirmed')
+    }
+    throw error
+  }
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -591,223 +593,151 @@ function constantTimeEqual(a: string, b: string): boolean {
   return acc === 0
 }
 
-export async function startServer(): Promise<void> {
-  const config = loadConfig()
+export type { BridgeServer, StartServerOptions } from './server-options.js'
+export { loadConfig }
 
-  // The data-directory lock is the durable-state owner. Acquire it before
-  // buildApp opens sessions.sqlite, then retain the separate port guard for
-  // listener ownership. A clean exit releases both; a dead predecessor's
-  // proven-stale pidfiles are reclaimed by single-instance.ts.
-  let dataDirectoryLock: DataDirectoryLock | undefined
+class UnconfirmedBridgeCleanup extends AggregateError {}
+
+async function disposeApp(built: Pick<Awaited<ReturnType<typeof buildApp>>, 'sessions' | 'extras'>): Promise<void> {
+  const errors: unknown[] = []
+  // Retained runs settle before the durable writer and database close.
+  for (const hook of built.extras.shutdownHooks) {
+    try { await hook() } catch (error) { errors.push(error) }
+  }
+  try { built.sessions.close() } catch (error) { errors.push(error) }
+  if (errors.length) throw new AggregateError(errors, 'CLI Bridge shutdown could not confirm all owned resources closed')
+}
+
+export async function startServer(options: StartServerOptions = {}): Promise<BridgeServer> {
+  const config = structuredClone(options.config ?? loadConfig())
+  assertListenerConfig(config, true)
+  const fsJailFlag = ['1', 'true', 'yes', 'on'].includes((process.env.WORKER_FS_JAIL ?? '').trim().toLowerCase())
+  const jailFloor = fsJailFlag ? 'fs-jail' : config.jailMode
+  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends, config.executors) && !selectJailBackend().isAvailable()) {
+    if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
+      console.warn(`[cli-bridge] WARNING: jail floor '${jailFloor}' is unavailable; requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).`)
+    } else {
+      throw new Error(`CLI Bridge jail floor '${jailFloor}' is unavailable. Enable a supported jail backend, or unset the jail floor.`)
+    }
+  }
+  const dataDirectoryLock = acquireDataDirectoryLock(config.dataDir)
   let instanceLock: InstanceLock | undefined
-  let runtimeConfig = config
+  let built: Awaited<ReturnType<typeof buildApp>>
+  const release = () => { instanceLock?.release(); dataDirectoryLock.release() }
   try {
-    dataDirectoryLock = acquireDataDirectoryLock(config.dataDir)
-    runtimeConfig = { ...config, dataDir: dataDirectoryLock.dataDir }
-    instanceLock = acquireInstanceLock(config.port)
-  } catch (err) {
-    dataDirectoryLock?.release()
-    instanceLock?.release()
-    if (err instanceof InstanceLockError) {
-      console.error(`[cli-bridge] ${err.message}`)
-      process.exit(1)
-    }
-    throw err
-  }
-
-  let built
-  try {
+    // The OS owns ephemeral listener allocation; a shared port-0 pidfile would serialize unrelated embedded servers.
+    if (config.port !== 0) instanceLock = acquireInstanceLock(config.port)
     reapStalePrivateTemporaryRoots()
-    built = await buildApp(runtimeConfig)
-  } catch (err) {
-    // A preflight failure is an operator message, not a stack trace: it already
-    // contains the observation and the command that fixes it.
-    if (err instanceof DockerPreflightError) {
-      console.error(`[cli-bridge] FATAL: ${err.message}`)
-      instanceLock?.release()
-      dataDirectoryLock?.release()
-      instanceLock = undefined
-      dataDirectoryLock = undefined
-      process.exit(1)
-    }
-    instanceLock?.release()
-    dataDirectoryLock?.release()
-    instanceLock = undefined
-    dataDirectoryLock = undefined
-    throw err
+    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir })
+  } catch (error) {
+    if (!(error instanceof UnconfirmedBridgeCleanup)) release()
+    throw error
   }
-  const { app, sessions, extras } = built
-  // Drop the lock on hard exit too — graceful shutdown also releases, but
-  // a process.exit() path (fatal error) must not strand the pidfile.
-  process.once('exit', () => {
-    instanceLock?.release()
-    dataDirectoryLock?.release()
-  })
-  const server = serve({
-    // @hono/node-server passes the native IncomingMessage as the second
-    // callback argument. Bind it to this Request before Hono runs so routes
-    // can enforce socket-local capabilities without trusting caller headers.
+  const { app } = built
+  let server: ReturnType<typeof serve>
+  try {
+    server = serve({
     fetch: ((request: Request, info?: { incoming?: import('node:http').IncomingMessage }) => {
       if (info?.incoming) bindIncomingRequest(request, info.incoming)
       return app.fetch(request)
     }) as typeof app.fetch,
     hostname: config.host,
     port: config.port,
-    // Pass timeouts at create-time so they apply to the http.Server
-    // before it starts accepting. Setting them post-listen has the
-    // same effect for new sockets, but doing it here is bulletproof.
-    serverOptions: {
-      requestTimeout: 0,
-      headersTimeout: 0,
-      keepAliveTimeout: 0,
-    },
-  }, (info) => {
-    console.log(`[cli-bridge] listening on http://${info.address}:${info.port}  (host=${config.host})`)
+    // Native run policy owns the execution deadline, including long streaming turns.
+    serverOptions: { requestTimeout: 0, headersTimeout: 0, keepAliveTimeout: 0 },
+    })
+  } catch (error) {
+    try { await disposeApp(built) } catch (cleanup) {
+      throw new UnconfirmedBridgeCleanup([error, cleanup], 'CLI Bridge startup failed and cleanup was not confirmed')
+    }
+    release()
+    throw error
+  }
+  let closed: Promise<void> | undefined
+  const detach = () => {
+    process.off('exit', release)
+    process.off('SIGTERM', shutdown)
+    process.off('SIGINT', shutdown)
+    process.off('unhandledRejection', unhandledRejection)
+    process.off('uncaughtException', uncaughtException)
+  }
+  const close = (): Promise<void> => closed ??= (async () => {
+    detach()
+    const stopped = new Promise<void>((resolve, reject) => server.close((error) => {
+      if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') reject(error)
+      else resolve()
+    }))
+    // Keep the listener rejection handled while awaiting native work shutdown.
+    void stopped.catch(() => {})
+    try {
+      await disposeApp(built)
+    } finally {
+      if ('closeAllConnections' in server) server.closeAllConnections()
+      await stopped
+    }
+    release()
+  })()
+  const shutdown = () => {
+    const timer = setTimeout(() => process.exit(1), 5000).unref()
+    void close().then(() => { clearTimeout(timer); process.exit(0) }, (error) => {
+      console.error('[cli-bridge] shutdown failed', error)
+      process.exit(1)
+    })
+  }
+  const unhandledRejection = (reason: unknown) => {
+    console.error('[cli-bridge] unhandledRejection — keeping process alive', reason instanceof Error ? reason.message : String(reason))
+  }
+  const uncaughtException = (error: Error) => {
+    console.error('[cli-bridge] uncaughtException', error.message)
+    if (isFatalServerStartupError(error)) process.exit(1)
+  }
+  try {
+    if (!server.listening) await new Promise<void>((resolve, reject) => {
+      server.once('listening', resolve)
+      server.once('error', reject)
+    })
+  } catch (error) {
+    try { await close() } catch (cleanup) {
+      throw new UnconfirmedBridgeCleanup([error, cleanup], 'CLI Bridge startup failed and cleanup was not confirmed')
+    }
+    throw error
+  }
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    await close()
+    throw new Error('CLI Bridge listener has no TCP address')
+  }
+  const host = address.address.includes(':') ? `[${address.address}]` : address.address
+  const url = `http://${host}:${address.port}`
+  if (options.handleSignals !== false) {
+    process.once('exit', release)
+    process.on('SIGTERM', shutdown)
+    process.on('SIGINT', shutdown)
+    process.on('unhandledRejection', unhandledRejection)
+    process.on('uncaughtException', uncaughtException)
+  }
+  if (!options.quiet) {
+    console.log(`[cli-bridge] listening on ${url} (host=${config.host})`)
     console.log(`[cli-bridge] backends: ${[...config.backends].join(', ')}`)
     console.log(`[cli-bridge] bearer: ${config.bearer ? 'required' : 'none (loopback only)'}`)
-    console.log(
-      `[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue}/class ` +
-      `reservedActive=${config.admission.reservedActive} (bulk ceiling ${config.admission.maxActive - config.admission.reservedActive}) ` +
-      `queueTimeoutMs=${config.admission.queueTimeoutMs} bulkQueueTimeoutMs=${config.admission.bulkQueueTimeoutMs}`,
-    )
+    console.log(`[cli-bridge] host admission: maxActive=${config.admission.maxActive} maxQueue=${config.admission.maxQueue}/class reservedActive=${config.admission.reservedActive} queueTimeoutMs=${config.admission.queueTimeoutMs} bulkQueueTimeoutMs=${config.admission.bulkQueueTimeoutMs}`)
     console.log(`[cli-bridge] reserved-lane clients: ${config.admissionReservedClients.join(', ') || 'none'}`)
-    // Two gates ration host concurrency. If the executor's ceiling is the lower
-    // one, admission stops being the limiter that its numbers claim to be, and
-    // a caller admitted by the lane queues again at the executor.
     const scope = scopedHostConcurrencyLimits()
-    if (scope.max < config.admission.maxActive) {
-      console.warn(
-        `[cli-bridge] admission maxActive=${config.admission.maxActive} exceeds scoped-executor ` +
-        `concurrency=${scope.max}: the executor is the real ceiling. Lower BRIDGE_HOST_CHAT_MAX_ACTIVE ` +
-        `or raise CLI_BRIDGE_SCOPE_MAX_CONCURRENCY so one gate owns the limit.`,
-      )
-    }
-    if (config.admission.reservedActive > 0 && scope.reserved === 0) {
-      console.warn(
-        '[cli-bridge] host admission reserves a lane but the scoped executor reserves none: ' +
-        'a reserved caller can clear admission and still be starved at the executor. ' +
-        'Set CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY.',
-      )
-    }
-    console.log(
-      config.trace.enabled
-        ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)`
-        : '[cli-bridge] traces: off (BRIDGE_TRACE=off)',
-    )
-    // WORKER_FS_JAIL=1 is a shorthand that raises the operator jail floor to
-    // fs-jail even when BRIDGE_JAIL_MODE is unset, so fold it into the effective
-    // floor the startup gate + log report.
-    const fsJailFlag = ['1', 'true', 'yes', 'on'].includes((process.env.WORKER_FS_JAIL ?? '').trim().toLowerCase())
-    const jailFloor: 'off' | 'write-jail' | 'fs-jail' = fsJailFlag ? 'fs-jail' : config.jailMode
+    if (scope.max < config.admission.maxActive) console.warn(`[cli-bridge] admission maxActive=${config.admission.maxActive} exceeds scoped-executor concurrency=${scope.max}; lower BRIDGE_HOST_CHAT_MAX_ACTIVE or raise CLI_BRIDGE_SCOPE_MAX_CONCURRENCY.`)
+    if (config.admission.reservedActive > 0 && scope.reserved === 0) console.warn('[cli-bridge] admission reserves a lane but the executor does not; set CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY.')
+    console.log(config.trace.enabled ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)` : '[cli-bridge] traces: off (BRIDGE_TRACE=off)')
     console.log(`[cli-bridge] jail default: ${jailFloor}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
-    // Fail fast (don't go ready) if a jail is the operator floor but no jail
-    // backend can run here — every host request would otherwise fail closed while
-    // /health reports ready. Only relevant when some backend actually spawns on the
-    // host: docker/remote-only deployments never hit the host jail. Honor
-    // BRIDGE_JAIL_FALLBACK=warn, which runs unconfined-with-warning instead.
-    const hasHostSpawn = anyBackendSpawnsOnHost(config.backends, config.executors)
-    if (jailFloor !== 'off' && hasHostSpawn && !selectJailBackend().isAvailable()) {
-      if (process.env.BRIDGE_JAIL_FALLBACK === 'warn') {
-        console.warn(
-          `[cli-bridge] WARNING: jail floor '${jailFloor}' set but no jail backend can run here; ` +
-          'requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).',
-        )
-      } else {
-        console.error(
-          `[cli-bridge] FATAL: jail floor '${jailFloor}' set but no jail backend can run on this ` +
-          'host — every host request would fail closed. Enable unprivileged user namespaces (Linux: ' +
-          '`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` or `sudo chmod u+s /usr/bin/bwrap`), ' +
-          'ensure sandbox-exec exists (macOS), set BRIDGE_JAIL_FALLBACK=warn, or unset the jail floor.',
-        )
-        process.exit(1)
-      }
+    for (const executor of Object.values(config.executors)) {
+      if (executor.kind === 'docker') console.log(`[cli-bridge] ${executor.name} executor: docker pool size=${executor.poolSize} image=${executor.image}`)
     }
-    for (const cfg of Object.values(config.executors)) {
-      if (cfg.kind === 'docker') {
-        console.log(`[cli-bridge] ${cfg.name} executor: docker pool size=${cfg.poolSize} image=${cfg.image}`)
-      }
-    }
-  })
-  // Node's http server defaults requestTimeout=300_000 (5 min). Long
-  // audit runs that stream tool_use deltas for 10–30 min get severed
-  // mid-flight by that ceiling; without this bump every long run dies
-  // at 300_700ms and the caller sees a truncated SSE stream with no
-  // final stop event. 0 = no transport ceiling. The durable run's
-  // execution.timeoutMs (or an explicit operator fallback) owns the process deadline.
-  ;(server as { requestTimeout?: number }).requestTimeout = 0
-  ;(server as { headersTimeout?: number }).headersTimeout = 0
-
-  const shutdown = async (sig: string) => {
-    console.log(`[cli-bridge] ${sig} — shutting down`)
-    for (const hook of extras.shutdownHooks) {
-      try { await hook() } catch {}
-    }
-    server.close(() => {
-      sessions.close()
-      instanceLock?.release()
-      dataDirectoryLock?.release()
-      instanceLock = undefined
-      dataDirectoryLock = undefined
-      process.exit(0)
-    })
-    setTimeout(() => process.exit(1), 5000).unref()
   }
-  process.on('SIGTERM', () => shutdown('SIGTERM'))
-  process.on('SIGINT', () => shutdown('SIGINT'))
-
-  // ─── Anti-fragile error handlers ──────────────────────────────────
-  // The bridge spawns long-running CLI subprocesses (claude-code,
-  // kimi-code, opencode) and pipes their stdout/stderr through async
-  // generators. A single unhandled promise rejection ANYWHERE in that
-  // tree — a stream error mid-spawn, a backend throwing during a
-  // request, an MCP stdio pipe glitch — would crash the whole bridge
-  // under Node's default `--unhandled-rejections=throw`.
-  // That killed in-flight requests + every other concurrent caller.
-  //
-  // The bridge is the local agentic sandbox for every harness on this
-  // host (physim, codebench-matrix, blueprint-agent, manual curl). One
-  // misbehaving caller should not take it down. Convert these into
-  // structured log entries so we know they happened, but keep serving.
-  //
-  // Honest tradeoff: a true OOM or DB-corruption-on-startup will get
-  // logged-and-survived here instead of crashing loud. Watchdogs that
-  // pre-existed will not get the SIGCHLD they expect. Net: caller-level
-  // failures stay isolated; consumers see error responses on their own
-  // requests rather than every concurrent caller losing its connection.
-  process.on('unhandledRejection', (reason, promise) => {
-    const err = reason instanceof Error ? reason : new Error(String(reason))
-    console.error(`[cli-bridge] unhandledRejection — keeping process alive`, {
-      message: err.message,
-      stack: err.stack?.split('\n').slice(0, 6).join('\n'),
-      promise: String(promise).slice(0, 120),
-    })
-  })
-  process.on('uncaughtException', (err) => {
-    if (isFatalServerStartupError(err)) {
-      console.error(`[cli-bridge] fatal server error — exiting`, {
-        message: err.message,
-        name: err.name,
-        code: (err as NodeJS.ErrnoException).code,
-      })
-      process.exit(1)
-    }
-    console.error(`[cli-bridge] uncaughtException — keeping process alive`, {
-      message: err.message,
-      name: err.name,
-      stack: err.stack?.split('\n').slice(0, 8).join('\n'),
-    })
-  })
+  return { url, close }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  await startServer()
-}
+if (import.meta.url === `file://${process.argv[1]}`) await startServer()
 
 function isFatalServerStartupError(err: Error): boolean {
-  // A second instance racing for the same port is fatal — exit cleanly so
-  // the operator sees the clear message rather than a survived exception.
   if (err instanceof InstanceLockError) return true
   const code = (err as NodeJS.ErrnoException).code
-  if (code === 'EADDRINUSE' || code === 'EACCES') return true
-  return /listen|address already in use|already running on port/i.test(err.message)
+  return code === 'EADDRINUSE' || code === 'EACCES' || /listen|address already in use|already running on port/i.test(err.message)
 }

@@ -20,6 +20,17 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 
 Personal productivity tool. Single-user by default. Loopback-only by default. No ambition to be a shared proxy.
 
+Install a reviewed source revision with `npm install https://github.com/drewstone/cli-bridge/archive/<commit>.tar.gz`;
+the npm registry package named `cli-bridge` belongs to another project. The artifact
+includes the existing TypeScript server and its runtime loader, so it needs no
+repository build or development dependencies. `cli-bridge` starts the normal server.
+
+Applications may import `{ loadConfig, startServer }` from `cli-bridge` and call
+`await startServer({ config: { ...loadConfig(env), port: 0 }, handleSignals: false, quiet: true })`.
+The returned `{ url, close }` is ready to serve; `await close()` stops only that
+server and its owned work. Embedded mode leaves process signals and error handlers
+with the caller. Use a private data directory and a generated bearer in `env`.
+
 ---
 
 ## The idea in two sentences

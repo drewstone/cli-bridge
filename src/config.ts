@@ -246,6 +246,24 @@ export function anyBackendSpawnsOnHost(
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
 
+/** Shared listener safety for environment and embedded callers; only embedding permits port 0. */
+export function assertListenerConfig(
+  { host, port, bearer }: Pick<Config, 'host' | 'port' | 'bearer'>,
+  ephemeral = false,
+): void {
+  if (!Number.isSafeInteger(port) || port < (ephemeral ? 0 : 1) || port > 65535) {
+    throw new Error(`invalid BRIDGE_PORT: ${port}`)
+  }
+  if (!LOOPBACK.has(host) && !bearer?.trim()) {
+    throw new Error(
+      `BRIDGE_HOST is ${host} (not loopback) but BRIDGE_BEARER is not set. ` +
+        'Refusing to start — an open proxy to your subscription keys is the ' +
+        'one thing this tool must not accidentally do. Generate a bearer with ' +
+        '`openssl rand -hex 32`, set BRIDGE_BEARER, and retry.',
+    )
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const host = env.BRIDGE_HOST ?? '127.0.0.1'
   // 3344 chosen to dodge common dev/services collisions: 8787 was hit
@@ -261,18 +279,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .filter(Boolean),
   )
 
-  if (Number.isNaN(port) || port < 1 || port > 65535) {
-    throw new Error(`invalid BRIDGE_PORT: ${env.BRIDGE_PORT}`)
-  }
-
-  if (!LOOPBACK.has(host) && !bearer) {
-    throw new Error(
-      `BRIDGE_HOST is ${host} (not loopback) but BRIDGE_BEARER is not set. ` +
-        `Refusing to start — an open proxy to your subscription keys is the ` +
-        `one thing this tool must not accidentally do. Generate a bearer with ` +
-        `\`openssl rand -hex 32\`, set BRIDGE_BEARER, and retry.`,
-    )
-  }
+  assertListenerConfig({ host, port, bearer })
 
   // A caller may own the process deadline through `execution.timeoutMs`.
   // Operator values are fallbacks only when the request omits that field; no

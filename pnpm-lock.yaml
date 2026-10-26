@@ -187,6 +187,9 @@ importers:
       hono:
         specifier: ^4.13.14
         version: 4.13.14
+      tsx:
+        specifier: ^4.23.15
+        version: 4.23.15
       zod:
         specifier: 4.6.7
         version: 4.6.7
@@ -200,9 +203,6 @@ importers:
       '@types/node':
         specifier: ^26.6.5
         version: 26.6.5
-      tsx:
-        specifier: ^4.23.15
-        version: 4.23.15
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
