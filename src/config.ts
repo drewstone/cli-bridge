@@ -541,8 +541,8 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 
 function parseNonNegativeInt(value: string | undefined, fallback: number): number {
   if (value === undefined || value === '') return fallback
-  const parsed = Number.parseInt(value, 10)
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  const parsed = /^(0|[1-9][0-9]*)$/u.test(value) ? Number(value) : NaN
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
     throw new Error(`invalid non-negative integer: ${value}`)
   }
   return parsed

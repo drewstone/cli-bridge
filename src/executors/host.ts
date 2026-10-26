@@ -179,8 +179,8 @@ export { saturated as executorSaturatedError }
 function readEnvInt(name: string, fallback: number, allowZero = false): number {
   const raw = process.env[name]
   if (!raw) return fallback
-  const n = parseInt(raw, 10)
-  return Number.isFinite(n) && (n > 0 || (allowZero && n === 0)) ? n : fallback
+  const n = /^(0|[1-9][0-9]*)$/u.test(raw) ? Number(raw) : NaN
+  return Number.isSafeInteger(n) && (n > 0 || (allowZero && n === 0)) ? n : fallback
 }
 
 const hostSemaphore = new HostSemaphore(
