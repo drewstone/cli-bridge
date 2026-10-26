@@ -254,10 +254,6 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
 
   candidates.push(join(home, '.cache'))
 
-  for (const p of (process.env.BRIDGE_JAIL_RO_PATHS ?? '').split(delimiter)) {
-    if (p.trim()) candidates.push(resolve(p.trim()))
-  }
-
   const base = resolve(projectDir)
   const seen = new Set<string>()
   const out: string[] = []

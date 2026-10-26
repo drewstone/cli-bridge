@@ -113,6 +113,7 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   return {
     root,
     projectDir,
+    fallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     ...(mode === 'fs-jail' ? { readConfine: true } : {}),
     ...(readable.length ? { extraReadablePaths: readable } : {}),
     ...(writable.length ? { extraWritablePaths: writable } : {}),

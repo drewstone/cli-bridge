@@ -34,12 +34,14 @@ export interface JailSpec {
    * empty tmpfs at `/tmp`, and the workspace (`projectDir`) read-WRITE. A
    * jailed CLI then cannot read the host repo (benchmark task definitions /
    * grader answer keys) or sibling run scratch trees under `/tmp` — only the
-   * paths its runtimes legitimately need. Linux-only: the macOS seatbelt and
-   * noop backends confine writes only and ignore this flag.
+   * paths its runtimes legitimately need. macOS applies the same read
+   * allowlist through seatbelt. Unsupported hosts refuse confinement.
    */
   readConfine?: boolean
   /** Refuse the operator's unconfined warn fallback for this request. */
   requireEnforcement?: boolean
+  /** Captured operator fallback; absent means refuse unconfined execution. */
+  fallback?: 'deny' | 'warn'
   /** Host auth/config sources made available inside the jail so a confined run
    * still authenticates as the operator. Each source explicitly declares
    * whether Linux may read-only bind it or must make an ephemeral writable

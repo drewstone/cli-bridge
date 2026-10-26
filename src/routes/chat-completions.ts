@@ -381,6 +381,8 @@ export function mountChatCompletions(
   app: Hono,
   deps: {
     registry: BackendRegistry
+    /** Captured operator jail defaults; standalone mounts retain process defaults. */
+    jailEnv?: NodeJS.ProcessEnv
     sessions: SessionStore
     durableWriter?: Pick<DurableRunWriter, 'commit'>
     retainedRuns?: Pick<SessionStore, 'getRetainedRun' | 'claimRetainedRun' | 'updateRetainedRun' | 'appendRetainedDelta' | 'retainedEventsAfterRun'>
@@ -1020,17 +1022,12 @@ export function mountChatCompletions(
           req,
         )
       } else {
-        // Host execution: resolve the write-jail spec from execution.jail
-        // (host variant) layered over the BRIDGE_JAIL_* env defaults, using
-        // the same cwd the backend will spawn in (req.cwd already folds in
-        // session.cwd above; backends fall back to process.cwd()). The
-        // resolved spec rides on req.jailSpec down to the spawn seam; null
-        // means no jail and the spawn is unchanged.
+        // Resolve request confinement against this Bridge's captured operator floor.
         req.jailSpec = resolveJailSpec({
           execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
           execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
           cwd: req.cwd ?? process.cwd(),
-          env: process.env,
+          env: deps.jailEnv ?? process.env,
         })
         // Preserve this backend's host credentials inside the jail so the
         // confined CLI still authenticates as the operator.

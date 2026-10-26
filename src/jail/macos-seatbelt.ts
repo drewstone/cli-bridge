@@ -1,10 +1,10 @@
 /**
- * macOS write-jail via sandbox-exec (SBPL).
+ * macOS filesystem jail via sandbox-exec (SBPL).
  *
  * Modeled on holtwick/bx-mac. The profile starts permissive — reads,
  * exec, and network are allowed — then denies ALL file writes and
- * re-allows them only under the jail root (HOME), the system temp dirs,
- * and any caller-supplied writable paths. SBPL is last-match-wins, so the
+ * re-allows them only under the jail root (HOME) and explicit writable paths.
+ * An fs-jail also denies reads outside system, toolchain, workspace and auth paths. SBPL is last-match-wins, so the
  * narrow `allow` rules after the broad `deny` carve out the writable set.
  *
  * Symlinks: macOS routes /tmp and /var through /private, so subpath rules
@@ -29,6 +29,7 @@ import {
 } from './auth-preserve.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
+import { toolchainReadPaths } from './linux-bwrap.js'
 
 const SANDBOX_EXEC_BIN = 'sandbox-exec'
 // Device nodes a normal process writes to (output redirection, RNG, tracing,
@@ -120,7 +121,12 @@ export class MacosSeatbeltJail implements JailBackend {
         authEnv[envVar] = resolveJailRoot(jailRel, root)
       }
 
-      const profile = buildProfile(writable, fixedPaths)
+      const readable = spec.readConfine ? await Promise.all([
+        '/System', '/usr', '/bin', '/sbin', '/private/etc', '/private/var/db/dyld', '/dev',
+        spec.projectDir, ...writable, ...toolchainReadPaths(bin, spec.projectDir),
+        ...(spec.extraReadablePaths ?? []), ...fixedPaths,
+      ].map((path) => realpath(path).catch(() => path))) : undefined
+      const profile = buildProfile(writable, fixedPaths, readable)
       const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
       const profilePath = join(dir, 'profile.sb')
       await writeFile(profilePath, profile, { mode: 0o600 })
@@ -188,7 +194,7 @@ async function linkHostKeychains(root: string): Promise<string[]> {
   return [library, target]
 }
 
-function buildProfile(writable: string[], fixed: string[] = []): string {
+export function buildProfile(writable: string[], fixed: string[] = [], readable?: string[]): string {
   const allowSubpaths = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
   const allowDevices = DEVICE_WRITABLE.map((path) => `  (literal "${sbplEscape(path)}")`).join('\n')
   const denyFixed = fixed.length === 0 ? [] : [
@@ -202,6 +208,13 @@ function buildProfile(writable: string[], fixed: string[] = []): string {
   return [
     '(version 1)',
     '(allow default)',
+    ...(readable ? [
+      '(deny file-read*)',
+      '(allow file-read-metadata)',
+      '(allow file-read*',
+      ...[...new Set(readable)].map((path) => `  (subpath "${sbplEscape(path)}")`),
+      ')',
+    ] : []),
     '',
     '; Deny all writes, then re-allow only the jail root + explicit writable paths',
     '; (subpaths) and standard device nodes (literals). Shared temp trees stay',

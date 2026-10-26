@@ -196,20 +196,7 @@ describe('toolchainReadPaths', () => {
     }
   })
 
-  it('honors BRIDGE_JAIL_RO_PATHS but still rejects an ancestor of the workspace', () => {
-    const projectDir = '/tmp/run42/ws'
-    const prev = process.env.BRIDGE_JAIL_RO_PATHS
-    // One safe extra dir + one that is an ancestor of the workspace (must be dropped).
-    process.env.BRIDGE_JAIL_RO_PATHS = `/opt/custom-runtime:/tmp/run42`
-    try {
-      const paths = toolchainReadPaths('/bin/sh', projectDir)
-      expect(paths).toContain('/opt/custom-runtime')
-      expect(paths, 'an ancestor of the workspace must be refused').not.toContain('/tmp/run42')
-    } finally {
-      if (prev === undefined) delete process.env.BRIDGE_JAIL_RO_PATHS
-      else process.env.BRIDGE_JAIL_RO_PATHS = prev
-    }
-  })
+
 })
 
 describe('registerJailReadable', () => {
@@ -876,17 +863,7 @@ describe('applyJail fail-closed', () => {
       .rejects.toThrow(/write-jail requested/)
   })
 
-  it('runs unconfined (pass-through) only when BRIDGE_JAIL_FALLBACK=warn is set', async () => {
-    process.env.BRIDGE_JAIL_FALLBACK = 'warn'
-    try {
-      const r = await applyJail('/bin/sh', ['-c', 'x'], jailedOpts, unavailable)
-      expect(r.bin).toBe('/bin/sh')
-      expect(r.args).toEqual(['-c', 'x'])
-      expect(r.env).toEqual({ BASE: 'kept' })
-    } finally {
-      delete process.env.BRIDGE_JAIL_FALLBACK
-    }
-  })
+
 
   it('refuses an operator warn fallback when the request requires enforcement', async () => {
     process.env.BRIDGE_JAIL_FALLBACK = 'warn'
@@ -961,31 +938,7 @@ describe('applyJail fail-closed', () => {
     ])
   })
 
-  it('keeps ordinary path arguments when explicit warn fallback runs unconfined', async () => {
-    process.env.BRIDGE_JAIL_FALLBACK = 'warn'
-    try {
-      const opts = {
-        jail: {
-          root: '/proj/.agent-home',
-          projectDir: '/proj',
-          argumentRewrites: [{
-            from: '/host/pi-extension',
-            to: '/proj/.agent-home/pi-extension',
-            precededBy: '--extension',
-          }],
-        },
-      } as never
-      const result = await applyJail(
-        'pi',
-        ['--extension', '/host/pi-extension'],
-        opts,
-        unavailable,
-      )
-      expect(result.args).toEqual(['--extension', '/host/pi-extension'])
-    } finally {
-      delete process.env.BRIDGE_JAIL_FALLBACK
-    }
-  })
+
 
   it('is a pure pass-through when no jail is requested (never throws)', async () => {
     const r = await applyJail('mybin', ['--x'], {} as never, unavailable)
