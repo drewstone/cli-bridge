@@ -6,6 +6,7 @@ types/*
 !types/config.d.ts
 !types/server-options.d.ts
 !types/local-seats.d.ts
+!types/model-entry.d.ts
 coverage/
 *.log
 .DS_Store

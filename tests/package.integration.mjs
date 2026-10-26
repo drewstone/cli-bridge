@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -24,7 +24,11 @@ test('packed production install embeds isolated HTTP services and runs the exist
     }
     await rm(root, { recursive: true, force: true })
   })
-  const packed = JSON.parse((await command(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', root], repo)).stdout)[0]
+  const source = join(root, 'source')
+  await mkdir(source)
+  await command('git', ['archive', '--format=tar', '--output', join(root, 'source.tar'), 'HEAD'], repo)
+  await command('tar', ['-xf', join(root, 'source.tar'), '-C', source], repo)
+  const packed = JSON.parse((await command(npm, ['pack', '--ignore-scripts', '--json', '--pack-destination', root], source)).stdout)[0]
   await writeFile(join(root, 'package.json'), '{"private":true,"type":"module"}\n')
   await command(npm, ['install', '--omit=dev', '--no-audit', '--no-fund', '--package-lock=false', join(root, packed.filename)], root)
   const manifest = JSON.parse(await readFile(join(root, 'node_modules/cli-bridge/package.json'), 'utf8'))

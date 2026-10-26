@@ -1,12 +1,20 @@
 import { localHarnesses, type Config } from './config.js';
 export interface LocalSeat {
     harness: typeof localHarnesses[number][1];
+    provider: string | null;
     status: 'authenticated' | 'configured' | 'signed_out' | 'missing' | 'unknown';
     authMode: 'subscription' | 'api_key' | 'unknown';
     source: 'native_status' | 'native_store';
     fix?: string;
 }
 export interface LocalSeatOptions {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    model?: string;
+    flags?: readonly string[];
+    /** Resolve this native provider only; omitted retains aggregate harness inventory. */
+    provider?: string;
+    harnesses?: readonly LocalSeat['harness'][];
     config?: Config;
     timeoutMs?: number;
     signal?: AbortSignal;
