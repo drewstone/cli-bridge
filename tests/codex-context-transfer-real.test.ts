@@ -1,5 +1,5 @@
 /** Real pinned Codex and loopback model fixture; the test never reads account or native history files directly. */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -75,6 +75,8 @@ describe('real Codex native context consumer', () => {
     const workspace = join(directory, 'workspace')
     const fixtureHome = join(directory, 'home')
     mkdirSync(workspace, { mode: 0o700 })
+    const policy = 'Repository policy 0c91: preserve this file.\n'
+    writeFileSync(join(workspace, 'AGENTS.md'), policy, { mode: 0o600 })
     mkdirSync(fixtureHome, { mode: 0o700 })
     vi.stubEnv('HOME', fixtureHome)
     vi.stubEnv('CODEX_HOME', fixtureHome)
@@ -183,6 +185,8 @@ describe('real Codex native context consumer', () => {
       expect(JSON.stringify(modelRequests[0])).toContain('native context conformance assistant 284e')
       expect(JSON.stringify(modelRequests[0])).toContain('Native profile instruction 91ca')
       expect(JSON.stringify(modelRequests[0])).toContain('Materialized profile resource 18de')
+      expect(readFileSync(join(workspace, 'AGENTS.md'), 'utf8')).toBe(policy)
+      expect(statSync(join(workspace, 'AGENTS.md')).mode & 0o777).toBe(0o600)
       expect(store!.get(request.plan.destination.sessionId, 'codex')?.internalId).toBe(nativeId)
     } finally {
       await service?.shutdown(1_000)

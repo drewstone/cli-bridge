@@ -109,7 +109,7 @@ export class CodexBackend implements Backend {
     const req = codexTransferChatRequest(request)
     const effort = nativeReasoningControl('codex', resolveRequestedReasoningEffort(req, null))
     profileExecutionIdentity(req, null, 'codex', effort)
-    assertWorkspacePlanSupported(materializeProfile(profile, 'codex', { skip: ['mcp'] }))
+    assertWorkspacePlanSupported(materializeProfile(profile, 'codex', { skip: ['mcp'], binds: ['codex.developer-instructions'] }))
   }
 
   async prepareContextTransfer(
