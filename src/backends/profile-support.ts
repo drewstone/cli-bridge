@@ -36,6 +36,7 @@ import { ExecutorConfigurationError } from '../executors/types.js'
 import {
   applyWorkspacePlan,
   assertWorkspacePlanSupported,
+  codexDeveloperInstructionArgs,
   hashWorkspacePlan,
   type HarnessId,
   materializeProfile,
@@ -143,7 +144,7 @@ export function provisionProfileWorkspace(
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   let scoped: OpencodeProfileScope | undefined
   try {
-    const plan = materializeProfile(profile, harness, { skip: ['mcp'] })
+    const plan = materializeProfile(profile, harness, { skip: ['mcp'], binds: harness === 'codex' ? ['codex.developer-instructions'] : [] })
     // Bind generated --settings to this exact profile. A resumed session retains its already-applied plan.
     if (harness === 'claude-code' && sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest !== hashWorkspacePlan(plan)) {
       const settingsPath = '.tangle/claude-settings.json'
@@ -179,19 +180,15 @@ export function provisionProfileWorkspace(
       plan,
       { ...applied, written, workspacePlanDigest: planDigest },
     )
+    const flags = applied.flags.map((flag, index) => requirePublicPlanValue(flag, `launch flag ${index}`, harness))
+    if (harness === 'codex') flags.push(...codexDeveloperInstructionArgs(applied.appendSystemPrompt, flags))
     return {
+      ...applied,
       env: { ...requirePublicPlanEnv(applied.env, harness), ...(scoped?.env ?? {}) },
-      flags: applied.flags.map((flag, index) =>
-        requirePublicPlanValue(flag, `launch flag ${index}`, harness),
-      ),
+      flags,
       written,
-      unsupported: applied.unsupported,
       workspacePlanDigest: planDigest,
       receipt,
-      ...(applied.systemPrompt === undefined ? {} : { systemPrompt: applied.systemPrompt }),
-      ...(applied.appendSystemPrompt === undefined
-        ? {}
-        : { appendSystemPrompt: applied.appendSystemPrompt }),
       ...(scoped ? { cleanup: scoped.cleanup } : {}),
     }
   } catch (error) {
