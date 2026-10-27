@@ -519,7 +519,7 @@ describe('PiBackend', () => {
       expect(argValue(args, '--extension')).toBe(adapterDir)
       expect(args).toContain('--approve')
       expect(systemPrompt).toBe('SYSTEM_ONCE')
-      expect(argValue(args, '--thinking')).toBe('xhigh')
+      expect(argValue(args, '--thinking')).toBe('max')
       expect(profile.model?.reasoningEffort).toBe('ultracode')
       expect(args.at(-1)).toBe('TASK_UNCHANGED')
       expect(args.at(-1)).not.toContain('SYSTEM_ONCE')
@@ -544,7 +544,7 @@ describe('PiBackend', () => {
         harness: 'pi',
         provider: 'tangle-router',
         model: 'pi/tangle-router/glm-5.2',
-        reasoningEffort: { requested: 'ultracode', applied: 'xhigh' },
+        reasoningEffort: { requested: 'ultracode', applied: 'max' },
         inference: {
           effectiveEndpoint: 'http://127.0.0.1:9/v1',
           apiMode: 'openai-completions',

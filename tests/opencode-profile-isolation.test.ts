@@ -215,8 +215,10 @@ describe('opencode profiles in a shared task workspace', () => {
     const cwd = workspace('oversize')
     try {
       const bash: Record<string, string> = { '*': 'deny' }
-      for (let index = 0; index < 400; index += 1) {
-        bash[`git log --oneline --since=window-${index} -- packages/probe-${index}/**`] = 'allow'
+      // Stay inside the contract's map bound (256 entries) and grow the config
+      // past the host env limit through key length instead.
+      for (let index = 0; index < 200; index += 1) {
+        bash[`git log --oneline --since=window-${index} -- packages/probe-${index}/**/${'x'.repeat(64)}`] = 'allow'
       }
       const big = request('big', 'BIG-MARKER', { bash: true }, cwd, { permissions: { bash } })
       // The refusal is raised where the value is built, before any executor is
