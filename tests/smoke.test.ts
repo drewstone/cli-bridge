@@ -27,7 +27,6 @@ import { profileExecutionIdentity } from '../src/backends/profile-support.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { mountSessions } from '../src/routes/sessions.js'
 import { mountHealth } from '../src/routes/health.js'
-import { mountModels } from '../src/routes/models.js'
 import { contentToText } from '../src/backends/content.js'
 import { AdmissionGate } from '../src/admission.js'
 
@@ -1368,76 +1367,6 @@ describe('GET /health', () => {
     const body = await res.json() as { backends: Array<{ name: string; state: string; detail?: string }> }
     expect(body.backends[0]!.state).toBe('error')
     expect(body.backends[0]!.detail).toContain('binary not found')
-  })
-})
-
-describe('GET /v1/models', () => {
-  it('lists models for ready backends only', async () => {
-    const app = new Hono()
-    const registry = new BackendRegistry().register(new FakeBackend('claude-code'))
-    mountModels(app, { registry })
-    const res = await app.request('/v1/models')
-    expect(res.status).toBe(200)
-    const body = await res.json() as { data: Array<{ id: string; backend: string }> }
-    expect(body.data.length).toBeGreaterThan(0)
-    expect(body.data.some((m) => m.backend === 'claude-code')).toBe(true)
-  })
-
-  it('advertises the benchmark matrix models for ready codex and opencode backends', async () => {
-    const app = new Hono()
-    const registry = new BackendRegistry()
-      .register(new FakeBackend('codex'))
-      .register(new FakeBackend('opencode'))
-    // opencode/pi catalogs are discovered live from the CLI; point the bin at a
-    // missing binary so discovery deterministically falls back to the curated
-    // seed. This asserts the fallback contract (never empty, curated set,
-    // provider filtering); live discovery is environment-dependent and covered
-    // by lib/model-discovery's own tests.
-    mountModels(app, { registry, opencodeBin: '/nonexistent/opencode' })
-    const res = await app.request('/v1/models')
-    expect(res.status).toBe(200)
-    const body = await res.json() as { data: Array<{ id: string; backend: string }> }
-    const ids = new Set(body.data.map((m) => m.id))
-    expect(ids.has('codex/gpt-5.4')).toBe(true)
-    expect(ids.has('codex/gpt-5.5')).toBe(true)
-    expect(ids.has('opencode/zai-coding-plan/glm-5.3')).toBe(true)
-    expect(ids.has('opencode/zai-coding-plan/glm-5-turbo')).toBe(true)
-    expect(ids.has('opencode/deepseek/deepseek-v4-pro')).toBe(true)
-    expect(ids.has('opencode/deepseek/deepseek-flash')).toBe(true)
-    expect(ids.has('opencode/kimi-for-coding/k3')).toBe(true)
-    expect(ids.has('opencode/tangle-router/deepseek/deepseek-v4.1-flash')).toBe(true)
-    // Retired provider IDs must not be advertised as routable lanes.
-    expect(ids.has('opencode/kimi-for-coding/k2p7')).toBe(false)
-    expect(ids.has('opencode/deepseek/deepseek-v4-flash')).toBe(false)
-    expect(ids.has('opencode/zai/glm-5.1')).toBe(false)
-    expect(ids.has('opencode/anthropic/claude-sonnet-4-5')).toBe(false)
-  })
-
-  it('keeps the current Pi model family when live discovery is unavailable', async () => {
-    const app = new Hono()
-    const registry = new BackendRegistry().register(new FakeBackend('pi'))
-    mountModels(app, { registry, piBin: '/nonexistent/pi' })
-
-    const res = await app.request('/v1/models')
-    expect(res.status).toBe(200)
-    const body = await res.json() as { data: Array<{ id: string }> }
-    const ids = new Set(body.data.map((model) => model.id))
-
-    expect(ids.has('pi/openai-codex/gpt-5.6-luna')).toBe(true)
-    expect(ids.has('pi/openai-codex/gpt-5.6-sol')).toBe(true)
-    expect(ids.has('pi/openai-codex/gpt-5.6-terra')).toBe(true)
-    expect(ids.has('pi/deepseek/deepseek-v4.1-flash')).toBe(true)
-    expect(ids.has('pi/openai-codex/gpt-5.3-codex')).toBe(false)
-  })
-
-  it('excludes models from unavailable backends', async () => {
-    const app = new Hono()
-    const registry = new BackendRegistry()
-    mountModels(app, { registry })
-    const res = await app.request('/v1/models')
-    expect(res.status).toBe(200)
-    const body = await res.json() as { data: Array<unknown> }
-    expect(body.data).toHaveLength(0)
   })
 })
 

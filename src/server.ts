@@ -14,18 +14,14 @@ import { serve } from '@hono/node-server'
 import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { BackendRegistry } from './backends/registry.js'
-import { ClaudeBackend } from './backends/claude.js'
+import { createLocalBackend } from './backends/local.js'
 import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
-import { OpencodeBackend } from './backends/opencode.js'
-import { KimiBackend } from './backends/kimi.js'
-import { GeminiBackend } from './backends/gemini.js'
 import { FactoryBackend } from './backends/factory.js'
 import { AmpBackend } from './backends/amp.js'
 import { ForgeBackend } from './backends/forge.js'
 import { AcpBackend } from './backends/acp.js'
 import { NanoclawBackend } from './backends/nanoclaw.js'
-import { PiBackend } from './backends/pi.js'
 import { PrimeBackend } from './backends/prime.js'
 import { PassthroughBackend } from './backends/passthrough.js'
 import { SandboxBackend } from './backends/sandbox.js'
@@ -366,14 +362,11 @@ export async function buildApp(config: Config, cwd = process.cwd()): Promise<{
   // Register order matters — first match wins. Harness-specific backends
   // come first so a `claude-code/sonnet` doesn't get claimed by a
   // passthrough that happens to know a provider-prefixed model id.
-  const nativeBackends = { claude: ClaudeBackend, codex: CodexBackend, opencode: OpencodeBackend,
-    kimi: KimiBackend, gemini: GeminiBackend, pi: PiBackend }
   for (const [name, harness] of localHarnesses) {
     if (!config.backends.has(name)) continue
     const bin = config[`${name}Bin`]
-    const Backend = nativeBackends[name]
     const spawner = await buildExecutorForBackend(config.executors[name], harness, extras, bin, config)
-    registry.register(new Backend({ bin, harness, timeoutMs: config[`${name}TimeoutMs`],
+    registry.register(createLocalBackend(config, name, {
       stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}), ...(spawner ? { spawner } : {}) }))
   }
   if (config.backends.has('claudish')) {
@@ -454,7 +447,7 @@ export async function buildApp(config: Config, cwd = process.cwd()): Promise<{
   }
 
   mountHealth(app, { registry, admission, runs })
-  mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin, describe: nativeCatalog.describe })
+  mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin, cwd, describe: nativeCatalog.describe })
   mountSessions(app, { sessions, retained })
   mountRetainedSessions(app, retained, { includeSessionList: false, includeRunEvents: false })
   mountRuns(app, { runs, retainedRuns: retained, retainedStore: sessions })
@@ -532,6 +525,7 @@ export async function buildApp(config: Config, cwd = process.cwd()): Promise<{
 export type { BridgeServer, StartServerOptions } from './server-options.js'
 export { loadConfig }
 export { detectLocalSeats } from './local-seats.js'
+export { listLocalModels } from './local-models.js'
 
 class UnconfirmedBridgeCleanup extends AggregateError {}
 

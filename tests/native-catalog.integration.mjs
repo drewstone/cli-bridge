@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import test from 'node:test'
 import { tsImport } from 'tsx/esm/api'
 
-const { loadConfig, startServer, detectLocalSeats } = await tsImport('../src/server.ts', import.meta.url)
+const { loadConfig, startServer, detectLocalSeats, listLocalModels } = await tsImport('../src/server.ts', import.meta.url)
 const { createNativeCatalog } = await tsImport('../src/native-catalog.ts', import.meta.url)
 const nativeCodex = resolve('node_modules/.bin/codex')
 const execute = promisify(execFile)
@@ -74,12 +74,61 @@ test('real native catalog and HTTP/SSE admission refuse API, signed-out and chan
     await writeFile(configFile, 'model_provider="openai"\nmodel="native-config-canary"\ncli_auth_credentials_store="file"\n')
     const attempted = join(root, 'inference-attempted')
     const wrapper = join(root, 'codex-readonly')
-    await writeFile(wrapper, `#!/bin/sh\ncase "$1" in\napp-server|--version|login) exec '${nativeCodex.replaceAll("'", "'\\''")}' "$@" ;;\n*) printf attempted > '${attempted}'; exit 125 ;;\nesac\n`, { mode: 0o700 })
-    const config = { ...loadConfig({ BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'codex,pi', CODEX_BIN: wrapper,
+    const methods = join(root, 'metadata-methods'), hold = join(root, 'hold-metadata'), blocked = join(root, 'metadata-blocked')
+    await writeFile(wrapper, `#!${process.execPath}
+const { spawn } = require('node:child_process');
+const { appendFileSync, writeFileSync, existsSync } = require('node:fs');
+const args = process.argv.slice(2);
+const metadata = args[0] === 'app-server';
+if (!metadata && args[0] !== '--version' && !(args[0] === 'login' && args[1] === 'status')) {
+  writeFileSync(${JSON.stringify(attempted)}, 'attempted'); process.exit(125);
+}
+const child = spawn(${JSON.stringify(nativeCodex)}, args, { stdio: [metadata ? 'pipe' : 'inherit', 'inherit', 'inherit'] });
+if (metadata) {
+  const allowed = new Set(['initialize', 'initialized', 'config/read', 'account/read', 'model/list']);
+  const lines = require('node:readline').createInterface({ input: process.stdin });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.method) {
+      appendFileSync(${JSON.stringify(methods)}, message.method + String.fromCharCode(10));
+      if (!allowed.has(message.method) || message.method === 'account/read' && message.params?.refreshToken !== false) {
+        writeFileSync(${JSON.stringify(attempted)}, message.method); child.kill('SIGKILL'); process.exit(125);
+      }
+    }
+    if (message.method === 'config/read' && existsSync(${JSON.stringify(hold)})) {
+      writeFileSync(${JSON.stringify(blocked)}, 'waiting for cancellation'); return;
+    }
+    child.stdin.write(line + String.fromCharCode(10));
+  });
+  lines.on('close', () => child.stdin.end());
+}
+child.on('error', () => process.exit(126));
+child.on('close', code => process.exit(code ?? 0));
+`, { mode: 0o700 })
+    const config = { ...loadConfig({ BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'codex,pi,passthrough', CODEX_BIN: wrapper, OPENAI_API_KEY: 'public-catalog-only-canary',
       BRIDGE_BEARER: 'native-catalog-public-test-bearer', BRIDGE_TRACE: 'off', BRIDGE_SUBSCRIPTIONS_ONLY: '1' }), port: 0 }
-    server = await startServer({ config, quiet: true, handleSignals: false })
+    const unused = join(root, 'catalog-only-state')
+    const local = (signal) => listLocalModels({ config: { ...config, jailMode: 'fs-jail', dataDir: unused }, cwd: workspace, signal })
+    const initialLocal = await local()
+    await assert.rejects(access(unused), { code: 'ENOENT' })
+    const aborted = AbortSignal.abort()
+    await assert.rejects(listLocalModels({ config, cwd: workspace, signal: aborted }), { name: 'AbortError' })
+    await writeFile(hold, 'hold only this native metadata RPC')
+    const controller = new AbortController()
+    const stopping = local(controller.signal).then(value => ({ value }), error => ({ error }))
+    await until(() => access(blocked).then(() => true, () => false), 'real native metadata request did not reach its cancellation boundary')
+    controller.abort()
+    assert.equal((await stopping).error?.name, 'AbortError', 'metadata cancellation must not become an empty or unknown catalog')
+    if (process.platform === 'linux') await until(async () => (await fixtureProcesses(wrapper)).length === 0, 'native metadata proxy survived cancellation')
+    await rm(hold)
+    await assert.rejects(access(unused), { code: 'ENOENT' })
+    server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false })
     const headers = { authorization: 'Bearer native-catalog-public-test-bearer', 'content-type': 'application/json' }
     const catalog = await fetch(`${server.url}/v1/models`, { headers }).then((response) => response.json())
+    assert.deepEqual(initialLocal, catalog.data.filter((row) => row.backend !== 'passthrough'), 'serverless and HTTP use identical ordered native model facts')
+    const nonNative = catalog.data.filter((row) => row.backend === 'passthrough')
+    assert.ok(nonNative.length > 0, 'non-native HTTP model routes remain advertised')
+    assert.ok(nonNative.every((row) => row.provider && row.authentication.status === 'unknown' && row.authentication.authMode === 'unknown'), 'non-native rows retain their provider and honest unknown authentication')
     const configured = catalog.data.find((entry) => entry.id === 'codex/native-config-canary')
     assert.equal(configured.provider, 'openai')
     assert.equal(configured.default, true)
@@ -106,6 +155,8 @@ test('real native catalog and HTTP/SSE admission refuse API, signed-out and chan
     delete process.env.CODEX_API_KEY
     await writeFile(configFile, 'model_provider="private-route"\nmodel="native-config-canary"\n[model_providers.private-route]\nname="Private route"\nbase_url="https://example.invalid/v1"\nwire_api="responses"\n')
     const changed = await fetch(`${server.url}/v1/models`, { headers }).then((response) => response.json())
+    assert.deepEqual(await local(), changed.data.filter((row) => row.backend !== 'passthrough'), 'fresh native configuration changes reach both catalog consumers')
+    await assert.rejects(access(unused), { code: 'ENOENT' })
     assert.equal(changed.data.find((entry) => entry.id === 'codex/native-config-canary').provider, 'private-route')
     await refusal(await request({ model: 'codex/default' }), 'subscription_unverified')
     await refusal(await request({ model: 'pi/openai-codex/native-config-canary' }, { 'x-cli-bridge-model-credential': 'public-override-canary', 'x-cli-bridge-model-base-url': 'https://example.invalid/v1' }), 'provider_unresolved')
@@ -115,6 +166,8 @@ test('real native catalog and HTTP/SSE admission refuse API, signed-out and chan
     assert.equal(replay.status, 200)
     const replayFrames = (await replay.text()).split('\n').filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]').map((line) => JSON.parse(line.slice(6)))
     assert.ok(replayFrames.some((frame) => frame.error?.type === 'subscription_required' && frame.error.cause === 'api_key_selected' && frame.error.status === 403))
+    const observedMethods = (await readFile(methods, 'utf8')).trim().split('\n')
+    assert.ok(observedMethods.includes('config/read') && observedMethods.includes('account/read'))
     await assert.rejects(readFile(attempted), { code: 'ENOENT' })
   } finally {
     await server?.close()
@@ -151,12 +204,14 @@ test('Claude listeners isolate their supplied workspaces and effective settings 
     assert.notEqual(server.url, sibling.url, 'both independently owned listeners must be live')
     const headers = { authorization: 'Bearer native-claude-public-test-bearer', 'content-type': 'application/json' }
     const secrets = ['public-user-api-canary', 'public-project-api-canary', 'public-local-bearer-canary', 'public-sibling-api-canary']
+    const catalogRows = new Map()
     const catalog = async (authMode, status, source, instance = server, model = 'haiku') => {
       const response = await fetch(`${instance.url}/v1/models`, { headers })
       assert.equal(response.status, 200)
       const wire = await response.text()
       for (const secret of secrets) assert.ok(!wire.includes(secret))
       const { data } = JSON.parse(wire)
+      catalogRows.set(instance, data)
       assert.deepEqual(data.filter((entry) => entry.default).map((entry) => entry.id), [`claude-code/${model}`], 'each listener resolves its own local model over project and excluded user defaults')
       const selected = data.find((entry) => entry.id === `claude-code/${model}`)
       assert.equal(selected.provider, 'anthropic', 'the excluded user endpoint must not poison discovery')
@@ -175,6 +230,11 @@ test('Claude listeners isolate their supplied workspaces and effective settings 
       assert.ok(error.fix.length > 0 && error.fix.length <= 256)
     }
     const [, siblingBefore] = await Promise.all([catalog('unknown', 'signed_out', 'native_status'), catalog('api_key', 'configured', 'native_store', sibling, 'opus')])
+    const metadataConfig = loadConfig({ BRIDGE_BACKENDS: 'claude', CLAUDE_BIN: wrapper, BRIDGE_DATA_DIR: join(root, 'unused-local-models') })
+    const localCatalogs = await Promise.all([workspace, siblingWorkspace].map((cwd) => listLocalModels({ config: metadataConfig, cwd })))
+    assert.deepEqual(localCatalogs[0], catalogRows.get(server), 'local model discovery retains the first workspace native provider and aliases')
+    assert.deepEqual(localCatalogs[1], catalogRows.get(sibling), 'local model discovery retains the sibling workspace effective settings')
+    await assert.rejects(access(metadataConfig.dataDir), { code: 'ENOENT' })
     await Promise.all([request().then((response) => refusal(response, 'not_authenticated')),
       request(sibling, siblingWorkspace, 'opus').then((response) => refusal(response, 'api_key_selected'))])
     await writeFile(join(project, 'settings.json'), JSON.stringify({ env: { ANTHROPIC_API_KEY: 'public-project-api-canary' } }))

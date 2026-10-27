@@ -7,7 +7,8 @@
  * skips that prefix.
  */
 
-import { Hono } from 'hono'
+import type { Hono } from 'hono'
+import { boundedProbe, resolveHealthProbeTimeoutMs } from '../backends/health.js'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { ProfileCatalog } from '../profiles/loader.js'
 import { discoverModels, parseOpencodeModels, parsePiModels, type ModelSpec } from '../lib/model-discovery.js'
@@ -69,42 +70,53 @@ const providersOf = (specs: readonly ModelSpec[]): string[] => [...new Set(specs
 const OPENCODE_PROVIDERS = providersOf(OPENCODE_MODELS)
 const PI_PROVIDERS = providersOf(PI_MODELS)
 
-export function mountModels(
-  app: Hono,
-  deps: { registry: BackendRegistry; catalog?: ProfileCatalog; opencodeBin?: string; piBin?: string;
-    describe?: (rows: readonly CatalogRow[]) => Promise<ModelEntry[]> },
-): void {
-  app.get('/v1/models', async (c) => {
-    const data: CatalogRow[] = []
-    const add = (backend: string, models: readonly ModelSpec[], prefix = `${backend}/`, providerSeparator?: '/' | '@'): void => {
-      for (const model of models) data.push({ id: prefix + model.id, object: 'model', backend,
-        provider: providerSeparator ? model.id.split(providerSeparator)[0]! : null,
-        ...(model.note ? { note: model.note } : {}) })
-    }
-    for (const backend of deps.registry.all()) {
-      if ((await backend.health()).state !== 'ready') continue
-      const name = backend.name
-      if (name === 'opencode' || name === 'pi') {
-        const isPi = name === 'pi'
-        add(name, await discoverModels(name, {
-          bin: (isPi ? deps.piBin : deps.opencodeBin) ?? name,
-          args: isPi ? ['--offline', '--list-models'] : ['models'],
-          providers: isPi ? PI_PROVIDERS : OPENCODE_PROVIDERS,
-          parse: isPi ? parsePiModels : parseOpencodeModels,
-          fallback: isPi ? PI_MODELS : OPENCODE_MODELS,
-        }), undefined, '/')
-      } else if (name === 'passthrough') {
-        add(name, ['openai/gpt-4o', 'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'moonshot/kimi-k2-0905-preview', 'zai/glm-4.6']
-          .map((id) => ({ id, note: 'forwards to vendor API — requires key' })), '', '/')
-      } else if (name === 'sandbox') {
-        add(name, (deps.catalog?.list() ?? []).map((entry) => ({ id: entry.id,
-          note: entry.profile.description ?? 'sandbox AgentProfile' })))
-        data.push({ id: 'sandbox', object: 'model', backend: name, provider: null,
-          note: 'inline profile mode — pass full AgentProfile in body field `agent_profile`' })
-      } else add(name, ALIASES[name] ?? [], undefined, name === 'forge' ? '/' : name === 'claudish' ? '@' : undefined)
-    }
-    const described = deps.describe ? await deps.describe(data) : data.map((row): ModelEntry => ({ ...row,
-      authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status' } }))
-    return c.json({ object: 'list', data: described })
-  })
+interface ModelCatalogDependencies {
+  registry: BackendRegistry
+  catalog?: ProfileCatalog
+  opencodeBin?: string
+  piBin?: string
+  cwd?: string
+  describe: (rows: readonly CatalogRow[], signal?: AbortSignal) => Promise<ModelEntry[]>
+}
+
+/** The HTTP and local consumers use identical route collection and native facts. */
+export async function collectModels(deps: ModelCatalogDependencies, signal?: AbortSignal): Promise<ModelEntry[]> {
+    signal?.throwIfAborted()
+  const data: CatalogRow[] = []
+  const add = (backend: string, models: readonly ModelSpec[], prefix = `${backend}/`, providerSeparator?: '/' | '@'): void => {
+    for (const model of models) data.push({ id: prefix + model.id, object: 'model', backend,
+      provider: providerSeparator ? model.id.split(providerSeparator)[0]! : null,
+      ...(model.note ? { note: model.note } : {}) })
+  }
+  for (const backend of deps.registry.all()) {
+    const health = await boundedProbe(backend, resolveHealthProbeTimeoutMs(), signal)
+    signal?.throwIfAborted()
+    if (health.state !== 'ready') continue
+    const name = backend.name
+    if (name === 'opencode' || name === 'pi') {
+      const isPi = name === 'pi'
+      add(name, await discoverModels(name, {
+        bin: (isPi ? deps.piBin : deps.opencodeBin) ?? name,
+        args: isPi ? ['--offline', '--list-models'] : ['models'],
+        providers: isPi ? PI_PROVIDERS : OPENCODE_PROVIDERS,
+        parse: isPi ? parsePiModels : parseOpencodeModels,
+        fallback: isPi ? PI_MODELS : OPENCODE_MODELS,
+      }, { cwd: deps.cwd, signal }), undefined, '/')
+    } else if (name === 'passthrough') {
+      add(name, ['openai/gpt-4o', 'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'moonshot/kimi-k2-0905-preview', 'zai/glm-4.6']
+        .map((id) => ({ id, note: 'forwards to vendor API — requires key' })), '', '/')
+    } else if (name === 'sandbox') {
+      add(name, (deps.catalog?.list() ?? []).map((entry) => ({ id: entry.id,
+        note: entry.profile.description ?? 'sandbox AgentProfile' })))
+      data.push({ id: 'sandbox', object: 'model', backend: name, provider: null,
+        note: 'inline profile mode — pass full AgentProfile in body field `agent_profile`' })
+    } else add(name, ALIASES[name] ?? [], undefined, name === 'forge' ? '/' : name === 'claudish' ? '@' : undefined)
+  }
+  const described = await deps.describe(data, signal)
+  signal?.throwIfAborted()
+  return described
+}
+
+export function mountModels(app: Hono, deps: ModelCatalogDependencies): void {
+  app.get('/v1/models', async (c) => c.json({ object: 'list', data: await collectModels(deps, c.req.raw.signal) }))
 }

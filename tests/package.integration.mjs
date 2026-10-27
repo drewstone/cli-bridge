@@ -35,12 +35,15 @@ test('packed production install embeds isolated HTTP services and runs the exist
   assert.ok(manifest.dependencies.tsx, 'the existing loader must be installed in production')
   assert.equal(manifest.devDependencies?.tsx, undefined)
   await writeFile(join(root, 'consumer.mts'), `
-    import { loadConfig, startServer, detectLocalSeats, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
+    import { loadConfig, startServer, detectLocalSeats, listLocalModels, type LocalModelOptions, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
     const run = async (): Promise<BridgeServer> => startServer({ config, cwd: process.cwd(), handleSignals: false, quiet: true });
     void run;
     const seats: Promise<LocalSeat[]> = detectLocalSeats({ config });
     void seats;
+    const options: LocalModelOptions = { config, cwd: process.cwd() };
+    const catalog: Promise<ModelEntry[]> = listLocalModels(options);
+    void catalog;
     const model: ModelEntry = { id: 'codex/native', object: 'model', backend: 'codex', provider: 'openai', authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status' } };
     void model;
   `)
@@ -54,7 +57,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
     import { createServer } from 'node:net';
     import { once } from 'node:events';
     import { join } from 'node:path';
-    import { loadConfig, startServer, detectLocalSeats } from 'cli-bridge';
+    import { loadConfig, startServer, detectLocalSeats, listLocalModels } from 'cli-bridge';
     const bearer = randomBytes(32).toString('hex');
     const events = ['SIGINT', 'SIGTERM', 'exit', 'uncaughtException', 'unhandledRejection'];
     const before = events.map((event) => process.listeners(event));
@@ -70,6 +73,10 @@ test('packed production install embeds isolated HTTP services and runs the exist
     assert.equal(missing.length, 6);
     assert.ok(missing.every((seat) => seat.status === 'missing' && seat.authMode === 'unknown'));
     assert.equal(existsSync(directory), false);
+    const localModels = await listLocalModels({ config: { ...missingConfig, backends: new Set(['claude', 'codex', 'opencode', 'kimi', 'gemini', 'pi']) } });
+    assert.deepEqual(localModels, []);
+    assert.equal(existsSync(directory), false);
+    await assert.rejects(listLocalModels({ config: missingConfig, signal: AbortSignal.abort() }), { name: 'AbortError' });
     const nativeCodexHome = join(process.cwd(), 'codex-login-check');
     mkdirSync(nativeCodexHome, { mode: 0o700 });
     process.env.CODEX_HOME = nativeCodexHome;

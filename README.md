@@ -89,6 +89,11 @@ bridge/gemini/gemini-2.5-pro
 
 The router's short-circuit strips the leading `bridge/` and forwards the `<harness>/<model>` as-is.
 
+For native model discovery without starting an HTTP listener or creating execution state, import
+`listLocalModels({ config, cwd, signal })` from the package root. Its options are optional. It returns the same ordered native model
+entries and authentication facts as `/v1/models`. It reads local metadata only and rejects on cancellation;
+it does not validate an execution jail or start a model turn.
+
 ## Local checks
 
 Local Beelink gate (set `TOUCHED_INTEGRATION_TEST` to the affected integration test file; the gate installs from the frozen pnpm lockfile): `beelink-gate auto https://github.com/drewstone/cli-bridge.git "$(git rev-parse HEAD)" -- sh -c 'pnpm typecheck && pnpm exec vitest run "$1"' _ "${TOUCHED_INTEGRATION_TEST:?set touched integration test path}"`. Live inference still runs locally through `pnpm test:local-inference` with its explicit model and filesystem-jail prerequisites.
