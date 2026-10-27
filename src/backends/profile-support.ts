@@ -572,7 +572,6 @@ function retainProfileMaterializationReceipt(
     ...(inference ? { inference } : {}),
   }
   req.profile_materialization_receipt = receipt
-  console.info(`[cli-bridge] profile materialization receipt ${JSON.stringify(receipt)}`)
   return receipt
 }
 
