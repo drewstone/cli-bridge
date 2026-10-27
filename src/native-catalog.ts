@@ -66,11 +66,13 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader, 
         if (!checked) refuse(unknown('tangle graph run --help'), 'This native transport did not establish subscription admission.')
       } }
     },
-    async describe(rows: readonly CatalogRow[]): Promise<ModelEntry[]> {
-      const read = context(cwd)
+    async describe(rows: readonly CatalogRow[], signal?: AbortSignal): Promise<ModelEntry[]> {
+      signal?.throwIfAborted()
+      const read = context(cwd, signal)
       const output: ModelEntry[] = []
       for (const row of rows) {
         const facts = await read(row)
+        signal?.throwIfAborted()
         const authentication = { status: facts.status, authMode: facts.authMode, source: facts.source, ...(facts.fix ? { fix: facts.fix } : {}) }
         output.push({ ...row, provider: facts.provider, authentication,
           ...(facts.defaultModel && row.id === `${row.backend}/${facts.defaultModel}` ? { default: true } : {}),

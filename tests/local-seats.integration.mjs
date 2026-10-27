@@ -8,6 +8,7 @@ import test from 'node:test'
 import { tsImport } from 'tsx/esm/api'
 
 const { detectLocalSeats, geminiLoginState } = await tsImport('../src/local-seats.ts', import.meta.url)
+const { listLocalModels } = await tsImport('../src/local-models.ts', import.meta.url)
 const { loadConfig } = await tsImport('../src/config.ts', import.meta.url)
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const execute = promisify(execFile)
@@ -26,7 +27,7 @@ async function until(check, message) {
   while (!await check()) { assert.ok(Date.now() < deadline, message); await pause(20) }
 }
 
-for (const abort of [false, true]) test(`native inventory stops an actual SIGTERM-ignoring tree on ${abort ? 'abort' : 'timeout'}`, {
+for (const reader of ['inventory', 'models']) for (const abort of [false, true]) test(`${reader} stops an actual SIGTERM-ignoring tree on ${abort ? 'abort' : 'timeout'}`, {
   skip: process.platform === 'win32' ? 'POSIX process-group boundary' : false, timeout: 12_000,
 }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), 'bridge-seat-process-'))
@@ -48,12 +49,12 @@ appendFileSync(${JSON.stringify(pidFile)}, String(process.pid) + '\\n');
 if (!process.argv.includes('--child')) spawn(process.execPath, [import.meta.filename, '--child'], { stdio: ['ignore', 'inherit', 'inherit'] });
 setInterval(() => {}, 1000);
 `, { mode: 0o700 })
-  const config = loadConfig({ BRIDGE_BACKENDS: '', BRIDGE_DATA_DIR: join(root, 'unused-state') })
+  const config = loadConfig({ BRIDGE_BACKENDS: reader === 'models' ? 'claude' : '', BRIDGE_DATA_DIR: join(root, 'unused-state') })
   for (const name of ['claude', 'codex', 'opencode', 'kimi', 'gemini', 'pi']) config[name + 'Bin'] = join(root, 'missing-' + name)
   config.claudeBin = executable
   const controller = new AbortController()
   const started = Date.now()
-  const pending = detectLocalSeats({ config, cwd: root, env: { HOME: root, PATH: process.env.PATH }, flags: ['--setting-sources', ''], timeoutMs: abort ? 5000 : 750, signal: controller.signal })
+  const pending = reader === 'models' ? listLocalModels({ config, cwd: root, signal: controller.signal }) : detectLocalSeats({ config, cwd: root, env: { HOME: root, PATH: process.env.PATH }, flags: ['--setting-sources', ''], timeoutMs: abort ? 5000 : 750, signal: controller.signal })
   // Attach the rejection observer before aborting to keep native AbortError handled.
   const outcome = pending.then((value) => ({ value }), (error) => ({ error }))
   await until(async () => (await pids(pidFile)).length === 2, 'the real readonly tree did not start')
@@ -67,6 +68,7 @@ setInterval(() => {}, 1000);
   } finally { clearTimeout(timer) }
   assert.ok(Date.now() - started < 4500)
   if (abort) assert.equal(result.error?.name, 'AbortError')
+  else if (reader === 'models') assert.deepEqual(result.value, [])
   else assert.equal(result.value.find((seat) => seat.harness === 'claude-code').status, 'unknown')
   const owned = await pids(pidFile)
   await until(() => owned.every((pid) => !exists(pid)), 'a readonly probe PID survived inventory settlement')
