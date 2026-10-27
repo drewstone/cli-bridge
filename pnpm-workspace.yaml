@@ -8,7 +8,7 @@ packages:
 minimumReleaseAgeExclude:
   - '@hono/node-server@2.1.5'
   - '@openai/codex@0.164.0'
-  - '@tangle-network/agent-interface@5.10.1'
+  - '@tangle-network/agent-interface@5.10.2'
   - '@tangle-network/agent-profile-materialize@1.0.1'
   - '@tangle-network/agent-runtime@1.0.0'
   - '@tangle-network/sandbox@1.0.23'
@@ -33,5 +33,5 @@ allowBuilds:
   esbuild: true
 
 overrides:
-  '@tangle-network/agent-interface': 5.10.1
+  '@tangle-network/agent-interface': 5.10.2
   zod: 4.6.7
