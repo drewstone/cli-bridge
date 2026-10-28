@@ -1,3 +1,4 @@
+import { workspaceProfile } from '../hub-mcp.js'
 import {
   chmodSync,
   mkdirSync,
@@ -130,7 +131,7 @@ export function provisionProfileWorkspace(
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   let scoped: OpencodeProfileScope | undefined
   try {
-    const plan = materializeProfile(profile, harness, { skip: ['mcp'], binds: harness === 'codex' ? ['codex.developer-instructions'] : [] })
+    const plan = materializeProfile(workspaceProfile(req, profile), harness, { skip: ['mcp'], binds: harness === 'codex' ? ['codex.developer-instructions'] : [] })
     // Bind generated --settings to this exact profile. A resumed session retains its already-applied plan.
     if (harness === 'claude-code' && sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest !== hashWorkspacePlan(plan)) {
       const settingsPath = '.tangle/claude-settings.json'
@@ -380,7 +381,7 @@ export function provisionPiProfile(
         `no request-scoped Pi loader exists for generic workspace file(s): ${genericFiles.join(', ')}`,
       )
     }
-    const plan = materializeProfile(profile, 'pi', { skip: ['mcp', 'extensions'] })
+    const plan = materializeProfile(workspaceProfile(req, profile), 'pi', { skip: ['mcp', 'extensions'] })
     assertWorkspacePlanSupported(plan)
     const nativeLoaders = assertPiPlanHasNativeLoaders(plan)
 

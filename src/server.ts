@@ -80,6 +80,7 @@ import {
 import { reapStalePrivateTemporaryRoots } from './runtime/private-temporary.js'
 import { bindIncomingRequest } from './http/request-source.js'
 import type { BridgeServer, StartServerOptions } from './server-options.js'
+import { mountHubMcp } from './hub-mcp.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -320,7 +321,7 @@ async function buildExecutorForBackend(
   })
 }
 
-export async function buildApp(config: Config, cwd = process.cwd()): Promise<{
+export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?: StartServerOptions['hub']): Promise<{
   app: Hono
   sessions: SessionStore
   registry: BackendRegistry
@@ -431,6 +432,8 @@ export async function buildApp(config: Config, cwd = process.cwd()): Promise<{
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
 
   const app = new Hono()
+  const hub = hubOptions ? mountHubMcp(app, hubOptions) : undefined
+  if (hub) extras.shutdownHooks.push(async () => hub.close())
 
   // Bearer guard — only active when BRIDGE_BEARER is set.
   if (config.bearer) {
@@ -462,7 +465,10 @@ export async function buildApp(config: Config, cwd = process.cwd()): Promise<{
     admission,
     admissionReservedClients: config.admissionReservedClients,
     jailEnv,
-    admitSubscription: nativeCatalog.admit,
+    admitSubscription: async (request, backend, signal) => {
+      await nativeCatalog.admit(request, backend, signal)
+      return hub?.prepare(request, signal, backend)
+    },
     netJail: extras.netJail,
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
@@ -559,7 +565,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     // The OS owns ephemeral listener allocation; a shared port-0 pidfile would serialize unrelated embedded servers.
     if (config.port !== 0) instanceLock = acquireInstanceLock(config.port)
     reapStalePrivateTemporaryRoots()
-    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir }, cwd)
+    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir }, cwd, options.hub)
   } catch (error) {
     if (!(error instanceof UnconfirmedBridgeCleanup)) release()
     throw error

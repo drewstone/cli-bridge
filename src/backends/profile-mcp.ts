@@ -45,7 +45,7 @@ export function resolveMcpServers(
       for (const [name, raw] of Object.entries(profileMcp)) {
         if (!name || !raw || typeof raw !== 'object') continue
         if ((raw as { enabled?: unknown }).enabled === false) continue
-        merged[name] = profileMcpToSpec(raw, name)
+        merged[name] = normalizeMcpServerSpec({ ...raw, type: raw.transport }, name, `mcp[${JSON.stringify(name)}]`)
       }
     }
   }
@@ -83,7 +83,7 @@ export function resolveMcpServers(
           'parse_error',
         )
       }
-      merged[name] = profileMcpToSpec(raw, name, `runtime_attachments.mcp[${JSON.stringify(name)}]`)
+      merged[name] = normalizeMcpServerSpec({ ...raw, type: raw.transport }, name, `runtime_attachments.mcp[${JSON.stringify(name)}]`)
     }
   }
 
@@ -147,37 +147,10 @@ function publicMcpConfigRecord(
   return out
 }
 
-function profileMcpToSpec(
-  raw: AgentProfileMcpServer,
-  name: string,
-  where = `mcp[${JSON.stringify(name)}]`,
-): McpServerSpec {
-  // AgentProfileMcpServer uses `transport`; McpServerSpec uses `type`.
-  // Rename and forward only the fields we model.
-  const out: McpServerSpec = {}
-  if (raw.transport) out.type = raw.transport
-  if (typeof raw.command === 'string') out.command = raw.command
-  if (Array.isArray(raw.args)) {
-    out.args = raw.args.map((arg, index) => publicMcpConfigString(arg, `${where}.args[${index}]`))
-  }
-  if (raw.env && typeof raw.env === 'object') {
-    out.env = publicMcpConfigRecord(raw.env, `${where}.env`)
-  }
-  if (typeof raw.url === 'string') out.url = raw.url
-  if (raw.headers && typeof raw.headers === 'object') {
-    out.headers = publicMcpConfigRecord(raw.headers, `${where}.headers`)
-  }
-  if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled
-  const timeoutRaw = (raw as { timeout?: unknown }).timeout
-  if (typeof timeoutRaw === 'number' && Number.isFinite(timeoutRaw) && timeoutRaw > 0) {
-    out.timeout = timeoutRaw
-  }
-  return out
-}
-
 function normalizeMcpServerSpec(
   raw: McpServerSpec | Record<string, unknown>,
   name: string,
+  where = `mcp.mcpServers[${JSON.stringify(name)}]`,
 ): McpServerSpec {
   // Defensive copy — drop any unknown fields, coerce types loosely.
   const r = raw as Record<string, unknown>
@@ -188,7 +161,6 @@ function normalizeMcpServerSpec(
   // to drop every non-string silently,
   // which turned a secret-ref in `args` into a SHORTER command line and a server that spawned
   // wrong for a reason nothing reported. Same refusal as the profile path, same reason.
-  const where = `mcp.mcpServers[${JSON.stringify(name)}]`
   if (Array.isArray(r.args)) {
     out.args = (r.args as unknown[]).map((a, i) => publicMcpConfigString(a, `${where}.args[${i}]`))
   }
@@ -262,8 +234,8 @@ export interface MaterializedMcpConfig {
  */
 export function buildCanonicalMcpServers(
   specs: Record<string, McpServerSpec>,
-): Record<string, Record<string, unknown>> {
-  const mcpServers: Record<string, Record<string, unknown>> = {}
+): Record<string, McpServerSpec> {
+  const mcpServers: Record<string, McpServerSpec> = {}
   for (const [name, spec] of Object.entries(specs)) {
     if (spec.enabled === false) continue
     if (isStdioMcpSpec(spec) && spec.command) {
@@ -673,34 +645,12 @@ export function materializeMcpServersForKimi(
  * are dropped.
  */
 function buildGeminiMcpServers(specs: Record<string, McpServerSpec>): Record<string, Record<string, unknown>> {
-  const out: Record<string, Record<string, unknown>> = {}
-  for (const [name, spec] of Object.entries(specs)) {
-    if (spec.enabled === false) continue
-    if (isStdioMcpSpec(spec) && spec.command) {
-      out[name] = {
-        command: spec.command,
-        ...(spec.args && spec.args.length ? { args: spec.args } : {}),
-        ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
-        ...(spec.timeout ? { timeout: spec.timeout } : {}),
-        trust: true,
-      }
-    } else if (spec.type === 'http' && spec.url) {
-      out[name] = {
-        httpUrl: spec.url,
-        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
-        ...(spec.timeout ? { timeout: spec.timeout } : {}),
-        trust: true,
-      }
-    } else if (spec.type === 'sse' && spec.url) {
-      out[name] = {
-        url: spec.url,
-        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
-        ...(spec.timeout ? { timeout: spec.timeout } : {}),
-        trust: true,
-      }
-    }
-  }
-  return out
+  return Object.fromEntries(Object.entries(buildCanonicalMcpServers(specs)).map(([name, spec]) => {
+    const { type, url, ...server } = spec
+    return [name, type
+      ? { ...server, [type === 'http' ? 'httpUrl' : 'url']: url, trust: true }
+      : { ...server, trust: true }]
+  }))
 }
 
 /**
@@ -731,27 +681,14 @@ export function materializeMcpServersForGemini(
  * shape omits. Remote entries are `{type:'http'|'sse', url, headers}`.
  */
 function buildFactoryMcpServers(specs: Record<string, McpServerSpec>): Record<string, Record<string, unknown>> {
-  const out: Record<string, Record<string, unknown>> = {}
-  for (const [name, spec] of Object.entries(specs)) {
-    if (spec.enabled === false) continue
-    if (isStdioMcpSpec(spec) && spec.command) {
-      out[name] = {
-        type: 'stdio',
-        command: spec.command,
-        args: spec.args ?? [],
-        ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}),
-        disabled: false,
-      }
-    } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
-      out[name] = {
-        type: spec.type,
-        url: spec.url,
-        ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
-        disabled: false,
-      }
-    }
-  }
-  return out
+  return Object.fromEntries(Object.entries(buildCanonicalMcpServers(specs)).map(([name, spec]) => {
+    const { timeout: _timeout, ...server } = spec
+    return [name, {
+      ...server,
+      ...(server.command ? { type: 'stdio', args: server.args ?? [] } : {}),
+      disabled: false,
+    }]
+  }))
 }
 
 /**
@@ -822,29 +759,22 @@ export function materializeMcpServersForOpencode(
     | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
     | { type: 'remote'; url: string; headers?: Record<string, string>; enabled?: boolean }
   > = {}
-  if (specs) {
-    for (const [name, spec] of Object.entries(specs)) {
-      if (spec.enabled === false) continue
-      if (isStdioMcpSpec(spec) && spec.command) {
-        opencodeMcp[name] = {
-          type: 'local',
-          command: [spec.command, ...(spec.args ?? [])],
-          ...(spec.env && Object.keys(spec.env).length ? { environment: spec.env } : {}),
-          enabled: true,
-          ...(spec.timeout ? { timeout: spec.timeout } : {}),
-        }
-      } else if ((spec.type === 'http' || spec.type === 'sse') && spec.url) {
-        // opencode loads remote MCP via `{type:'remote', url, headers}`
-        // (opencode.ai/config.json). Forward verbatim so an HTTP tool host
-        // is reachable, mirroring the claude/kimi remote fix (cli-bridge#48).
-        opencodeMcp[name] = {
-          type: 'remote',
-          url: spec.url,
-          ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}),
-          enabled: true,
-        }
+  for (const [name, spec] of Object.entries(buildCanonicalMcpServers(specs ?? {}))) {
+    if (spec.command) {
+      opencodeMcp[name] = {
+        type: 'local',
+        command: [spec.command, ...(spec.args ?? [])],
+        ...(spec.env ? { environment: spec.env } : {}),
+        enabled: true,
+        ...(spec.timeout ? { timeout: spec.timeout } : {}),
       }
-      // unknown transport / missing required fields → drop
+    } else if (spec.url) {
+      opencodeMcp[name] = {
+        type: 'remote',
+        url: spec.url,
+        ...(spec.headers ? { headers: spec.headers } : {}),
+        enabled: true,
+      }
     }
   }
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {

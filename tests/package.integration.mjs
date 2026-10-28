@@ -36,8 +36,12 @@ test('packed production install embeds isolated HTTP services and runs the exist
   assert.equal(manifest.devDependencies?.tsx, undefined)
   await writeFile(join(root, 'consumer.mts'), `
     import { loadConfig, startServer, detectLocalSeats, listLocalModels, type LocalModelOptions, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
+    import { HubClient } from '@tangle-network/hub-sdk';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
-    const run = async (): Promise<BridgeServer> => startServer({ config, cwd: process.cwd(), handleSignals: false, quiet: true });
+    const run = async (): Promise<BridgeServer> => startServer({ config, cwd: process.cwd(), handleSignals: false, quiet: true,
+      hub: { client: new HubClient({ baseUrl: 'http://127.0.0.1:1', authHeaders: () => ({}) }), hash: JSON.stringify,
+        serverForGrant: (_token: string) => ({ transport: 'stdio', command: process.execPath }) },
+    });
     void run;
     const seats: Promise<LocalSeat[]> = detectLocalSeats({ config });
     void seats;
@@ -58,6 +62,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
     import { once } from 'node:events';
     import { join } from 'node:path';
     import { loadConfig, startServer, detectLocalSeats, listLocalModels } from 'cli-bridge';
+    import { HubClient } from '@tangle-network/hub-sdk';
     const bearer = randomBytes(32).toString('hex');
     const events = ['SIGINT', 'SIGTERM', 'exit', 'uncaughtException', 'unhandledRejection'];
     const before = events.map((event) => process.listeners(event));
@@ -130,6 +135,17 @@ test('packed production install embeds isolated HTTP services and runs the exist
       assert.equal(new URL(captured.url).hostname, '127.0.0.1');
       assert.equal((await fetch(captured.url + '/v1/models')).status, 401);
     } finally { await captured.close(); }
+    const embeddedHub = await startServer({ config: { ...base, port: 0, bearer,
+      dataDir: join(process.cwd(), 'embedded-hub') }, handleSignals: false, quiet: true,
+      hub: { client: new HubClient({ baseUrl: 'http://127.0.0.1:1', authHeaders: () => ({}) }),
+        hash: JSON.stringify, serverForGrant: () => { throw new Error('No connection requested'); } },
+    });
+    try {
+      assert.equal((await fetch(embeddedHub.url + '/hub/mcp/grants/invalid/tools')).status, 403);
+      assert.equal((await fetch(embeddedHub.url + '/v1/models')).status, 401);
+      assert.equal((await fetch(embeddedHub.url + '/v1/models', { headers: { authorization: 'Bearer ' + bearer } })).status, 200);
+    } finally { await embeddedHub.close(); }
+    await assert.rejects(fetch(embeddedHub.url + '/hub/mcp/grants/invalid/tools'));
     const first = await open(directory);
     const sibling = await open(join(process.cwd(), 'sibling'));
     try {
