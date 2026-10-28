@@ -382,7 +382,7 @@ export function mountChatCompletions(
   app: Hono,
   deps: {
     registry: BackendRegistry
-    admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void>
+    admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void | (() => void)>
     /** Captured operator jail defaults; standalone mounts retain process defaults. */
     jailEnv?: NodeJS.ProcessEnv
     sessions: SessionStore
@@ -910,6 +910,13 @@ export function mountChatCompletions(
 
     let admissionSlot: AdmissionSlot | null = null
     let sessionLease: SessionExecutionLease | null = null
+    let releaseSubscription: void | (() => void)
+    const endJobResources = (): void => {
+      releaseSubscription?.()
+      sessionLease?.release()
+      // No-op when the stream's catch already closed the span.
+      recorder?.end()
+    }
     try {
       // Distinct runs that continue one backend session must own its full
       // read → execute → update interval. The duplicate-run attachment path
@@ -939,7 +946,7 @@ export function mountChatCompletions(
         req.cwd = session.cwd
       }
       const profile = assertProfileRequestAuthority(req, session)
-      await deps.admitSubscription?.(req, backend.name, run.signal)
+      releaseSubscription = await deps.admitSubscription?.(req, backend.name, run.signal)
       if (backend.name === 'pi') assertPiOutputTokenRequest(req, profile)
       const sessionProfileBinding = exactSessionProfileBinding(req, session)
       if (session) {
@@ -1039,7 +1046,7 @@ export function mountChatCompletions(
         if (requestedAcquireTimeoutMs !== undefined) {
           req.acquireDeadlineMs = resolveHostAcquireDeadlineMs(requestedAcquireTimeoutMs)
         }
-        if (deps.admission && shouldApplyHostAdmission(backend.name, req)) {
+        if (deps.admission && backend.name !== 'sandbox' && backend.name !== 'passthrough') {
           // Admission is owned by the job. Explicit cancellation can remove
           // a queued job before it ever acquires a process slot. The slot is
           // bound to the job's lifetime below; the run's terminal state is the
@@ -1182,12 +1189,6 @@ export function mountChatCompletions(
       // the run is already committed terminal. `pump()` always settles — it
       // returns the settled promise on that path — so this binding has no exit
       // to skip.
-      const endJobResources = (): void => {
-        sessionLease?.release()
-        sessionLease = null
-        // No-op when the stream's catch already closed the span.
-        recorder?.end()
-      }
       // The receipt supplier is read at FAILURE time: the backend retains the
       // receipt on `req` during materialization (before spawn), so a thrown
       // subprocess failure still acknowledges the profile instead of letting
@@ -1202,13 +1203,12 @@ export function mountChatCompletions(
       // slot: had this line been skipped, the gate would reclaim it once
       // `run.failSetup` commits the run terminal.
       admissionSlot?.holdUntil(Promise.resolve())
-      sessionLease?.release()
-      sessionLease = null
       run.failSetup(error)
       // A request rejected at admission or misconfigured before spawn never
       // reaches the wrapped stream, and it is exactly the request an operator
       // goes looking for. The span records why it never ran.
       recorder?.fail(error)
+      endJobResources()
       return errorResponse(c, error)
     }
 
@@ -1877,11 +1877,6 @@ function admissionErrorResponse(c: Context, err: unknown): Response {
       admission: s,
     },
   }, 503)
-}
-
-function shouldApplyHostAdmission(backendName: string, req: ChatRequest): boolean {
-  if (req.execution?.kind === 'sandbox') return false
-  return backendName !== 'sandbox' && backendName !== 'passthrough'
 }
 
 /**

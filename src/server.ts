@@ -467,7 +467,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     jailEnv,
     admitSubscription: async (request, backend, signal) => {
       await nativeCatalog.admit(request, backend, signal)
-      await hub?.prepare(request, signal)
+      return hub?.prepare(request, signal)
     },
     netJail: extras.netJail,
     trace: new TraceEmitter({

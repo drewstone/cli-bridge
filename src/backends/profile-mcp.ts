@@ -646,10 +646,10 @@ export function materializeMcpServersForKimi(
  */
 function buildGeminiMcpServers(specs: Record<string, McpServerSpec>): Record<string, Record<string, unknown>> {
   return Object.fromEntries(Object.entries(buildCanonicalMcpServers(specs)).map(([name, spec]) => {
-    const { type, url, timeout, ...server } = spec
+    const { type, url, ...server } = spec
     return [name, type
       ? { ...server, [type === 'http' ? 'httpUrl' : 'url']: url, trust: true }
-      : { ...server, ...(timeout ? { timeout } : {}), trust: true }]
+      : { ...server, trust: true }]
   }))
 }
 
