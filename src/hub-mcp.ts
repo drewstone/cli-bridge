@@ -15,9 +15,15 @@ export function mountHubMcp(app: Hono, options: NonNullable<StartServerOptions['
   app.route('/hub/mcp', createHubMcpRoutes(scope))
   return {
     close: () => scope.close(),
-    async prepare(req: ChatRequest, signal: AbortSignal) {
+    async prepare(req: ChatRequest, signal: AbortSignal, backend: string) {
       const profile = req.agent_profile as AgentProfile | undefined
       if (!profile?.connections?.length) return
+      if (req.execution?.kind === 'sandbox' || backend === 'sandbox') {
+        throw new BackendError(
+          'Embedded Hub connections require local Bridge execution; use the Sandbox SDK for cloud grants. Run: tangle graph run --help',
+          'not_configured', undefined, { providerDispatch: 'not_started' },
+        )
+      }
       signal.throwIfAborted()
       const resolved = await scope.resolveConnectionsToMcp(options.client, profile.connections, options.serverForGrant)
       try {

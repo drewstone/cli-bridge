@@ -10,7 +10,7 @@ export interface StartServerOptions {
   /** Embedded callers retain ownership of signals and process-wide error handlers. */
   handleSignals?: boolean
   quiet?: boolean
-  /** Embedded one-shot runs share this listener's revocable Hub scope. */
+  /** Embedded local one-shot runs share this listener's revocable Hub scope. */
   hub?: HubMcpScopeOptions & {
     client: HubClient
     serverForGrant(token: string): AgentProfileMcpServer
