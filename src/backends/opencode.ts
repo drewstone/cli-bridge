@@ -24,14 +24,18 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   admitNativeSubscription,
-  materializeMcpServersForOpencode,
   profileExecutionIdentity,
   provisionProfileWorkspace,
   resolveAgentProfile,
-  resolveMcpServers,
-  resolvePromptMessages,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
+import {
+  materializeMcpServersForOpencode,
+  resolveMcpServers,
+} from './profile-mcp.js'
+import {
+  resolvePromptMessages,
+} from './profile-prompt.js'
 import { registerJailReadable } from '../jail/index.js'
 import { dirname, join } from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'

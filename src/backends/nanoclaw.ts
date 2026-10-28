@@ -23,7 +23,7 @@ import type { Backend, BackendHealth, ChatDelta, ChatMessage, ChatRequest } from
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { contentToText } from './content.js'
-import { resolvePromptMessages } from './profile-support.js'
+import { resolvePromptMessages } from './profile-prompt.js'
 
 export interface NanoclawBackendOptions {
   name?: string

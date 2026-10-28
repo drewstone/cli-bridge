@@ -11,16 +11,22 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   admitNativeSubscription,
-  codexMcpConfigText,
   contextTransferRoute,
-  materializeMcpServersForCodex,
   profileExecutionIdentity,
   provisionProfileWorkspace,
   resolveAgentProfile,
-  resolveMcpServers,
-  resolvePromptMessages,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
+import {
+  codexMcpConfigText,
+  materializeMcpServersForCodex,
+} from './codex-mcp.js'
+import {
+  resolveMcpServers,
+} from './profile-mcp.js'
+import {
+  resolvePromptMessages,
+} from './profile-prompt.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { sanitizeHostEnv } from '../executors/host.js'

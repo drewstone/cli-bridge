@@ -34,7 +34,7 @@ import { RunRegistry } from '../src/runs/registry.js'
 import type { Backend, ChatDelta, ChatRequest, McpServerSpec } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
-import { resolveMcpServers, writeMcpConfigFile } from '../src/backends/profile-support.js'
+import { resolveMcpServers, writeMcpConfigFile } from '../src/backends/profile-mcp.js'
 
 const coordination = (port: number): Record<string, unknown> => ({
   transport: 'http',

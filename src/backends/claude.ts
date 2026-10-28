@@ -27,16 +27,20 @@ import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   admitNativeSubscription,
-  buildMcpAllowList,
-  writeMcpConfigFile,
-  renderLocalHarnessProfilePreamble,
   resolveAgentProfile,
-  resolveMcpServers,
-  type MaterializedMcpConfig,
   profileExecutionIdentity,
   provisionProfileWorkspace,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
+import {
+  buildMcpAllowList,
+  writeMcpConfigFile,
+  resolveMcpServers,
+  type MaterializedMcpConfig,
+} from './profile-mcp.js'
+import {
+  renderLocalHarnessProfilePreamble,
+} from './profile-prompt.js'
 import { contentToText } from './content.js'
 import { registerJailReadable } from '../jail/index.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'

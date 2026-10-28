@@ -17,7 +17,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { materializeMcpServersForOpencode, provisionProfileWorkspace } from '../src/backends/profile-support.js'
+import { materializeMcpServersForOpencode } from '../src/backends/profile-mcp.js'
+import { provisionProfileWorkspace } from '../src/backends/profile-support.js'
 import type { ChatRequest } from '../src/backends/types.js'
 
 const BIN = process.env.OPENCODE_BIN ?? join(homedir(), '.opencode/bin/opencode')

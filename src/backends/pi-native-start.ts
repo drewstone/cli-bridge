@@ -12,14 +12,16 @@ import { BackendError } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import {
   assertPiOutputTokenRequest,
-  buildCanonicalMcpServers,
-  materializeMcpServersForPi,
   profileExecutionIdentity,
   provisionPiProfile,
   resolveAgentProfile,
-  resolveMcpServers,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
+import {
+  buildCanonicalMcpServers,
+  materializeMcpServersForPi,
+  resolveMcpServers,
+} from './profile-mcp.js'
 import {
   parsePiModelId,
   piDirectToolSelection,
