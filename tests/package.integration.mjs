@@ -36,8 +36,12 @@ test('packed production install embeds isolated HTTP services and runs the exist
   assert.equal(manifest.devDependencies?.tsx, undefined)
   await writeFile(join(root, 'consumer.mts'), `
     import { loadConfig, startServer, detectLocalSeats, listLocalModels, type LocalModelOptions, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
+    import { HubClient } from '@tangle-network/hub-sdk';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
-    const run = async (): Promise<BridgeServer> => startServer({ config, cwd: process.cwd(), handleSignals: false, quiet: true });
+    const run = async (): Promise<BridgeServer> => startServer({ config, cwd: process.cwd(), handleSignals: false, quiet: true,
+      hub: { client: new HubClient({ baseUrl: 'http://127.0.0.1:1', authHeaders: () => ({}) }), hash: JSON.stringify,
+        serverForGrant: (_token: string) => ({ transport: 'stdio', command: process.execPath }) },
+    });
     void run;
     const seats: Promise<LocalSeat[]> = detectLocalSeats({ config });
     void seats;
