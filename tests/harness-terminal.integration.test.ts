@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { CODEX_DISABLED_FEATURE_ARGS } from '@tangle-network/agent-profile-materialize'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { FactoryBackend } from '../src/backends/factory.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
@@ -13,13 +14,71 @@ import { OpencodeBackend } from '../src/backends/opencode.js'
 import { CodexBackend } from '../src/backends/codex.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { hostSpawner } from '../src/executors/host.js'
+import type { Spawner } from '../src/executors/types.js'
 import { RunRegistry } from '../src/runs/registry.js'
 
 const progress = 'progress: reading the disposable protocol fixture\n'
 const usage = { input_tokens: 23, output_tokens: 13 }
 type Harness = 'claude' | 'codex' | 'factory' | 'gemini' | 'kimi' | 'opencode'
+// These are the existing model/profile laws, observed at the real executable boundary.
+const codexArguments: {
+  name: string
+  model: string
+  expectedModel?: string
+  expectedProvider?: string
+  profileModel?: { provider?: string; default: string }
+  prompt?: string
+  refused?: boolean
+}[] = [
+  {
+    name: 'qualified model',
+    model: 'codex/openai/gpt-5.1-codex',
+    expectedProvider: 'openai',
+    expectedModel: 'gpt-5.1-codex',
+    prompt: '-cfeatures.plugins=true',
+  },
+  {
+    name: 'bare model',
+    model: 'codex/gpt-5.1-codex',
+    expectedModel: 'gpt-5.1-codex',
+    prompt: 'resume',
+  },
+  {
+    name: 'profile default',
+    model: 'codex/default',
+    profileModel: { default: 'default' },
+    prompt: '-cfeatures.plugins=true',
+  },
+  {
+    name: 'profile harness provider',
+    model: 'codex/gpt-5-codex',
+    profileModel: { provider: 'codex', default: 'gpt-5-codex' },
+    expectedModel: 'gpt-5-codex',
+    prompt: 'resume',
+  },
+  {
+    name: 'wire harness provider',
+    model: 'codex/codex/gpt-5-codex',
+    expectedModel: 'gpt-5-codex',
+  },
+  { name: 'alias without model', model: 'codex' },
+  {
+    name: 'OSS colon model',
+    model: 'codex/ollama/gpt-oss:20b',
+    expectedProvider: 'ollama',
+    expectedModel: 'gpt-oss:20b',
+  },
+  {
+    name: 'conflicting profile provider',
+    model: 'codex/openai/gpt-5-codex',
+    profileModel: { provider: 'codex', default: 'gpt-5-codex' },
+    refused: true,
+  },
+]
+
 interface Scenario {
   name: string
+  codexArguments?: (typeof codexArguments)[number]
   terminal: boolean
   exitCode: number
   diagnostic?: string
@@ -114,12 +173,16 @@ describe('native harness terminal result followed by actual process exit', () =>
     const selected = harness === 'claude' || harness === 'codex'
       ? scenarios
       : scenarios.filter((scenario) => ['success', 'late-native-error', 'late-process-failure', 'signal-death'].includes(scenario.name))
-    const cases: Scenario[] = harness === 'kimi'
-      ? [...selected, { name: 'json-content-nonzero-without-terminal', terminal: false, exitCode: 7,
-          diagnostic: 'native Kimi process failed without a completion event', failureType: 'NODE_DOWN' }]
-      : selected
+    const cases: Scenario[] = harness === 'codex'
+      ? selected.flatMap((scenario) => scenario.name === 'success'
+        ? codexArguments.map((argumentsCase) => ({ ...scenario, codexArguments: argumentsCase }))
+        : [scenario])
+      : harness === 'kimi'
+        ? [...selected, { name: 'json-content-nonzero-without-terminal', terminal: false, exitCode: 7,
+            diagnostic: 'native Kimi process failed without a completion event', failureType: 'NODE_DOWN' }]
+        : selected
     for (const scenario of cases) {
-      it(`${harness}: ${scenario.name} preserves raw evidence and gates structured final output`, async () => {
+      it(`${harness}: ${scenario.name}${scenario.codexArguments ? ` (${scenario.codexArguments.name})` : ''} preserves raw evidence and gates structured final output`, async () => {
         const cwd = await mkdtemp(join(scratch, `${harness}-${scenario.name}-`))
         const bin = join(cwd, 'native-protocol.cjs')
         const finalOutput = { fixture: harness, ok: true }
@@ -129,17 +192,43 @@ describe('native harness terminal result followed by actual process exit', () =>
         await writeFile(join(cwd, 'native-case.json'), JSON.stringify({
           ...scenario, events: nativeEvents(harness, finalText, scenario.terminal),
         }))
+        let codexLaunches = 0
+        const observedCodexSpawner: Spawner = (command, args, options) => {
+          codexLaunches += 1
+          return hostSpawner(command, args, options)
+        }
+        observedCodexSpawner.executionEnvironment = hostSpawner.executionEnvironment
         const backend = harness === 'claude'
           ? new ClaudeBackend({ bin, harness: 'claude-code', timeoutMs: 5000, spawner: hostSpawner })
-          : harness === 'codex' ? new CodexBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
+          : harness === 'codex' ? new CodexBackend({ bin, timeoutMs: 5000, spawner: observedCodexSpawner })
           : harness === 'factory' ? new FactoryBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
           : harness === 'gemini' ? new GeminiBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
           : harness === 'kimi' ? new KimiBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
           : new OpencodeBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
+        const argumentsCase = scenario.codexArguments
+        const prompt = argumentsCase?.prompt ?? 'exercise the native protocol fixture'
         const request: ChatRequest = {
-          model: `${harness === 'claude' ? 'claude-code/anthropic' : harness === 'kimi' ? 'kimi-code' : harness}/protocol-fixture-model`,
-          mode: 'byob', cwd, messages: [{ role: 'user', content: 'exercise the native protocol fixture' }],
+          model: argumentsCase?.model ?? `${harness === 'claude' ? 'claude-code/anthropic' : harness === 'kimi' ? 'kimi-code' : harness}/protocol-fixture-model`,
+          mode: 'byob', cwd, messages: [{ role: 'user', content: prompt }],
           responseFormat: { type: 'json_object' },
+          ...(argumentsCase?.profileModel ? {
+            agent_profile: {
+              name: 'native-argv-policy',
+              harness: 'codex',
+              model: argumentsCase.profileModel,
+              prompt: { instructions: ['Public native argv policy fixture.'] },
+            },
+          } : {}),
+        }
+        if (argumentsCase?.refused) {
+          const iteration = backend.chat(request, null, new AbortController().signal)[Symbol.asyncIterator]()
+          try {
+            await expect(iteration.next()).rejects.toThrow(/conflicts with agent_profile\.model/u)
+            expect(codexLaunches).toBe(0)
+          } finally {
+            await iteration.return?.()
+          }
+          return
         }
         const registry = new RunRegistry({ maxLifetimeMs: 5000 })
         try {
@@ -158,6 +247,24 @@ describe('native harness terminal result followed by actual process exit', () =>
           const receipt = JSON.parse(await readFile(join(cwd, 'exit-receipt.json'), 'utf8'))
           expect(receipt.exitCode).toBe(scenario.exitCode)
           expect(receipt.argv).toContain(harness === 'codex' ? '--json' : harness === 'opencode' ? '--format' : '--output-format')
+          if (harness === 'codex') {
+            const argv: string[] = receipt.argv
+            expect(argv.slice(-2)).toEqual(['--', prompt])
+            const featureFlags = argv.findIndex((_, index) =>
+              CODEX_DISABLED_FEATURE_ARGS.every((flag, offset) => argv[index + offset] === flag),
+            )
+            expect(featureFlags >= 0).toBe(Boolean(argumentsCase?.profileModel))
+            if (argumentsCase) {
+              for (const [key, expected] of [
+                ['model', argumentsCase.expectedModel],
+                ['model_provider', argumentsCase.expectedProvider],
+              ] as const) {
+                const selections = argv.filter((arg) => arg.startsWith(`${key}=`))
+                if (expected === undefined) expect(selections).toEqual([])
+                else expect(selections).toContain(`${key}="${expected}"`)
+              }
+            }
+          }
           expect(deltas.map((delta) => delta.content ?? '').join('')).toBe(progress + finalText)
           if (scenario.terminal && ['claude', 'codex', 'kimi', 'opencode'].includes(harness)) {
             const nativeUsage = deltas.find((delta) => delta.usage !== undefined)?.usage
