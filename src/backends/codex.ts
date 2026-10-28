@@ -38,7 +38,7 @@ import { terminateSpawned } from '../executors/process-tree.js'
 import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
 import { nativeReasoningControl, workspaceCwdPathForBase, type ContextTransferRequest } from '@tangle-network/agent-interface'
 import { CODEX_NATIVE_IMPORT_VERSION, CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
-import { assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
+import { CODEX_DISABLED_FEATURE_ARGS, assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
 import {
   assertRouterCodexExecution,
   assertRouterCodexVersion,
@@ -141,7 +141,7 @@ export class CodexBackend implements Backend {
     } finally {
       releasePreparation()
     }
-    const args = ['app-server', '--listen', 'stdio://', ...provisioned.flags]
+    const args = ['app-server', '--listen', 'stdio://', ...provisioned.flags, ...CODEX_DISABLED_FEATURE_ARGS]
     const { provider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
     if (provider && provider !== this.name) args.push('-c', `model_provider=${JSON.stringify(provider)}`)
     if (modelArg) args.push('-c', `model=${JSON.stringify(modelArg)}`)
@@ -193,7 +193,6 @@ export class CodexBackend implements Backend {
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
     // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
     const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
-    const providerArg = splitProvider === this.name ? null : splitProvider
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
     // else `codex exec <prompt>`. --json emits JSONL events.
@@ -210,7 +209,7 @@ export class CodexBackend implements Backend {
     // split wire id is not restated here: a second `model_provider` naming a table
     // no config defines relies on undocumented last-override-wins precedence.
     if (!router) {
-      if (providerArg) args.push('-c', `model_provider="${providerArg}"`)
+      if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
       if (modelArg) args.push('-c', `model="${modelArg}"`)
     }
     const reasoningEffort = nativeReasoningControl(
@@ -223,8 +222,6 @@ export class CodexBackend implements Backend {
       args.splice(1, 0, 'resume', session.internalId)
       // codex exec resume <id> [prompt]
     }
-    const nativeConfigFlags = codexConfigFlags(args)
-    if (!router) args.push(prompt)
 
     // Reject unsupported profile plans before copying auth or writing MCP
     // credentials into a synthetic CODEX_HOME.
@@ -238,7 +235,8 @@ export class CodexBackend implements Backend {
     const launchEnv = { ...process.env, ...provisioned.env }
     if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
     args.push(...provisioned.flags)
-    nativeConfigFlags.push(...codexConfigFlags(provisioned.flags))
+    if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
+    const nativeConfigFlags = codexConfigFlags(args)
     let routerVersion: string | undefined
     if (router) {
       try {
@@ -256,11 +254,13 @@ export class CodexBackend implements Backend {
         assertRouterCodexVersion(health.version)
         routerVersion = health.version
         signal.throwIfAborted()
-        args.push(...codexRouterArgs(router), '--', prompt)
+        args.push(...codexRouterArgs(router))
       } catch (error) {
         throw new BackendError((error as Error).message, 'not_configured')
       }
     }
+
+    args.push('--', prompt)
 
     // Session leases own native state; the account turn lease owns auth rotation.
     // Keep native state across turns, but regenerate MCP config and auth links.
@@ -305,6 +305,14 @@ export class CodexBackend implements Backend {
       throw error
     }
     let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
+    let record: ReturnType<typeof openRouterLaunchRecord> | undefined
+    const releaseState = (outcome: 'closed' | 'failed' | 'aborted'): void => {
+      try { codexHome?.cleanup() } finally {
+        try { jailHome?.cleanup() } finally {
+          try { record?.close(outcome) } finally { releaseHostAuth?.() }
+        }
+      }
+    }
     try {
       // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
       await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
@@ -334,7 +342,7 @@ export class CodexBackend implements Backend {
         nativeConfigFlags.unshift('-c', 'cli_auth_credentials_store="file"')
       }
     } catch (error) {
-      try { codexHome?.cleanup() } finally { releaseHostAuth?.() }
+      releaseState(signal.aborted ? 'aborted' : 'failed')
       throw error
     }
 
@@ -353,7 +361,6 @@ export class CodexBackend implements Backend {
       ]
     }
 
-    let record: ReturnType<typeof openRouterLaunchRecord> | undefined
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       if (router) {
@@ -418,11 +425,7 @@ export class CodexBackend implements Backend {
         throw new BackendError(`Codex launch aborted during spawn; termination ${outcome}`, 'aborted')
       }
     } catch (error) {
-      try { codexHome?.cleanup() } finally {
-        try { jailHome?.cleanup() } finally {
-          try { record?.close(signal.aborted ? 'aborted' : 'failed') } finally { releaseHostAuth?.() }
-        }
-      }
+      releaseState(signal.aborted ? 'aborted' : 'failed')
       throw error
     }
     const child = spawned.child
@@ -548,13 +551,7 @@ export class CodexBackend implements Backend {
       try {
         await finishRecord()
       } finally {
-        try { releaseSpawner() } finally {
-          try {
-            try { codexHome?.cleanup() } finally { jailHome?.cleanup() }
-          } finally {
-            try { record?.close(signal.aborted ? 'aborted' : recordOutcome) } finally { releaseHostAuth?.() }
-          }
-        }
+        try { releaseSpawner() } finally { releaseState(signal.aborted ? 'aborted' : recordOutcome) }
       }
     }
   }
