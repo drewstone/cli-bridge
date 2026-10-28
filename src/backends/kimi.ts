@@ -37,13 +37,17 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   admitNativeSubscription,
-  materializeMcpServersForKimi,
   profileExecutionIdentity,
   provisionProfileWorkspace,
-  resolveMcpServers,
-  resolvePromptMessages,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
+import {
+  materializeMcpServersForKimi,
+  resolveMcpServers,
+} from './profile-mcp.js'
+import {
+  resolvePromptMessages,
+} from './profile-prompt.js'
 import { contentToText } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'

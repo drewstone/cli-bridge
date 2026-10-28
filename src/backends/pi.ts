@@ -17,12 +17,14 @@ import { nativeReasoningControl } from '@tangle-network/agent-interface'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   buildCanonicalMcpServers,
-  assertPiOutputTokenRequest,
   materializeMcpServersForPi,
+  resolveMcpServers,
+} from './profile-mcp.js'
+import {
+  assertPiOutputTokenRequest,
   profileExecutionIdentity,
   provisionPiProfile,
   resolveAgentProfile,
-  resolveMcpServers,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import { contentToText } from './content.js'
@@ -91,7 +93,6 @@ interface PiModelSpec {
 
 export function parsePiModelId(model: string): PiModelSpec {
   const m = model.toLowerCase()
-  if (m === 'pi') return {}
   if (!m.startsWith('pi/')) return {}
   const rest = model.slice(3) // preserve original case for the model id
   const slash = rest.indexOf('/')
@@ -1508,9 +1509,8 @@ function isEmptyToolArguments(value: unknown): boolean {
 
 function stringifyToolArguments(value: unknown): string {
   if (typeof value === 'string') return value
-  if (value === undefined || value === null) return '{}'
   try {
-    return JSON.stringify(value)
+    return JSON.stringify(value ?? {})
   } catch {
     return '{}'
   }

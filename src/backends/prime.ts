@@ -103,10 +103,14 @@ import type { SessionRecord } from '../sessions/store.js'
 import {
   assertProfileRequestAuthority,
   resolveAgentProfile,
-  resolveMcpServers,
-  resolvePromptMessages,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
+import {
+  resolveMcpServers,
+} from './profile-mcp.js'
+import {
+  resolvePromptMessages,
+} from './profile-prompt.js'
 import { contentToText, extractImageAttachments } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'

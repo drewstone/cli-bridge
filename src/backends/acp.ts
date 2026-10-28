@@ -23,7 +23,8 @@ import type { Spawner } from '../executors/types.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { contentToText } from './content.js'
-import { buildAcpMcpServers, resolveMcpServers, resolvePromptMessages } from './profile-support.js'
+import { buildAcpMcpServers, resolveMcpServers } from './profile-mcp.js'
+import { resolvePromptMessages } from './profile-prompt.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 
 export interface AcpBackendOptions {

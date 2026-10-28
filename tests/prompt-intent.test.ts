@@ -43,9 +43,11 @@ import { OpencodeBackend } from '../src/backends/opencode.js'
 import { PiBackend } from '../src/backends/pi.js'
 import {
   assertProfilePromptIntentsSupported,
-  provisionProfileWorkspace,
   renderLocalHarnessProfilePreamble,
   resolvePromptMessages,
+} from '../src/backends/profile-prompt.js'
+import {
+  provisionProfileWorkspace,
 } from '../src/backends/profile-support.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'

@@ -18,11 +18,13 @@ import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   admitNativeSubscription,
-  materializeMcpServersForGemini,
   profileExecutionIdentity,
   provisionProfileWorkspace,
-  resolveMcpServers,
 } from './profile-support.js'
+import {
+  materializeMcpServersForGemini,
+  resolveMcpServers,
+} from './profile-mcp.js'
 import { contentToText } from './content.js'
 import { hostSpawner } from '../executors/host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'

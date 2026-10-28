@@ -40,10 +40,12 @@ import type { SessionRecord } from '../src/sessions/store.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import {
   writeMcpConfigFile,
-  materializeMcpServersForCodex,
   materializeMcpServersForOpencode,
   resolveMcpServers,
-} from '../src/backends/profile-support.js'
+} from '../src/backends/profile-mcp.js'
+import {
+  materializeMcpServersForCodex,
+} from '../src/backends/codex-mcp.js'
 
 /**
  * Captures the ChatRequest the route hands to the backend, so tests
