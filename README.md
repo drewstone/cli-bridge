@@ -154,11 +154,12 @@ Enable `BRIDGE_BACKENDS=cursor` and install Cursor's official `cursor-agent` CLI
 `cursor/default` keeps Cursor's configured default. Read available model IDs with
 `cursor-agent models`. `CURSOR_TIMEOUT_MS` overrides the shared CLI deadline.
 
-Credentials come from `CURSOR_API_KEY` or `CURSOR_API_KEY_FILE` (default
+Execution requires an API key. Credentials come from `CURSOR_API_KEY` or `CURSOR_API_KEY_FILE` (default
 `~/.config/fleet/secrets/CURSOR_SERVICE_TOKEN`). Token files must be regular,
 owner-only files owned by the bridge user; symlinks are refused. Credentials go
 only in the child environment. Seat inventory reports configured API-key auth
-separately from browser login; it does not infer subscription access.
+separately from browser login; it does not infer subscription access. Browser login
+alone does not authorize execution through this backend.
 
 Each invocation passes `--trust --workspace <request cwd>` and runs in that cwd.
 Only use this BYOB backend with a workspace whose project instructions and tools

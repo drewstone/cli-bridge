@@ -13,6 +13,7 @@ import { admitNativeSubscription } from './profile-support.js'
 import { assertSuccessfulHarnessExit, readProcessLines } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+import { nativeJson, nativeObject } from '../lib/native-state.js'
 import { cursorEnvironment } from '../lib/cursor-auth.js'
 
 export class CursorBackend implements Backend {
@@ -44,10 +45,13 @@ export class CursorBackend implements Backend {
     const model = req.model.slice('cursor/'.length)
     if (req.model !== 'cursor' && model && model !== 'default') args.push('--model', model)
     if (session?.internalId) args.push('--resume', session.internalId)
-    const env = await cursorEnvironment(process.env)
+    const credential = await cursorEnvironment(process.env)
+    if (!credential.CURSOR_API_KEY) throw new BackendError('Cursor requires CURSOR_API_KEY or an owner-only CURSOR_API_KEY_FILE', 'not_configured')
+    const env = { ...credential, ...req.env, CURSOR_API_KEY: credential.CURSOR_API_KEY }
     await admitNativeSubscription(req, { env, args, flags: [], cwd, model: req.model, executor: this.spawner.executionEnvironment })
     const spawned = await this.spawner(this.opts.bin, args, {
-      cwd, env, signal, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd, env, signal, stdio: ['pipe', 'pipe', 'pipe'], envPassthroughKeys: Object.keys(req.env ?? {}),
+      ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
@@ -70,28 +74,36 @@ export class CursorBackend implements Backend {
       for await (const next of readProcessLines({ child: spawned.child, stdout: spawned.child.stdout, progressIntervalMs: 30_000 })) {
         if (next.kind === 'progress') { yield { keepalive: { source: 'cursor', elapsedMs: next.elapsedMs } }; continue }
         if (!next.line.trim()) continue
-        let event: Record<string, any>
-        try { event = JSON.parse(next.line) } catch { throw new BackendError('Cursor emitted invalid stream JSON', 'parse_error') }
-        if (typeof event.session_id === 'string' && event.session_id) {
+        let event: Record<string, unknown>
+        try { event = nativeJson(next.line) } catch { throw new BackendError('Cursor emitted invalid stream JSON', 'parse_error') }
+        if (event.type === 'error' || event.error || event.is_error === true) throw new BackendError('Cursor reported a stream error', 'upstream')
+        if (typeof event.session_id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u.test(event.session_id)) {
           if (nativeId && nativeId !== event.session_id) throw new BackendError('Cursor changed native session identity', 'upstream')
           nativeId = event.session_id
           if (!identityEmitted) { yield { internal_session_id: nativeId }; identityEmitted = true }
         }
         if (event.type === 'assistant') {
-          const content = (event.message?.content ?? []).filter((part: any) => part.type === 'text' && typeof part.text === 'string').map((part: any) => part.text).join('')
+          const parts = nativeObject(event.message).content
+          if (!Array.isArray(parts)) throw new BackendError('Malformed Cursor assistant event', 'parse_error')
+          const content = parts.map((part) => nativeObject(part)).filter((part) => part.type === 'text' && typeof part.text === 'string').map((part) => part.text).join('')
           if (content) { text += content; yield { content, final_text: text } }
         } else if (event.type === 'thinking' && event.subtype === 'delta' && typeof event.text === 'string') {
           yield { reasoning: event.text }
         } else if (event.type === 'tool_call' && event.subtype === 'started') {
-          for (const [name, call] of Object.entries(event.tool_call ?? {}) as [string, any][]) {
-            yield { tool_calls: [{ id: String(event.call_id), name, arguments: JSON.stringify(call.args ?? {}) }] }
+          const calls = Object.entries(nativeObject(event.tool_call))
+          if (!calls.length || typeof event.call_id !== 'string' || !event.call_id) throw new BackendError('Malformed Cursor tool event', 'parse_error')
+          for (const [name, call] of calls) {
+            yield { tool_calls: [{ id: event.call_id, name, arguments: JSON.stringify(nativeObject(call).args ?? {}) }] }
           }
-        } else if (event.type === 'result') terminal = event
-        else if (event.type === 'error' || event.error) throw new BackendError('Cursor reported a stream error', 'upstream')
+        } else if (event.type === 'result') {
+          if (terminal) throw new BackendError('Cursor emitted multiple terminal results', 'parse_error')
+          terminal = event
+        }
       }
       if (signal.aborted) { yield { finish_reason: 'error' }; return }
       await assertSuccessfulHarnessExit(spawned, 'cursor', () => stderr.render())
-      if (!nativeId || !terminal || terminal.is_error !== false || terminal.subtype !== 'success') {
+      if (!identityEmitted || !terminal || terminal.session_id !== nativeId || typeof terminal.result !== 'string'
+        || terminal.is_error !== false || terminal.subtype !== 'success') {
         throw new BackendError('Cursor exited without a successful terminal result and native session ID', 'upstream')
       }
       // Cursor's final result is authoritative; it can aggregate several assistant messages.

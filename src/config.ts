@@ -288,6 +288,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   )
 
   assertListenerConfig({ host, port, bearer })
+  if (backends.has('cursor') && (env.CURSOR_EXECUTOR && env.CURSOR_EXECUTOR !== 'host'
+    || env.BRIDGE_DEFAULT_EXECUTOR === 'docker' || Object.keys(env).some((key) => key.startsWith('CURSOR_DOCKER_')))) {
+    throw new Error('Cursor currently requires host execution; Docker execution is not configured')
+  }
 
   // A caller may own the process deadline through `execution.timeoutMs`.
   // Codex defaults to its bounded native subscription policy; explicit operator/request values win.

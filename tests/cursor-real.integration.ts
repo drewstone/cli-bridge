@@ -15,7 +15,7 @@ await chmod(evidence, 0o700)
 const home = join(evidence, 'home'), cwd = join(evidence, 'workspace')
 await mkdir(home, { mode: 0o700 }); await mkdir(cwd, { mode: 0o700 })
 Object.assign(process.env, { HOME: home, CURSOR_API_KEY_FILE: credentialFile, CURSOR_BIN: binary,
-  BRIDGE_TRACE: 'off', BRIDGE_BACKENDS: 'cursor', BRIDGE_JAIL_MODE: 'off', BRIDGE_SUBSCRIPTIONS_ONLY: '0' })
+  BRIDGE_TRACE: 'off', BRIDGE_BACKENDS: 'cursor', BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_SUBSCRIPTIONS_ONLY: '0' })
 const bearer = randomBytes(32).toString('hex')
 const config = { ...loadConfig({ ...process.env, BRIDGE_PORT: '3344', BRIDGE_BEARER: bearer, BRIDGE_DATA_DIR: join(evidence, 'bridge') }), port: 0 }
 let bridge = await startServer({ config, cwd, handleSignals: false, quiet: true })
@@ -40,7 +40,7 @@ async function processes(): Promise<number[]> {
   const found: number[] = []
   for (const pid of (await readdir('/proc')).filter((pid) => /^\d+$/.test(pid))) {
     try {
-      if (await readlink(`/proc/${pid}/cwd`) === cwd && (await readFile(`/proc/${pid}/cmdline`, 'utf8')).includes('cursor-agent')) found.push(Number(pid))
+      if ((await readlink(`/proc/${pid}/cwd`) === cwd || (await readFile(`/proc/${pid}/cmdline`, 'utf8')).includes(cwd)) && (await readFile(`/proc/${pid}/cmdline`, 'utf8')).includes('cursor-agent')) found.push(Number(pid))
     } catch { /* Process ended between enumeration and inspection. */ }
   }
   return found
@@ -66,15 +66,15 @@ try {
     const marker = randomBytes(16).toString('hex'), id = randomUUID()
     await writeFile(join(cwd, 'workspace-only.txt'), marker, { mode: 0o600 })
     const started = Date.now()
-    const first = await api('/v1/chat/completions', { model: `cursor/${model}`, session_id: id, cwd,
-      messages: [{ role: 'user', content: 'Read workspace-only.txt in the current workspace using your file tool. Reply only its entire content and remember it as the secret word for this chat.' }] })
+    const first = await api('/v1/chat/completions', { model: `cursor/${model}`, session_id: id, cwd, env: { APP_PUBLIC_LABEL: marker },
+      messages: [{ role: 'user', content: 'Use your shell tool to read workspace-only.txt and print the APP_PUBLIC_LABEL environment value. They must match. Reply with the word and remember it as the secret word for this chat.' }] })
     assert.ok(first.choices[0].message.content.includes(marker), JSON.stringify(first))
     const firstNative = await native(id)
     assert.ok(firstNative.internalId)
     await bridge.close()
     bridge = await startServer({ config, cwd, handleSignals: false, quiet: true })
     const second = await api('/v1/chat/completions', { model: `cursor/${model}`, session_id: id,
-      messages: [{ role: 'user', content: 'What was the secret word from the previous turn? Reply only that word. Do not use any tools or read any files.' }] })
+      messages: [{ role: 'user', content: 'What was the secret word from the previous turn? Reply only that word. Do not read any files. Use your shell tool to check APP_PUBLIC_LABEL still equals the remembered word.' }] })
     assert.ok(second.choices[0].message.content.includes(marker), JSON.stringify(second))
     const secondNative = await native(id)
     assert.equal(firstNative.internalId, secondNative.internalId)
