@@ -168,7 +168,7 @@ The persisted native chat ID goes to `--resume` on the next external session tur
 Cursor's native chat store must survive alongside the bridge data directory.
 
 This backend supports text, streamed reasoning and tool events, native chat
-continuation and durable run cancellation/replay. Exact AgentProfiles, request
+continuation and durable run cancellation/replay. Exact AgentProfiles, public request env, request
 MCP, attachments, reasoning/sampling overrides and hosted modes are refused.
 The existing capability response advertises those limits. Token counts use the
 CLI's terminal receipt when present; billed cost and served model stay unknown

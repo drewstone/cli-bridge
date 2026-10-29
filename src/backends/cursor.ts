@@ -35,8 +35,8 @@ export class CursorBackend implements Backend {
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'])
     if (req.agent_profile || session?.metadata.agent_profile || resolveMcpServers(req, session)
-      || req.effort || req.temperature !== undefined || req.max_tokens !== undefined || req.messages.some((message) => typeof message.content !== 'string' && message.content !== null)) {
-      throw new BackendError('Cursor CLI supports text turns and native resume; exact profiles, MCP, reasoning overrides and attachments are not configured', 'capability_denied')
+      || req.env && Object.keys(req.env).length > 0 || req.effort || req.temperature !== undefined || req.max_tokens !== undefined || req.messages.some((message) => typeof message.content !== 'string' && message.content !== null)) {
+      throw new BackendError('Cursor CLI supports text turns and native resume; exact profiles, public env, MCP, reasoning overrides and attachments are not configured', 'capability_denied')
     }
     signal.throwIfAborted()
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
@@ -45,12 +45,11 @@ export class CursorBackend implements Backend {
     const model = req.model.slice('cursor/'.length)
     if (req.model !== 'cursor' && model && model !== 'default') args.push('--model', model)
     if (session?.internalId) args.push('--resume', session.internalId)
-    const credential = await cursorEnvironment(process.env)
-    if (!credential.CURSOR_API_KEY) throw new BackendError('Cursor requires CURSOR_API_KEY or an owner-only CURSOR_API_KEY_FILE', 'not_configured')
-    const env = { ...credential, ...req.env, CURSOR_API_KEY: credential.CURSOR_API_KEY }
+    const env = await cursorEnvironment(process.env)
+    if (!env.CURSOR_API_KEY) throw new BackendError('Cursor requires CURSOR_API_KEY or an owner-only CURSOR_API_KEY_FILE', 'not_configured')
     await admitNativeSubscription(req, { env, args, flags: [], cwd, model: req.model, executor: this.spawner.executionEnvironment })
     const spawned = await this.spawner(this.opts.bin, args, {
-      cwd, env, signal, stdio: ['pipe', 'pipe', 'pipe'], envPassthroughKeys: Object.keys(req.env ?? {}),
+      cwd, env, signal, stdio: ['pipe', 'pipe', 'pipe'],
       ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
@@ -92,7 +91,7 @@ export class CursorBackend implements Backend {
         } else if (event.type === 'tool_call' && event.subtype === 'started') {
           const calls = Object.entries(nativeObject(event.tool_call))
           if (!calls.length || typeof event.call_id !== 'string' || !event.call_id) throw new BackendError('Malformed Cursor tool event', 'parse_error')
-          for (const [name, call] of calls) {
+          for (const [name, call] of calls.filter(([name]) => name.endsWith('ToolCall'))) {
             yield { tool_calls: [{ id: event.call_id, name, arguments: JSON.stringify(nativeObject(call).args ?? {}) }] }
           }
         } else if (event.type === 'result') {
