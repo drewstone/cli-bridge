@@ -17,7 +17,7 @@ await mkdir(home, { mode: 0o700 }); await mkdir(cwd, { mode: 0o700 })
 Object.assign(process.env, { HOME: home, CURSOR_API_KEY_FILE: credentialFile, CURSOR_BIN: binary,
   BRIDGE_TRACE: 'off', BRIDGE_BACKENDS: 'cursor', BRIDGE_JAIL_MODE: 'off', BRIDGE_SUBSCRIPTIONS_ONLY: '0' })
 const bearer = randomBytes(32).toString('hex')
-const config = loadConfig({ ...process.env, BRIDGE_PORT: '0', BRIDGE_BEARER: bearer, BRIDGE_DATA_DIR: join(evidence, 'bridge') })
+const config = { ...loadConfig({ ...process.env, BRIDGE_PORT: '3344', BRIDGE_BEARER: bearer, BRIDGE_DATA_DIR: join(evidence, 'bridge') }), port: 0 }
 let bridge = await startServer({ config, cwd, handleSignals: false, quiet: true })
 const receipt: Record<string, unknown> = { evidence, rows: [], status: 'failed' }
 async function api(path: string, body?: unknown) {
