@@ -7,6 +7,7 @@
 
 import { loadConfig } from '../src/config.js'
 import { buildApp } from '../src/server.js'
+import { boundedProbe, resolveHealthProbeTimeoutMs } from '../src/backends/health.js'
 
 async function main(): Promise<void> {
   const config = loadConfig({
@@ -19,7 +20,7 @@ async function main(): Promise<void> {
   console.log('─'.repeat(60))
   let allOk = true
   for (const b of registry.all()) {
-    const h = await b.health()
+    const h = await boundedProbe(b, resolveHealthProbeTimeoutMs())
     const emoji = h.state === 'ready' ? '✓' : h.state === 'unavailable' ? '◦' : '✗'
     console.log(`${emoji} ${b.name.padEnd(14)} ${h.state.padEnd(12)} ${h.detail ?? h.version ?? ''}`)
     if (h.state === 'error') allOk = false

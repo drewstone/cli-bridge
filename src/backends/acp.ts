@@ -26,7 +26,7 @@ import { contentToText } from './content.js'
 import { buildAcpMcpServers, resolveMcpServers } from './profile-mcp.js'
 import { resolvePromptMessages } from './profile-prompt.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
-import { resolveHealthProbeTimeoutMs, versionHealth } from './health.js'
+import { versionHealth } from './health.js'
 
 export interface AcpBackendOptions {
   /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
@@ -88,7 +88,7 @@ export class AcpBackend implements Backend {
   }
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
-    return versionHealth(this.name, this.bin, this.spawner, undefined, signal ?? AbortSignal.timeout(resolveHealthProbeTimeoutMs()))
+    return versionHealth(this.name, this.bin, this.spawner, undefined, signal)
   }
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
