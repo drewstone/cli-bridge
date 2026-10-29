@@ -405,6 +405,7 @@ export class CodexBackend implements Backend {
         }
       await admitNativeSubscription(req, { env: finalEnv, cwd: cwd ?? process.cwd(), model: req.model, args, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
+        nativeStore: 'codex',
         signal,
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
@@ -430,12 +431,11 @@ export class CodexBackend implements Backend {
     }
     const child = spawned.child
     const releaseSpawner = spawned.release
+    const nativeStore = spawned.effectiveNativeStore ? { effective_native_store: spawned.effectiveNativeStore } : {}
 
     // Capture both errors already observed by the spawner and errors emitted after this listener attaches.
-    let spawnErrorMessage = ''
+    let spawnErrorMessage = spawned.spawnError?.()?.message ?? ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
-    const earlySpawnError = spawned.spawnError?.()
-    if (earlySpawnError) spawnErrorMessage = earlySpawnError.message
 
     // The durable run owns the deadline and delivers it through this signal.
     const onAbort = (): void => { void terminateSpawned(spawned) }
@@ -480,7 +480,7 @@ export class CodexBackend implements Backend {
 
         if (type === 'thread.started' && typeof ev.thread_id === 'string') {
           internalSessionId = ev.thread_id
-          yield { internal_session_id: internalSessionId }
+          yield { internal_session_id: internalSessionId, ...nativeStore }
           continue
         }
 
@@ -516,7 +516,7 @@ export class CodexBackend implements Backend {
 
       if (signal.aborted) {
         await finishRecord()
-        yield { finish_reason: 'error', internal_session_id: internalSessionId }
+        yield { finish_reason: 'error', internal_session_id: internalSessionId, ...nativeStore }
         return
       }
       if (sawError) {
@@ -529,7 +529,7 @@ export class CodexBackend implements Backend {
         if (await finishRecord() !== 'stopped') {
           throw new BackendError('Codex process termination is unconfirmed', 'upstream')
         }
-        yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId }
+        yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId, ...nativeStore }
         return
       }
       await assertSuccessfulHarnessExit(spawned, 'codex', () => stderr.render())
@@ -540,7 +540,7 @@ export class CodexBackend implements Backend {
       if (await finishRecord() !== 'stopped')
         throw new BackendError('Codex process termination is unconfirmed', 'upstream')
       if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
-      yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
+      yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId, ...nativeStore }
     } finally {
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree — codex spawns sub-processes for MCP

@@ -394,6 +394,7 @@ function approximateDeltaBytes(delta: ChatDelta): number {
     bytes += DELTA_OVERHEAD_BYTES + call.id.length + call.name.length + call.arguments.length
   }
   if (delta.internal_session_id) bytes += delta.internal_session_id.length
+  if (delta.effective_native_store) bytes += JSON.stringify(delta.effective_native_store).length
   if (delta.profile_materialization) bytes += JSON.stringify(delta.profile_materialization).length
   if (delta.keepalive) bytes += delta.keepalive.source.length + DELTA_OVERHEAD_BYTES
   if (delta.usage) bytes += JSON.stringify(delta.usage).length

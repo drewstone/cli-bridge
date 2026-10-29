@@ -120,7 +120,6 @@ What is per-backend — *written N times but small*:
 - `POST /v1/sessions/:id/inject` — mid-turn user message. Body is a `UserMessage`.
 - `DELETE /v1/sessions/:id` — cancel + reap.
 - `GET /v1/sessions/:id/events` — SSE re-subscribe (live + replay-from-last-event-id for crash recovery and external observers).
-- `GET /v1/sessions/:id/transcript` — full JSONL transcript download.
 
 ### Docker executor
 

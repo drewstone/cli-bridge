@@ -420,10 +420,6 @@ export class RetainedSessionService {
     }
   }
 
-  transcript(id: string): Record<string, unknown> {
-    return this.events.transcript(id)
-  }
-
   assertReplayCursor(id: string, afterCursor: number): void {
     this.events.assertSessionCursor(id, afterCursor)
   }

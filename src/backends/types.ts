@@ -17,6 +17,7 @@
 import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
 import type { JailSpec } from '../jail/index.js'
+import type { EffectiveNativeStore } from '../jail/types.js'
 import type { CallerTrace } from '../trace/ids.js'
 import type {
   AgentEnvironmentCapabilities,
@@ -611,6 +612,8 @@ export interface ChatDelta {
   profile_materialization?: ProfileMaterializationReceipt
   /** Backend assigned id for this turn. Written to session store. */
   internal_session_id?: string
+  /** Observed host-readable home from the actual spawner, never caller-supplied environment. */
+  effective_native_store?: EffectiveNativeStore
   /**
    * Subprocess-liveness signal. Backends emit this when the upstream CLI
    * is silently buffering (no stdout for >N seconds) so the SSE writer

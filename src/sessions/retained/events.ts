@@ -7,10 +7,8 @@
  * event, and a commit landing between two reads cannot open a gap.
  */
 
-import type { InteractionRequest, Part } from '@tangle-network/agent-interface'
 import type { RunRegistry } from '../../runs/registry.js'
 import type { RetainedEventRecord, SessionStore } from '../store.js'
-import { isUsageEvent } from './native-turn.js'
 import type { RetainedSessionState } from './state.js'
 import { RetainedSessionError } from './types.js'
 
@@ -20,37 +18,6 @@ export class RetainedEvents {
     private readonly runs: RunRegistry,
     private readonly state: RetainedSessionState,
   ) {}
-
-  transcript(id: string): Record<string, unknown> {
-    this.state.require(id)
-    const events = this.store.retainedEventsAfter(id)
-    const messages = new Map<string, { id: string; role: 'assistant'; parts: Part[] }>()
-    const interactions: InteractionRequest[] = []
-    const usage: unknown[] = []
-    for (const item of events) {
-      const event = item.envelope.event
-      if (event.type === 'message.part.updated') {
-        const messageId = event.part.messageID
-        const message = messages.get(messageId) ?? { id: messageId, role: 'assistant', parts: [] }
-        const index = message.parts.findIndex((part) => part.id === event.part.id)
-        if (index >= 0) message.parts[index] = event.part
-        else message.parts.push(event.part)
-        messages.set(messageId, message)
-      } else if (event.type === 'interaction') {
-        interactions.push(event.request)
-      } else if (event.type === 'raw' && isUsageEvent(event.event)) {
-        usage.push(event.event)
-      }
-    }
-    return {
-      session_id: id,
-      messages: [...messages.values()],
-      interactions,
-      usage,
-      event_count: events.length,
-      last_event_id: this.store.latestRetainedEvent(id)?.envelope.cursor ?? null,
-    }
-  }
 
   assertSessionCursor(id: string, afterCursor: number): void {
     this.state.require(id)
