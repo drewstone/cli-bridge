@@ -401,15 +401,6 @@ describe('Pi native RPC adapter', () => {
     expect(second.status).toBe(202)
     await waitFor(() => store!.getRetained('child-session')?.turns === 2)
 
-    const transcript = await app.request('/v1/sessions/child-session/transcript')
-    const body = await readJson(transcript)
-    expect(body.messages.flatMap((message: any) => message.parts.map((part: any) => part.text))).toEqual([
-      'child-reply-1',
-      'child-reply-2',
-    ])
-    expect(body.usage).toHaveLength(2)
-    expect(body.last_event_id).toBe('18')
-
     const events = await app.request('/v1/sessions/child-session/events')
     const eventText = await events.text()
     const envelopes = [...eventText.matchAll(/data: (\{.*\})\r?\n/gu)].map(match => JSON.parse(match[1]!))
@@ -476,8 +467,6 @@ describe('Pi native RPC adapter', () => {
     expect(byRun('handled-1')).not.toContainEqual(expect.objectContaining({
       type: 'raw', event: expect.objectContaining({ type: 'extension_ui_request' }),
     }))
-    const transcript = await readJson(await app.request('/v1/sessions/handled-session/transcript'))
-    expect(transcript.messages.flatMap((message: any) => message.parts.map((part: any) => part.text))).toEqual(['child-reply-1'])
     expect(calls).toHaveLength(1)
   })
 

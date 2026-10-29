@@ -202,14 +202,6 @@ export function mountRetainedSessions(
     })
   })
 
-  app.get('/v1/sessions/:id/transcript', (c) => {
-    try {
-      return c.json(service.transcript(c.req.param('id')))
-    } catch (error) {
-      return retainedError(c, error)
-    }
-  })
-
   app.get('/v1/sessions/:id/status', (c) => {
     try {
       return c.json(service.get(c.req.param('id')))

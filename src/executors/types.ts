@@ -21,7 +21,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process'
-import type { JailSpec } from '../jail/index.js'
+import type { EffectiveNativeStore, JailSpec } from '../jail/types.js'
 
 /** What the spawner produces. Compatible with node's ChildProcess. */
 export type SpawnedChild = ChildProcess
@@ -84,6 +84,8 @@ export interface ExecutorSaturationSnapshot {
 }
 
 export interface SpawnOpts {
+  /** Ask the real host spawner to retain this harness's effective native-home binding. */
+  nativeStore?: 'codex'
   /** Abort startup when the owning durable run is cancelled before spawn completes. */
   signal?: AbortSignal
   /** Working directory inside the executor's filesystem. */
@@ -139,6 +141,7 @@ export interface SpawnOpts {
 
 export interface SpawnResult {
   child: SpawnedChild
+  readonly effectiveNativeStore?: EffectiveNativeStore
   /**
    * Terminate the executor-owned workload and wait until it cannot keep
    * running. Host executors kill the child process group; Docker executors

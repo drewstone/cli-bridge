@@ -101,6 +101,13 @@ export interface JailAuthSource {
   envVar?: string
 }
 
+/** Host-visible native state observed where the executor applies the real launch mapping. */
+export interface EffectiveNativeStore {
+  readonly harness: 'codex'
+  readonly root: string
+  readonly basis: 'host-jail' | 'host-environment'
+}
+
 export interface JailWrap {
   /** Executable to spawn (e.g. `sudo`, `sandbox-exec`, or the bin itself). */
   bin: string
@@ -108,6 +115,7 @@ export interface JailWrap {
   args: string[]
   /** Env overrides to merge onto the child's environment. */
   env?: Record<string, string>
+  effectiveNativeStore?: EffectiveNativeStore
   /** Tear down any backend-owned temp state (e.g. an SBPL profile file). */
   cleanup?: () => Promise<void> | void
 }

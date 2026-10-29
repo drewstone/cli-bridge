@@ -203,9 +203,13 @@ export class LinuxBwrapJail implements JailBackend {
       bin, ...args,
     )
 
+    const nativeHome = resolvedAuthSources.find(({ source }) => source.envVar === 'CODEX_HOME')
     return {
       bin: BWRAP_BIN,
       args: bwrapArgs,
+      ...(nativeHome
+        ? { effectiveNativeStore: { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } }
+        : {}),
       ...(copiedWritableAuth.length > 0
         ? { cleanup: () => removeAuthCopies(copiedWritableAuth) }
         : {}),

@@ -1,4 +1,5 @@
 import type { DurableRunWriter } from '../sessions/durable-writer.js'
+import { legacyRequestMetadata } from '../sessions/legacy-metadata.js'
 /**
  * POST /v1/chat/completions — OpenAI-compatible.
  *
@@ -966,16 +967,7 @@ export function mountChatCompletions(
           model: req.model,
           internalId: session?.internalId ?? null,
           cwd: req.cwd ?? session?.cwd ?? null,
-          metadata: {
-            ...(Object.keys(safeBodyMetadata).length > 0 ? { request_metadata: safeBodyMetadata } : {}),
-            ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
-            ...(sessionProfileBinding ? { agent_profile_binding: sessionProfileBinding } : {}),
-            ...(req.execution ? { execution: req.execution } : {}),
-            ...(req.env ? { env: req.env } : {}),
-            ...(req.context ? { context: req.context } : {}),
-            ...(req.providerOptions ? { provider_options: req.providerOptions } : {}),
-            ...(req.mcp ? { mcp: req.mcp } : {}),
-          },
+          metadata: legacyRequestMetadata(req, safeBodyMetadata, sessionProfileBinding),
         })
         // A legacy row may be durable before its first native id exists.
         // Keep that placeholder out of backend resume state until upsert records the id.
@@ -1097,20 +1089,9 @@ export function mountChatCompletions(
                   internalId: delta.internal_session_id,
                   cwd: req.cwd ?? session?.cwd ?? null,
                   metadata: {
-                    ...(Object.keys(safeBodyMetadata).length > 0 ? { request_metadata: safeBodyMetadata } : {}),
-                    model: req.model,
-                    ...(req.agent_profile ? { agent_profile: req.agent_profile } : {}),
-                    ...(sessionProfileBinding
-                      ? { agent_profile_binding: sessionProfileBinding }
-                      : {}),
-                    ...(req.execution ? { execution: req.execution } : {}),
-                    ...(req.env ? { env: req.env } : {}),
-                    ...(req.context ? { context: req.context } : {}),
-                    ...(req.providerOptions ? { provider_options: req.providerOptions } : {}),
-                    ...(req.mcp ? { mcp: req.mcp } : {}),
-                    ...(req.profile_materialization_receipt
-                      ? { profile_materialization: req.profile_materialization_receipt }
-                      : {}),
+                    ...legacyRequestMetadata(req, safeBodyMetadata, sessionProfileBinding),
+                    ...(delta.effective_native_store ? { effective_native_store: { ...delta.effective_native_store,
+                      nativeSessionId: delta.internal_session_id, runId: run.id, requestDigest: run.requestDigest } } : {}),
                   },
                 })
               }

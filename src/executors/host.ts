@@ -27,7 +27,7 @@
 import { type ChildProcess } from 'node:child_process'
 import { spawnCaptured as spawn } from './raw-capture.js'
 import { LINEAGE_ENV_KEYS, withLineageEnv } from '../trace/lineage.js'
-import { applyJail } from './jail-support.js'
+import { applyJail, effectiveNativeStore } from './jail-support.js'
 import { killTree, processGroupExists, retryCleanupUntilSuccessful } from './process-tree.js'
 import { ExecutorSaturatedError, type SpawnOpts, type SpawnResult, type Spawner } from './types.js'
 
@@ -235,6 +235,8 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     const jailed = await applyJail(bin, args, opts)
     jailCleanup = jailed.cleanup
     opts.signal?.throwIfAborted()
+    const env = withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv)
+    const nativeStore = effectiveNativeStore(opts, jailed, env)
     // detached: true → child is the leader of a new process group whose
     // pgid equals its pid. kill(-pid, sig) reaches every descendant. We
     // do NOT call child.unref() — the bridge still owns the child for
@@ -243,7 +245,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
       signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv),
+      env,
       detached: true,
     })
     // Synchronous error capture — Node fires 'error' on nextTick for spawn
@@ -258,6 +260,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     child.once('error', release)
     const result: SpawnResult = {
       child,
+      effectiveNativeStore: nativeStore,
       terminate,
       release,
       spawnError: () => spawnError,

@@ -143,6 +143,7 @@ export class MacosSeatbeltJail implements JailBackend {
         // sandbox-exec does NOT rewrite the child env; -D only parameterizes the
         // profile. Return the real env so HOME/XDG actually point into the jail.
         env: { ...jailEnv(root), ...authEnv },
+        ...(authEnv.CODEX_HOME ? { effectiveNativeStore: { harness: 'codex' as const, root: authEnv.CODEX_HOME, basis: 'host-jail' as const } } : {}),
         cleanup: async () => {
           await rm(dir, { recursive: true, force: true })
           await removeCopiedAuth()

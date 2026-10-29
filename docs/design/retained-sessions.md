@@ -61,13 +61,12 @@ The response headers are `X-Run-Id`, `X-Run-Request-Digest`, `X-Run-Provider`, `
 The retained routes are:
 
 - `POST /v1/sessions` creates a caller-owned session.
-- `GET /v1/sessions` lists retained and legacy sessions.
+- `GET /v1/sessions` lists retained and legacy sessions. `session_id` plus `backend` reads one exact legacy mapping. Its optional `metadata.effective_native_store` binds the actual host-readable Codex home and native session ID to the producing run and request digest; it contains no credential or environment values. Native conversation readers use that binding, while `/events` remains the durable normalized event stream.
 - `GET /v1/sessions/:id` reads the durable session view.
 - `POST /v1/sessions/:id/turns` starts one idempotent turn.
 - `POST /v1/sessions/:id/continue` performs one Agent Interface native continuation.
 - `POST /v1/sessions/:id/continue?return=admission` returns exact control after durable admission.
 - `GET /v1/sessions/:id/events` replays normalized session events.
-- `GET /v1/sessions/:id/transcript` reads the normalized transcript.
 - `GET /v1/sessions/:id/status` reads the current status.
 - `POST /v1/sessions/:id/steer` sends a mid-turn message when the backend advertises steering.
 - `POST /v1/sessions/:id/cancel` cancels one exact admitted run.

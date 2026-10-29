@@ -14,11 +14,15 @@ export function mountSessions(app: Hono, deps: {
   retained?: Pick<RetainedSessionService, 'list'>
 }): void {
   app.get('/v1/sessions', (c) => {
+    const sessionId = c.req.query('session_id'), backend = c.req.query('backend')
+    if (sessionId !== undefined && !backend)
+      return c.json({ error: { message: 'backend is required with session_id', type: 'invalid_request_error' } }, 400)
     const parsed = Number.parseInt(c.req.query('limit') ?? '50', 10)
     const limit = Number.isNaN(parsed) ? 50 : Math.min(Math.max(1, parsed), 500)
-    const legacy = deps.sessions.list(limit)
-    if (!deps.retained) return c.json({ data: legacy })
-    return c.json({ object: 'list', data: [...deps.retained.list(limit), ...legacy] })
+    const session = sessionId === undefined ? null : deps.sessions.get(sessionId, backend!)
+    const data = sessionId === undefined ? deps.sessions.list(limit) : session ? [session] : []
+    if (!deps.retained) return c.json({ data })
+    return c.json({ object: 'list', data: sessionId === undefined ? [...deps.retained.list(limit), ...data] : data })
   })
 
   app.delete('/v1/sessions/:externalId', (c) => {

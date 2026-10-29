@@ -149,7 +149,7 @@ export function sanitizeLegacySessionMetadata(value: unknown): Record<string, un
   if (model.success && !containsSecretShapedValue(model.data)) metadata.model = model.data
   const profileDigest = legacyProfileDigestMetadata.safeParse(source.profile_digest)
   if (profileDigest.success) metadata.profile_digest = profileDigest.data
-  for (const key of ['agent_profile', 'agent_profile_binding', 'profile_materialization'] as const) {
+  for (const key of ['agent_profile', 'agent_profile_binding', 'profile_materialization', 'effective_native_store'] as const) {
     const value = source[key]
     if (key === 'agent_profile' && value !== undefined) {
       try {

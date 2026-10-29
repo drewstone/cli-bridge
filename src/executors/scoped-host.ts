@@ -59,7 +59,7 @@ import { posix } from 'node:path'
 import { promisify } from 'node:util'
 import { withLineageEnv } from '../trace/lineage.js'
 import { executorSaturatedError, hostSpawner, sanitizeHostEnv } from './host.js'
-import { applyJail } from './jail-support.js'
+import { applyJail, effectiveNativeStore } from './jail-support.js'
 import { killTree, retryCleanupUntilSuccessful } from './process-tree.js'
 import type { Spawner, SpawnResult } from './types.js'
 
@@ -515,15 +515,18 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   }
 
   let child
+  let nativeStore: SpawnResult['effectiveNativeStore']
   try {
+    const env = resolveScopedSpawnEnv(
+      withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv),
+      busTransportEnv,
+    )
+    nativeStore = effectiveNativeStore(opts, jailed, env)
     child = spawn(SYSTEMD_RUN_BIN, wrapped, {
       signal: opts.signal,
       stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
       cwd: opts.cwd,
-      env: resolveScopedSpawnEnv(
-        withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv),
-        busTransportEnv,
-      ),
+      env,
       // `detached: true` makes the wrapper a process-group leader, so
       // existing killTree() (kill -pgid) still works as the graceful
       // first signal. The cgroup-kill in release() is the hard backstop.
@@ -561,6 +564,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
 
   const result: SpawnResult = {
     child,
+    effectiveNativeStore: nativeStore,
     terminate: () => terminateScopedWorkload(child, unitName, stopScope),
     release,
     spawnError: () => spawnError,

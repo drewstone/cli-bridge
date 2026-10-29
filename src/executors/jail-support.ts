@@ -14,6 +14,9 @@
  */
 
 import { selectJailBackend } from '../jail/index.js'
+import { realpathSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
+import type { EffectiveNativeStore } from '../jail/types.js'
 import type { JailBackend } from '../jail/index.js'
 import { BackendError } from '../backends/types.js'
 import type { SpawnOpts } from './types.js'
@@ -22,6 +25,7 @@ export interface JailedCommand {
   bin: string
   args: string[]
   env: NodeJS.ProcessEnv | undefined
+  effectiveNativeStore?: EffectiveNativeStore
   /** Tear-down for backend-owned jail temp state; run once in release(). */
   cleanup?: () => Promise<void> | void
 }
@@ -78,7 +82,14 @@ export async function applyJail(
   const env = opts.jail.environment || wrap.env
     ? { ...(opts.env ?? {}), ...(opts.jail.environment ?? {}), ...(wrap.env ?? {}) }
     : opts.env
-  return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup }
+  return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup, effectiveNativeStore: wrap.effectiveNativeStore }
+}
+
+/** Called after host sanitization; jail mappings take precedence over launcher environment. */
+export function effectiveNativeStore(opts: SpawnOpts, command: JailedCommand, env: NodeJS.ProcessEnv | undefined): EffectiveNativeStore | undefined {
+  if (opts.nativeStore !== 'codex') return undefined
+  const root = command.effectiveNativeStore?.root ?? env?.CODEX_HOME
+  return root && isAbsolute(root) ? { harness: 'codex', root: realpathSync(root), basis: command.effectiveNativeStore?.basis ?? 'host-environment' } : undefined
 }
 
 export function rewriteJailArguments(

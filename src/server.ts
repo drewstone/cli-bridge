@@ -505,7 +505,6 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       '/v1/sessions/:id/input',
       '/v1/sessions/:id/events',
       '/v1/sessions/:id/status',
-      '/v1/sessions/:id/transcript',
       '/v1/sessions/:id/steer',
       '/v1/sessions/:id/cancel',
       '/v1/sessions/:id/detach',
