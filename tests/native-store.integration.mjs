@@ -59,7 +59,7 @@ printf '%s\\n' '{"type":"thread.started","thread_id":"native-store-owned-thread"
     assert.equal(binding.basis, 'host-jail')
     assert.equal(binding.nativeSessionId, session.internalId)
     assert.equal(binding.runId, 'owned-native-store-run')
-    assert.match(binding.requestDigest, /^[a-f0-9]{64}$/u)
+    assert.match(binding.requestDigest, /^sha256:[a-f0-9]{64}$/u)
     assert.ok((await readFile(join(binding.root, 'sessions', 'owned.jsonl'), 'utf8')).includes(session.internalId))
     assert.deepEqual((await fetch(server.url + endpoint.replace('backend=codex', 'backend=pi'), { headers }).then(r => r.json())).data, [])
     assert.equal((await fetch(server.url + '/v1/sessions?session_id=owned-external-session', { headers })).status, 400)
