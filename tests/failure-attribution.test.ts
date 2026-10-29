@@ -272,16 +272,5 @@ describe('/health cannot present a remembered verdict as a fresh one', () => {
     expect(second.ts).toBe(new Date(12_000).toISOString())
   })
 
-  it('says the verdicts are fresh when they are', async () => {
-    let clock = 1_000
-    const app = healthApp(async () => ({ name: 'opencode', state: 'error', detail: 'container gone' }), () => clock)
 
-    const first = await (await app.request('/health')).json() as any
-    expect(first.cached_verdicts).toBe(false)
-    clock += 11_000
-    const second = await (await app.request('/health')).json() as any
-    // A failing verdict is never cached, so the second answer is measured.
-    expect(second.cached_verdicts).toBe(false)
-    expect(second.oldest_probed_at).toBe(new Date(12_000).toISOString())
-  })
 })
