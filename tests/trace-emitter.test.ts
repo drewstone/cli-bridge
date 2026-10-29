@@ -934,18 +934,7 @@ describe('trace configuration', () => {
   })
 })
 
-/**
- * WHICH BUILD of the contract this suite ran against.
- *
- * Two builds of `@tangle-network/agent-trace-contract` declare version `1.0.2`
- * and behave differently, so every assertion in this file is worth exactly as
- * much as the build it ran on and a version comparison establishes nothing.
- * These cases pin the build three ways: the symbol `MAX_SPANS_READ` and the
- * bound it names, the `truncated-input` finding an oversized export must raise,
- * and byte-for-byte identity with the one build the repo's own pnpm-lock.yaml
- * pins — an allowlist derived from the lockfile, so ANY other tree fails, not
- * just one remembered bad one.
- */
+/** Spans identify the installed trace-contract bytes. */
 describe('trace contract build identity', () => {
   it('stamps that digest on the request span, so a trace records its own producer', () => {
     const written: ContractSpan[] = []

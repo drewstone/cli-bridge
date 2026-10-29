@@ -26,6 +26,7 @@ import { contentToText } from './content.js'
 import { buildAcpMcpServers, resolveMcpServers } from './profile-mcp.js'
 import { resolvePromptMessages } from './profile-prompt.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+import { resolveHealthProbeTimeoutMs, versionHealth } from './health.js'
 
 export interface AcpBackendOptions {
   /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
@@ -86,30 +87,8 @@ export class AcpBackend implements Backend {
     return model === this.name || model.startsWith(`${this.name}/`)
   }
 
-  async health(): Promise<BackendHealth> {
-    let release: (() => void) | null = null
-    try {
-      const spawned = await this.spawner(this.bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] })
-      release = spawned.release
-      const child = spawned.child
-      const early = spawned.spawnError?.()
-      if (early) return { name: this.name, state: 'unavailable', detail: `spawn failed: ${early.message}` }
-      const out = new BoundedDiagnosticBuffer()
-      child.stdout?.on('data', (b) => { out.append(b) })
-      child.stderr?.on('data', (b) => { out.append(b) })
-      const code = await new Promise<number>((resolve) => {
-        const t = setTimeout(() => { void terminateSpawned(spawned); resolve(124) }, 5000)
-        child.on('exit', (c) => { clearTimeout(t); resolve(c ?? 0) })
-        child.on('error', () => { clearTimeout(t); resolve(1) })
-      })
-      const output = out.render()
-      if (code !== 0 && !output.trim()) return { name: this.name, state: 'error', detail: `${this.bin} --version exit ${code}` }
-      return { name: this.name, state: 'ready', version: output.split('\n')[0]?.trim() || this.bin }
-    } catch (err) {
-      return { name: this.name, state: 'error', detail: `health probe failed: ${(err as Error).message}` }
-    } finally {
-      release?.()
-    }
+  async health(signal?: AbortSignal): Promise<BackendHealth> {
+    return versionHealth(this.name, this.bin, this.spawner, undefined, signal ?? AbortSignal.timeout(resolveHealthProbeTimeoutMs()))
   }
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {

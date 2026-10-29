@@ -463,6 +463,13 @@ Lists model ids each ready backend claims, with which harness serves them.
 
 ### `GET /health`
 
+Healthy probes use `BRIDGE_HEALTH_CACHE_MS`. Failed probes keep their original
+`probed_at` with `cached: true`; `BRIDGE_HEALTH_NEGATIVE_CACHE_MS` bounds how
+soon another request starts a shared background refresh. Warm failures return
+immediately while that refresh runs. `?force=1` waits for a fresh shared probe;
+setting `BRIDGE_HEALTH_CACHE_MS=0` disables caching. Defaults live in
+[src/routes/health.ts](src/routes/health.ts).
+
 JSON report per backend — ready / unavailable / error with detail.
 
 When host admission is configured, the report carries an `admission` object.

@@ -1,70 +1,26 @@
 /**
- * GET /health — status of each registered backend + the server itself.
- *
- * Cached + bounded by design. The watchdog hits this endpoint once per
- * 60s on every bridge instance (5 bridges × 1 probe = 5 calls/min);
- * each call previously fork-exec'd `--version` on every CLI backend
- * (claude, kimi, opencode, …). Under heavy review load — fork+exec
- * stalls when the box's load average climbs past `nproc` — those
- * subprocess spawns can sit in the kernel for >5 s. The watchdog's
- * `curl --max-time 5` then SIGKILLs the bridge because /health looked
- * unresponsive, even though every chat request was healthy.
- *
- * Two defenses, layered:
- *
- *   1. Per-probe timeout (`PROBE_TIMEOUT_MS`). We Promise.race each
- *      backend's `health()` against a timer; a wedged spawn surfaces
- *      as `state: 'error', detail: 'health probe timed out'` instead
- *      of hanging the whole /health endpoint. Independent of any
- *      transport-layer timeout the caller imposes.
- *
- *   2. TTL cache (`HEALTH_CACHE_MS`). Successful probes are memoized
- *      for the TTL window (default 30 s). Watchdog calls return
- *      cached results in <1 ms — the only spawn cost is once per
- *      cache-eviction, and concurrent cache misses share that probe.
- *      `?force=1` bypasses the cache for debugging.
- *
- * Only `ready` verdicts are cached. A failing backend is RE-PROBED on
- * every request, because a cached failure is the worse of the two
- * errors in both directions:
- *
- *   - It cannot recover. Once a fault was cached, fixing the underlying
- *     cause changed nothing until the process restarted. Measured on
- *     this host: a bridge up for ten days served the identical
- *     `No such container` detail after the image was rebuilt and the
- *     directories restored, with `active=0 queued=0` — idle, not busy.
- *   - It looked live while doing it. The response stamps a fresh
- *     top-level `ts` on a verdict from an older probe, which reads as
- *     "just checked, still broken". That is worse than reporting
- *     nothing, so each backend now carries its OWN `probed_at` and a
- *     `cached` flag: no verdict can borrow the response's freshness.
- *
- * The original reason for caching survives untouched — a healthy pool
- * still answers watchdog probes from memory in <1 ms, so the fork+exec
- * storm that got live bridges SIGKILLed cannot come back. Re-probing
- * only the already-failing backends costs one spawn per failing backend
- * per request, bounded by `PROBE_TIMEOUT_MS`.
- *
- * Tradeoff kept: a backend that DIES between probes is reported `ready`
- * for up to the cache TTL. `?force=1` bypasses the cache;
- * `BRIDGE_HEALTH_CACHE_MS=0` disables it.
+ * Bounded backend health with per-probe provenance. Healthy verdicts use the
+ * regular TTL; faults use a short negative TTL and one request-driven refresh.
+ * Warm fault responses never wait for that refresh. ?force=1 waits for a fresh
+ * shared probe; disabling caching restores fresh probes on every request.
  */
 
 import { getHeapStatistics } from 'node:v8'
 import { Hono } from 'hono'
 import type { BackendRegistry } from '../backends/registry.js'
 import type { Backend, BackendHealth } from '../backends/types.js'
-import { boundedProbe } from '../backends/health.js'
+import { boundedProbe, resolveHealthProbeTimeoutMs } from '../backends/health.js'
 import type { AdmissionGate } from '../admission.js'
 import type { RunRegistry } from '../runs/registry.js'
 import { hostExecutorSnapshot } from '../executors/host.js'
 import { scopedHostExecutorSnapshot } from '../executors/scoped-host.js'
 
 const DEFAULT_HEALTH_CACHE_MS = 30_000
-const DEFAULT_PROBE_TIMEOUT_MS = 3_500
+const DEFAULT_HEALTH_NEGATIVE_CACHE_MS = 1_000
 
 interface CacheEntry {
   probedAt: number
+  completedAt: number
   health: BackendHealth
 }
 
@@ -129,7 +85,8 @@ export function mountHealth(
   options: MountHealthOptions = {},
 ): void {
   const cacheMs = options.cacheMs ?? resolveEnvMs('BRIDGE_HEALTH_CACHE_MS', DEFAULT_HEALTH_CACHE_MS)
-  const probeTimeoutMs = options.probeTimeoutMs ?? resolveEnvMs('BRIDGE_HEALTH_PROBE_TIMEOUT_MS', DEFAULT_PROBE_TIMEOUT_MS)
+  const negativeCacheMs = cacheMs > 0 ? resolveEnvMs('BRIDGE_HEALTH_NEGATIVE_CACHE_MS', DEFAULT_HEALTH_NEGATIVE_CACHE_MS) : 0
+  const probeTimeoutMs = options.probeTimeoutMs ?? resolveHealthProbeTimeoutMs()
   const now = options.now ?? Date.now
   const probe = options.probe ?? ((b) => boundedProbe(b, probeTimeoutMs))
   const cache = new Map<string, CacheEntry>()
@@ -142,7 +99,7 @@ export function mountHealth(
     const pending = (async () => {
       const probedAt = now()
       const health = await probe(backend)
-      const fresh = { probedAt, health }
+      const fresh = { probedAt, completedAt: now(), health }
       cache.set(backend.name, fresh)
       return fresh
     })()
@@ -163,13 +120,16 @@ export function mountHealth(
     const probes: ReportedHealth[] = await Promise.all(
       deps.registry.all().map(async (b) => {
         const cached = cache.get(b.name)
+        if (!force && cached && cached.health.state !== 'ready' && negativeCacheMs > 0) {
+          if (ts - cached.completedAt >= negativeCacheMs) void probeFresh(b).catch(() => {})
+          return { ...cached.health, probed_at: new Date(cached.probedAt).toISOString(), cached: true }
+        }
         const pending = inFlight.get(b.name)
         if (pending) {
           const fresh = await pending
           return { ...fresh.health, probed_at: new Date(fresh.probedAt).toISOString(), cached: false }
         }
-        // Reusable only while it says `ready`: a fault must be retried so a
-        // fixed fault recovers without restarting the process.
+        // Successful verdicts keep their regular TTL; faults refresh above.
         if (!force
           && cached
           && cached.health.state === 'ready'
@@ -202,7 +162,7 @@ export function mountHealth(
       ...(deps.admission ? { admission: deps.admission.snapshot() } : {}),
       executor: executorSnapshot(),
       memory: memorySnapshot(deps.runs),
-      ts: new Date(ts).toISOString(),
+      ts: new Date(now()).toISOString(),
     }, any ? 200 : 503)
   })
 }
