@@ -36,35 +36,7 @@ import { mountRuns } from './routes/runs.js'
 import { RetainedSessionService, mountRetainedSessions } from './sessions/retained.js'
 import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
-import { mountMetrics, registerPoolForMetrics } from './routes/metrics.js'
-import { mountPoolMaintenance } from './routes/pool-maintenance.js'
-import { PoolMaintenance } from './runtime/pool-maintenance.js'
-import { ContainerPool } from './executors/container-pool.js'
-import { provisionNetJail } from './executors/net-jail-network.js'
-import { modelEndpointsFor, parseAllowList } from './jail/net-allowlist.js'
-import type { EnforcedNetJail } from './jail/enforce-net-jail.js'
-import { createDockerSpawner } from './executors/docker.js'
-import {
-  buildCommandFor,
-  DockerPreflightError,
-  preflightDockerImage,
-  preflightDockerSlot,
-  type DockerPreflightMount,
-  type DockerPreflightTarget,
-  type PreflightFinding,
-} from './executors/docker-preflight.js'
-import type { Spawner } from './executors/types.js'
-
-/**
- * Volume-name prefix for per-slot credential mount `mountIndex`. Index 0 keeps
- * the historical `<namePrefix>-oauth` name so an existing per-slot login is not
- * orphaned by adding the second mount.
- */
-function perSlotVolumePrefix(cfg: BackendExecutorConfig, mountIndex: number): string {
-  const base = `${cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`}-oauth`
-  return mountIndex === 0 ? base : `${base}${mountIndex}`
-}
-import type { BackendExecutorConfig } from './config.js'
+import { mountMetrics } from './routes/metrics.js'
 import { AdmissionGate } from './admission.js'
 import { scopedHostConcurrencyLimits } from './executors/scoped-host.js'
 import { RunRegistry } from './runs/registry.js'
@@ -99,226 +71,7 @@ function parseEnvNonNegativeInt(name: string, fallback: number): number {
 }
 
 export interface BuildAppExtras {
-  /** Disposers to await on graceful shutdown — pool teardown lives here. */
   shutdownHooks: Array<() => Promise<void>>
-  /**
-   * Backends whose worker containers were provisioned onto a verified net-jail
-   * network. Written only after {@link provisionNetJail} has PROVEN the jail on
-   * a throwaway container, so a membership test here is evidence rather than
-   * intent — which is what lets the chat route refuse a net-jail request it
-   * cannot honour instead of recording a policy it never applied.
-   */
-  netJail: Map<string, EnforcedNetJail>
-}
-
-/**
- * Describe a docker executor for the startup preflight. Kept next to the pool
- * wiring so the probed configuration is derived from the SAME values the pool
- * receives — a preflight that reconstructs the config independently can pass
- * while the real pool is misconfigured.
- */
-function preflightTargetFor(cfg: BackendExecutorConfig, bin: string, slotIndex: number): DockerPreflightTarget {
-  const containerHome = cfg.containerHome ?? '/root'
-  // The mount the credential file belongs to, so the check runs against the
-  // directory that actually holds auth rather than the first one configured.
-  const credentialPath = cfg.credentialFile ? `${containerHome}/${cfg.credentialFile}` : undefined
-  const mounts: DockerPreflightMount[] = [
-    { host: cfg.hostConfigDir!, container: cfg.containerConfigDir! },
-    ...(cfg.extraMounts ?? []),
-  ].map((pair, i) => {
-    const credentialFile = credentialPath?.startsWith(`${pair.container}/`)
-      ? credentialPath.slice(pair.container.length + 1) : undefined
-    return {
-      // Per-slot mode gives THIS slot its own volumes, so the probe must name
-      // this slot's volumes — probing slot 0's for every slot was evidence
-      // about one slot while traffic went to all of them.
-      source: cfg.oauthMode === 'per-slot' ? `${perSlotVolumePrefix(cfg, i)}-${slotIndex}` : pair.host,
-      target: pair.container,
-      kind: cfg.oauthMode === 'per-slot' ? 'volume' : 'bind',
-      ...(credentialFile ? { credentialFile } : {}),
-    }
-  })
-  return {
-    backend: cfg.name,
-    envPrefix: cfg.name.toUpperCase(),
-    image: cfg.image!,
-    bin,
-    containerHome,
-    ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
-    ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
-    mounts,
-    buildCommand: buildCommandFor(cfg.image!),
-  }
-}
-
-/**
- * Build a Spawner for a backend, plus the shutdown hook that tears down
- * the underlying container pool when the bridge exits. Returns null when
- * the backend's executor is `host` — backends fall back to their default
- * hostSpawner in that case.
- *
- * Order matters. The image/daemon/mount checks run BEFORE provisioning,
- * because `docker run` against an absent image fails with a message about
- * pulling from a registry — not the build command the operator needs. The
- * slot checks run AFTER, against a real pool container, and end by executing
- * `<bin> --version` in the workdir the executor will cd into. Both throw, so
- * `startServer` never reaches `serve()` with a configuration that would fail
- * at first request.
- */
-async function buildExecutorForBackend(
-  cfg: BackendExecutorConfig | undefined,
-  /**
-   * The name the chat route resolves this backend by (`backend.name`). It keys the net-jail
-   * registry, so it must equal the registered harness name, which differs from the executor
-   * config name for claude (`claude-code`) and kimi (`kimi-code`).
-   */
-  routeName: string,
-  extras: BuildAppExtras,
-  bin: string,
-  config: Config,
-): Promise<Spawner | null> {
-  if (!cfg || cfg.kind !== 'docker') return null
-  if (!cfg.image || !cfg.poolSize || !cfg.containerConfigDir) {
-    throw new Error(`backend ${cfg.name} executor=docker but missing image/poolSize/containerConfigDir`)
-  }
-  // The net-jail is provisioned BEFORE the pool because the pool's containers
-  // join its internal network at creation; a container cannot be re-jailed
-  // afterwards. loadConfig has already refused any configuration this cannot
-  // enforce, so reaching here with the mode on means it must succeed.
-  const netJail = config.netJailMode === 'net-jail'
-    ? await provisionNetJail({
-      backend: cfg.name,
-      namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
-      image: cfg.image,
-      allow: [
-        ...modelEndpointsFor(cfg.name, process.env),
-        ...parseAllowList(config.netJailAllow.join(','), 'BRIDGE_NET_JAIL_ALLOW'),
-      ],
-      onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
-    })
-    : null
-  if (netJail) {
-    extras.shutdownHooks.push(() => netJail.destroy())
-    console.log(
-      `[${cfg.name}-pool] net-jail verified on ${netJail.network} — sole next hop ${netJail.relayIp} ` +
-        '(Docker host, peer containers, link-local and IPv6 proven unreachable); egress denied except ' +
-        netJail.entries.map((e) => `${e.host}:${e.port} (${e.source})`).join(', '),
-    )
-  }
-  // Deliberately not switchable off. An operator who needs the bridge up
-  // without a working container runtime wants <NAME>_EXECUTOR=host, not a
-  // bridge that reports ready and fails every request.
-  const target = preflightTargetFor(cfg, bin, 0)
-  const imageFindings = await preflightDockerImage(target)
-  if (imageFindings.length > 0) throw new DockerPreflightError(cfg.name, imageFindings)
-  const caps = {
-    memory: process.env.BRIDGE_POOL_MEMORY || '4g',
-    cpus: process.env.BRIDGE_POOL_CPUS || '2',
-    maxQueueDepth: parseEnvPositiveInt('BRIDGE_POOL_MAX_QUEUE', cfg.poolSize * 4),
-    acquireDeadlineMs: parseEnvPositiveInt('BRIDGE_POOL_ACQUIRE_DEADLINE_MS', 60_000),
-    maxAcquireDeadlineMs: parseEnvPositiveInt('BRIDGE_POOL_MAX_ACQUIRE_DEADLINE_MS', 900_000),
-    slotMaxHoldMs: parseEnvNonNegativeInt('BRIDGE_SLOT_MAX_HOLD_MS', 0),
-  }
-  const pool = await ContainerPool.create({
-    size: cfg.poolSize,
-    image: cfg.image,
-    namePrefix: cfg.namePrefix ?? `cli-bridge-${cfg.name}-pool`,
-    oauthMode: cfg.oauthMode ?? 'share',
-    strictSessionAffinity: cfg.name === 'codex' && cfg.oauthMode === 'per-slot',
-    ...caps,
-    ...(cfg.containerUser ? { containerUser: cfg.containerUser } : {}),
-    ...(cfg.containerHome ? { containerHome: cfg.containerHome } : {}),
-    ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
-    // The net-jail network supersedes any operator network; loadConfig refuses
-    // a configuration where both are set, so this can never silently override.
-    ...(netJail ? { network: netJail.network } : cfg.network ? { network: cfg.network } : {}),
-    // Joining the internal network is not the jail. The deny lives in each
-    // container's own network namespace, and it is written here — a slot whose
-    // filter cannot be installed is destroyed instead of served.
-    ...(netJail ? { afterCreate: (id: string, i: number) => netJail.applyFilter(id, `slot ${i}`) } : {}),
-    // Every credential directory the CLI reads, not only the primary one: a pool
-    // that mounts ~/.config/opencode alone has no auth.json in it, and the CLI
-    // then authenticates against nothing and returns an empty completion.
-    ...(cfg.oauthMode === 'share' || !cfg.oauthMode
-      ? {
-          shareMounts: [
-            `${cfg.hostConfigDir}:${cfg.containerConfigDir}`,
-            ...(cfg.extraMounts ?? []).map((m) => `${m.host}:${m.container}`),
-          ],
-        }
-      : {
-          perSlotVolumes: [
-            { volumePrefix: perSlotVolumePrefix(cfg, 0), target: cfg.containerConfigDir },
-            ...(cfg.extraMounts ?? []).map((m, i) => ({
-              volumePrefix: perSlotVolumePrefix(cfg, i + 1),
-              target: m.container,
-            })),
-          ],
-        }),
-    onProgress: (m) => console.log(`[${cfg.name}-pool] ${m}`),
-  })
-  console.log(`[${cfg.name}-pool] caps`, caps)
-  registerPoolForMetrics(cfg.name, pool)
-  extras.shutdownHooks.push(() => pool.destroy())
-
-  // Probe a real slot: same image, same mounts, same user, same workdir the
-  // executor will use. If this passes, `ok` on /health means the bridge has
-  // demonstrated it can execute a command, not merely that it started.
-  const liveContainers = pool.liveContainerIds()
-  if (liveContainers.length === 0) {
-    await pool.destroy()
-    throw new Error(`backend ${cfg.name}: container pool provisioned no usable slots`)
-  }
-  const preflightWarnings: string[] = []
-  const slotFindings: PreflightFinding[] = []
-  for (const [slotIndex, containerId] of liveContainers.entries()) {
-    // Slot 0 pays for the whole probe; every other slot is checked for the one
-    // thing that is genuinely per-slot — its own credential mounts. Skipping
-    // them entirely is how a pool with zero credentials reported preflight ok.
-    slotFindings.push(...(await preflightDockerSlot(
-      slotIndex === 0 ? target : preflightTargetFor(cfg, bin, slotIndex),
-      containerId,
-      undefined,
-      preflightWarnings,
-      slotIndex === 0 ? {} : { scope: 'credentials' },
-    )))
-  }
-  if (slotFindings.length > 0) {
-    await pool.destroy()
-    throw new DockerPreflightError(cfg.name, slotFindings)
-  }
-  for (const warning of preflightWarnings) console.warn(`[${cfg.name}-pool] WARNING: ${warning}`)
-  // The summary may not claim more than the probes established. Measured on this
-  // host: two WARNING lines saying the credential volumes hold no auth.json,
-  // followed immediately by "credential mounts ... all verified in-slot" — a
-  // success message contradicting the warnings above it, in the same log, which
-  // is the same defect as a 200 on a failed request.
-  console.log(
-    preflightWarnings.length === 0
-      ? `[${cfg.name}-pool] preflight ok on ${liveContainers.length} slot(s) — image, credential mounts, HOME, ` +
-        `workspace ${cfg.workspaceRoot}, and \`${bin} --version\` all verified in-slot`
-      : `[${cfg.name}-pool] preflight passed with ${preflightWarnings.length} warning(s) on ` +
-        `${liveContainers.length} slot(s) — image, HOME, workspace ${cfg.workspaceRoot} and ` +
-        `\`${bin} --version\` verified in-slot; the warnings above are NOT verified and /health reports them`,
-  )
-
-  // Recorded only here: after the network was verified AND a pool of live slots
-  // was actually created on it. Anything earlier would let the chat route
-  // report a jail for containers that do not exist.
-  if (netJail) extras.netJail.set(routeName, { network: netJail.network, allow: netJail.allow })
-
-  return createDockerSpawner({
-    pool,
-    oauthMode: cfg.oauthMode ?? 'share',
-    containerConfigDir: cfg.containerConfigDir,
-    backend: cfg.name,
-    envPrefix: cfg.name.toUpperCase(),
-    ...(cfg.workspaceRoot ? { workspaceRoot: cfg.workspaceRoot } : {}),
-    // The readiness probe must judge the SAME configuration the pool received,
-    // for the slot it actually acquires — so it is derived here, from these
-    // values, rather than reconstructed inside the executor.
-    preflightTarget: (slotIndex) => preflightTargetFor(cfg, bin, slotIndex),
-  })
 }
 
 export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?: StartServerOptions['hub']): Promise<{
@@ -330,7 +83,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   extras: BuildAppExtras
 }> {
   const sessions = new SessionStore(config.dataDir)
-  const extras: BuildAppExtras = { shutdownHooks: [], netJail: new Map() }
+  const extras: BuildAppExtras = { shutdownHooks: [] }
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -341,9 +94,6 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   extras.shutdownHooks.push(async () => await runs.shutdown())
-  // Validate the durable maintenance owner before any backend provisions Docker slots.
-  const poolMaintenance = new PoolMaintenance(config.dataDir)
-  extras.shutdownHooks.push(async () => await poolMaintenance.close())
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
     extras.shutdownHooks.push(() => durableWriter.close())
@@ -366,9 +116,8 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   for (const [name, harness] of localHarnesses) {
     if (!config.backends.has(name)) continue
     const bin = config[`${name}Bin`]
-    const spawner = await buildExecutorForBackend(config.executors[name], harness, extras, bin, config)
     registry.register(createLocalBackend(config, name, {
-      stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}), ...(spawner ? { spawner } : {}) }))
+      stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}) }))
   }
   if (config.backends.has('claudish')) {
     if (!config.claudishUrl) {
@@ -469,7 +218,6 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       await nativeCatalog.admit(request, backend, signal)
       return hub?.prepare(request, signal, backend)
     },
-    netJail: extras.netJail,
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
       maxToolSpans: config.trace.maxToolSpans,
@@ -478,7 +226,6 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountCadRender(app)
   mountImagesGenerate(app)
   mountMetrics(app)
-  mountPoolMaintenance(app, poolMaintenance, Boolean(config.bearer))
 
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
@@ -549,7 +296,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
   const cwd = resolve(options.cwd ?? process.cwd())
   assertListenerConfig(config, true)
   const jailFloor = config.jailMode
-  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends, config.executors) && !(await selectJailBackend().isAvailable())) {
+  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends) && !(await selectJailBackend().isAvailable())) {
     if (config.jailFallback === 'warn') {
       console.warn(`[cli-bridge] WARNING: jail floor '${jailFloor}' is unavailable; requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).`)
     } else {
@@ -662,9 +409,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     if (config.admission.reservedActive > 0 && scope.reserved === 0) console.warn('[cli-bridge] admission reserves a lane but the executor does not; set CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY.')
     console.log(config.trace.enabled ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)` : '[cli-bridge] traces: off (BRIDGE_TRACE=off)')
     console.log(`[cli-bridge] jail default: ${jailFloor}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
-    for (const executor of Object.values(config.executors)) {
-      if (executor.kind === 'docker') console.log(`[cli-bridge] ${executor.name} executor: docker pool size=${executor.poolSize} image=${executor.image}`)
-    }
   }
   return { url, close }
 }

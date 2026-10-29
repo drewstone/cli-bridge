@@ -62,18 +62,13 @@ export const retainedInputPartSchema = z.union([
   }),
 ])
 
-const netJailSchema = z.strictObject({
-  mode: z.enum(['off', 'net-jail']).optional(),
-  allow: z.array(z.string().min(1).max(512)).max(RETAINED_MAX_JSON_ARRAY_LENGTH).optional(),
-})
-
 const hostExecutionSchema = z.strictObject({
   kind: z.literal('host'),
   jail: z.strictObject({
     mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
     root: z.string().max(RETAINED_MAX_CWD_LENGTH).optional(),
   }).optional(),
-  netJail: netJailSchema.optional(),
+  netJail: z.never({ error: 'execution.netJail is no longer supported' }).optional(),
   timeoutMs: z.number().int().positive().max(RETAINED_MAX_EXECUTION_TIMEOUT_MS).optional(),
   /** Executor-slot wait for a resumed turn. Capped again by the executor. */
   acquireTimeoutMs: z.number().int().positive().max(RETAINED_MAX_EXECUTION_TIMEOUT_MS).optional(),
@@ -85,7 +80,7 @@ const sandboxExecutionSchema = z.strictObject({
   gitRef: z.string().min(1).max(512).optional(),
   capability: z.string().min(1).max(256).optional(),
   ttlSeconds: z.number().int().positive().max(31_536_000).optional(),
-  netJail: netJailSchema.optional(),
+  netJail: z.never({ error: 'execution.netJail is no longer supported' }).optional(),
   timeoutMs: z.number().int().positive().max(RETAINED_MAX_EXECUTION_TIMEOUT_MS).optional(),
 })
 

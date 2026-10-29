@@ -10,8 +10,6 @@
 import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailPathList } from './jail/resolve-spec.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
-import { assertDockerNetworkName } from './executors/docker-network.js'
-import { formatAllowEntry, parseAllowList } from './jail/net-allowlist.js'
 
 const maxExecutionTimeoutMs = 2_147_483_647
 export const maxCodexSubscriptionTurnMs = 4 * 60 * 60 * 1000
@@ -90,30 +88,6 @@ export interface Config extends NativeHarnessConfig {
   /** Operator timeout fallback sent to sandbox-api when the caller omits one. Zero means none. */
   sandboxTimeoutMs: number
   /**
-   * Per-backend executor configuration. Every subprocess backend
-   * (claude, kimi, codex, opencode, gemini, …) reads its own slot from this
-   * map at startup. `host` (default) spawns the CLI on the host;
-   * `docker` provisions a pool of pre-warmed containers and dispatches
-   * each chat() via `docker exec`.
-   *
-   * Env keys per backend `<NAME>` (uppercased, e.g. CLAUDE, KIMI):
-   *   `<NAME>_EXECUTOR=host|docker`
-   *   `<NAME>_DOCKER_IMAGE=<image-tag>`
-   *   `<NAME>_DOCKER_POOL_SIZE=<n>`
-   *   `<NAME>_DOCKER_OAUTH_MOUNT=share|per-slot`
-   *   `<NAME>_DOCKER_NAME_PREFIX=<prefix>`
-   *   `<NAME>_DOCKER_HOST_CONFIG_DIR=<host path>`  (share mode only)
-   *   `<NAME>_DOCKER_CONTAINER_CONFIG_DIR=<container path>`  (mount target)
-   *   `<NAME>_DOCKER_WORKSPACE_ROOT=<absolute host path>`  (read-write, same container path)
-   *   `<NAME>_DOCKER_NETWORK=<existing Docker network name>`
-   *   `<NAME>_DOCKER_USER=<positive uid>:<positive gid>`  (non-root container identity)
-   *   `<NAME>_DOCKER_HOME=<absolute container path>`  (required with Docker user)
-   *
-   * `BRIDGE_DEFAULT_EXECUTOR` sets the fallback for backends that don't
-   * override individually. Default: host.
-   */
-  executors: Record<string, BackendExecutorConfig>
-  /**
    * Default jail mode for host-executed CLIs, from `BRIDGE_JAIL_MODE`
    * (off|write-jail|fs-jail, default off; `WORKER_FS_JAIL=1` is a shorthand
    * for fs-jail). A per-request `execution.jail.mode` may raise (never lower)
@@ -137,27 +111,6 @@ export interface Config extends NativeHarnessConfig {
   jailReadablePaths: string[]
   /** Operator extra writable binds for jailed workers (`BRIDGE_JAIL_RW_PATHS`), validated at boot. */
   jailWritablePaths: string[]
-  /**
-   * Default net-jail mode, from `BRIDGE_NET_JAIL_MODE` (off|net-jail, default
-   * off; `WORKER_NET_JAIL=1` is a shorthand for net-jail). Sibling of
-   * {@link Config.jailMode}: fs-jail confines what a worker can READ, net-jail
-   * confines where it can CONNECT. In `net-jail` every worker container runs on
-   * an internal Docker network with no route off it, and reaches only an
-   * allowlist that always contains its own model endpoint.
-   *
-   * Docker-only, by construction. A CLI spawned on the host shares the host's
-   * network namespace and there is no unprivileged way to give it a partial
-   * egress policy, so this setting REFUSES to load alongside a host-executed
-   * backend rather than reporting a policy it cannot apply.
-   */
-  netJailMode: 'off' | 'net-jail'
-  /**
-   * Extra `host` or `host:port` tokens added to every net-jail allowlist, from
-   * `BRIDGE_NET_JAIL_ALLOW`. The model endpoint is derived automatically and
-   * does not belong here; this is for the rest (a package registry, an internal
-   * service) that a specific workload legitimately needs.
-   */
-  netJailAllow: string[]
   /** OTLP span emission for chat requests. See {@link TraceConfig}. */
   trace: TraceConfig
 }
@@ -183,75 +136,6 @@ export interface TraceConfig {
   maxToolSpans: number
 }
 
-export interface BackendExecutorConfig {
-  /** Backend name, lowercase: 'claude', 'kimi', 'codex', 'opencode', … */
-  name: string
-  kind: 'host' | 'docker'
-  /** Docker-only fields. Empty/undefined when kind === 'host'. */
-  image?: string
-  poolSize?: number
-  oauthMode?: 'share' | 'per-slot'
-  namePrefix?: string
-  /** Host path that gets bind-mounted (share mode). */
-  hostConfigDir?: string
-  /** Mount target inside the container, e.g. /root/.claude or /root/.config/opencode. */
-  containerConfigDir?: string
-  /** Optional numeric non-root identity used by the pool container and every docker exec. */
-  containerUser?: string
-  /** Writable HOME exposed to the configured container identity. */
-  containerHome?: string
-  /**
-   * Additional credential/state directories this CLI reads, mounted at the same
-   * HOME-relative path. opencode is the measured case: config lives in
-   * ~/.config/opencode but auth.json lives in ~/.local/share/opencode, so
-   * mounting only the config dir gives the container a pool with NO credentials
-   * in it — the CLI starts, authenticates against nothing, and the caller reads
-   * the empty completion as a model problem.
-   */
-  extraMounts?: Array<{ host: string; container: string }>
-  /**
-   * Path, relative to the container HOME, of the file whose presence proves the
-   * CLI can authenticate. Checked by the startup preflight against the mount it
-   * belongs to.
-   */
-  credentialFile?: string
-  /**
-   * Canonical host directory exposed read-write to Docker workers at the
-   * identical absolute path. Requests with a cwd outside this root fail.
-   * Always set for a docker executor: without a mounted directory a request
-   * that names no cwd has nowhere to run, and the bridge used to answer it by
-   * refusing the request for the bridge's OWN working directory.
-   */
-  workspaceRoot?: string
-  /** Existing Docker network joined by every pool container. */
-  network?: string
-}
-
-/** Backends that never spawn a CLI on the host (remote HTTP, local proxy, or a
- * socket to an already-running daemon), so the host write-jail never applies. */
-const NON_HOST_SPAWN_BACKENDS = new Set(['sandbox', 'passthrough', 'nanoclaw'])
-
-/**
- * Whether any ENABLED backend will spawn a CLI on the host (and therefore be
- * subject to the write-jail). True unless every enabled backend is remote/proxy
- * or pinned to a docker executor. Errs toward true: an unrecognized backend is
- * assumed to host-spawn, so the startup jail check fails closed rather than
- * booting "healthy" and failing every request at runtime. Covers backends that
- * are NOT in `executors` (e.g. ACP hermes/openclaw, factory, amp, forge), which
- * default to host spawn.
- */
-export function anyBackendSpawnsOnHost(
-  backends: Iterable<string>,
-  executors: Record<string, BackendExecutorConfig>,
-): boolean {
-  for (const name of backends) {
-    if (NON_HOST_SPAWN_BACKENDS.has(name)) continue
-    if (executors[name]?.kind === 'docker') continue
-    return true
-  }
-  return false
-}
-
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
 
 /** Shared listener safety for environment and embedded callers; only embedding permits port 0. */
@@ -272,6 +156,10 @@ export function assertListenerConfig(
   }
 }
 
+export function anyBackendSpawnsOnHost(backends: Iterable<string>): boolean {
+  return [...backends].some((name) => !['sandbox', 'passthrough', 'nanoclaw'].includes(name))
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const host = env.BRIDGE_HOST ?? '127.0.0.1'
   // 3344 chosen to dodge common dev/services collisions: 8787 was hit
@@ -288,17 +176,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   )
 
   assertListenerConfig({ host, port, bearer })
-  if (backends.has('cursor') && (env.CURSOR_EXECUTOR && env.CURSOR_EXECUTOR !== 'host'
-    || env.BRIDGE_DEFAULT_EXECUTOR === 'docker' || Object.keys(env).some((key) => key.startsWith('CURSOR_DOCKER_')))) {
-    throw new Error('Cursor currently requires host execution; Docker execution is not configured')
-  }
-
   // A caller may own the process deadline through `execution.timeoutMs`.
   // Codex defaults to its bounded native subscription policy; explicit operator/request values win.
   const defaultTimeout = parseExecutionTimeoutMs('CLI_TIMEOUT_MS', env.CLI_TIMEOUT_MS, 0)
-  const executors = parseAllExecutors(env, dataDir)
-  const netJailMode = parseNetJailMode(env)
-  if (netJailMode !== 'off') assertNetJailEnforceable(backends, executors)
+  for (const [key, value] of Object.entries(env)) {
+    if ((key === 'BRIDGE_DEFAULT_EXECUTOR' || /^(CLAUDE|CODEX|KIMI|OPENCODE|GEMINI|CURSOR|PI)_EXECUTOR$/.test(key)) && value && value !== 'host') {
+      throw new Error(`${key}: only host execution is supported`)
+    }
+    if (/^(CLAUDE|CODEX|KIMI|OPENCODE|GEMINI|CURSOR|PI)_DOCKER_/.test(key) && value) throw new Error(`${key}: Docker execution is no longer supported`)
+  }
+  if ((env.BRIDGE_NET_JAIL_MODE && env.BRIDGE_NET_JAIL_MODE !== 'off')
+    || ['1', 'true', 'yes', 'on'].includes((env.WORKER_NET_JAIL ?? '').trim().toLowerCase())
+    || env.BRIDGE_NET_JAIL_ALLOW?.trim()) throw new Error('net-jail is no longer supported')
 
   return {
     host,
@@ -333,15 +222,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
-    executors,
     jailMode: jailFloor({ ...env, BRIDGE_JAIL_MODE: parseJailMode(env.BRIDGE_JAIL_MODE) }),
     jailFallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
     ...resolveJailPathLists(env),
-    netJailMode,
-    // Parsed (not merely split) so an unusable token is rejected at startup
-    // rather than at provisioning time, when it would read as a Docker failure.
-    netJailAllow: parseAllowList(env.BRIDGE_NET_JAIL_ALLOW, 'BRIDGE_NET_JAIL_ALLOW').map(formatAllowEntry),
     trace: parseTraceConfig(env, dataDir),
   }
 }
@@ -446,71 +330,6 @@ function parseJailMode(value: string | undefined): 'off' | 'write-jail' | 'fs-ja
   throw new Error(`invalid BRIDGE_JAIL_MODE: ${value} — expected off|write-jail|fs-jail`)
 }
 
-function parseNetJailMode(env: NodeJS.ProcessEnv): 'off' | 'net-jail' {
-  const value = env.BRIDGE_NET_JAIL_MODE
-  if (value !== undefined && value !== '' && value !== 'off' && value !== 'net-jail') {
-    throw new Error(`invalid BRIDGE_NET_JAIL_MODE: ${value} — expected off|net-jail`)
-  }
-  const shorthand = ['1', 'true', 'yes', 'on'].includes((env.WORKER_NET_JAIL ?? '').trim().toLowerCase())
-  return value === 'net-jail' || shorthand ? 'net-jail' : 'off'
-}
-
-/**
- * Refuse to load a net-jail the bridge cannot enforce.
- *
- * Two contradictions, both fatal rather than warned:
- *
- *   - A backend that spawns its CLI on the host. That process shares the host's
- *     network namespace; there is no unprivileged mechanism that gives it an
- *     egress allowlist, and a proxy variable it can `unset` is not one. Booting
- *     with the setting accepted would report a network policy to every caller
- *     while enforcing nothing — the failure this feature exists to remove.
- *   - A backend pinned to an operator's own `<NAME>_DOCKER_NETWORK`. A worker
- *     joins exactly one network at creation, and joining a routable one is
- *     indistinguishable from having no jail at all.
- */
-function assertNetJailEnforceable(
-  backends: Set<string>,
-  executors: Record<string, BackendExecutorConfig>,
-): void {
-  const hostSpawned = [...backends].filter(
-    (name) => !NON_HOST_SPAWN_BACKENDS.has(name) && executors[name]?.kind !== 'docker',
-  )
-  if (hostSpawned.length > 0) {
-    // <NAME>_EXECUTOR=docker is only a real remedy for backends with a docker execution
-    // mode; suggesting it for the rest sends the operator in a loop on the same refusal.
-    const dockerCapable = hostSpawned.filter((n) => SUPPORTED_EXECUTOR_BACKENDS.includes(n))
-    const hostOnly = hostSpawned.filter((n) => !SUPPORTED_EXECUTOR_BACKENDS.includes(n))
-    const remedies = [
-      ...(dockerCapable.length > 0
-        ? ['set ' + dockerCapable.map((n) => `${n.toUpperCase()}_EXECUTOR=docker`).join(' / ')]
-        : []),
-      ...(hostOnly.length > 0
-        ? [
-            `${hostOnly.join(', ')} ${hostOnly.length === 1 ? 'has' : 'have'} no docker execution mode — ` +
-              'drop it from BRIDGE_BACKENDS',
-          ]
-        : []),
-    ]
-    throw new Error(
-      `net-jail is enabled (BRIDGE_NET_JAIL_MODE / WORKER_NET_JAIL) but ${hostSpawned.join(', ')} ` +
-        `${hostSpawned.length === 1 ? 'runs' : 'run'} on the host execution mode, which cannot enforce it: a ` +
-        'host-spawned CLI shares this machine\'s network namespace and any proxy variable it is given can be ' +
-        `unset. ${remedies.join('; or ')}, or unset the net-jail. Refusing to start with a network ` +
-        'policy that would not be applied.',
-    )
-  }
-  for (const cfg of Object.values(executors)) {
-    if (cfg.kind === 'docker' && cfg.network && backends.has(cfg.name)) {
-      throw new Error(
-        `net-jail is enabled but ${cfg.name.toUpperCase()}_DOCKER_NETWORK=${cfg.network} pins its workers to a ` +
-          'routable network. A container joins one network at creation, so the two settings cannot both hold. ' +
-          `Unset ${cfg.name.toUpperCase()}_DOCKER_NETWORK, or unset the net-jail.`,
-      )
-    }
-  }
-}
-
 /**
  * Host-chat admission limits.
  *
@@ -565,274 +384,6 @@ function parseExecutionTimeoutMs(
     throw new Error(`invalid ${key}: expected an integer from 0 to ${maxExecutionTimeoutMs}`)
   }
   return parsed
-}
-
-/** Every executor uses the maintained runtime image unless the operator overrides it. */
-const SHARED_RUNTIME_IMAGE = 'cli-bridge-cli-runtime:latest'
-const DEFAULT_CONTAINER_HOME = '/root'
-
-/** Resolve HOME-relative paths against the actual host/container HOME. */
-interface BackendExecutorDefaults {
-  image: string
-  configRel: string
-  /** Additional native state, such as OpenCode's separate credential directory. */
-  extraRels?: string[]
-  /** Native authentication evidence; absent means preflight requires a nonempty mount. */
-  credentialFile?: string
-}
-
-const BACKEND_EXECUTOR_DEFAULTS: Record<string, BackendExecutorDefaults> = {
-  claude: { image: SHARED_RUNTIME_IMAGE, configRel: '.claude', credentialFile: '.claude/.credentials.json' },
-  kimi: { image: SHARED_RUNTIME_IMAGE, configRel: '.kimi', credentialFile: '.kimi/credentials' },
-  gemini: { image: SHARED_RUNTIME_IMAGE, configRel: '.gemini' },
-  codex: { image: SHARED_RUNTIME_IMAGE, configRel: '.codex', credentialFile: '.codex/auth.json' },
-  opencode: {
-    image: SHARED_RUNTIME_IMAGE,
-    configRel: '.config/opencode',
-    extraRels: ['.local/share/opencode'],
-    credentialFile: '.local/share/opencode/auth.json',
-  },
-  pi: { image: SHARED_RUNTIME_IMAGE, configRel: '.pi/agent', credentialFile: '.pi/agent/auth.json' },
-}
-
-const SUPPORTED_EXECUTOR_BACKENDS = Object.keys(BACKEND_EXECUTOR_DEFAULTS)
-
-/**
- * Every `<NAME>_DOCKER_*` setting the parser understands. Anything else with
- * that shape is REJECTED rather than ignored: `OPENCODE_DOCKER_WORKSPACE_ROOT`
- * was set on a build that did not yet read it, so the bridge accepted the
- * setting, mounted nothing, exec'd into a path that did not exist, and reported
- * exit 127 — "command not found". A setting the bridge silently drops is
- * indistinguishable to the operator from one it honours.
- */
-const KNOWN_DOCKER_SUFFIXES = [
-  'IMAGE',
-  'POOL_SIZE',
-  'OAUTH_MOUNT',
-  'NAME_PREFIX',
-  'HOST_HOME',
-  'HOST_CONFIG_DIR',
-  'CONTAINER_CONFIG_DIR',
-  'WORKSPACE_ROOT',
-  'NETWORK',
-  'USER',
-  'HOME',
-] as const
-
-function parseAllExecutors(env: NodeJS.ProcessEnv, dataDir: string): Record<string, BackendExecutorConfig> {
-  const defaultKind = parseExecutor('BRIDGE_DEFAULT_EXECUTOR', env.BRIDGE_DEFAULT_EXECUTOR, 'host')
-  const out: Record<string, BackendExecutorConfig> = {}
-  for (const name of SUPPORTED_EXECUTOR_BACKENDS) {
-    const defaults = BACKEND_EXECUTOR_DEFAULTS[name]
-    if (!defaults) continue
-    const upper = name.toUpperCase()
-    const kind = parseExecutor(`${upper}_EXECUTOR`, env[`${upper}_EXECUTOR`], defaultKind)
-    assertNoUnknownDockerKeys(env, upper)
-    const workspaceRootKey = `${upper}_DOCKER_WORKSPACE_ROOT`
-    const rawWorkspaceRoot = env[workspaceRootKey]?.trim()
-    const networkKey = `${upper}_DOCKER_NETWORK`
-    const rawNetwork = env[networkKey]
-    const containerUserKey = `${upper}_DOCKER_USER`
-    const containerHomeKey = `${upper}_DOCKER_HOME`
-    const rawContainerUser = env[containerUserKey]?.trim()
-    const rawContainerHome = env[containerHomeKey]?.trim()
-    // Every docker-only key, not just the four that used to be checked: a
-    // `<NAME>_DOCKER_IMAGE` alongside `<NAME>_EXECUTOR=host` was accepted and
-    // dropped, which is the same "accepted but not honoured" failure.
-    const configuredDockerOnlyKey = KNOWN_DOCKER_SUFFIXES
-      .map((suffix) => `${upper}_DOCKER_${suffix}`)
-      .find((key) => (env[key]?.trim() ?? '') !== '')
-    if (configuredDockerOnlyKey && kind !== 'docker') {
-      throw new Error(
-        `${configuredDockerOnlyKey} is set but ${upper}_EXECUTOR is ${kind} — the setting would be ignored. ` +
-          `Set ${upper}_EXECUTOR=docker, or remove ${configuredDockerOnlyKey}.`,
-      )
-    }
-    const cfg: BackendExecutorConfig = { name, kind }
-    if (kind === 'docker') {
-      cfg.image = env[`${upper}_DOCKER_IMAGE`] ?? defaults.image
-      cfg.poolSize = parsePositiveInt(env[`${upper}_DOCKER_POOL_SIZE`], 4)
-      cfg.oauthMode = parseOauthMode(`${upper}_DOCKER_OAUTH_MOUNT`, env[`${upper}_DOCKER_OAUTH_MOUNT`], 'share')
-      cfg.namePrefix = env[`${upper}_DOCKER_NAME_PREFIX`] ?? `cli-bridge-${name}-pool`
-      // The host directory treated as this CLI's home for credential purposes.
-      // One knob for the whole mount set, because the set only makes sense
-      // together: it is one CLI's home seen from the host and from the container.
-      // Needed because the credential/state directory is also where the CLI keeps
-      // its database — measured, ~/.local/share/opencode/opencode.db is 36 GB on
-      // this host — so an operator has to be able to point the pool at a prepared
-      // directory instead of the personal one.
-      const hostHomeKey = `${upper}_DOCKER_HOST_HOME`
-      const rawHostHome = env[hostHomeKey]?.trim()
-      if (rawHostHome !== undefined && rawHostHome !== '' && !isAbsolute(rawHostHome)) {
-        throw new Error(
-          `${hostHomeKey}=${rawHostHome} must be an absolute host path: it is bind-mounted into every pool ` +
-            `container, and a relative path would resolve against whatever directory the bridge was started in.`,
-        )
-      }
-      const hostBase = rawHostHome || env.HOME || DEFAULT_CONTAINER_HOME
-      cfg.hostConfigDir = resolve(env[`${upper}_DOCKER_HOST_CONFIG_DIR`] ?? `${hostBase}/${defaults.configRel}`)
-      if (rawNetwork !== undefined && rawNetwork !== '') {
-        cfg.network = assertDockerNetworkName(rawNetwork, networkKey)
-      }
-      if (Boolean(rawContainerUser) !== Boolean(rawContainerHome)) {
-        throw new Error(`${containerUserKey} and ${containerHomeKey} must be configured together`)
-      }
-      if (rawContainerUser && rawContainerHome) {
-        cfg.containerUser = parseDockerUser(containerUserKey, rawContainerUser)
-        cfg.containerHome = parseDockerHome(containerHomeKey, rawContainerHome)
-      }
-      // Resolve the mount target against the home the CLI will actually have,
-      // so the default cannot point at another user's home.
-      const containerHome = cfg.containerHome ?? DEFAULT_CONTAINER_HOME
-      cfg.containerConfigDir = env[`${upper}_DOCKER_CONTAINER_CONFIG_DIR`] ?? `${containerHome}/${defaults.configRel}`
-      if (cfg.containerUser) {
-        const configRelativeToHome = relative(containerHome, resolve(cfg.containerConfigDir))
-        if (configRelativeToHome === ''
-          || configRelativeToHome === '..'
-          || configRelativeToHome.startsWith(`..${sep}`)
-          || isAbsolute(configRelativeToHome)) {
-          throw new Error(
-            `${upper}_DOCKER_CONTAINER_CONFIG_DIR=${cfg.containerConfigDir} is outside ` +
-              `${containerHomeKey}=${containerHome}, so a CLI running as ${cfg.containerUser} would never read it. ` +
-              `Use a path under ${containerHome}, or unset ${containerUserKey}/${containerHomeKey} to run as the ` +
-              `image's root identity.`,
-          )
-        }
-      }
-      // Every further credential directory the CLI reads, at the same
-      // HOME-relative path on both sides so `<cli> auth login` inside a
-      // container writes where the host mount can see it.
-      const extraMounts = (defaults.extraRels ?? []).map((rel) => ({
-        host: resolve(`${hostBase}/${rel}`),
-        container: `${containerHome}/${rel}`,
-      }))
-      if (extraMounts.length > 0) cfg.extraMounts = extraMounts
-      if (defaults.credentialFile) cfg.credentialFile = defaults.credentialFile
-      // A docker executor ALWAYS has a workspace. Without one, a request that
-      // names no cwd has no container-visible directory to run in, and the
-      // bridge answered it by refusing the caller's request for the bridge's
-      // own working directory — a remedy the HTTP API cannot express.
-      cfg.workspaceRoot = rawWorkspaceRoot
-        ? parseDockerWorkspaceRoot(workspaceRootKey, rawWorkspaceRoot)
-        : join(dataDir, 'workspace', name)
-      assertDockerMountsDoNotOverlap(
-        workspaceRootKey,
-        cfg.workspaceRoot,
-        cfg.hostConfigDir,
-        cfg.containerConfigDir,
-      )
-    }
-    out[name] = cfg
-  }
-  return out
-}
-
-/**
- * Reject a `<NAME>_DOCKER_*` variable the parser does not read. A typo or a
- * variable from a newer/older build is otherwise indistinguishable from a
- * setting that took effect, which is how a configured workspace root ended up
- * never mounted while the bridge reported healthy.
- */
-function assertNoUnknownDockerKeys(env: NodeJS.ProcessEnv, upper: string): void {
-  const prefix = `${upper}_DOCKER_`
-  const known = new Set<string>(KNOWN_DOCKER_SUFFIXES)
-  for (const key of Object.keys(env)) {
-    if (!key.startsWith(prefix)) continue
-    const suffix = key.slice(prefix.length)
-    if (known.has(suffix)) continue
-    throw new Error(
-      `unknown setting ${key} — cli-bridge does not read it, so it would have no effect. ` +
-        `Supported ${prefix}* settings: ${KNOWN_DOCKER_SUFFIXES.join(', ')}.`,
-    )
-  }
-}
-
-function parseDockerUser(key: string, value: string): string {
-  const match = /^([1-9][0-9]*):([1-9][0-9]*)$/u.exec(value)
-  const uid = Number(match?.[1])
-  const gid = Number(match?.[2])
-  if (!match || !Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid > 2_147_483_647 || gid > 2_147_483_647) {
-    throw new Error(`invalid ${key}: expected positive numeric uid:gid`)
-  }
-  return `${uid}:${gid}`
-}
-
-function parseDockerHome(key: string, value: string): string {
-  if (!isAbsolute(value) || value === '/' || value.includes(',')) {
-    throw new Error(`invalid ${key}: expected an absolute non-root path without commas`)
-  }
-  return resolve(value)
-}
-
-function canonicalOrResolvedPath(value: string): string {
-  try {
-    return realpathSync(value)
-  } catch {
-    return resolve(value)
-  }
-}
-
-function pathsOverlap(left: string, right: string): boolean {
-  const rel = relative(left, right)
-  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
-}
-
-function assertDockerMountsDoNotOverlap(
-  workspaceKey: string,
-  workspaceRoot: string,
-  hostConfigDir: string,
-  containerConfigDir: string,
-): void {
-  const canonicalHostConfig = canonicalOrResolvedPath(hostConfigDir)
-  if (pathsOverlap(workspaceRoot, canonicalHostConfig) || pathsOverlap(canonicalHostConfig, workspaceRoot)) {
-    throw new Error(
-      `invalid ${workspaceKey}: workspace and host OAuth/config directories must not overlap`,
-    )
-  }
-  if (!isAbsolute(containerConfigDir)) {
-    throw new Error(`invalid ${workspaceKey}: Docker config mount target must be absolute`)
-  }
-  const canonicalContainerConfig = resolve(containerConfigDir)
-  if (pathsOverlap(workspaceRoot, canonicalContainerConfig) || pathsOverlap(canonicalContainerConfig, workspaceRoot)) {
-    throw new Error(
-      `invalid ${workspaceKey}: workspace and container OAuth/config directories must not overlap`,
-    )
-  }
-}
-
-function parseDockerWorkspaceRoot(key: string, value: string): string {
-  if (!isAbsolute(value)) {
-    throw new Error(`invalid ${key}: expected an absolute path, got ${value}`)
-  }
-  if (value.includes(',')) {
-    throw new Error(`invalid ${key}: commas are not supported in Docker bind paths`)
-  }
-
-  let canonical: string
-  try {
-    canonical = realpathSync(value)
-  } catch {
-    throw new Error(`invalid ${key}: path does not exist: ${value}`)
-  }
-  if (!statSync(canonical).isDirectory()) {
-    throw new Error(`invalid ${key}: path is not a directory: ${value}`)
-  }
-  if (canonical === parse(canonical).root) {
-    throw new Error(`invalid ${key}: refusing to expose filesystem root ${canonical}`)
-  }
-  return canonical
-}
-
-function parseExecutor(key: string, value: string | undefined, fallback: 'host' | 'docker'): 'host' | 'docker' {
-  if (value === 'host' || value === 'docker') return value
-  if (value === undefined || value === '') return fallback
-  throw new Error(`invalid ${key}: ${value} — expected host|docker`)
-}
-
-function parseOauthMode(key: string, value: string | undefined, fallback: 'share' | 'per-slot'): 'share' | 'per-slot' {
-  if (value === 'share' || value === 'per-slot') return value
-  if (value === undefined || value === '') return fallback
-  throw new Error(`invalid ${key}: ${value} — expected share|per-slot`)
 }
 
 /**

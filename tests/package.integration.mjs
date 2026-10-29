@@ -101,26 +101,6 @@ test('packed production install embeds isolated HTTP services and runs the exist
     assert.equal(existsSync(join(partialDirectory, '.cli-bridge-data-directory.pid')), false);
     const recoveredPartial = await open(partialDirectory);
     await recoveredPartial.close();
-    const maintenanceDirectory = join(process.cwd(), 'maintenance');
-    const legacyDirectory = join(process.cwd(), 'legacy');
-    mkdirSync(maintenanceDirectory, { mode: 0o700 });
-    mkdirSync(legacyDirectory, { mode: 0o700 });
-    const record = (prefix, legacyDataDir) => ({ prefix, legacyDataDir,
-      expectedImage: 'sha256:' + 'a'.repeat(64), image: 'sha256:' + 'a'.repeat(64),
-      legacyPorts: [1], slots: [{ index: 0, id: 'b'.repeat(64) }], rolls: {} });
-    writeFileSync(join(maintenanceDirectory, 'pool-maintenance.json'), JSON.stringify({ schema: 1,
-      pools: [record('cli-bridge-package-rollback', legacyDirectory),
-        record('cli-bridge-package-missing', join(process.cwd(), 'missing-legacy'))] }), { mode: 0o600 });
-    await assert.rejects(open(maintenanceDirectory), { code: 'ENOENT' });
-    assert.equal(existsSync(join(legacyDirectory, '.cli-bridge-data-directory.pid')), false);
-    const recoveredLegacy = await open(legacyDirectory);
-    try {
-      const metrics = await (await fetch(recoveredLegacy.url + '/metrics', {
-        headers: { authorization: 'Bearer ' + bearer },
-      })).json();
-      assert.equal(metrics.pools['cli-bridge-package-rollback'], undefined);
-      assert.deepEqual(events.map((event) => process.listeners(event)), before);
-    } finally { await recoveredLegacy.close(); }
     const invalidListenerDirectory = join(process.cwd(), 'invalid-listener');
     await assert.rejects(startServer({ config: { ...base, port: 0, bearer,
       dataDir: invalidListenerDirectory, host: String.fromCharCode(0), asyncDurableWrites: true },

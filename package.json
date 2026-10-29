@@ -29,8 +29,7 @@
     "verify": "tsx scripts/verify.ts",
     "verify:fs-jail": "tsx scripts/verify-fs-jail.ts",
     "install:harness": "sh scripts/install-harness.sh",
-    "install:harnesses": "sh scripts/install-all-harnesses.sh",
-    "docker:build:runtime": "docker build -f docker/Dockerfile.cli-runtime -t cli-bridge-cli-runtime:latest ."
+    "install:harnesses": "sh scripts/install-all-harnesses.sh"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.5",

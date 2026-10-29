@@ -15,30 +15,6 @@
  *   - resolveJailSpec: null when off; root clamped inside cwd.
  */
 
-import { existsSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import {
-  LinuxBwrapJail,
-  MacosSeatbeltJail,
-  NoopJail,
-  registerJailEnvironment,
-  registerJailReadable,
-  resolveJailRoot,
-} from '../src/jail/index.js'
-import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
-import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
-import { applyJail } from '../src/executors/jail-support.js'
-import {
-  authSourcesFor,
-  copyAuthIntoJail,
-  removeStaleAuthCopies,
-} from '../src/jail/auth-preserve.js'
-import { ignoreJailRoot } from '../src/jail/types.js'
-import { anyBackendSpawnsOnHost } from '../src/config.js'
-import type { BackendExecutorConfig } from '../src/config.js'
 import type { JailBackend } from '../src/jail/index.js'
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
@@ -1069,40 +1045,5 @@ describe('resolveJailSpec', () => {
         resolve(cwd, DEFAULT_JAIL_ROOT),
       )
     }
-  })
-})
-
-describe('anyBackendSpawnsOnHost (startup jail fail-fast gate)', () => {
-  const docker = (name: string): BackendExecutorConfig => ({ name, kind: 'docker' })
-  const host = (name: string): BackendExecutorConfig => ({ name, kind: 'host' })
-
-  it('is true for the default host-CLI backends', () => {
-    expect(anyBackendSpawnsOnHost(new Set(['claude', 'kimi', 'gemini']), {})).toBe(true)
-  })
-
-  it('is true for ACP backends absent from the executor map (hermes/openclaw)', () => {
-    // Regression: hermes/openclaw forward the jailSpec to the host spawner but are
-    // not in config.executors, so an executor-only check missed them and let an
-    // ACP-only write-jail deployment boot "healthy" then fail every request.
-    expect(anyBackendSpawnsOnHost(new Set(['hermes', 'openclaw']), {})).toBe(true)
-    expect(anyBackendSpawnsOnHost(new Set(['sandbox', 'passthrough', 'hermes']), {})).toBe(true)
-  })
-
-  it('is false when every enabled backend is remote/proxy (no host spawn)', () => {
-    expect(anyBackendSpawnsOnHost(new Set(['sandbox', 'passthrough', 'nanoclaw']), {})).toBe(false)
-  })
-
-  it('is false when the only host-CLI backend is pinned to a docker executor', () => {
-    expect(anyBackendSpawnsOnHost(new Set(['claude', 'sandbox']), { claude: docker('claude') })).toBe(false)
-  })
-
-  it('is true when at least one host-CLI backend keeps a host executor', () => {
-    expect(
-      anyBackendSpawnsOnHost(new Set(['claude', 'kimi']), { claude: docker('claude'), kimi: host('kimi') }),
-    ).toBe(true)
-  })
-
-  it('is false for an empty backend set', () => {
-    expect(anyBackendSpawnsOnHost(new Set<string>(), {})).toBe(false)
   })
 })
