@@ -11,6 +11,7 @@ import test from 'node:test'
 const execute = promisify(execFile)
 const repo = resolve(import.meta.dirname, '..')
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+const nativeHarnesses = { claude: 'claude-code', codex: 'codex', opencode: 'opencode', kimi: 'kimi-code', gemini: 'gemini', cursor: 'cursor', pi: 'pi' }
 const command = (program, args, cwd) => execute(program, args, { cwd, timeout: 180_000, maxBuffer: 4 * 1024 * 1024 })
 
 test('packed production install embeds isolated HTTP services and runs the existing binary', { timeout: 300_000 }, async (context) => {
@@ -73,11 +74,13 @@ test('packed production install embeds isolated HTTP services and runs the exist
     const directory = join(process.cwd(), 'state');
     const base = loadConfig({ BRIDGE_DATA_DIR: directory, BRIDGE_BACKENDS: '', BRIDGE_TRACE: 'off' });
     const missingConfig = { ...base };
-    for (const name of ['claude', 'codex', 'opencode', 'kimi', 'gemini', 'cursor', 'pi']) missingConfig[name + 'Bin'] = join(process.cwd(), 'not-installed-' + name);
+    const nativeHarnesses = ${JSON.stringify(nativeHarnesses)};
+    for (const name of Object.keys(nativeHarnesses)) missingConfig[name + 'Bin'] = join(process.cwd(), 'not-installed-' + name);
     const missing = await detectLocalSeats({ config: missingConfig, env: { HOME: join(process.cwd(), 'missing-home'), PATH: process.env.PATH }, flags: ['--setting-sources', ''] });
+    assert.deepEqual(missing.map((seat) => seat.harness).sort(), Object.values(nativeHarnesses).sort());
     assert.ok(missing.every((seat) => seat.status === 'missing' && seat.authMode === 'unknown'));
     assert.equal(existsSync(directory), false);
-    const localModels = await listLocalModels({ config: { ...missingConfig, backends: new Set(['claude', 'codex', 'opencode', 'kimi', 'gemini', 'cursor', 'pi']) } });
+    const localModels = await listLocalModels({ config: { ...missingConfig, backends: new Set(Object.keys(nativeHarnesses)) } });
     assert.deepEqual(localModels, []);
     assert.equal(existsSync(directory), false);
     await assert.rejects(listLocalModels({ config: missingConfig, signal: AbortSignal.abort() }), { name: 'AbortError' });
@@ -195,10 +198,12 @@ test('packed production install embeds isolated HTTP services and runs the exist
   const inventory = await execute(process.execPath, [join(root, 'node_modules/cli-bridge', manifest.bin['cli-bridge']), '--seats', '--json'], {
     cwd: root, timeout: 30_000, maxBuffer: 65536,
     env: { ...process.env, BRIDGE_DATA_DIR: state, ...Object.fromEntries(
-      ['CLAUDE', 'CODEX', 'OPENCODE', 'KIMI', 'GEMINI', 'CURSOR', 'PI'].map((name) => [name + '_BIN', join(root, 'missing-' + name)]),
+      Object.keys(nativeHarnesses).map((name) => [name.toUpperCase() + '_BIN', join(root, 'missing-' + name)]),
     ) },
   })
-  assert.ok(JSON.parse(inventory.stdout).every((seat) => seat.status === 'missing'))
+  const seats = JSON.parse(inventory.stdout)
+  assert.deepEqual(seats.map((seat) => seat.harness).sort(), Object.values(nativeHarnesses).sort())
+  assert.ok(seats.every((seat) => seat.status === 'missing'))
   const child = spawn(process.execPath, [join(root, 'node_modules/cli-bridge', manifest.bin['cli-bridge'])], {
     cwd: root, env: { ...process.env, BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: '',
       BRIDGE_PORT: String(port), BRIDGE_HOST: '127.0.0.1', BRIDGE_TRACE: 'off',
