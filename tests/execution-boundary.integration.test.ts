@@ -19,6 +19,9 @@ test('real HTTP boundaries refuse removed network confinement before creating se
       const retained = await post('/v1/sessions', { id: 'net-jail-refusal', model: 'codex/gpt-5', execution })
       expect(retained.status).toBe(400)
       expect(await retained.text()).toContain('execution.netJail is no longer supported')
+      const turn = await post('/v1/sessions/net-jail-refusal/turns', { message: 'must not execute', run_id: 'refused-turn', execution })
+      expect(turn.status).toBe(400)
+      expect(await turn.text()).toContain('execution.netJail is no longer supported')
     }
     const metrics = await fetch(server.url + '/metrics', { headers })
     expect(metrics.status).toBe(200)

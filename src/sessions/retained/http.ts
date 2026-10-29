@@ -8,7 +8,6 @@ import { describeRunFailure } from '../../runs/error-shape.js'
 import { ExecutorSaturatedError } from '../../executors/types.js'
 import { setExactRunIdentityHeaders } from '../../runs/headers.js'
 import { lineageChildEnv } from '../../trace/lineage.js'
-import { retainedCancellationAcknowledgement } from './control-acknowledgement.js'
 import { RETAINED_MAX_HTTP_BODY_BYTES } from './schema.js'
 import { RetainedSessionError } from './types.js'
 import type { RetainedSessionService } from '../retained.js'
@@ -16,7 +15,7 @@ import type { RetainedSessionService } from '../retained.js'
 export function mountRetainedSessions(
   app: Hono,
   service: RetainedSessionService,
-  options: { includeSessionList?: boolean; includeRunEvents?: boolean } = {},
+  options: { includeSessionList?: boolean } = {},
 ): void {
   app.get('/v1/capabilities', async (c) => {
     const model = c.req.query('model')
@@ -133,23 +132,6 @@ export function mountRetainedSessions(
     }
   })
 
-  app.post('/v1/sessions/:id/input', async (c) => {
-    try {
-      const result = await service.beginTurn(c.req.param('id'), service.parseTurn(await readBoundedJson(c.req.raw)), {
-        queue: true,
-        signal: c.req.raw.signal,
-        callerId: canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback'),
-        childLineage: lineageChildEnv((name) => c.req.header(name)),
-      })
-      return c.json(
-        { session: service.get(c.req.param('id')), run: result.run, context_boundary: result.contextBoundary },
-        202,
-      )
-    } catch (error) {
-      return retainedError(c, error)
-    }
-  })
-
   app.get('/v1/sessions/:id/events', async (c) => {
     const cursor = parseCursor(c.req.header('last-event-id') ?? c.req.query('cursor'))
     if (!cursor.ok) return c.json({ error: { message: cursor.message, type: 'invalid_replay_cursor' } }, 400)
@@ -176,32 +158,6 @@ export function mountRetainedSessions(
     })
   })
 
-  if (options.includeRunEvents !== false) app.get('/v1/runs/:runId/events', async (c) => {
-    const cursor = parseCursor(c.req.header('last-event-id') ?? c.req.query('cursor'))
-    if (!cursor.ok) return c.json({ error: { message: cursor.message, type: 'invalid_replay_cursor' } }, 400)
-    try {
-      service.assertRunReplayCursor(c.req.param('runId'), cursor.value)
-    } catch (error) {
-      return retainedError(c, error)
-    }
-    const controller = new AbortController()
-    return streamSSE(c, async (stream) => {
-      stream.onAbort(() => controller.abort())
-      try {
-        for await (const item of service.runEvents(c.req.param('runId'), cursor.value, controller.signal)) {
-          await stream.writeSSE({
-            id: String(item.envelope.sequence),
-            event: item.envelope.event.type,
-            data: JSON.stringify(item.envelope),
-          })
-        }
-      } catch (error) {
-        if (!controller.signal.aborted)
-          await stream.writeSSE({ event: 'error', data: JSON.stringify(errorBody(error)) })
-      }
-    })
-  })
-
   app.get('/v1/sessions/:id/status', (c) => {
     try {
       return c.json(service.get(c.req.param('id')))
@@ -216,31 +172,6 @@ export function mountRetainedSessions(
       const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
       const result = await service.steer(c.req.param('id'), body, caller)
       return c.json(result.acknowledgement, result.status as 200 | 400 | 404 | 409 | 501 | 502)
-    } catch (error) {
-      return retainedError(c, error)
-    }
-  })
-
-  app.post('/v1/sessions/:id/cancel', async (c) => {
-    try {
-      const wait = parseWaitMs(c.req.query('wait_ms'))
-      if (!wait.ok) throw new RetainedSessionError(wait.message, 400, 'invalid_request_error')
-      const raw = await readBoundedJson(c.req.raw)
-      const body = service.parseCancel(raw)
-      const caller = canonicalCandidateDigest(c.req.header('authorization') ?? 'loopback')
-      const result = await service.cancel(c.req.param('id'), wait.value, body, caller)
-      return c.json(
-        retainedCancellationAcknowledgement(body, result.acknowledgement),
-        result.status as 200 | 400 | 404 | 409 | 501 | 502,
-      )
-    } catch (error) {
-      return retainedError(c, error)
-    }
-  })
-
-  app.post('/v1/sessions/:id/detach', (c) => {
-    try {
-      return c.json({ detached: true, session: service.detach(c.req.param('id')) })
     } catch (error) {
       return retainedError(c, error)
     }
@@ -327,15 +258,6 @@ function parseCursor(raw: string | undefined): { ok: true; value: number } | { o
   if (!/^(0|[1-9][0-9]*)$/u.test(raw)) return { ok: false, message: 'replay cursor must be a non-negative integer' }
   const value = Number(raw)
   return Number.isSafeInteger(value) ? { ok: true, value } : { ok: false, message: 'replay cursor is too large' }
-}
-
-function parseWaitMs(raw: string | undefined): { ok: true; value: number } | { ok: false; message: string } {
-  if (raw === undefined) return { ok: true, value: 0 }
-  if (!/^(0|[1-9][0-9]*)$/u.test(raw)) return { ok: false, message: 'wait_ms must be a non-negative integer' }
-  const value = Number(raw)
-  return Number.isSafeInteger(value) && value <= 30_000
-    ? { ok: true, value }
-    : { ok: false, message: 'wait_ms must be at most 30000' }
 }
 
 function retainedError(c: Context, error: unknown): Response {

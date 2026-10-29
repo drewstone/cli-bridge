@@ -69,8 +69,7 @@ The retained routes are:
 - `GET /v1/sessions/:id/events` replays normalized session events.
 - `GET /v1/sessions/:id/status` reads the current status.
 - `POST /v1/sessions/:id/steer` sends a mid-turn message when the backend advertises steering.
-- `POST /v1/sessions/:id/cancel` cancels one exact admitted run.
-- `POST /v1/sessions/:id/detach` returns the session without killing its native process.
+- `POST /v1/runs/:id/cancel` cancels one exact admitted run.
 - `POST /v1/sessions/:id/close` closes the native process and owned files.
 - `GET /v1/runs/:runId` reads a live or retained run snapshot.
 - `GET /v1/runs/:runId/events` replays a live or retained run event stream.

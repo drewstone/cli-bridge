@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { agentRunCancellationRequestDigest } from '@tangle-network/agent-interface'
+import { AgentRunCancellationAcknowledgementSchema, agentRunCancellationRequestDigest } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend } from '../src/backends/pi.js'
 import { RunRegistry } from '../src/runs/registry.js'
+import { mountRuns } from '../src/routes/runs.js'
 import { SessionStore } from '../src/sessions/store.js'
 import { RetainedSessionService, mountRetainedSessions } from '../src/sessions/retained.js'
 
@@ -79,6 +80,7 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
     const service = new RetainedSessionService({ store, registry, runs })
     const app = new Hono()
     mountRetainedSessions(app, service)
+    mountRuns(app, { runs, retainedRuns: service, retainedStore: store })
     const model = process.env.CLI_BRIDGE_REAL_PI_MODEL ?? 'pi/deepseek/deepseek-v4-pro'
 
     const created = await app.request('/v1/sessions', {
@@ -151,6 +153,7 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
     const service = new RetainedSessionService({ store, registry, runs })
     const app = new Hono()
     mountRetainedSessions(app, service)
+    mountRuns(app, { runs, retainedRuns: service, retainedStore: store })
     const model = process.env.CLI_BRIDGE_REAL_PI_MODEL ?? 'pi/deepseek/deepseek-v4-pro'
 
     expect((await app.request('/v1/sessions', {
@@ -236,6 +239,7 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
     const service = new RetainedSessionService({ store, registry, runs })
     const app = new Hono()
     mountRetainedSessions(app, service)
+    mountRuns(app, { runs, retainedRuns: service, retainedStore: store })
     const model = process.env.CLI_BRIDGE_REAL_PI_MODEL ?? 'pi/deepseek/deepseek-v4-pro'
     const sessionId = 'real-pi-cancel'
     const runId = 'real-pi-cancel-run'
@@ -244,14 +248,15 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
       method: 'POST',
       body: JSON.stringify({ id: sessionId, model, cwd: dir }),
     })).status).toBe(201)
-    expect((await app.request(`/v1/sessions/${sessionId}/turns`, {
+    const admitted = await app.request(`/v1/sessions/${sessionId}/turns`, {
       method: 'POST',
       body: JSON.stringify({
         message: 'You must use the read tool to read cancel-target.txt before answering.',
         run_id: runId,
         execution_id: 'real-pi-cancel-execution',
       }),
-    })).status).toBe(202)
+    })
+    expect(admitted.status, await admitted.text()).toBe(202)
     await waitFor(
       () => store!.retainedEventsAfter(sessionId).some(item => item.envelope.event.type === 'interaction'),
       180_000,
@@ -275,12 +280,12 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
       ...material,
       requestDigest: agentRunCancellationRequestDigest(material),
     }
-    const cancelled = await app.request(`/v1/sessions/${sessionId}/cancel?wait_ms=5000`, {
+    const cancelled = await app.request(`/v1/runs/${runId}/cancel?wait_ms=5000`, {
       method: 'POST',
       body: JSON.stringify(command),
     })
     expect(cancelled.status).toBe(200)
-    const acknowledgement = await cancelled.json()
+    const acknowledgement = AgentRunCancellationAcknowledgementSchema.parse(await cancelled.json())
     expect(acknowledgement).toMatchObject({
       operationId: material.operationId,
       status: 'accepted',
@@ -297,15 +302,15 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
         .some(item => item.envelope.runId === runId && item.envelope.event.type === 'interaction.cancel'),
     ).toBe(true)
 
-    const replay = await app.request(`/v1/sessions/${sessionId}/cancel?wait_ms=5000`, {
+    const replay = await app.request(`/v1/runs/${runId}/cancel?wait_ms=5000`, {
       method: 'POST',
       body: JSON.stringify(command),
     })
     expect(replay.status).toBe(200)
-    expect(await replay.json()).toEqual(acknowledgement)
+    expect(await replay.json()).toEqual({ ...acknowledgement, status: 'replayed' })
 
     const changedMaterial = { ...material, reason: 'changed cancellation reason' }
-    const changed = await app.request(`/v1/sessions/${sessionId}/cancel?wait_ms=5000`, {
+    const changed = await app.request(`/v1/runs/${runId}/cancel?wait_ms=5000`, {
       method: 'POST',
       body: JSON.stringify({
         ...changedMaterial,
@@ -329,6 +334,7 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
     const service = new RetainedSessionService({ store, registry, runs })
     const app = new Hono()
     mountRetainedSessions(app, service)
+    mountRuns(app, { runs, retainedRuns: service, retainedStore: store })
     const model = process.env.CLI_BRIDGE_REAL_PI_MODEL ?? 'pi/deepseek/deepseek-v4-pro'
     const request = {
       message: 'You must use the read tool to read restart-target.txt before answering. Then reply with exactly: this response must not be resubmitted.',

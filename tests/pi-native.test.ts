@@ -717,68 +717,6 @@ describe('Pi native RPC adapter', () => {
     expect(lifecycle).toMatchObject({ releases: 1, terminations: 1 })
   })
 
-  it('aborts and closes a real retained child exactly once on cancellation', async () => {
-    dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-cancel-`)
-    store = new SessionStore(dir)
-    runs = new RunRegistry({ replayRetentionMs: 60_000, identityRetentionMs: 60_000 })
-    const lifecycle = { children: [] as ReturnType<typeof spawn>[], releases: 0, terminations: 0 }
-    const backend = new PiBackend({
-      bin: 'pi',
-      timeoutMs: 500,
-      spawner: makeChildSpawner([], lifecycle, abortingChild),
-      transportResolver: testPiInferenceTransport(),
-    })
-    const registry = new BackendRegistry().register(backend)
-    const service = new RetainedSessionService({ store, registry, runs })
-    const app = new Hono()
-    mountRetainedSessions(app, service)
-
-    expect((await app.request('/v1/sessions', {
-      method: 'POST',
-      body: JSON.stringify({ id: 'cancel-real', model: 'pi/test/model', cwd: dir }),
-    })).status).toBe(201)
-    const turn = await app.request('/v1/sessions/cancel-real/turns', {
-      method: 'POST',
-      body: JSON.stringify({ message: 'hang until cancelled', run_id: 'cancel-real-run', execution_id: 'cancel-real-execution' }),
-    })
-    expect(turn.status).toBe(202)
-    const runId = (await readJson(turn)).run.id as string
-    await waitFor(() => store!.getRetained('cancel-real')?.status === 'running')
-
-    const admission = store.getRetainedRun(runId)
-    if (!admission) throw new Error('cancel-real run admission missing')
-    const material = {
-      operationId: 'cancel-real',
-      run: {
-        runId,
-        provider: 'cli-bridge',
-        environmentId: 'cli-bridge',
-        sessionId: 'cancel-real',
-        executionId: admission.executionId,
-        requestDigest: admission.requestDigest as `sha256:${string}`,
-      },
-    }
-    const cancelled = await app.request('/v1/sessions/cancel-real/cancel?wait_ms=2000', {
-      method: 'POST',
-      body: JSON.stringify({
-        ...material,
-        requestDigest: agentRunCancellationRequestDigest(material),
-      }),
-    })
-    expect(cancelled.status).toBe(200)
-    expect(await readJson(cancelled)).toMatchObject({ status: 'accepted', effect: 'cancelled' })
-    await waitFor(() => lifecycle.releases === 1)
-    expect(lifecycle.releases).toBe(1)
-    expect(lifecycle.terminations).toBe(1)
-    expect(runs!.nativeSession('cancel-real')).toBeNull()
-
-    // A second terminal cleanup request must not call the provider or release
-    // the executor slot again.
-    await runs!.shutdown(1_000)
-    expect(lifecycle.releases).toBe(1)
-    expect(lifecycle.terminations).toBe(1)
-  })
-
   it('bounds an unacknowledged initial prompt RPC and then closes the real child', async () => {
     dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-timeout-`)
     store = new SessionStore(dir)

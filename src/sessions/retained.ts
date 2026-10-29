@@ -362,10 +362,6 @@ export class RetainedSessionService {
     return this.control.cancel(id, waitMs, request, callerId)
   }
 
-  detach(id: string): RetainedSessionView {
-    return this.get(id)
-  }
-
   async shutdown(timeoutMs = 5_000): Promise<void> {
     await this.turns.awaitFinalizations(timeoutMs)
   }
