@@ -44,7 +44,7 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
       ? ['auth', 'check', '--provider', options.provider, ...(options.model ? ['--model', options.model] : []), '--json', '--no-refresh'] : args
     const fact: LocalSeat = { harness, provider: null, status: 'unknown', authMode: 'unknown',
       source: key === 'kimi' || key === 'gemini' ? 'native_store' : 'native_status', fix }
-    const native = await (key === 'claude' ? readClaudeNativeContext({ cwd: options.cwd ?? process.cwd(), env, flags: options.flags ?? [] }) : Promise.resolve({ env: key === 'cursor' ? await cursorEnvironment(env) : env, flags: [], settings: [] as Record<string, unknown>[] })).catch(() => null)
+    const native = await (key === 'claude' ? readClaudeNativeContext({ cwd: options.cwd ?? process.cwd(), env, flags: options.flags ?? [] }) : Promise.resolve().then(async () => ({ env: key === 'cursor' ? await cursorEnvironment(env) : env, flags: [], settings: [] as Record<string, unknown>[] }))).catch(() => null)
     if (!native) return fact
     if (key === 'claude') {
       const { env, settings } = native
