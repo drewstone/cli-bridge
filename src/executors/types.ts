@@ -1,24 +1,4 @@
-/**
- * Executor — the abstraction over "how do we spawn a CLI subprocess for
- * a chat() call?".
- *
- * Backends use a `Spawner` rather than calling node's `spawn` directly.
- * That lets us swap in a Docker-backed spawner without each backend
- * caring whether the CLI lives on the host or inside an isolated
- * container.
- *
- *   Spawner = (bin, args, opts) → ChildLike + release()
- *
- * Why async + a `release()` callback?
- *   - Docker variants ACQUIRE a pool slot before spawning. Acquisition
- *     can block waiting for a free slot; that's intrinsically async.
- *   - When the chat() call finishes, the slot must be returned to the
- *     pool. The backend doesn't know about pools, so it just calls
- *     `release()` in its `finally` block.
- *
- * Host (non-pooled) spawners are still trivially async — they wrap
- * node's sync spawn and return a no-op release.
- */
+/** Process spawning, lifetime, and host admission contracts shared by native backends. */
 
 import type { ChildProcess } from 'node:child_process'
 import type { EffectiveNativeStore, JailSpec } from '../jail/types.js'
@@ -92,8 +72,6 @@ export interface SpawnOpts {
   cwd?: string
   /** Env to set on the child. */
   env?: NodeJS.ProcessEnv
-  /** Codex MCP config written through stdin into the acquired Docker slot. */
-  dockerCodexConfig?: string
   /**
    * Exact names in `env` that the backend resolved for THIS request and that
    * must reach the child even though the host sanitizer's allowlist does not
@@ -169,35 +147,11 @@ export interface SpawnResult {
    * error here to surface it as a BackendError.
    */
   spawnError?(): Error | null
-  /**
-   * Explain a non-zero exit that the EXECUTOR caused rather than the CLI.
-   *
-   * The Docker executor runs the CLI through `docker exec`, which returns 127
-   * both for "the workdir does not exist inside the container" and for "the
-   * binary is not on PATH", and 126 both for "not executable" and "permission
-   * denied". Reporting that status as a CLI exit ("opencode exited 127") states
-   * a CLI failure for a CLI that never started, and points every reader at the
-   * wrong half of the system.
-   *
-   * Implementations probe the container and return a one-line cause + remedy,
-   * or null when the status genuinely came from the CLI — callers then keep
-   * their own wording. Host executors do not implement this; `describeCliExit`
-   * handles its absence.
-   */
+  /** Optional executor-specific diagnosis of a failed launch. */
   diagnoseExit?(exitCode: number | null, stderr: string): Promise<string | null>
 }
 
-/**
- * Build the message for a non-zero CLI exit, giving the executor a chance to
- * replace an ambiguous status with a named cause first.
- *
- * Every subprocess backend ends with the same shape — `<cli> exited <code>:
- * <stderr>` — and that shape is exactly what turns an executor-level failure
- * into a CLI-level accusation. Routing all of them through one helper means a
- * new executor's diagnosis reaches every backend at once, and the fallback is
- * byte-identical to what each backend printed before. A `null` exit status is a
- * signal death and names the signal instead of printing `exited null`.
- */
+/** Describe a failed native child, preserving signal and diagnostic information. */
 export async function describeCliExit(
   spawned: Pick<SpawnResult, 'diagnoseExit'>,
   label: string,
@@ -248,48 +202,15 @@ export interface ExecutorReadiness {
 
 export interface Spawner {
   (bin: string, args: string[], opts: SpawnOpts): Promise<SpawnResult>
-  /**
-   * Resolve and validate a requested cwd before any backend writes profile or
-   * MCP files into it. Docker spawners use this to enforce their bind root.
-   *
-   * `undefined` in means the CALLER named no directory, and the answer is this
-   * executor's own default — not the bridge's working directory. That
-   * distinction is the whole point: a backend that pre-filled `process.cwd()`
-   * made a request with no cwd indistinguishable from one asking for the
-   * bridge's own directory, and the docker executor then refused the request
-   * for a path the caller never sent, offering a remedy ("send it without a
-   * cwd") the caller had already followed.
-   */
+  /** Resolve a requested working directory before materializing workspace files. */
   resolveCwd?(cwd: string | undefined): string | undefined
-  /**
-   * Prove this executor can serve a REQUEST, by taking the request path.
-   *
-   * The defect this exists to close: readiness used to be a LIST of checks, and
-   * what was on the list was one slot, one mount kind, one caller shape. Three
-   * items were off it, and the list could not be completed by adding a fourth,
-   * because the probe took a path no request could take — `<bin> --version`
-   * with no cwd, so the executor's own `resolveCwd` was never called, the
-   * workspace assertion every request crosses was skipped, and a
-   * credential-independent command answered `ready` for a pool holding no
-   * credentials.
-   *
-   * An implementation must therefore use the SAME cwd policy, the SAME
-   * assertions and a REAL slot from the same pool a request would get. Anything
-   * a request would hit, this hits first — which is what makes new request-path
-   * checks reach /health without anyone remembering to add them.
-   *
-   * Absent (the host executor) means the executor has no configuration a
-   * request can trip over beyond spawning the binary, which `versionHealth`
-   * already covers.
-   */
+  /** Optional executor readiness probe. */
   probeRequestPath?(signal?: AbortSignal): Promise<ExecutorReadiness>
   /**
    * Isolation boundary the spawned CLI inhabits. Pi refuses an undeclared
    * executor because credential safety cannot depend on guessing its behavior.
    */
   executionEnvironment?: 'host' | 'docker' | 'test-double'
-  /** Docker credential mount ownership; per-slot homes must not inherit host Codex auth. */
-  dockerOauthMode?: 'share' | 'per-slot'
 }
 
 /**

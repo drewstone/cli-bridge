@@ -166,3 +166,15 @@ Bound the proof to one owned session, two serial inputs, and 90 seconds; cancel
 unexpected model/tool activity and close only the proof session. Record
 observed usage and unknown counters honestly rather than infer zero billing
 from missing events.
+
+## Retire legacy execution pools
+
+After deploying removal of Docker execution, use the existing CLI against the
+private directory holding the original `pool-maintenance.json`:
+`BRIDGE_DATA_DIR=/absolute/maintenance-directory cli-bridge --retire-pools --json`.
+The CLI takes legacy ownership locks, refuses live legacy listeners or active
+slot work, and verifies every promoted container's exact journal identity and
+maintenance labels. It durably records stop intents and receipts in
+`pool-retirement.json`. Repeating the command reconciles interrupted stops.
+It disables their automatic restart policy and stops only those slots; containers, predecessor containers, images, volumes,
+and the original maintenance journal remain available. Never remove them by hand.

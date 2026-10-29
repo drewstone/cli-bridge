@@ -191,24 +191,6 @@ export interface ProfileMaterializationReceipt {
   }
 }
 
-/**
- * Per-request net-jail requirement — the network sibling of `execution.jail`.
- *
- * `mode: 'net-jail'` requires deny-by-default egress for the worker process
- * tree, with an allowlist that always contains the backend's own model
- * endpoint. `allow` ASSERTS the exact enforced `host:port` list rather than
- * changing it, because a pooled worker joined its network when the bridge
- * started and cannot be re-jailed per request.
- *
- * No resolved form travels onward to the backends the way `jailSpec` does:
- * enforcement lives in the network the container was created on, so the chat
- * route either proves the jail is in force or fails the request.
- */
-export interface NetJailRequest {
-  mode?: 'off' | 'net-jail'
-  allow?: string[]
-}
-
 /** Final native execution inputs, after profile and credential configuration. Never a wire field. */
 export interface NativeSubscriptionInvocation {
   env: NodeJS.ProcessEnv
@@ -324,7 +306,7 @@ export interface ChatRequest {
          * {@link JailSpec} on `jailSpec` by the chat route.
          */
         jail?: { mode?: 'off' | 'write-jail' | 'fs-jail'; root?: string }
-        netJail?: NetJailRequest
+        netJail?: never
         /** Caller-owned process deadline. Omit to allow the operator fallback, if configured. */
         timeoutMs?: number
         /**
@@ -345,7 +327,7 @@ export interface ChatRequest {
         // Declared on this variant too so a net-jail asked of the sandbox mode
         // reaches the gate and is REFUSED by name. Dropping it from the type
         // would make the request parse and the requirement disappear.
-        netJail?: NetJailRequest
+        netJail?: never
         /** Caller-owned task deadline. Omit to allow the operator fallback, if configured. */
         timeoutMs?: number
       }

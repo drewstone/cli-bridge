@@ -18,7 +18,6 @@ import {
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import {
-  codexMcpConfigText,
   materializeMcpServersForCodex,
 } from './codex-mcp.js'
 import {
@@ -104,11 +103,11 @@ export class CodexBackend implements Backend {
   }
 
   contextTransferAvailable(): boolean {
-    return Boolean(this.opts.stateDir) && this.spawner.executionEnvironment !== 'docker' && this.nativeImportProtocolQualified
+    return Boolean(this.opts.stateDir) && this.nativeImportProtocolQualified
   }
 
   validateContextTransfer(request: ContextTransferRequest): void {
-    if (!this.opts.stateDir || this.spawner.executionEnvironment === 'docker') {
+    if (!this.opts.stateDir) {
       throw new BackendError('Codex native context import requires the retained host executor state directory', 'capability_denied')
     }
     const profile = validateCodexContextTransfer(request)
@@ -265,12 +264,8 @@ export class CodexBackend implements Backend {
     // Session leases own native state; the account turn lease owns auth rotation.
     // Keep native state across turns, but regenerate MCP config and auth links.
     const mcpServers = resolveMcpServers(req, session)
-    const dockerExecution = this.spawner.executionEnvironment === 'docker'
-    // The container's mounted home owns per-slot credentials and native state.
-    // MCP settings travel through stdin into that private home, never argv.
-    const dockerCodexConfig = dockerExecution ? codexMcpConfigText(mcpServers) ?? '' : undefined
     const externalId = req.session_id ?? session?.externalId
-    const nativeHome = !dockerExecution && this.opts.stateDir && externalId
+    const nativeHome = this.opts.stateDir && externalId
       ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))
       : undefined
     const legacySession = nativeHome && session?.internalId && !existsSync(nativeHome)
@@ -286,14 +281,13 @@ export class CodexBackend implements Backend {
     // credential during inference. Use the effective launch env after profile
     // materialization; Codex exec prefers env API keys and access tokens.
     const hostSubscription = !req.jailSpec
-      && !dockerExecution
       && !router
       && !hasCodexEnvAuth(launchEnv)
       && isCodexSubscriptionAuth(authSourcePath)
     const releaseHostAuth = hostSubscription ? await this.acquireAuthPreparation(signal) : undefined
     let codexHome: ReturnType<typeof materializeMcpServersForCodex>
     try {
-      codexHome = dockerExecution ? null : materializeMcpServersForCodex(
+      codexHome = materializeMcpServersForCodex(
         mcpServers,
         authSourcePath,
         nativeHome && !legacySession
@@ -317,7 +311,7 @@ export class CodexBackend implements Backend {
       // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
       await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
         cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
-      if (req.jailSpec && !dockerExecution) {
+      if (req.jailSpec) {
         // Only canonical auth preparation can rotate the account. Access-only
         // jailed turns may run concurrently after their private seeds exist.
         const releasePreparation = await this.acquireAuthPreparation(signal)
@@ -387,13 +381,6 @@ export class CodexBackend implements Backend {
       signal.throwIfAborted()
       const finalEnv = {
           ...launchEnv,
-          ...(dockerExecution ? {
-            CODEX_HOME: undefined,
-            ...(this.spawner.dockerOauthMode === 'per-slot' ? {
-              CODEX_API_KEY: provisioned.env.CODEX_API_KEY,
-              CODEX_ACCESS_TOKEN: provisioned.env.CODEX_ACCESS_TOKEN,
-            } : {}),
-          } : {}),
           ...(jailHome?.subscription ? {
             OPENAI_API_KEY: undefined,
             OPENAI_BASE_URL: undefined,
@@ -415,7 +402,6 @@ export class CodexBackend implements Backend {
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
-        ...(dockerCodexConfig !== undefined ? { dockerCodexConfig } : {}),
       })
       // A custom spawner may settle after cancellation even if it ignores the
       // signal. Do not read a late child's output or report a normal stop.

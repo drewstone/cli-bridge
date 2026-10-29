@@ -1,20 +1,3 @@
-/**
- * Composition tests for the local write-jail backends.
- *
- * These assert that the argv-rewriting logic composes correctly WITHOUT
- * ever spawning a sandbox: the backends only build the wrapper argv (and,
- * for seatbelt, an SBPL profile file), so we can call each backend
- * directly and inspect the result regardless of the host OS.
- *
- *   - bwrap (Linux): wraps in a bubblewrap invocation that ro-binds the
- *     host, writable-binds the jail root, sets HOME, and chdir's into the
- *     project dir, ending in the original command.
- *   - seatbelt (macOS): emits a sandbox-exec invocation pointing at a
- *     generated profile that denies all writes then re-allows the root.
- *   - NoopJail: pass-through, argv unchanged.
- *   - resolveJailSpec: null when off; root clamped inside cwd.
- */
-
 import { existsSync } from 'node:fs'
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
@@ -38,8 +21,25 @@ import {
 } from '../src/jail/auth-preserve.js'
 import { ignoreJailRoot } from '../src/jail/types.js'
 import { anyBackendSpawnsOnHost } from '../src/config.js'
-import type { BackendExecutorConfig } from '../src/config.js'
 import type { JailBackend } from '../src/jail/index.js'
+
+/**
+ * Composition tests for the local write-jail backends.
+ *
+ * These assert that the argv-rewriting logic composes correctly WITHOUT
+ * ever spawning a sandbox: the backends only build the wrapper argv (and,
+ * for seatbelt, an SBPL profile file), so we can call each backend
+ * directly and inspect the result regardless of the host OS.
+ *
+ *   - bwrap (Linux): wraps in a bubblewrap invocation that ro-binds the
+ *     host, writable-binds the jail root, sets HOME, and chdir's into the
+ *     project dir, ending in the original command.
+ *   - seatbelt (macOS): emits a sandbox-exec invocation pointing at a
+ *     generated profile that denies all writes then re-allows the root.
+ *   - NoopJail: pass-through, argv unchanged.
+ *   - resolveJailSpec: null when off; root clamped inside cwd.
+ */
+
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
 function seqIndex(argv: string[], ...seq: string[]): number {
@@ -1069,40 +1069,5 @@ describe('resolveJailSpec', () => {
         resolve(cwd, DEFAULT_JAIL_ROOT),
       )
     }
-  })
-})
-
-describe('anyBackendSpawnsOnHost (startup jail fail-fast gate)', () => {
-  const docker = (name: string): BackendExecutorConfig => ({ name, kind: 'docker' })
-  const host = (name: string): BackendExecutorConfig => ({ name, kind: 'host' })
-
-  it('is true for the default host-CLI backends', () => {
-    expect(anyBackendSpawnsOnHost(new Set(['claude', 'kimi', 'gemini']), {})).toBe(true)
-  })
-
-  it('is true for ACP backends absent from the executor map (hermes/openclaw)', () => {
-    // Regression: hermes/openclaw forward the jailSpec to the host spawner but are
-    // not in config.executors, so an executor-only check missed them and let an
-    // ACP-only write-jail deployment boot "healthy" then fail every request.
-    expect(anyBackendSpawnsOnHost(new Set(['hermes', 'openclaw']), {})).toBe(true)
-    expect(anyBackendSpawnsOnHost(new Set(['sandbox', 'passthrough', 'hermes']), {})).toBe(true)
-  })
-
-  it('is false when every enabled backend is remote/proxy (no host spawn)', () => {
-    expect(anyBackendSpawnsOnHost(new Set(['sandbox', 'passthrough', 'nanoclaw']), {})).toBe(false)
-  })
-
-  it('is false when the only host-CLI backend is pinned to a docker executor', () => {
-    expect(anyBackendSpawnsOnHost(new Set(['claude', 'sandbox']), { claude: docker('claude') })).toBe(false)
-  })
-
-  it('is true when at least one host-CLI backend keeps a host executor', () => {
-    expect(
-      anyBackendSpawnsOnHost(new Set(['claude', 'kimi']), { claude: docker('claude'), kimi: host('kimi') }),
-    ).toBe(true)
-  })
-
-  it('is false for an empty backend set', () => {
-    expect(anyBackendSpawnsOnHost(new Set<string>(), {})).toBe(false)
   })
 })

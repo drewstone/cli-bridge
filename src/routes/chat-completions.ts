@@ -49,8 +49,6 @@ import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
-import { resolveNetJailSpec } from '../jail/resolve-net-spec.js'
-import { assertNetJailEnforced, type NetJailRegistry } from '../jail/enforce-net-jail.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
 import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionSlot } from '../admission.js'
 import {
@@ -266,10 +264,7 @@ const chatRequestSchema = z.object({
       mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
       root: z.string().optional(),
     }).optional(),
-    netJail: z.object({
-      mode: z.enum(['off', 'net-jail']).optional(),
-      allow: z.array(z.string()).optional(),
-    }).optional(),
+    netJail: z.never({ error: 'execution.netJail is no longer supported' }).optional(),
     timeoutMs: z.number().int().positive().max(maxExecutionTimeoutMs).optional(),
     /**
      * How long this turn may WAIT for an executor slot before the bridge
@@ -396,8 +391,6 @@ export function mountChatCompletions(
      * Absent = every caller is `bulk`.
      */
     admissionReservedClients?: string[]
-    /** Backends with a provisioned, verified net-jail. Absent map = none. */
-    netJail?: NetJailRegistry
     /** Emits one conforming span per request. Absent = no tracing. */
     trace?: TraceEmitter
     /** Durable context admission shared with retained-session execution. */
@@ -972,22 +965,6 @@ export function mountChatCompletions(
         // A legacy row may be durable before its first native id exists.
         // Keep that placeholder out of backend resume state until upsert records the id.
         session = session?.internalId ? remembered : null
-      }
-
-      // Deny-by-default egress, gated before any execution path is chosen so a
-      // net-jail cannot be requested of a mode that would not apply it.
-      const netJailSpec = resolveNetJailSpec({
-        execMode: req.execution?.netJail?.mode,
-        ...(req.execution?.netJail?.allow ? { execAllow: req.execution.netJail.allow } : {}),
-        env: process.env,
-      })
-      if (netJailSpec) {
-        assertNetJailEnforced({
-          backend: backend.name,
-          executionKind: req.execution?.kind ?? 'host',
-          spec: netJailSpec,
-          registry: deps.netJail ?? new Map(),
-        })
       }
 
       let makeSource: ((run: Run) => AsyncIterable<ChatDelta>) | null = null

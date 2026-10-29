@@ -1,3 +1,22 @@
+import { EventEmitter } from 'node:events'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PassThrough, Readable } from 'node:stream'
+import type { ChildProcess } from 'node:child_process'
+import { Hono } from 'hono'
+import { afterEach, describe, expect, it } from 'vitest'
+import { versionHealth } from '../src/backends/health.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
+import { BackendRegistry } from '../src/backends/registry.js'
+import type { Backend, BackendHealth, ChatDelta, ChatRequest } from '../src/backends/types.js'
+import { ExecutorConfigurationError, type SpawnOpts, type Spawner } from '../src/executors/types.js'
+import { mountChatCompletions } from '../src/routes/chat-completions.js'
+import { mountHealth } from '../src/routes/health.js'
+import { mountRuns } from '../src/routes/runs.js'
+import { RunRegistry } from '../src/runs/registry.js'
+import { SessionStore, type SessionRecord } from '../src/sessions/store.js'
+
 /**
  * A health check that does not exercise the request path is not a health check.
  *
@@ -36,32 +55,6 @@
  * model answered nothing".
  */
 
-import { EventEmitter } from 'node:events'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { PassThrough, Readable } from 'node:stream'
-import type { ChildProcess } from 'node:child_process'
-import { Hono } from 'hono'
-import { afterEach, describe, expect, it } from 'vitest'
-import { versionHealth } from '../src/backends/health.js'
-import { OpencodeBackend } from '../src/backends/opencode.js'
-import { BackendRegistry } from '../src/backends/registry.js'
-import type { Backend, BackendHealth, ChatDelta, ChatRequest } from '../src/backends/types.js'
-import { assertDockerWorkspaceCwd, createDockerSpawner } from '../src/executors/docker.js'
-import type { ContainerPool } from '../src/executors/container-pool.js'
-import type { DockerCli, DockerCliResult } from '../src/executors/docker-cli.js'
-import {
-  buildCommandFor,
-  preflightDockerSlot,
-  type DockerPreflightTarget,
-} from '../src/executors/docker-preflight.js'
-import { ExecutorConfigurationError, type SpawnOpts, type Spawner } from '../src/executors/types.js'
-import { mountChatCompletions } from '../src/routes/chat-completions.js'
-import { mountHealth } from '../src/routes/health.js'
-import { mountRuns } from '../src/routes/runs.js'
-import { RunRegistry } from '../src/runs/registry.js'
-import { SessionStore, type SessionRecord } from '../src/sessions/store.js'
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
@@ -106,9 +99,6 @@ function recordingSpawner(over: Partial<Spawner> = {}): Spawner & { calls: Spawn
   return spawner
 }
 
-const ok = (stdout = ''): DockerCliResult => ({ code: 0, stdout, stderr: '' })
-const fail = (stderr: string, code = 1): DockerCliResult => ({ code, stdout: '', stderr })
-
 const tempDirs: string[] = []
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
@@ -118,48 +108,6 @@ function tempDir(prefix = 'cli-bridge-probe-ws-'): string {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   tempDirs.push(dir)
   return dir
-}
-
-function preflightTarget(over: Partial<DockerPreflightTarget> = {}): DockerPreflightTarget {
-  return {
-    backend: 'opencode',
-    envPrefix: 'OPENCODE',
-    image: 'cli-bridge-cli-runtime:latest',
-    bin: 'opencode',
-    containerHome: '/root',
-    workspaceRoot: tempDir(),
-    mounts: [{
-      source: 'cli-bridge-pool-oauth1-0',
-      target: '/root/.local/share/opencode',
-      kind: 'volume',
-      credentialFile: 'auth.json',
-    }],
-    buildCommand: buildCommandFor('cli-bridge-cli-runtime:latest'),
-    ...over,
-  }
-}
-
-/**
- * A docker CLI in which every probe succeeds EXCEPT the credential file, which
- * is absent. That is this host's real misconfiguration: the mount exists, is
- * readable and writable, holds files — and holds no auth.json.
- */
-function cliWithoutCredentials(seen: string[] = []): DockerCli {
-  return async (args) => {
-    const line = args.join(' ')
-    seen.push(line)
-    // The one thing that is absent. Everything else about the mount is fine —
-    // which is exactly why "the directory is not empty" passed on it.
-    if (line.includes('auth.json')) return fail('')
-    if (args[0] === 'exec' && args.includes('--version')) return ok('1.18.9\n')
-    // The workspace bind is proven by a marker round-trip: the container path
-    // equals the host path, so reading the host file IS the mount working.
-    if (args.includes('cat')) {
-      const path = args[args.length - 1]!
-      try { return ok(readFileSync(path, 'utf8')) } catch { return fail('No such file or directory') }
-    }
-    return ok('ok\n')
-  }
 }
 
 interface HealthFixture {
@@ -234,142 +182,6 @@ async function postChat(app: Hono, body: object, headers: Record<string, string>
 }
 
 // ─── the shape: the probe takes the request path ──────────────────────────
-
-describe('the readiness probe traverses the request path', () => {
-  it('refuses when the executor cwd policy a request would hit refuses', async () => {
-    // A real request calls `resolveSpawnerCwd(spawner, undefined)`, which asks the
-    // executor. The probe skipped that call entirely by passing no cwd, so the one
-    // assertion every request crosses was the one the probe never reached.
-    const spawner = recordingSpawner({
-      resolveCwd: () => {
-        throw new ExecutorConfigurationError(
-          'opencode runs on a Docker executor with no workspace mounted; set OPENCODE_DOCKER_WORKSPACE_ROOT',
-        )
-      },
-    })
-    const health = await versionHealth('opencode', 'opencode', spawner)
-    expect(health.state).not.toBe('ready')
-    expect(health.detail ?? '').toMatch(/OPENCODE_DOCKER_WORKSPACE_ROOT/)
-  })
-
-  it('spawns the probe in the directory a cwd-less request resolves to', async () => {
-    const spawner = recordingSpawner({ resolveCwd: (cwd) => cwd ?? '/workspace/opencode' })
-    const health = await versionHealth('opencode', 'opencode', spawner)
-    expect(health.state).toBe('ready')
-    // The probe must run `--version` where a request would run, not in the
-    // image's own WORKDIR: a workspace bind that vanished after startup is
-    // otherwise invisible to /health while every request fails with exit 127.
-    expect(spawner.calls.map((c) => c.cwd)).toContain('/workspace/opencode')
-  })
-
-  it('reads a successful version probe that writes only to stderr', async () => {
-    const spawner = (async () => ({
-      child: childExiting(0, '', '0.7.0\n'),
-      release: () => {},
-    })) as Spawner
-    const health = await versionHealth('prime', 'prime-agent', spawner)
-    expect(health).toMatchObject({ state: 'ready', version: '0.7.0' })
-  })
-
-  it('reports an executor readiness finding instead of ready', async () => {
-    const spawner = recordingSpawner({
-      probeRequestPath: async () => ({
-        cwd: '/workspace/opencode',
-        findings: [{
-          check: 'auth-mount-credentials',
-          detail: '/root/.local/share/opencode/auth.json does not exist, so opencode has NO credentials',
-          remedy: 'run `docker exec -it <slot> opencode auth login` inside the pool container',
-        }],
-      }),
-    } as unknown as Partial<Spawner>)
-    const health = await versionHealth('opencode', 'opencode', spawner)
-    expect(health.state).not.toBe('ready')
-    expect(health.detail ?? '').toMatch(/auth\.json does not exist/)
-    // The remedy has to travel with the observation, or the caller has a symptom
-    // and no action.
-    expect(health.detail ?? '').toMatch(/auth login/)
-  })
-
-  it('/health answers 503 and names the cause when the request path is not ready', async () => {
-    const backend: Backend = {
-      name: 'opencode',
-      matches: () => true,
-      health: async () => await versionHealth('opencode', 'opencode', recordingSpawner({
-        probeRequestPath: async () => ({
-          cwd: '/workspace/opencode',
-          findings: [{
-            check: 'auth-mount-credentials',
-            detail: '/root/.local/share/opencode/auth.json does not exist, so opencode has NO credentials',
-            remedy: 'run `docker exec -it <slot> opencode auth login` inside the pool container',
-          }],
-        }),
-      } as unknown as Partial<Spawner>)),
-      chat: async function* () { yield { finish_reason: 'stop' as const } },
-    }
-    const { app, cleanup } = healthApp(backend)
-    try {
-      const res = await app.request('/health')
-      expect(res.status).toBe(503)
-      const body = await res.json() as { status: string; backends: Array<{ state: string; detail?: string }> }
-      expect(body.status).toBe('degraded')
-      expect(body.backends[0]?.state).not.toBe('ready')
-      expect(body.backends[0]?.detail ?? '').toMatch(/auth\.json/)
-    } finally {
-      cleanup()
-    }
-  })
-
-  it('the docker executor probes EVERY live slot, at that slot own mounts', async () => {
-    // Probing slot 0's volumes for every slot is evidence about one slot while
-    // traffic goes to all of them, so every slot's own volumes must be named.
-    let acquires = 0
-    const pool = {
-      liveContainerIds: () => ['container-slot-0', 'container-slot-1'],
-      // Acquiring would make /health queue behind real traffic, so a busy pool
-      // would read as unhealthy. The `--version` spawn exercises acquire.
-      acquire: async () => { acquires += 1; throw new Error('must not acquire for a readiness probe') },
-      reportContainerUnusable: async () => {},
-      recycleHeldSlot: async () => {},
-    } as unknown as ContainerPool
-    const seen: string[] = []
-    const workspaceRoot = tempDir()
-    const spawner = createDockerSpawner({
-      pool,
-      backend: 'opencode',
-      envPrefix: 'OPENCODE',
-      workspaceRoot,
-      cli: cliWithoutCredentials(seen),
-      preflightTarget: (slotIndex: number) => preflightTarget({
-        workspaceRoot,
-        mounts: [{
-          source: `cli-bridge-pool-oauth1-${slotIndex}`,
-          target: '/root/.local/share/opencode',
-          kind: 'volume',
-          credentialFile: 'auth.json',
-        }],
-      }),
-    } as never)
-
-    expect(typeof (spawner as { probeRequestPath?: unknown }).probeRequestPath).toBe('function')
-    const readiness = await (spawner as unknown as {
-      probeRequestPath: () => Promise<{ cwd?: string; findings: Array<{ detail: string; remedy: string }> }>
-    }).probeRequestPath()
-
-    expect(acquires).toBe(0)
-    // A cwd-less request runs in the workspace root, so the probe must too.
-    expect(readiness.cwd).toBe(workspaceRoot)
-    expect(readiness.findings.length).toBe(2)
-    const detail = readiness.findings.map((f) => `${f.detail} ${f.remedy}`).join(' ')
-    expect(detail).toMatch(/auth\.json/)
-    // Each slot's OWN volume, not slot 0's twice.
-    expect(detail).toContain('cli-bridge-pool-oauth1-0')
-    expect(detail).toContain('cli-bridge-pool-oauth1-1')
-    expect(seen.join(' ')).toContain('container-slot-0')
-    expect(seen.join(' ')).toContain('container-slot-1')
-  })
-})
-
-// ─── finding 1: a yielded failure carries a machine-readable reason ───────
 
 describe('a terminal error delta carries its reason, however the backend produced it', () => {
   it('records the run failure for a YIELDED error, not only a thrown one', async () => {
@@ -509,86 +321,3 @@ describe('a backend that KNOWS the reason attaches it', () => {
 })
 
 // ─── finding 2: credentials are a readiness verdict, not a log line ───────
-
-describe('the credential predicate is "can this mount authenticate"', () => {
-  it('makes a missing credential file a request-path finding, for a VOLUME', async () => {
-    const findings = await preflightDockerSlot(
-      preflightTarget(),
-      'container-slot-0',
-      cliWithoutCredentials(),
-      [],
-      { scope: 'request-path' } as never,
-    )
-    const text = findings.map((f) => `${f.check} ${f.detail} ${f.remedy}`).join('\n')
-    expect(findings.length).toBeGreaterThan(0)
-    expect(text).toMatch(/auth\.json/)
-    expect(text).toMatch(/auth login/)
-  })
-
-  it('makes a missing credential file a request-path finding, for a BIND too', async () => {
-    const findings = await preflightDockerSlot(
-      preflightTarget({
-        mounts: [{
-          source: '/home/drew/.local/share/opencode',
-          target: '/root/.local/share/opencode',
-          kind: 'bind',
-          credentialFile: 'auth.json',
-        }],
-      }),
-      'container-slot-0',
-      cliWithoutCredentials(),
-      [],
-      { scope: 'request-path' } as never,
-    )
-    expect(findings.map((f) => f.detail).join('\n')).toMatch(/auth\.json/)
-  })
-
-  it('startup still only warns, so a first login can happen inside the pool', async () => {
-    const warnings: string[] = []
-    const findings = await preflightDockerSlot(
-      preflightTarget(),
-      'container-slot-0',
-      cliWithoutCredentials(),
-      warnings,
-      { scope: 'credentials' },
-    )
-    expect(findings).toEqual([])
-    expect(warnings.join('\n')).toMatch(/auth\.json/)
-  })
-})
-
-// ─── finding 3: the remedy has to be one the operator can perform ─────────
-
-describe('a workspace refusal names the real cause and a performable remedy', () => {
-  it('does not tell the caller to do something the request cannot express', () => {
-    let message = ''
-    try {
-      assertDockerWorkspaceCwd(undefined, '/home/drew/code/cli-bridge-preflight', {
-        backend: 'opencode',
-        envPrefix: 'OPENCODE',
-      })
-    } catch (err) {
-      message = err instanceof Error ? err.message : String(err)
-    }
-    expect(message).not.toBe('')
-    // The cwd may have been resolved by the bridge rather than sent by the
-    // caller, so "send requests without a cwd" is both an accusation and,
-    // through the HTTP API, unperformable.
-    expect(message).not.toMatch(/send requests without a cwd/)
-    expect(message).toMatch(/OPENCODE_DOCKER_WORKSPACE_ROOT/)
-    // The second remedy an operator actually has.
-    expect(message).toMatch(/OPENCODE_EXECUTOR=host/)
-  })
-
-  it('an outside-the-root refusal still offers the cwd-less route, which now works', () => {
-    let message = ''
-    try {
-      assertDockerWorkspaceCwd('/workspace/opencode', '/etc', { backend: 'opencode', envPrefix: 'OPENCODE' })
-    } catch (err) {
-      message = err instanceof Error ? err.message : String(err)
-    }
-    expect(message).toMatch(/outside/)
-    expect(message).toMatch(/OPENCODE_DOCKER_WORKSPACE_ROOT/)
-    expect(message).toMatch(/OPENCODE_EXECUTOR=host/)
-  })
-})
