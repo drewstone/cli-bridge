@@ -59,7 +59,9 @@ interface ClaudeStreamInit {
 }
 interface ClaudeStreamAssistant {
   type: 'assistant'
+  isApiErrorMessage?: boolean
   message: {
+    model?: string
     id: string
     content: Array<
       | { type: 'text'; text: string }
@@ -94,34 +96,16 @@ interface ClaudeNativeUsage {
 
 const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 300
 
-/**
- * Build the usage record for a claude `result` line.
- *
- * `total_cost_usd` is the dollar figure Anthropic billed for the whole
- * `claude -p` invocation, including every internal model call the harness made.
- * It is a provider receipt, so it travels as `cost_known: true` with
- * `provider-receipt` provenance — the lane a dollar budget may debit. It is
- * also the complete charge for the invocation, which is what `cost_scope:
- * 'total'` asserts.
- *
- * A run that reports no figure returns `cost_known: false` with no dollar
- * amount at all. A zero here would read as a measured free turn.
- */
+/** Native result cost is a complete provider receipt. Missing cost stays unknown;
+ * token counts retain their independent measured/partial provenance. */
 function claudeResultUsage(result: ClaudeStreamResult): NonNullable<ChatDelta['usage']> | undefined {
   const usage = normalizeClaudeUsage(result.usage)
   const cost = result.total_cost_usd
   const billed = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : undefined
-  if (billed === undefined) {
-    if (!usage) return undefined
-    return { ...usage, cost_known: false }
-  }
-  return {
-    ...(usage ?? {}),
-    cost: billed,
-    cost_known: true,
-    cost_provenance: 'provider-receipt',
-    cost_scope: 'total',
-  }
+  if (!usage && billed === undefined) return undefined
+  return { ...usage, ...(billed === undefined ? { cost_known: false } : {
+    cost: billed, cost_known: true, cost_provenance: 'provider-receipt', cost_scope: 'total',
+  }) }
 }
 
 /**
@@ -151,6 +135,7 @@ function normalizeClaudeUsage(usage: ClaudeNativeUsage | undefined): NonNullable
   ) return undefined
 
   return {
+    estimated: false,
     ...(promptTokens !== undefined ? { input_tokens: promptTokens } : {}),
     ...(freshInput !== undefined ? { fresh_input_tokens: freshInput } : {}),
     ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
@@ -397,6 +382,7 @@ export class ClaudeBackend implements Backend {
     try {
       let internalSessionId: string | undefined
       let terminal: ClaudeStreamResult | undefined
+      const observations = new Set<string>()
       let sawError: string | undefined
       let usage: ChatDelta['usage']
       const stderr = new BoundedDiagnosticBuffer()
@@ -453,6 +439,12 @@ export class ClaudeBackend implements Backend {
 
         if (msg.type === 'assistant') {
           const a = msg as ClaudeStreamAssistant
+          const model = a.message?.model
+          const observation = JSON.stringify([a.message?.id, model])
+          if (!a.isApiErrorMessage && typeof model === 'string' && model.trim() && model !== '<synthetic>' && !observations.has(observation)) {
+            observations.add(observation)
+            yield { model, provider_models: [model] }
+          }
           const content = a.message?.content ?? []
           for (const block of content) {
             if (block.type === 'text') {

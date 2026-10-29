@@ -502,8 +502,10 @@ export interface ChatDelta {
    * the backend or model does not produce reasoning.
    */
   reasoning?: string
-  /** Provider-reported response model. This is distinct from the requested route model. */
+  /** Backend response/compatibility model; this alone does not certify provider identity. */
   model?: string
+  /** Explicit provider-response observations. Absent for legacy or configured-only identity. */
+  provider_models?: string[]
   /** Provider response fingerprint, when the upstream protocol exposes one. */
   system_fingerprint?: string
   /** Tool calls the assistant emitted this delta. Each is appended. */

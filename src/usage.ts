@@ -35,7 +35,7 @@ export interface CollectedUsage {
   /** True only when a total catalog estimate covers every contributing call. */
   estimatedCostComplete: boolean
   /** True when any contributing record was derived from text rather than measured. */
-  estimated: boolean
+  estimated?: boolean
 }
 
 /**
@@ -108,7 +108,9 @@ export function addUsage(
     estimatedCostComplete: totalCost
       ? catalogEstimate !== undefined
       : (current?.estimatedCostComplete ?? true) && catalogEstimate !== undefined,
-    estimated: (current?.estimated ?? false) || next.estimated === true,
+    estimated: !hasTokenReceipt ? current?.estimated
+      : current?.estimated === true || next.estimated === true ? true
+      : next.estimated === false && (!hadTokenReceipt || current?.estimated === false) ? false : undefined,
   }
 }
 
