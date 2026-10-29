@@ -79,6 +79,7 @@ try {
     const secondNative = await native(id)
     assert.equal(firstNative.internalId, secondNative.internalId)
     assert.equal(secondNative.cwd, cwd)
+    assert.equal(secondNative.turns, 2)
     ;(receipt.rows as unknown[]).push({ model, nativeSessionId: secondNative.internalId, turns: secondNative.turns, elapsedMs: Date.now() - started, first, second })
   }
   const cancelRun = randomUUID(), cancelSession = randomUUID()

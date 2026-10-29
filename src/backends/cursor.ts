@@ -66,6 +66,7 @@ export class CursorBackend implements Backend {
       let terminal: Record<string, unknown> | undefined
       let text = ''
       let nativeId = session?.internalId
+      let identityEmitted = false
       for await (const next of readProcessLines({ child: spawned.child, stdout: spawned.child.stdout, progressIntervalMs: 30_000 })) {
         if (next.kind === 'progress') { yield { keepalive: { source: 'cursor', elapsedMs: next.elapsedMs } }; continue }
         if (!next.line.trim()) continue
@@ -74,7 +75,7 @@ export class CursorBackend implements Backend {
         if (typeof event.session_id === 'string' && event.session_id) {
           if (nativeId && nativeId !== event.session_id) throw new BackendError('Cursor changed native session identity', 'upstream')
           nativeId = event.session_id
-          yield { internal_session_id: nativeId }
+          if (!identityEmitted) { yield { internal_session_id: nativeId }; identityEmitted = true }
         }
         if (event.type === 'assistant') {
           const content = (event.message?.content ?? []).filter((part: any) => part.type === 'text' && typeof part.text === 'string').map((part: any) => part.text).join('')
@@ -99,7 +100,7 @@ export class CursorBackend implements Backend {
       const counts = usage && Number.isSafeInteger(usage.inputTokens) && Number.isSafeInteger(usage.outputTokens)
         && Number(usage.inputTokens) >= 0 && Number(usage.outputTokens) >= 0
         ? { input_tokens: Number(usage.inputTokens), output_tokens: Number(usage.outputTokens), estimated: false } : {}
-      yield { internal_session_id: nativeId, usage: { ...counts, cost_known: false }, finish_reason: 'stop' }
+      yield { usage: { ...counts, cost_known: false }, finish_reason: 'stop' }
     } finally {
       signal.removeEventListener('abort', onAbort)
       await terminateSpawned(spawned)
