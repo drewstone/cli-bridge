@@ -22,8 +22,6 @@ const ALIASES: Record<string, readonly ModelSpec[]> = {
   claudish: ['openrouter@deepseek/deepseek-r1', 'google@gemini-2.0-flash', 'zai@glm-4.6'].map((id) => ({ id })),
   cursor: [{ id: 'default', note: 'native configured model; explicit cursor/<model> routes are passed to cursor-agent' }],
   codex: [{ id: 'default', note: 'native no-override wire route; concrete native model required for a canonical seat' }],
-  factory: [{ id: 'droid', note: 'stubbed' }], amp: [{ id: 'default', note: 'stubbed' }],
-  forge: [{ id: 'anthropic/claude-sonnet-4-5', note: 'stubbed' }],
 }
 
 // The opencode/pi catalogs are discovered live from each CLI's own model list
@@ -103,15 +101,12 @@ export async function collectModels(deps: ModelCatalogDependencies, signal?: Abo
         parse: isPi ? parsePiModels : parseOpencodeModels,
         fallback: isPi ? PI_MODELS : OPENCODE_MODELS,
       }, { cwd: deps.cwd, signal }), undefined, '/')
-    } else if (name === 'passthrough') {
-      add(name, ['openai/gpt-4o', 'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'moonshot/kimi-k2-0905-preview', 'zai/glm-4.6']
-        .map((id) => ({ id, note: 'forwards to vendor API — requires key' })), '', '/')
     } else if (name === 'sandbox') {
       add(name, (deps.catalog?.list() ?? []).map((entry) => ({ id: entry.id,
         note: entry.profile.description ?? 'sandbox AgentProfile' })))
       data.push({ id: 'sandbox', object: 'model', backend: name, provider: null,
         note: 'inline profile mode — pass full AgentProfile in body field `agent_profile`' })
-    } else add(name, ALIASES[name] ?? [], undefined, name === 'forge' ? '/' : name === 'claudish' ? '@' : undefined)
+    } else add(name, ALIASES[name] ?? [], undefined, name === 'claudish' ? '@' : undefined)
   }
   const described = await deps.describe(data, signal)
   signal?.throwIfAborted()

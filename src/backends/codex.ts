@@ -38,20 +38,13 @@ import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from '
 import { nativeReasoningControl, workspaceCwdPathForBase, type ContextTransferRequest } from '@tangle-network/agent-interface'
 import { CODEX_NATIVE_IMPORT_VERSION, CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
 import { CODEX_DISABLED_FEATURE_ARGS, assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
-import {
-  assertRouterCodexExecution,
-  assertRouterCodexVersion,
-  codexRouterArgs,
-  openRouterLaunchRecord,
-  prepareRouterLaunch,
-} from './router-launch.js'
 
 export interface CodexBackendOptions {
   bin: string
   timeoutMs: number
   /** Bridge-owned native state; session execution leases serialize access. */
   stateDir?: string
-  /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
+  /** Subprocess spawner; defaults to the host executor. */
   spawner?: Spawner
 }
 
@@ -182,13 +175,6 @@ export class CodexBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'codex hosted-safe requires verified --sandbox read-only audit')
 
-    let router: ReturnType<typeof prepareRouterLaunch>
-    try {
-      router = prepareRouterLaunch(req)
-    } catch (error) {
-      throw new BackendError((error as Error).message, 'not_configured')
-    }
-
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
     // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
     const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
@@ -200,17 +186,9 @@ export class CodexBackend implements Backend {
       '--json',
       '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox',
-      // Receipt-required launches refuse any override this codex version does not
-      // recognize: an ignored provider table would spend tokens Router cannot attribute.
-      ...(router ? ['--strict-config'] : []),
     ]
-    // In receipt mode `codexRouterArgs` is the single owner of the route, so the
-    // split wire id is not restated here: a second `model_provider` naming a table
-    // no config defines relies on undocumented last-override-wins precedence.
-    if (!router) {
-      if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
-      if (modelArg) args.push('-c', `model="${modelArg}"`)
-    }
+    if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
+    if (modelArg) args.push('-c', `model="${modelArg}"`)
     const reasoningEffort = nativeReasoningControl(
       'codex',
       resolveRequestedReasoningEffort(req, session),
@@ -236,29 +214,6 @@ export class CodexBackend implements Backend {
     args.push(...provisioned.flags)
     if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
     const nativeConfigFlags = codexConfigFlags(args)
-    let routerVersion: string | undefined
-    if (router) {
-      try {
-        assertRouterCodexExecution({
-          bin: this.opts.bin,
-          environment: this.spawner.executionEnvironment,
-          jail: req.jailSpec,
-          flags: provisioned.flags,
-          env: process.env,
-          ...(session?.externalId ? { resumedExternalId: session.externalId } : {}),
-          launch: router,
-        })
-        const health = await this.health(AbortSignal.any([signal, AbortSignal.timeout(10_000)]))
-        if (health.state !== 'ready') throw new Error('Router receipt preflight: harness version probe failed')
-        assertRouterCodexVersion(health.version)
-        routerVersion = health.version
-        signal.throwIfAborted()
-        args.push(...codexRouterArgs(router))
-      } catch (error) {
-        throw new BackendError((error as Error).message, 'not_configured')
-      }
-    }
-
     args.push('--', prompt)
 
     // Session leases own native state; the account turn lease owns auth rotation.
@@ -281,7 +236,6 @@ export class CodexBackend implements Backend {
     // credential during inference. Use the effective launch env after profile
     // materialization; Codex exec prefers env API keys and access tokens.
     const hostSubscription = !req.jailSpec
-      && !router
       && !hasCodexEnvAuth(launchEnv)
       && isCodexSubscriptionAuth(authSourcePath)
     const releaseHostAuth = hostSubscription ? await this.acquireAuthPreparation(signal) : undefined
@@ -299,18 +253,17 @@ export class CodexBackend implements Backend {
       throw error
     }
     let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
-    let record: ReturnType<typeof openRouterLaunchRecord> | undefined
-    const releaseState = (outcome: 'closed' | 'failed' | 'aborted'): void => {
+    const releaseState = (): void => {
       try { codexHome?.cleanup() } finally {
         try { jailHome?.cleanup() } finally {
-          try { record?.close(outcome) } finally { releaseHostAuth?.() }
+          releaseHostAuth?.()
         }
       }
     }
     try {
       // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
       await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
-        cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
+        cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, executor: this.spawner.executionEnvironment })
       if (req.jailSpec) {
         // Only canonical auth preparation can rotate the account. Access-only
         // jailed turns may run concurrently after their private seeds exist.
@@ -336,7 +289,7 @@ export class CodexBackend implements Backend {
         nativeConfigFlags.unshift('-c', 'cli_auth_credentials_store="file"')
       }
     } catch (error) {
-      releaseState(signal.aborted ? 'aborted' : 'failed')
+      releaseState()
       throw error
     }
 
@@ -357,27 +310,6 @@ export class CodexBackend implements Backend {
 
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      if (router) {
-        // Evidence is created before inference on purpose: an unattributable launch
-        // must be refused, never reported as a success with the record missing.
-        try {
-          router.directory = ensurePrivateDataDirectory(router.directory)
-          const profile = resolveAgentProfile(req, session)
-          record = openRouterLaunchRecord(router, {
-            version: routerVersion!,
-            profileDigest: provisioned.receipt?.effectiveProfileDigest ?? null,
-            configuredTools: profile?.tools ?? null,
-            mcpServers: Object.keys(mcpServers ?? {}).sort(),
-          })
-        } catch (error) {
-          throw new BackendError(
-            'Router receipt preflight: cannot write launch evidence under BRIDGE_LAUNCH_RECORD_DIR '
-            + `(${(error as Error).message})`,
-            'not_configured',
-          )
-        }
-        signal.throwIfAborted()
-      }
       signal.throwIfAborted()
       const finalEnv = {
           ...launchEnv,
@@ -388,9 +320,8 @@ export class CodexBackend implements Backend {
             CODEX_API_KEY: undefined,
           } : {}),
           ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
-          ...(router ? { TANGLE_ROUTER_CREDENTIAL: router.key } : {}),
         }
-      await admitNativeSubscription(req, { env: finalEnv, cwd: cwd ?? process.cwd(), model: req.model, args, flags: nativeConfigFlags, credentialOverride: Boolean(router), executor: this.spawner.executionEnvironment })
+      await admitNativeSubscription(req, { env: finalEnv, cwd: cwd ?? process.cwd(), model: req.model, args, flags: nativeConfigFlags, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
         nativeStore: 'codex',
         signal,
@@ -407,12 +338,11 @@ export class CodexBackend implements Backend {
       // signal. Do not read a late child's output or report a normal stop.
       if (signal.aborted) {
         const outcome = await terminateSpawned(spawned)
-        record?.termination(outcome)
         spawned.release()
         throw new BackendError(`Codex launch aborted during spawn; termination ${outcome}`, 'aborted')
       }
     } catch (error) {
-      releaseState(signal.aborted ? 'aborted' : 'failed')
+      releaseState()
       throw error
     }
     const child = spawned.child
@@ -428,12 +358,9 @@ export class CodexBackend implements Backend {
     signal.addEventListener('abort', onAbort, { once: true })
 
     let emittedToolCall = false
-    let recordOutcome: 'closed' | 'failed' = 'failed'
     let terminationOutcome: 'stopped' | 'failed' | 'unknown' | null = null
-    const finishRecord = async (): Promise<'stopped' | 'failed' | 'unknown'> => {
+    const finishProcess = async (): Promise<'stopped' | 'failed' | 'unknown'> => {
       terminationOutcome ??= await terminateSpawned(spawned)
-      record?.termination(terminationOutcome)
-      record?.close(signal.aborted ? 'aborted' : terminationOutcome === 'stopped' ? recordOutcome : 'failed')
       return terminationOutcome
     }
     try {
@@ -457,7 +384,6 @@ export class CodexBackend implements Backend {
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
         const line = event.line
-        record?.append(line)
         if (!line.trim()) continue
         let ev: Record<string, unknown>
         try { ev = JSON.parse(line) as Record<string, unknown> } catch { continue }
@@ -477,7 +403,6 @@ export class CodexBackend implements Backend {
 
         const toolCall = extractToolCall(ev)
         if (toolCall) {
-          record?.observeTool(toolCall.name)
           yield { tool_calls: [toolCall] }
           emittedToolCall = true
           // Fall through to extractText: a tool item can also carry a
@@ -501,18 +426,16 @@ export class CodexBackend implements Backend {
       if (usage) yield { usage }
 
       if (signal.aborted) {
-        await finishRecord()
+        await finishProcess()
         yield { finish_reason: 'error', internal_session_id: internalSessionId, ...nativeStore }
         return
       }
       if (sawError) {
-        recordOutcome = 'failed'
         // Ended through the delta envelope, not a throw: `BackendError.code` is the
         // bridge's own closed taxonomy and cannot carry a provider discriminant, while
         // the terminal error delta reaches the caller with it. The route answers both
         // shapes 502 (`BackendReportedFailureError`), so only the code is new.
-        record?.terminal('error')
-        if (await finishRecord() !== 'stopped') {
+        if (await finishProcess() !== 'stopped') {
           throw new BackendError('Codex process termination is unconfirmed', 'upstream')
         }
         yield { ...terminalOutcome('codex', sawError, emittedToolCall), internal_session_id: internalSessionId, ...nativeStore }
@@ -521,9 +444,7 @@ export class CodexBackend implements Backend {
       await assertSuccessfulHarnessExit(spawned, 'codex', () => stderr.render())
       if (!sawTerminal)
         throw new BackendError('Codex launch ended without a native terminal event', 'parse_error')
-      record?.terminal('completed')
-      recordOutcome = 'closed'
-      if (await finishRecord() !== 'stopped')
+      if (await finishProcess() !== 'stopped')
         throw new BackendError('Codex process termination is unconfirmed', 'upstream')
       if (signal.aborted) throw new BackendError('Codex launch was aborted', 'aborted')
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId, ...nativeStore }
@@ -531,13 +452,10 @@ export class CodexBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       // Reap the whole subtree — codex spawns sub-processes for MCP
       // tool calls, model HTTP I/O, etc. and we owe them a clean exit.
-      // Each cleanup runs even if an earlier one throws, so the evidence record is
-      // always closed. `recordOutcome` is 'closed' only after a native terminal event
-      // already closed the record, so this call is a no-op on the success path.
       try {
-        await finishRecord()
+        await finishProcess()
       } finally {
-        try { releaseSpawner() } finally { releaseState(signal.aborted ? 'aborted' : recordOutcome) }
+        try { releaseSpawner() } finally { releaseState() }
       }
     }
   }

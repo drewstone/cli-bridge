@@ -363,8 +363,8 @@ export function materializeMcpServersForPi(
  * Mount a `{mcpServers}` object into a CWD-NATIVE config file
  * (`<cwd>/<subdir>/<filename>`) that a CLI discovers by working directory
  * rather than a per-invocation flag. Shared by the additive cwd-native MCP
- * backends — gemini (`.gemini/settings.json`) and droid/factory
- * (`.factory/mcp.json`). Only the schema of the `mcpServers` values differs,
+ * backends such as gemini (`.gemini/settings.json`). Only the schema of
+ * the `mcpServers` values differs,
  * and the caller has already transformed those.
  *
  * The file lives in the run workspace, not a temp dir, because the CLI
@@ -672,44 +672,6 @@ export function materializeMcpServersForGemini(
     console.error(`[cli-bridge mcp gemini] materialized servers: ${Object.keys(mcpServers).join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
   }
   return mountCwdNativeMcp(target, { subdir: '.gemini', filename: 'settings.json', backendName: 'gemini', mcpServers })
-}
-
-/**
- * Build the droid (Factory) `mcpServers` object. droid's `mcp.json` is
- * nearly canonical — stdio entries carry an explicit `type:'stdio'` and
- * every entry an explicit `disabled:false`, both of which the canonical
- * shape omits. Remote entries are `{type:'http'|'sse', url, headers}`.
- */
-function buildFactoryMcpServers(specs: Record<string, McpServerSpec>): Record<string, Record<string, unknown>> {
-  return Object.fromEntries(Object.entries(buildCanonicalMcpServers(specs)).map(([name, spec]) => {
-    const { timeout: _timeout, ...server } = spec
-    return [name, {
-      ...server,
-      ...(server.command ? { type: 'stdio', args: server.args ?? [] } : {}),
-      disabled: false,
-    }]
-  }))
-}
-
-/**
- * Materialize MCP servers for the droid/Factory backend by merging them
- * into the project-scope `<cwd>/.factory/mcp.json`, which `droid exec`
- * discovers by cwd (verified against the CLI: config candidates include
- * `join(cwd, '.factory', 'mcp.json')`). This never touches the user's
- * `~/.factory/mcp.json`. cwd-native, so it shares pi's lock + no-follow
- * discipline via `mountCwdNativeMcp`. Returns null when no usable servers
- * remain.
- */
-export function materializeMcpServersForFactory(
-  specs: Record<string, McpServerSpec> | null,
-  cwd: string,
-): MaterializedMcpConfig | null {
-  if (!specs) return null
-  const mcpServers = buildFactoryMcpServers(specs)
-  if (process.env.CLI_BRIDGE_DEBUG_MCP) {
-    console.error(`[cli-bridge mcp factory] materialized servers: ${Object.keys(mcpServers).join(', ') || '(none)'} from specs: ${Object.keys(specs).join(', ') || '(empty)'}`)
-  }
-  return mountCwdNativeMcp(cwd, { subdir: '.factory', filename: 'mcp.json', backendName: 'factory', mcpServers })
 }
 
 /**

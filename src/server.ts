@@ -17,13 +17,8 @@ import { BackendRegistry } from './backends/registry.js'
 import { createLocalBackend } from './backends/local.js'
 import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
-import { FactoryBackend } from './backends/factory.js'
-import { AmpBackend } from './backends/amp.js'
-import { ForgeBackend } from './backends/forge.js'
 import { AcpBackend } from './backends/acp.js'
-import { NanoclawBackend } from './backends/nanoclaw.js'
 import { PrimeBackend } from './backends/prime.js'
-import { PassthroughBackend } from './backends/passthrough.js'
 import { SandboxBackend } from './backends/sandbox.js'
 import { createProfileCatalog, type ProfileCatalog } from './profiles/loader.js'
 import { mountChatCompletions } from './routes/chat-completions.js'
@@ -110,9 +105,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     BRIDGE_JAIL_RW_PATHS: config.jailWritablePaths.join(','),
     BRIDGE_JAIL_FALLBACK: config.jailFallback,
   }
-  // Register order matters — first match wins. Harness-specific backends
-  // come first so a `claude-code/sonnet` doesn't get claimed by a
-  // passthrough that happens to know a provider-prefixed model id.
+  // Register enabled native harnesses before remote execution.
   for (const [name, harness] of localHarnesses) {
     if (!config.backends.has(name)) continue
     const bin = config[`${name}Bin`]
@@ -129,17 +122,10 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       claudishUrl: config.claudishUrl,
     }))
   }
-  for (const [name, Backend] of [['factory', FactoryBackend], ['amp', AmpBackend], ['forge', ForgeBackend]] as const) {
-    if (config.backends.has(name)) registry.register(new Backend({ bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
-  }
   // ACP-protocol agents (driven via `<bin> acp`): hermes, openclaw. Registered when
   // BRIDGE_BACKENDS lists them; health reports `unavailable` if the binary is absent.
   for (const name of ['hermes', 'openclaw'] as const) {
     if (config.backends.has(name)) registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
-  }
-  // NanoClaw: a Unix-socket client to the running NanoClaw daemon (not a spawned CLI).
-  if (config.backends.has('nanoclaw')) {
-    registry.register(new NanoclawBackend({ socketPath: config.nanoclawSocket, timeoutMs: config.cliTimeoutMsDefault }))
   }
   // prime-agent (the pi fork) — host-spawned `--mode rpc` with a bridge-owned
   // isolated HOME per run; see PrimeBackend for the daemon-avoidance contract.
@@ -150,14 +136,6 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       stateDir: join(config.dataDir, 'prime'),
       ...(config.primeModelsJson ? { modelsJsonPath: config.primeModelsJson } : {}),
       ...(config.primePersistentAgentDir ? { persistentAgentDir: config.primePersistentAgentDir } : {}),
-    }))
-  }
-  if (config.backends.has('passthrough')) {
-    registry.register(new PassthroughBackend({
-      openaiApiKey: config.openaiApiKey,
-      anthropicApiKey: config.anthropicApiKey,
-      moonshotApiKey: config.moonshotApiKey,
-      zaiApiKey: config.zaiApiKey,
     }))
   }
   if (config.backends.has('sandbox')) {

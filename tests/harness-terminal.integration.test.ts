@@ -7,7 +7,6 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { CODEX_DISABLED_FEATURE_ARGS } from '@tangle-network/agent-profile-materialize'
 import { ClaudeBackend } from '../src/backends/claude.js'
-import { FactoryBackend } from '../src/backends/factory.js'
 import { GeminiBackend } from '../src/backends/gemini.js'
 import { KimiBackend } from '../src/backends/kimi.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
@@ -19,7 +18,7 @@ import { RunRegistry } from '../src/runs/registry.js'
 
 const progress = 'progress: reading the disposable protocol fixture\n'
 const usage = { input_tokens: 23, output_tokens: 13 }
-type Harness = 'claude' | 'codex' | 'factory' | 'gemini' | 'kimi' | 'opencode'
+type Harness = 'claude' | 'codex' | 'gemini' | 'kimi' | 'opencode'
 // These are the existing model/profile laws, observed at the real executable boundary.
 const codexArguments: {
   name: string
@@ -169,7 +168,7 @@ describe('native harness terminal result followed by actual process exit', () =>
     await rm(scratch, { recursive: true, force: true })
   })
 
-  for (const harness of ['claude', 'codex', 'factory', 'gemini', 'kimi', 'opencode'] as const) {
+  for (const harness of ['claude', 'codex', 'gemini', 'kimi', 'opencode'] as const) {
     const selected = harness === 'claude' || harness === 'codex'
       ? scenarios
       : scenarios.filter((scenario) => ['success', 'late-native-error', 'late-process-failure', 'signal-death'].includes(scenario.name))
@@ -201,7 +200,6 @@ describe('native harness terminal result followed by actual process exit', () =>
         const backend = harness === 'claude'
           ? new ClaudeBackend({ bin, harness: 'claude-code', timeoutMs: 5000, spawner: hostSpawner })
           : harness === 'codex' ? new CodexBackend({ bin, timeoutMs: 5000, spawner: observedCodexSpawner })
-          : harness === 'factory' ? new FactoryBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
           : harness === 'gemini' ? new GeminiBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
           : harness === 'kimi' ? new KimiBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })
           : new OpencodeBackend({ bin, timeoutMs: 5000, spawner: hostSpawner })

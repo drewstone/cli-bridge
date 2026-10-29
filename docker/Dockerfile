@@ -38,9 +38,6 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 COPY scripts/install-harness.sh scripts/python-security-overrides.txt /usr/local/share/cli-bridge/
 RUN sh /usr/local/share/cli-bridge/install-harness.sh kimi
 
-# Factory droid, Sourcegraph amp, Forge left out by default — install
-# manually on hosts that need them. They change rapidly.
-
 # --- App install ---
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY tests/runtime-consumer/package.json tests/runtime-consumer/
