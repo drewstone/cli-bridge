@@ -1,9 +1,3 @@
-/**
- * materializeProfile golden-file tests — assert the EXACT native file tree + flags +
- * fail-closed records each harness produces for a full profile, per the verified
- * capability matrix. A wrong path here = the live sandbox loads nothing, so these
- * lock the matrix down.
- */
 import { describe, it, expect } from 'vitest'
 import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -23,6 +17,13 @@ import {
 import { GeminiBackend } from '../src/backends/gemini.js'
 import type { ChatRequest } from '../src/backends/types.js'
 import { sanitizeHostEnv } from '../src/executors/host.js'
+
+/**
+ * materializeProfile golden-file tests — assert the EXACT native file tree + flags +
+ * fail-closed records each harness produces for a full profile, per the verified
+ * capability matrix. A wrong path here = the live sandbox loads nothing, so these
+ * lock the matrix down.
+ */
 
 const SKILL_BODY = '---\nskill: fhenix-core\ndescription: >\n  Build real CoFHE.\n---\nUse euint.'
 const FULL: AgentProfile = {

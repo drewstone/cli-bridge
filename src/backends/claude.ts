@@ -204,12 +204,7 @@ export interface ClaudeBackendOptions {
    * a different model backend.
    */
   anthropicBaseUrl?: string | null
-  /**
-   * Subprocess spawner. Defaults to host node spawn. Pass a
-   * docker-pooled spawner to run claude inside isolated containers
-   * (per-call FS isolation; safe parallelism). See
-   * `src/executors/docker.ts` + `container-pool.ts`.
-   */
+  /** Subprocess spawner; defaults to the host executor. */
   spawner?: Spawner
 }
 

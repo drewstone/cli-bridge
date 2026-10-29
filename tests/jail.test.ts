@@ -1,3 +1,28 @@
+import { existsSync } from 'node:fs'
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { afterEach, describe, expect, it } from 'vitest'
+import {
+  LinuxBwrapJail,
+  MacosSeatbeltJail,
+  NoopJail,
+  registerJailEnvironment,
+  registerJailReadable,
+  resolveJailRoot,
+} from '../src/jail/index.js'
+import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
+import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
+import { applyJail } from '../src/executors/jail-support.js'
+import {
+  authSourcesFor,
+  copyAuthIntoJail,
+  removeStaleAuthCopies,
+} from '../src/jail/auth-preserve.js'
+import { ignoreJailRoot } from '../src/jail/types.js'
+import { anyBackendSpawnsOnHost } from '../src/config.js'
+import type { JailBackend } from '../src/jail/index.js'
+
 /**
  * Composition tests for the local write-jail backends.
  *
@@ -15,7 +40,6 @@
  *   - resolveJailSpec: null when off; root clamped inside cwd.
  */
 
-import type { JailBackend } from '../src/jail/index.js'
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
 function seqIndex(argv: string[], ...seq: string[]): number {

@@ -1,3 +1,22 @@
+import { EventEmitter } from 'node:events'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PassThrough, Readable } from 'node:stream'
+import type { ChildProcess } from 'node:child_process'
+import { Hono } from 'hono'
+import { afterEach, describe, expect, it } from 'vitest'
+import { versionHealth } from '../src/backends/health.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
+import { BackendRegistry } from '../src/backends/registry.js'
+import type { Backend, BackendHealth, ChatDelta, ChatRequest } from '../src/backends/types.js'
+import { ExecutorConfigurationError, type SpawnOpts, type Spawner } from '../src/executors/types.js'
+import { mountChatCompletions } from '../src/routes/chat-completions.js'
+import { mountHealth } from '../src/routes/health.js'
+import { mountRuns } from '../src/routes/runs.js'
+import { RunRegistry } from '../src/runs/registry.js'
+import { SessionStore, type SessionRecord } from '../src/sessions/store.js'
+
 /**
  * A health check that does not exercise the request path is not a health check.
  *
@@ -36,12 +55,6 @@
  * model answered nothing".
  */
 
-import { ExecutorConfigurationError, type SpawnOpts, type Spawner } from '../src/executors/types.js'
-import { mountChatCompletions } from '../src/routes/chat-completions.js'
-import { mountHealth } from '../src/routes/health.js'
-import { mountRuns } from '../src/routes/runs.js'
-import { RunRegistry } from '../src/runs/registry.js'
-import { SessionStore, type SessionRecord } from '../src/sessions/store.js'
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 

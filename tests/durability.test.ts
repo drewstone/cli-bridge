@@ -1,3 +1,5 @@
+import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest'
+
 /**
  * Durability — every safety net we ship in this PR.
  *
@@ -15,7 +17,6 @@
  * integration path is covered by tests/docker-executor.test.ts.
  */
 
-import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest'
 
 afterEach(() => {
   vi.useRealTimers()

@@ -1,3 +1,21 @@
+import { EventEmitter } from 'node:events'
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { PassThrough, Readable } from 'node:stream'
+import type { ChildProcess } from 'node:child_process'
+import { Hono } from 'hono'
+import { afterEach, describe, expect, it } from 'vitest'
+import { loadConfig } from '../src/config.js'
+import { resolveSpawnerCwd } from '../src/executors/types.js'
+import { mountHealth } from '../src/routes/health.js'
+import { mountChatCompletions } from '../src/routes/chat-completions.js'
+import { BackendRegistry } from '../src/backends/registry.js'
+import { OpencodeBackend } from '../src/backends/opencode.js'
+import { BackendError, type Backend, type BackendHealth, type ChatDelta } from '../src/backends/types.js'
+import { SessionStore } from '../src/sessions/store.js'
+import { RunRegistry } from '../src/runs/registry.js'
+
 /**
  * Second pass over the same defect class: NO FAILURE MAY PRESENT AS A
  * DIFFERENT FAILURE. Each test below encodes a case that survived the first
@@ -42,13 +60,6 @@
  *      fields a watchdog reads were not.
  */
 
-import { mountHealth } from '../src/routes/health.js'
-import { mountChatCompletions } from '../src/routes/chat-completions.js'
-import { BackendRegistry } from '../src/backends/registry.js'
-import { OpencodeBackend } from '../src/backends/opencode.js'
-import { BackendError, type Backend, type BackendHealth, type ChatDelta } from '../src/backends/types.js'
-import { SessionStore } from '../src/sessions/store.js'
-import { RunRegistry } from '../src/runs/registry.js'
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 

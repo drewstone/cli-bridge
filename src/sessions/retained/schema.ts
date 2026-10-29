@@ -106,6 +106,12 @@ export type RetainedTurnInput = Omit<z.infer<typeof turnSchema>, 'interactions'>
 }
 
 export function parseCreate(value: unknown): RetainedCreateInput {
+  if (value && typeof value === 'object' && 'execution' in value) {
+    const execution = value.execution
+    if (execution && typeof execution === 'object' && 'netJail' in execution) {
+      throw new RetainedSessionError('execution.netJail is no longer supported', 400, 'invalid_request_error')
+    }
+  }
   const parsed = createSchema.safeParse(value)
   if (!parsed.success)
     throw new RetainedSessionError('invalid retained-session creation request', 400, 'invalid_request_error')
@@ -123,6 +129,12 @@ export function parseCreate(value: unknown): RetainedCreateInput {
 }
 
 export function parseTurn(value: unknown): RetainedTurnInput {
+  if (value && typeof value === 'object' && 'execution' in value) {
+    const execution = value.execution
+    if (execution && typeof execution === 'object' && 'netJail' in execution) {
+      throw new RetainedSessionError('execution.netJail is no longer supported', 400, 'invalid_request_error')
+    }
+  }
   const parsed = turnSchema.safeParse(value)
   if (!parsed.success)
     throw new RetainedSessionError('invalid retained-session turn request', 400, 'invalid_request_error')
