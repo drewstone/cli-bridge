@@ -27,7 +27,6 @@ import {
   type ContextTransferRequest,
   type RequestedInteractions,
 } from '@tangle-network/agent-interface'
-import { routerReceiptsRequired } from '../backends/router-launch.js'
 import type { BackendRegistry } from '../backends/registry.js'
 import {
   SessionExecutionAbortedError,
@@ -605,13 +604,7 @@ export function mountChatCompletions(
     if (!backend) {
       return c.json({
         error: {
-          // Receipt-required deployments admit only the harness whose Router tuple carrier is
-          // verified, so say that instead of letting an excluded harness look unregistered.
-          message: routerReceiptsRequired()
-            ? `no backend admitted for model "${selectedModel}": BRIDGE_ROUTER_RECEIPTS_REQUIRED=1 admits only codex, `
-              + 'the one harness whose Tangle Router receipt-tuple carrier is verified. '
-              + 'Unset it to launch the other harnesses without receipts.'
-            : `no backend matches model "${selectedModel}". Check /health for registered backends.`,
+          message: `no backend matches model "${selectedModel}". Check /health for registered backends.`,
           type: 'not_found_error',
         },
       }, 404)
@@ -1015,7 +1008,7 @@ export function mountChatCompletions(
         if (requestedAcquireTimeoutMs !== undefined) {
           req.acquireDeadlineMs = resolveHostAcquireDeadlineMs(requestedAcquireTimeoutMs)
         }
-        if (deps.admission && backend.name !== 'sandbox' && backend.name !== 'passthrough') {
+        if (deps.admission && backend.name !== 'sandbox') {
           // Admission is owned by the job. Explicit cancellation can remove
           // a queued job before it ever acquires a process slot. The slot is
           // bound to the job's lifetime below; the run's terminal state is the
@@ -1837,22 +1830,11 @@ function admissionErrorResponse(c: Context, err: unknown): Response {
   }, 503)
 }
 
-/**
- * Map a host harness name (the `Backend.name` field — `claude`,
- * `kimi-code`, `gemini`, `codex`, `opencode`, `amp`, `factory`, `forge`) to the
- * matching in-container backend type the sandbox SDK accepts. The two
- * sets are mostly 1:1; the only divergence today is `factory` (host)
- * vs `factory-droids` (sandbox), which mirrors the upstream package
- * naming conventions.
- *
- * Unknown harnesses fall through as-is — sandbox-api will 400 if it
- * doesn't recognise the type, which is the right loud failure.
- */
+/** Map a registered host harness to its sandbox execution name. */
 function harnessToSandboxBackendType(harnessName: string): string {
   switch (harnessName) {
     case 'claude': return 'claude-code'
     case 'claudish': return 'claude-code'
-    case 'factory': return 'factory-droids'
     default: return harnessName
   }
 }

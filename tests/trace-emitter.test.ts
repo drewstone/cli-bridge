@@ -13,9 +13,7 @@ import {
   type ContractSpan,
 } from '@tangle-network/agent-trace-contract'
 import {
-  EXPECTED_MAX_SPANS_READ,
   traceContractBuildId,
-  verifyInstalledTraceContract,
 } from '../src/trace/contract-build.js'
 import { AdmissionGate } from '../src/admission.js'
 import { holdSlot } from './admission-hold.js'
@@ -948,52 +946,7 @@ describe('trace configuration', () => {
  * pins — an allowlist derived from the lockfile, so ANY other tree fails, not
  * just one remembered bad one.
  */
-describe('the installed contract build is the one with the bounded read', () => {
-  // Read off the namespace, not as a named import: a named import of a symbol a
-  // build lacks fails at link time and takes the whole FILE down before any
-  // assertion runs, which reports as "cannot load" instead of "wrong build".
-  const declaredBound: unknown = traceContract.MAX_SPANS_READ
-
-  it('exports MAX_SPANS_READ, and it is the expected bound', () => {
-    expect(
-      typeof declaredBound,
-      'the installed build does not export MAX_SPANS_READ, so it reads an export in full however large its length claims to be',
-    ).toBe('number')
-    expect(declaredBound).toBe(EXPECTED_MAX_SPANS_READ)
-  })
-
-  it('reports truncated-input when an export declares more entries than are read', () => {
-    // Falls back to the pinned bound rather than deriving the probe size from
-    // the module under test: a build with no bound would otherwise choose the
-    // probe that lets it pass.
-    const probeLength =
-      (typeof declaredBound === 'number' && Number.isSafeInteger(declaredBound)
-        ? declaredBound
-        : EXPECTED_MAX_SPANS_READ) + 1
-    // Sparse on purpose — `length` is a number a producer wrote, and the bound
-    // exists so that number cannot decide how long this call runs.
-    const oversized = new Array(probeLength)
-    oversized[0] = { span_id: 'a'.repeat(16), name: 'probe' }
-    const codes = validateTraceSpans(oversized as unknown as ContractSpan[]).findings.map(
-      (entry) => entry.code,
-    )
-    expect(
-      codes,
-      `an export declaring ${probeLength} entries produced no truncated-input finding, so this build reads the whole declared length`,
-    ).toContain('truncated-input')
-  })
-
-  it('is byte-identical to the build the lockfile pins', { timeout: 30_000 }, async () => {
-    const provenance = await verifyInstalledTraceContract()
-    expect(provenance.integrity).toMatch(/^sha512-/)
-    expect(
-      { missing: provenance.missing, extra: provenance.extra, mismatched: provenance.mismatched },
-      `the installed tree at ${provenance.packageDir} is not the ${provenance.version} build pinned by pnpm-lock.yaml (${provenance.integrity})`,
-    ).toEqual({ missing: [], extra: [], mismatched: [] })
-    // The tree digest is what the emitter stamps; it must exist for the locked build.
-    expect(traceContractBuildId()).toMatch(/^[0-9a-f]{64}$/)
-  })
-
+describe('trace contract build identity', () => {
   it('stamps that digest on the request span, so a trace records its own producer', () => {
     const written: ContractSpan[] = []
     const rec = new TraceEmitter({

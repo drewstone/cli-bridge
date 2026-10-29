@@ -24,15 +24,10 @@ export interface Config extends NativeHarnessConfig {
     backends: Set<string>;
     /** Dedicated subscription consumers refuse API and unverified native routes. */
     subscriptionsOnly: boolean;
-    factoryBin: string;
-    ampBin: string;
-    forgeBin: string;
     /** ACP-protocol agents driven via `<bin> acp` (AcpBackend). */
     hermesBin: string;
     openclawBin: string;
-    /** NanoClaw daemon CLI-channel Unix socket (NanoclawBackend connects as a client). */
-    nanoclawSocket: string;
-    primeBin: string;
+      primeBin: string;
     primeTimeoutMs: number;
     /** Operator models.json materialized into every isolated prime agent dir. Null = none configured. */
     primeModelsJson: string | null;
@@ -60,10 +55,6 @@ export interface Config extends NativeHarnessConfig {
      * spawned with ANTHROPIC_BASE_URL=<this> for `claudish/*` model ids.
      */
     claudishUrl: string | null;
-    openaiApiKey: string | null;
-    anthropicApiKey: string | null;
-    moonshotApiKey: string | null;
-    zaiApiKey: string | null;
     /** Tangle sandbox-api base URL (e.g. https://sandbox.tangle.tools). When set + key present, the `sandbox` backend registers. */
     sandboxApiUrl: string | null;
     /** Bearer for sandbox-api. Required for the sandbox backend. */

@@ -36,9 +36,7 @@ import { materializeProfile } from '@tangle-network/agent-profile-materialize'
 import { AcpBackend } from '../src/backends/acp.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { CodexBackend } from '../src/backends/codex.js'
-import { FactoryBackend } from '../src/backends/factory.js'
 import { KimiBackend } from '../src/backends/kimi.js'
-import { NanoclawBackend } from '../src/backends/nanoclaw.js'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import { PiBackend } from '../src/backends/pi.js'
 import {
@@ -430,7 +428,7 @@ describe('prompt intents reach each harness through its own control', () => {
   describe('backends with no system-prompt channel at all', () => {
     // These flatten a role:'system' message into the user turn, so neither
     // intent has anywhere real to land. The shared seam refuses both — including
-    // for backends (acp, factory, nanoclaw) that never materialize a plan and
+    // for backends (acp) that never materialize a plan and
     // would otherwise drop the intent without a word.
     for (const backend of ['kimi-code', 'nanoclaw', 'acp', 'factory', 'a-backend-added-tomorrow']) {
       it(`refuses a replacement on ${backend}`, () => {
@@ -527,7 +525,7 @@ describe('the shared refusal seam fires on the real request path', () => {
   const signal = (): AbortSignal => new AbortController().signal
 
   const cases: SeamCase[] = [
-    // acp / factory / nanoclaw never materialize a profile plan, so the materializer's fail-closed
+    // acp never materialize a profile plan, so the materializer's fail-closed
     // record never reaches them: this seam is their ONLY guard on either intent.
     ...(['replace', 'append'] as const).flatMap((intent): SeamCase[] => {
       const profileOf = intent === 'replace' ? replacement : addition
@@ -541,15 +539,6 @@ describe('the shared refusal seam fires on the real request path', () => {
           run: async (profile, cwd, spawner) => {
             const backend = new AcpBackend({ name: 'hermes', bin: 'hermes', timeoutMs: 5_000, spawner })
             await drain(backend.chat(request(profile, 'hermes', cwd), null, signal()))
-          },
-        },
-        {
-          label: `factory · ${intent}`,
-          intent,
-          refusal,
-          run: async (profile, cwd, spawner) => {
-            const backend = new FactoryBackend({ bin: 'droid', timeoutMs: 5_000, spawner })
-            await drain(backend.chat(request(profile, 'factory', cwd), null, signal()))
           },
         },
         {
@@ -604,38 +593,6 @@ describe('the shared refusal seam fires on the real request path', () => {
       expect(readdirSync(cwd)).toEqual([])
     })
   }
-
-  it('refuses both intents on nanoclaw without opening its socket', async () => {
-    const dir = workspace()
-    const socketPath = join(dir, 'cli.sock')
-    let connections = 0
-    const server = net.createServer((socket) => {
-      connections += 1
-      socket.destroy()
-    })
-    await new Promise<void>((resolve) => server.listen(socketPath, resolve))
-
-    try {
-      const backend = new NanoclawBackend({ socketPath, timeoutMs: 5_000, silenceMs: 50 })
-      const cwd = workspace()
-
-      await expect(
-        drain(backend.chat(request(replacement, 'nanoclaw', cwd), null, signal())),
-      ).rejects.toMatchObject({ name: 'BackendError', code: 'not_configured' })
-      await expect(
-        drain(backend.chat(request(replacement, 'nanoclaw', cwd), null, signal())),
-      ).rejects.toThrow(REPLACE_REFUSAL)
-      await expect(
-        drain(backend.chat(request(addition, 'nanoclaw', cwd), null, signal())),
-      ).rejects.toThrow(APPEND_REFUSAL)
-
-      // nanoclaw launches nothing itself — it hands the turn to a running daemon. Reaching that
-      // daemon at all IS the downgrade here, so the socket connection count is the spawn count.
-      expect(connections).toBe(0)
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-    }
-  })
 
   it('lets a supported intent through the same seam, so the refusal is not blanket', async () => {
     // The guard must refuse only what the backend cannot execute. codex owns replacement and

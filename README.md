@@ -4,7 +4,7 @@
 
 Model ids are `<harness>/<model>`. The harness is the agent runtime (Claude Code, Codex, opencode, claudish, …); the model is whatever that runtime can address. One string, both choices explicit.
 
-Backends this is built for (✓ implemented, ◦ stubbed):
+Supported backends:
 
 | Harness | Status | What it is |
 |---|---|---|
@@ -14,10 +14,6 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 | `opencode/` | ✓ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
 | `cursor/` | ✓ | Cursor Agent CLI — local native chats and `--resume` |
 | `gemini/` | ✓ | [Gemini CLI](https://github.com/google-gemini/gemini-cli) — Google's official Gemini coding CLI |
-| `factory/` | ◦ | [Factory Droid](https://docs.factory.ai/) |
-| `amp/` | ◦ | [Sourcegraph Amp](https://ampcode.com/) |
-| `forge/` | ◦ | [Forge Code](https://github.com/antinomyhq/forge) |
-| `<provider>/` | ✓ | Passthrough: `openai/`, `anthropic/`, `moonshot/`, `zai/` — direct vendor API, not a CLI |
 
 Personal productivity tool. Single-user by default. Loopback-only by default. No ambition to be a shared proxy.
 
@@ -71,8 +67,6 @@ opencode/anthropic/claude-sonnet-4-5 # opencode's configured anthropic provider
 gemini/gemini-2.5-pro                # Gemini CLI with explicit model
 gemini/gemini-2.5-flash              # Gemini CLI Flash model
 
-openai/gpt-4o                        # passthrough — OpenAI API, metered
-zai/glm-4.6                          # passthrough — Z.AI API, metered
 ```
 
 The registry matches on the `<harness>/` prefix; first-registered-first-match wins. `bridge/claude` (no model) defaults to whatever the harness default is.
@@ -133,7 +127,6 @@ pnpm install:harnesses      # all harnesses
 | `gemini` | `npm install -g @google/gemini-cli` | Gemini CLI's official auth/login flow |
 | `pi` | `pnpm install:harness pi` (qualified Pi 1.0.2) | Explicit provider/model config in `~/.pi/agent/models.json`; cli-bridge resolves its credential before spawn |
 | `prime` | prime-agent, the PrimeIntellect fork of pi. It is **not installable from npm**: the registry serves the upstream pi line under the fork's own package name `@earendil-works/pi-coding-agent` (latest `0.84.x`; the fork's `0.7.x` does not exist there), and the two are wire-incompatible. Run `pnpm install:harness prime` — it builds from source at the pinned commit and installs the entrypoint as `prime-agent`, which is what `PRIME_BIN` defaults to. Do **not** install it as `pi` | Operator `models.json` named by `PRIME_MODELS_JSON`, materialized into an isolated per-run agent dir; only the apiKey env vars it names are forwarded |
-| `passthrough` | (none) | provider API keys in `.env` |
 
 For Codex, enable `codex` in `BRIDGE_BACKENDS` on the bridge process that will serve the request.
 That process selects one subscription account from `CODEX_HOME/auth.json`, or from `$HOME/.codex/auth.json` when `CODEX_HOME` is unset.
@@ -849,7 +842,7 @@ brew install claudish   # or install-from-source per its repo
 claudish --port 3456
 # then in cli-bridge .env:
 CLAUDISH_URL=http://127.0.0.1:3456
-BRIDGE_BACKENDS=claude,claudish,passthrough
+BRIDGE_BACKENDS=claude,claudish
 ```
 
 Now every `claudish/<model>` call spawns Claude Code with `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` — Claude Code's workflow, whatever-you-configured's brain.

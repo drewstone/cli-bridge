@@ -39,14 +39,9 @@ export interface Config extends NativeHarnessConfig {
   backends: Set<string>
   /** Dedicated subscription consumers refuse API and unverified native routes. */
   subscriptionsOnly: boolean
-  factoryBin: string
-  ampBin: string
-  forgeBin: string
   /** ACP-protocol agents driven via `<bin> acp` (AcpBackend). */
   hermesBin: string
   openclawBin: string
-  /** NanoClaw daemon CLI-channel Unix socket (NanoclawBackend connects as a client). */
-  nanoclawSocket: string
   primeBin: string
   primeTimeoutMs: number
   /** Operator models.json materialized into every isolated prime agent dir. Null = none configured. */
@@ -75,10 +70,6 @@ export interface Config extends NativeHarnessConfig {
    * spawned with ANTHROPIC_BASE_URL=<this> for `claudish/*` model ids.
    */
   claudishUrl: string | null
-  openaiApiKey: string | null
-  anthropicApiKey: string | null
-  moonshotApiKey: string | null
-  zaiApiKey: string | null
   /** Tangle sandbox-api base URL (e.g. https://sandbox.tangle.tools). When set + key present, the `sandbox` backend registers. */
   sandboxApiUrl: string | null
   /** Bearer for sandbox-api. Required for the sandbox backend. */
@@ -157,7 +148,7 @@ export function assertListenerConfig(
 }
 
 export function anyBackendSpawnsOnHost(backends: Iterable<string>): boolean {
-  return [...backends].some((name) => !['sandbox', 'passthrough', 'nanoclaw'].includes(name))
+  return [...backends].some((name) => name !== 'sandbox')
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -169,7 +160,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const bearer = env.BRIDGE_BEARER?.trim() || null
   const dataDir = resolve(env.BRIDGE_DATA_DIR ?? './data')
   const backends = new Set(
-    (env.BRIDGE_BACKENDS ?? 'claude,kimi,gemini,sandbox,passthrough')
+    (env.BRIDGE_BACKENDS ?? 'claude,kimi,gemini,sandbox')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean),
@@ -201,12 +192,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? (name === 'cursor' ? 'cursor-agent' : name)],
       [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], name === 'codex' && !env.CLI_TIMEOUT_MS ? maxCodexSubscriptionTurnMs : defaultTimeout)],
     ])) as NativeHarnessConfig,
-    factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',
-    ampBin: env.AMP_BIN ?? 'amp',
-    forgeBin: env.FORGE_BIN ?? 'forge',
     hermesBin: env.HERMES_BIN ?? 'hermes',
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
-    nanoclawSocket: env.NANOCLAW_SOCKET ?? '',
     primeBin: env.PRIME_BIN ?? 'prime-agent',
     primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),
     ...parsePrimeStateConfig(env, backends),
@@ -214,10 +201,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     admission: admissionConfig(env),
     admissionReservedClients: parseClientList(env.BRIDGE_HOST_CHAT_RESERVED_CLIENTS, ['pr-reviewer']),
     claudishUrl: env.CLAUDISH_URL?.trim() || null,
-    openaiApiKey: env.OPENAI_API_KEY?.trim() || null,
-    anthropicApiKey: env.ANTHROPIC_API_KEY?.trim() || null,
-    moonshotApiKey: env.MOONSHOT_API_KEY?.trim() || null,
-    zaiApiKey: env.ZAI_API_KEY?.trim() || null,
     sandboxApiUrl: env.SANDBOX_API_URL?.trim() || null,
     sandboxApiKey: env.SANDBOX_API_KEY?.trim() || null,
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
