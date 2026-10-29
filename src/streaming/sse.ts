@@ -27,12 +27,12 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   const hasFinalOutput = Object.hasOwn(delta, 'final_output')
   const hasContent = delta.content !== undefined
   const hasReasoning = delta.reasoning !== undefined
-  const hasIdentity = delta.model !== undefined || delta.system_fingerprint !== undefined
+  const providerModels = [...new Set(delta.provider_models ?? [])]
+  const hasIdentity = providerModels.length > 0 || delta.model !== undefined || delta.system_fingerprint !== undefined
   const hasToolCalls = !!delta.tool_calls && delta.tool_calls.length > 0
   const hasToolResults = !!delta.tool_results && delta.tool_results.length > 0
   const hasFinish = delta.finish_reason !== undefined
   const hasUsage = !!delta.usage
-  const hasSessionId = !!delta.internal_session_id
   const hasProfileMaterialization = !!delta.profile_materialization
 
   // Pure keepalive deltas don't go on the OpenAI wire — surface as SSE
@@ -40,13 +40,6 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   // deltas are also non-OpenAI metadata (consumed by the session store)
   // and are intentionally skipped here.
   if (!hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization && !hasFinalOutput) {
-    return null
-  }
-  // internal_session_id-only deltas: the session id is bookkeeping for
-  // the bridge's own store, not OpenAI surface area. Skip to avoid
-  // sending an empty `delta: {}` chunk which strict consumers (LiteLLM,
-  // some agent harnesses) reject as malformed.
-  if (hasSessionId && !hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization && !hasFinalOutput) {
     return null
   }
 
@@ -90,6 +83,8 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
     object: 'chat.completion.chunk',
     created: meta.created,
     model: delta.model ?? meta.model,
+    ...(providerModels.length ? { provider_models: providerModels } : {}),
+    ...(providerModels.length === 1 ? { provider_model: providerModels[0] } : {}),
     choices: metadataOnly ? [] : [
       {
         index: 0,
@@ -130,7 +125,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
                 : {}),
             }),
         ...(usage.cost_scope ? { cost_scope: usage.cost_scope } : {}),
-        ...(usage.estimated ? { estimated: true } : {}),
+        ...(usage.estimated !== undefined ? { estimated: usage.estimated } : {}),
       },
     } : {}),
     ...(delta.profile_materialization
@@ -185,6 +180,7 @@ export async function collectNonStreaming(
   let usage: CollectedUsage | undefined
   let profileMaterialization: ChatDelta['profile_materialization']
   let error: ChatDelta['error']
+  const providerModels = new Set<string>()
   let responseModel: string | undefined
   let systemFingerprint: string | undefined
 
@@ -197,6 +193,7 @@ export async function collectNonStreaming(
     // body keeps the plain OpenAI shape and drops them.
     if (d.content) content += d.content
     if (d.model) responseModel = d.model
+    for (const observation of d.provider_models ?? []) providerModels.add(observation)
     if (d.system_fingerprint) systemFingerprint = d.system_fingerprint
     if (d.tool_calls) toolCalls.push(...d.tool_calls)
     if (d.finish_reason) finishReason = d.finish_reason
@@ -238,7 +235,7 @@ export async function collectNonStreaming(
                 : {}),
             }),
         cost_scope: 'total' as const,
-        ...(usage.estimated ? { estimated: true } : {}),
+        ...(usage.estimated !== undefined ? { estimated: usage.estimated } : {}),
       }
     : undefined
 
@@ -247,6 +244,8 @@ export async function collectNonStreaming(
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model: responseModel ?? model,
+    ...(providerModels.size ? { provider_models: [...providerModels] } : {}),
+    ...(providerModels.size === 1 ? { provider_model: [...providerModels][0] } : {}),
     choices: [
       {
         index: 0,

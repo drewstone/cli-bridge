@@ -1,3 +1,6 @@
+import { spawn } from 'node:child_process'
+import { piResponseIdentityFromEvent } from '../src/backends/pi.js'
+import { collectNonStreaming } from '../src/streaming/sse.js'
 /** Real native process -> HTTP SSE -> SQLite reopen. No synthetic backend or spawner. */
 import { serve } from '@hono/node-server'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -17,7 +20,7 @@ import { RetainedSessionService } from '../src/sessions/retained.js'
 const nativeProcess = `#!${process.execPath}
 const fs = require('node:fs');
 fs.appendFileSync('dispatches.txt', String(process.pid) + '\\n');
-const events = [
+const events = fs.existsSync('native-case.json') ? JSON.parse(fs.readFileSync('native-case.json', 'utf8')) : [
  { type:'system', subtype:'init', session_id:'native-replay-session' },
  { type:'assistant', message:{content:[{type:'text',text:'progress before final JSON'}]} },
  { type:'assistant', message:{content:[{type:'text',text:'{"answer":42}'}]} },
@@ -155,3 +158,96 @@ it('refuses rotated and expired replay cursors after an actual native process co
     await rm(root, { recursive: true, force: true })
   }
 }, 15000)
+
+
+for (const specimen of [
+  { name: 'observed response and repeated provider ID', models: ['actual-provider-a', 'actual-provider-a'], observed: ['actual-provider-a'] },
+  { name: 'absent response model', models: [undefined], observed: [] },
+  { name: 'synthetic response', models: ['<synthetic>'], observed: [] },
+  { name: 'API error response', models: ['not-provider-evidence'], apiError: true, observed: [] },
+  { name: 'conflicting response models including one repeated provider ID', models: ['actual-provider-a', 'actual-provider-b', 'actual-provider-a'], observed: ['actual-provider-a', 'actual-provider-b'] },
+  { name: 'partial native token receipt', models: ['actual-provider-a'], observed: ['actual-provider-a'], usage: { input_tokens: 11, output_tokens: 13 } },
+  { name: 'absent native usage becomes an explicit estimate', models: ['actual-provider-a'], observed: ['actual-provider-a'], usage: null },
+  { name: 'observed zero is measured', models: ['actual-provider-a'], observed: ['actual-provider-a'], usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 } },
+]) {
+  it(`preserves provider evidence through actual Claude child, HTTP and SQLite replay: ${specimen.name}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'bridge-provider-evidence-'))
+    const bin = join(root, 'native.cjs')
+    const nativeUsage = specimen.usage === undefined
+      ? { input_tokens: 11, cache_read_input_tokens: 7, cache_creation_input_tokens: 5, output_tokens: 13 }
+      : specimen.usage
+    await writeFile(bin, nativeProcess)
+    await chmod(bin, 0o755)
+    await writeFile(join(root, 'native-case.json'), JSON.stringify([
+      { type: 'system', subtype: 'init', session_id: 'evidence-session', model: 'init-is-not-an-observation' },
+      ...specimen.models.map((model) => ({ type: 'assistant', isApiErrorMessage: specimen.apiError,
+        message: { id: 'same-provider-message', model, usage: { input_tokens: 999, output_tokens: 999 }, content: [{ type: 'text', text: 'fixture text' }] } })),
+      { type: 'result', subtype: 'success', session_id: 'evidence-session', result: 'fixture text',
+        ...(nativeUsage === null ? {} : { usage: nativeUsage }) },
+    ]))
+    const body = { model: 'claude-code/requested-only', cwd: root, mode: 'byob', stream: true,
+      run_id: 'provider-evidence-run', messages: [{ role: 'user', content: 'only exercise this local executable' }] }
+    let server: Awaited<ReturnType<typeof startServer>> | undefined
+    try {
+      server = await startServer(root, bin)
+      const response = await dispatch(server.url, body)
+      expect(response.status).toBe(200)
+      const initial = frames(await response.text())
+      expect([...new Set(initial.flatMap((frame) => frame.provider_models as string[] | undefined ?? []))]).toEqual(specimen.observed)
+      expect(initial.filter((frame) => frame.provider_models !== undefined)).toHaveLength(specimen.observed.length)
+      expect(initial.some((frame) => frame.provider_model === 'init-is-not-an-observation')).toBe(false)
+      const nonstream = await dispatch(server.url, { ...body, stream: false, run_id: 'provider-evidence-nonstream' })
+      expect(nonstream.status).toBe(200)
+      const completion = await nonstream.json() as {
+        model?: string; provider_models?: string[]; provider_model?: string
+        usage: { estimated?: boolean; completion_tokens?: number; prompt_tokens?: number; cost_known?: boolean; cost?: number }
+      }
+      expect(completion.model).toBe(specimen.observed.at(-1) ?? body.model)
+      expect(completion.provider_models).toEqual(specimen.observed.length ? specimen.observed : undefined)
+      expect(completion.provider_model).toBe(specimen.observed.length === 1 ? specimen.observed[0] : undefined)
+      const usage = completion.usage
+      expect(usage.estimated).toBe(nativeUsage === null)
+      if (nativeUsage !== null) {
+        expect(usage.completion_tokens).toBe(nativeUsage.output_tokens)
+        expect(usage.cost_known).toBe(false)
+        expect(usage.cost).toBeUndefined()
+        if ('cache_read_input_tokens' in nativeUsage && nativeUsage.cache_read_input_tokens !== undefined && nativeUsage.cache_creation_input_tokens !== undefined) expect(usage.prompt_tokens).toBe(
+          nativeUsage.input_tokens + nativeUsage.cache_read_input_tokens + nativeUsage.cache_creation_input_tokens)
+        else expect(usage.prompt_tokens).toBeUndefined()
+      }
+      await server.stop()
+      server = await startServer(root, bin)
+      const replay = await fetch(`${server.url}/v1/runs/${body.run_id}/events`, { headers: { 'Last-Event-ID': '0' } })
+      expect(replay.status).toBe(200)
+      const evidence = (values: Array<Record<string, unknown>>) => values.map(({ id, created, model, ...value }) => value)
+      expect(evidence(frames(await replay.text()))).toEqual(evidence(initial))
+      expect((await readFile(join(root, 'dispatches.txt'), 'utf8')).trim().split('\n')).toHaveLength(2)
+    } finally {
+      await server?.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  }, 15000)
+}
+
+
+it('does not promote a Pi configured model plus fingerprint from actual child stdout to provider evidence', async () => {
+  const child = spawn(process.execPath, ['-e', `
+    console.log(JSON.stringify({ message: { model: 'configured-only', system_fingerprint: 'fp_control' } }));
+    console.log(JSON.stringify({ message: { model: 'configured-only', responseModel: 'observed-response', system_fingerprint: 'fp_actual' } }));
+  `], { stdio: ['ignore', 'pipe', 'pipe'] })
+  const closed = new Promise<void>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error(`child exit ${code}`)))
+  })
+  let stdout = ''
+  for await (const bytes of child.stdout) stdout += bytes.toString()
+  await closed
+  const identities = stdout.trim().split('\n').map((line) => piResponseIdentityFromEvent(JSON.parse(line)))
+  expect(identities[0]).toEqual({ model: 'configured-only@fp_control', systemFingerprint: 'fp_control' })
+  expect(identities[1]).toEqual({ model: 'observed-response@fp_actual', systemFingerprint: 'fp_actual' })
+  const result = await collectNonStreaming((async function* () {
+    for (const identity of identities) if (identity) yield { model: identity.model, system_fingerprint: identity.systemFingerprint }
+  })(), 'requested-only') as { provider_model?: string; provider_models?: string[] }
+  expect(result.provider_models).toBeUndefined()
+  expect(result.provider_model).toBeUndefined()
+})
