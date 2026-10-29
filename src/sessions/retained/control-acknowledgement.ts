@@ -1,3 +1,5 @@
+import type { RetainedControlAcknowledgement } from './types.js'
+
 /**
  * How a control operation reports what it actually did.
  *
@@ -6,14 +8,6 @@
  * operation non-retryable, because repeating an operation whose side effect
  * may already have landed is worse than reporting the uncertainty.
  */
-
-import {
-  AgentRunCancellationAcknowledgementSchema,
-  agentRunCancellationAcknowledgementMatchesRequest,
-  type AgentRunCancellationAcknowledgement,
-  type AgentRunCancellationRequest,
-} from '@tangle-network/agent-interface'
-import { RetainedSessionError, type RetainedControlAcknowledgement } from './types.js'
 
 export function controlConflict(
   operationId: string,
@@ -41,38 +35,4 @@ export function statusForControlAcknowledgement(acknowledgement: RetainedControl
   if (acknowledgement.status === 'conflict') return 409
   if (acknowledgement.status === 'pending') return 202
   return 200
-}
-
-/** Render the internal acknowledgement as the wire cancellation contract. */
-export function retainedCancellationAcknowledgement(
-  request: AgentRunCancellationRequest,
-  internal: RetainedControlAcknowledgement,
-): AgentRunCancellationAcknowledgement {
-  const outcome =
-    internal.status === 'cancelled'
-      ? { status: 'accepted' as const, effect: 'cancelled' as const }
-      : internal.status === 'already_terminal'
-        ? { status: 'accepted' as const, effect: 'not_live' as const }
-        : internal.status === 'accepted' || internal.status === 'pending'
-          ? { status: 'accepted' as const, effect: 'cancel_requested' as const }
-          : internal.status === 'conflict'
-            ? { status: 'conflict' as const, effect: 'unknown' as const }
-            : { status: 'unknown' as const, effect: 'unknown' as const }
-  const acknowledgement = AgentRunCancellationAcknowledgementSchema.parse({
-    operationId: request.operationId,
-    requestDigest: request.requestDigest,
-    run: request.run,
-    ...outcome,
-    ...(internal.message ? { message: internal.message } : {}),
-    ...(internal.retryable !== undefined ? { retryable: internal.retryable } : {}),
-    ...(internal.existingRequestDigest ? { existingRequestDigest: internal.existingRequestDigest } : {}),
-  })
-  if (!agentRunCancellationAcknowledgementMatchesRequest(request, acknowledgement)) {
-    throw new RetainedSessionError(
-      'retained cancellation acknowledgement changed its exact request binding',
-      500,
-      'server_error',
-    )
-  }
-  return acknowledgement
 }

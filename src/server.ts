@@ -179,7 +179,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountHealth(app, { registry, admission, runs })
   mountModels(app, { registry, catalog, opencodeBin: config.opencodeBin, piBin: config.piBin, cwd, describe: nativeCatalog.describe })
   mountSessions(app, { sessions, retained })
-  mountRetainedSessions(app, retained, { includeSessionList: false, includeRunEvents: false })
+  mountRetainedSessions(app, retained, { includeSessionList: false })
   mountRuns(app, { runs, retainedRuns: retained, retainedStore: sessions })
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
