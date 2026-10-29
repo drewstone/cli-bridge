@@ -63,19 +63,21 @@ try {
   const unsafe = await detectLocalSeats({ config, harnesses: ['cursor'], env: { ...process.env, CURSOR_API_KEY: '', CURSOR_API_KEY_FILE: bad } })
   assert.equal(unsafe[0]?.status, 'unknown')
   for (const model of (process.env.CURSOR_PROOF_MODELS || 'grok-4.7-medium,composer-2.5').split(',')) {
-    const marker = randomBytes(16).toString('hex'), id = randomUUID()
+    const marker = randomBytes(16).toString('hex'), publicValue = randomBytes(12).toString('hex'), id = randomUUID()
     await writeFile(join(cwd, 'workspace-only.txt'), marker, { mode: 0o600 })
     const started = Date.now()
-    const first = await api('/v1/chat/completions', { model: `cursor/${model}`, session_id: id, cwd, env: { APP_PUBLIC_LABEL: marker },
-      messages: [{ role: 'user', content: 'Use your shell tool to read workspace-only.txt and print the APP_PUBLIC_LABEL environment value. They must match. Reply with the word and remember it as the secret word for this chat.' }] })
+    const first = await api('/v1/chat/completions', { model: `cursor/${model}`, session_id: id, cwd, env: { APP_PUBLIC_LABEL: publicValue },
+      messages: [{ role: 'user', content: 'Use your shell tool to read workspace-only.txt and print the APP_PUBLIC_LABEL environment value. Reply with both values, and remember only the file content as the secret word for this chat.' }] })
     assert.ok(first.choices[0].message.content.includes(marker), JSON.stringify(first))
+    assert.ok(first.choices[0].message.content.includes(publicValue), JSON.stringify(first))
     const firstNative = await native(id)
     assert.ok(firstNative.internalId)
     await bridge.close()
     bridge = await startServer({ config, cwd, handleSignals: false, quiet: true })
     const second = await api('/v1/chat/completions', { model: `cursor/${model}`, session_id: id,
-      messages: [{ role: 'user', content: 'What was the secret word from the previous turn? Reply only that word. Do not read any files. Use your shell tool to check APP_PUBLIC_LABEL still equals the remembered word.' }] })
+      messages: [{ role: 'user', content: 'What was the secret word from the previous turn? Reply only that word. Do not read any files. Separately use your shell tool to print APP_PUBLIC_LABEL. Reply with the remembered secret word and that environment value.' }] })
     assert.ok(second.choices[0].message.content.includes(marker), JSON.stringify(second))
+    assert.ok(second.choices[0].message.content.includes(publicValue), JSON.stringify(second))
     const secondNative = await native(id)
     assert.equal(firstNative.internalId, secondNative.internalId)
     assert.equal(secondNative.cwd, cwd)
