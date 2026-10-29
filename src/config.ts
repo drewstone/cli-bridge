@@ -23,6 +23,7 @@ export const localHarnesses = [
   ['opencode', 'opencode', 'opencode auth login', ['auth', 'list', '--pure'], null],
   ['kimi', 'kimi-code', 'kimi login', ['--version'], null],
   ['gemini', 'gemini', 'gemini', ['--version'], 'google'],
+  ['cursor', 'cursor', 'cursor-agent login', ['status', '--format', 'json'], 'cursor'],
   ['pi', 'pi', 'pi', ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null],
 ] as const
 
@@ -287,6 +288,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   )
 
   assertListenerConfig({ host, port, bearer })
+  if (backends.has('cursor') && (env.CURSOR_EXECUTOR && env.CURSOR_EXECUTOR !== 'host'
+    || env.BRIDGE_DEFAULT_EXECUTOR === 'docker' || Object.keys(env).some((key) => key.startsWith('CURSOR_DOCKER_')))) {
+    throw new Error('Cursor currently requires host execution; Docker execution is not configured')
+  }
 
   // A caller may own the process deadline through `execution.timeoutMs`.
   // Codex defaults to its bounded native subscription policy; explicit operator/request values win.
@@ -304,7 +309,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     backends,
     subscriptionsOnly: parseOnOff('BRIDGE_SUBSCRIPTIONS_ONLY', env.BRIDGE_SUBSCRIPTIONS_ONLY, false),
     ...Object.fromEntries(localHarnesses.flatMap(([name]) => [
-      [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? name],
+      [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? (name === 'cursor' ? 'cursor-agent' : name)],
       [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], name === 'codex' && !env.CLI_TIMEOUT_MS ? maxCodexSubscriptionTurnMs : defaultTimeout)],
     ])) as NativeHarnessConfig,
     factoryBin: env.FACTORY_BIN ?? env.DROID_BIN ?? 'droid',

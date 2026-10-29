@@ -12,6 +12,7 @@ Backends this is built for (✓ implemented, ◦ stubbed):
 | `claudish/` | ✓ | Claude Code + [claudish](https://github.com/MadAppGang/claudish) — Claude's workflow, a different brain |
 | `codex/` | ✓ | [OpenAI Codex CLI](https://github.com/openai/codex) — your ChatGPT Plus/Pro subscription |
 | `opencode/` | ✓ | [opencode](https://github.com/sst/opencode) — multi-provider; the vehicle for Kimi Code via the `opencode-kimi-full` plugin |
+| `cursor/` | ✓ | Cursor Agent CLI — local native chats and `--resume` |
 | `gemini/` | ✓ | [Gemini CLI](https://github.com/google-gemini/gemini-cli) — Google's official Gemini coding CLI |
 | `factory/` | ◦ | [Factory Droid](https://docs.factory.ai/) |
 | `amp/` | ◦ | [Sourcegraph Amp](https://ampcode.com/) |
@@ -33,7 +34,7 @@ server and its owned work. Embedded mode leaves process signals and error handle
 with the caller. Use a private data directory and a generated bearer in `env`.
 
 `cli-bridge --seats --json` or `await detectLocalSeats({ config })` reports native
-login facts for Claude Code, Codex, OpenCode, Kimi Code, Gemini, and Pi. No model
+login facts for Claude Code, Codex, OpenCode, Kimi Code, Gemini, Cursor, and Pi. No model
 turn is sent; no credential or account identity appears in the result. Each fact
 has `harness`, `provider` (or null), `status`, `authMode`, `source`, and an optional `fix` command.
 Model selection, ranking, and seat syntax belong to the consuming seat resolver.
@@ -43,7 +44,7 @@ inference was verified. Where inventory reads Kimi/Gemini's own OAuth stores,
 the result is `configured` rather than a verified live login. Missing or malformed
 state stays `signed_out` or `unknown`; OAuth and API-key state stay distinct.
 Pi checks use `--no-refresh`. `CLAUDE_BIN`, `CODEX_BIN`, `OPENCODE_BIN`, `KIMI_BIN`,
-`GEMINI_BIN`, and `PI_BIN` select the same binaries for inventory and execution.
+`GEMINI_BIN`, `CURSOR_BIN`, and `PI_BIN` select the same binaries for inventory and execution.
 
 ---
 
@@ -145,6 +146,38 @@ For a Nix-provisioned host shell with the shared prerequisites:
 nix-shell nix/harness-profile.nix
 sh scripts/install-harness.sh all
 ```
+
+## Cursor
+
+Enable `BRIDGE_BACKENDS=cursor` and install Cursor's official `cursor-agent` CLI.
+`CURSOR_BIN` selects the executable (default `cursor-agent`). Send `cursor/<model>`;
+`cursor/default` keeps Cursor's configured default. Read available model IDs with
+`cursor-agent models`. `CURSOR_TIMEOUT_MS` overrides the shared CLI deadline.
+
+Execution requires an API key. Credentials come from `CURSOR_API_KEY` or `CURSOR_API_KEY_FILE` (default
+`~/.config/fleet/secrets/CURSOR_SERVICE_TOKEN`). Token files must be regular,
+owner-only files owned by the bridge user; symlinks are refused. Credentials go
+only in the child environment. Seat inventory reports configured API-key auth
+separately from browser login; it does not infer subscription access. Browser login
+alone does not authorize execution through this backend.
+
+Each invocation passes `--trust --workspace <request cwd>` and runs in that cwd.
+Only use this BYOB backend with a workspace whose project instructions and tools
+you trust. The bridge does not pass `--force` or approve MCP servers globally.
+The persisted native chat ID goes to `--resume` on the next external session turn.
+Cursor's native chat store must survive alongside the bridge data directory.
+
+This backend supports text, streamed reasoning and tool events, native chat
+continuation and durable run cancellation/replay. Exact AgentProfiles, public request env, request
+MCP, attachments, reasoning/sampling overrides and hosted modes are refused.
+The existing capability response advertises those limits. Token counts use the
+CLI's terminal receipt when present; billed cost and served model stay unknown
+when Cursor does not report authoritative observations.
+
+Run the real HTTP proof on Beelink: `CURSOR_BIN=$HOME/.local/bin/cursor-agent
+pnpm exec tsx tests/cursor-real.integration.ts`. It invokes Grok and a non-Grok
+model, restarts the bridge between turns, verifies native resume and cancellation,
+and checks capabilities, credential-file protection, cwd and seat inventory.
 
 ## Quick test
 

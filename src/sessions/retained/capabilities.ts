@@ -94,7 +94,7 @@ export async function readyBackendCapabilities(input: {
  * materialization, usage, placement, and lifecycle observation. Native process
  * continuation and native interactions remain exclusive to native backends.
  */
-export function genericCliBridgeCapabilities(_backendName?: string, nativeContextTransfer = false): AgentEnvironmentCapabilities {
+export function genericCliBridgeCapabilities(backendName?: string, nativeContextTransfer = false): AgentEnvironmentCapabilities {
   const candidate: AgentEnvironmentCapabilities = {
     profile: {
       namedProfiles: false,
@@ -149,6 +149,12 @@ export function genericCliBridgeCapabilities(_backendName?: string, nativeContex
       computeBilling: false,
       accountUsage: false,
     },
+  }
+  if (backendName === 'cursor') candidate.profile = {
+    namedProfiles: false, systemPrompt: { replace: false, append: false }, instructions: false,
+    tools: false, permissions: false, mcp: false, subagents: false,
+    resources: { files: false, instructions: false, tools: false, skills: false, agents: false, commands: false },
+    hooks: false, modes: false, runtimeUpdate: false, validation: true,
   }
   const validated = AgentEnvironmentCapabilitiesSchema.safeParse(candidate)
   if (!validated.success) {
