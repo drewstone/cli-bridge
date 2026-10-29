@@ -1,3 +1,4 @@
+import { cursorEnvironment } from './lib/cursor-auth.js'
 import { join, resolve } from 'node:path'
 import { findGitDir } from './jail/types.js'
 import { loadConfig, localHarnesses, type Config } from './config.js'
@@ -43,7 +44,7 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
       ? ['auth', 'check', '--provider', options.provider, ...(options.model ? ['--model', options.model] : []), '--json', '--no-refresh'] : args
     const fact: LocalSeat = { harness, provider: null, status: 'unknown', authMode: 'unknown',
       source: key === 'kimi' || key === 'gemini' ? 'native_store' : 'native_status', fix }
-    const native = await (key === 'claude' ? readClaudeNativeContext({ cwd: options.cwd ?? process.cwd(), env, flags: options.flags ?? [] }) : Promise.resolve({ env, flags: [], settings: [] as Record<string, unknown>[] })).catch(() => null)
+    const native = await (key === 'claude' ? readClaudeNativeContext({ cwd: options.cwd ?? process.cwd(), env, flags: options.flags ?? [] }) : Promise.resolve({ env: key === 'cursor' ? await cursorEnvironment(env) : env, flags: [], settings: [] as Record<string, unknown>[] })).catch(() => null)
     if (!native) return fact
     if (key === 'claude') {
       const { env, settings } = native
@@ -60,7 +61,13 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
     const result = await probe(bin, [...native.flags, ...nativeArgs], native.env)
     if (result.code === 'ENOENT') { delete fact.fix; return { ...fact, status: 'missing' } }
     try {
-      if (key === 'claude' && (result.code === 0 || result.code === 1)) {
+      if (key === 'cursor') {
+        const auth = decode(result.stdout)
+        fact.provider = 'cursor'
+        fact.status = native.env.CURSOR_API_KEY ? 'configured' : result.code === 0 && auth.isAuthenticated === true ? 'authenticated' : auth.isAuthenticated === false ? 'signed_out' : 'unknown'
+        if (native.env.CURSOR_API_KEY) fact.source = 'native_store'
+        fact.authMode = native.env.CURSOR_API_KEY ? 'api_key' : 'unknown'
+      } else if (key === 'claude' && (result.code === 0 || result.code === 1)) {
         const auth = decode(result.stdout)
         fact.provider = auth.apiProvider === 'firstParty' ? provider : null
         if (auth.loggedIn === false) fact.status = 'signed_out'

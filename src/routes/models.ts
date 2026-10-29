@@ -20,6 +20,7 @@ const ALIASES: Record<string, readonly ModelSpec[]> = {
   'claude-code': ['sonnet', 'opus', 'haiku'].map((id) => ({ id })),
   'kimi-code': ['kimi-for-coding', 'kimi-k2.6'].map((id) => ({ id })),
   claudish: ['openrouter@deepseek/deepseek-r1', 'google@gemini-2.0-flash', 'zai@glm-4.6'].map((id) => ({ id })),
+  cursor: [{ id: 'default', note: 'native configured model; explicit cursor/<model> routes are passed to cursor-agent' }],
   codex: [{ id: 'default', note: 'native no-override wire route; concrete native model required for a canonical seat' }],
   factory: [{ id: 'droid', note: 'stubbed' }], amp: [{ id: 'default', note: 'stubbed' }],
   forge: [{ id: 'anthropic/claude-sonnet-4-5', note: 'stubbed' }],

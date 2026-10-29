@@ -5,10 +5,11 @@ import { CodexBackend } from './codex.js'
 import { OpencodeBackend } from './opencode.js'
 import { KimiBackend } from './kimi.js'
 import { GeminiBackend } from './gemini.js'
+import { CursorBackend } from './cursor.js'
 import { PiBackend } from './pi.js'
 
 const backends = { claude: ClaudeBackend, codex: CodexBackend, opencode: OpencodeBackend,
-  kimi: KimiBackend, gemini: GeminiBackend, pi: PiBackend }
+  kimi: KimiBackend, gemini: GeminiBackend, pi: PiBackend, cursor: CursorBackend }
 
 /** Construct native adapters without provisioning an executor or opening state. */
 export function createLocalBackend(config: Config, name: typeof localHarnesses[number][0],
