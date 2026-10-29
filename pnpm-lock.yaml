@@ -183,7 +183,7 @@ importers:
         specifier: ^2.1.0
         version: 2.1.0
       '@tangle-network/hub-sdk':
-        specifier: 1.0.5
+        specifier: ^1.0.5
         version: 1.0.5
       better-sqlite3:
         specifier: ^13.0.3
