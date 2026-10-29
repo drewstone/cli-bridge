@@ -248,14 +248,15 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
       method: 'POST',
       body: JSON.stringify({ id: sessionId, model, cwd: dir }),
     })).status).toBe(201)
-    expect((await app.request(`/v1/sessions/${sessionId}/turns`, {
+    const admitted = await app.request(`/v1/sessions/${sessionId}/turns`, {
       method: 'POST',
       body: JSON.stringify({
         message: 'You must use the read tool to read cancel-target.txt before answering.',
         run_id: runId,
         execution_id: 'real-pi-cancel-execution',
       }),
-    })).status).toBe(202)
+    })
+    expect(admitted.status, await admitted.text()).toBe(202)
     await waitFor(
       () => store!.retainedEventsAfter(sessionId).some(item => item.envelope.event.type === 'interaction'),
       180_000,
