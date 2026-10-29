@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { agentRunCancellationRequestDigest } from '@tangle-network/agent-interface'
+import { AgentRunCancellationAcknowledgementSchema, agentRunCancellationRequestDigest } from '@tangle-network/agent-interface'
 import { BackendRegistry } from '../src/backends/registry.js'
 import { PiBackend } from '../src/backends/pi.js'
 import { RunRegistry } from '../src/runs/registry.js'
@@ -284,7 +284,7 @@ describe.skipIf(!enabled)('gated real Pi native RPC', () => {
       body: JSON.stringify(command),
     })
     expect(cancelled.status).toBe(200)
-    const acknowledgement = await cancelled.json()
+    const acknowledgement = AgentRunCancellationAcknowledgementSchema.parse(await cancelled.json())
     expect(acknowledgement).toMatchObject({
       operationId: material.operationId,
       status: 'accepted',
