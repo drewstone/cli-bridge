@@ -101,14 +101,16 @@ describe('real Codex native context consumer', () => {
     const address = modelServer.address()
     if (!address || typeof address === 'string') throw new Error('model fixture address missing')
     const endpoint = `http://127.0.0.1:${address.port}/v1`
+    // The fixture overrides go before `--`; everything after it is the prompt.
     const spawner: Spawner = (bin, args, options) => hostSpawner(bin, args[0] === '--version' ? args : [
-      ...args,
+      ...args.slice(0, args.includes('--') ? args.indexOf('--') : args.length),
       '-c', 'model_providers.fixture.name="Loopback fixture"',
       '-c', `model_providers.fixture.base_url=${JSON.stringify(endpoint)}`,
       '-c', 'model_providers.fixture.wire_api="responses"',
       '-c', 'model_providers.fixture.supports_websockets=false',
       '-c', 'model_providers.fixture.request_max_retries=0',
       '-c', 'model_providers.fixture.stream_max_retries=0',
+      ...args.slice(args.includes('--') ? args.indexOf('--') : args.length),
     ], {
       ...options,
       env: {
