@@ -1191,7 +1191,7 @@ async function forwardRequest(
   else traffic.auxiliaryRequests += 1
   traffic.inFlightRequests += 1
 
-  let hungUp = false
+  let hungUp: boolean | undefined
   try {
     const hasBody = method !== 'GET' && method !== 'HEAD'
     const upstream = await fetch(upstreamUrl, {
@@ -1221,10 +1221,7 @@ async function forwardRequest(
       // protocols. Buffer them once so the exact Router proof survives Pi's adapter,
       // while still redacting the upstream credential before it reaches the child.
       const rawBody = await upstream.text()
-      const body = annotateProviderDispatchFailureBody(
-        rawBody,
-        providerDispatchMarker,
-      ).split(upstreamApiKey).join(scopedApiKey)
+      const body = annotateProviderDispatchFailureBody(rawBody, providerDispatchMarker).split(upstreamApiKey).join(scopedApiKey)
       const redactedBody = upstreamAccountId !== null && scopedAccountId !== null
         ? body.split(upstreamAccountId).join(scopedAccountId)
         : body
@@ -1240,9 +1237,12 @@ async function forwardRequest(
       return
     }
     const body = Readable.fromWeb(upstream.body as never)
-    // Pi exits as soon as it reads its final event, which can close this socket before the upstream
-    // body ends. That is not an upstream failure: a response Pi lost still lacks its usage receipt.
-    response.once('close', () => { hungUp = !response.writableFinished && !body.errored })
+    // Pi exits once it reads its final event, possibly before the upstream body ends. A client that leaves
+    // before the upstream errs is no upstream failure (a response Pi lost still lacks its usage receipt).
+    const clientLeft = (): void => { hungUp ??= !response.writableFinished }
+    request.once('aborted', clientLeft)
+    response.once('close', clientLeft)
+    body.once('error', () => { hungUp ??= false })
     const identity = resolved.apiMode === 'openai-completions'
       && upstream.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
       ? createOpenAiResponseIdentityStream()
