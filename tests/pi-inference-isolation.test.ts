@@ -1287,11 +1287,16 @@ describe('Pi inference credential isolation', () => {
     }
   })
 
-  it('cancels upstream inference when the client disconnects after sending its full body', async () => {
+  it('cancels upstream inference when the client disconnects mid-request, and counts a hang-up after the final event as complete', async () => {
     let upstreamStarted = false
     let upstreamCancelled = false
     const upstream = createServer(async (request, response) => {
-      await readBody(request)
+      if ((JSON.parse(await readBody(request)) as { stream?: boolean }).stream) {
+        response.writeHead(200, { 'content-type': 'text/event-stream' })
+        response.write('data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        setTimeout(() => response.end(), 20)
+        return
+      }
       upstreamStarted = true
       response.once('close', () => {
         if (!response.writableEnded) upstreamCancelled = true
@@ -1335,6 +1340,17 @@ describe('Pi inference credential isolation', () => {
         failedRequests: 1,
         inFlightRequests: 0,
       })
+
+      // Pi exits the moment it reads its final event, while the upstream body can still be open.
+      // That hang-up got a complete response, so it is not a failed upstream exchange.
+      const finished = httpRequest(`${transport.localBaseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${scopedToken}`, 'content-type': 'application/json' },
+      }, (response) => response.on('data', (chunk: Buffer) => chunk.includes('[DONE]') && finished.destroy()))
+      finished.on('error', () => {})
+      finished.end(JSON.stringify({ model: 'credential-check', messages: [], stream: true }))
+      await waitFor(() => transport.traffic().generationRequests === 2 && transport.traffic().inFlightRequests === 0)
+      expect(transport.traffic()).toMatchObject({ generationRequests: 2, failedRequests: 1, inFlightRequests: 0 })
     } finally {
       await transport.cleanup()
       await close(upstream)

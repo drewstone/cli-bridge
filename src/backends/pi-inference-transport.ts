@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { Readable, Transform } from 'node:stream'
+import { PassThrough, Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { zstdDecompress } from 'node:zlib'
 import {
@@ -1191,6 +1191,7 @@ async function forwardRequest(
   else traffic.auxiliaryRequests += 1
   traffic.inFlightRequests += 1
 
+  let hungUp: boolean | undefined
   try {
     const hasBody = method !== 'GET' && method !== 'HEAD'
     const upstream = await fetch(upstreamUrl, {
@@ -1220,10 +1221,7 @@ async function forwardRequest(
       // protocols. Buffer them once so the exact Router proof survives Pi's adapter,
       // while still redacting the upstream credential before it reaches the child.
       const rawBody = await upstream.text()
-      const body = annotateProviderDispatchFailureBody(
-        rawBody,
-        providerDispatchMarker,
-      ).split(upstreamApiKey).join(scopedApiKey)
+      const body = annotateProviderDispatchFailureBody(rawBody, providerDispatchMarker).split(upstreamApiKey).join(scopedApiKey)
       const redactedBody = upstreamAccountId !== null && scopedAccountId !== null
         ? body.split(upstreamAccountId).join(scopedAccountId)
         : body
@@ -1239,6 +1237,12 @@ async function forwardRequest(
       return
     }
     const body = Readable.fromWeb(upstream.body as never)
+    // Pi exits once it reads its final event, possibly before the upstream body ends. A client that leaves
+    // before the upstream errs is no upstream failure (a response Pi lost still lacks its usage receipt).
+    const clientLeft = (): void => { hungUp ??= !response.writableFinished }
+    request.once('aborted', clientLeft)
+    response.once('close', clientLeft)
+    body.once('error', () => { hungUp ??= false })
     const identity = resolved.apiMode === 'openai-completions'
       && upstream.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
       ? createOpenAiResponseIdentityStream()
@@ -1247,15 +1251,9 @@ async function forwardRequest(
     const accountRedaction = upstreamAccountId !== null && scopedAccountId !== null
       ? createCredentialRedactionStream(upstreamAccountId, scopedAccountId)
       : undefined
-    if (identity) {
-      if (accountRedaction) await pipeline(body, identity, redaction, accountRedaction, response)
-      else await pipeline(body, identity, redaction, response)
-    } else {
-      if (accountRedaction) await pipeline(body, redaction, accountRedaction, response)
-      else await pipeline(body, redaction, response)
-    }
+    await pipeline(body, identity ?? new PassThrough(), redaction, accountRedaction ?? new PassThrough(), response)
   } catch (error) {
-    traffic.failedRequests += 1
+    if (!hungUp) traffic.failedRequests += 1
     if (response.headersSent) {
       response.destroy(error instanceof Error ? error : undefined)
       return
