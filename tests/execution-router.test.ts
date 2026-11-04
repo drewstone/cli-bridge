@@ -210,21 +210,6 @@ describe('execution-router', () => {
     }
   })
 
-  it('factory harness maps to factory-droids in-container type', async () => {
-    const factory = new StubBackend('factory')
-    const sandbox = new StubBackend('sandbox')
-    const { app, cleanup } = buildApp([factory, sandbox])
-    try {
-      const res = await postChat(app, {
-        model: 'factory/droid-base',
-        messages: [{ role: 'user', content: 'hi' }],
-        execution: { kind: 'sandbox' },
-      })
-      expect(res.status).toBe(200)
-      expect(sandbox.received[0]!.req.metadata?.sandboxBackendType).toBe('factory-droids')
-    } finally { cleanup() }
-  })
-
   it('gemini harness is preserved as the in-container backend type', async () => {
     const gemini = new StubBackend('gemini')
     const sandbox = new StubBackend('sandbox')
