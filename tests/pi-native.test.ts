@@ -306,8 +306,9 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
   throw new Error('timed out waiting for native child turn')
 }
 
-function privateRootCount(dir: string): number {
-  return readdirSync(dir).filter(name => name.startsWith('.cli-bridge-pi-')).length
+/** This worker's live Pi private roots: under the host tmpdir, never in the task workspace. */
+function privateRootCount(): number {
+  return readdirSync(tmpdir()).filter(name => /^\.cli-bridge-pi-[a-z]+-(\d+)-/u.exec(name)?.[1] === String(process.pid)).length
 }
 
 describe('Pi native RPC adapter', () => {
@@ -355,7 +356,7 @@ describe('Pi native RPC adapter', () => {
       expect.stringMatching(new RegExp(`^\\[pi-native-prestart\\] id=${diagnosticId} outcome=failed code=upstream phases_ms=interaction_root:\\d+,resolve_inference:\\d+$`, 'u')),
     )
     expect(lifecycle.children).toHaveLength(0)
-    expect(privateRootCount(dir)).toBe(0)
+    expect(privateRootCount()).toBe(0)
   })
 
   it.each([undefined, 'started', 'queued'])('uses a real JSONL child for two HTTP turns with disposition %s, state proof, and canonical replay', async (disposition) => {
@@ -553,12 +554,12 @@ describe('Pi native RPC adapter', () => {
     })).status).toBe(202)
     await waitFor(() => store!.getRetained('evicted-child')?.turns === 1)
     expect(lifecycle.children).toHaveLength(1)
-    expect(privateRootCount(dir)).toBeGreaterThan(0)
+    expect(privateRootCount()).toBeGreaterThan(0)
 
     await waitFor(() => runs!.get('evicted-child-run') === undefined && lifecycle.releases === 1)
     expect(lifecycle.terminations).toBe(1)
     expect(lifecycle.releases).toBe(1)
-    expect(privateRootCount(dir)).toBe(0)
+    expect(privateRootCount()).toBe(0)
     expect(lifecycle.children[0]!.exitCode !== null || lifecycle.children[0]!.signalCode !== null).toBe(true)
   })
 
@@ -636,11 +637,11 @@ describe('Pi native RPC adapter', () => {
 
     await expect(native.close()).rejects.toThrow(/termination not proven/)
     expect(releases).toBe(0)
-    expect(privateRootCount(dir)).toBeGreaterThan(0)
+    expect(privateRootCount()).toBeGreaterThan(0)
 
     await expect(native.close()).resolves.toBeUndefined()
     expect(releases).toBe(1)
-    expect(privateRootCount(dir)).toBe(0)
+    expect(privateRootCount()).toBe(0)
     const observedChild = child as ReturnType<typeof spawn> | null
     expect(observedChild).not.toBeNull()
     expect(observedChild!.exitCode !== null || observedChild!.signalCode !== null).toBe(true)
@@ -701,9 +702,9 @@ describe('Pi native RPC adapter', () => {
       mode: 'byob',
       interaction_policy: 'interactive',
     }, null)
-    const rootName = readdirSync(dir).find(name => name.startsWith('.cli-bridge-pi-rpc-'))
+    const rootName = readdirSync(tmpdir()).find(name => name.startsWith(`.cli-bridge-pi-rpc-${process.pid}-`))
     expect(rootName).toBeDefined()
-    const root = `${dir}/${rootName!}`
+    const root = `${tmpdir()}/${rootName!}`
     const original = `${root}.original`
     renameSync(root, original)
     mkdirSync(root, { mode: 0o700 })

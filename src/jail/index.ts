@@ -50,6 +50,11 @@ export function registerJailReadable(spec: JailSpec | null | undefined, ...paths
   spec.extraReadablePaths = [...merged]
 }
 
+/** Bind host paths read-write into any jail (fs-jail or write-jail); a no-op without one. */
+export function registerJailWritable(spec: JailSpec | null | undefined, ...paths: string[]): void {
+  if (spec) spec.extraWritablePaths = [...new Set([...(spec.extraWritablePaths ?? []), ...paths.filter(Boolean)])]
+}
+
 /**
  * Register one exact argv translation that applies only when a jail really
  * wraps the command. This keeps the ordinary host/Docker argv valid when a

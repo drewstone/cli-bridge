@@ -161,9 +161,8 @@ export class LinuxBwrapJail implements JailBackend {
     for (const path of spec.extraWritablePaths ?? []) {
       bwrapArgs.push('--bind', path, path)
     }
-    // A path registered as BOTH writable and readable must stay writable: pi registers its
-    // own agent and session dirs in both lists, and an identical ro-bind after the rw-bind
-    // would mask it and fail pi's session write with EROFS. Only an exact duplicate is
+    // A path registered as BOTH writable and readable must stay writable: an identical ro-bind
+    // after the rw-bind would mask it and fail writes with EROFS. Only an exact duplicate is
     // skipped; a read-only path nested under a writable root is still carved back to RO.
     const writableExtras = new Set(spec.extraWritablePaths ?? [])
     for (const path of spec.extraReadablePaths ?? []) {

@@ -1,5 +1,6 @@
 import { writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import {
@@ -40,7 +41,7 @@ import {
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
-import { registerJailReadable, selectJailBackend } from '../jail/index.js'
+import { registerJailReadable, registerJailWritable, selectJailBackend } from '../jail/index.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { traceContextToChildEnv } from '../trace/ids.js'
 
@@ -176,7 +177,7 @@ export async function startPiNativeSession(
   }
 
   try {
-    interactionRoot = createPrivateTemporaryRoot(runCwd ?? process.cwd(), '.cli-bridge-pi-rpc-')
+    interactionRoot = createPrivateTemporaryRoot(tmpdir(), '.cli-bridge-pi-rpc-')
     const interactionExtension = join(interactionRoot.path, 'interaction-gate.mjs')
     writeFileSync(interactionExtension, piInteractionExtension(randomUUID().replaceAll('-', '')), {
       encoding: 'utf8',
@@ -203,16 +204,7 @@ export async function startPiNativeSession(
       ...(profile?.model === undefined ? {} : { modelHints: profile.model }),
     })
     advancePhase('reserve_session')
-    if (req.jailSpec) {
-      req.jailSpec.extraWritablePaths = [
-        ...new Set([
-          ...(req.jailSpec.extraWritablePaths ?? []),
-          inference.agentDir,
-          inference.sessionDir,
-        ]),
-      ]
-      registerJailReadable(req.jailSpec, inference.agentDir, inference.sessionDir)
-    }
+    registerJailWritable(req.jailSpec, inference.agentDir, inference.sessionDir)
     args.push('--session-dir', inference.sessionDir)
     ensurePiSessionFile(
       inference.sessionDir,
@@ -231,7 +223,6 @@ export async function startPiNativeSession(
     provisioned = provisionPiProfile(
       req,
       session,
-      runCwd,
       executionIdentity,
       {
         effectiveEndpoint: inference.requestScopedEndpoint
