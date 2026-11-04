@@ -34,6 +34,7 @@ import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import {
   registerJailArgumentRewrite,
   registerJailReadable,
+  registerJailWritable,
   resolveJailRoot,
   selectJailBackend,
 } from '../jail/index.js'
@@ -576,15 +577,7 @@ export class PiBackend implements NativeSessionBackend {
         },
       )
       advancePhase('session_and_mcp')
-      if (req.jailSpec) {
-        req.jailSpec.extraWritablePaths = [
-          ...new Set([
-            ...(req.jailSpec.extraWritablePaths ?? []),
-            inference.agentDir,
-            inference.sessionDir,
-          ]),
-        ]
-      }
+      registerJailWritable(req.jailSpec, inference.agentDir, inference.sessionDir)
       args.push('--session-dir', inference.sessionDir)
       if (req.session_id) {
         ensurePiSessionFile(
@@ -602,7 +595,6 @@ export class PiBackend implements NativeSessionBackend {
       provisioned = provisionPiProfile(
         req,
         session,
-        runCwd,
         executionIdentity,
         {
           effectiveEndpoint: inference.requestScopedEndpoint

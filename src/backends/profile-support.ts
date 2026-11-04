@@ -1,12 +1,10 @@
 import { workspaceProfile } from '../hub-mcp.js'
-import {
-  chmodSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, posix, resolve } from 'node:path'
+import { registerJailReadable, registerJailWritable } from '../jail/index.js'
+import type { JailSpec } from '../jail/types.js'
+import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import type {
   AgentProfile,
   AgentProfileModelHints,
@@ -120,8 +118,7 @@ export function provisionProfileWorkspace(
    * Release the request-scoped files this provisioning wrote outside the plan.
    *
    * Only the opencode path returns one today. The caller MUST invoke it after
-   * the harness process exits — the profile's instruction bytes stay readable
-   * in the shared task directory until it runs.
+   * the harness process exits.
    */
   cleanup?: () => void
 } {
@@ -149,7 +146,7 @@ export function provisionProfileWorkspace(
     const planDigest = hashWorkspacePlan(plan)
     const resumesSamePlan = sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest === planDigest
     if (harness === 'opencode') {
-      scoped = scopeOpencodeProfileConfig(plan, workspaceCwd)
+      scoped = scopeOpencodeProfileConfig(plan, req.jailSpec)
       plan.files = scoped.workspaceFiles
     }
     const applied = applyWorkspacePlan(
@@ -228,7 +225,7 @@ interface OpencodeProfileScope {
  */
 function scopeOpencodeProfileConfig(
   plan: WorkspacePlan,
-  workspaceCwd: string,
+  jail: JailSpec | null | undefined,
 ): OpencodeProfileScope {
   const isWorkspaceFile = (file: PlanFile): boolean => (file.root ?? 'workspace') === 'workspace'
   const generated = plan.files.filter((file) =>
@@ -265,32 +262,24 @@ function scopeOpencodeProfileConfig(
     }
   }
 
-  let profileRoot: string | null = null
+  // Outside the task workspace, so the agent, its `git add -A` and the grader never see it.
+  // opencode installs its config directory's plugin dependencies, so a jail must leave it writable.
+  const root = privateBridgeRoot(jail, OPENCODE_PROFILE_ROOT_PREFIX, 'writable')
   try {
-    // Under the cwd so a Docker executor sees the identical absolute path: its
-    // pool bind-mounts the workspace root and nothing else. Traversable and
-    // world-readable because the container may run opencode under a different
-    // uid, and a mode it cannot read would drop the profile's instructions with
-    // nothing reported.
-    profileRoot = mkdtempSync(join(workspaceCwd, OPENCODE_PROFILE_ROOT_PREFIX))
-    chmodSync(profileRoot, 0o755)
     const applied = applyWorkspacePlan(
       { harness: plan.harness, files: nativeFiles, env: {}, flags: [], unsupported: [] },
-      profileRoot,
+      root.path,
       { existingFiles: 'reject' },
     )
-    const configDir = join(profileRoot, OPENCODE_NATIVE_DIR)
+    const configDir = join(root.path, OPENCODE_NATIVE_DIR)
     // A profile with no native files still needs the directory to exist, so the
     // config directory opencode reads is this empty private one and never a
     // populated ambient default.
-    mkdirSync(configDir, { recursive: true, mode: 0o755 })
-    chmodSync(configDir, 0o755)
+    mkdirSync(configDir, { recursive: true })
 
     const spawnConfig = instructions === undefined
       ? config
-      : { ...config, instructions: (instructions as string[]).map((entry) => join(profileRoot!, entry)) }
-    const root = profileRoot
-    let cleaned = false
+      : { ...config, instructions: (instructions as string[]).map((entry) => join(root.path, entry)) }
     return {
       env: {
         [OPENCODE_PROFILE_CONFIG_ENV]: opencodeProcessConfigValue(spawnConfig),
@@ -302,16 +291,20 @@ function scopeOpencodeProfileConfig(
       // refuses the turn ("profile materialization changed across session turns").
       written: applied.written.map((relPath) => posix.join(OPENCODE_PROFILE_RECEIPT_ROOT, relPath)),
       workspaceFiles,
-      cleanup: () => {
-        if (cleaned) return
-        cleaned = true
-        rmSync(root, { recursive: true, force: true })
-      },
+      cleanup: root.cleanup,
     }
   } catch (error) {
-    if (profileRoot) rmSync(profileRoot, { recursive: true, force: true })
+    root.cleanup()
     throw error
   }
+}
+
+/** A per-turn bridge directory the next bridge start reaps after a SIGKILL, bound into the turn's jail. */
+function privateBridgeRoot(jail: JailSpec | null | undefined, prefix: string, mode: 'readable' | 'writable'): PrivateTemporaryRoot {
+  const root = createPrivateTemporaryRoot(tmpdir(), prefix)
+  if (mode === 'writable') registerJailWritable(jail, root.path)
+  else registerJailReadable(jail, root.path)
+  return root
 }
 
 /** Merge profile config over the operator's OPENCODE_CONFIG_CONTENT without losing unrelated provider keys.
@@ -357,23 +350,21 @@ export interface ProvisionedPiProfile {
   cleanup(): void
 }
 
-/** Apply Pi's exact profile through private per-process loaders under the workspace.
+/** Apply Pi's exact profile through private per-process loaders outside the workspace.
  * Disable ambient context/skills/templates; reject generic files whose declared workspace paths would change.
- * The caller validates and mounts MCP/extensions.pi separately. Host and Docker use identical paths.
+ * The caller validates and mounts MCP/extensions.pi separately.
  */
 export function provisionPiProfile(
   req: ChatRequest,
   session: SessionRecord | null,
-  cwd: string | undefined,
   executionIdentity: ProfileExecutionIdentity = profileExecutionIdentity(req, session, 'pi', null),
   inference?: NonNullable<ProfileMaterializationReceipt['inference']>,
 ): ProvisionedPiProfile | null {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
   if (!profile) return null
-  const workspaceCwd = requireMaterializationCwd(cwd, 'pi AgentProfile materialization')
 
-  let profileRoot: string | null = null
+  let root: PrivateTemporaryRoot | undefined
   try {
     const genericFiles = profile.resources?.files?.map((file) => file.path) ?? []
     if (genericFiles.length > 0) {
@@ -385,13 +376,9 @@ export function provisionPiProfile(
     assertWorkspacePlanSupported(plan)
     const nativeLoaders = assertPiPlanHasNativeLoaders(plan)
 
-    profileRoot = mkdtempSync(join(workspaceCwd, '.cli-bridge-pi-profile-'))
-    // Docker executors may run Pi under a uid different from the bridge. The
-    // workspace bind is already the trust boundary; keep the directory
-    // traversable and the files read-only to non-owners.
-    chmodSync(profileRoot, 0o755)
-    const applied = applyWorkspacePlan(plan, profileRoot, { existingFiles: 'reject' })
-    const flags = piProfileFlags(plan, applied, profileRoot, nativeLoaders)
+    root = privateBridgeRoot(req.jailSpec, '.cli-bridge-pi-profile-', 'readable')
+    const applied = applyWorkspacePlan(plan, root.path, { existingFiles: 'reject' })
+    const flags = piProfileFlags(plan, applied, root.path, nativeLoaders)
     const receipt = retainProfileMaterializationReceipt(
       req,
       profile,
@@ -402,21 +389,16 @@ export function provisionPiProfile(
       inference,
     )
 
-    let cleaned = false
     return {
       env: requirePublicPlanEnv(applied.env, 'pi'),
       flags,
       written: applied.written,
       workspacePlanDigest: applied.workspacePlanDigest,
       receipt,
-      cleanup: () => {
-        if (cleaned) return
-        cleaned = true
-        rmSync(profileRoot!, { recursive: true, force: true })
-      },
+      cleanup: root.cleanup,
     }
   } catch (error) {
-    if (profileRoot) rmSync(profileRoot, { recursive: true, force: true })
+    root?.cleanup()
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
   }

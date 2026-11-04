@@ -122,10 +122,8 @@ export class OpencodeBackend implements Backend {
     // Cleanup runs in the outer finally so the temp dir doesn't leak
     // when the subprocess crashes.
     //
-    // The provisioning above owns a second request-scoped directory — the
-    // private opencode config directory this profile runs from — and it leaks
-    // into the shared task workspace if anything between here and the spawn
-    // throws, so both releases are paired at every exit.
+    // The provisioning above owns a second request-scoped directory, the private
+    // opencode config directory, so both releases are paired at every exit.
     let mcpMaterialized: ReturnType<typeof materializeMcpServersForOpencode>
     try {
       mcpMaterialized = materializeMcpServersForOpencode(

@@ -83,6 +83,10 @@ function instructionBytes(provisioned: Provisioned): string {
   return paths.map((path) => readFileSync(path, 'utf8')).join('')
 }
 
+/** This worker's live profile roots: under the host tmpdir, never in the task workspace. */
+const profileRoots = (): string[] =>
+  readdirSync(tmpdir()).filter((name) => name.startsWith(`.cli-bridge-opencode-profile-${process.pid}-`))
+
 function configDir(provisioned: Provisioned): string {
   return provisioned.env.OPENCODE_CONFIG_DIR!
 }
@@ -122,11 +126,12 @@ describe('opencode profiles in a shared task workspace', () => {
       // Declared task files still land in the shared directory.
       expect(readFileSync(join(cwd, 'inputs/shared.md'), 'utf8')).toBe('shared evidence\n')
 
-      // Each process reads its own private config directory, under the cwd so a
-      // container that binds only the workspace root sees the same path.
+      // Each process reads its own private config directory, outside the task
+      // workspace so the agent, its `git add -A` and the grader never see it.
       expect(configDir(first)).not.toBe(configDir(second))
+      expect(profileRoots()).toHaveLength(2)
       for (const provisioned of [first, second]) {
-        expect(configDir(provisioned).startsWith(`${cwd}/`)).toBe(true)
+        expect(configDir(provisioned).startsWith(`${cwd}/`)).toBe(false)
         expect(statSync(configDir(provisioned)).isDirectory()).toBe(true)
         for (const path of processConfig(provisioned).instructions as string[]) {
           expect(path.startsWith(`${configDir(provisioned)}/`)).toBe(true)
@@ -197,7 +202,6 @@ describe('opencode profiles in a shared task workspace', () => {
       }
       const provisioned = provisionProfileWorkspace(bare, null, 'opencode', cwd)
       expect(provisioned.env.OPENCODE_DISABLE_PROJECT_CONFIG).toBe('1')
-      expect(configDir(provisioned).startsWith(`${cwd}/`)).toBe(true)
       // Its own subagent is private, and the shared directory holds only the
       // task file the profile declared.
       expect(existsSync(join(cwd, '.opencode'))).toBe(false)
@@ -205,7 +209,7 @@ describe('opencode profiles in a shared task workspace', () => {
       expect(readFileSync(join(cwd, 'inputs/shared.md'), 'utf8')).toBe('shared\n')
       expect(processConfig(provisioned)).toEqual({})
       provisioned.cleanup?.()
-      expect(readdirSync(cwd).filter((name) => name.startsWith('.cli-bridge-opencode-profile-'))).toEqual([])
+      expect(profileRoots()).toEqual([])
     } finally {
       rmSync(cwd, { recursive: true, force: true })
     }
@@ -225,7 +229,7 @@ describe('opencode profiles in a shared task workspace', () => {
       // chosen, so host and Docker enforce the same profile or neither runs.
       expect(() => provisionProfileWorkspace(big, null, 'opencode', cwd))
         .toThrow(/would not reach the process on the host executor/)
-      expect(readdirSync(cwd).filter((name) => name.startsWith('.cli-bridge-opencode-profile-'))).toEqual([])
+      expect(profileRoots()).toEqual([])
 
       // Anything the guard accepts is a value the host sanitizer really carries.
       const ok = request('ok', 'OK-MARKER', { bash: true }, cwd, { permissions: { bash: { '*': 'deny' } } })
@@ -427,12 +431,10 @@ describe('opencode profiles in a shared task workspace', () => {
       expect(resumed).not.toContain('DIRECTOR-MARKER')
 
       // Every request-scoped directory is gone once the turns are over.
-      expect(readdirSync(cwd).filter((name) => name.startsWith('.cli-bridge-opencode-profile-'))).toEqual([])
+      expect(profileRoots()).toEqual([])
 
       // A turn cancelled while its process is still running releases the same
-      // directory. Only a bridge that never reaches its own cleanup — a kill or
-      // a crash mid-turn — leaves one behind, and a leftover is inert: nothing
-      // reads a config directory no process is pointed at.
+      // directory. A bridge killed mid-turn leaves one for its next start to reap.
       const cancelled = request('cancelled', 'CANCELLED-MARKER', { bash: true }, cwd)
       gates.set(cancelled.session_id!, join(cwd, '.gate-never-written'))
       const controller = new AbortController()
@@ -446,7 +448,7 @@ describe('opencode profiles in a shared task workspace', () => {
       await new Promise((resolve) => setTimeout(resolve, 100))
       controller.abort()
       await inFlight
-      expect(readdirSync(cwd).filter((name) => name.startsWith('.cli-bridge-opencode-profile-'))).toEqual([])
+      expect(profileRoots()).toEqual([])
     } finally {
       rmSync(cwd, { recursive: true, force: true })
     }

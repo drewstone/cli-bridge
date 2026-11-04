@@ -1472,7 +1472,6 @@ describe('PrimeBackend startup failure diagnostics (cli-bridge#194)', () => {
     // A jail confines the request cwd, it must not revoke it: fs-jail replaces
     // the filesystem, so without registration the agent cannot even read the
     // directory it was told to run in (a file-delivered trajectory lives there).
-    expect(capture.jail?.extraReadablePaths).toContain(runCwd)
     expect(capture.jail?.extraWritablePaths).toContain(runCwd)
     expect(capture.cwd).toBe(runCwd)
   })

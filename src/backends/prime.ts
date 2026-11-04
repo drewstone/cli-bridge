@@ -117,7 +117,7 @@ import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
-import { registerJailReadable } from '../jail/index.js'
+import { registerJailReadable, registerJailWritable } from '../jail/index.js'
 import {
   piAssistantFailure,
   piFailureKind,
@@ -511,34 +511,23 @@ export class PrimeBackend implements Backend {
     args.push('--daemon-socket', home.daemonSocketPath)
 
     const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
-    if (req.jailSpec) {
-      // The socket dir lives under the HOST tmpdir, which every jail mode
-      // hides: write-jail binds the host root read-only and fs-jail replaces
-      // /tmp with an empty tmpfs. The fork's daemon supervisor takes a lockfile
-      // beside the socket before it listens, so an unexposed dir dies as
-      // "Prime Agent daemon exited during startup" with EACCES/ENOENT on
-      // `<socket>.lock` in the daemon log (reproduced against fork be9e2fa0).
-      // The prompt dir carries --append-system-prompt and profile files; an
-      // fs-jail that cannot see the path makes the fork take it as literal
-      // prompt text (resource-loader.ts resolves a path only when it exists).
-      //
-      // The request cwd is where the caller asked the agent to RUN; a jail
-      // confines it, it must not silently revoke it. An fs-jail without the
-      // cwd registered cannot even read the working directory — a
-      // file-delivered trajectory (traces' prime engine passes cwd with
-      // trajectory.otlp.jsonl inside) would vanish for the agent.
-      req.jailSpec.extraWritablePaths = [
-        ...new Set([
-          ...(req.jailSpec.extraWritablePaths ?? []),
-          home.home,
-          home.sessionArtifactDir,
-          home.socketDir,
-          ...(runCwd ? [runCwd] : []),
-        ]),
-      ]
-      registerJailReadable(req.jailSpec, home.promptDir)
-      if (runCwd) registerJailReadable(req.jailSpec, runCwd)
-    }
+    // The socket dir lives under the HOST tmpdir, which every jail mode
+    // hides: write-jail binds the host root read-only and fs-jail replaces
+    // /tmp with an empty tmpfs. The fork's daemon supervisor takes a lockfile
+    // beside the socket before it listens, so an unexposed dir dies as
+    // "Prime Agent daemon exited during startup" with EACCES/ENOENT on
+    // `<socket>.lock` in the daemon log (reproduced against fork be9e2fa0).
+    // The prompt dir carries --append-system-prompt and profile files; an
+    // fs-jail that cannot see the path makes the fork take it as literal
+    // prompt text (resource-loader.ts resolves a path only when it exists).
+    //
+    // The request cwd is where the caller asked the agent to RUN; a jail
+    // confines it, it must not silently revoke it. An fs-jail without the
+    // cwd registered cannot even read the working directory — a
+    // file-delivered trajectory (traces' prime engine passes cwd with
+    // trajectory.otlp.jsonl inside) would vanish for the agent.
+    registerJailWritable(req.jailSpec, home.home, home.sessionArtifactDir, home.socketDir, runCwd ?? '')
+    registerJailReadable(req.jailSpec, home.promptDir)
 
     let spawned: Awaited<ReturnType<Spawner>>
     try {

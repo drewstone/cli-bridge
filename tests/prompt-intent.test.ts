@@ -25,10 +25,10 @@
  *                        no additive control exists
  */
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { AgentProfile } from '@tangle-network/agent-interface'
@@ -392,9 +392,9 @@ describe('prompt intents reach each harness through its own control', () => {
       expect(readFileSync(join(configDir, 'agent-system-prompt.md'), 'utf8')).toBe(`${ADDITION}\n`)
       expect(req.profile_materialization_receipt!.files.map((file) => file.path))
         .toContain(`.cli-bridge-opencode-profile/.opencode/agent-system-prompt.md`)
-      expect(readdirSync(cwd)).toEqual([basename(dirname(configDir))])
-      provisioned.cleanup?.()
       expect(readdirSync(cwd)).toEqual([])
+      provisioned.cleanup?.()
+      expect(existsSync(dirname(configDir))).toBe(false)
     })
   })
 
