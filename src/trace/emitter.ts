@@ -26,10 +26,10 @@
  * its usage is their sum (`cli_bridge.usage.scope`), so a reader that sums
  * every LLM span can skip it instead of counting the tokens twice.
  *
- * Tool spans are instants (`end_time === start_time`) and carry no status,
- * because the backends report the model's DECISION to call a tool and never
- * report the call finishing. An invented duration or an assumed `OK` would be a
- * measurement the bridge does not have.
+ * A tool span runs from the call to its `tool_results` entry and carries that
+ * outcome as OK or ERROR, never the output: a trace must not copy what the agent
+ * read. A call whose backend reports no outcome stays an instant with no status,
+ * because an invented duration or an assumed `OK` is a measurement nobody made.
  *
  * Nothing here may throw into a request. Every entry point is wrapped, and the
  * failure mode is a lost span, never a lost completion.
@@ -40,6 +40,7 @@ import {
   toolSpan,
   type ContractSpan,
   type SpanStatus,
+  type ToolSpanInit,
 } from '@tangle-network/agent-trace-contract'
 import type { ChatDelta } from '../backends/types.js'
 import { addUsage, type CollectedUsage } from '../usage.js'
@@ -245,7 +246,9 @@ export class RequestSpanRecorder {
 
   private readonly options: RecorderOptions
   private readonly startedAtMs: number
-  private readonly toolSpans: ContractSpan[] = []
+  private toolSpanCount = 0
+  /** Tool calls waiting for their `tool_results` entry, by call id. */
+  private readonly openTools = new Map<string, ToolSpanInit>()
   /** Tool and model-call spans not yet written: held only until the agent's identity is known. */
   private pendingSpans: ContractSpan[] = []
   private usage: CollectedUsage | undefined
@@ -293,6 +296,7 @@ export class RequestSpanRecorder {
       if (delta.finish_reason) this.finishReason = delta.finish_reason
       if (delta.error?.message) this.deltaErrorMessage = delta.error.message
       for (const call of delta.tool_calls ?? []) this.recordToolCall(call)
+      for (const result of delta.tool_results ?? []) this.closeTool(result.id, result.status)
     } catch (error) {
       this.report(error)
     }
@@ -340,6 +344,8 @@ export class RequestSpanRecorder {
       // known (the route records it once, before the backend streams), so every
       // span of one turn names the same agent or none of them does. A request
       // that never names an agent writes them here, with the request span.
+      for (const open of this.openTools.values()) this.pendingSpans.push(toolSpan(open))
+      this.openTools.clear()
       const pending = this.withNode(this.pendingSpans)
       this.pendingSpans = []
       this.options.sink.write([this.buildRequestSpan(), ...pending])
@@ -429,13 +435,14 @@ export class RequestSpanRecorder {
 
   private recordToolCall(call: { id: string; name: string; arguments: string }): void {
     this.toolCallsObserved += 1
-    if (this.toolSpans.length >= this.options.maxToolSpans) return
+    if (this.toolSpanCount >= this.options.maxToolSpans) return
+    this.toolSpanCount += 1
     const at = isoTime(this.options.now())
     const name = truncate(call.name, MAX_ATTR_CHARS)
     // `call.arguments` is deliberately dropped: it carries prompts, file contents
     // and paths, and a trace file must not become a second copy of everything the
     // agent read.
-    const span = toolSpan({
+    const span: ToolSpanInit = {
       traceId: this.traceId,
       spanId: this.options.mintSpanId(),
       parentSpanId: this.spanId,
@@ -448,9 +455,21 @@ export class RequestSpanRecorder {
       endTime: at,
       toolName: name,
       ...(call.id ? { attributes: { [BRIDGE_ATTR.toolCallId]: truncate(call.id, MAX_ATTR_CHARS) } } : {}),
-    })
-    this.toolSpans.push(span)
-    this.pendingSpans.push(span)
+    }
+    if (call.id && !this.openTools.has(call.id)) this.openTools.set(call.id, span)
+    else this.writeToolSpan(span)
+  }
+
+  /** The backend reported the call finished: its span ends now, with that outcome. */
+  private closeTool(id: string, outcome: 'completed' | 'error'): void {
+    const span = this.openTools.get(id)
+    if (span === undefined || this.ended) return
+    this.openTools.delete(id)
+    this.writeToolSpan({ ...span, endTime: isoTime(this.options.now()), status: { code: outcome === 'error' ? 'STATUS_CODE_ERROR' : 'STATUS_CODE_OK' } })
+  }
+
+  private writeToolSpan(init: ToolSpanInit): void {
+    this.pendingSpans.push(toolSpan(init))
     if (this.node !== undefined) this.flushPendingSpans()
   }
 
@@ -475,7 +494,7 @@ export class RequestSpanRecorder {
     }
     const contractBuild = traceContractBuildIdOrNull()
     if (contractBuild !== null) attributes[BRIDGE_ATTR.traceContractBuild] = contractBuild
-    const dropped = this.toolCallsObserved - this.toolSpans.length
+    const dropped = this.toolCallsObserved - this.toolSpanCount
     if (dropped > 0) attributes[BRIDGE_ATTR.toolCallsDropped] = dropped
 
     return llmSpan({
