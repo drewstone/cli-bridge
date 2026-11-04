@@ -102,6 +102,8 @@ function nativeEvents(harness: Harness, finalText: string, terminal: boolean): u
     return [
       { type: 'system', subtype: 'init', session_id: 'fixture-claude-session', model: 'protocol-fixture-model' },
       { type: 'assistant', message: { id: 'progress', content: [{ type: 'text', text: progress }] } },
+      { type: 'assistant', message: { id: 'tool', content: [{ type: 'tool_use', id: 'toolu_fixture', name: 'Bash', input: { command: 'false' } }] } },
+      { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_fixture', content: [{ type: 'text', text: 'exit 1' }], is_error: true }] } },
       { type: 'assistant', message: { id: 'answer', content: [{ type: 'text', text: finalText }] } },
       ...(terminal ? [{ type: 'result', subtype: 'success', session_id: 'fixture-claude-session',
         result: finalText, is_error: false,
@@ -278,7 +280,9 @@ describe('native harness terminal result followed by actual process exit', () =>
             expect(run.failure()).toBeUndefined()
             expect(deltas.filter((delta) => Object.hasOwn(delta, 'final_output'))
               .map((delta) => delta.final_output)).toEqual([finalOutput])
-            expect(deltas.filter((delta) => delta.finish_reason === (harness === 'codex' ? 'tool_calls' : 'stop'))).toHaveLength(1)
+            expect(deltas.filter((delta) => delta.finish_reason === (harness === 'codex' || harness === 'claude' ? 'tool_calls' : 'stop'))).toHaveLength(1)
+            if (harness === 'claude') expect(deltas.flatMap((delta) => delta.tool_results ?? []))
+              .toEqual([{ id: 'toolu_fixture', name: 'Bash', status: 'error', error: 'exit 1' }])
             if (harness === 'codex') expect(deltas.flatMap((delta) => delta.tool_calls ?? [])
               .map((call) => call.name)).toEqual(['bash', 'fixture_lookup', 'websearch'])
           } else {

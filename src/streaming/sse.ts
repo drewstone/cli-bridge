@@ -153,10 +153,6 @@ export function deltaToSseComment(delta: ChatDelta): string | null {
   return `: keepalive source=${source} elapsed=${elapsedMs}\n\n`
 }
 
-export function sseDone(): string {
-  return 'data: [DONE]\n\n'
-}
-
 export function makeChunkMeta(model: string): ChunkMeta {
   return {
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,

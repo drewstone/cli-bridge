@@ -245,13 +245,6 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   }
 }
 
-export function isUsageEvent(value: unknown): value is AgentEnvironmentEvent {
-  const record = recordValue(value)
-  if (record?.type !== 'usage') return false
-  const data = recordValue(record.data)
-  return recordValue(record.usage) !== null || recordValue(data?.usage) !== null
-}
-
 /** The inverse of {@link interactionFromPi} — a canonical answer as Pi expects it. */
 export function nativeResponseFor(request: InteractionRequest, response: InteractionResponse): Record<string, unknown> {
   if (response.outcome !== 'accepted') return { cancelled: true }

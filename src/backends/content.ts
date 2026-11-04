@@ -1,16 +1,8 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import type { ChatMessage, ChatMessageContent, ChatContentPart } from './types.js'
+import type { ChatDelta, ChatMessage, ChatMessageContent, ChatContentPart } from './types.js'
 
 export interface ImageAttachment {
   data: Buffer
   mediaType: string
-}
-
-export interface MaterializedImages {
-  paths: string[]
-  cleanup: () => Promise<void>
 }
 
 export function flattenMessages(messages: ChatMessage[], options: { includeSystem?: boolean } = {}): string {
@@ -49,12 +41,10 @@ export function estimateMessagesChars(messages: ChatMessage[]): number {
   return n
 }
 
-export function collectSystemText(messages: ChatMessage[]): string {
-  return messages
-    .filter((m) => m.role === 'system')
-    .map((m) => contentToText(m.content))
-    .filter(Boolean)
-    .join('\n\n')
+/** A tool call the harness ran itself, as `delta.tool_results` reports it; `content` is what the model got back. */
+export function toolResult(id: string, name: string, isError: boolean, content: unknown): NonNullable<ChatDelta['tool_results']>[number] {
+  const text = typeof content === 'string' || Array.isArray(content) ? contentToText(content as ChatMessageContent) : undefined
+  return isError ? { id, name, status: 'error', ...(text ? { error: text } : {}) } : { id, name, status: 'completed', ...(text === undefined ? {} : { output: text }) }
 }
 
 export function contentToText(content: ChatMessageContent): string {
@@ -84,28 +74,6 @@ export function extractImageAttachments(messages: ChatMessage[]): ImageAttachmen
     }
   }
   return images
-}
-
-export async function materializeImages(images: ImageAttachment[]): Promise<MaterializedImages> {
-  if (images.length === 0) {
-    return { paths: [], cleanup: async () => {} }
-  }
-
-  const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-images-'))
-  const paths: string[] = []
-  await Promise.all(images.map(async (image, i) => {
-    const ext = extensionForMediaType(image.mediaType)
-    const file = join(dir, `image-${i + 1}.${ext}`)
-    await writeFile(file, image.data)
-    paths.push(file)
-  }))
-
-  return {
-    paths,
-    cleanup: async () => {
-      await rm(dir, { recursive: true, force: true })
-    },
-  }
 }
 
 function imagePartValue(part: ChatContentPart): string | undefined {
@@ -146,11 +114,4 @@ function parseImageValue(value: string, fallbackMediaType: string): ImageAttachm
 function mediaTypeFromDataUrl(value?: string): string | undefined {
   if (!value) return undefined
   return /^data:([^;,]+)/i.exec(value)?.[1]
-}
-
-function extensionForMediaType(mediaType: string): string {
-  if (mediaType.includes('png')) return 'png'
-  if (mediaType.includes('webp')) return 'webp'
-  if (mediaType.includes('gif')) return 'gif'
-  return 'jpg'
 }
