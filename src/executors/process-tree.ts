@@ -164,10 +164,6 @@ async function retryCleanup(retry: CleanupRetry): Promise<void> {
   }
 }
 
-export function pendingCleanupRetries(): number {
-  return cleanupRetries.size
-}
-
 /**
  * Synchronously kill the child group. Used in shutdown handlers where
  * we cannot await — best-effort, returns immediately. Pair with the

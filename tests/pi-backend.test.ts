@@ -2293,7 +2293,7 @@ describe('PiBackend', () => {
     ])
   })
 
-  it('surfaces real pi tool_execution_start events as OpenAI tool_calls', async () => {
+  it('surfaces real pi tool executions as OpenAI tool_calls and their outcomes as tool_results', async () => {
     const backend = newTestPiBackend({
       bin: 'pi',
       timeoutMs: 1000,
@@ -2308,9 +2308,11 @@ describe('PiBackend', () => {
           type: 'tool_execution_end',
           toolCallId: 'call_bash_1',
           toolName: 'bash',
-          result: 'ok',
+          result: { content: [{ type: 'text', text: '3 passed' }], details: {} },
           isError: false,
         },
+        { type: 'tool_execution_start', toolCallId: 'call_read_2', toolName: 'read', args: { path: 'missing.ts' } },
+        { type: 'tool_execution_end', toolCallId: 'call_read_2', toolName: 'read', result: { content: [{ type: 'text', text: 'ENOENT: missing.ts' }], details: {} }, isError: true },
         { type: 'turn_end', message: { usage: { input: 10, output: 5 } } },
       ]),
     })
@@ -2322,6 +2324,9 @@ describe('PiBackend', () => {
 
     expect(deltas).toEqual([
       { tool_calls: [{ id: 'call_bash_1', name: 'bash', arguments: '{"command":"pnpm test"}' }] },
+      { tool_results: [{ id: 'call_bash_1', name: 'bash', status: 'completed', output: '3 passed' }] },
+      { tool_calls: [{ id: 'call_read_2', name: 'read', arguments: '{"path":"missing.ts"}' }] },
+      { tool_results: [{ id: 'call_read_2', name: 'read', status: 'error', error: 'ENOENT: missing.ts' }] },
       { usage: { input_tokens: 10, fresh_input_tokens: 10, output_tokens: 5 } },
       { finish_reason: 'tool_calls' },
     ])

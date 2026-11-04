@@ -40,7 +40,7 @@ import { registerJailReadable } from '../jail/index.js'
 import { dirname, join } from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { contentToText } from './content.js'
+import { contentToText, toolResult } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
@@ -466,12 +466,7 @@ function extractToolResult(
   const id = String(part.id ?? part.callID ?? part.toolCallID ?? part.tool_call_id ?? '')
   const name = String(part.name ?? part.tool ?? '')
   if (!id || !name) return null
-  if (status === 'completed') {
-    const output = state?.output
-    return { id, name, status, ...(typeof output === 'string' ? { output } : {}) }
-  }
-  const error = state?.error
-  return { id, name, status, ...(typeof error === 'string' ? { error } : {}) }
+  return toolResult(id, name, status === 'error', status === 'error' ? state?.error : state?.output)
 }
 
 function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {

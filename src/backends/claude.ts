@@ -41,7 +41,7 @@ import {
 import {
   renderLocalHarnessProfilePreamble,
 } from './profile-prompt.js'
-import { contentToText } from './content.js'
+import { contentToText, toolResult } from './content.js'
 import { registerJailReadable } from '../jail/index.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
@@ -374,6 +374,7 @@ export class ClaudeBackend implements Backend {
     signal.addEventListener('abort', onAbort, { once: true })
 
     let emittedAnyToolCall = false
+    const toolNames = new Map<string, string>() // tool_use id -> name, for the tool_result that answers it
     try {
       let internalSessionId: string | undefined
       let terminal: ClaudeStreamResult | undefined
@@ -458,12 +459,22 @@ export class ClaudeBackend implements Backend {
                   arguments: JSON.stringify(block.input ?? {}),
                 }],
               }
+              toolNames.set(block.id, block.name)
               emittedAnyToolCall = true
             }
           }
           continue
         }
 
+        if (msg.type === 'user') {
+          // claude-code-cli answers its own tool_use with a tool_result block in a user message.
+          const content = (msg as { message?: { content?: unknown } }).message?.content
+          for (const block of Array.isArray(content) ? (content as Array<Record<string, unknown>>) : []) {
+            const name = toolNames.get(String(block.tool_use_id))
+            if (block.type === 'tool_result' && name) yield { tool_results: [toolResult(String(block.tool_use_id), name, block.is_error === true, block.content)] }
+          }
+          continue
+        }
         if (msg.type === 'error') {
           const error = msg as { message?: string; error?: { message?: string } }
           sawError ??= sanitizeUpstreamErrorDetail(error.error?.message ?? error.message)

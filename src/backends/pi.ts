@@ -27,7 +27,7 @@ import {
   resolveAgentProfile,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
-import { contentToText } from './content.js'
+import { contentToText, toolResult } from './content.js'
 import { traceContextToChildEnv } from '../trace/ids.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
@@ -839,12 +839,11 @@ export class PiBackend implements NativeSessionBackend {
           continue
         }
 
-        const toolCall = piToolCalls.observe(ev, type)
-        if (toolCall) {
-          emittedToolCall = true
-          yield { ...piResponseIdentityDelta(responseIdentity), tool_calls: [toolCall] }
-          continue
-        }
+        const [toolCall, finished] = [piToolCalls.observe(ev, type), piToolCalls.finish(ev, type)]
+        emittedToolCall ||= toolCall !== null
+        if (toolCall) yield { ...piResponseIdentityDelta(responseIdentity), tool_calls: [toolCall] }
+        if (finished) yield { ...piResponseIdentityDelta(responseIdentity), tool_results: [finished] }
+        if (toolCall || finished) continue
 
         // message_start / message_end (top-level) — drop. We rely on
         // text_delta inside message_update for streaming content.
@@ -1348,26 +1347,6 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined
 }
 
-/**
- * Pi's `partial` object can carry assembled text in
- * `partial.content[N].text` — walk it for a last-resort delta when the
- * top-level `delta` field is missing on a text event.
- */
-function extractTextFromPartial(partial: unknown): string {
-  if (!partial || typeof partial !== 'object') return ''
-  const obj = partial as Record<string, unknown>
-  const content = obj.content
-  if (!Array.isArray(content)) return ''
-  let out = ''
-  for (const block of content) {
-    if (block && typeof block === 'object') {
-      const b = block as Record<string, unknown>
-      if (b.type === 'text' && typeof b.text === 'string') out += b.text
-    }
-  }
-  return out
-}
-
 type ToolCallDelta = NonNullable<ChatDelta['tool_calls']>[number]
 
 export class PiToolCallTracker {
@@ -1392,6 +1371,14 @@ export class PiToolCallTracker {
       name,
       arguments: stringifyToolArguments(args),
     }
+  }
+
+  /** A finished call's outcome (`tool_execution_end`), under the id that announced the call. */
+  finish(ev: Record<string, unknown>, eventType: string): NonNullable<ChatDelta['tool_results']>[number] | null {
+    if (normalizePiEventType(eventType) !== 'tool_execution_end') return null
+    const tool = this.pickNestedTool(ev)
+    const [id, name] = [this.pickToolCallId(ev, tool), this.pickToolName(ev, tool)]
+    return id && name ? toolResult(id, name, ev.isError === true, (ev.result as { content?: unknown } | undefined)?.content ?? ev.result) : null
   }
 
   private shouldDefer(normalized: string, args: unknown): boolean {

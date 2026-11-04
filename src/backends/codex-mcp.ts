@@ -72,12 +72,6 @@ export function materializeMcpServersForCodex(
   }
 }
 
-/** Docker Codex keeps its mounted auth home; write this MCP config through stdin. */
-export function codexMcpConfigText(specs: Record<string, McpServerSpec> | null): string | null {
-  const { lines, serverNames } = codexMcpConfig(specs)
-  return serverNames.length ? `${lines.join('\n\n')}\n` : null
-}
-
 function codexMcpConfig(specs: Record<string, McpServerSpec> | null): {
   lines: string[]
   serverNames: string[]
