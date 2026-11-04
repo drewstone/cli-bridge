@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { Readable, Transform } from 'node:stream'
+import { PassThrough, Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { zstdDecompress } from 'node:zlib'
 import {
@@ -1191,6 +1191,7 @@ async function forwardRequest(
   else traffic.auxiliaryRequests += 1
   traffic.inFlightRequests += 1
 
+  let hungUp = false
   try {
     const hasBody = method !== 'GET' && method !== 'HEAD'
     const upstream = await fetch(upstreamUrl, {
@@ -1239,6 +1240,9 @@ async function forwardRequest(
       return
     }
     const body = Readable.fromWeb(upstream.body as never)
+    // Pi exits as soon as it reads its final event, which can close this socket before the upstream
+    // body ends. That is not an upstream failure: a response Pi lost still lacks its usage receipt.
+    response.once('close', () => { hungUp = !response.writableFinished && !body.errored })
     const identity = resolved.apiMode === 'openai-completions'
       && upstream.headers.get('content-type')?.toLowerCase().includes('text/event-stream')
       ? createOpenAiResponseIdentityStream()
@@ -1247,15 +1251,9 @@ async function forwardRequest(
     const accountRedaction = upstreamAccountId !== null && scopedAccountId !== null
       ? createCredentialRedactionStream(upstreamAccountId, scopedAccountId)
       : undefined
-    if (identity) {
-      if (accountRedaction) await pipeline(body, identity, redaction, accountRedaction, response)
-      else await pipeline(body, identity, redaction, response)
-    } else {
-      if (accountRedaction) await pipeline(body, redaction, accountRedaction, response)
-      else await pipeline(body, redaction, response)
-    }
+    await pipeline(body, identity ?? new PassThrough(), redaction, accountRedaction ?? new PassThrough(), response)
   } catch (error) {
-    traffic.failedRequests += 1
+    if (!hungUp) traffic.failedRequests += 1
     if (response.headersSent) {
       response.destroy(error instanceof Error ? error : undefined)
       return
