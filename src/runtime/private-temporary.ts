@@ -100,15 +100,6 @@ export function createPrivateTemporaryRoot(parent: string, prefix: string): Priv
   }
 }
 
-/** Remove group/other access from every generated file beneath a private root. */
-export function hardenPrivateTemporaryTree(root: string): void {
-  assertOwnedDirectory(root)
-  chmodSync(root, 0o700)
-  for (const name of readdirSync(root)) {
-    hardenEntry(join(root, name))
-  }
-}
-
 /** Remove registered roots whose creating process no longer exists. */
 export function reapStalePrivateTemporaryRoots(): number {
   const registry = privateTemporaryRegistryDir()
@@ -261,18 +252,6 @@ function assertPathIdentity(path: string, device: string, inode: string, label: 
     || String(stat.dev) !== device || String(stat.ino) !== inode) {
     throw new Error(`${label} identity changed: ${path}`)
   }
-}
-
-function hardenEntry(path: string): void {
-  const stat = lstatSync(path)
-  if (stat.isSymbolicLink()) throw new Error(`private temporary tree contains a symlink: ${path}`)
-  if (stat.isDirectory()) {
-    chmodSync(path, 0o700)
-    for (const name of readdirSync(path)) hardenEntry(join(path, name))
-    return
-  }
-  if (!stat.isFile()) throw new Error(`private temporary tree contains a special file: ${path}`)
-  chmodSync(path, 0o600 | (stat.mode & 0o100))
 }
 
 function pidAlive(pid: number): boolean {

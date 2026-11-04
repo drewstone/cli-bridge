@@ -71,6 +71,7 @@ class ToolUsingBackend extends TestBackend {
     yield { content: 'looking at the repo' }
     yield { tool_calls: [{ id: 'call_1', name: 'Read', arguments: '{"path":"/etc/hosts"}' }] }
     yield { tool_calls: [{ id: 'call_2', name: 'Bash', arguments: '{"cmd":"ls"}' }] }
+    yield { tool_results: [{ id: 'call_2', name: 'Bash', status: 'error', error: 'ls: /private-dir: Permission denied' }] }
     yield {
       finish_reason: 'tool_calls',
       usage: {
@@ -321,23 +322,26 @@ describe('span shape conformance', () => {
     expect(Date.parse(llm.end_time)).toBeGreaterThanOrEqual(Date.parse(llm.start_time))
 
     const tools = spans.filter((span) => span.kind === 'TOOL')
-    expect(tools.map((span) => span.name)).toEqual(['Read', 'Bash'])
+    // Bash reported its outcome, so its span ends there and is written then; Read
+    // never did, so it is written at the turn's end as an instant claiming nothing.
+    expect(tools.map((span) => span.name)).toEqual(['Bash', 'Read'])
     for (const tool of tools) {
       expect(tool.trace_id).toBe(llm.trace_id)
       expect(tool.parent_span_id).toBe(llm.span_id)
-      // The bridge sees the DECISION to call a tool and never the call finishing,
-      // so the span is an instant and claims no outcome.
-      expect(tool.end_time).toBe(tool.start_time)
-      expect(tool.status).toEqual({ code: 'STATUS_CODE_UNSET' })
     }
-    expect(tools[0]?.attributes).toMatchObject({
+    const [bash, read] = tools
+    expect(bash?.status).toEqual({ code: 'STATUS_CODE_ERROR' })
+    expect(Date.parse(bash!.end_time)).toBeGreaterThanOrEqual(Date.parse(bash!.start_time))
+    expect(read?.end_time).toBe(read?.start_time)
+    expect(read?.status).toEqual({ code: 'STATUS_CODE_UNSET' })
+    expect(read?.attributes).toMatchObject({
       [ATTR.toolName]: 'Read',
       [BRIDGE_ATTR.toolCallId]: 'call_1',
     })
 
     // Tool ARGUMENTS carry prompts, paths and file contents; they must not land
     // in a trace file that outlives the request.
-    expect(readFileSync(ctx.file, 'utf8')).not.toContain('/etc/hosts')
+    expect(readFileSync(ctx.file, 'utf8')).not.toMatch(/\/etc\/hosts|\/private-dir/)
 
     const validation = validateTraceSpans(spans)
     expect(validation.findings).toEqual([])
