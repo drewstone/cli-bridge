@@ -28,7 +28,7 @@
  *
  * A tool span runs from the call to its `tool_results` entry and carries that
  * outcome as OK or ERROR, never the output: a trace must not copy what the agent
- * read. A call whose backend reports no outcome stays an instant with no status,
+ * read. Its input keeps only what ran and where ({@link toolLocators}). A call whose backend reports no outcome stays an instant with no status,
  * because an invented duration or an assumed `OK` is a measurement nobody made.
  *
  * Nothing here may throw into a request. Every entry point is wrapped, and the
@@ -43,6 +43,7 @@ import {
   type ToolSpanInit,
 } from '@tangle-network/agent-trace-contract'
 import type { ChatDelta } from '../backends/types.js'
+import { redactCredentials } from '../runtime/redact-credentials.js'
 import { addUsage, type CollectedUsage } from '../usage.js'
 import { traceContractBuildIdOrNull } from './contract-build.js'
 import { newSpanId, newTraceId, type ResolvedCallerTrace } from './ids.js'
@@ -139,6 +140,7 @@ export const BRIDGE_ATTR = Object.freeze({
 
 /** Longest attribute string written. Bounds one pathological value's blast radius. */
 const MAX_ATTR_CHARS = 256
+const MAX_COMMAND_CHARS = 1_024
 /** Longest status message written. Stack traces are truncated, not stored whole. */
 const MAX_STATUS_CHARS = 500
 
@@ -439,9 +441,7 @@ export class RequestSpanRecorder {
     this.toolSpanCount += 1
     const at = isoTime(this.options.now())
     const name = truncate(call.name, MAX_ATTR_CHARS)
-    // `call.arguments` is deliberately dropped: it carries prompts, file contents
-    // and paths, and a trace file must not become a second copy of everything the
-    // agent read.
+    const input = toolLocators(call.arguments)
     const span: ToolSpanInit = {
       traceId: this.traceId,
       spanId: this.options.mintSpanId(),
@@ -454,7 +454,10 @@ export class RequestSpanRecorder {
       startTime: at,
       endTime: at,
       toolName: name,
-      ...(call.id ? { attributes: { [BRIDGE_ATTR.toolCallId]: truncate(call.id, MAX_ATTR_CHARS) } } : {}),
+      attributes: {
+        ...(call.id ? { [BRIDGE_ATTR.toolCallId]: truncate(call.id, MAX_ATTR_CHARS) } : {}),
+        ...(input ? { 'input.value': input } : {}),
+      },
     }
     if (call.id && !this.openTools.has(call.id)) this.openTools.set(call.id, span)
     else this.writeToolSpan(span)
@@ -552,6 +555,30 @@ export class RequestSpanRecorder {
 
 function isCount(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value >= 0
+}
+
+/**
+ * The tool arguments a trace keeps, as JSON for `input.value`: the command, file or search,
+ * which is what `traces` reads to say what ran. File contents, edit bodies and prompts stay
+ * out, so a trace is never a second copy of what the agent read; a shell command can still
+ * quote text, so it is scrubbed of credentials and capped.
+ */
+function toolLocators(args: string): string | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(args)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined
+  const kept: Record<string, string> = {}
+  for (const field of ['command', 'cmd', 'file_path', 'filePath', 'path', 'pattern', 'query', 'url']) {
+    const value = (parsed as Record<string, unknown>)[field]
+    const text = Array.isArray(value) ? value.filter((word) => typeof word === 'string').join(' ') : value
+    if (typeof text !== 'string' || text.length === 0) continue
+    kept[field] = truncate(redactCredentials(text), field === 'command' || field === 'cmd' ? MAX_COMMAND_CHARS : MAX_ATTR_CHARS)
+  }
+  return Object.keys(kept).length > 0 ? JSON.stringify(kept) : undefined
 }
 
 function isoTime(ms: number): string {
