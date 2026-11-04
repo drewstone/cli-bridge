@@ -7,7 +7,6 @@ import {
   LinuxBwrapJail,
   MacosSeatbeltJail,
   NoopJail,
-  registerJailEnvironment,
   registerJailReadable,
   resolveJailRoot,
 } from '../src/jail/index.js'
@@ -883,27 +882,6 @@ describe('applyJail fail-closed', () => {
     } finally {
       delete process.env.BRIDGE_JAIL_FALLBACK
     }
-  })
-
-  it('applies registered environment only when a jail actually wraps', async () => {
-    const spec = { root: '/proj/.agent-home', projectDir: '/proj' }
-    registerJailEnvironment(spec, 'PI_CODING_AGENT_SESSION_DIR', '/proj/.agent-home/.pi-sessions')
-    const available: JailBackend = {
-      name: 'available',
-      isAvailable: () => true,
-      wrap: (bin, args) => ({ bin, args, env: { WRAP: 'active' } }),
-    }
-
-    const result = await applyJail('/bin/sh', ['-c', 'x'], {
-      env: { BASE: 'kept' },
-      jail: spec,
-    }, available)
-
-    expect(result.env).toEqual({
-      BASE: 'kept',
-      PI_CODING_AGENT_SESSION_DIR: '/proj/.agent-home/.pi-sessions',
-      WRAP: 'active',
-    })
   })
 
   it('rewrites exact path arguments only when an available jail wraps the command', async () => {

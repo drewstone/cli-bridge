@@ -50,12 +50,9 @@ export interface JailSpec {
   authSources?: JailAuthSource[]
   /** Exact argv values that differ only while the OS jail is active.
    * Backends declare both values; the executor applies the rewrite after it
-   * has proved a jail backend is available. Fallback and Docker paths retain
+   * has proved a jail backend is available. The fallback path retains
    * the original argument. */
   argumentRewrites?: JailArgumentRewrite[]
-  /** Child environment overrides that apply only when confinement is active.
-   * The explicit warn fallback must retain the ordinary host environment. */
-  environment?: Record<string, string>
 }
 
 /** One exact command argument and the value visible inside an active jail. */

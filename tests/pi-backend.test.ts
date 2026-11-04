@@ -781,29 +781,6 @@ describe('PiBackend', () => {
     expect(info.some((message) => message.startsWith('[pi-prestart]'))).toBe(false)
   })
 
-  it('refuses Docker before auth resolution instead of using mounted provider credentials', async () => {
-    let resolves = 0
-    let spawns = 0
-    const spawner = piSpawner([], () => { spawns += 1 })
-    spawner.executionEnvironment = 'docker'
-    const backend = new PiBackend({
-      bin: 'pi',
-      timeoutMs: 1000,
-      transportResolver: async (selection, signal) => {
-        resolves += 1
-        return await testPiInferenceTransport()(selection, signal)
-      },
-      spawner,
-    })
-
-    await expect(collect(backend.chat({
-      model: 'pi/tangle-router/glm-5.2',
-      messages: [{ role: 'user', content: 'task' }],
-    }, null, new AbortController().signal))).rejects.toThrow(/PI_EXECUTOR=host/u)
-    expect(resolves).toBe(0)
-    expect(spawns).toBe(0)
-  })
-
   it('rejects a turn-level effort that conflicts with the exact profile', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-profile-effort-conflict-'))
     let spawns = 0
@@ -2774,7 +2751,6 @@ describe('PiBackend', () => {
     const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR
     let args: string[] = []
     let jail: ChatRequest['jailSpec']
-    let jailedSessionDir: string | undefined
     let spawnedSessionDir: string | undefined
     let spawnedAgentDir: string | undefined
     try {
@@ -2797,7 +2773,6 @@ describe('PiBackend', () => {
         ], (_bin, rawArgs, opts) => {
           args = [...rawArgs]
           jail = opts.jail
-          jailedSessionDir = opts.jail?.environment?.PI_CODING_AGENT_SESSION_DIR
           spawnedSessionDir = opts.env?.PI_CODING_AGENT_SESSION_DIR
           spawnedAgentDir = opts.env?.PI_CODING_AGENT_DIR
         }),
@@ -2819,7 +2794,6 @@ describe('PiBackend', () => {
       expect(jail?.authSources).toEqual([])
       expect(jail?.argumentRewrites).toBeUndefined()
       expect(jail?.extraReadablePaths).toContain(join(agentDir, 'npm', 'node_modules'))
-      expect(jailedSessionDir).toBeUndefined()
       expect(spawnedSessionDir).toBeUndefined()
       expect(spawnedAgentDir).toBeTruthy()
       expect(argValue(args, '--session-dir')).toBe(join(spawnedAgentDir!, 'sessions'))

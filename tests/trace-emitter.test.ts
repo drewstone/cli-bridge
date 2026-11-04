@@ -69,8 +69,17 @@ class ToolUsingBackend extends TestBackend {
     this.calls += 1
     yield { internal_session_id: 'harness-session-9' }
     yield { content: 'looking at the repo' }
-    yield { tool_calls: [{ id: 'call_1', name: 'Read', arguments: '{"path":"/etc/hosts"}' }] }
-    yield { tool_calls: [{ id: 'call_2', name: 'Bash', arguments: '{"cmd":"ls"}' }] }
+    yield { tool_calls: [{ id: 'call_1', name: 'Read', arguments: '{"path":"/etc/hosts","content":"FILE-BYTES"}' }] }
+    yield {
+      tool_calls: [{
+        id: 'call_2',
+        name: 'Bash',
+        arguments: JSON.stringify({
+          command: 'curl -H "Authorization: Bearer live-bearer-value" https://x.test && git push https://me:ghs_tokenvalue1@github.com/a/b && gh auth login --with-token flag-token-value',
+          description: 'PROSE',
+        }),
+      }],
+    }
     yield { tool_results: [{ id: 'call_2', name: 'Bash', status: 'error', error: 'ls: /private-dir: Permission denied' }] }
     yield {
       finish_reason: 'tool_calls',
@@ -339,9 +348,13 @@ describe('span shape conformance', () => {
       [BRIDGE_ATTR.toolCallId]: 'call_1',
     })
 
-    // Tool ARGUMENTS carry prompts, paths and file contents; they must not land
-    // in a trace file that outlives the request.
-    expect(readFileSync(ctx.file, 'utf8')).not.toMatch(/\/etc\/hosts|\/private-dir/)
+    // A trace says what ran and where, so `traces` can read it. Credentials, file
+    // contents, prose and tool output must not land in a file that outlives the request.
+    expect(read?.attributes['input.value']).toBe('{"path":"/etc/hosts"}')
+    expect(JSON.parse(String(bash?.attributes['input.value']))).toEqual({
+      command: 'curl -H "Authorization: Bearer <redacted> https://x.test && git push https://<redacted>@github.com/a/b && gh auth login --with-token <redacted>',
+    })
+    expect(readFileSync(ctx.file, 'utf8')).not.toMatch(/FILE-BYTES|PROSE|live-bearer-value|ghs_tokenvalue1|flag-token-value|\/private-dir/)
 
     const validation = validateTraceSpans(spans)
     expect(validation.findings).toEqual([])

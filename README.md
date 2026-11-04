@@ -1054,8 +1054,9 @@ the bridge's own execution context:
 | `cli_bridge.usage.estimated` | Present and `true` when tokens were derived from text, not measured |
 | `cli_bridge.tool_calls.observed` / `.dropped` | Tool calls seen, and any beyond the per-request span cap |
 
-Tool ARGUMENTS are never written: they carry prompts, paths and file contents, and
-a trace file must not become a second copy of everything the agent read. Cost is
+A tool span keeps only what ran and where, as `input.value` JSON: `command`, `file_path`,
+`path`, `pattern`, `query` or `url`, scrubbed of credentials and capped. File contents, edit
+bodies, prompts and tool output are never written. Cost is
 written only when every usage record reported one, so a floor is never read as a
 total. The profile is written as a DIGEST for the same reason — the profile itself
 carries prompts and instructions.

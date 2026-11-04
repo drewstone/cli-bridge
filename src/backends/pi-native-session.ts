@@ -8,6 +8,7 @@ import type { NativeSession } from './types.js'
 import { BackendError } from './types.js'
 import type { Spawner } from '../executors/types.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
+import { redactCredentials } from '../runtime/redact-credentials.js'
 import { retryCleanupUntilSuccessful, terminateSpawned } from '../executors/process-tree.js'
 import { piPermissionMarker, piPermissionTokenFromTitle, piSelectedValue } from './pi-interaction.js'
 
@@ -53,14 +54,13 @@ const STDERR_TAIL_CHARS = 1_000
  * removed. Pi's stderr is untrusted child output that reaches API callers.
  */
 export function redactedStderrTail(stderr: string, maxChars = STDERR_TAIL_CHARS): string {
-  const sanitized = stderr
-    // eslint-disable-next-line no-control-regex
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\x00-\x1f\x7f-\x9f]+/gu, ' ')
-    .replace(/\b(Bearer\s+)[^\s,;]+/giu, '$1<redacted>')
-    .replace(/\b(sk-(?:ant-|proj-)?|ghp_|gho_|github_pat_|xox[a-z]-)[A-Za-z0-9_-]{8,}/gu, '<redacted>')
-    .replace(/\b([A-Za-z0-9_]*(?:api[_-]?key|token|secret|password)[A-Za-z0-9_]*["']?\s*[:=]\s*["']?)[^\s"',;]+/giu, '$1<redacted>')
+  const sanitized = redactCredentials(
+    stderr
+      // eslint-disable-next-line no-control-regex
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\x00-\x1f\x7f-\x9f]+/gu, ' '),
+  )
     .replace(/\s+/gu, ' ')
     .trim()
   return sanitized.length <= maxChars ? sanitized : `...${sanitized.slice(-maxChars)}`

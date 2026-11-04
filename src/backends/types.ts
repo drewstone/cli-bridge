@@ -202,7 +202,7 @@ export interface NativeSubscriptionInvocation {
   provider?: string | null
   endpoint?: string
   credentialOverride?: boolean
-  executor?: 'host' | 'docker' | 'test-double'
+  executor?: 'host' | 'test-double'
 }
 
 export interface NativeSubscriptionAdmission {

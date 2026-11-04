@@ -57,7 +57,7 @@ export function registerJailWritable(spec: JailSpec | null | undefined, ...paths
 
 /**
  * Register one exact argv translation that applies only when a jail really
- * wraps the command. This keeps the ordinary host/Docker argv valid when a
+ * wraps the command. This keeps the ordinary host argv valid when a
  * requested jail is unavailable and the operator explicitly permits fallback.
  */
 export function registerJailArgumentRewrite(
@@ -80,21 +80,6 @@ export function registerJailArgumentRewrite(
     ...(spec.argumentRewrites ?? []),
     { from, to, ...(precededBy ? { precededBy } : {}) },
   ]
-}
-
-/** Register one child environment override that applies only when a jail is
- * available and actually wraps the command. */
-export function registerJailEnvironment(
-  spec: JailSpec | null | undefined,
-  name: string,
-  value: string,
-): void {
-  if (!spec) return
-  const existing = spec.environment?.[name]
-  if (existing !== undefined && existing !== value) {
-    throw new Error(`conflicting jail environment override for ${name}`)
-  }
-  spec.environment = { ...(spec.environment ?? {}), [name]: value }
 }
 
 export function selectJailBackend(platform: NodeJS.Platform = process.platform): JailBackend {

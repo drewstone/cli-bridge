@@ -77,7 +77,7 @@ export async function startPiNativeSession(
 
   if (options.spawner.executionEnvironment === undefined) {
     throw new BackendError(
-      'backend pi requires an executor that declares host or docker isolation; '
+      'backend pi requires an executor that declares host isolation; '
       + 'an undeclared executor cannot prove that Pi tools are separated from host credentials',
       'not_configured',
     )
@@ -85,13 +85,6 @@ export async function startPiNativeSession(
   if (options.spawner.executionEnvironment === 'test-double' && process.env.VITEST !== 'true') {
     throw new BackendError(
       'backend pi test-double executors are only accepted by the test runner',
-      'not_configured',
-    )
-  }
-  if (options.spawner.executionEnvironment === 'docker') {
-    throw new BackendError(
-      'backend pi retained inference uses a bridge-owned loopback transport that is not reachable from the '
-      + 'Docker network namespace; set PI_EXECUTOR=host rather than falling back to mounted provider credentials',
       'not_configured',
     )
   }
