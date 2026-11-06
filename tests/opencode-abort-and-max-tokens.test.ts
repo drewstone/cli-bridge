@@ -10,6 +10,7 @@
  *   >20s teardown acknowledgment in Braid's packed cancellation test).
  */
 import { EventEmitter } from 'node:events'
+import type { ChildProcess } from 'node:child_process'
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -82,7 +83,7 @@ describe('opencode binds cancellation across the spawn window', () => {
       await sleep(30)
       spawnedAt = performance.now()
       return {
-        child,
+        child: child as unknown as ChildProcess,
         terminate: async () => {
           terminateCalls += 1
           terminatedAt = performance.now()
