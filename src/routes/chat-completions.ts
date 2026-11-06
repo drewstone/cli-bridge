@@ -531,9 +531,38 @@ export function mountChatCompletions(
         persistedSession = candidates[0] ?? null
       }
     }
-    const selectedModel = typeof persistedSession?.metadata.model === 'string'
+    // A durable session is bound to the model it was admitted with. When a
+    // stored binding exists, the binding comparison below owns refusals (and
+    // deliberately absorbs an SDK restart's inferred provider default, see
+    // execution-router's restart case). A legacy session with only
+    // metadata.model used to silently swap the requested model for the stored
+    // one, executing the run on a model the caller did not name with receipts
+    // that look internally clean (#182). Refuse the change before
+    // substitution on that legacy path only.
+    const persistedModel = typeof persistedSession?.metadata.model === 'string'
       ? persistedSession.metadata.model
-      : rest.model
+      : undefined
+    const hasStoredBinding = typeof persistedSession?.metadata.agent_profile_binding === 'object'
+      && persistedSession.metadata.agent_profile_binding !== null
+    if (
+      !hasStoredBinding && persistedModel !== undefined
+      && rest.model !== undefined && rest.model !== persistedModel
+    ) {
+      return c.json({
+        error: {
+          type: 'session_model_conflict',
+          session_id: sessionId,
+          message: `session ${JSON.stringify(sessionId)} is bound to model ${JSON.stringify(persistedModel)}; `
+            + `this request names ${JSON.stringify(rest.model)}. A durable session never rebinds its model; `
+            + 'start a new session to use a different model.',
+          stored_model: persistedModel,
+          received_model: rest.model,
+          /** The refusal happens before any spawn, so nothing was executed. */
+          provider_dispatch: 'not_started',
+        },
+      }, 409)
+    }
+    const selectedModel = persistedModel ?? rest.model
     const persistedProfile = persistedSession?.metadata.agent_profile
     const effectiveProfile = agent_profile ?? (
       persistedProfile && typeof persistedProfile === 'object' ? persistedProfile : undefined

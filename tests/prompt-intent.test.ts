@@ -443,6 +443,28 @@ describe('prompt intents reach each harness through its own control', () => {
         ).toThrow(/cannot add to its harness's system prompt/)
       })
     }
+
+    // Both refusals happen before anything spawns, so the accounting surface
+    // must say no provider dispatch was started (issue #213).
+    it('marks both refusals provider_dispatch not_started', () => {
+      const replacement = (() => {
+        try {
+          assertProfilePromptIntentsSupported({ prompt: { systemPrompt: REPLACEMENT } }, 'kimi-code')
+        } catch (error) {
+          return error
+        }
+      })()
+      expect(replacement).toMatchObject({ name: 'BackendError', providerDispatch: 'not_started' })
+
+      const addition = (() => {
+        try {
+          assertProfilePromptIntentsSupported({ prompt: { appendSystemPrompt: ADDITION } }, 'acp')
+        } catch (error) {
+          return error
+        }
+      })()
+      expect(addition).toMatchObject({ name: 'BackendError', providerDispatch: 'not_started' })
+    })
   })
 
   describe('the shared preamble', () => {
@@ -583,7 +605,7 @@ describe('the shared refusal seam fires on the real request path', () => {
 
       await expect(
         seamCase.run(profile, cwd, countingSpawner(counter)),
-      ).rejects.toMatchObject({ name: 'BackendError', code: 'not_configured' })
+      ).rejects.toMatchObject({ name: 'BackendError', code: 'not_configured', providerDispatch: 'not_started' })
       await expect(seamCase.run(profile, cwd, countingSpawner(counter))).rejects.toThrow(
         seamCase.refusal,
       )

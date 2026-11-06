@@ -88,6 +88,20 @@ export class OpencodeBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
+    // opencode has no verified native output cap, and an accepted-but-unenforced
+    // max_tokens makes the request look bounded to cost accounting while the
+    // run can spend above the bound (#138). Refuse before anything spawns.
+    if (req.max_tokens !== undefined) {
+      throw new BackendError(
+        `backend opencode cannot enforce request max_tokens ${String(req.max_tokens)}: opencode exposes no verified native output cap, `
+        + 'so the bound would be accepted but not applied to billed output tokens. '
+        + 'Omit max_tokens, or route through a backend that enforces it.',
+        'not_configured',
+        undefined,
+        { providerDispatch: 'not_started' },
+      )
+    }
+
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'opencode'))
     const model = this.extractModel(req.model)
 
@@ -217,6 +231,11 @@ export class OpencodeBackend implements Backend {
     // killing the local `docker exec` client does not stop OpenCode inside it.
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
+    // The spawner await above is exactly the window an early cancel can land
+    // in: the listener installed after it never fires for an already-aborted
+    // signal, leaving the child alive until the iterator closes. Bind the
+    // already-aborted case the moment the listener is in place (#136).
+    if (signal.aborted) onAbort()
 
     try {
       let internalSessionId: string | undefined
