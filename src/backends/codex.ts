@@ -3,6 +3,8 @@
 import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { registerJailReadable } from '../jail/index.js'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
 import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth, PreparedContextTransfer } from './types.js'
 import { versionHealth } from './health.js'
@@ -283,6 +285,9 @@ export class CodexBackend implements Backend {
           releasePreparation()
         }
         if (req.jailSpec.readConfine) req.jailSpec.requireEnforcement = true
+        // The standalone install links ~/.local/bin/codex through ~/.codex/packages/standalone/current, a hop the
+        // PATH-derived binds miss (bwrap: execvp ~/.local/bin/codex ENOENT); declare the root as opencode does.
+        registerJailReadable(req.jailSpec, join(homedir(), '.codex', 'packages'))
         // The jail seed has no refresh capability. File storage must win over
         // an account config that would otherwise select an unrelated keyring.
         args.splice(1, 0, '-c', 'cli_auth_credentials_store="file"')
