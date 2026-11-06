@@ -417,7 +417,7 @@ export class CodexBackend implements Backend {
 
         if (type === 'turn.completed' || type === 'thread.completed') {
           sawTerminal = true
-          usage = ev.usage as ChatDelta['usage'] ?? usage
+          usage = normalizeCodexUsage(ev.usage) ?? usage
           continue
         }
       }
@@ -578,6 +578,49 @@ function httpStatus(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
     ? value
     : undefined
+}
+
+/**
+ * Translate Codex's native token classes into the bridge's canonical receipt.
+ * Codex's `input_tokens` is the whole prompt total and `cached_input_tokens`
+ * is the portion served from its prompt cache; Runtime charges
+ * `input - cacheRead + output`, so dropping the split charged the cached
+ * prefix in full (measured 2026-09-09: 81-99% of every prompt, up to 19.1 M
+ * tokens/hour against a 32 M pool — #208). Emit nothing for a class Codex did
+ * not report; never infer zero.
+ */
+function normalizeCodexUsage(raw: unknown): ChatDelta['usage'] | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const usage = raw as {
+    input_tokens?: unknown
+    cached_input_tokens?: unknown
+    cache_write_input_tokens?: unknown
+    output_tokens?: unknown
+    reasoning_output_tokens?: unknown
+  }
+  const tokenCount = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+  const input = tokenCount(usage.input_tokens)
+  const cacheRead = tokenCount(usage.cached_input_tokens)
+  const cacheWrite = tokenCount(usage.cache_write_input_tokens)
+  const output = tokenCount(usage.output_tokens)
+  const reasoning = tokenCount(usage.reasoning_output_tokens)
+  const fresh = input !== undefined && cacheRead !== undefined && input >= cacheRead
+    ? input - cacheRead
+    : undefined
+  if (
+    input === undefined && cacheRead === undefined && cacheWrite === undefined
+    && output === undefined && reasoning === undefined
+  ) return undefined
+  return {
+    estimated: false,
+    ...(input !== undefined ? { input_tokens: input } : {}),
+    ...(fresh !== undefined ? { fresh_input_tokens: fresh } : {}),
+    ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cache_write_input_tokens: cacheWrite } : {}),
+    ...(output !== undefined ? { output_tokens: output } : {}),
+    ...(reasoning !== undefined ? { reasoning_output_tokens: reasoning } : {}),
+  }
 }
 
 /** Codex's own discriminant for a failure it did not classify. */

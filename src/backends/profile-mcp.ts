@@ -716,6 +716,7 @@ export function buildAcpMcpServers(specs: Record<string, McpServerSpec> | null):
 export function materializeMcpServersForOpencode(
   specs: Record<string, McpServerSpec> | null,
   callerPermissions?: Record<string, unknown> | null,
+  profileTools?: Record<string, boolean> | null,
 ): MaterializedMcpConfig {
   const opencodeMcp: Record<string,
     | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
@@ -769,6 +770,17 @@ export function materializeMcpServersForOpencode(
     for (const [key, value] of Object.entries(callerPermissions)) {
       if (value === 'allow' || value === 'ask' || value === 'deny') {
         headlessPermission[key] = value
+      }
+    }
+  }
+  // The profile's own tools map must survive the headless allow-list:
+  // opencode resolves a tool as enabled when `permission` allows it,
+  // regardless of the `tools` map, so a profile that disables a tool needs
+  // the matching `deny` here or its disable is never enforced (#218).
+  if (profileTools && typeof profileTools === 'object') {
+    for (const [key, enabled] of Object.entries(profileTools)) {
+      if (enabled === false && key in headlessPermission) {
+        headlessPermission[key] = 'deny'
       }
     }
   }

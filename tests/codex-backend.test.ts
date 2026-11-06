@@ -153,6 +153,55 @@ describe('CodexBackend tool-call translation', () => {
     expect(deltas.find((d) => d.finish_reason)?.finish_reason).toBe('stop')
   })
 
+  it('maps the recorded cache split onto the usage receipt (issue #208)', async () => {
+    // Captured shape from a sandbox child's turn.completed (2026-09-09):
+    // 81% of the prompt served from cache; dropped before this fix, so every
+    // bridge Codex turn reached Runtime with cacheBreakdownKnown: false and
+    // the cached prefix was charged in full.
+    const cachedTurn = {
+      type: 'turn.completed',
+      usage: {
+        input_tokens: 317_069,
+        cached_input_tokens: 257_024,
+        cache_write_input_tokens: 0,
+        output_tokens: 3_190,
+        reasoning_output_tokens: 883,
+      },
+    }
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, cachedTurn]),
+    })
+    const deltas = await collect(backend.chat(request(), null, new AbortController().signal))
+    const usage = deltas.find((d) => d.usage)?.usage
+    expect(usage).toMatchObject({
+      input_tokens: 317_069,
+      fresh_input_tokens: 60_045,
+      cache_read_input_tokens: 257_024,
+      cache_write_input_tokens: 0,
+      output_tokens: 3_190,
+      reasoning_output_tokens: 883,
+    })
+  })
+
+  it('emits no cache class codex did not report', async () => {
+    const uncachedTurn = {
+      type: 'turn.completed',
+      usage: { input_tokens: 1_000, output_tokens: 50 },
+    }
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, uncachedTurn]),
+    })
+    const deltas = await collect(backend.chat(request(), null, new AbortController().signal))
+    const usage = deltas.find((d) => d.usage)?.usage
+    expect(usage).toMatchObject({ input_tokens: 1_000, output_tokens: 50 })
+    expect(usage).not.toHaveProperty('cache_read_input_tokens')
+    expect(usage).not.toHaveProperty('fresh_input_tokens')
+  })
+
   it('never emits a tool call for non-tool items', async () => {
     const reasoning = { type: 'item.completed', item: { id: 'item_9', type: 'reasoning', text: 'thinking' } }
     const backend = new CodexBackend({

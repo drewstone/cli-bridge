@@ -862,9 +862,16 @@ export class PiBackend implements NativeSessionBackend {
           },
         }
       }
-      const accountingMatched = inferenceTraffic.generationRequests === usageCost.receipts
+      // The generation/receipt identity is the accounting fact; rejected or
+      // in-flight requests are delivery facts. A FAILED request whose identity
+      // still balances (generations === receipts — a generation that fails
+      // while piping is counted, so the identity sees it on its own) is a
+      // surfaced, retryable anomaly, not a mismatch: folding it into the
+      // refusal killed eleven cells on 2026-08-23, every one with the stated
+      // identity holding exactly (#200).
+      const generationIdentity = inferenceTraffic.generationRequests === usageCost.receipts
+      const accountingMatched = generationIdentity
         && inferenceTraffic.rejectedRequests === 0
-        && inferenceTraffic.failedRequests === 0
         && inferenceTraffic.inFlightRequests === 0
       const typedPreProviderFailure = [turnFailure, sawError]
         .filter((message): message is string => message !== null)
@@ -908,14 +915,22 @@ export class PiBackend implements NativeSessionBackend {
         }
       }
       if (this.spawner.executionEnvironment === 'host' && !accountingMatched && !typedPreProviderFailure) {
+        // Name the condition that actually failed. The old single message
+        // claimed a usage mismatch even when its own numbers showed the
+        // identity holding, sending readers hunting for an accounting bug
+        // that was not there.
+        const cause = !generationIdentity
+          ? 'pi inference traffic did not match its recorded usage: '
+            + `${inferenceTraffic.generationRequests} generation request(s) vs `
+            + `${usageCost.receipts} Pi usage receipt(s)`
+          : inferenceTraffic.rejectedRequests > 0
+            ? `pi inference had ${inferenceTraffic.rejectedRequests} rejected request(s)`
+            : `pi inference still had ${inferenceTraffic.inFlightRequests} request(s) in flight`
         throw new BackendError(
-          'pi inference traffic did not match its recorded usage: '
-          + `${inferenceTraffic.generationRequests} generation request(s), `
-          + `${usageCost.receipts} Pi usage receipt(s), `
-          + `${inferenceTraffic.auxiliaryRequests} auxiliary request(s), `
-          + `${inferenceTraffic.rejectedRequests} rejected request(s), `
-          + `${inferenceTraffic.failedRequests} failed request(s), `
-          + `${inferenceTraffic.inFlightRequests} still in flight`,
+          `${cause} `
+          + `(${inferenceTraffic.auxiliaryRequests} auxiliary request(s), `
+          + `${inferenceTraffic.failedRequests} failed request(s) recorded on the receipt; `
+          + 'a balanced failure is surfaced for retry, not refused)',
           'upstream',
         )
       }

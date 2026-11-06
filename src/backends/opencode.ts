@@ -140,9 +140,14 @@ export class OpencodeBackend implements Backend {
     // opencode config directory, so both releases are paired at every exit.
     let mcpMaterialized: ReturnType<typeof materializeMcpServersForOpencode>
     try {
+      const profileForControls = resolveAgentProfile(req, session) as {
+        permissions?: Record<string, unknown>
+        tools?: Record<string, boolean>
+      } | null
       mcpMaterialized = materializeMcpServersForOpencode(
         resolveMcpServers(req, session),
-        (resolveAgentProfile(req, session) as { permissions?: Record<string, unknown> } | null)?.permissions,
+        profileForControls?.permissions,
+        profileForControls?.tools,
       )
     } catch (error) {
       provisioned.cleanup?.()
