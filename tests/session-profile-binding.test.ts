@@ -162,4 +162,35 @@ describe('session profile binding — structured conflict', () => {
       effectiveProfileDigest: canonicalAgentProfileDigest(PROFILE),
     })
   })
+
+  it('refuses a changed model on a legacy session instead of silently swapping it', async () => {
+    // A legacy session carries only metadata.model. The model half of the
+    // binding contract must hold here too: substituting the stored model would
+    // execute the run on a model the caller did not name with receipts that
+    // look internally clean (issue #182).
+    sessions.remember({
+      externalId: 'legacy-model-cell',
+      backend: 'capture',
+      model: 'capture',
+      internalId: 'native-legacy-model',
+      cwd: null,
+      metadata: { model: 'capture' },
+    })
+
+    const conflict = await post({ session_id: 'legacy-model-cell', model: 'capture/other' })
+    expect(conflict.status).toBe(409)
+    const body = await conflict.json() as {
+      error: { type: string; stored_model: string; received_model: string; provider_dispatch: string }
+    }
+    expect(body.error.type).toBe('session_model_conflict')
+    expect(body.error.stored_model).toBe('capture')
+    expect(body.error.received_model).toBe('capture/other')
+    // The refusal happens before any spawn, so nothing was executed.
+    expect(body.error.provider_dispatch).toBe('not_started')
+    expect(backend.turns).toBe(0)
+
+    // Naming the stored model still resumes the same conversation.
+    expect((await post({ session_id: 'legacy-model-cell', model: 'capture' })).status).toBe(200)
+    expect(backend.turns).toBe(1)
+  })
 })

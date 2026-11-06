@@ -77,6 +77,8 @@ export function assertProfilePromptIntentsSupported(
         .map(([name]) => name)
         .join(', ')}).`,
       'not_configured',
+      undefined,
+      { providerDispatch: 'not_started' },
     )
   }
   if (typeof prompt.appendSystemPrompt === 'string' && controls.append === null) {
@@ -89,6 +91,8 @@ export function assertProfilePromptIntentsSupported(
         .map(([name]) => name)
         .join(', ')}).`,
       'not_configured',
+      undefined,
+      { providerDispatch: 'not_started' },
     )
   }
 }

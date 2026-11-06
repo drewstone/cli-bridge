@@ -93,11 +93,13 @@ export function streamChatDeltaEvents(
     const heartbeat = setInterval(() => {
       void writeRaw(': keepalive\n\n')
     }, resolveSseHeartbeatMs())
+    let lastSeq: number | undefined
 
     try {
       if (!await writeRaw(': connected\n\n')) return
       for await (const { seq, delta } of source(readerController.signal)) {
         if (clientGone) break
+        lastSeq = seq
         if ((delta.finish_reason === 'error' || delta.finish_reason === 'timeout') && delta.error) {
           await writeSse(JSON.stringify({ error: delta.error }), seq)
           break
@@ -119,7 +121,12 @@ export function streamChatDeltaEvents(
       if (clientGone) return
       const message = error instanceof Error ? error.message : String(error)
       const type = error instanceof RunReplayCursorError ? error.code : 'server_error'
-      await writeSse(JSON.stringify({ error: { message, type } }))
+      // Runtime's bridge parser requires an id on every JSON data frame and
+      // classifies an unnumbered one as a terminal schema violation, which
+      // replaces this error — the one the caller needs — with a protocol
+      // complaint. Number the frame with the next sequence id so the real
+      // failure survives the wire (#220).
+      await writeSse(JSON.stringify({ error: { message, type } }), lastSeq === undefined ? 0 : lastSeq + 1)
     } finally {
       clearInterval(heartbeat)
     }
