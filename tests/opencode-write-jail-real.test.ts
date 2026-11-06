@@ -21,7 +21,7 @@ import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 
 const BIN = process.env.OPENCODE_BIN ?? join(homedir(), '.opencode/bin/opencode')
 const BWRAP = '/usr/bin/bwrap'
-const MODEL = process.env.CLI_BRIDGE_LIVE_MODEL ?? 'opencode/glm-5.3-flash-free'
+const MODEL = process.env.CLI_BRIDGE_LIVE_MODEL ?? 'opencode/opencode/glm-5.3-flash-free'
 const ENABLED = existsSync(BIN)
   && existsSync(BWRAP)
   && process.env.CLI_BRIDGE_SKIP_REAL_OPENCODE !== '1'
