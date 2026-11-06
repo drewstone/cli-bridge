@@ -1657,8 +1657,7 @@ describe('PiBackend', () => {
     ])
   })
 
-  it('accounts for Google countTokens separately from generation usage receipts', async () => {
-    const upstreamPaths: string[] = []
+  it('accounts for Google countTokens separately from generation usage receipts', async () => {    const upstreamPaths: string[] = []
     const upstream = createServer(async (request, response) => {
       for await (const _chunk of request) {
         // Drain the request before responding so the proxy records a settled exchange.
@@ -1770,6 +1769,118 @@ describe('PiBackend', () => {
         accountingMatched: true,
       })
       expect(request.profile_materialization_receipt).toEqual(completed)
+    } finally {
+      await closeTestServer(upstream)
+    }
+  })
+
+  it('surfaces a balanced failed request instead of refusing the turn (#200)', async () => {
+    // One credential-refresh failure increments failedRequests before the
+    // generation counter, so the generation/receipt identity still holds.
+    // The old check folded failedRequests into the identity and killed the
+    // driver with a message claiming a mismatch its own numbers disproved
+    // (eleven cells, 2026-08-23).
+    const upstream = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* drain before responding */ }
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end('{}')
+    })
+    await listenTestServer(upstream)
+    const address = upstream.address()
+    if (!address || typeof address === 'string') throw new Error('fake upstream did not listen')
+
+    let refreshCalls = 0
+    const spawner: Spawner = async (_bin, _args, opts): Promise<SpawnResult> => {
+      const child = new FakeChild()
+      queueMicrotask(() => {
+        void (async () => {
+          try {
+            const agentDir = opts.env?.PI_CODING_AGENT_DIR
+            if (!agentDir) throw new Error('missing request Pi config')
+            const config = JSON.parse(readFileSync(join(agentDir, 'models.json'), 'utf8')) as {
+              providers: Record<string, { baseUrl: string; apiKey: string }>
+            }
+            const provider = Object.values(config.providers)[0]
+            if (!provider) throw new Error('missing request provider')
+            let response = await fetch(`${provider.baseUrl}/models/balanced-fail:generateContent?key=${encodeURIComponent(provider.apiKey)}`, {
+              method: 'POST', body: '{}',
+            })
+            if (response.ok) throw new Error('first generation should have hit the failed refresh')
+            // The driver's own retry: this one balances the identity.
+            response = await fetch(`${provider.baseUrl}/models/balanced-fail:generateContent?key=${encodeURIComponent(provider.apiKey)}`, {
+              method: 'POST', body: '{}',
+            })
+            if (!response.ok) throw new Error(`proxy returned ${response.status}`)
+            child.stdout.write(`${JSON.stringify({
+              type: 'turn_end',
+              message: { usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } },
+            })}\n`)
+            child.stdout.end()
+            child.stderr.end()
+            child.exitCode = 0
+            child.emit('close', 0)
+          } catch (error) {
+            child.stderr.end(error instanceof Error ? error.message : String(error))
+            child.stdout.end()
+            child.exitCode = 1
+            child.emit('close', 1)
+          }
+        })()
+      })
+      return { child: child as never, release() {}, spawnError: () => null }
+    }
+    spawner.executionEnvironment = 'test-double'
+
+    try {
+      const backend = newTestPiBackend({
+        bin: 'pi',
+        timeoutMs: 5_000,
+        spawner,
+        transportResolver: testPiInferenceTransport({
+          upstreamBaseUrl: `http://127.0.0.1:${address.port}/v1beta`,
+          apiMode: 'google-generative-ai',
+          upstreamApiKey: 'google-upstream-key',
+          resolveUpstreamApiKey: async () => {
+            refreshCalls += 1
+            if (refreshCalls === 1) throw new Error('credential refresh failed once')
+            return 'google-upstream-key'
+          },
+          providerConfig: { api: 'google-generative-ai' },
+          modelConfig: {
+            id: 'balanced-fail',
+            api: 'google-generative-ai',
+            input: ['text'],
+            contextWindow: 128_000,
+            maxTokens: 16_384,
+          },
+        }),
+      })
+      const request: ChatRequest = {
+        model: 'pi/google-test/balanced-fail',
+        messages: [{ role: 'user', content: 'retry once' }],
+        agent_profile: {
+          harness: 'pi',
+          model: { provider: 'google-test', default: 'balanced-fail' },
+        },
+      }
+
+      const deltas = await collect(backend.chat(request, null, new AbortController().signal))
+
+      // The turn completes: the balanced failure is recorded on the receipt,
+      // not turned into a terminal refusal.
+      expect(deltas.find((delta) => delta.finish_reason === 'error')).toBeUndefined()
+      expect(deltas.at(-1)).toMatchObject({ finish_reason: 'stop' })
+      const observation = deltas.findLast(
+        (delta) => delta.profile_materialization?.inference?.observation !== undefined,
+      )?.profile_materialization?.inference?.observation
+      expect(observation).toMatchObject({
+        generationRequests: 1,
+        failedRequests: 1,
+        rejectedRequests: 0,
+        inFlightRequests: 0,
+        accountingMatched: true,
+      })
+      expect(refreshCalls).toBe(2)
     } finally {
       await closeTestServer(upstream)
     }

@@ -65,6 +65,31 @@ describe('materializeMcpServersForOpencode', () => {
     expect(written.mcp).toEqual({})
     m.cleanup()
   })
+
+  it('denies tools the profile disables — the headless allow-list must not re-enable them (#218)', () => {
+    const m = materializeMcpServersForOpencode(
+      null,
+      null,
+      { bash: false, webfetch: false, edit: true },
+    )
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.permission.bash).toBe('deny')
+    expect(written.permission.webfetch).toBe('deny')
+    expect(written.permission.edit).toBe('allow')
+    m.cleanup()
+  })
+
+  it('lets an explicit agent_profile.permissions deny stand when tools and permissions disagree', () => {
+    const m = materializeMcpServersForOpencode(
+      null,
+      { webfetch: 'deny' },
+      { bash: false },
+    )
+    const written = JSON.parse(readFileSync(m.configPath, 'utf-8'))
+    expect(written.permission.webfetch).toBe('deny')
+    expect(written.permission.bash).toBe('deny')
+    m.cleanup()
+  })
 })
 
 describe('materializeMcpServersForPi', () => {
