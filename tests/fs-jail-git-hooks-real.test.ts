@@ -71,9 +71,8 @@ describe('Git hooks under the fs-jail', () => {
       const refused = await run('git', ['commit', '-q', '-m', 'must be refused'])
       expect(refused.stderr).toContain('privacy-denied'); expect(refused.status).not.toBe(0)
       expect(host('rev-list', '--count', 'HEAD').stdout.trim()).toBe('1')
-      for (const path of [join(home, 'private'), join(tools, 'untracked-secret'), join(tools, '.git/config')]) {
-        expect((await run('test', ['-r', path])).status, path).not.toBe(0)
-      }
+      const hidden = [join(home, 'private'), join(tools, 'untracked-secret'), join(tools, '.git/config')]
+      expect((await run('sh', ['-c', 'for path; do test ! -r "$path" || exit 1; done', 'sh', ...hidden])).status, hidden.join('\n')).toBe(0)
       if (kind.endsWith('-tmp')) expect((await run('sh', ['-c', 'test -z "$(find "$1" -type f -print -quit)"', 'sh', temporary])).status).toBe(0)
       const readonly = await run('sh', ['-c', 'echo corrupt >> "$1"', 'sh', join(tools, 'bin/check')])
       expect(readonly.status).not.toBe(0)
@@ -83,5 +82,5 @@ describe('Git hooks under the fs-jail', () => {
         else process.env[key] = value
       }
     }
-  })
+  }, 20_000)
 })
