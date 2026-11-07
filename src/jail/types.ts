@@ -1,16 +1,4 @@
-/**
- * Jail module types — the abstraction over "wrap a CLI invocation in an
- * OS sandbox that confines writes to a known scratch root".
- *
- *   JailBackend.wrap(bin, args, spec) → JailWrap{ bin, args, env?, cleanup? }
- *
- * A backend never spawns anything. It rewrites the argv so the SAME
- * spawn machinery the bridge already uses launches the CLI inside a
- * write-jail instead. The host filesystem is readable; writes are
- * confined to `spec.root` (and any `extraWritablePaths`). On Linux this
- * is bubblewrap (bwrap); on macOS it is sandbox-exec (SBPL). Everywhere
- * else the NoopJail passes argv through unchanged.
- */
+/** Jail backends rewrite argv. They do not spawn. Linux is bwrap; macOS is sandbox-exec. */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
@@ -27,31 +15,17 @@ export interface JailSpec {
   extraWritablePaths?: string[]
   /** Extra absolute paths to expose read-only beyond the host default. */
   extraReadablePaths?: string[]
-  /**
-   * Confine READS as well as writes (an "fs-jail"). When true, the Linux
-   * (bwrap) backend does NOT mount the whole host root read-only; it binds
-   * only a minimal allowlist of system + language-toolchain paths, a FRESH
-   * empty tmpfs at `/tmp`, and the workspace (`projectDir`) read-WRITE. A
-   * jailed CLI then cannot read the host repo (benchmark task definitions /
-   * grader answer keys) or sibling run scratch trees under `/tmp` — only the
-   * paths its runtimes legitimately need. macOS applies the same read
-   * allowlist through seatbelt. Unsupported hosts refuse confinement.
-   */
+  /** fs-jail: allowlisted reads, fresh /tmp, workspace read-write. */
   readConfine?: boolean
+  /** Egress. Omitted and `none` unshare the network. `router` allows only the Tangle Router. */
+  network?: 'none' | 'router'
   /** Refuse the operator's unconfined warn fallback for this request. */
   requireEnforcement?: boolean
   /** Captured operator fallback; absent means refuse unconfined execution. */
   fallback?: 'deny' | 'warn'
-  /** Host auth/config sources made available inside the jail so a confined run
-   * still authenticates as the operator. Each source explicitly declares
-   * whether Linux may read-only bind it or must make an ephemeral writable
-   * copy for a CLI that locks its own settings. Populated per backend by
-   * {@link authSourcesFor}. */
+  /** Host auth paths exposed inside the jail. Populated per backend. */
   authSources?: JailAuthSource[]
-  /** Exact argv values that differ only while the OS jail is active.
-   * Backends declare both values; the executor applies the rewrite after it
-   * has proved a jail backend is available. The fallback path retains
-   * the original argument. */
+  /** Argv values swapped only after a jail backend is actually available. */
   argumentRewrites?: JailArgumentRewrite[]
 }
 
@@ -67,34 +41,13 @@ export interface JailArgumentRewrite {
 export interface JailAuthSource {
   /** Absolute host path holding the backend CLI's auth/config. */
   source: string
-  /** Path relative to the jail root (== jail HOME) where `source` must appear.
-   * Read-only sources normally retain their logical HOME location; writable
-   * copies use a unique request path and redirect the CLI through `envVar`.
-   * Always inside the root, even when `source` lives outside operator HOME. */
+  /** Path under the jail root. Writable copies stay inside that root. */
   jailRel: string
-  /** `read-only` preserves the host path through a Linux bind mount.
-   * `copy-writable` copies it inside the writable jail HOME and removes that
-   * copy when the process exits.
-   * `seed-writable` copies it to a STABLE path inside the writable jail HOME,
-   * refreshed on every run and deliberately NOT removed when the process
-   * exits: the CLI keeps its own session state (codex rollouts, claude
-   * project transcripts) next to the seed, and a later turn of the same
-   * bridge session must find that state or `resume` breaks. Use `only` to
-   * keep the seed small — a full home tree (host codex sessions run to
-   * hundreds of GB) must never be copied. The jail root is operator scratch
-   * (git-ignored by prepareJailHome), so the seed cannot be committed.
-   * macOS must copy every mode because sandbox-exec cannot bind mount. */
+  /** `seed-writable` is kept after exit so a later turn can resume. Copy `only`, never a full home. macOS copies every mode. */
   mode: 'read-only' | 'copy-writable' | 'seed-writable'
-  /** For `seed-writable`: the source-relative entries to copy. An entry
-   * missing on the host is skipped, never fatal. Absent means the whole
-   * source tree — only safe for a synthesized directory that is known small
-   * (e.g. codex's MCP-passthrough CODEX_HOME). */
+  /** Entries to copy for `seed-writable`. Absent means the whole small source tree. */
   only?: readonly string[]
-  /** Optional env var the jail must point at this source's IN-JAIL location
-   * (`<root>/<jailRel>`). Set ONLY by the jail backend when it actually wraps,
-   * so e.g. codex's `CODEX_HOME` is redirected into the jail for confined runs
-   * but left untouched on docker / fallback-passthrough paths that ignore the
-   * jail. */
+  /** Env var pointed at the in-jail path, set only when a jail actually wraps. */
   envVar?: string
 }
 
@@ -124,16 +77,7 @@ export interface JailBackend {
   wrap(bin: string, args: string[], spec: JailSpec): JailWrap | Promise<JailWrap>
 }
 
-/**
- * Resolve `root` against `base` and prove it cannot escape `base`.
- *
- * Pure path arithmetic — no filesystem access, so it is safe to call
- * before the directory exists. A relative `root` is resolved under
- * `base`; an absolute `root` is taken as-is. Either way the result must
- * be `base` itself or a descendant of it, else we throw. This is the
- * single chokepoint that stops a caller from pointing the writable jail
- * root at `../../etc` or any path outside the allowed base.
- */
+/** Resolve `root` under `base` and reject anything that is not a strict descendant. */
 export function resolveJailRoot(root: string, base: string): string {
   if (!root) throw new Error('jail root must be a non-empty path')
   // Canonicalize BOTH paths (resolve symlinks on the existing prefix) before

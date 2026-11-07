@@ -262,6 +262,7 @@ const chatRequestSchema = z.object({
     jail: z.object({
       mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
       root: z.string().optional(),
+      network: z.enum(['none', 'router']).optional(),
     }).optional(),
     netJail: z.never({ error: 'execution.netJail is no longer supported' }).optional(),
     timeoutMs: z.number().int().positive().max(maxExecutionTimeoutMs).optional(),
@@ -1021,6 +1022,7 @@ export function mountChatCompletions(
         req.jailSpec = resolveJailSpec({
           execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
           execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
+          execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
           cwd: req.cwd ?? process.cwd(),
           env: deps.jailEnv ?? process.env,
         })

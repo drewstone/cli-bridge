@@ -76,6 +76,8 @@ export interface Config extends NativeHarnessConfig {
     jailMode: 'off' | 'write-jail' | 'fs-jail';
     /** Explicit policy when the configured OS jail is unavailable. */
     jailFallback: 'deny' | 'warn';
+    /** `BRIDGE_JAIL_NETWORK=none` forces no egress. `router` is not granted until a spawn asks. */
+    jailNetwork?: 'none' | 'router';
     /**
      * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
      * resolve under the request cwd; absolute paths must stay inside it.

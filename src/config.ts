@@ -78,19 +78,12 @@ export interface Config extends NativeHarnessConfig {
   sandboxProfilesDir: string
   /** Operator timeout fallback sent to sandbox-api when the caller omits one. Zero means none. */
   sandboxTimeoutMs: number
-  /**
-   * Default jail mode for host-executed CLIs, from `BRIDGE_JAIL_MODE`
-   * (off|write-jail|fs-jail, default off; `WORKER_FS_JAIL=1` is a shorthand
-   * for fs-jail). A per-request `execution.jail.mode` may raise (never lower)
-   * this floor. In `write-jail` the host filesystem is read-only and the CLI's
-   * writes are confined to the jail root; `fs-jail` additionally confines
-   * READS to a minimal system+toolchain allowlist so the CLI cannot read the
-   * host repo or sibling run scratch dirs (bwrap Linux only; write-jail on
-   * macOS via sandbox-exec; no-op elsewhere).
-   */
+  /** `BRIDGE_JAIL_MODE`. A request may raise this floor, never lower it. */
   jailMode: 'off' | 'write-jail' | 'fs-jail'
   /** Explicit policy when the configured OS jail is unavailable. */
   jailFallback: 'deny' | 'warn'
+  /** `BRIDGE_JAIL_NETWORK=none` forces no egress. `router` is not granted until a spawn asks. */
+  jailNetwork?: 'none' | 'router'
   /**
    * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
    * resolve under the request cwd; absolute paths must stay inside it.
@@ -207,6 +200,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
     jailMode: jailFloor({ ...env, BRIDGE_JAIL_MODE: parseJailMode(env.BRIDGE_JAIL_MODE) }),
     jailFallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
+    ...parseJailNetwork(env.BRIDGE_JAIL_NETWORK),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
     ...resolveJailPathLists(env),
     trace: parseTraceConfig(env, dataDir),
@@ -305,6 +299,13 @@ function parsePrimeStateConfig(
     primeModelsJson: modelsJson ? resolve(modelsJson) : null,
     primePersistentAgentDir: persistentAgentDir ? resolve(persistentAgentDir) : null,
   }
+}
+
+function parseJailNetwork(value: string | undefined): { jailNetwork?: 'none' | 'router' } {
+  const network = (value ?? '').trim()
+  if (network === '') return {}
+  if (network === 'none' || network === 'router') return { jailNetwork: network }
+  throw new Error(`invalid BRIDGE_JAIL_NETWORK: ${value} — expected none|router`)
 }
 
 function parseJailMode(value: string | undefined): 'off' | 'write-jail' | 'fs-jail' {
