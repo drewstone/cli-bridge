@@ -1,20 +1,4 @@
-/**
- * macOS filesystem jail via sandbox-exec (SBPL).
- *
- * Modeled on holtwick/bx-mac. The profile starts permissive — reads,
- * exec, and network are allowed — then denies ALL file writes and
- * re-allows them only under the jail root (HOME) and explicit writable paths.
- * An fs-jail also denies reads outside system, toolchain, workspace and auth paths. SBPL is last-match-wins, so the
- * narrow `allow` rules after the broad `deny` carve out the writable set.
- *
- * Symlinks: macOS routes /tmp and /var through /private, so subpath rules
- * must use realpath'd targets or they silently fail to match. We resolve
- * the root and every allow/deny path through realpath after creating the
- * root, and escape each before embedding it in the profile.
- *
- * The generated profile is written to a 0o600 temp file; `cleanup`
- * removes it (and its temp dir) after the spawn completes.
- */
+/** macOS sandbox-exec profile. Last match wins. Paths are realpath'd because /tmp goes through /private. */
 
 import { accessSync, constants, existsSync } from 'node:fs'
 import { lstat, mkdir, mkdtemp, readlink, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
@@ -132,7 +116,7 @@ export class MacosSeatbeltJail implements JailBackend {
         spec.projectDir, ...writable, ...toolchainReadPaths(bin, spec.projectDir),
         ...readOnly, ...fixedPaths,
       ].map(canonicalizeJailPath) : undefined
-      const profile = buildProfile(writable, fixedPaths, readable, readOnly.filter((path) => !writable.includes(path)))
+      const profile = buildProfile(writable, fixedPaths, readable, readOnly.filter((path) => !writable.includes(path)), spec.network ?? 'none')
       const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
       const profilePath = join(dir, 'profile.sb')
       await writeFile(profilePath, profile, { mode: 0o600 })
@@ -201,7 +185,7 @@ async function linkHostKeychains(root: string): Promise<string[]> {
   return [library, target]
 }
 
-export function buildProfile(writable: string[], fixed: string[] = [], readable?: string[], readOnly: string[] = []): string {
+export function buildProfile(writable: string[], fixed: string[] = [], readable?: string[], readOnly: string[] = [], network: 'none' | 'router' = 'none'): string {
   const allowSubpaths = writable.map((path) => `  (subpath "${sbplEscape(path)}")`).join('\n')
   const allowDevices = DEVICE_WRITABLE.map((path) => `  (literal "${sbplEscape(path)}")`).join('\n')
   const denyFixed = fixed.length + readOnly.length === 0 ? [] : [
@@ -215,6 +199,8 @@ export function buildProfile(writable: string[], fixed: string[] = [], readable?
   return [
     '(version 1)',
     '(allow default)',
+    '(deny network*)',
+    ...(network === 'router' ? ['(allow network-outbound (remote tcp "router.tangle.tools:443"))'] : []),
     ...(readable ? [
       '(deny file-read*)',
       '(allow file-read-metadata)',

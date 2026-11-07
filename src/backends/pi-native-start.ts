@@ -95,6 +95,7 @@ export async function startPiNativeSession(
       req.jailSpec = resolveJailSpec({
         execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
         execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
+        execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
         cwd: runCwd ?? process.cwd(),
         env: options.jailEnv ?? process.env,
       })

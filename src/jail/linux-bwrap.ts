@@ -1,33 +1,15 @@
 /**
- * Linux write-jail via bubblewrap (bwrap).
- *
- * The host root is mounted read-only, `/dev` is provided, networking is
- * shared (so API calls resolve DNS and connect), and exactly one subtree —
- * the jail root — is bind-mounted writable and exported as HOME. The CLI is
- * chdir'd into the read-only project dir. Writes anywhere except the jail
- * root (and any extraWritablePaths) hit a read-only filesystem and fail. We
- * deliberately do NOT tmpfs /tmp (the bridge materializes runtime config
- * there before spawn); the CLI's temp writes go to TMPDIR=<root>/.tmp.
- *
- * Runs UNPRIVILEGED: `--unshare-user` creates a user namespace mapping the
- * caller's uid to itself, so files in the jail are owned by the real user
- * and no `sudo`/`chmod` is needed. This requires the host to permit
- * unprivileged user namespaces. Modern Ubuntu restricts that by default
- * (`kernel.apparmor_restrict_unprivileged_userns=1`) AND ships a
- * non-setuid bwrap, so on such hosts `isAvailable()` returns false and the
- * caller falls back to no-jail WITH A WARNING (see executors/jail-support).
- * Enable it once with either:
- *   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   (persist in /etc/sysctl.d)
- *   sudo chmod u+s /usr/bin/bwrap                                    (setuid bwrap)
- *
- * Bind order matters: bwrap applies mounts left-to-right, last wins. The
- * project dir is bound read-only BEFORE the writable jail root, so a root
- * nested inside the project still ends up writable.
+ * Linux write-jail via bubblewrap. Network starts unshared; `router` reaches
+ * only router.tangle.tools. Unprivileged user namespaces: if apparmor blocks
+ * them and bwrap is not setuid, `isAvailable()` is false and the caller refuses
+ * unconfined execution. Bind order is left-to-right, last wins.
  */
 
 import { spawnSync } from 'node:child_process'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { accessSync, constants, existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
+import { resolve4 } from 'node:dns/promises'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   copyAuthIntoJail,
@@ -41,25 +23,7 @@ import { canonicalizeJailPath, ignoreJailRoot, jailEnv, prepareJailHome, resolve
 
 const BWRAP_BIN = 'bwrap'
 
-/**
- * Minimal read-only system paths bound into an fs-jail (readConfine) so the
- * CLI, a shell, and the C/Python runtimes resolve. Each is bound with
- * `--ro-bind-try` so a path absent on this host is skipped, not fatal.
- *
- *   - /usr holds the bulk of binaries + shared libs + the Python stdlib.
- *   - /bin /sbin /lib* are real dirs on split-usr systems and symlinks into
- *     /usr on merged-usr systems; `--ro-bind-try` binds either shape (it
- *     follows the symlink to the target dir), so `#!/bin/sh` shebangs and
- *     PATH lookups work without assuming a layout.
- *   - /etc supplies resolv.conf, TLS trust (ssl/ca-certificates), passwd/nss.
- *     A resolver symlink's exact target is bound separately, not its parent
- *     directory: WSL and other hosts may keep it outside /etc.
- *
- * Deliberately absent: /home, /root, /tmp, /var, /mnt, /media — the host repo
- * (task defs / grader keys) and sibling run scratch dirs live under those and
- * must stay invisible. The workspace and the language toolchain are added
- * explicitly (see wrap() / {@link toolchainReadPaths}).
- */
+/** fs-jail read allowlist. `--ro-bind-try` skips a missing path. /home, /root, /tmp, /var, /mnt, and /media stay unbound. */
 const SYSTEM_RO_PATHS: readonly string[] = [
   '/usr',
   '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32',
@@ -94,19 +58,12 @@ export class LinuxBwrapJail implements JailBackend {
     const seededAuthSources = availableAuthSources.filter(
       (source) => source.mode === 'seed-writable',
     )
-    for (const source of availableAuthSources) {
-      // Resolve every destination before any credential copy. Once bytes exist
-      // under the jail root, the remaining wrapper construction is synchronous
-      // array assembly and cannot strand a copy through a later path error.
-      resolveJailRoot(source.jailRel, root)
-    }
+    for (const source of availableAuthSources) resolveJailRoot(source.jailRel, root)
     for (const source of writableAuthSources) {
       if (!source.envVar) {
         throw new Error('a copy-writable jail auth source requires envVar')
       }
     }
-    // Resolve before copying credentials. Only a regular DNS configuration
-    // file is admitted, never an extra /mnt or /run directory mount.
     const resolver = spec.readConfine ? tryRealpath('/etc/resolv.conf') : null
     if (resolver && !statSync(resolver).isFile()) throw new Error('DNS resolver is not a regular file')
     const hooks = spec.readConfine ? gitHookReadPaths(spec.projectDir, config.hooks) : undefined
@@ -116,32 +73,23 @@ export class LinuxBwrapJail implements JailBackend {
       writableAuthSources,
       { replace: false },
     )
-    // Stable writable homes (codex/claude) live inside the bind-writable root:
-    // refreshed here, retained after exit so a later turn's `resume` still
-    // finds the session state the CLI wrote beside the seed.
     await seedAuthIntoJail(root, seededAuthSources)
     const resolvedAuthSources = availableAuthSources.map((source) => ({
       source,
       destination: resolveJailRoot(source.jailRel, root),
     }))
 
+    const router = (spec.network ?? 'none') === 'router'
     const bwrapArgs = [
       '--unshare-user',
+      ...(router ? ['--uid', '0', '--gid', '0', '--cap-add', 'CAP_NET_ADMIN', '--cap-add', 'CAP_SETPCAP'] : []),
       '--unshare-pid',
       '--unshare-ipc',
       '--unshare-uts',
-      '--share-net',
+      '--unshare-net',
     ]
 
     if (spec.readConfine) {
-      // fs-jail: ALLOWLIST reads. Bind only the minimal system + toolchain
-      // paths the CLI and its runtimes need; the host repo, sibling run
-      // scratch dirs, and the host /tmp are simply never mounted, so a jailed
-      // shell cannot read benchmark task definitions or grader answer keys.
-      // /tmp is a FRESH empty tmpfs (writable, ephemeral) — the host /tmp
-      // (twins, other runs' materialized config) is invisible. The workspace
-      // is re-exposed READ-WRITE below (it commonly lives under /tmp), after
-      // the tmpfs, so a coding agent can still build its solution.
       for (const path of SYSTEM_RO_PATHS) bwrapArgs.push('--ro-bind-try', path, path)
       bwrapArgs.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp')
       for (const path of toolchainReadPaths(bin, spec.projectDir)) {
@@ -151,12 +99,6 @@ export class LinuxBwrapJail implements JailBackend {
       for (const [alias, target] of hooks!.links) bwrapArgs.push('--symlink', target, alias)
       bwrapArgs.push('--bind', spec.projectDir, spec.projectDir)
     } else {
-      // write-jail: reads stay OPEN (whole host read-only), only writes are
-      // confined to the jail root. Note we do NOT tmpfs /tmp: the bridge
-      // materializes runtime config (MCP config, OPENCODE_CONFIG) under the
-      // host tmpdir before spawn, and the CLI must
-      // still read those paths. /tmp stays readable (read-only) via this bind;
-      // the CLI's own temp WRITES are redirected to TMPDIR=<root>/.tmp (jailEnv).
       bwrapArgs.push(
         '--ro-bind', '/', '/',
         '--dev', '/dev',
@@ -164,23 +106,12 @@ export class LinuxBwrapJail implements JailBackend {
       )
     }
 
-    // Writable extras FIRST, read-only extras after: a later mount masks an earlier one under
-    // it, so this order lets an operator declare a writable state dir and then carve its code
-    // subtree back to read-only (RW ~/.hermes, RO ~/.hermes/hermes-agent). The reverse order
-    // would silently make the code writable.
     for (const path of spec.extraWritablePaths ?? []) {
       bwrapArgs.push('--bind', path, path)
     }
-    // A path registered as BOTH writable and readable must stay writable: an identical ro-bind
-    // after the rw-bind would mask it and fail writes with EROFS. Only an exact duplicate is
-    // skipped; a read-only path nested under a writable root is still carved back to RO.
     const writableExtras = new Set(spec.extraWritablePaths ?? [])
     for (const path of spec.extraReadablePaths ?? []) {
       if (writableExtras.has(path)) continue
-      // In an fs-jail these carry the materialized runtime config the backend
-      // wrote under the host /tmp (now hidden by the tmpfs above) and the
-      // operator's BRIDGE_JAIL_RO_PATHS; `-try` keeps a since-removed path
-      // non-fatal. Bound after the tmpfs so they win.
       bwrapArgs.push('--ro-bind-try', path, path)
     }
     // Writable root last so it wins over any read-only mount above it.
@@ -189,71 +120,87 @@ export class LinuxBwrapJail implements JailBackend {
       bwrapArgs.push('--ro-bind', resolver, resolver)
     }
 
-    // Make backend config available at its stable path inside the jail.
-    // Read-only sources are bound after the writable root so they stay
-    // read-only. Sources whose CLI takes settings locks were copied into the
-    // writable root above and therefore need only their env redirect here.
     for (const { source: authSource, destination } of resolvedAuthSources) {
       const { source, envVar, mode } = authSource
       if (mode === 'read-only') bwrapArgs.push('--ro-bind', source, destination)
-      // Point the backend's env var (e.g. CODEX_HOME) at the in-jail copy. Done
-      // here, where the jail truly applies, so non-jailed paths are untouched.
       if (envVar) bwrapArgs.push('--setenv', envVar, destination)
     }
 
     for (const { source, destination } of config.binds) bwrapArgs.push('--ro-bind', source, destination)
 
-    // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.
     for (const [key, value] of Object.entries(jailEnv(root))) {
       bwrapArgs.push('--setenv', key, value)
     }
 
-    bwrapArgs.push(
-      '--chdir', spec.projectDir,
-      '--die-with-parent',
-      bin, ...args,
-    )
-
     const nativeHome = resolvedAuthSources.find(({ source }) => source.envVar === 'CODEX_HOME')
-    return {
-      bin: BWRAP_BIN,
-      args: bwrapArgs,
-      ...(nativeHome
-        ? { effectiveNativeStore: { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } }
-        : {}),
-      cleanup: async () => { try { await removeAuthCopies(copiedWritableAuth) } finally { await config.cleanup() } },
+    const cleanup = async () => { try { await removeAuthCopies(copiedWritableAuth) } finally { await config.cleanup() } }
+    const store = nativeHome
+      ? { effectiveNativeStore: { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } }
+      : {}
+    if (!router) {
+      bwrapArgs.push('--chdir', spec.projectDir, '--die-with-parent', bin, ...args)
+      return { bin: BWRAP_BIN, args: bwrapArgs, ...store, cleanup }
     }
+    return launchRouter(bwrapArgs, spec.projectDir, bin, args, { ...store, cleanup })
   }
 }
 
-/**
- * Read-only paths for the language + CLI toolchain that must be visible inside
- * an fs-jail, derived at wrap time so no host layout is hard-coded:
- *
- *   - the Node install prefix (from the bridge's own interpreter), covering
- *     node/npm/pnpm and any globally-installed CLI under its lib/node_modules;
- *   - the wrapped CLI's own location — both its on-PATH entry dir (so a bare
- *     `bin` name resolves) and its realpath install root (so a bundled runtime
- *     a level up, e.g. `~/.opencode`, is readable);
- *   - the operator's `~/.cache` (tokenizer / model caches some CLIs read).
- * Explicit operator extras come only from the resolved JailSpec.
- *
- * Every candidate passes through {@link isSafeReadPath}: `/`, `/home`, the
- * operator HOME itself, and any ANCESTOR of the workspace are refused, so a
- * mis-derivation can never re-open the whole home tree or the sibling run
- * scratch dirs the jail exists to hide.
- */
+const ROUTER_HOST = 'router.tangle.tools'
+
+/** Unshared net plus slirp, then nft drops every destination except the Router. */
+async function launchRouter(
+  bwrapArgs: string[],
+  projectDir: string,
+  bin: string,
+  args: string[],
+  wrap: Pick<JailWrap, 'cleanup' | 'effectiveNativeStore'>,
+): Promise<JailWrap> {
+  const ips = [...new Set(await resolve4(ROUTER_HOST))]
+  if (ips.length === 0) throw new Error(`jail network: ${ROUTER_HOST} did not resolve`)
+  const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-net-'))
+  const allow = ips.map((ip) => `ip daddr ${ip} tcp dport 443 accept`).join('\n    ')
+  const rules = `table inet jail {\n  chain output {\n    type filter hook output priority 0; policy drop;\n    oifname "lo" accept\n    ${allow}\n  }\n}\n`
+  const enter = `#!/bin/sh\nnft -f /jail-net.nft || exit 125\nexec setpriv --nnp --bounding-set -all --inh-caps -all --ambient-caps -all -- "$@"\n`
+  await writeFile(join(dir, 'hosts'), `127.0.0.1 localhost\n${ips.map((ip) => `${ip} ${ROUTER_HOST}`).join('\n')}\n`)
+  await writeFile(join(dir, 'rules.nft'), rules)
+  await writeFile(join(dir, 'enter'), enter)
+  const supervisor = `import { spawn } from 'node:child_process'
+const child = spawn('bwrap', ${JSON.stringify([...bwrapArgs, '--ro-bind', join(dir, 'hosts'), '/etc/hosts', '--ro-bind', join(dir, 'rules.nft'), '/jail-net.nft', '--ro-bind', join(dir, 'enter'), '/jail-net-enter', '--info-fd', '3', '--block-fd', '4', '--chdir', projectDir, '--die-with-parent', '/bin/sh', '/jail-net-enter', bin, ...args])}, { stdio: ['ignore', 'inherit', 'inherit', 'pipe', 'pipe'] })
+let info = ''
+const pid = await new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error('jail network: no pid')), 5000)
+  child.stdio[3].on('data', (chunk) => { info += chunk; try { clearTimeout(timer); resolve(JSON.parse(info)['child-pid']) } catch {} })
+  child.on('exit', (code) => reject(new Error('bwrap exited ' + code + ' ' + info)))
+})
+const slirp = spawn('slirp4netns', ['--configure', '--disable-host-loopback', '--disable-dns', '--ready-fd', '3', '--userns-path', '/proc/' + pid + '/ns/user', '--netns-type', 'path', '/proc/' + pid + '/ns/net', 'tap0'], { stdio: ['ignore', 'inherit', 'inherit', 'pipe'] })
+await new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error('jail network: slirp not ready')), 5000)
+  slirp.stdio[3].once('data', () => { clearTimeout(timer); resolve() })
+  slirp.on('exit', (code) => reject(new Error('slirp exited ' + code)))
+})
+child.stdio[4].end('x')
+const code = await new Promise((resolve) => child.on('exit', resolve))
+try { slirp.kill('SIGKILL') } catch {}
+process.exit(code ?? 1)
+`
+  await writeFile(join(dir, 'supervise.mjs'), supervisor)
+  const previous = wrap.cleanup
+  return {
+    bin: process.execPath,
+    args: [join(dir, 'supervise.mjs')],
+    ...wrap,
+    cleanup: async () => { try { await previous?.() } finally { await rm(dir, { recursive: true, force: true }) } },
+  }
+}
+
+/** Node prefix, the CLI's real install root, and ~/.cache. Ancestors of the workspace are refused. */
 export function toolchainReadPaths(bin: string, projectDir: string): string[] {
   const home = canonicalizeJailPath(homedir())
   const candidates: string[] = []
 
-  // Node install prefix: <prefix>/bin/node → <prefix>. Also covers npm/pnpm and
-  // globally npm-installed CLIs (which live under <prefix>/lib/node_modules).
   const nodeReal = tryRealpath(process.execPath)
   if (nodeReal) candidates.push(dirname(dirname(nodeReal)))
 
-  // The wrapped CLI itself: its on-PATH entry dir (resolves a bare name and a
-  // symlink such as ~/.local/bin/opencode) plus its realpath install root.
   const onPathEntry = whichPath(bin)
   if (onPathEntry) {
     candidates.push(dirname(onPathEntry))
@@ -278,9 +225,7 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
   return out
 }
 
-/** Hook directories are trusted explicitly; their owning checkout contributes only tracked
- * files, never its Git metadata or untracked secrets. No shell dependency guessing: hooks may
- * exec sibling tools, and external installs retain BRIDGE_JAIL_RO_PATHS as their owner. */
+/** Tracked files of a configured hooks directory. Not Git metadata or untracked files. */
 function gitHookReadPaths(projectDir: string, candidates: string[]): { paths: string[]; links: Map<string, string> } {
   const home = homedir(), base = canonicalizeJailPath(projectDir)
   const paths = new Set<string>(), links = new Map<string, string>(), owners = new Set<string>()
@@ -329,14 +274,7 @@ function tryReaddir(dir: string): string[] {
   }
 }
 
-/**
- * Reject a toolchain read-bind that would defeat the jail: the filesystem root,
- * the shared `/home`, the operator HOME itself, or any path that is the
- * workspace or an ANCESTOR of it. The ancestor check is the load-bearing one —
- * binding an ancestor read-only (e.g. `/tmp` when the workspace is a
- * `/tmp/vb-live-<id>/ws` scratch dir) would re-expose the workspace's siblings,
- * which is exactly the leak the fs-jail closes.
- */
+/** Refuse `/`, `/home`, the operator home, and any ancestor of the workspace. */
 export function isSafeReadPath(p: string, home: string, base: string): boolean {
   if (!isAbsolute(p) || p === '/home') return false
   return [home, base].every((denied) => {
@@ -384,12 +322,6 @@ function onPath(bin: string): boolean {
 }
 
 let probed: boolean | undefined
-/**
- * Whether bwrap can actually create its namespaces on this host. Probed
- * once (a ~tens-of-ms `bwrap ... true`) and cached, because the answer is
- * a host property, not per-request — and the failure mode (restricted
- * unprivileged userns, non-setuid bwrap) is a static host config.
- */
 function canRunUnprivileged(): boolean {
   if (probed !== undefined) return probed
   try {

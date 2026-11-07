@@ -104,6 +104,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     BRIDGE_JAIL_RO_PATHS: config.jailReadablePaths.join(','),
     BRIDGE_JAIL_RW_PATHS: config.jailWritablePaths.join(','),
     BRIDGE_JAIL_FALLBACK: config.jailFallback,
+    ...(config.jailNetwork ? { BRIDGE_JAIL_NETWORK: config.jailNetwork } : {}),
   }
   // Register enabled native harnesses before remote execution.
   for (const [name, harness] of localHarnesses) {
