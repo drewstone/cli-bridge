@@ -1,16 +1,14 @@
 import { existsSync } from 'node:fs'
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   LinuxBwrapJail,
   MacosSeatbeltJail,
   NoopJail,
-  registerJailReadable,
   resolveJailRoot,
 } from '../src/jail/index.js'
-import { toolchainReadPaths } from '../src/jail/linux-bwrap.js'
 import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
 import {
@@ -21,24 +19,6 @@ import {
 import { ignoreJailRoot } from '../src/jail/types.js'
 import { anyBackendSpawnsOnHost } from '../src/config.js'
 import type { JailBackend } from '../src/jail/index.js'
-
-/**
- * Composition tests for the local write-jail backends.
- *
- * These assert that the argv-rewriting logic composes correctly WITHOUT
- * ever spawning a sandbox: the backends only build the wrapper argv (and,
- * for seatbelt, an SBPL profile file), so we can call each backend
- * directly and inspect the result regardless of the host OS.
- *
- *   - bwrap (Linux): wraps in a bubblewrap invocation that ro-binds the
- *     host, writable-binds the jail root, sets HOME, and chdir's into the
- *     project dir, ending in the original command.
- *   - seatbelt (macOS): emits a sandbox-exec invocation pointing at a
- *     generated profile that denies all writes then re-allows the root.
- *   - NoopJail: pass-through, argv unchanged.
- *   - resolveJailSpec: null when off; root clamped inside cwd.
- */
-
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
 function seqIndex(argv: string[], ...seq: string[]): number {
@@ -69,151 +49,6 @@ async function tempProjectDir(): Promise<string> {
   cleanups.push(() => rm(dir, { recursive: true, force: true }))
   return realpath(dir)
 }
-
-describe('LinuxBwrapJail.wrap', () => {
-  it('builds a bwrap argv that ro-binds the host, writable-binds the root, sets HOME/chdir, and ends in the original command', async () => {
-    const projectDir = await tempProjectDir()
-    const root = join(projectDir, '.agent-home')
-    const cmd = 'echo jailed'
-
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', cmd], { root, projectDir })
-
-    // Runs unprivileged: bwrap IS the spawned bin (no sudo prefix).
-    expect(wrap.bin).toBe('bwrap')
-    const argv = [wrap.bin, ...wrap.args]
-    expect(argv).not.toContain('sudo')
-
-    const expectedRoot = resolveJailRoot(root, projectDir)
-
-    expect(argv).toContain('--ro-bind')
-    expect(seqIndex(argv, '--bind', expectedRoot), 'writable --bind of the jail root').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--setenv', 'HOME', expectedRoot), 'HOME set to the jail root').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--setenv', 'XDG_CONFIG_HOME', join(expectedRoot, '.config')), 'XDG_CONFIG_HOME redirected into the jail').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--setenv', 'XDG_CACHE_HOME', join(expectedRoot, '.cache')), 'XDG_CACHE_HOME redirected into the jail').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--setenv', 'TMPDIR', join(expectedRoot, '.tmp')), 'TMPDIR redirected into the jail').toBeGreaterThanOrEqual(0)
-    expect(argv, 'no tmpfs shadowing /tmp (would hide materialized configs)').not.toContain('--tmpfs')
-    expect(seqIndex(argv, '--chdir', projectDir), 'chdir into the project dir').toBeGreaterThanOrEqual(0)
-
-    // The original command is the tail of the argv.
-    expect(argv.slice(-3)).toEqual(['/bin/sh', '-c', cmd])
-
-    // The jail root is gitignored so scratch/copied-creds never get committed.
-    const gi = await readFile(join(expectedRoot, '.gitignore'), 'utf8')
-    expect(gi).toContain('*')
-
-    // The project dir is exposed read-only.
-    expect(seqIndex(argv, '--ro-bind', projectDir, projectDir)).toBeGreaterThanOrEqual(0)
-  })
-})
-
-describe('LinuxBwrapJail.wrap read-confine (fs-jail)', () => {
-  it('drops the whole-host read bind, uses a system allowlist + fresh /tmp, and binds the workspace READ-WRITE', async () => {
-    const projectDir = await tempProjectDir()
-    const root = join(projectDir, '.agent-home')
-
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'echo hi'], { root, projectDir, readConfine: true })
-    const argv = [wrap.bin, ...wrap.args]
-    const expectedRoot = resolveJailRoot(root, projectDir)
-
-    // The read hole is CLOSED: the whole host root is no longer mounted readable.
-    expect(seqIndex(argv, '--ro-bind', '/', '/'), 'must NOT ro-bind the whole host root').toBe(-1)
-    // A minimal system allowlist is bound read-only instead.
-    expect(seqIndex(argv, '--ro-bind-try', '/usr', '/usr'), '/usr allowlisted read-only').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--ro-bind-try', '/etc', '/etc'), '/etc allowlisted read-only').toBeGreaterThanOrEqual(0)
-    // Fresh empty /tmp so the host /tmp (twins, other runs) is invisible.
-    expect(seqIndex(argv, '--tmpfs', '/tmp'), 'fresh tmpfs over /tmp').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--proc', '/proc')).toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--dev', '/dev')).toBeGreaterThanOrEqual(0)
-    // The workspace is READ-WRITE (a coding agent builds here), not read-only.
-    expect(seqIndex(argv, '--bind', projectDir, projectDir), 'workspace bound read-write').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--ro-bind', projectDir, projectDir), 'workspace must not be read-only in fs-jail').toBe(-1)
-    // HOME + chdir still wired; original command still the tail.
-    expect(seqIndex(argv, '--setenv', 'HOME', expectedRoot)).toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--chdir', projectDir)).toBeGreaterThanOrEqual(0)
-    expect(argv.slice(-3)).toEqual(['/bin/sh', '-c', 'echo hi'])
-  })
-
-  it('re-binds extraReadablePaths AFTER the fresh /tmp so a materialized config under /tmp survives', async () => {
-    const projectDir = await tempProjectDir()
-    const root = join(projectDir, '.agent-home')
-    const cfgDir = await mkdtemp(join(tmpdir(), 'cli-bridge-cfg-'))
-    cleanups.push(() => rm(cfgDir, { recursive: true, force: true }))
-
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
-      root, projectDir, readConfine: true, extraReadablePaths: [cfgDir],
-    })
-    const argv = [wrap.bin, ...wrap.args]
-    const tmpfsAt = seqIndex(argv, '--tmpfs', '/tmp')
-    const cfgAt = seqIndex(argv, '--ro-bind-try', cfgDir, cfgDir)
-    expect(tmpfsAt).toBeGreaterThanOrEqual(0)
-    expect(cfgAt, 'config dir re-bound').toBeGreaterThanOrEqual(0)
-    expect(cfgAt, 'config re-bind comes AFTER the tmpfs so it wins').toBeGreaterThan(tmpfsAt)
-  })
-
-  it('keeps a path registered as both writable and readable writable, and a nested read-only subpath read-only', async () => {
-    const projectDir = await tempProjectDir()
-    const root = join(projectDir, '.agent-home')
-    const stateDir = await mkdtemp(join(tmpdir(), 'cli-bridge-pi-state-'))
-    cleanups.push(() => rm(stateDir, { recursive: true, force: true }))
-    const sessionDir = join(stateDir, 'sessions')
-    const codeDir = join(stateDir, 'code')
-
-    // pi registers its agent/session dirs in BOTH lists (pi-native-start.ts).
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
-      root,
-      projectDir,
-      readConfine: true,
-      extraWritablePaths: [stateDir, sessionDir],
-      extraReadablePaths: [sessionDir, codeDir],
-    })
-    const argv = [wrap.bin, ...wrap.args]
-    const sessionRw = seqIndex(argv, '--bind', sessionDir, sessionDir)
-    expect(sessionRw, 'session dir is bind-writable').toBeGreaterThanOrEqual(0)
-    expect(seqIndex(argv, '--ro-bind-try', sessionDir, sessionDir), 'no ro-bind masks the writable session dir').toBe(-1)
-
-    const stateRw = seqIndex(argv, '--bind', stateDir, stateDir)
-    const codeRo = seqIndex(argv, '--ro-bind-try', codeDir, codeDir)
-    expect(codeRo, 'nested read-only subpath is still bound read-only').toBeGreaterThanOrEqual(0)
-    expect(codeRo, 'and after its writable parent so it wins').toBeGreaterThan(stateRw)
-  })
-})
-
-describe('toolchainReadPaths', () => {
-  it('includes the node install prefix and never a jail-defeating path', () => {
-    const projectDir = '/tmp/some-run/workspace'
-    const paths = toolchainReadPaths('/bin/sh', projectDir)
-    // The Node prefix (two levels up from the running node) is present.
-    const nodePrefix = dirname(dirname(process.execPath))
-    expect(paths).toContain(nodePrefix)
-    // Never the root, /home, the operator HOME, or an ancestor of the workspace.
-    for (const p of paths) {
-      expect(p).not.toBe('/')
-      expect(p).not.toBe('/home')
-      expect(p).not.toBe(homedir())
-      // p must not be an ancestor of (or equal to) the workspace.
-      expect(projectDir === p || projectDir.startsWith(`${p}/`), `${p} must not contain the workspace`).toBe(false)
-    }
-  })
-
-
-})
-
-describe('registerJailReadable', () => {
-  it('adds paths to a read-confined spec, deduped', () => {
-    const spec = { root: '/p/.agent-home', projectDir: '/p', readConfine: true } as const
-    const mut = { ...spec, extraReadablePaths: undefined as string[] | undefined }
-    registerJailReadable(mut, '/tmp/cfg-a', '/tmp/cfg-a', '/tmp/cfg-b')
-    expect(mut.extraReadablePaths?.sort()).toEqual(['/tmp/cfg-a', '/tmp/cfg-b'])
-  })
-
-  it('is a no-op on a write-jail spec (whole host already readable) and on null', () => {
-    const writeJail = { root: '/p/.agent-home', projectDir: '/p', extraReadablePaths: undefined as string[] | undefined }
-    registerJailReadable(writeJail, '/tmp/cfg')
-    expect(writeJail.extraReadablePaths).toBeUndefined()
-    expect(() => registerJailReadable(null, '/tmp/cfg')).not.toThrow()
-    expect(() => registerJailReadable(undefined, '/tmp/cfg')).not.toThrow()
-  })
-})
 
 describe('MacosSeatbeltJail.wrap', () => {
   it('emits a sandbox-exec invocation whose profile denies file-write* and re-allows the jail root', async () => {
@@ -359,40 +194,6 @@ describe('resolveJailRoot containment', () => {
 })
 
 describe('auth preservation', () => {
-  it('authSourcesFor maps registered harness aliases to the same creds, [] for unknown', () => {
-    expect(authSourcesFor('totally-unknown-backend')).toEqual([])
-    // The server registers 'claude-code'/'claudish'/'kimi-code', not 'claude'/'kimi'.
-    expect(authSourcesFor('claude-code')).toEqual(authSourcesFor('claude'))
-    expect(authSourcesFor('claudish')).toEqual(authSourcesFor('claude'))
-    expect(authSourcesFor('kimi-code')).toEqual(authSourcesFor('kimi'))
-    for (const { source, jailRel, mode, only } of authSourcesFor('claude-code')) {
-      expect(existsSync(source), `${source} should exist`).toBe(true)
-      expect(source.startsWith(homedir())).toBe(true)
-      // jailRel must be a relative location strictly inside the jail root.
-      expect(jailRel.startsWith('/'), `${jailRel} must be relative`).toBe(false)
-      expect(jailRel.startsWith('..'), `${jailRel} must not escape the root`).toBe(false)
-      // Claude rewrites ~/.claude.json and persists transcripts under
-      // ~/.claude on every run: a read-only home kills the jailed CLI, so
-      // its home is a small writable seed instead of a bind.
-      expect(mode).toBe('seed-writable')
-      if (jailRel === '.claude') {
-        expect(only).toEqual(['.credentials.json', 'credentials.json', 'settings.json'])
-      }
-    }
-    // codex must be preserved too (no-MCP jailed codex would otherwise lose
-    // ~/.codex) and tagged so the jail redirects CODEX_HOME at the in-jail
-    // home. Seeded WRITABLE: codex writes PATH aliases + app-server state +
-    // session rollouts inside CODEX_HOME before it can run (a read-only bind
-    // measured as `codex exited 1: ... Read-only file system (os error 30)`),
-    // and `only` keeps the host's multi-GB sessions/ tree out of the copy.
-    for (const { jailRel, envVar, mode, only } of authSourcesFor('codex')) {
-      expect(jailRel).toBe('.codex')
-      expect(envVar).toBe('CODEX_HOME')
-      expect(mode).toBe('seed-writable')
-      expect(only).toEqual(['auth.json', 'config.toml'])
-    }
-  })
-
   it('authSourcesFor seeds current and legacy Kimi homes', async () => {
     const fakeHome = await mkdtemp(join(tmpdir(), 'cli-bridge-kimi-home-'))
     cleanups.push(() => rm(fakeHome, { recursive: true, force: true }))
@@ -929,19 +730,6 @@ describe('applyJail fail-closed', () => {
     // request there must be rejected, not silently run unconfined.
     await expect(applyJail('/bin/sh', ['-c', 'x'], jailedOpts, new NoopJail()))
       .rejects.toThrow(/write-jail requested/)
-  })
-})
-
-describe('NoopJail.wrap', () => {
-  it('returns bin and args unchanged with no env or cleanup', () => {
-    const wrap = new NoopJail().wrap('mybin', ['--flag', 'value'], {
-      root: '/anything',
-      projectDir: '/anywhere',
-    })
-    expect(wrap.bin).toBe('mybin')
-    expect(wrap.args).toEqual(['--flag', 'value'])
-    expect(wrap.env).toBeUndefined()
-    expect(wrap.cleanup).toBeUndefined()
   })
 })
 

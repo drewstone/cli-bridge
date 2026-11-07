@@ -48,7 +48,7 @@ import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
-import { authSourcesFor, gitConfigSources } from '../jail/auth-preserve.js'
+import { authSourcesFor } from '../jail/auth-preserve.js'
 import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionSlot } from '../admission.js'
 import {
   type Run,
@@ -1026,7 +1026,7 @@ export function mountChatCompletions(
         })
         // Preserve this backend's host credentials inside the jail so the
         // confined CLI still authenticates as the operator.
-        if (req.jailSpec) req.jailSpec.authSources = [...authSourcesFor(backend.name), ...gitConfigSources()]
+        if (req.jailSpec) req.jailSpec.authSources = authSourcesFor(backend.name)
         // The lane rides on the request so the scoped-host executor honours the
         // same reservation. Set even when this bridge has no admission gate:
         // the executor semaphore exists either way.
