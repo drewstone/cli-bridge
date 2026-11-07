@@ -215,8 +215,8 @@ export async function gitConfigSources(cwd = process.cwd(), writablePaths: reado
   }
   for (const [file] of roots) visit(file)
   const writable = [cwd, ...writablePaths].map(canonicalizeJailPath)
-  const parent = [tmpdir(), '/tmp', join(home, '.cache')].find((path) => writable.every((root) => {
-    const rel = relative(root, canonicalizeJailPath(path))
+  const parent = [tmpdir(), '/tmp', join(home, '.cache')].map(canonicalizeJailPath).find((path) => writable.every((root) => {
+    const rel = relative(root, path)
     return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)
   }))
   if (!parent) throw new Error('Git configuration snapshots need storage outside the writable jail; configure TMPDIR outside its writable paths')

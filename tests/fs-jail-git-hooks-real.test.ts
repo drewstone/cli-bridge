@@ -11,7 +11,7 @@ const base = realpathSync(mkdtempSync(join(tmpdir(), 'fs-jail-git-hooks-')))
 afterAll(() => rmSync(base, { recursive: true, force: true }))
 
 describe('Git hooks under the fs-jail', () => {
-  it.skipIf(!enabled).each(['default', 'override', 'symlink', 'tilde', 'xdg', 'escape', 'conditional', 'onbranch', 'relative', 'workspace-tmp', 'writable-tmp', 'alias-tmp'])('%s global hooks enforce commits without opening the owner checkout', async (kind) => {
+  it.skipIf(!enabled).each(['default', 'override', 'symlink', 'tilde', 'xdg', 'escape', 'conditional', 'onbranch', 'relative', 'workspace-tmp', 'writable-tmp', 'alias-tmp', 'outbound-tmp'])('%s global hooks enforce commits without opening the owner checkout', async (kind) => {
     const root = join(base, kind), home = join(root, 'home'), tools = join(root, 'tools'), project = join(kind === 'conditional' ? home : root, 'project')
     for (const dir of [join(home, '.config/privacy'), join(tools, 'git/hooks'), join(tools, 'bin'), project]) mkdirSync(dir, { recursive: true })
     const script = (path: string, body: string) => { writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755) }
@@ -39,8 +39,9 @@ describe('Git hooks under the fs-jail', () => {
     writeFileSync(join(project, 'a.txt'), 'allowed\n'); expect(host('add', 'a.txt').status).toBe(0)
     const temporary = join(['workspace-tmp', 'alias-tmp'].includes(kind) ? project : root, 'operator-tmp'); mkdirSync(temporary)
     if (kind === 'alias-tmp') symlinkSync(temporary, join(home, 'tmp-alias'), 'dir')
+    if (kind === 'outbound-tmp') symlinkSync(temporary, join(project, 'tmp-alias'), 'dir')
     const saved = Object.fromEntries(['TMPDIR', 'HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_PRIVACY_DENYLIST'].map((key) => [key, process.env[key]]))
-    if (kind.endsWith('-tmp')) process.env.TMPDIR = kind === 'alias-tmp' ? join(home, 'tmp-alias') : temporary
+    if (kind.endsWith('-tmp')) process.env.TMPDIR = kind === 'alias-tmp' ? join(home, 'tmp-alias') : kind === 'outbound-tmp' ? join(project, 'tmp-alias') : temporary
     process.env.HOME = home
     if (kind === 'xdg') process.env.XDG_CONFIG_HOME = xdg
     else delete process.env.XDG_CONFIG_HOME
@@ -51,7 +52,10 @@ describe('Git hooks under the fs-jail', () => {
       const run = async (bin: string, args: string[]) => {
         const wrap = await jail.wrap(bin, args, { root: join(project, '.agent-home'), projectDir: project, readConfine: true, ...(kind === 'writable-tmp' ? { extraWritablePaths: [temporary] } : {}) })
         const config = kind.endsWith('-tmp') ? wrap.args[wrap.args.findIndex((arg, i) => arg === '--ro-bind' && wrap.args[i + 2] === join(project, '.agent-home/.gitconfig')) + 1] : undefined
-        if (config) expect(existsSync(config)).toBe(true)
+        if (config) {
+          expect(existsSync(config)).toBe(true); expect(realpathSync(config)).toBe(config)
+          expect(config.startsWith(`${project}/`)).toBe(false)
+        }
         try { return spawnSync(wrap.bin, wrap.args, { env, encoding: 'utf8' }) } finally {
           await wrap.cleanup?.(); if (config) expect(existsSync(config)).toBe(false)
         }
