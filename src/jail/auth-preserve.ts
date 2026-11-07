@@ -173,7 +173,7 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
  * source and verifies the serialized entries; values never pass through a shell or argv. */
 export async function gitConfigSources(cwd = process.cwd()) {
   const home = backendHome(), xdg = process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config')
-  const roots = process.env.GIT_CONFIG_GLOBAL ? [[resolve(cwd, process.env.GIT_CONFIG_GLOBAL), '.gitconfig']] :
+  const roots: Array<[string, string]> = process.env.GIT_CONFIG_GLOBAL ? [[resolve(cwd, process.env.GIT_CONFIG_GLOBAL), '.gitconfig']] :
     [[join(home, '.gitconfig'), '.gitconfig'], [join(xdg, 'git/config'), '.config/git/config']]
   const repo = spawnSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
   const root = repo.status === 0 ? repo.stdout.trim() : cwd
