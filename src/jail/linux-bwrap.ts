@@ -26,11 +26,12 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs'
+import { accessSync, constants, existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   copyAuthIntoJail,
+  gitConfigSources,
   removeAuthCopies,
   removeStaleAuthCopies,
   seedAuthIntoJail,
@@ -75,10 +76,16 @@ export class LinuxBwrapJail implements JailBackend {
   }
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
+    const config = await gitConfigSources(spec.projectDir)
+    try { return await this.wrapWithGitConfig(bin, args, spec, config) }
+    catch (error) { await config.cleanup(); throw error }
+  }
+
+  private async wrapWithGitConfig(bin: string, args: string[], spec: JailSpec, config: Awaited<ReturnType<typeof gitConfigSources>>): Promise<JailWrap> {
     const root = resolveJailRoot(spec.root, spec.projectDir)
     await prepareJailHome(root)
     ignoreJailRoot(spec.projectDir, root)
-    const availableAuthSources = (spec.authSources ?? []).filter((source) =>
+    const availableAuthSources = [...(spec.authSources ?? []), ...config.sources].filter((source) =>
       existsSync(source.source),
     )
     const writableAuthSources = availableAuthSources.filter(
@@ -102,6 +109,7 @@ export class LinuxBwrapJail implements JailBackend {
     // file is admitted, never an extra /mnt or /run directory mount.
     const resolver = spec.readConfine ? tryRealpath('/etc/resolv.conf') : null
     if (resolver && !statSync(resolver).isFile()) throw new Error('DNS resolver is not a regular file')
+    const hooks = spec.readConfine ? gitHookReadPaths(spec.projectDir, config.hooks) : undefined
     await removeStaleAuthCopies(root)
     const copiedWritableAuth = await copyAuthIntoJail(
       root,
@@ -139,6 +147,8 @@ export class LinuxBwrapJail implements JailBackend {
       for (const path of toolchainReadPaths(bin, spec.projectDir)) {
         bwrapArgs.push('--ro-bind-try', path, path)
       }
+      for (const path of hooks!.paths) bwrapArgs.push('--ro-bind-try', path, path)
+      for (const [alias, target] of hooks!.links) bwrapArgs.push('--symlink', target, alias)
       bwrapArgs.push('--bind', spec.projectDir, spec.projectDir)
     } else {
       // write-jail: reads stay OPEN (whole host read-only), only writes are
@@ -191,6 +201,8 @@ export class LinuxBwrapJail implements JailBackend {
       if (envVar) bwrapArgs.push('--setenv', envVar, destination)
     }
 
+    for (const { source, destination } of config.binds) bwrapArgs.push('--ro-bind', source, destination)
+
     // Redirect HOME + XDG dirs into the jail so stateful CLIs write inside it.
     for (const [key, value] of Object.entries(jailEnv(root))) {
       bwrapArgs.push('--setenv', key, value)
@@ -209,9 +221,7 @@ export class LinuxBwrapJail implements JailBackend {
       ...(nativeHome
         ? { effectiveNativeStore: { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } }
         : {}),
-      ...(copiedWritableAuth.length > 0
-        ? { cleanup: () => removeAuthCopies(copiedWritableAuth) }
-        : {}),
+      cleanup: async () => { try { await removeAuthCopies(copiedWritableAuth) } finally { await config.cleanup() } },
     }
   }
 }
@@ -266,6 +276,57 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
     if (isSafeReadPath(p, home, base)) out.push(p)
   }
   return out
+}
+
+/** Hook directories are trusted explicitly; their owning checkout contributes only tracked
+ * files, never its Git metadata or untracked secrets. No shell dependency guessing: hooks may
+ * exec sibling tools, and external installs retain BRIDGE_JAIL_RO_PATHS as their owner. */
+function gitHookReadPaths(projectDir: string, candidates: string[]): { paths: string[]; links: Map<string, string> } {
+  const home = homedir(), base = canonicalizeJailPath(projectDir)
+  const paths = new Set<string>(), links = new Map<string, string>(), owners = new Set<string>()
+  const add = (path: string) => {
+    const target = tryRealpath(path)
+    if (!target || target === base || target.startsWith(`${base}${sep}`) || !isSafeReadPath(target, home, base) || !isSafeReadPath(path, home, base)) return
+    paths.add(target)
+    if (path !== target) links.set(path, target)
+  }
+  const configuredHook = git(projectDir, 'config', '--type=path', '--get', 'core.hooksPath')
+  for (const configured of [...candidates, ...(configuredHook ? [configuredHook] : [])]) {
+    const dir = configured ? tryRealpath(isAbsolute(configured) ? configured : resolve(git(projectDir, 'rev-parse', '--show-toplevel') ?? projectDir, configured)) : null
+    if (!dir || !configured) continue
+    if (!dir.startsWith(`${base}${sep}`) && dir !== base && !isSafeReadPath(dir, home, base)) throw new Error('Configured Git hooks directory would expose HOME or a workspace ancestor; use a dedicated hooks directory')
+    add(isAbsolute(configured) ? configured : dir)
+    for (const path of [dir, ...tryReaddir(dir).map((name) => join(dir, name))]) {
+      const target = tryRealpath(path)
+      if (!target) continue
+      add(path)
+      const owner = git(statSync(target).isDirectory() ? target : dirname(target), 'rev-parse', '--show-toplevel')
+      if (!owner || owners.has(owner)) continue
+      owners.add(owner)
+      for (const file of (git(owner, 'ls-files', '-z') ?? '').split('\0')) {
+        if (!file) continue
+        const tracked = join(owner, file), real = tryRealpath(tracked)
+        const rel = real && relative(owner, real)
+        if (real && rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel) && statSync(real).isFile()) add(tracked)
+      }
+    }
+  }
+  return { paths: [...paths], links }
+}
+
+/** One git query's trimmed stdout, or null when git fails or prints nothing. */
+function git(cwd: string, ...args: string[]): string | null {
+  const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
+  if (r.error || (args[0] === 'config' && r.status !== 0 && r.status !== 1)) throw new Error('Could not resolve Git hook read paths before confinement')
+  return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null
+}
+
+function tryReaddir(dir: string): string[] {
+  try {
+    return readdirSync(dir)
+  } catch {
+    return []
+  }
 }
 
 /**

@@ -13,10 +13,11 @@
  * what codex.ts already does for CODEX_HOME, generalized to every host CLI.
  */
 
+import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, cp, mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { chmod, cp, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { resolveJailRoot, type JailAuthSource } from './types.js'
 
@@ -165,6 +166,67 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     }
   }
   return out
+}
+
+/** Snapshot each global config source at its original path, preserving dynamic includes while
+ * translating paths whose meaning would change when HOME/XDG are redirected. Git parses every
+ * source and verifies the serialized entries; values never pass through a shell or argv. */
+export async function gitConfigSources(cwd = process.cwd()) {
+  const home = backendHome(), xdg = process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config')
+  const roots = process.env.GIT_CONFIG_GLOBAL ? [[resolve(cwd, process.env.GIT_CONFIG_GLOBAL), '.gitconfig']] :
+    [[join(home, '.gitconfig'), '.gitconfig'], [join(xdg, 'git/config'), '.config/git/config']]
+  const repo = spawnSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+  const root = repo.status === 0 ? repo.stdout.trim() : cwd
+  const prepared = new Map<string, string>(), hooks = new Set<string>()
+  const query = (file: string, ...args: string[]) => {
+    const result = spawnSync('git', ['config', '--file', file, '--no-includes', '--null', ...args], { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'ignore'] })
+    if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error('Could not prepare global Git configuration for confinement')
+    return result.stdout
+  }
+  const quote = (value: string) => `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(/\u0008/g, '\\b')}"`
+  const visit = (file: string) => {
+    if (prepared.has(file) || !existsSync(file)) return
+    prepared.set(file, '')
+    const typed = new Map<string, string[]>()
+    const entries = query(file, '--list').split('\0').filter(Boolean).map((entry) => {
+      const at = entry.indexOf('\n')
+      let key = at < 0 ? entry : entry.slice(0, at), value = at < 0 ? undefined : entry.slice(at + 1)
+      if (value !== undefined && (key === 'core.hookspath' || /^include(?:if\..*)?\.path$/i.test(key))) {
+        if (!typed.has(key)) typed.set(key, query(file, '--type=path', '--get-all', key).split('\0'))
+        value = typed.get(key)!.shift()!
+        if (key === 'core.hookspath') {
+          hooks.add(resolve(root, value))
+        } else {
+          value = resolve(dirname(file), value); visit(value)
+          key = key.replace(/^(includeif\.gitdir(?:\/i)?:)(~\/|\.\/)(.*)(\.path)$/i, (_m, prefix, base, pattern, tail) =>
+            `${prefix}${join(base === '~/' ? home : dirname(file), pattern)}${tail}`)
+        }
+      }
+      return { key, value }
+    })
+    const text = entries.map(({ key, value }) => {
+      const first = key.indexOf('.'), last = key.lastIndexOf('.')
+      return `[${key.slice(0, first)}${last === first ? '' : ` ${quote(key.slice(first + 1, last))}`}]\n${key.slice(last + 1)}${value === undefined ? '' : ` = ${quote(value)}`}\n`
+    }).join('')
+    const check = spawnSync('git', ['config', '--file', '-', '--no-includes', '--null', '--list'], { input: text, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] })
+    const expected = entries.map(({ key, value }) => `${key}${value === undefined ? '' : `\n${value}`}\0`).join('')
+    if (check.error || check.status !== 0 || check.stdout !== expected) throw new Error('Global Git configuration could not be preserved exactly')
+    prepared.set(file, text)
+  }
+  for (const [file] of roots) visit(file)
+  const directory = await mkdtemp(join(tmpdir(), 'cli-bridge-git-'))
+  const cleanup = () => rm(directory, { recursive: true, force: true })
+  const binds: Array<{ source: string; destination: string }> = [], sources: JailAuthSource[] = []
+  try {
+    for (const [destination, text] of prepared) {
+      const source = join(directory, String(binds.length))
+      await writeFile(source, text, { mode: 0o600 }); binds.push({ source, destination })
+      for (const [file, jailRel] of roots) if (file === destination) sources.push({ source, jailRel, mode: 'read-only' })
+    }
+    const privacy = process.env.GIT_PRIVACY_DENYLIST || join(home, '.config/privacy/denylist')
+    if (existsSync(privacy)) sources.push({ source: privacy, jailRel: '.config/privacy/denylist', mode: 'read-only', envVar: 'GIT_PRIVACY_DENYLIST' })
+    return { sources, binds, hooks: [...hooks], cleanup }
+  } catch (error) { await cleanup(); throw error }
 }
 
 /**
