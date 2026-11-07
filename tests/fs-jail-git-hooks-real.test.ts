@@ -1,6 +1,6 @@
 /** Real Git and bwrap: global hooks run, enforce privacy and remain read-only. */
 import { spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
@@ -11,7 +11,7 @@ const base = realpathSync(mkdtempSync(join(tmpdir(), 'fs-jail-git-hooks-')))
 afterAll(() => rmSync(base, { recursive: true, force: true }))
 
 describe('Git hooks under the fs-jail', () => {
-  it.skipIf(!enabled).each(['default', 'override', 'symlink', 'tilde', 'xdg', 'escape', 'conditional', 'onbranch', 'relative'])('%s global hooks enforce commits without opening the owner checkout', async (kind) => {
+  it.skipIf(!enabled).each(['default', 'override', 'symlink', 'tilde', 'xdg', 'escape', 'conditional', 'onbranch', 'relative', 'workspace-tmp', 'writable-tmp', 'alias-tmp', 'outbound-tmp'])('%s global hooks enforce commits without opening the owner checkout', async (kind) => {
     const root = join(base, kind), home = join(root, 'home'), tools = join(root, 'tools'), project = join(kind === 'conditional' ? home : root, 'project')
     for (const dir of [join(home, '.config/privacy'), join(tools, 'git/hooks'), join(tools, 'bin'), project]) mkdirSync(dir, { recursive: true })
     const script = (path: string, body: string) => { writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755) }
@@ -37,7 +37,11 @@ describe('Git hooks under the fs-jail', () => {
     writeFileSync(join(tools, 'untracked-secret'), 'hidden\n')
     expect(host('init', '-q').status).toBe(0)
     writeFileSync(join(project, 'a.txt'), 'allowed\n'); expect(host('add', 'a.txt').status).toBe(0)
-    const saved = Object.fromEntries(['HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_PRIVACY_DENYLIST'].map((key) => [key, process.env[key]]))
+    const temporary = join(['workspace-tmp', 'alias-tmp'].includes(kind) ? project : root, 'operator-tmp'); mkdirSync(temporary)
+    if (kind === 'alias-tmp') symlinkSync(temporary, join(home, 'tmp-alias'), 'dir')
+    if (kind === 'outbound-tmp') symlinkSync(temporary, join(project, 'tmp-alias'), 'dir')
+    const saved = Object.fromEntries(['TMPDIR', 'HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_PRIVACY_DENYLIST'].map((key) => [key, process.env[key]]))
+    if (kind.endsWith('-tmp')) process.env.TMPDIR = kind === 'alias-tmp' ? join(home, 'tmp-alias') : kind === 'outbound-tmp' ? join(project, 'tmp-alias') : temporary
     process.env.HOME = home
     if (kind === 'xdg') process.env.XDG_CONFIG_HOME = xdg
     else delete process.env.XDG_CONFIG_HOME
@@ -46,8 +50,15 @@ describe('Git hooks under the fs-jail', () => {
     else delete process.env.GIT_CONFIG_GLOBAL
     try {
       const run = async (bin: string, args: string[]) => {
-        const wrap = await jail.wrap(bin, args, { root: join(project, '.agent-home'), projectDir: project, readConfine: true })
-        try { return spawnSync(wrap.bin, wrap.args, { env, encoding: 'utf8' }) } finally { await wrap.cleanup?.() }
+        const wrap = await jail.wrap(bin, args, { root: join(project, '.agent-home'), projectDir: project, readConfine: true, ...(kind === 'writable-tmp' ? { extraWritablePaths: [temporary] } : {}) })
+        const config = kind.endsWith('-tmp') ? wrap.args[wrap.args.findIndex((arg, i) => arg === '--ro-bind' && wrap.args[i + 2] === join(project, '.agent-home/.gitconfig')) + 1] : undefined
+        if (config) {
+          expect(existsSync(config)).toBe(true); expect(realpathSync(config)).toBe(config)
+          expect(config.startsWith(`${project}/`)).toBe(false)
+        }
+        try { return spawnSync(wrap.bin, wrap.args, { env, encoding: 'utf8' }) } finally {
+          await wrap.cleanup?.(); if (config) expect(existsSync(config)).toBe(false)
+        }
       }
       const allowed = kind === 'onbranch' ? await run('sh', ['-c', 'git switch -c feature-hook && git commit -qm jailed']) : await run('git', ['commit', '-q', '-m', 'jailed'])
       expect(allowed.stderr).toContain('hook-tool-ran'); expect(allowed.status, allowed.stderr).toBe(0)
@@ -63,6 +74,7 @@ describe('Git hooks under the fs-jail', () => {
       for (const path of [join(home, 'private'), join(tools, 'untracked-secret'), join(tools, '.git/config')]) {
         expect((await run('test', ['-r', path])).status, path).not.toBe(0)
       }
+      if (kind.endsWith('-tmp')) expect((await run('sh', ['-c', 'test -z "$(find "$1" -type f -print -quit)"', 'sh', temporary])).status).toBe(0)
       const readonly = await run('sh', ['-c', 'echo corrupt >> "$1"', 'sh', join(tools, 'bin/check')])
       expect(readonly.status).not.toBe(0)
     } finally {

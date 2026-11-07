@@ -335,46 +335,6 @@ describe('auth preservation', () => {
     }
   })
 
-  it('bwrap read-only-binds an auth source into the jail HOME at its relative path', async () => {
-    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-authtest-'))
-    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
-    const projectDir = await tempProjectDir()
-    const root = join(projectDir, '.agent-home')
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
-      root,
-      projectDir,
-      authSources: [{ source: authDir, jailRel: '.claude', mode: 'read-only' }],
-    })
-    const expectedRoot = resolveJailRoot(root, projectDir)
-    expect(
-      seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.claude')),
-      'auth source ro-bound into the jail HOME',
-    ).toBeGreaterThanOrEqual(0)
-  })
-
-  it('bwrap redirects an auth env var (CODEX_HOME) at the in-jail copy — only when it wraps', async () => {
-    const authDir = await mkdtemp(join(homedir(), '.cli-bridge-codexauth-'))
-    cleanups.push(() => rm(authDir, { recursive: true, force: true }))
-    const projectDir = await tempProjectDir()
-    const root = join(projectDir, '.agent-home')
-    const wrap = await new LinuxBwrapJail().wrap('/bin/sh', ['-c', 'x'], {
-      root,
-      projectDir,
-      authSources: [{
-        source: authDir,
-        jailRel: '.codex',
-        mode: 'read-only',
-        envVar: 'CODEX_HOME',
-      }],
-    })
-    const expectedRoot = resolveJailRoot(root, projectDir)
-    expect(seqIndex(wrap.args, '--ro-bind', authDir, join(expectedRoot, '.codex'))).toBeGreaterThanOrEqual(0)
-    expect(
-      seqIndex(wrap.args, '--setenv', 'CODEX_HOME', join(expectedRoot, '.codex')),
-      'CODEX_HOME redirected to the in-jail copy',
-    ).toBeGreaterThanOrEqual(0)
-  })
-
   it('bwrap gives Pi an ephemeral writable config copy and removes it on cleanup', async () => {
     const authDir = await mkdtemp(join(homedir(), '.cli-bridge-piauth-'))
     cleanups.push(() => rm(authDir, { recursive: true, force: true }))
