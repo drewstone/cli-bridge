@@ -168,6 +168,21 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
 }
 
 /**
+ * Git's global config at the paths a jailed git reads (HOME and XDG_CONFIG_HOME
+ * point into the jail). Without it a confined commit has no identity and runs
+ * the repo's template hooks instead of the operator's `core.hooksPath`, whose
+ * directory {@link gitHookReadPaths} exposes. Read-only, every backend.
+ */
+export function gitConfigSources(): JailAuthSource[] {
+  const home = backendHome()
+  const config = process.env.GIT_CONFIG_GLOBAL?.trim() || join(home, '.gitconfig')
+  const xdg = join(process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config'), 'git')
+  return [[config, '.gitconfig'], [xdg, '.config/git']]
+    .filter(([source]) => existsSync(source))
+    .map(([source, jailRel]) => ({ source, jailRel, mode: 'read-only' as const }))
+}
+
+/**
  * Copy each auth source into the jail HOME at its $HOME-relative path. macOS
  * uses this for every source because sandbox-exec cannot bind-mount; Linux uses
  * it only for CLIs that lock their settings. Returns the copied destination

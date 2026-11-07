@@ -26,7 +26,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs'
+import { accessSync, constants, existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
@@ -254,7 +254,7 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
     }
   }
 
-  candidates.push(join(home, '.cache'))
+  candidates.push(join(home, '.cache'), ...gitHookReadPaths(projectDir))
 
   const base = canonicalizeJailPath(projectDir)
   const seen = new Set<string>()
@@ -266,6 +266,39 @@ export function toolchainReadPaths(bin: string, projectDir: string): string[] {
     if (isSafeReadPath(p, home, base)) out.push(p)
   }
   return out
+}
+
+/**
+ * The hooks a commit in the workspace runs, and what they exec. A jailed git
+ * reads the operator's config ({@link gitConfigSources}), so an absolute
+ * `core.hooksPath` outside the workspace names hooks the fs-jail would hide and
+ * every commit fails. Expose the hooks directory widened to the git work tree
+ * that owns it: hooks resolve their tooling relative to themselves (`$(dirname
+ * "$0")/../../bin/...`), and the owning checkout bounds that set without parsing
+ * scripts. A hook symlinked in from elsewhere adds its target's tree the same
+ * way. Workspace hooks (`.git/hooks`, husky's `.husky/_`) are already readable.
+ */
+function gitHookReadPaths(projectDir: string): string[] {
+  const configured = git(projectDir, 'config', '--type=path', '--get', 'core.hooksPath')
+  const dir = configured && isAbsolute(configured) ? tryRealpath(configured) : null
+  if (!dir) return []
+  const owner = (path: string) => [tryRealpath(git(path, 'rev-parse', '--show-toplevel') ?? path) ?? path, path]
+  const targets = tryReaddir(dir).map((name) => tryRealpath(join(dir, name)))
+  return [...owner(dir), ...targets.flatMap((t) => (t && dirname(t) !== dir ? owner(dirname(t)) : []))]
+}
+
+/** One git query's trimmed stdout, or null when git fails or prints nothing. */
+function git(cwd: string, ...args: string[]): string | null {
+  const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] })
+  return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null
+}
+
+function tryReaddir(dir: string): string[] {
+  try {
+    return readdirSync(dir)
+  } catch {
+    return []
+  }
 }
 
 /**
