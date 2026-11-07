@@ -19,7 +19,7 @@ import { existsSync } from 'node:fs'
 import { chmod, cp, mkdir, mkdtemp, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { resolveJailRoot, type JailAuthSource } from './types.js'
+import { canonicalizeJailPath, resolveJailRoot, type JailAuthSource } from './types.js'
 
 const PI_AUTH_COPY_PREFIX = `pi-${process.pid}-`
 
@@ -171,7 +171,7 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
 /** Snapshot each global config source at its original path, preserving dynamic includes while
  * translating paths whose meaning would change when HOME/XDG are redirected. Git parses every
  * source and verifies the serialized entries; values never pass through a shell or argv. */
-export async function gitConfigSources(cwd = process.cwd()) {
+export async function gitConfigSources(cwd = process.cwd(), writablePaths: readonly string[] = []) {
   const home = backendHome(), xdg = process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config')
   const roots: Array<[string, string]> = process.env.GIT_CONFIG_GLOBAL ? [[resolve(cwd, process.env.GIT_CONFIG_GLOBAL), '.gitconfig']] :
     [[join(home, '.gitconfig'), '.gitconfig'], [join(xdg, 'git/config'), '.config/git/config']]
@@ -214,7 +214,14 @@ export async function gitConfigSources(cwd = process.cwd()) {
     prepared.set(file, text)
   }
   for (const [file] of roots) visit(file)
-  const directory = await mkdtemp(join(tmpdir(), 'cli-bridge-git-'))
+  const writable = [cwd, ...writablePaths].map(canonicalizeJailPath)
+  const parent = [tmpdir(), '/tmp', join(home, '.cache')].find((path) => writable.every((root) => {
+    const rel = relative(root, canonicalizeJailPath(path))
+    return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)
+  }))
+  if (!parent) throw new Error('Git configuration snapshots need storage outside the writable jail; configure TMPDIR outside its writable paths')
+  await mkdir(parent, { recursive: true })
+  const directory = await mkdtemp(join(parent, 'cli-bridge-git-'))
   const cleanup = () => rm(directory, { recursive: true, force: true })
   const binds: Array<{ source: string; destination: string }> = [], sources: JailAuthSource[] = []
   try {

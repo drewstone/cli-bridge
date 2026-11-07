@@ -76,7 +76,7 @@ export class LinuxBwrapJail implements JailBackend {
   }
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
-    const config = await gitConfigSources(spec.projectDir)
+    const config = await gitConfigSources(spec.projectDir, spec.extraWritablePaths)
     try { return await this.wrapWithGitConfig(bin, args, spec, config) }
     catch (error) { await config.cleanup(); throw error }
   }
