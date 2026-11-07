@@ -24,7 +24,7 @@ release; bump it whenever the `systemPrompt` or `instructions` change.
 
 | id | purpose |
 |---|---|
-| `vb-reviewer` | VerticalBench shot reviewer — a resumable sonnet-4-6 agent with read-only permissions that watches a coding agent across N shots and emits the next-shot instruction. DSPy-RLM optimizes this profile's `prompt.systemPrompt` / `prompt.instructions`; model + tools + resources stay fixed so the gradient signal is isolated to reasoning policy. |
+| `vb-reviewer` | VerticalBench shot reviewer — a resumable `claude-opus-5-5` agent with read-only permissions that watches a coding agent across N shots and emits the next-shot instruction. DSPy-RLM optimizes this profile's `prompt.systemPrompt` / `prompt.instructions`; model + tools + resources stay fixed so the gradient signal is isolated to reasoning policy. |
 
 ## Adding a profile
 
