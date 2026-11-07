@@ -11,7 +11,7 @@ const base = realpathSync(mkdtempSync(join(tmpdir(), 'fs-jail-git-hooks-')))
 afterAll(() => rmSync(base, { recursive: true, force: true }))
 
 describe('Git hooks under the fs-jail', () => {
-  it.skipIf(!enabled).each(['default', 'override', 'symlink', 'tilde', 'xdg', 'escape', 'conditional', 'onbranch'])('%s global hooks enforce commits without opening the owner checkout', async (kind) => {
+  it.skipIf(!enabled).each(['default', 'override', 'symlink', 'tilde', 'xdg', 'escape', 'conditional', 'onbranch', 'relative'])('%s global hooks enforce commits without opening the owner checkout', async (kind) => {
     const root = join(base, kind), home = join(root, 'home'), tools = join(root, 'tools'), project = join(kind === 'conditional' ? home : root, 'project')
     for (const dir of [join(home, '.config/privacy'), join(tools, 'git/hooks'), join(tools, 'bin'), project]) mkdirSync(dir, { recursive: true })
     const script = (path: string, body: string) => { writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755) }
@@ -23,9 +23,13 @@ describe('Git hooks under the fs-jail', () => {
     const config = kind === 'override' ? join(root, 'custom-gitconfig') : kind === 'xdg' ? join(xdg, 'git/config') : join(home, '.gitconfig')
     // The hooks path comes from a relative include, as in common split global configurations.
     writeFileSync(config, `[user]\n name = Jail Test\n email = jail@example.test\n${kind === 'conditional' ? '[includeIf "gitdir:~/project/"]' : kind === 'onbranch' ? '[includeIf "onbranch:feature-hook"]' : '[include]'}\n path = ${kind === 'escape' ? '../' : ''}${kind === 'override' ? 'home/' : ''}hooks-config\n`)
-    writeFileSync(kind === 'escape' ? join(root, 'hooks-config') : kind === 'xdg' ? join(xdg, 'git/hooks-config') : join(home, 'hooks-config'), `[core]\n hooksPath = ${kind === 'tilde' ? '~/hook-alias' : hooks}\n`)
+    writeFileSync(kind === 'escape' ? join(root, 'hooks-config') : kind === 'xdg' ? join(xdg, 'git/hooks-config') : join(home, 'hooks-config'), `[core]\n hooksPath = ${kind === 'tilde' ? '~/hook-alias' : kind === 'relative' ? '.hooks' : hooks}\n`)
     writeFileSync(join(home, '.config/privacy/denylist'), 'blocked-fixture\n')
     writeFileSync(join(home, 'private'), 'hidden\n')
+    if (kind === 'relative') for (const prefix of ['', 'nested/']) {
+      mkdirSync(join(project, prefix, '.hooks'), { recursive: true })
+      script(join(project, prefix, '.hooks/pre-commit'), `${prefix ? 'echo nested-hook-ran >&2;' : ''} if grep -qx "$(git show :a.txt)" "$GIT_PRIVACY_DENYLIST"; then echo privacy-denied >&2; exit 1; fi; echo hook-tool-ran >&2`)
+    }
     const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, ...(kind === 'override' ? { GIT_CONFIG_GLOBAL: config } : {}), ...(kind === 'xdg' ? { XDG_CONFIG_HOME: xdg } : {}) }
     const host = (...args: string[]) => spawnSync('git', ['-C', project, ...args], { env, encoding: 'utf8' })
     expect(spawnSync('git', ['init', '-q', tools], { env }).status).toBe(0)
@@ -48,6 +52,10 @@ describe('Git hooks under the fs-jail', () => {
       const allowed = kind === 'onbranch' ? await run('sh', ['-c', 'git switch -c feature-hook && git commit -qm jailed']) : await run('git', ['commit', '-q', '-m', 'jailed'])
       expect(allowed.stderr).toContain('hook-tool-ran'); expect(allowed.status, allowed.stderr).toBe(0)
       expect(host('log', '-1', '--format=%an <%ae> %s').stdout.trim()).toBe('Jail Test <jail@example.test> jailed')
+      if (kind === 'relative') {
+        const nested = await run('sh', ['-c', 'git -C nested init -q && echo allowed > nested/a.txt && git -C nested add a.txt && git -C nested commit -qm nested-jailed'])
+        expect(nested.stderr).toContain('nested-hook-ran'); expect(nested.status, nested.stderr).toBe(0)
+      }
       writeFileSync(join(project, 'a.txt'), 'blocked-fixture\n'); expect(host('add', 'a.txt').status).toBe(0)
       const refused = await run('git', ['commit', '-q', '-m', 'must be refused'])
       expect(refused.stderr).toContain('privacy-denied'); expect(refused.status).not.toBe(0)

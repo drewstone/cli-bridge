@@ -195,7 +195,7 @@ export async function gitConfigSources(cwd = process.cwd()) {
         if (!typed.has(key)) typed.set(key, query(file, '--type=path', '--get-all', key).split('\0'))
         value = typed.get(key)!.shift()!
         if (key === 'core.hookspath') {
-          value = resolve(root, value); hooks.add(value)
+          hooks.add(resolve(root, value))
         } else {
           value = resolve(dirname(file), value); visit(value)
           key = key.replace(/^(includeif\.gitdir(?:\/i)?:)(~\/|\.\/)(.*)(\.path)$/i, (_m, prefix, base, pattern, tail) =>
