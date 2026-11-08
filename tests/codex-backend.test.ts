@@ -347,7 +347,7 @@ describe('CodexBackend plain Router mode', () => {
     const deltas = await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal))
     expect(deltas.find((d) => d.finish_reason)?.finish_reason).toBe('stop')
     expect(observed.args).toContain(
-      'model_providers.zai = { name = "Tangle Router", base_url = "http://127.0.0.9:9/v1", env_key = "TANGLE_API_KEY", wire_api = "chat", requires_openai_auth = false }',
+      'model_providers.zai = { name = "Tangle Router", base_url = "http://127.0.0.9:9/v1", env_key = "TANGLE_API_KEY", wire_api = "responses", requires_openai_auth = false }',
     )
     expect(observed.args).toContain('model_provider = "zai"')
     // The Router authorizes the full slug; a bare id answers 400 model_not_allowed.
