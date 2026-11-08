@@ -1,9 +1,10 @@
 {
   "name": "opencode-generalist",
+  "version": "1.1.0",
   "description": "Multi-provider balanced coding agent — full tools in the sandbox, model-agnostic so the caller can swap providers without re-writing the profile. Use when you want agent-ish behavior without committing to a specific vendor.",
   "tags": ["generalist", "multi-provider", "opencode", "balanced"],
   "model": {
-    "default": "anthropic/claude-sonnet-4-5",
+    "default": "anthropic/claude-opus-5-5",
     "small": "openai/gpt-4.1-mini",
     "provider": "opencode"
   },
