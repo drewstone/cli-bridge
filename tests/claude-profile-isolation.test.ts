@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -42,6 +42,8 @@ describe('Claude profiles in a shared task workspace', () => {
       const retained = session(root, cwd, root.profile_materialization_receipt)
       expect(provisionProfileWorkspace({ ...root }, retained, 'claude-code', cwd).workspacePlanDigest).toBe(first.workspacePlanDigest)
       expect(root.profile_materialization_receipt?.effectiveProfileDigest).not.toBe(child.profile_materialization_receipt?.effectiveProfileDigest)
+      // A skill the materializer recorded is replaced on re-apply (agent-profile-materialize 1.1.72); an edited one is refused.
+      writeFileSync(join(cwd, '.claude/skills/method/SKILL.md'), 'agent edit\n')
       expect(() => provisionProfileWorkspace(request('conflicting-child', 'CHILD', { Read: true }), null, 'claude-code', cwd)).toThrow(/Refusing to replace/u)
     } finally {
       rmSync(cwd, { recursive: true, force: true })
