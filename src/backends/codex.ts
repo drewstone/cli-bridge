@@ -178,8 +178,6 @@ export class CodexBackend implements Backend {
       'codex hosted-safe requires verified --sandbox read-only audit')
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
-    // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
-    const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
     // else `codex exec <prompt>`. --json emits JSONL events.
@@ -189,8 +187,13 @@ export class CodexBackend implements Backend {
       '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox',
     ]
-    if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
-    if (modelArg) args.push('-c', `model="${modelArg}"`)
+    const routerOverrides = plainRouterArgs(this.extractModel(req.model))
+    if (!routerOverrides) {
+      // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
+      const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+      if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
+      if (modelArg) args.push('-c', `model="${modelArg}"`)
+    }
     const reasoningEffort = nativeReasoningControl(
       'codex',
       resolveRequestedReasoningEffort(req, session),
@@ -214,6 +217,11 @@ export class CodexBackend implements Backend {
     const launchEnv = { ...process.env, ...provisioned.env }
     if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
     args.push(...provisioned.flags)
+    if (routerOverrides) {
+      // The Router owns the route: codex -c is last-wins, so the overrides go
+      // after the profile flags to outrank any plan-level model or provider set.
+      args.push(...routerOverrides)
+    }
     if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
     const nativeConfigFlags = codexConfigFlags(args)
     args.push('--', prompt)
@@ -520,6 +528,84 @@ export function splitCodexModel(
   const provider = slash > 0 ? remainder.slice(0, slash) : null
   const model = slash > 0 ? remainder.slice(slash + 1) : remainder
   return { provider, model: model.toLowerCase() === 'default' ? null : model }
+}
+
+/**
+ * Plain Router mode: route a provider-qualified model through the Tangle
+ * Router from env alone — no receipt headers, record directory or version
+ * gate. Gated by CODEX_TANGLE_ROUTER_URL alone, scoped to the codex backend
+ * so the images route's TANGLE_ROUTER_URL + TANGLE_API_KEY pair never
+ * force-enables it; when the gate is set, a missing or blank TANGLE_API_KEY
+ * throws rather than silently downgrading to the bare split, which would
+ * send the turn to api.openai.com. The key remains the provider table's
+ * env_key — one owner: the Router credential. Without the gate the argv
+ * stays byte-identical to the bare split. The spawn env spreads
+ * process.env, so codex reads the key itself, and
+ * `requires_openai_auth = false` keeps it from demanding OpenAI login state.
+ *
+ * The Router authorizes full slugs (`zai/glm-5.3`; a bare id answers
+ * 400 model_not_allowed), so the whole remainder after the harness prefix
+ * is the wire model and its first segment names the provider table. Unlike
+ * receipt mode the URL check is deliberately loose: a conformance suite
+ * points it at a loopback listener, so only the shape is enforced.
+ *
+ * The mode scopes to the chat/exec path only, by design: catalog probes and
+ * context transfer keep the legacy split.
+ */
+function plainRouterArgs(remainder: string | null): string[] | null {
+  const rawUrl = process.env.CODEX_TANGLE_ROUTER_URL?.trim()
+  if (!rawUrl) return null
+  if (!process.env.TANGLE_API_KEY?.trim()) {
+    throw new BackendError(
+      'CODEX_TANGLE_ROUTER_URL is set but TANGLE_API_KEY is missing or blank; ' +
+        'refusing to fall back to the bare split and send the turn to api.openai.com',
+      'not_configured',
+    )
+  }
+  let url: URL | undefined
+  try { url = new URL(rawUrl) } catch { url = undefined }
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')
+    || url.username || url.password || url.search || url.hash) {
+    throw new BackendError(
+      'CODEX_TANGLE_ROUTER_URL must be an absolute http(s) URL without userinfo, query or fragment',
+      'not_configured',
+    )
+  }
+  if (!remainder || !remainder.includes('/')) {
+    throw new BackendError(
+      'TANGLE Router mode requires a provider-qualified model (codex/<provider>/<model>)',
+      'not_configured',
+    )
+  }
+  const providerName = remainder.slice(0, remainder.indexOf('/'))
+  // The split path's rule holds here too: a leading `codex` segment names the
+  // harness, never a wire provider. The charset also keeps the segment a safe
+  // TOML bare key — it is interpolated into the provider-table override.
+  if (providerName === 'codex' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(providerName)) {
+    throw new BackendError(
+      `TANGLE Router mode requires a wire provider segment in the model route: ${remainder}`,
+      'not_configured',
+    )
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$/u.test(remainder)) {
+    throw new BackendError(
+      `TANGLE Router model route is not a valid Router slug: ${remainder}`,
+      'not_configured',
+    )
+  }
+  const text = (value: string): string => JSON.stringify(value)
+  const table = [
+    `name = ${text('Tangle Router')}`,
+    `base_url = ${text(rawUrl)}`,
+    'env_key = "TANGLE_API_KEY"',
+    'wire_api = "chat"',
+    'requires_openai_auth = false',
+  ].join(', ')
+  return [
+    '-c', `model_providers.${providerName} = { ${table} }`,
+    '-c', `model_provider = ${text(providerName)}`,
+    '-c', `model = ${text(remainder)}`,
+  ]
 }
 
 /**
