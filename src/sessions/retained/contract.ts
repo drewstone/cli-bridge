@@ -105,6 +105,22 @@ const envName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u).max(256)
 export const retainedEnvSchema = z.record(envName, boundedString)
   .refine((value) => Object.keys(value).length <= RETAINED_MAX_ENV_ENTRIES, 'environment has too many entries')
 
+/**
+ * agent-runtime's loopback coordination bearer. The value is a secret-ref
+ * payload for the coordination MCP header, not a caller-owned env name.
+ */
+export const RUNTIME_COORDINATION_ENV_NAME = 'AGENT_RUNTIME_COORDINATION_TOKEN'
+
+/** Drop the runtime coordination bearer before durable identity or session storage. */
+export function omitRuntimeCoordinationEnv(
+  env: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (env === undefined || !Object.hasOwn(env, RUNTIME_COORDINATION_ENV_NAME)) return env
+  const retained = { ...env }
+  delete retained[RUNTIME_COORDINATION_ENV_NAME]
+  return Object.keys(retained).length === 0 ? undefined : retained
+}
+
 export const retainedPublicRecordSchema = z.custom<Record<string, unknown>>(
   (value) => typeof value === 'object' && value !== null && !Array.isArray(value) && isBoundedJsonValue(value),
   { message: 'object exceeds retained request bounds' },
@@ -214,7 +230,7 @@ export function parseSafeRetainedEnv(value: unknown): Record<string, string> {
   if (!parsed.success) throw new Error('environment contains unsupported names or values')
   if (containsSecretShapedValue(parsed.data)) throw new Error('environment contains a credential-bearing value')
   for (const name of Object.keys(parsed.data)) {
-    if (isCredentialBearingProfileConfigName(name)) {
+    if (name !== RUNTIME_COORDINATION_ENV_NAME && isCredentialBearingProfileConfigName(name)) {
       throw new Error(`environment variable ${JSON.stringify(name)} is credential-bearing`)
     }
     if (isRetainedProcessControlEnvironmentName(name)) {

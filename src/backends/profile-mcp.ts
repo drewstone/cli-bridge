@@ -3,6 +3,7 @@ import {
   closeSync,
   constants as fsConstants,
   existsSync,
+  fchmodSync,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -23,6 +24,7 @@ import type {
 import type { ChatRequest, McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { RUNTIME_COORDINATION_ENV_NAME } from '../sessions/retained/contract.js'
 import { resolveAgentProfile, requireMaterializationCwd } from './profile-support.js'
 
 export function resolveMcpServers(
@@ -83,7 +85,12 @@ export function resolveMcpServers(
           'parse_error',
         )
       }
-      merged[name] = normalizeMcpServerSpec({ ...raw, type: raw.transport }, name, `runtime_attachments.mcp[${JSON.stringify(name)}]`)
+      merged[name] = normalizeMcpServerSpec(
+        { ...raw, type: raw.transport },
+        name,
+        `runtime_attachments.mcp[${JSON.stringify(name)}]`,
+        req.env ?? {},
+      )
     }
   }
 
@@ -102,6 +109,8 @@ export function resolveMcpServers(
  * resolve a reference with. So a reference is REFUSED here rather than resolved or rendered:
  * writing the reference object is nonsense to the harness, and writing a placeholder turns an auth
  * failure into what looks like a broken tool. The refusal names the reference KEY, never a value.
+ * The one exception is a runtime-attachment header whose secret-ref key is
+ * AGENT_RUNTIME_COORDINATION_TOKEN: that bearer is taken from the request env.
  *
  * `args` is refused for a second, stronger reason: those strings become the MCP server's argv,
  * which is readable by every process on the host (`/proc/<pid>/cmdline`) and lies outside every
@@ -133,16 +142,48 @@ function publicMcpConfigString(value: unknown, where: string): string {
   )
 }
 
+/**
+ * Resolve agent-runtime's coordination secret-ref from the request env.
+ *
+ * Returns undefined for every other value so the public-value refusal stays.
+ * An env argument means this channel may resolve that one name.
+ */
+function resolveRuntimeCoordinationHeader(
+  value: unknown,
+  where: string,
+  env: Record<string, string> | undefined,
+): string | undefined {
+  if (!value || typeof value !== 'object' || env === undefined) return undefined
+  const config = value as { kind?: unknown; key?: unknown; format?: unknown }
+  if (config.kind !== 'secret-ref' || config.key !== RUNTIME_COORDINATION_ENV_NAME) return undefined
+  if (config.format !== undefined && config.format !== 'bearer') {
+    throw new BackendError(
+      `AgentProfile ${where} secret-ref ${JSON.stringify(RUNTIME_COORDINATION_ENV_NAME)} must use bearer format`,
+      'parse_error',
+    )
+  }
+  const secret = env[RUNTIME_COORDINATION_ENV_NAME]
+  if (typeof secret !== 'string' || secret.length === 0 || /[\r\n\0]/u.test(secret)) {
+    throw new BackendError(
+      `AgentProfile ${where} secret-ref ${JSON.stringify(RUNTIME_COORDINATION_ENV_NAME)} is not in the request environment`,
+      'parse_error',
+    )
+  }
+  return `Bearer ${secret}`
+}
+
 /** Every entry of an MCP `env`/`headers` map as public strings. */
 function publicMcpConfigRecord(
   record: Record<string, AgentProfileConfigValue> | undefined,
   where: string,
+  env?: Record<string, string>,
 ): Record<string, string> {
   const out: Record<string, string> = {}
   if (!record || typeof record !== 'object') return out
   for (const [key, value] of Object.entries(record)) {
     if (value === undefined) continue
-    out[key] = publicMcpConfigString(value, `${where}[${JSON.stringify(key)}]`)
+    const place = `${where}[${JSON.stringify(key)}]`
+    out[key] = resolveRuntimeCoordinationHeader(value, place, env) ?? publicMcpConfigString(value, place)
   }
   return out
 }
@@ -151,6 +192,7 @@ function normalizeMcpServerSpec(
   raw: McpServerSpec | Record<string, unknown>,
   name: string,
   where = `mcp.mcpServers[${JSON.stringify(name)}]`,
+  env?: Record<string, string>,
 ): McpServerSpec {
   // Defensive copy — drop any unknown fields, coerce types loosely.
   const r = raw as Record<string, unknown>
@@ -172,6 +214,7 @@ function normalizeMcpServerSpec(
     out.headers = publicMcpConfigRecord(
       r.headers as Record<string, AgentProfileConfigValue>,
       `${where}.headers`,
+      env,
     )
   }
   if (typeof r.enabled === 'boolean') out.enabled = r.enabled
@@ -260,8 +303,55 @@ export function buildCanonicalMcpServers(
   return mcpServers
 }
 
+/** Private parent for per-run MCP config directories. Mode is reset after create so umask cannot widen it. */
+function privateConfigRoot(): string {
+  const root = join(tmpdir(), 'cli-bridge-private')
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  chmodSync(root, 0o700)
+  return root
+}
+
+/** One run's directory. A session id only labels it; the random suffix keeps runs apart. */
+function privateRunDir(kind: string, sessionId: string | undefined): string {
+  const label = (sessionId ?? 'run').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48) || 'run'
+  const dir = mkdtempSync(join(privateConfigRoot(), `${kind}-${label}-`))
+  chmodSync(dir, 0o700)
+  return dir
+}
+
+/** Write JSON that only the owner can read. `open` is umask-masked, so `fchmod` sets the mode that sticks. */
+function writePrivateJson(dir: string, name: string, value: unknown): string {
+  const configPath = join(dir, name)
+  const fd = openSync(
+    configPath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+    0o600,
+  )
+  try {
+    writeFileSync(fd, JSON.stringify(value, null, 2))
+    fchmodSync(fd, 0o600)
+  } finally {
+    closeSync(fd)
+  }
+  return configPath
+}
+
+function cleanupDir(dir: string): () => void {
+  let cleaned = false
+  return () => {
+    if (cleaned) return
+    cleaned = true
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // best-effort cleanup
+    }
+  }
+}
+
 export function writeMcpConfigFile(
   specs: Record<string, McpServerSpec> | null,
+  sessionId?: string,
 ): MaterializedMcpConfig | null {
   if (!specs) return null
   const mcpServers = buildCanonicalMcpServers(specs)
@@ -271,19 +361,17 @@ export function writeMcpConfigFile(
   }
   if (serverNames.length === 0) return null
 
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-mcp-'))
-  const configPath = join(dir, 'mcp-config.json')
-  writeFileSync(configPath, JSON.stringify({ mcpServers }, null, 2))
-  return {
-    configPath,
-    serverNames,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
+  const dir = privateRunDir('mcp', sessionId)
+  try {
+    const configPath = writePrivateJson(dir, 'mcp-config.json', { mcpServers })
+    return {
+      configPath,
+      serverNames,
+      cleanup: cleanupDir(dir),
+    }
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true })
+    throw error
   }
 }
 
@@ -717,6 +805,7 @@ export function materializeMcpServersForOpencode(
   specs: Record<string, McpServerSpec> | null,
   callerPermissions?: Record<string, unknown> | null,
   profileTools?: Record<string, boolean> | null,
+  sessionId?: string,
 ): MaterializedMcpConfig {
   const opencodeMcp: Record<string,
     | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
@@ -745,8 +834,7 @@ export function materializeMcpServersForOpencode(
   }
   const serverNames = Object.keys(opencodeMcp)
 
-  const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-opencode-'))
-  const configPath = join(dir, 'opencode.json')
+  const dir = privateRunDir('opencode', sessionId)
   // Headless benchmark and automation runs must never block on an
   // interactive permission prompt, so every tool defaults to `allow`.
   const headlessPermission: Record<string, 'allow' | 'ask' | 'deny'> = {
@@ -784,21 +872,21 @@ export function materializeMcpServersForOpencode(
       }
     }
   }
-  writeFileSync(configPath, JSON.stringify({
-    $schema: 'https://opencode.ai/config.json',
-    permission: headlessPermission,
-    mcp: opencodeMcp,
-  }, null, 2))
+  let configPath: string
+  try {
+    configPath = writePrivateJson(dir, 'opencode.json', {
+      $schema: 'https://opencode.ai/config.json',
+      permission: headlessPermission,
+      mcp: opencodeMcp,
+    })
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true })
+    throw error
+  }
   return {
     configPath,
     serverNames,
-    cleanup: () => {
-      try {
-        rmSync(dir, { recursive: true, force: true })
-      } catch {
-        // best-effort cleanup
-      }
-    },
+    cleanup: cleanupDir(dir),
   }
 }
 

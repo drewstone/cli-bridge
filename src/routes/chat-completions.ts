@@ -76,6 +76,7 @@ import {
   parseSafeCallerMetadata,
   parseSafeRetainedMcp,
   parseSafeRetainedEnv,
+  omitRuntimeCoordinationEnv,
   parseSafePublicRecord,
   retainedEnvSchema,
   retainedExecutionSchema,
@@ -1518,7 +1519,10 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
   const normalized = JSON.parse(JSON.stringify({
     schema: 'cli-bridge.durable-run-request.v1',
     backend,
-    request: executionRequest,
+    request: {
+      ...executionRequest,
+      env: omitRuntimeCoordinationEnv(executionRequest.env),
+    },
     ...(protectedModelCredential
       ? {
           protectedModelCredentialDigest: protectedModelCredential.digest,

@@ -310,7 +310,11 @@ export class ClaudeBackend implements Backend {
     // otherwise body/header MCP. `resolveMcpServers` refuses mixed channels.
     const mcpMaterialized = writeMcpConfigFile(
       resolveMcpServers(req, session),
+      req.session_id,
     )
+    // The file holds the coordination bearer. Every exit, including a throw
+    // while building argv and an abort before the process try, removes it.
+    try {
     // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
     // expose its dir read-only so the confined claude can still read the
     // `--mcp-config` path. Same idiom as kimi/opencode. Measured without it:
@@ -525,6 +529,9 @@ export class ClaudeBackend implements Backend {
       // this was `child.kill('SIGTERM')` which leaked grand-children.
       await terminateSpawned(spawned)
       releaseSpawner()
+      mcpMaterialized?.cleanup()
+    }
+    } finally {
       mcpMaterialized?.cleanup()
     }
   }

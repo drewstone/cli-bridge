@@ -148,6 +148,7 @@ export class OpencodeBackend implements Backend {
         resolveMcpServers(req, session),
         profileForControls?.permissions,
         profileForControls?.tools,
+        req.session_id,
       )
     } catch (error) {
       provisioned.cleanup?.()
