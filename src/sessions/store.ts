@@ -39,8 +39,7 @@ import {
   containsCredentialBearingKey,
   containsSecretShapedValue,
   parseSafeRetainedMetadata,
-  parseSafeRetainedMcp,
-  omitRuntimeCoordinationEnv,
+  parseSafeRetainedMcp, omitRuntimeCoordinationEnv,
   parseSafeRetainedEnv,
   retainedPublicRecordSchema,
   snapshotRetainedAgentProfile,
@@ -174,8 +173,7 @@ export function sanitizeLegacySessionMetadata(value: unknown): Record<string, un
     const candidate = source[key]
     if (key === 'env' && candidate !== undefined) {
       try {
-        const parsedEnv = omitRuntimeCoordinationEnv(parseSafeRetainedEnv(candidate))
-        if (parsedEnv) metadata.env = parsedEnv
+        { const parsedEnv = omitRuntimeCoordinationEnv(parseSafeRetainedEnv(candidate)); if (parsedEnv) metadata.env = parsedEnv }
       } catch {
         // Unsafe legacy environment values are omitted before they can be replayed.
       }
