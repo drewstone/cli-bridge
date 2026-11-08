@@ -3,7 +3,7 @@
  * its JSON event stream to OpenAI chat deltas.
  *
  * Model id scheme: `opencode/<rest>` where `<rest>` is opencode's own
- * `provider/model` spec (`anthropic/claude-sonnet-4-5`, `kimi-for-coding`,
+ * `provider/model` spec (`anthropic/claude-sonnet-5-5`, `kimi-for-coding`,
  * etc). opencode resolves it via its configured auth.
  *
  * Session resume: external session id maps (via SessionStore) to an

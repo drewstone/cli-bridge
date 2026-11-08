@@ -1,11 +1,11 @@
 {
   "name": "claude-code-plan",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Claude Opus in plan mode — read-only analysis and reasoning, no file writes, no shell. Use for architecture review, codebase Q&A, and planning work where the agent should think before (or without) touching anything.",
   "tags": ["plan", "read-only", "reasoning", "claude-code"],
   "model": {
     "default": "anthropic/claude-opus-5-5",
-    "small": "anthropic/claude-haiku-4-5",
+    "small": "anthropic/claude-haiku-5-5",
     "provider": "anthropic"
   },
   "prompt": {

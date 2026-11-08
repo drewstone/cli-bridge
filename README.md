@@ -55,7 +55,7 @@ Every AI lab now ships a CLI, each with its own subscription + better session ec
 
 claude/sonnet                        # Claude Code + Anthropic Sonnet
 claude/opus                          # Claude Code + Anthropic Opus
-claude/claude-sonnet-4-5-20250929    # Claude Code + specific version
+claude/claude-sonnet-5-5             # Claude Code + specific version
 
 claudish/openrouter@deepseek/deepseek-r1   # Claude Code workflow, DeepSeek brain
 claudish/google@gemini-2.0-flash           # Claude Code workflow, Gemini brain
@@ -63,7 +63,7 @@ claudish/zai@glm-4.6                       # Claude Code workflow, Z.AI brain
 
 codex/gpt-5-codex                    # Codex CLI, Codex model
 opencode/kimi-for-coding             # opencode + kimi-full plugin (Kimi Code sub)
-opencode/anthropic/claude-sonnet-4-5 # opencode's configured anthropic provider
+opencode/anthropic/claude-sonnet-5-5 # opencode's configured anthropic provider
 gemini/gemini-2.5-pro                # Gemini CLI with explicit model
 gemini/gemini-2.5-flash              # Gemini CLI Flash model
 
@@ -906,7 +906,7 @@ One-shot backends (`claude`, `codex`, `opencode`, `kimi-code`, `gemini`) hold a 
 A request can buy itself a longer queue with `execution.acquireTimeoutMs`, capped by `BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS`:
 
 ```json
-{ "model": "pi/anthropic/claude-sonnet-4-5", "execution": { "kind": "host", "acquireTimeoutMs": 900000 } }
+{ "model": "pi/anthropic/claude-sonnet-5-5", "execution": { "kind": "host", "acquireTimeoutMs": 900000 } }
 ```
 
 A supervisor that already grants a worker a 15-minute settle grace can spend that grace queueing instead of losing the spawn to the fixed 60-second default.
