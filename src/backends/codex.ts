@@ -545,7 +545,10 @@ export function splitCodexModel(
  *
  * The Router authorizes full slugs (`zai/glm-5.3`; a bare id answers
  * 400 model_not_allowed), so the whole remainder after the harness prefix
- * is the wire model and its first segment names the provider table. Unlike
+ * is the wire model and its first segment names the provider table. The
+ * table pins `wire_api = "responses"`: codex removed the `"chat"` wire
+ * (config load fails with `wire_api = "chat"` is no longer supported), and
+ * the Router serves the Responses API at `{base_url}/responses`. Unlike
  * receipt mode the URL check is deliberately loose: a conformance suite
  * points it at a loopback listener, so only the shape is enforced.
  *
@@ -598,7 +601,7 @@ function plainRouterArgs(remainder: string | null): string[] | null {
     `name = ${text('Tangle Router')}`,
     `base_url = ${text(rawUrl)}`,
     'env_key = "TANGLE_API_KEY"',
-    'wire_api = "chat"',
+    'wire_api = "responses"',
     'requires_openai_auth = false',
   ].join(', ')
   return [
