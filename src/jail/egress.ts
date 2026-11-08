@@ -110,7 +110,7 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
     await rm(shared, { recursive: true, force: true })
     throw new Error(`egress socket path exceeds ${MAX_SOCKET_PATH} bytes; set TMPDIR to a shorter directory`)
   }
-  let proxy: { child: ChildProcess; dir: string } | undefined
+  let proxy: Awaited<ReturnType<typeof startIronProxy>> | undefined
   let relay: EgressRelay | undefined
   const intercepts: JailEgressIntercept[] = []
   const cleanup = async () => {
