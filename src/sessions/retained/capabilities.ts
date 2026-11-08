@@ -156,6 +156,9 @@ export function genericCliBridgeCapabilities(backendName?: string, nativeContext
     resources: { files: false, instructions: false, tools: false, skills: false, agents: false, commands: false },
     hooks: false, modes: false, runtimeUpdate: false, validation: true,
   }
+  // codex maps neither a verified primary-process permission policy nor a subagent
+  // mechanism; claiming them would invite profiles the backend must refuse.
+  if (backendName === 'codex') candidate.profile = { ...candidate.profile, permissions: false, subagents: false }
   const validated = AgentEnvironmentCapabilitiesSchema.safeParse(candidate)
   if (!validated.success) {
     throw new RetainedSessionError('Bridge generic capabilities are invalid', 500, 'server_error')
