@@ -1,9 +1,10 @@
 {
   "name": "claude-code-plan",
-  "description": "Claude Sonnet in plan mode — read-only analysis and reasoning, no file writes, no shell. Use for architecture review, codebase Q&A, and planning work where the agent should think before (or without) touching anything.",
+  "version": "1.1.0",
+  "description": "Claude Opus in plan mode — read-only analysis and reasoning, no file writes, no shell. Use for architecture review, codebase Q&A, and planning work where the agent should think before (or without) touching anything.",
   "tags": ["plan", "read-only", "reasoning", "claude-code"],
   "model": {
-    "default": "anthropic/claude-sonnet-4-5",
+    "default": "anthropic/claude-opus-5-5",
     "small": "anthropic/claude-haiku-4-5",
     "provider": "anthropic"
   },

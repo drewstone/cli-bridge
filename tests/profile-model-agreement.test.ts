@@ -57,7 +57,6 @@ describe('assertExactProfileRequest — the wire id each harness actually receiv
   })
 
   it('accepts an opencode profile whose provider is its own harness', () => {
-    // profiles/opencode-generalist.json: provider `opencode`, default `anthropic/claude-sonnet-4-5`.
     // Runtime keeps one harness prefix, so the provider segment never reaches the bridge.
     expect(() =>
       check('opencode/anthropic/claude-sonnet-4-5', 'opencode', {

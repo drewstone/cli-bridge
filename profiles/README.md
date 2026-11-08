@@ -15,10 +15,9 @@ The profile `id` is the filename without the `.json` extension — e.g.
 
 ## Schema
 
-Profiles conform to `AgentProfile` from `@tangle-network/agent-interface`. The
-`version` field is a free-form string (semver is the convention) used
-to track prompt/behavior revisions independent of the cli-bridge
-release; bump it whenever the `systemPrompt` or `instructions` change.
+Profiles conform to `AgentProfile` from `@tangle-network/agent-interface`. The `version` field
+(free-form; semver by convention) tracks behavior revisions independent of the cli-bridge release;
+bump it whenever the `systemPrompt`, `instructions` or model change.
 
 ## Shipped profiles
 
