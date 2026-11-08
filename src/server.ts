@@ -107,6 +107,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     ...(config.jailNetwork ? { BRIDGE_JAIL_NETWORK: config.jailNetwork } : {}),
     ...(config.ironProxyBin ? { BRIDGE_IRON_PROXY_BIN: config.ironProxyBin } : {}),
     ...(config.proxySecretCommand ? { BRIDGE_PROXY_SECRET_COMMAND: config.proxySecretCommand } : {}),
+    ...(config.jailRelayAllow?.length ? { BRIDGE_JAIL_RELAY_ALLOW: config.jailRelayAllow.join(',') } : {}),
   }
   // Register enabled native harnesses before remote execution.
   for (const [name, harness] of localHarnesses) {

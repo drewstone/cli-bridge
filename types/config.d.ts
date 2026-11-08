@@ -82,6 +82,8 @@ export interface Config extends NativeHarnessConfig {
     ironProxyBin?: string;
     /** `BRIDGE_PROXY_SECRET_COMMAND`: mints and revokes a proxySecrets credential per spawn (see jail/egress.ts). */
     proxySecretCommand?: string;
+    /** Hostnames from `BRIDGE_JAIL_RELAY_ALLOW`, spliced on relay only. Empty omits the field. */
+    jailRelayAllow?: string[];
     /**
      * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
      * resolve under the request cwd; absolute paths must stay inside it.

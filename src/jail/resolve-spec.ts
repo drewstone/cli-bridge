@@ -105,10 +105,37 @@ export function parseJailNetwork(value: string | undefined, name: string): JailN
   throw new Error(`invalid ${name}: ${network} — expected none|router|relay`)
 }
 
-function egressFields(network: JailNetwork, env: NodeJS.ProcessEnv): Pick<JailSpec, 'network' | 'ironProxyBin' | 'proxySecretCommand'> {
+const RELAY_HOST = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))+$/u
+
+/**
+ * Hostnames from `BRIDGE_JAIL_RELAY_ALLOW`. The delivery list's owner is factory
+ * `graphs/delivery.graph.yaml`'s egress anchor (de5cc83a), including
+ * release-assets.githubusercontent.com. This process cannot read that file.
+ */
+export function parseRelayAllow(value: string | undefined): string[] {
+  const out: string[] = []
+  for (const raw of (value ?? '').split(',')) {
+    const trimmed = raw.trim().toLowerCase()
+    if (!trimmed) continue
+    const host = trimmed.endsWith(':443') ? trimmed.slice(0, -4) : trimmed
+    if (!RELAY_HOST.test(host) || /^\d+(?:\.\d+){3}$/u.test(host)) {
+      throw new Error(`BRIDGE_JAIL_RELAY_ALLOW: "${raw.trim()}" is not a DNS hostname`)
+    }
+    if (!out.includes(host)) out.push(host)
+  }
+  return out
+}
+
+function egressFields(network: JailNetwork, env: NodeJS.ProcessEnv): Pick<JailSpec, 'network' | 'ironProxyBin' | 'proxySecretCommand' | 'passThroughHosts'> {
   const bin = env.BRIDGE_IRON_PROXY_BIN?.trim(), command = env.BRIDGE_PROXY_SECRET_COMMAND?.trim()
   if (network !== 'relay') return { network }
-  return { network, ...(bin ? { ironProxyBin: bin } : {}), ...(command ? { proxySecretCommand: command } : {}) }
+  const passThroughHosts = parseRelayAllow(env.BRIDGE_JAIL_RELAY_ALLOW)
+  return {
+    network,
+    ...(bin ? { ironProxyBin: bin } : {}),
+    ...(command ? { proxySecretCommand: command } : {}),
+    ...(passThroughHosts.length ? { passThroughHosts } : {}),
+  }
 }
 
 /** Return whichever of the two modes is more confined. */

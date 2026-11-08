@@ -7,7 +7,7 @@
  * keys is the failure mode we refuse to allow.
  */
 
-import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailNetwork, parseJailPathList } from './jail/resolve-spec.js'
+import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailNetwork, parseJailPathList, parseRelayAllow } from './jail/resolve-spec.js'
 import type { JailNetwork } from './jail/egress.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
@@ -89,6 +89,8 @@ export interface Config extends NativeHarnessConfig {
   ironProxyBin?: string
   /** `BRIDGE_PROXY_SECRET_COMMAND`: mints and revokes a proxySecrets credential per spawn (see jail/egress.ts). */
   proxySecretCommand?: string
+  /** Hostnames from `BRIDGE_JAIL_RELAY_ALLOW`, spliced on relay only. Empty omits the field. */
+  jailRelayAllow?: string[]
   /**
    * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
    * resolve under the request cwd; absolute paths must stay inside it.
@@ -208,6 +210,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...optional('jailNetwork', parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')),
     ...optional('ironProxyBin', env.BRIDGE_IRON_PROXY_BIN?.trim() || undefined),
     ...optional('proxySecretCommand', env.BRIDGE_PROXY_SECRET_COMMAND?.trim() || undefined),
+    ...optional('jailRelayAllow', (() => {
+      const hosts = parseRelayAllow(env.BRIDGE_JAIL_RELAY_ALLOW)
+      return hosts.length ? hosts : undefined
+    })()),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
     ...resolveJailPathLists(env),
     trace: parseTraceConfig(env, dataDir),
