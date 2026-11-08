@@ -1033,13 +1033,14 @@ describe('retained Agent Interface sessions', () => {
     const capabilities = await json(response)
     expect(capabilities).toMatchObject({
       profile: {
-        namedProfiles: false,
-        systemPrompt: { replace: true, append: true },
-        instructions: true,
-        tools: true,
-        permissions: true,
-        mcp: true,
-        subagents: true,
+      namedProfiles: false,
+      systemPrompt: { replace: true, append: true },
+      instructions: true,
+      tools: true,
+      // codex maps neither a verified permission policy nor a subagent mechanism
+      permissions: backendName !== 'codex',
+      mcp: true,
+      subagents: backendName !== 'codex',
         resources: {
           files: true,
           instructions: true,
