@@ -76,7 +76,7 @@ export interface Config extends NativeHarnessConfig {
     jailMode: 'off' | 'write-jail' | 'fs-jail';
     /** Explicit policy when the configured OS jail is unavailable. */
     jailFallback: 'deny' | 'warn';
-    /** `BRIDGE_JAIL_NETWORK` caps a spawn's requested egress (none < router < relay). Unset: no cap. */
+    /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, no ceiling. */
     jailNetwork?: 'none' | 'router' | 'relay';
     /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
     ironProxyBin?: string;

@@ -13,7 +13,7 @@ export interface ResolveJailSpecInput {
   execMode?: string
   /** Per-request writable root from `execution.jail.root`. Overrides the env default. */
   execRoot?: string
-  /** Per-request egress from `execution.jail.network`. Default none; capped by `BRIDGE_JAIL_NETWORK`. */
+  /** Per-request egress from `execution.jail.network`. Defaults to, and is capped by, `BRIDGE_JAIL_NETWORK`. */
   execNetwork?: string
   /** Working directory the CLI runs in; the containment base for the jail root. */
   cwd: string
@@ -86,11 +86,12 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   }
 }
 
-/** Default none. `BRIDGE_JAIL_NETWORK` caps the request: a `router` floor turns `relay` into `router`. */
+/** `BRIDGE_JAIL_NETWORK` is the operator default and ceiling: a request may narrow it, never widen it. Unset: default none, no ceiling. */
 export function jailNetwork(requested: string | undefined, env: NodeJS.ProcessEnv): JailNetwork {
-  const floor = parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK') ?? 'relay'
-  const ask = parseJailNetwork(requested, 'jail network') ?? 'none'
-  return JAIL_NETWORK_RANK[ask] <= JAIL_NETWORK_RANK[floor] ? ask : floor
+  const operator = parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')
+  const ask = parseJailNetwork(requested, 'jail network') ?? operator ?? 'none'
+  const ceiling = operator ?? 'relay'
+  return JAIL_NETWORK_RANK[ask] <= JAIL_NETWORK_RANK[ceiling] ? ask : ceiling
 }
 
 export function parseJailNetwork(value: string | undefined, name: string): JailNetwork | undefined {
