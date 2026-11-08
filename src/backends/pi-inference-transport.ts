@@ -677,7 +677,7 @@ function readConfiguredTransport(
     : typeof provider.api === 'string'
       ? provider.api.trim()
       : ''
-  const upstreamBaseUrl = validateUpstreamBaseUrl(baseUrl, selection)
+  const upstreamBaseUrl = validateUpstreamBaseUrl(baseUrl, `pi provider ${selection.provider}/${selection.model}`)
   if (!(PI_API_MODES as readonly string[]).includes(api)) {
     throw new BackendError(
       `backend pi provider ${selection.provider}/${selection.model} has unsupported or missing api mode "${api}"`,
@@ -768,7 +768,7 @@ async function readCatalogTransport(options: {
   return {
     provider: options.selection.provider,
     model: options.selection.model,
-    upstreamBaseUrl: validateUpstreamBaseUrl(model.baseUrl.trim(), options.selection),
+    upstreamBaseUrl: validateUpstreamBaseUrl(model.baseUrl.trim(), `pi provider ${options.selection.provider}/${options.selection.model}`),
     apiMode: api as PiApiMode,
     providerConfig: { api },
     modelConfig,
@@ -797,27 +797,27 @@ function copySafeModelFields(
   return modelConfig
 }
 
-function validateUpstreamBaseUrl(baseUrl: string, selection: PiInferenceSelection): string {
+export function validateUpstreamBaseUrl(baseUrl: string, label: string): string {
   let parsed: URL
   try {
     parsed = new URL(baseUrl)
   } catch {
     throw new BackendError(
-      `backend pi provider ${selection.provider}/${selection.model} has invalid baseUrl "${baseUrl}"`,
+      `backend ${label} has an invalid baseUrl`,
       'not_configured',
     )
   }
   const localHttp = parsed.protocol === 'http:' && isLocalHostname(parsed.hostname)
   if ((parsed.protocol !== 'https:' && !localHttp) || parsed.username || parsed.password) {
     throw new BackendError(
-      `backend pi provider ${selection.provider}/${selection.model} baseUrl must be HTTPS `
+      `backend ${label} baseUrl must be HTTPS `
       + 'or loopback HTTP, without embedded credentials',
       'not_configured',
     )
   }
   if (parsed.search || parsed.hash) {
     throw new BackendError(
-      `backend pi provider ${selection.provider}/${selection.model} baseUrl cannot contain query or fragment data`,
+      `backend ${label} baseUrl cannot contain query or fragment data`,
       'not_configured',
     )
   }
