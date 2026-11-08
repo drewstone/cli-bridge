@@ -116,7 +116,9 @@ export class MacosSeatbeltJail implements JailBackend {
         spec.projectDir, ...writable, ...toolchainReadPaths(bin, spec.projectDir),
         ...readOnly, ...fixedPaths,
       ].map(canonicalizeJailPath) : undefined
-      const profile = buildProfile(writable, fixedPaths, readable, readOnly.filter((path) => !writable.includes(path)), spec.network ?? 'none')
+      // Seatbelt cannot authorize SNI or swap credentials; only the Linux relay can.
+      if (spec.network === 'relay' || spec.proxySecrets?.length) throw new Error('jail network relay and proxySecrets are Linux-only; use none or router on macOS')
+      const profile = buildProfile(writable, fixedPaths, readable, readOnly.filter((path) => !writable.includes(path)), spec.network === 'router' ? 'router' : 'none')
       const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-jail-'))
       const profilePath = join(dir, 'profile.sb')
       await writeFile(profilePath, profile, { mode: 0o600 })

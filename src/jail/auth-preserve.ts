@@ -203,7 +203,8 @@ export async function gitConfigSources(cwd = process.cwd(), writablePaths: reado
         }
       }
       return { key, value }
-    })
+    // A jail has no SSH route under any network policy, so a rewrite to SSH can only break a push.
+    }).filter(({ key }) => !/^url\.(?:ssh:\/\/|[^.@/]+@).*\.(?:push)?insteadof$/iu.test(key))
     const text = entries.map(({ key, value }) => {
       const first = key.indexOf('.'), last = key.lastIndexOf('.')
       return `[${key.slice(0, first)}${last === first ? '' : ` ${quote(key.slice(first + 1, last))}`}]\n${key.slice(last + 1)}${value === undefined ? '' : ` = ${quote(value)}`}\n`
