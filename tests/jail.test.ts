@@ -9,7 +9,8 @@ import {
   NoopJail,
   resolveJailRoot,
 } from '../src/jail/index.js'
-import { DEFAULT_JAIL_ROOT, resolveJailSpec } from '../src/jail/resolve-spec.js'
+import { relayAllowHosts } from '../src/jail/egress.js'
+import { DEFAULT_JAIL_ROOT, parseRelayAllow, resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { applyJail } from '../src/executors/jail-support.js'
 import {
   authSourcesFor,
@@ -17,7 +18,7 @@ import {
   removeStaleAuthCopies,
 } from '../src/jail/auth-preserve.js'
 import { ignoreJailRoot } from '../src/jail/types.js'
-import { anyBackendSpawnsOnHost } from '../src/config.js'
+import { anyBackendSpawnsOnHost, loadConfig } from '../src/config.js'
 import type { JailBackend } from '../src/jail/index.js'
 
 /** Index of the first position where `seq` appears contiguously in `argv`, else -1. */
@@ -794,6 +795,46 @@ describe('resolveJailSpec', () => {
       expect(spec?.root, `escape attempt ${execRoot} must clamp to default`).toBe(
         resolve(cwd, DEFAULT_JAIL_ROOT),
       )
+    }
+  })
+
+  it('splices BRIDGE_JAIL_RELAY_ALLOW onto relay and ignores it for router', () => {
+    const cwd = '/home/user/project'
+    const allow = 'release-assets.githubusercontent.com, GitHub.com, github.com:443, github.com'
+    const spec = resolveJailSpec({
+      cwd,
+      execMode: 'write-jail',
+      env: { BRIDGE_JAIL_NETWORK: 'relay', BRIDGE_JAIL_RELAY_ALLOW: allow },
+    })
+    expect(spec?.passThroughHosts).toEqual(['release-assets.githubusercontent.com', 'github.com'])
+    expect(relayAllowHosts(spec!)).toEqual([
+      'router.tangle.tools',
+      'release-assets.githubusercontent.com',
+      'github.com',
+    ])
+    const router = resolveJailSpec({
+      cwd,
+      execMode: 'write-jail',
+      env: { BRIDGE_JAIL_NETWORK: 'router', BRIDGE_JAIL_RELAY_ALLOW: allow },
+    })
+    expect(router?.network).toBe('router')
+    expect(router?.passThroughHosts).toBeUndefined()
+    expect(relayAllowHosts({ network: 'router', passThroughHosts: ['github.com'] })).toEqual(['router.tangle.tools'])
+    expect(parseRelayAllow(allow)).toEqual(['release-assets.githubusercontent.com', 'github.com'])
+    const config = loadConfig({ BRIDGE_JAIL_RELAY_ALLOW: allow })
+    expect(config.jailRelayAllow).toEqual(['release-assets.githubusercontent.com', 'github.com'])
+  })
+
+  it('fails closed on a relay allow entry that is not a DNS hostname', () => {
+    const cwd = '/home/user/project'
+    for (const bad of ['*.github.com', 'https://github.com', '10.0.0.1', 'github.com/foo', 'not a host']) {
+      expect(() => parseRelayAllow(bad), bad).toThrow(/DNS hostname/)
+      expect(() => resolveJailSpec({
+        cwd,
+        execMode: 'write-jail',
+        env: { BRIDGE_JAIL_NETWORK: 'relay', BRIDGE_JAIL_RELAY_ALLOW: bad },
+      }), bad).toThrow(/DNS hostname/)
+      expect(() => loadConfig({ BRIDGE_JAIL_RELAY_ALLOW: bad }), bad).toThrow(/DNS hostname/)
     }
   })
 })

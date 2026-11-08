@@ -27,6 +27,14 @@ export interface JailSpec {
   proxySecretCommand?: string
   /** `relay` only: the harness's vendor hosts (see egress.ts). Populated per backend. */
   vendorHosts?: string[]
+  /**
+   * `relay` only: extra SNI pass-through hosts from `BRIDGE_JAIL_RELAY_ALLOW`.
+   * cli-bridge does not read a graph file. The owner of the delivery list is
+   * factory `graphs/delivery.graph.yaml`'s egress anchor (factory de5cc83a),
+   * which includes release-assets.githubusercontent.com. The operator passes
+   * that list; it is not copied here.
+   */
+  passThroughHosts?: string[]
   /** `BRIDGE_IRON_PROXY_BIN`, required when `proxySecrets` is non-empty. */
   ironProxyBin?: string
   /** Refuse the operator's unconfined warn fallback for this request. */

@@ -7,9 +7,12 @@
  *   router  model calls only: the egress relay admits just the declared
  *           router hosts.
  *   relay   the harness's own vendor hosts (a subscription CLI reaching its
- *           provider) and the Router by SNI pass-through, plus the profile's
- *           `proxySecrets` hosts, which go through a per-spawn iron-proxy that
- *           swaps the placeholder in the jail's env for the real credential.
+ *           provider), the Router, and `BRIDGE_JAIL_RELAY_ALLOW` by SNI
+ *           pass-through, plus the profile's `proxySecrets` hosts, which go
+ *           through a per-spawn iron-proxy that swaps the placeholder in the
+ *           jail's env for the real credential. The allow list's owner for a
+ *           delivery graph is factory `graphs/delivery.graph.yaml`'s egress
+ *           anchor (de5cc83a), including release-assets.githubusercontent.com.
  *           Every other host is refused.
  *
  * Secrets are minted per spawn by the operator's `BRIDGE_PROXY_SECRET_COMMAND`
@@ -85,7 +88,19 @@ function proxySecretPlaceholder(envName: string): string {
   return `proxy-${envName.toLowerCase().replace(/[^a-z0-9]+/gu, '-')}.${randomBytes(12).toString('base64url')}`
 }
 
-type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin'>
+type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin'>
+
+/** Hosts the relay may splice. Router mode stays the Router only; pass-through is relay-only. */
+export function relayAllowHosts(spec: EgressSpec): readonly string[] {
+  const network = spec.network ?? 'none'
+  if (network === 'none') return []
+  if (network === 'router') return ROUTER_HOSTS
+  const allow: string[] = []
+  for (const host of [...ROUTER_HOSTS, ...(spec.vendorHosts ?? []), ...(spec.passThroughHosts ?? [])]) {
+    if (!allow.includes(host)) allow.push(host)
+  }
+  return allow
+}
 
 /**
  * Every spawn's relay socket and proxy state live under one parent that each
@@ -144,7 +159,7 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
     }
     relay = await startEgressRelay({
       socketPath,
-      allow: network === 'router' ? ROUTER_HOSTS : [...ROUTER_HOSTS, ...(spec.vendorHosts ?? [])],
+      allow: relayAllowHosts(spec),
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
     return {
