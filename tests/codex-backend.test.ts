@@ -3,11 +3,23 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
-import { describe, expect, it } from 'vitest'
+import { describe, afterAll, afterEach, expect, it } from 'vitest'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { CodexBackend } from '../src/backends/codex.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SpawnResult, Spawner } from '../src/executors/types.js'
+
+// Plain Router mode reads env at chat time; keep ambient operator settings out of every fixture.
+const SAVED_ROUTER_URL = process.env.TANGLE_ROUTER_URL
+const SAVED_API_KEY = process.env.TANGLE_API_KEY
+delete process.env.TANGLE_ROUTER_URL
+delete process.env.TANGLE_API_KEY
+afterAll(() => {
+  if (SAVED_ROUTER_URL === undefined) delete process.env.TANGLE_ROUTER_URL
+  else process.env.TANGLE_ROUTER_URL = SAVED_ROUTER_URL
+  if (SAVED_API_KEY === undefined) delete process.env.TANGLE_API_KEY
+  else process.env.TANGLE_API_KEY = SAVED_API_KEY
+})
 
 class FakeChild extends EventEmitter {
   stdout = new PassThrough()
@@ -289,5 +301,109 @@ describe('CodexBackend jailed MCP visibility', () => {
       else process.env.CODEX_API_KEY = previousApiKey
       rmSync(sourceHome, { recursive: true, force: true })
     }
+  })
+})
+
+describe('CodexBackend plain Router mode', () => {
+  afterEach(() => {
+    delete process.env.TANGLE_ROUTER_URL
+    delete process.env.TANGLE_API_KEY
+  })
+
+  it('carries the Router provider table for a provider-qualified model', async () => {
+    process.env.TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    process.env.TANGLE_API_KEY = 'dummy'
+    const observed: { args?: string[] } = {}
+    let spawnedEnv: NodeJS.ProcessEnv | undefined
+    const inner = codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed)
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: async (bin, args, opts) => {
+        spawnedEnv = opts.env
+        return inner(bin, args, opts)
+      },
+    })
+    const deltas = await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal))
+    expect(deltas.find((d) => d.finish_reason)?.finish_reason).toBe('stop')
+    expect(observed.args).toContain(
+      'model_providers.zai = { name = "Tangle Router", base_url = "http://127.0.0.9:9/v1", env_key = "TANGLE_API_KEY", wire_api = "chat", requires_openai_auth = false }',
+    )
+    expect(observed.args).toContain('model_provider = "zai"')
+    // The Router authorizes the full slug; a bare id answers 400 model_not_allowed.
+    expect(observed.args).toContain('model = "zai/glm-5.3"')
+    expect(observed.args).not.toContain('model = "glm-5.3"')
+    // codex reads the key itself through the table's env_key, so the spawn env must carry it.
+    expect(spawnedEnv?.TANGLE_API_KEY).toBe('dummy')
+  })
+
+  it('splits the wire provider segment into model_provider + model config without a Router URL', async () => {
+    delete process.env.TANGLE_ROUTER_URL
+    delete process.env.TANGLE_API_KEY
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+    await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal))
+    expect(observed.args).toContain('model_provider="zai"')
+    expect(observed.args).toContain('model="glm-5.3"')
+    expect(observed.args?.some((arg) => arg.startsWith('model_providers.'))).toBe(false)
+  })
+
+  it('stays on the bare split when only the API key is set', async () => {
+    delete process.env.TANGLE_ROUTER_URL
+    process.env.TANGLE_API_KEY = 'dummy'
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+    await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal))
+    expect(observed.args).toContain('model_provider="zai"')
+    expect(observed.args).toContain('model="glm-5.3"')
+    expect(observed.args?.some((arg) => arg.startsWith('model_providers.'))).toBe(false)
+  })
+
+  it('refuses a malformed Router URL before any spawn', async () => {
+    process.env.TANGLE_ROUTER_URL = 'http://user:secret@127.0.0.9:9/v1#frag'
+    process.env.TANGLE_API_KEY = 'dummy'
+    const observed: { args?: string[] } = {}
+    let dispatches = 0
+    const inner = codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed)
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: async (bin, args, opts) => {
+        dispatches += 1
+        return inner(bin, args, opts)
+      },
+    })
+    await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    process.env.TANGLE_ROUTER_URL = 'not-a-url'
+    await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    expect(dispatches).toBe(0)
+  })
+
+  it('refuses a model without a wire provider segment, including the harness prefix', async () => {
+    process.env.TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    process.env.TANGLE_API_KEY = 'dummy'
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE]),
+    })
+    // No '/' after the harness prefix: the Router would see a bare model id.
+    await expect(collect(backend.chat({ ...request(), model: 'codex/glm-5.3' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    await expect(collect(backend.chat(request(), null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    // A leading `codex` segment names the harness (issue #161), never a provider.
+    await expect(collect(backend.chat({ ...request(), model: 'codex/codex/gpt-5.1' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
   })
 })

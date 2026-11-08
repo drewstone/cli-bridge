@@ -178,8 +178,6 @@ export class CodexBackend implements Backend {
       'codex hosted-safe requires verified --sandbox read-only audit')
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
-    // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
-    const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
 
     // Build argv. `codex exec resume <id> <prompt>` if we have one,
     // else `codex exec <prompt>`. --json emits JSONL events.
@@ -189,8 +187,16 @@ export class CodexBackend implements Backend {
       '--skip-git-repo-check',
       '--dangerously-bypass-approvals-and-sandbox',
     ]
-    if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
-    if (modelArg) args.push('-c', `model="${modelArg}"`)
+    const routerOverrides = plainRouterArgs(this.extractModel(req.model))
+    if (routerOverrides) {
+      // The Router owns the route: its provider table and the full wire slug replace the bare split.
+      args.push(...routerOverrides)
+    } else {
+      // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
+      const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+      if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
+      if (modelArg) args.push('-c', `model="${modelArg}"`)
+    }
     const reasoningEffort = nativeReasoningControl(
       'codex',
       resolveRequestedReasoningEffort(req, session),
@@ -520,6 +526,73 @@ export function splitCodexModel(
   const provider = slash > 0 ? remainder.slice(0, slash) : null
   const model = slash > 0 ? remainder.slice(slash + 1) : remainder
   return { provider, model: model.toLowerCase() === 'default' ? null : model }
+}
+
+/**
+ * Plain Router mode: route a provider-qualified model through the Tangle
+ * Router from env alone — no receipt headers, record directory or version
+ * gate. Active only when BOTH TANGLE_ROUTER_URL and TANGLE_API_KEY are set;
+ * without them the argv stays byte-identical to the bare split. The spawn
+ * env spreads process.env, so codex reads the key itself through the
+ * provider table's `env_key`, and `requires_openai_auth = false` keeps it
+ * from demanding OpenAI login state.
+ *
+ * The Router authorizes full slugs (`zai/glm-5.3`; a bare id answers
+ * 400 model_not_allowed), so the whole remainder after the harness prefix
+ * is the wire model and its first segment names the provider table. Unlike
+ * receipt mode the URL check is deliberately loose: a conformance suite
+ * points it at a loopback listener, so only the shape is enforced.
+ */
+function plainRouterArgs(
+  remainder: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] | null {
+  const rawUrl = env.TANGLE_ROUTER_URL?.trim()
+  if (!rawUrl || !env.TANGLE_API_KEY?.trim()) return null
+  let url: URL | undefined
+  try { url = new URL(rawUrl) } catch { url = undefined }
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')
+    || url.username || url.password || url.hash) {
+    throw new BackendError(
+      'TANGLE_ROUTER_URL must be an absolute http(s) URL without userinfo or fragment',
+      'not_configured',
+    )
+  }
+  if (!remainder || !remainder.includes('/')) {
+    throw new BackendError(
+      'TANGLE Router mode requires a provider-qualified model (codex/<provider>/<model>)',
+      'not_configured',
+    )
+  }
+  const providerName = remainder.slice(0, remainder.indexOf('/'))
+  // The split path's rule holds here too: a leading `codex` segment names the
+  // harness, never a wire provider. The charset also keeps the segment a safe
+  // TOML bare key — it is interpolated into the provider-table override.
+  if (providerName === 'codex' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(providerName)) {
+    throw new BackendError(
+      `TANGLE Router mode requires a wire provider segment in the model route: ${remainder}`,
+      'not_configured',
+    )
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$/u.test(remainder)) {
+    throw new BackendError(
+      `TANGLE Router model route is not a valid Router slug: ${remainder}`,
+      'not_configured',
+    )
+  }
+  const text = (value: string): string => JSON.stringify(value)
+  const table = [
+    `name = ${text('Tangle Router')}`,
+    `base_url = ${text(rawUrl)}`,
+    'env_key = "TANGLE_API_KEY"',
+    'wire_api = "chat"',
+    'requires_openai_auth = false',
+  ].join(', ')
+  return [
+    '-c', `model_providers.${providerName} = { ${table} }`,
+    '-c', `model_provider = ${text(providerName)}`,
+    '-c', `model = ${text(remainder)}`,
+  ]
 }
 
 /**
