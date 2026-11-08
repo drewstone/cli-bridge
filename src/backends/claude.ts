@@ -94,7 +94,7 @@ interface ClaudeNativeUsage {
   output_tokens?: number
 }
 
-const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 300
+const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 512
 
 /** Native result cost is a complete provider receipt. Missing cost stays unknown;
  * token counts retain their independent measured/partial provenance. */
@@ -379,7 +379,7 @@ export class ClaudeBackend implements Backend {
       let internalSessionId: string | undefined
       let terminal: ClaudeStreamResult | undefined
       const observations = new Set<string>()
-      let sawError: string | undefined
+      let sawError: string | undefined, apiError = ''
       let usage: ChatDelta['usage']
       const stderr = new BoundedDiagnosticBuffer()
       child.stderr?.on('data', (b) => { stderr.append(b) })
@@ -444,7 +444,7 @@ export class ClaudeBackend implements Backend {
           const content = a.message?.content ?? []
           for (const block of content) {
             if (block.type === 'text') {
-              yield { content: block.text }
+              yield { content: a.isApiErrorMessage ? (apiError = sanitizeUpstreamErrorDetail(block.text)) : block.text }
             } else if (block.type === 'tool_use') {
               // claude-code-cli emits `tool_use` for its own built-in
               // tools (Read, Bash, Edit, ToolSearch, ...) and for any
@@ -485,13 +485,13 @@ export class ClaudeBackend implements Backend {
           terminal = result
           usage = claudeResultUsage(result) ?? usage
           if (result.is_error || result.subtype !== 'success')
-            sawError ??= sanitizeUpstreamErrorDetail(result.result)
+            sawError ??= sanitizeUpstreamErrorDetail(result.result || apiError)
           // The native result is provisional. Continue parsing trailing usage and errors.
           continue
         }
       }
 
-      await waitForProcessClose(child)
+      const closed = await waitForProcessClose(child)
       if (usage) yield { usage }
 
       if (signal.aborted) {
@@ -499,8 +499,8 @@ export class ClaudeBackend implements Backend {
         return
       }
 
+      if (sawError || (apiError && (closed.code !== 0 || closed.signal !== null))) throw new BackendError(`claude upstream error: ${sawError || apiError}`, 'upstream')
       await assertSuccessfulHarnessExit(spawned, 'claude', () => stderr.render())
-      if (sawError) throw new BackendError(`claude upstream error: ${sawError}`, 'upstream')
       if (terminal) {
         yield {
           finish_reason: emittedAnyToolCall ? 'tool_calls' : 'stop',
