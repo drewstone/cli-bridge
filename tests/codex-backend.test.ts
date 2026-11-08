@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { EventEmitter } from 'node:events'
-import { describe, afterAll, afterEach, expect, it } from 'vitest'
+import { describe, afterAll, afterEach, expect, it, vi } from 'vitest'
 import type { SessionRecord } from '../src/sessions/store.js'
 import { CodexBackend } from '../src/backends/codex.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
@@ -12,13 +12,31 @@ import type { SpawnResult, Spawner } from '../src/executors/types.js'
 // Plain Router mode reads env at chat time; keep ambient operator settings out of every fixture.
 const SAVED_ROUTER_URL = process.env.TANGLE_ROUTER_URL
 const SAVED_API_KEY = process.env.TANGLE_API_KEY
+const SAVED_CODEX_ROUTER_URL = process.env.CODEX_TANGLE_ROUTER_URL
 delete process.env.TANGLE_ROUTER_URL
 delete process.env.TANGLE_API_KEY
+delete process.env.CODEX_TANGLE_ROUTER_URL
 afterAll(() => {
   if (SAVED_ROUTER_URL === undefined) delete process.env.TANGLE_ROUTER_URL
   else process.env.TANGLE_ROUTER_URL = SAVED_ROUTER_URL
   if (SAVED_API_KEY === undefined) delete process.env.TANGLE_API_KEY
   else process.env.TANGLE_API_KEY = SAVED_API_KEY
+  if (SAVED_CODEX_ROUTER_URL === undefined) delete process.env.CODEX_TANGLE_ROUTER_URL
+  else process.env.CODEX_TANGLE_ROUTER_URL = SAVED_CODEX_ROUTER_URL
+})
+
+// One test fakes a provisioned profile flag to pin -c last-wins ordering;
+// every other test sees the real provisioner unchanged.
+const provisionFake = vi.hoisted(() => ({ flags: null as string[] | null }))
+vi.mock('../src/backends/profile-support.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/backends/profile-support.js')>()
+  return {
+    ...actual,
+    provisionProfileWorkspace: (...args: Parameters<typeof actual.provisionProfileWorkspace>) => {
+      const provisioned = actual.provisionProfileWorkspace(...args)
+      return provisionFake.flags ? { ...provisioned, flags: [...provisioned.flags, ...provisionFake.flags] } : provisioned
+    },
+  }
 })
 
 class FakeChild extends EventEmitter {
@@ -308,10 +326,12 @@ describe('CodexBackend plain Router mode', () => {
   afterEach(() => {
     delete process.env.TANGLE_ROUTER_URL
     delete process.env.TANGLE_API_KEY
+    delete process.env.CODEX_TANGLE_ROUTER_URL
+    provisionFake.flags = null
   })
 
   it('carries the Router provider table for a provider-qualified model', async () => {
-    process.env.TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    process.env.CODEX_TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
     process.env.TANGLE_API_KEY = 'dummy'
     const observed: { args?: string[] } = {}
     let spawnedEnv: NodeJS.ProcessEnv | undefined
@@ -333,8 +353,31 @@ describe('CodexBackend plain Router mode', () => {
     // The Router authorizes the full slug; a bare id answers 400 model_not_allowed.
     expect(observed.args).toContain('model = "zai/glm-5.3"')
     expect(observed.args).not.toContain('model = "glm-5.3"')
-    // codex reads the key itself through the table's env_key, so the spawn env must carry it.
+    // codex reads the key itself through the table's env_key, so the spawn env must carry it —
+    // and the key itself must never reach argv.
     expect(spawnedEnv?.TANGLE_API_KEY).toBe('dummy')
+    expect(observed.args?.some((arg) => arg.includes('dummy'))).toBe(false)
+  })
+
+  it('keeps the bare split for the images-route pair without CODEX_TANGLE_ROUTER_URL', async () => {
+    process.env.TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    process.env.TANGLE_API_KEY = 'dummy'
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+    await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal))
+    expect(observed.args).toContain('model_provider="zai"')
+    expect(observed.args).toContain('model="glm-5.3"')
+    expect(observed.args?.some((arg) => arg.startsWith('model_providers.'))).toBe(false)
+    // The images var alone activates nothing either.
+    delete process.env.TANGLE_API_KEY
+    await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal))
+    expect(observed.args).toContain('model_provider="zai"')
+    expect(observed.args).toContain('model="glm-5.3"')
+    expect(observed.args?.some((arg) => arg.startsWith('model_providers.'))).toBe(false)
   })
 
   it('splits the wire provider segment into model_provider + model config without a Router URL', async () => {
@@ -367,8 +410,32 @@ describe('CodexBackend plain Router mode', () => {
     expect(observed.args?.some((arg) => arg.startsWith('model_providers.'))).toBe(false)
   })
 
+  it('refuses Router mode before any spawn when TANGLE_API_KEY is missing, empty or blank', async () => {
+    process.env.CODEX_TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    let dispatches = 0
+    const inner = codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE])
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: async (bin, args, opts) => {
+        dispatches += 1
+        return inner(bin, args, opts)
+      },
+    })
+    delete process.env.TANGLE_API_KEY
+    await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    process.env.TANGLE_API_KEY = ''
+    await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    process.env.TANGLE_API_KEY = '   '
+    await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    expect(dispatches).toBe(0)
+  })
+
   it('refuses a malformed Router URL before any spawn', async () => {
-    process.env.TANGLE_ROUTER_URL = 'http://user:secret@127.0.0.9:9/v1#frag'
+    process.env.CODEX_TANGLE_ROUTER_URL = 'http://user:secret@127.0.0.9:9/v1#frag'
     process.env.TANGLE_API_KEY = 'dummy'
     const observed: { args?: string[] } = {}
     let dispatches = 0
@@ -383,14 +450,18 @@ describe('CodexBackend plain Router mode', () => {
     })
     await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
       .rejects.toMatchObject({ code: 'not_configured' })
-    process.env.TANGLE_ROUTER_URL = 'not-a-url'
+    process.env.CODEX_TANGLE_ROUTER_URL = 'not-a-url'
+    await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
+      .rejects.toMatchObject({ code: 'not_configured' })
+    // A key riding the URL query must never reach argv.
+    process.env.CODEX_TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1?key=secret'
     await expect(collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal)))
       .rejects.toMatchObject({ code: 'not_configured' })
     expect(dispatches).toBe(0)
   })
 
   it('refuses a model without a wire provider segment, including the harness prefix', async () => {
-    process.env.TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    process.env.CODEX_TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
     process.env.TANGLE_API_KEY = 'dummy'
     const backend = new CodexBackend({
       bin: 'codex',
@@ -405,5 +476,41 @@ describe('CodexBackend plain Router mode', () => {
     // A leading `codex` segment names the harness (issue #161), never a provider.
     await expect(collect(backend.chat({ ...request(), model: 'codex/codex/gpt-5.1' }, null, new AbortController().signal)))
       .rejects.toMatchObject({ code: 'not_configured' })
+  })
+
+  it('outranks a provisioned profile flag for the route (codex -c is last-wins)', async () => {
+    process.env.CODEX_TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    process.env.TANGLE_API_KEY = 'dummy'
+    provisionFake.flags = ['-c', 'model="evil"']
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+    await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3' }, null, new AbortController().signal))
+    const args = observed.args!
+    expect(args).toContain('model="evil"')
+    // The Router overrides are pushed after the profile flags, so they win.
+    expect(args.lastIndexOf('model = "zai/glm-5.3"')).toBeGreaterThan(args.lastIndexOf('model="evil"'))
+    expect(args.lastIndexOf('model_provider = "zai"')).toBeGreaterThan(args.lastIndexOf('model="evil"'))
+  })
+
+  it('keeps exec resume ahead of the Router overrides', async () => {
+    process.env.CODEX_TANGLE_ROUTER_URL = 'http://127.0.0.9:9/v1'
+    process.env.TANGLE_API_KEY = 'dummy'
+    const observed: { args?: string[] } = {}
+    const backend = new CodexBackend({
+      bin: 'codex',
+      timeoutMs: 5_000,
+      spawner: codexSpawner([THREAD, MESSAGE_ITEM, TURN_DONE], observed),
+    })
+    const session: SessionRecord = {
+      externalId: 's1', backend: 'codex', internalId: 'native-1', cwd: null,
+      turns: 1, createdAt: 0, lastUsedAt: 0, metadata: {},
+    }
+    await collect(backend.chat({ ...request(), model: 'codex/zai/glm-5.3', session_id: 's1' }, session, new AbortController().signal))
+    expect(observed.args?.slice(0, 3)).toEqual(['exec', 'resume', 'native-1'])
+    expect(observed.args!.findIndex((arg) => arg.startsWith('model_providers.zai'))).toBeGreaterThan(2)
   })
 })

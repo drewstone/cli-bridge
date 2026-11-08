@@ -188,10 +188,7 @@ export class CodexBackend implements Backend {
       '--dangerously-bypass-approvals-and-sandbox',
     ]
     const routerOverrides = plainRouterArgs(this.extractModel(req.model))
-    if (routerOverrides) {
-      // The Router owns the route: its provider table and the full wire slug replace the bare split.
-      args.push(...routerOverrides)
-    } else {
+    if (!routerOverrides) {
       // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
       const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
       if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
@@ -220,6 +217,11 @@ export class CodexBackend implements Backend {
     const launchEnv = { ...process.env, ...provisioned.env }
     if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
     args.push(...provisioned.flags)
+    if (routerOverrides) {
+      // The Router owns the route: codex -c is last-wins, so the overrides go
+      // after the profile flags to outrank any plan-level model or provider set.
+      args.push(...routerOverrides)
+    }
     if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
     const nativeConfigFlags = codexConfigFlags(args)
     args.push('--', prompt)
@@ -531,30 +533,41 @@ export function splitCodexModel(
 /**
  * Plain Router mode: route a provider-qualified model through the Tangle
  * Router from env alone — no receipt headers, record directory or version
- * gate. Active only when BOTH TANGLE_ROUTER_URL and TANGLE_API_KEY are set;
- * without them the argv stays byte-identical to the bare split. The spawn
- * env spreads process.env, so codex reads the key itself through the
- * provider table's `env_key`, and `requires_openai_auth = false` keeps it
- * from demanding OpenAI login state.
+ * gate. Gated by CODEX_TANGLE_ROUTER_URL alone, scoped to the codex backend
+ * so the images route's TANGLE_ROUTER_URL + TANGLE_API_KEY pair never
+ * force-enables it; when the gate is set, a missing or blank TANGLE_API_KEY
+ * throws rather than silently downgrading to the bare split, which would
+ * send the turn to api.openai.com. The key remains the provider table's
+ * env_key — one owner: the Router credential. Without the gate the argv
+ * stays byte-identical to the bare split. The spawn env spreads
+ * process.env, so codex reads the key itself, and
+ * `requires_openai_auth = false` keeps it from demanding OpenAI login state.
  *
  * The Router authorizes full slugs (`zai/glm-5.3`; a bare id answers
  * 400 model_not_allowed), so the whole remainder after the harness prefix
  * is the wire model and its first segment names the provider table. Unlike
  * receipt mode the URL check is deliberately loose: a conformance suite
  * points it at a loopback listener, so only the shape is enforced.
+ *
+ * The mode scopes to the chat/exec path only, by design: catalog probes and
+ * context transfer keep the legacy split.
  */
-function plainRouterArgs(
-  remainder: string | null,
-  env: NodeJS.ProcessEnv = process.env,
-): string[] | null {
-  const rawUrl = env.TANGLE_ROUTER_URL?.trim()
-  if (!rawUrl || !env.TANGLE_API_KEY?.trim()) return null
+function plainRouterArgs(remainder: string | null): string[] | null {
+  const rawUrl = process.env.CODEX_TANGLE_ROUTER_URL?.trim()
+  if (!rawUrl) return null
+  if (!process.env.TANGLE_API_KEY?.trim()) {
+    throw new BackendError(
+      'CODEX_TANGLE_ROUTER_URL is set but TANGLE_API_KEY is missing or blank; ' +
+        'refusing to fall back to the bare split and send the turn to api.openai.com',
+      'not_configured',
+    )
+  }
   let url: URL | undefined
   try { url = new URL(rawUrl) } catch { url = undefined }
   if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')
-    || url.username || url.password || url.hash) {
+    || url.username || url.password || url.search || url.hash) {
     throw new BackendError(
-      'TANGLE_ROUTER_URL must be an absolute http(s) URL without userinfo or fragment',
+      'CODEX_TANGLE_ROUTER_URL must be an absolute http(s) URL without userinfo, query or fragment',
       'not_configured',
     )
   }
