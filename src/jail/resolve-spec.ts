@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { canonicalizeJailPath, resolveJailRoot } from './types.js'
 import type { JailSpec } from './types.js'
+import { JAIL_NETWORK_RANK, type JailNetwork } from './egress.js'
 
 export type JailMode = 'off' | 'write-jail' | 'fs-jail'
 
@@ -12,7 +13,7 @@ export interface ResolveJailSpecInput {
   execMode?: string
   /** Per-request writable root from `execution.jail.root`. Overrides the env default. */
   execRoot?: string
-  /** Per-request egress from `execution.jail.network`. Default none. `BRIDGE_JAIL_NETWORK=none` forces none. */
+  /** Per-request egress from `execution.jail.network`. Defaults to, and is capped by, `BRIDGE_JAIL_NETWORK`. */
   execNetwork?: string
   /** Working directory the CLI runs in; the containment base for the jail root. */
   cwd: string
@@ -78,23 +79,36 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
     root,
     projectDir,
     fallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
-    network: jailNetwork(input.execNetwork, env),
+    ...egressFields(jailNetwork(input.execNetwork, env), env),
     ...(mode === 'fs-jail' ? { readConfine: true } : {}),
     ...(readable.length ? { extraReadablePaths: readable } : {}),
     ...(writable.length ? { extraWritablePaths: writable } : {}),
   }
 }
 
-/** Default off. An explicit `none` floor cannot be raised by the request. */
-export function jailNetwork(requested: string | undefined, env: NodeJS.ProcessEnv): 'none' | 'router' {
-  const floor = (env.BRIDGE_JAIL_NETWORK ?? '').trim()
-  const ask = (requested ?? '').trim()
-  if (floor !== '' && floor !== 'none' && floor !== 'router') {
-    throw new Error(`invalid BRIDGE_JAIL_NETWORK: ${floor} — expected none|router`)
-  }
-  if (ask !== '' && ask !== 'none' && ask !== 'router') throw new Error(`invalid jail network: ${ask}`)
-  if (floor === 'none') return 'none'
-  return ask === 'router' ? 'router' : 'none'
+/**
+ * `BRIDGE_JAIL_NETWORK` is the operator default and ceiling: a request may
+ * narrow it, never widen it. Unset: default none, ceiling router, so only an
+ * operator opts spawns into vendor hosts and proxySecrets.
+ */
+export function jailNetwork(requested: string | undefined, env: NodeJS.ProcessEnv): JailNetwork {
+  const operator = parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')
+  const ask = parseJailNetwork(requested, 'jail network') ?? operator ?? 'none'
+  const ceiling = operator ?? 'router'
+  return JAIL_NETWORK_RANK[ask] <= JAIL_NETWORK_RANK[ceiling] ? ask : ceiling
+}
+
+export function parseJailNetwork(value: string | undefined, name: string): JailNetwork | undefined {
+  const network = (value ?? '').trim()
+  if (network === '') return undefined
+  if (Object.hasOwn(JAIL_NETWORK_RANK, network)) return network as JailNetwork
+  throw new Error(`invalid ${name}: ${network} — expected none|router|relay`)
+}
+
+function egressFields(network: JailNetwork, env: NodeJS.ProcessEnv): Pick<JailSpec, 'network' | 'ironProxyBin' | 'proxySecretCommand'> {
+  const bin = env.BRIDGE_IRON_PROXY_BIN?.trim(), command = env.BRIDGE_PROXY_SECRET_COMMAND?.trim()
+  if (network !== 'relay') return { network }
+  return { network, ...(bin ? { ironProxyBin: bin } : {}), ...(command ? { proxySecretCommand: command } : {}) }
 }
 
 /** Return whichever of the two modes is more confined. */

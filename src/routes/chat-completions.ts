@@ -49,6 +49,7 @@ import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { authSourcesFor } from '../jail/auth-preserve.js'
+import { vendorHostsFor } from '../jail/egress.js'
 import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionSlot } from '../admission.js'
 import {
   type Run,
@@ -262,7 +263,7 @@ const chatRequestSchema = z.object({
     jail: z.object({
       mode: z.enum(['off', 'write-jail', 'fs-jail']).optional(),
       root: z.string().optional(),
-      network: z.enum(['none', 'router']).optional(),
+      network: z.enum(['none', 'router', 'relay']).optional(),
     }).optional(),
     netJail: z.never({ error: 'execution.netJail is no longer supported' }).optional(),
     timeoutMs: z.number().int().positive().max(maxExecutionTimeoutMs).optional(),
@@ -1026,9 +1027,16 @@ export function mountChatCompletions(
           cwd: req.cwd ?? process.cwd(),
           env: deps.jailEnv ?? process.env,
         })
-        // Preserve this backend's host credentials inside the jail so the
-        // confined CLI still authenticates as the operator.
-        if (req.jailSpec) req.jailSpec.authSources = authSourcesFor(backend.name)
+        const proxySecrets = req.agent_profile?.proxySecrets
+        if (proxySecrets?.length && !req.jailSpec) {
+          throw new BackendError('agent_profile.proxySecrets require execution.jail with network relay', 'parse_error')
+        }
+        // Host credentials, vendor hosts and proxySecrets bindings for the confined CLI.
+        if (req.jailSpec) {
+          req.jailSpec.authSources = authSourcesFor(backend.name)
+          req.jailSpec.vendorHosts = vendorHostsFor(backend.name)
+          if (proxySecrets?.length) req.jailSpec.proxySecrets = proxySecrets
+        }
         // The lane rides on the request so the scoped-host executor honours the
         // same reservation. Set even when this bridge has no admission gate:
         // the executor semaphore exists either way.

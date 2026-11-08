@@ -1,15 +1,13 @@
 /**
- * Linux write-jail via bubblewrap. Network starts unshared; `router` reaches
- * only router.tangle.tools. Unprivileged user namespaces: if apparmor blocks
+ * Linux write-jail via bubblewrap. Network is always unshared; egress.ts owns
+ * what a `router` or `relay` spawn may reach. Unprivileged user namespaces: if apparmor blocks
  * them and bwrap is not setuid, `isAvailable()` is false and the caller refuses
  * unconfined execution. Bind order is left-to-right, last wins.
  */
 
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { accessSync, constants, existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
-import { resolve4 } from 'node:dns/promises'
+import { homedir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   copyAuthIntoJail,
@@ -18,6 +16,7 @@ import {
   removeStaleAuthCopies,
   seedAuthIntoJail,
 } from './auth-preserve.js'
+import { prepareEgress, type PreparedEgress } from './egress.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 import { canonicalizeJailPath, ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot } from './types.js'
 
@@ -41,11 +40,17 @@ export class LinuxBwrapJail implements JailBackend {
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     const config = await gitConfigSources(spec.projectDir, spec.extraWritablePaths)
-    try { return await this.wrapWithGitConfig(bin, args, spec, config) }
-    catch (error) { await config.cleanup(); throw error }
+    let egress: PreparedEgress | undefined
+    try {
+      egress = await prepareEgress(spec)
+      return await this.wrapWithGitConfig(bin, args, spec, config, egress)
+    } catch (error) {
+      try { await egress?.cleanup() } finally { await config.cleanup() }
+      throw error
+    }
   }
 
-  private async wrapWithGitConfig(bin: string, args: string[], spec: JailSpec, config: Awaited<ReturnType<typeof gitConfigSources>>): Promise<JailWrap> {
+  private async wrapWithGitConfig(bin: string, args: string[], spec: JailSpec, config: Awaited<ReturnType<typeof gitConfigSources>>, egress: PreparedEgress): Promise<JailWrap> {
     const root = resolveJailRoot(spec.root, spec.projectDir)
     await prepareJailHome(root)
     ignoreJailRoot(spec.projectDir, root)
@@ -79,10 +84,8 @@ export class LinuxBwrapJail implements JailBackend {
       destination: resolveJailRoot(source.jailRel, root),
     }))
 
-    const router = (spec.network ?? 'none') === 'router'
     const bwrapArgs = [
       '--unshare-user',
-      ...(router ? ['--uid', '0', '--gid', '0', '--cap-add', 'CAP_NET_ADMIN', '--cap-add', 'CAP_SETPCAP'] : []),
       '--unshare-pid',
       '--unshare-ipc',
       '--unshare-uts',
@@ -101,6 +104,7 @@ export class LinuxBwrapJail implements JailBackend {
     } else {
       bwrapArgs.push(
         '--ro-bind', '/', '/',
+        '--proc', '/proc',
         '--dev', '/dev',
         '--ro-bind', spec.projectDir, spec.projectDir,
       )
@@ -127,69 +131,27 @@ export class LinuxBwrapJail implements JailBackend {
     }
 
     for (const { source, destination } of config.binds) bwrapArgs.push('--ro-bind', source, destination)
+    bwrapArgs.push(...egress.bwrapArgs)
+    for (const [key, value] of Object.entries(egress.env)) bwrapArgs.push('--setenv', key, value)
 
     for (const [key, value] of Object.entries(jailEnv(root))) {
       bwrapArgs.push('--setenv', key, value)
     }
 
     const nativeHome = resolvedAuthSources.find(({ source }) => source.envVar === 'CODEX_HOME')
-    const cleanup = async () => { try { await removeAuthCopies(copiedWritableAuth) } finally { await config.cleanup() } }
-    const store = nativeHome
-      ? { effectiveNativeStore: { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } }
-      : {}
-    if (!router) {
-      bwrapArgs.push('--chdir', spec.projectDir, '--die-with-parent', bin, ...args)
-      return { bin: BWRAP_BIN, args: bwrapArgs, ...store, cleanup }
+    bwrapArgs.push('--chdir', spec.projectDir, '--die-with-parent', ...egress.prefix, bin, ...args)
+    return {
+      bin: BWRAP_BIN,
+      args: bwrapArgs,
+      ...(nativeHome
+        ? { effectiveNativeStore: { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } }
+        : {}),
+      cleanup: async () => {
+        try { await removeAuthCopies(copiedWritableAuth) } finally {
+          try { await egress.cleanup() } finally { await config.cleanup() }
+        }
+      },
     }
-    return launchRouter(bwrapArgs, spec.projectDir, bin, args, { ...store, cleanup })
-  }
-}
-
-const ROUTER_HOST = 'router.tangle.tools'
-
-/** Unshared net plus slirp, then nft drops every destination except the Router. */
-async function launchRouter(
-  bwrapArgs: string[],
-  projectDir: string,
-  bin: string,
-  args: string[],
-  wrap: Pick<JailWrap, 'cleanup' | 'effectiveNativeStore'>,
-): Promise<JailWrap> {
-  const ips = [...new Set(await resolve4(ROUTER_HOST))]
-  if (ips.length === 0) throw new Error(`jail network: ${ROUTER_HOST} did not resolve`)
-  const dir = await mkdtemp(join(tmpdir(), 'cli-bridge-net-'))
-  const allow = ips.map((ip) => `ip daddr ${ip} tcp dport 443 accept`).join('\n    ')
-  const rules = `table inet jail {\n  chain output {\n    type filter hook output priority 0; policy drop;\n    oifname "lo" accept\n    ${allow}\n  }\n}\n`
-  const enter = `#!/bin/sh\nnft -f /jail-net.nft || exit 125\nexec setpriv --nnp --bounding-set -all --inh-caps -all --ambient-caps -all -- "$@"\n`
-  await writeFile(join(dir, 'hosts'), `127.0.0.1 localhost\n${ips.map((ip) => `${ip} ${ROUTER_HOST}`).join('\n')}\n`)
-  await writeFile(join(dir, 'rules.nft'), rules)
-  await writeFile(join(dir, 'enter'), enter)
-  const supervisor = `import { spawn } from 'node:child_process'
-const child = spawn('bwrap', ${JSON.stringify([...bwrapArgs, '--ro-bind', join(dir, 'hosts'), '/etc/hosts', '--ro-bind', join(dir, 'rules.nft'), '/jail-net.nft', '--ro-bind', join(dir, 'enter'), '/jail-net-enter', '--info-fd', '3', '--block-fd', '4', '--chdir', projectDir, '--die-with-parent', '/bin/sh', '/jail-net-enter', bin, ...args])}, { stdio: ['ignore', 'inherit', 'inherit', 'pipe', 'pipe'] })
-let info = ''
-const pid = await new Promise((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error('jail network: no pid')), 5000)
-  child.stdio[3].on('data', (chunk) => { info += chunk; try { clearTimeout(timer); resolve(JSON.parse(info)['child-pid']) } catch {} })
-  child.on('exit', (code) => reject(new Error('bwrap exited ' + code + ' ' + info)))
-})
-const slirp = spawn('slirp4netns', ['--configure', '--disable-host-loopback', '--disable-dns', '--ready-fd', '3', '--userns-path', '/proc/' + pid + '/ns/user', '--netns-type', 'path', '/proc/' + pid + '/ns/net', 'tap0'], { stdio: ['ignore', 'inherit', 'inherit', 'pipe'] })
-await new Promise((resolve, reject) => {
-  const timer = setTimeout(() => reject(new Error('jail network: slirp not ready')), 5000)
-  slirp.stdio[3].once('data', () => { clearTimeout(timer); resolve() })
-  slirp.on('exit', (code) => reject(new Error('slirp exited ' + code)))
-})
-child.stdio[4].end('x')
-const code = await new Promise((resolve) => child.on('exit', resolve))
-try { slirp.kill('SIGKILL') } catch {}
-process.exit(code ?? 1)
-`
-  await writeFile(join(dir, 'supervise.mjs'), supervisor)
-  const previous = wrap.cleanup
-  return {
-    bin: process.execPath,
-    args: [join(dir, 'supervise.mjs')],
-    ...wrap,
-    cleanup: async () => { try { await previous?.() } finally { await rm(dir, { recursive: true, force: true }) } },
   }
 }
 

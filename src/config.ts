@@ -7,7 +7,8 @@
  * keys is the failure mode we refuse to allow.
  */
 
-import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailPathList } from './jail/resolve-spec.js'
+import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailNetwork, parseJailPathList } from './jail/resolve-spec.js'
+import type { JailNetwork } from './jail/egress.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 
@@ -82,8 +83,12 @@ export interface Config extends NativeHarnessConfig {
   jailMode: 'off' | 'write-jail' | 'fs-jail'
   /** Explicit policy when the configured OS jail is unavailable. */
   jailFallback: 'deny' | 'warn'
-  /** `BRIDGE_JAIL_NETWORK=none` forces no egress. `router` is not granted until a spawn asks. */
-  jailNetwork?: 'none' | 'router'
+  /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
+  jailNetwork?: JailNetwork
+  /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
+  ironProxyBin?: string
+  /** `BRIDGE_PROXY_SECRET_COMMAND`: mints and revokes a proxySecrets credential per spawn (see jail/egress.ts). */
+  proxySecretCommand?: string
   /**
    * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
    * resolve under the request cwd; absolute paths must stay inside it.
@@ -200,7 +205,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
     jailMode: jailFloor({ ...env, BRIDGE_JAIL_MODE: parseJailMode(env.BRIDGE_JAIL_MODE) }),
     jailFallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
-    ...parseJailNetwork(env.BRIDGE_JAIL_NETWORK),
+    ...optional('jailNetwork', parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')),
+    ...optional('ironProxyBin', env.BRIDGE_IRON_PROXY_BIN?.trim() || undefined),
+    ...optional('proxySecretCommand', env.BRIDGE_PROXY_SECRET_COMMAND?.trim() || undefined),
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
     ...resolveJailPathLists(env),
     trace: parseTraceConfig(env, dataDir),
@@ -301,11 +308,8 @@ function parsePrimeStateConfig(
   }
 }
 
-function parseJailNetwork(value: string | undefined): { jailNetwork?: 'none' | 'router' } {
-  const network = (value ?? '').trim()
-  if (network === '') return {}
-  if (network === 'none' || network === 'router') return { jailNetwork: network }
-  throw new Error(`invalid BRIDGE_JAIL_NETWORK: ${value} — expected none|router`)
+function optional<K extends string, V>(key: K, value: V | undefined): { [P in K]?: V } {
+  return (value === undefined ? {} : { [key]: value }) as { [P in K]?: V }
 }
 
 function parseJailMode(value: string | undefined): 'off' | 'write-jail' | 'fs-jail' {

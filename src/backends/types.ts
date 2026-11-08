@@ -305,7 +305,7 @@ export interface ChatRequest {
          * on. `root` is clamped inside the request cwd. Resolved to a
          * {@link JailSpec} on `jailSpec` by the chat route.
          */
-        jail?: { mode?: 'off' | 'write-jail' | 'fs-jail'; root?: string; network?: 'none' | 'router' }
+        jail?: { mode?: 'off' | 'write-jail' | 'fs-jail'; root?: string; network?: 'none' | 'router' | 'relay' }
         netJail?: never
         /** Caller-owned process deadline. Omit to allow the operator fallback, if configured. */
         timeoutMs?: number

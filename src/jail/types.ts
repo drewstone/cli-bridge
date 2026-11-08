@@ -3,6 +3,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import type { ProxySecretBinding } from '@tangle-network/agent-interface'
+import type { JailNetwork } from './egress.js'
 
 export interface JailSpec {
   /** Writable scratch root; becomes HOME inside the jail. Must resolve
@@ -17,8 +19,16 @@ export interface JailSpec {
   extraReadablePaths?: string[]
   /** fs-jail: allowlisted reads, fresh /tmp, workspace read-write. */
   readConfine?: boolean
-  /** Egress. Omitted and `none` unshare the network. `router` allows only the Tangle Router. */
-  network?: 'none' | 'router'
+  /** Egress (see egress.ts). Omitted means `none`. */
+  network?: JailNetwork
+  /** `relay` only: AgentProfile.proxySecrets, minted and revoked per spawn (see egress.ts). */
+  proxySecrets?: ProxySecretBinding[]
+  /** `BRIDGE_PROXY_SECRET_COMMAND`, required when `proxySecrets` is non-empty. */
+  proxySecretCommand?: string
+  /** `relay` only: the harness's vendor hosts (see egress.ts). Populated per backend. */
+  vendorHosts?: string[]
+  /** `BRIDGE_IRON_PROXY_BIN`, required when `proxySecrets` is non-empty. */
+  ironProxyBin?: string
   /** Refuse the operator's unconfined warn fallback for this request. */
   requireEnforcement?: boolean
   /** Captured operator fallback; absent means refuse unconfined execution. */

@@ -76,8 +76,12 @@ export interface Config extends NativeHarnessConfig {
     jailMode: 'off' | 'write-jail' | 'fs-jail';
     /** Explicit policy when the configured OS jail is unavailable. */
     jailFallback: 'deny' | 'warn';
-    /** `BRIDGE_JAIL_NETWORK=none` forces no egress. `router` is not granted until a spawn asks. */
-    jailNetwork?: 'none' | 'router';
+    /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
+    jailNetwork?: 'none' | 'router' | 'relay';
+    /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
+    ironProxyBin?: string;
+    /** `BRIDGE_PROXY_SECRET_COMMAND`: mints and revokes a proxySecrets credential per spawn (see jail/egress.ts). */
+    proxySecretCommand?: string;
     /**
      * Default writable jail root from `BRIDGE_JAIL_ROOT`. Relative paths
      * resolve under the request cwd; absolute paths must stay inside it.
