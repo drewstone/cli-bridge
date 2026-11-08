@@ -132,7 +132,7 @@ export class CodexBackend implements Backend {
     const releasePreparation = await this.acquireAuthPreparation(signal)
     let codexHome: ReturnType<typeof materializeMcpServersForCodex>
     try {
-      codexHome = materializeMcpServersForCodex(resolveMcpServers(req, null), resolveCodexAuthPath(), nativeHome)
+      codexHome = materializeMcpServersForCodex(resolveMcpServers(req, null, { backend: this.name, privateMcpConfig: true }), resolveCodexAuthPath(), nativeHome)
     } finally {
       releasePreparation()
     }
@@ -223,7 +223,7 @@ export class CodexBackend implements Backend {
 
     // Session leases own native state; the account turn lease owns auth rotation.
     // Keep native state across turns, but regenerate MCP config and auth links.
-    const mcpServers = resolveMcpServers(req, session)
+    const mcpServers = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true })
     const externalId = req.session_id ?? session?.externalId
     const nativeHome = this.opts.stateDir && externalId
       ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))

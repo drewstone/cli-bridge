@@ -106,19 +106,20 @@ export const retainedEnvSchema = z.record(envName, boundedString)
   .refine((value) => Object.keys(value).length <= RETAINED_MAX_ENV_ENTRIES, 'environment has too many entries')
 
 /**
- * agent-runtime's loopback coordination bearer. The value is a secret-ref
- * payload for the coordination MCP header, not a caller-owned env name.
+ * agent-runtime's loopback coordination bearer. Chat ingress lifts this one
+ * name off env onto the in-memory request. It is not a caller-owned env name.
  */
 export const RUNTIME_COORDINATION_ENV_NAME = 'AGENT_RUNTIME_COORDINATION_TOKEN'
 
-/** Drop the runtime coordination bearer before durable identity or session storage. */
-export function omitRuntimeCoordinationEnv(
+/** Move the coordination bearer off env. Callers keep the value in memory only. */
+export function takeRuntimeCoordinationBearer(
   env: Record<string, string> | undefined,
-): Record<string, string> | undefined {
-  if (env === undefined || !Object.hasOwn(env, RUNTIME_COORDINATION_ENV_NAME)) return env
+): { env: Record<string, string> | undefined; bearer: string | undefined } {
+  if (env === undefined || !Object.hasOwn(env, RUNTIME_COORDINATION_ENV_NAME)) return { env, bearer: undefined }
+  const bearer = env[RUNTIME_COORDINATION_ENV_NAME]
   const retained = { ...env }
   delete retained[RUNTIME_COORDINATION_ENV_NAME]
-  return Object.keys(retained).length === 0 ? undefined : retained
+  return { env: Object.keys(retained).length === 0 ? undefined : retained, bearer }
 }
 
 export const retainedPublicRecordSchema = z.custom<Record<string, unknown>>(
@@ -230,7 +231,7 @@ export function parseSafeRetainedEnv(value: unknown): Record<string, string> {
   if (!parsed.success) throw new Error('environment contains unsupported names or values')
   if (containsSecretShapedValue(parsed.data)) throw new Error('environment contains a credential-bearing value')
   for (const name of Object.keys(parsed.data)) {
-    if (name !== RUNTIME_COORDINATION_ENV_NAME && isCredentialBearingProfileConfigName(name)) {
+    if (isCredentialBearingProfileConfigName(name)) {
       throw new Error(`environment variable ${JSON.stringify(name)} is credential-bearing`)
     }
     if (isRetainedProcessControlEnvironmentName(name)) {

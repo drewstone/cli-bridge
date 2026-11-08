@@ -71,7 +71,7 @@ class HarnessMcpBackend implements Backend {
   async health() { return { name: this.name, state: 'ready' as const } }
   async *chat(req: ChatRequest, session: SessionRecord | null): AsyncIterable<ChatDelta> {
     this.last = req
-    this.lastSpecs = resolveMcpServers(req, session)
+    this.lastSpecs = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true })
     const materialized = writeMcpConfigFile(this.lastSpecs)
     this.lastConfig = materialized
       ? JSON.parse(readFileSync(materialized.configPath, 'utf8'))
@@ -288,7 +288,7 @@ describe('runtime attachments — chat completions', () => {
     expect(response.status).toBe(400)
     const body = await response.json() as { error: { message: string } }
     expect(body.error.message).toContain('AGENT_RUNTIME_COORDINATION_TOKEN')
-    expect(body.error.message).toContain('not in the request environment')
+    expect(body.error.message).toContain('is not on this request')
     expect(body.error.message).not.toContain('Bearer')
   })
 
@@ -560,6 +560,48 @@ describe('runtime coordination bearer through chat completions', () => {
       sessions.close()
       rmSync(dir, { recursive: true, force: true })
       rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses the coordination secret-ref for a backend whose MCP config is not private', async () => {
+    class PublicMcpBackend implements Backend {
+      readonly name = 'pi'
+      matches(model: string): boolean { return model === 'pi' }
+      async health() { return { name: this.name, state: 'ready' as const } }
+      async *chat(req: ChatRequest, session: SessionRecord | null): AsyncIterable<ChatDelta> {
+        resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false })
+        yield { finish_reason: 'stop' }
+      }
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-coord-pi-'))
+    const sessions = new SessionStore(dir)
+    const app = new Hono()
+    mountChatCompletions(app, {
+      registry: new BackendRegistry().register(new PublicMcpBackend()),
+      sessions,
+      runs: new RunRegistry(),
+    })
+    try {
+      const response = await app.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'pi',
+          messages: [{ role: 'user', content: 'settle' }],
+          env: { AGENT_RUNTIME_COORDINATION_TOKEN: token },
+          runtime_attachments: { mcp: { coordination: attachment } },
+        }),
+      })
+      const body = await response.text()
+      const message = (JSON.parse(body) as { error: { message: string } }).error.message
+      expect(response.status).toBe(400)
+      expect(message).toContain('AGENT_RUNTIME_COORDINATION_TOKEN')
+      expect(message).toContain('backend "pi"')
+      expect(message).toContain('not private')
+      expect(body).not.toContain(token)
+    } finally {
+      sessions.close()
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })

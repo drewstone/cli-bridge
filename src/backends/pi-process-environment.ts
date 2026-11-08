@@ -1,4 +1,4 @@
-import { omitRuntimeCoordinationEnv, parseSafeRetainedEnv } from '../sessions/retained/contract.js'
+import { parseSafeRetainedEnv } from '../sessions/retained/contract.js'
 
 const PI_INHERITED_ENV_KEYS = [
   'HOME',
@@ -39,17 +39,11 @@ export function piToolProcessEnvironment(
     const value = inherited[key]
     if (typeof value === 'string' && value.length > 0) child[key] = value
   }
-  // The coordination bearer is request-scoped so the MCP header can be
-  // resolved. It is not a Pi tool variable, and this map is the child env.
-  const safeRequestValues = parseSafeRetainedEnv(
-    omitRuntimeCoordinationEnv(
-      Object.fromEntries(
-        Object.entries(requestValues).filter(
-          (entry): entry is [string, string] => typeof entry[1] === 'string',
-        ),
-      ),
-    ) ?? {},
-  )
+  const safeRequestValues = parseSafeRetainedEnv(Object.fromEntries(
+    Object.entries(requestValues).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
+  ))
   for (const [key, value] of Object.entries(safeRequestValues)) child[key] = value
   return child
 }

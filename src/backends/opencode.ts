@@ -145,7 +145,7 @@ export class OpencodeBackend implements Backend {
         tools?: Record<string, boolean>
       } | null
       mcpMaterialized = materializeMcpServersForOpencode(
-        resolveMcpServers(req, session),
+        resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }),
         profileForControls?.permissions,
         profileForControls?.tools,
         req.session_id,

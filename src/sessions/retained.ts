@@ -35,7 +35,6 @@ import {
 import {
   parseSafeCallerMetadata,
   parseSafeRetainedMcp,
-  omitRuntimeCoordinationEnv,
   parseSafeRetainedEnv,
   parseSafePublicRecord,
   snapshotRetainedAgentProfile,
@@ -184,7 +183,7 @@ export class RetainedSessionService {
     let providerOptions: Record<string, unknown> | undefined
     try {
       profile = input.agent_profile === undefined ? null : snapshotRetainedAgentProfile(input.agent_profile)
-      env = input.env === undefined ? undefined : omitRuntimeCoordinationEnv(parseSafeRetainedEnv(input.env))
+      env = input.env === undefined ? undefined : parseSafeRetainedEnv(input.env)
       mcp = input.mcp === undefined ? undefined : parseSafeRetainedMcp(input.mcp)
       runtimeAttachments = input.runtime_attachments === undefined
         ? undefined

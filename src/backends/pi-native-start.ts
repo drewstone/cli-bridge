@@ -125,7 +125,7 @@ export async function startPiNativeSession(
   const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
   const thinking = nativeReasoningControl('pi', requestedReasoningEffort)
   const executionIdentity = profileExecutionIdentity(req, session, 'pi', thinking)
-  const mcpSpecs = resolveMcpServers(req, session)
+  const mcpSpecs = resolveMcpServers(req, session, { backend: 'pi', privateMcpConfig: false })
   const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []
   const mcpAdapterPath = requestedMcpNames.length > 0 ? resolvePiMcpAdapterInstallPath() : null
   if (requestedMcpNames.length > 0 && (!piMcpAdapterAvailable() || !mcpAdapterPath)) {

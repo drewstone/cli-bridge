@@ -75,7 +75,7 @@ import { isLoopbackRequest } from '../http/request-source.js'
 import {
   parseSafeCallerMetadata,
   parseSafeRetainedMcp,
-  parseSafeRetainedEnv, omitRuntimeCoordinationEnv,
+  parseSafeRetainedEnv, takeRuntimeCoordinationBearer,
   parseSafePublicRecord,
   retainedEnvSchema,
   retainedExecutionSchema,
@@ -582,12 +582,12 @@ export function mountChatCompletions(
     const requestedAcquireTimeoutMs = effectiveExecution?.kind === 'sandbox'
       ? undefined
       : effectiveExecution?.acquireTimeoutMs
-    let effectiveEnv: Record<string, string> | undefined
+    let effectiveEnv: Record<string, string> | undefined, runtimeCoordinationBearer: string | undefined
     try {
-      const storedEnv = persistedSession?.metadata.env
-      effectiveEnv = env === undefined
-        ? storedEnv === undefined ? undefined : parseSafeRetainedEnv(storedEnv)
-        : parseSafeRetainedEnv(env)
+      const taken = takeRuntimeCoordinationBearer(env)
+      runtimeCoordinationBearer = taken.bearer
+      const sourceEnv = env === undefined ? persistedSession?.metadata.env : taken.env
+      effectiveEnv = sourceEnv === undefined ? undefined : parseSafeRetainedEnv(sourceEnv)
     } catch (error) {
       return invalidRequest(c, error instanceof Error ? error.message : String(error))
     }
@@ -704,7 +704,7 @@ export function mountChatCompletions(
         : {}),
       ...(cwd ? { cwd } : {}),
       ...(effectiveExecution ? { execution: effectiveExecution } : {}),
-      ...(effectiveEnv ? { env: effectiveEnv } : {}),
+      ...(effectiveEnv ? { env: effectiveEnv } : {}), ...(runtimeCoordinationBearer ? { runtimeCoordinationBearer } : {}),
       ...(effectiveContext ? { context: effectiveContext } : {}),
       ...(effectiveProviderOptions ? { providerOptions: effectiveProviderOptions } : {}),
       ...(protectedModelCredential ? { protectedModelCredential } : {}),
@@ -1508,7 +1508,7 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
     // dispatcher that restarts re-issues the same job from a new port, and
     // that reconnect must re-attach to the in-flight run, not conflict.
     runtime_attachments: _runtimeAttachments,
-    protectedModelCredential,
+    protectedModelCredential, runtimeCoordinationBearer: _runtimeCoordinationBearer,
     ...executionRequest
   } = req
   // The request originated as JSON, but object spreads can reintroduce
@@ -1518,7 +1518,7 @@ function durableRunRequestDigest(req: ChatRequest, backend: string): string {
   const normalized = JSON.parse(JSON.stringify({
     schema: 'cli-bridge.durable-run-request.v1',
     backend,
-    request: { ...executionRequest, env: omitRuntimeCoordinationEnv(executionRequest.env) },
+    request: { ...executionRequest },
     ...(protectedModelCredential
       ? {
           protectedModelCredentialDigest: protectedModelCredential.digest,

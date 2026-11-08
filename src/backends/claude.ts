@@ -309,7 +309,7 @@ export class ClaudeBackend implements Backend {
     // One MCP authority reaches this point: profile MCP for an exact profile,
     // otherwise body/header MCP. `resolveMcpServers` refuses mixed channels.
     const mcpMaterialized = writeMcpConfigFile(
-      resolveMcpServers(req, session),
+      resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }),
       req.session_id,
     )
     // The file holds the coordination bearer. Every exit, including a throw

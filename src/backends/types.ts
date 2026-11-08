@@ -284,6 +284,8 @@ export interface ChatRequest {
   cwd?: string
   /** Public, non-secret environment entries requested for this execution. */
   env?: Record<string, string>
+  /** In-memory coordination bearer lifted off env at chat ingress. Never serialized. */
+  runtimeCoordinationBearer?: string
   /** Canonical portable context defaults and per-turn overrides. */
   context?: Record<string, unknown>
   /** Canonical provider options preserved across retained-session restart. */

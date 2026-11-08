@@ -28,7 +28,6 @@ import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { AgentProfile } from '@tangle-network/agent-interface'
 import { contentToText } from './content.js'
-import { omitRuntimeCoordinationEnv } from '../sessions/retained/contract.js'
 
 export interface SandboxBackendOptions {
   /** Tangle sandbox-api base URL, e.g. `https://sandbox.tangle.tools`. */
@@ -104,11 +103,10 @@ export class SandboxBackend implements Backend {
     const requestMetadata = (req.metadata ?? {}) as Record<string, unknown>
     const { forwardedAuthorization: _forwardedAuthorization, sandboxBackendType: _sandboxBackendType, ...publicMetadata } = requestMetadata
 
-    const forwardedEnv = omitRuntimeCoordinationEnv(req.env)
     const requestBody = {
       tasks: [{ id: taskId, message, ...(timeoutMs > 0 ? { timeoutMs } : {}) }],
       backend: { type: backendType, profile },
-      ...(forwardedEnv ? { env: forwardedEnv } : {}),
+      ...(req.env ? { env: req.env } : {}),
       ...(Object.keys(publicMetadata).length > 0 ? { metadata: publicMetadata } : {}),
       ...(timeoutMs > 0 ? { timeoutMs } : {}),
       scalingMode: 'balanced' as const,

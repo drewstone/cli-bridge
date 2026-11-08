@@ -30,6 +30,7 @@ import { resolveAgentProfile, requireMaterializationCwd } from './profile-suppor
 export function resolveMcpServers(
   req: ChatRequest,
   session: SessionRecord | null,
+  destination: { backend: string; privateMcpConfig: boolean } = { backend: 'unspecified', privateMcpConfig: false },
 ): Record<string, McpServerSpec> | null {
   const merged: Record<string, McpServerSpec> = {}
 
@@ -89,7 +90,7 @@ export function resolveMcpServers(
         { ...raw, type: raw.transport },
         name,
         `runtime_attachments.mcp[${JSON.stringify(name)}]`,
-        req.env ?? {},
+        { ...destination, bearer: req.runtimeCoordinationBearer },
       )
     }
   }
@@ -110,7 +111,7 @@ export function resolveMcpServers(
  * writing the reference object is nonsense to the harness, and writing a placeholder turns an auth
  * failure into what looks like a broken tool. The refusal names the reference KEY, never a value.
  * The one exception is a runtime-attachment header whose secret-ref key is
- * AGENT_RUNTIME_COORDINATION_TOKEN: that bearer is taken from the request env.
+ * AGENT_RUNTIME_COORDINATION_TOKEN: the in-memory bearer, and only a private MCP config.
  *
  * `args` is refused for a second, stronger reason: those strings become the MCP server's argv,
  * which is readable by every process on the host (`/proc/<pid>/cmdline`) and lies outside every
@@ -143,29 +144,33 @@ function publicMcpConfigString(value: unknown, where: string): string {
 }
 
 /**
- * Resolve agent-runtime's coordination secret-ref from the request env.
+ * Resolve agent-runtime's coordination secret-ref from the in-memory bearer.
  *
  * Returns undefined for every other value so the public-value refusal stays.
- * An env argument means this channel may resolve that one name.
+ * A destination may resolve that one name only when its MCP config is private.
  */
 function resolveRuntimeCoordinationHeader(
   value: unknown,
   where: string,
-  env: Record<string, string> | undefined,
+  destination: { backend: string; privateMcpConfig: boolean; bearer?: string } | undefined,
 ): string | undefined {
-  if (!value || typeof value !== 'object' || env === undefined) return undefined
+  if (!value || typeof value !== 'object' || destination === undefined) return undefined
   const config = value as { kind?: unknown; key?: unknown; format?: unknown }
   if (config.kind !== 'secret-ref' || config.key !== RUNTIME_COORDINATION_ENV_NAME) return undefined
+  if (!destination.privateMcpConfig) throw new BackendError(
+    `AgentProfile ${where} secret-ref ${JSON.stringify(RUNTIME_COORDINATION_ENV_NAME)} cannot be written for backend ${JSON.stringify(destination.backend)} because its MCP config is not private`,
+    'parse_error',
+  )
   if (config.format !== undefined && config.format !== 'bearer') {
     throw new BackendError(
       `AgentProfile ${where} secret-ref ${JSON.stringify(RUNTIME_COORDINATION_ENV_NAME)} must use bearer format`,
       'parse_error',
     )
   }
-  const secret = env[RUNTIME_COORDINATION_ENV_NAME]
+  const secret = destination.bearer
   if (typeof secret !== 'string' || secret.length === 0 || /[\r\n\0]/u.test(secret)) {
     throw new BackendError(
-      `AgentProfile ${where} secret-ref ${JSON.stringify(RUNTIME_COORDINATION_ENV_NAME)} is not in the request environment`,
+      `AgentProfile ${where} secret-ref ${JSON.stringify(RUNTIME_COORDINATION_ENV_NAME)} is not on this request`,
       'parse_error',
     )
   }
@@ -176,14 +181,14 @@ function resolveRuntimeCoordinationHeader(
 function publicMcpConfigRecord(
   record: Record<string, AgentProfileConfigValue> | undefined,
   where: string,
-  env?: Record<string, string>,
+  destination?: { backend: string; privateMcpConfig: boolean; bearer?: string },
 ): Record<string, string> {
   const out: Record<string, string> = {}
   if (!record || typeof record !== 'object') return out
   for (const [key, value] of Object.entries(record)) {
     if (value === undefined) continue
     const place = `${where}[${JSON.stringify(key)}]`
-    out[key] = resolveRuntimeCoordinationHeader(value, place, env) ?? publicMcpConfigString(value, place)
+    out[key] = resolveRuntimeCoordinationHeader(value, place, destination) ?? publicMcpConfigString(value, place)
   }
   return out
 }
@@ -192,7 +197,7 @@ function normalizeMcpServerSpec(
   raw: McpServerSpec | Record<string, unknown>,
   name: string,
   where = `mcp.mcpServers[${JSON.stringify(name)}]`,
-  env?: Record<string, string>,
+  destination?: { backend: string; privateMcpConfig: boolean; bearer?: string },
 ): McpServerSpec {
   // Defensive copy — drop any unknown fields, coerce types loosely.
   const r = raw as Record<string, unknown>
@@ -214,7 +219,7 @@ function normalizeMcpServerSpec(
     out.headers = publicMcpConfigRecord(
       r.headers as Record<string, AgentProfileConfigValue>,
       `${where}.headers`,
-      env,
+      destination,
     )
   }
   if (typeof r.enabled === 'boolean') out.enabled = r.enabled
