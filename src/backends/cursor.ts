@@ -34,7 +34,7 @@ export class CursorBackend implements Backend {
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'])
-    if (req.agent_profile || session?.metadata.agent_profile || resolveMcpServers(req, session)
+    if (req.agent_profile || session?.metadata.agent_profile || resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false })
       || req.env && Object.keys(req.env).length > 0 || req.effort || req.temperature !== undefined || req.max_tokens !== undefined || req.messages.some((message) => typeof message.content !== 'string' && message.content !== null)) {
       throw new BackendError('Cursor CLI supports text turns and native resume; exact profiles, public env, MCP, reasoning overrides and attachments are not configured', 'capability_denied')
     }

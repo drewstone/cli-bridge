@@ -398,7 +398,7 @@ export class PrimeBackend implements Backend {
     // enabled:false are OFF, not requested). The fork evidence is the shared
     // refusal reason, so this backend and the in-sandbox adapter cite the same
     // facts and a fork change moves one string.
-    const mcpSpecs = resolveMcpServers(req, session)
+    const mcpSpecs = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false })
     if (mcpSpecs && Object.keys(mcpSpecs).length > 0) {
       throw new BackendError(
         `backend prime cannot mount MCP servers (requested: ${Object.keys(mcpSpecs).join(', ')}): `

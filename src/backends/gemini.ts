@@ -90,7 +90,7 @@ export class GeminiBackend implements Backend {
     // layering the project settings over the user's global ones. Cleanup in
     // the outer finally restores the workspace so it never leaks. Fail-loud:
     // a symlink/lock violation throws rather than silently dropping MCP.
-    const mcpMaterialized = materializeMcpServersForGemini(resolveMcpServers(req, session), cwd)
+    const mcpMaterialized = materializeMcpServersForGemini(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false }), cwd)
 
     let spawned: Awaited<ReturnType<Spawner>>
     try {

@@ -131,7 +131,7 @@ export class KimiBackend implements Backend {
       // Kimi Code discovers request-scoped MCP from the project-local
       // `<cwd>/.kimi-code/mcp.json`; the mount restores the original file
       // after this process exits and serializes overlapping runs.
-      mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session), cwd)
+      mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false }), cwd)
 
       const childEnv = { ...process.env, ...provisioned.env }
       await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,

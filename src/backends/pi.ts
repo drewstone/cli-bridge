@@ -520,7 +520,7 @@ export class PiBackend implements NativeSessionBackend {
     // config flag. FAIL-LOUD, not fail-safe: if the caller
     // requested MCP tools pi can't provide, reject the request — a
     // silently tool-less run scores zero for the wrong reason.
-    const mcpSpecs = resolveMcpServers(req, session)
+    const mcpSpecs = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false })
     const requestedMcpNames = mcpSpecs ? Object.keys(buildCanonicalMcpServers(mcpSpecs)) : []
     const mcpAdapterPath = requestedMcpNames.length > 0
       ? resolvePiMcpAdapterInstallPath()

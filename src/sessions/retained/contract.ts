@@ -105,6 +105,23 @@ const envName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u).max(256)
 export const retainedEnvSchema = z.record(envName, boundedString)
   .refine((value) => Object.keys(value).length <= RETAINED_MAX_ENV_ENTRIES, 'environment has too many entries')
 
+/**
+ * agent-runtime's loopback coordination bearer. Chat ingress lifts this one
+ * name off env onto the in-memory request. It is not a caller-owned env name.
+ */
+export const RUNTIME_COORDINATION_ENV_NAME = 'AGENT_RUNTIME_COORDINATION_TOKEN'
+
+/** Move the coordination bearer off env. Callers keep the value in memory only. */
+export function takeRuntimeCoordinationBearer(
+  env: Record<string, string> | undefined,
+): { env: Record<string, string> | undefined; bearer: string | undefined } {
+  if (env === undefined || !Object.hasOwn(env, RUNTIME_COORDINATION_ENV_NAME)) return { env, bearer: undefined }
+  const bearer = env[RUNTIME_COORDINATION_ENV_NAME]
+  const retained = { ...env }
+  delete retained[RUNTIME_COORDINATION_ENV_NAME]
+  return { env: Object.keys(retained).length === 0 ? undefined : retained, bearer }
+}
+
 export const retainedPublicRecordSchema = z.custom<Record<string, unknown>>(
   (value) => typeof value === 'object' && value !== null && !Array.isArray(value) && isBoundedJsonValue(value),
   { message: 'object exceeds retained request bounds' },

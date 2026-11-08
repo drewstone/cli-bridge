@@ -39,13 +39,11 @@ export function piToolProcessEnvironment(
     const value = inherited[key]
     if (typeof value === 'string' && value.length > 0) child[key] = value
   }
-  const safeRequestValues = parseSafeRetainedEnv(
-    Object.fromEntries(
-      Object.entries(requestValues).filter(
-        (entry): entry is [string, string] => typeof entry[1] === 'string',
-      ),
+  const safeRequestValues = parseSafeRetainedEnv(Object.fromEntries(
+    Object.entries(requestValues).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
     ),
-  )
+  ))
   for (const [key, value] of Object.entries(safeRequestValues)) child[key] = value
   return child
 }

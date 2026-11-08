@@ -173,7 +173,7 @@ export function sanitizeLegacySessionMetadata(value: unknown): Record<string, un
     const candidate = source[key]
     if (key === 'env' && candidate !== undefined) {
       try {
-        metadata.env = parseSafeRetainedEnv(candidate)
+        { const parsedEnv = parseSafeRetainedEnv(candidate); if (parsedEnv) metadata.env = parsedEnv }
       } catch {
         // Unsafe legacy environment values are omitted before they can be replayed.
       }

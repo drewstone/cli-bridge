@@ -99,7 +99,7 @@ export class AcpBackend implements Backend {
     // temp file. Schema verified live against `hermes acp`: remote is
     // `{type, name, url, headers:[{name,value}]}`, stdio is
     // `{name, command, args, env:[{name,value}]}`.
-    const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session))
+    const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
 
     const spawned = await this.spawner(this.bin, this.acpArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
