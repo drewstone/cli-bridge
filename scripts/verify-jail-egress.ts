@@ -51,8 +51,9 @@ printf '%s' "$out"
 `)
 await chmod(wrapper, 0o700)
 
-const floor = resolveJailSpec({ execMode: 'fs-jail', execNetwork: 'relay', cwd: '/tmp', env: { BRIDGE_JAIL_NETWORK: 'none' } })
-assert.equal(floor?.network, 'none', 'a none floor must cap a relay request')
+const capped = (ask: string, operator?: string) => resolveJailSpec({ execMode: 'fs-jail', execNetwork: ask, cwd: '/tmp', env: operator ? { BRIDGE_JAIL_NETWORK: operator } : {} })?.network
+assert.equal(capped('relay', 'none'), 'none', 'a none operator setting must cap a relay request')
+assert.equal(capped('relay'), 'router', 'without an operator setting, relay is capped at router')
 
 /** Runs inside the jail: each check is a command whose exit status and output tail come back. */
 const probe = `
@@ -71,17 +72,17 @@ const fronting = (name: string) =>
   `echo | timeout 10 openssl s_client -proxy 127.0.0.1:3128 -connect router.tangle.tools:443 -servername ${name} 2>&1 | grep -q 'subject=' && exit 0 || exit 1`
 const blocked = { npm: curl('https://registry.npmjs.org/'), discord: curl('https://discord.com/'), github: curl('https://github.com/') }
 // The key reaches curl on stdin, never argv.
-const routerTurn = `printf 'authorization: Bearer %s' "$TANGLE_ROUTER_KEY" | curl -sS --max-time 40 -o /dev/null -w '%{http_code}' https://router.tangle.tools/v1/chat/completions -H @- -H 'content-type: application/json' -d '{"model":"zai/glm-5.3","messages":[{"role":"user","content":"Reply with the single word pong."}],"max_tokens":32}' | grep -qx 200`
+const routerTurn = `printf 'authorization: Bearer %s' "$TANGLE_ROUTER_KEY" | curl -sS --max-time 40 -o /dev/null -w '%{http_code}' https://router.tangle.tools/v1/chat/completions -H @- -H 'content-type: application/json' -d '{"model":"zai/glm-5.3","messages":[{"role":"user","content":"Reply with the single word pong."}],"max_tokens":32}'`
 
 type Result = Record<string, { status: number | null; tail: string }> & { environ: string }
 
-async function scenario(network: 'none' | 'router' | 'relay', checks: Record<string, string>, profile?: unknown) {
+async function scenario(network: 'none' | 'router' | 'relay', checks: Record<string, string>, profile?: unknown, mode: 'fs-jail' | 'write-jail' = 'fs-jail') {
   const directory = await mkdtemp(join(tmpdir(), 'verify-egress-run-'))
   const workspace = join(directory, 'workspace')
   await mkdir(workspace)
   const config = loadConfig({
     BRIDGE_BACKENDS: '', BRIDGE_DATA_DIR: join(directory, 'state'), BRIDGE_TRACE: 'off',
-    BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_JAIL_FALLBACK: 'deny',
+    BRIDGE_JAIL_MODE: mode, BRIDGE_JAIL_FALLBACK: 'deny', BRIDGE_JAIL_NETWORK: network,
     BRIDGE_IRON_PROXY_BIN: process.env.BRIDGE_IRON_PROXY_BIN, BRIDGE_PROXY_SECRET_COMMAND: wrapper,
   })
   const built = await buildApp(config)
@@ -114,7 +115,7 @@ async function scenario(network: 'none' | 'router' | 'relay', checks: Record<str
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'net-probe', messages: [{ role: 'user', content: 'egress probe' }], cwd: workspace,
-        execution: { kind: 'host', jail: { mode: 'fs-jail', network } },
+        execution: { kind: 'host', jail: { mode, network } },
         ...(profile ? { agent_profile: profile } : {}),
       }),
       signal: AbortSignal.timeout(300_000),
@@ -136,6 +137,13 @@ const failed = (r: { status: number | null; tail: string }) => r.status !== 0 ||
 const none = await scenario('none', { github: blocked.github, router: curl('https://router.tangle.tools/') })
 for (const name of ['github', 'router']) assert.ok(failed(none.result[name]!), `none ${name}: ${none.result[name]!.tail}`)
 
+// A write-jail sees the host root, but never a sibling spawn's relay socket directory.
+await mkdir(join(tmpdir(), 'cbe'), { recursive: true, mode: 0o700 })
+const sibling = await mkdtemp(join(tmpdir(), 'cbe', 's-'))
+const writeNone = await scenario('none', { siblings: `test -z "$(ls -A ${join(tmpdir(), 'cbe')})"` }, undefined, 'write-jail')
+assert.equal(writeNone.result.siblings!.status, 0, 'a write-jail can list another spawn\'s egress directory')
+await rm(sibling, { recursive: true, force: true })
+
 // router: one model turn; everything else, including SNI fronting on the Router's address, fails.
 const router = await scenario('router', {
   ...blocked, frontNpm: fronting('registry.npmjs.org'), frontDiscord: fronting('discord.com'),
@@ -143,7 +151,7 @@ const router = await scenario('router', {
 })
 for (const name of ['npm', 'discord', 'github']) assert.ok(failed(router.result[name]!), `router ${name}: ${router.result[name]!.tail}`)
 for (const name of ['frontNpm', 'frontDiscord']) assert.notEqual(router.result[name]!.status, 0, `router ${name} completed a TLS handshake`)
-if (routerKey) assert.equal(router.result.turn!.status, 0, `router turn: ${redact(router.result.turn!.tail)}`)
+if (routerKey) assert.equal(router.result.turn!.tail.trim(), '200', `router turn: ${redact(router.result.turn!.tail)}`)
 
 // relay: GitHub only through iron-proxy with a placeholder credential.
 const profile = {
@@ -189,7 +197,7 @@ const hits = texts.flatMap((text) => text.match(/[A-Za-z0-9_\-.]{20,}/gu) ?? [])
   .filter((token) => createHash('sha256').update(token).digest('hex') === secretHash)
 assert.equal(hits.length, 0, 'the real secret appears under the jail root, its environ or logs')
 
-for (const dir of [none.directory, router.directory, relay.directory, scratch]) await rm(dir, { recursive: true, force: true })
+for (const dir of [none.directory, writeNone.directory, router.directory, relay.directory, scratch]) await rm(dir, { recursive: true, force: true })
 console.log('PASS jail egress: none reaches nothing; router fails closed (incl. SNI fronting); relay pushes through iron-proxy with a placeholder and cannot create a PR; secret hash absent')
 console.log(JSON.stringify({
   router: { turn: routerKey ? 'completed' : 'skipped (no TANGLE_ROUTER_KEY)', npm: router.result.npm!.tail, discord: router.result.discord!.tail },

@@ -13,6 +13,7 @@
  * nothing else, and never echo the token in an error.
  */
 
+const GITHUB_HOSTS = new Set(['github.com', 'api.github.com', 'codeload.github.com'])
 const HUB_MINT_URL = process.env.TANGLE_HUB_URL ?? 'https://id.tangle.tools/v1/hub/github-app/mint-installation-token'
 
 const verb = process.argv[2]
@@ -21,6 +22,9 @@ const input = JSON.parse(await readStdin())
 if (verb === 'mint') {
   const repo = /^github:([A-Za-z0-9-]+\/[A-Za-z0-9._-]+)$/u.exec(String(input.key))?.[1]
   if (!repo) fail('secretRef.key must be github:<owner>/<name>')
+  // The binding's hosts decide where iron-proxy presents the token; a GitHub token goes only to GitHub.
+  const hosts = Array.isArray(input.hosts) ? input.hosts : []
+  if (!hosts.length || hosts.some((host) => !GITHUB_HOSTS.has(host))) fail(`hosts must be within ${[...GITHUB_HOSTS].join(', ')}`)
   if (!process.env.TANGLE_API_KEY) fail('TANGLE_API_KEY is unset')
   const response = await fetch(HUB_MINT_URL, {
     method: 'POST',

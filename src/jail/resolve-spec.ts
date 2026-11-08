@@ -86,11 +86,15 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
   }
 }
 
-/** `BRIDGE_JAIL_NETWORK` is the operator default and ceiling: a request may narrow it, never widen it. Unset: default none, no ceiling. */
+/**
+ * `BRIDGE_JAIL_NETWORK` is the operator default and ceiling: a request may
+ * narrow it, never widen it. Unset: default none, ceiling router, so only an
+ * operator opts spawns into vendor hosts and proxySecrets.
+ */
 export function jailNetwork(requested: string | undefined, env: NodeJS.ProcessEnv): JailNetwork {
   const operator = parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')
   const ask = parseJailNetwork(requested, 'jail network') ?? operator ?? 'none'
-  const ceiling = operator ?? 'relay'
+  const ceiling = operator ?? 'router'
   return JAIL_NETWORK_RANK[ask] <= JAIL_NETWORK_RANK[ceiling] ? ask : ceiling
 }
 

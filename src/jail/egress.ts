@@ -21,7 +21,7 @@
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -63,7 +63,7 @@ interface JailEgressIntercept {
 }
 
 export interface PreparedEgress {
-  /** bwrap read-only binds for the shim and relay socket; the jail always unshares the network. */
+  /** bwrap args: the sibling-egress mask, then read-only binds for this spawn's shim and relay socket. */
   bwrapArgs: string[]
   /** Environment set inside the jail. */
   env: Record<string, string>
@@ -87,13 +87,24 @@ function proxySecretPlaceholder(envName: string): string {
 
 type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin'>
 
+/**
+ * Every spawn's relay socket and proxy state live under one parent that each
+ * jail covers with a fresh tmpfs before binding back only its own directory.
+ * A unix socket ignores network namespaces, so without this mask a write-jail
+ * (host root visible) could connect to a sibling spawn's relay and use its
+ * credential.
+ */
+const EGRESS_PARENT = join(tmpdir(), 'cbe')
+
 export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
   const network = spec.network ?? 'none'
   const bindings = spec.proxySecrets ?? []
   if (bindings.length && network !== 'relay') throw new Error('proxySecrets require execution.jail.network relay')
-  if (network === 'none') return { bwrapArgs: [], env: {}, prefix: [], cleanup: async () => {} }
+  const mask = ['--tmpfs', EGRESS_PARENT]
+  if (network === 'none') return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
 
-  const shared = await mkdtemp(join(tmpdir(), 'cbe-'))
+  await mkdir(EGRESS_PARENT, { recursive: true, mode: 0o700 })
+  const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
   if (socketPath.length > MAX_SOCKET_PATH) {
     await rm(shared, { recursive: true, force: true })
@@ -127,7 +138,7 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
     return {
-      bwrapArgs: ['--ro-bind', shared, shared, '--ro-bind', EGRESS_SHIM_PATH, EGRESS_SHIM_PATH],
+      bwrapArgs: [...mask, '--ro-bind', shared, shared, '--ro-bind', EGRESS_SHIM_PATH, EGRESS_SHIM_PATH],
       env,
       prefix: [process.execPath, EGRESS_SHIM_PATH, socketPath, SHIM_PORT],
       cleanup,
@@ -212,7 +223,7 @@ async function startIronProxy(
   bin: string,
   intercepts: readonly JailEgressIntercept[],
 ): Promise<{ child: ChildProcess; dir: string; tunnel: { host: string; port: number }; caCert: string }> {
-  const dir = await mkdtemp(join(tmpdir(), 'cbe-proxy-'))
+  const dir = await mkdtemp(join(EGRESS_PARENT, 'p-'))
   await chmod(dir, 0o700)
   try {
     await run(bin, ['generate-ca', '-outdir', dir, '-alg', 'ed25519'])

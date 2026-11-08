@@ -52,7 +52,10 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     return allow.has(port === HTTPS_PORT ? host : `${host}:${port}`)
   }
 
+  const open = new Set<Socket>()
   const server = createServer((client) => {
+    open.add(client)
+    client.once('close', () => open.delete(client))
     client.setNoDelay(true)
     const timer = setTimeout(() => client.destroy(), NAME_DEADLINE_MS)
     timer.unref()
@@ -70,13 +73,15 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
           log(`deny host=${host}:${port} reason=sni-mismatch sni=${sni ?? '<none>'}`)
           return void client.destroy()
         }
-        clearTimeout(timer)
         const upstream = intercepted.has(host)
           ? await openTunnel(options.intercept!.tunnel, host, port)
           : await dial(host, port, allow)
+        clearTimeout(timer)
+        if (client.destroyed) return void upstream.destroy()
         log(`allow host=${host}:${port}${intercepted.has(host) ? ' via=iron-proxy' : ''}`)
         upstream.write(Buffer.concat([hello.head, hello.rest]))
         const drop = () => { upstream.destroy(); client.destroy() }
+        client.once('close', () => upstream.destroy())
         upstream.on('error', drop)
         client.on('error', drop)
         client.pipe(upstream).pipe(client)
@@ -88,7 +93,13 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
       })
   })
   await listen(server, options.socketPath)
-  return { close: () => new Promise((resolve) => server.close(() => resolve())) }
+  // Close ends live tunnels too, so a held connection cannot delay the proxy kill and revoke.
+  return {
+    close: () => new Promise((resolve) => {
+      server.close(() => resolve())
+      for (const socket of open) socket.destroy()
+    }),
+  }
 }
 
 function normalizeTarget(entry: string): string {
@@ -142,10 +153,11 @@ function readUntil(
       return false
     }
     const onData = (chunk: Buffer) => { buf = Buffer.concat([buf, chunk]); check() }
-    const onEnd = () => reject(new Error('client-closed'))
+    const onEnd = () => reject(new Error('peer-closed'))
     if (check()) return
     socket.on('data', onData)
     socket.once('end', onEnd)
+    socket.once('error', onEnd)
     socket.resume()
   })
 }
@@ -158,7 +170,11 @@ function clientHelloEnd(buf: Buffer): number | null {
   return buf.length >= end ? end : null
 }
 
-/** SNI host name from one complete ClientHello record, or undefined when it names none. */
+/**
+ * SNI host name from one complete ClientHello record, or undefined when it
+ * names none. A hello carrying ECH or ESNI is refused: its outer name is not
+ * the origin the encrypted inner hello selects.
+ */
 function readSni(buf: Buffer): string | undefined {
   const recordEnd = 5 + buf.readUInt16BE(3)
   let p = 5
@@ -173,20 +189,21 @@ function readSni(buf: Buffer): string | undefined {
   if (p + 2 > recordEnd) return undefined
   const extensionsEnd = Math.min(p + 2 + buf.readUInt16BE(p), recordEnd)
   p += 2
+  let name: string | undefined
   while (p + 4 <= extensionsEnd) {
     const type = buf.readUInt16BE(p)
     const len = buf.readUInt16BE(p + 2)
     const body = p + 4
-    if (body + len > extensionsEnd) return undefined
+    if (body + len > extensionsEnd || type === 0xfe0d || type === 0xffce) return undefined
     if (type === 0x0000) {
       const nameType = buf[body + 2]
       const nameLen = buf.readUInt16BE(body + 3)
       if (nameType !== 0 || body + 5 + nameLen > body + len) return undefined
-      return buf.toString('latin1', body + 5, body + 5 + nameLen).toLowerCase()
+      name = buf.toString('latin1', body + 5, body + 5 + nameLen).toLowerCase()
     }
     p = body + len
   }
-  return undefined
+  return name
 }
 
 async function dial(host: string, port: number, allow: ReadonlySet<string>): Promise<Socket> {
@@ -201,6 +218,7 @@ async function dial(host: string, port: number, allow: ReadonlySet<string>): Pro
 /** CONNECT through iron-proxy's tunnel listener; resolves once it answers 200. */
 async function openTunnel(tunnel: { host: string; port: number }, host: string, port: number): Promise<Socket> {
   const socket = await connectTo(tunnel.host, tunnel.port)
+  socket.on('error', () => socket.destroy())
   socket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`)
   const { head, rest } = await readUntil(socket, (buf) => buf.indexOf('\r\n\r\n') >= 0 ? buf.indexOf('\r\n\r\n') + 4 : null)
   if (!/^HTTP\/1\.[01] 200 /u.test(head.toString('latin1'))) {
@@ -214,9 +232,10 @@ async function openTunnel(tunnel: { host: string; port: number }, host: string, 
 
 function connectTo(host: string, port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const socket = connect({ host, port }, () => { socket.off('error', reject); resolve(socket) })
+    const socket = connect({ host, port, timeout: NAME_DEADLINE_MS }, () => { socket.off('error', reject); socket.setTimeout(0); resolve(socket) })
     socket.setNoDelay(true)
     socket.once('error', reject)
+    socket.once('timeout', () => { socket.destroy(); reject(new Error(`connect-timeout ${host}:${port}`)) })
   })
 }
 
@@ -227,12 +246,13 @@ function listen(server: Server, socketPath: string): Promise<void> {
   })
 }
 
-/** Private, loopback, link-local, CGNAT and metadata ranges a resolved name must not reach. */
+/** Private, loopback, link-local, CGNAT, benchmark, multicast, reserved, NAT64/6to4 and metadata ranges. */
 function isBlockedAddress(ip: string): boolean {
   if (isIP(ip) === 6) {
     const v6 = ip.toLowerCase()
     if (v6.startsWith('::ffff:')) return isBlockedAddress(v6.slice(7))
     return v6 === '::1' || v6 === '::' || v6.startsWith('fe80:') || v6.startsWith('fc') || v6.startsWith('fd')
+      || v6.startsWith('64:ff9b:') || v6.startsWith('2002:') || v6.startsWith('ff')
   }
   const [a, b] = ip.split('.').map(Number)
   if (a === undefined || b === undefined) return true
@@ -241,4 +261,6 @@ function isBlockedAddress(ip: string): boolean {
     || (a === 192 && b === 168)
     || (a === 169 && b === 254)
     || (a === 100 && b >= 64 && b <= 127)
+    || (a === 198 && (b === 18 || b === 19))
+    || a >= 224
 }
