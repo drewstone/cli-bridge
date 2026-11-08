@@ -21,7 +21,7 @@
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -92,18 +92,28 @@ type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'proxySecrets' | 'p
  * jail covers with a fresh tmpfs before binding back only its own directory.
  * A unix socket ignores network namespaces, so without this mask a write-jail
  * (host root visible) could connect to a sibling spawn's relay and use its
- * credential.
+ * credential. The parent must be our own 0700 directory: in a shared /tmp,
+ * another account could otherwise pre-create it and swap a spawn's socket.
  */
-const EGRESS_PARENT = join(tmpdir(), 'cbe')
+const EGRESS_PARENT = join(tmpdir(), `cbe-${process.getuid?.() ?? 0}`)
+
+async function egressParent(): Promise<string> {
+  await mkdir(EGRESS_PARENT, { recursive: true, mode: 0o700 })
+  const stat = await lstat(EGRESS_PARENT)
+  if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o700) {
+    throw new Error(`${EGRESS_PARENT} must be a directory owned by this user with mode 0700`)
+  }
+  return EGRESS_PARENT
+}
 
 export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
   const network = spec.network ?? 'none'
   const bindings = spec.proxySecrets ?? []
   if (bindings.length && network !== 'relay') throw new Error('proxySecrets require execution.jail.network relay')
-  const mask = ['--tmpfs', EGRESS_PARENT]
+  // Created on every path: a write-jail cannot create the mask's mountpoint on the read-only host root.
+  const mask = ['--tmpfs', await egressParent()]
   if (network === 'none') return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
 
-  await mkdir(EGRESS_PARENT, { recursive: true, mode: 0o700 })
   const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
   if (socketPath.length > MAX_SOCKET_PATH) {

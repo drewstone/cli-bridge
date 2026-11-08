@@ -19,7 +19,7 @@
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
 import { once } from 'node:events'
-import { chmod, mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readdir, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { serve } from '@hono/node-server'
@@ -138,9 +138,13 @@ const none = await scenario('none', { github: blocked.github, router: curl('http
 for (const name of ['github', 'router']) assert.ok(failed(none.result[name]!), `none ${name}: ${none.result[name]!.tail}`)
 
 // A write-jail sees the host root, but never a sibling spawn's relay socket directory.
-await mkdir(join(tmpdir(), 'cbe'), { recursive: true, mode: 0o700 })
-const sibling = await mkdtemp(join(tmpdir(), 'cbe', 's-'))
-const writeNone = await scenario('none', { siblings: `test -z "$(ls -A ${join(tmpdir(), 'cbe')})"` }, undefined, 'write-jail')
+// The bridge, not this script, must create the egress parent, or a write-jail cannot start.
+const parent = join(tmpdir(), `cbe-${process.getuid!()}`)
+// Only an empty parent is removed: other bridges run by this user may hold live spawns in it.
+await rmdir(parent).catch(() => {})
+await scenario('none', {}, undefined, 'write-jail')
+const sibling = await mkdtemp(join(parent, 's-'))
+const writeNone = await scenario('none', { siblings: `test -z "$(ls -A ${parent})"` }, undefined, 'write-jail')
 assert.equal(writeNone.result.siblings!.status, 0, 'a write-jail can list another spawn\'s egress directory')
 await rm(sibling, { recursive: true, force: true })
 

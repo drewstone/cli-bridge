@@ -196,6 +196,7 @@ function readSni(buf: Buffer): string | undefined {
     const body = p + 4
     if (body + len > extensionsEnd || type === 0xfe0d || type === 0xffce) return undefined
     if (type === 0x0000) {
+      if (name !== undefined) return undefined
       const nameType = buf[body + 2]
       const nameLen = buf.readUInt16BE(body + 3)
       if (nameType !== 0 || body + 5 + nameLen > body + len) return undefined
