@@ -1,4 +1,5 @@
 import { DurableRunWriter } from './sessions/durable-writer.js'
+import { preparePrivateMcp } from './private-mcp.js'
 /**
  * cli-bridge server entry — Hono on Node.
  *
@@ -69,7 +70,7 @@ export interface BuildAppExtras {
   shutdownHooks: Array<() => Promise<void>>
 }
 
-export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?: StartServerOptions['hub']): Promise<{
+export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?: StartServerOptions['hub'], mcpSecrets?: StartServerOptions['mcpSecrets']): Promise<{
   app: Hono
   sessions: SessionStore
   registry: BackendRegistry
@@ -198,7 +199,11 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     jailEnv,
     admitSubscription: async (request, backend, signal) => {
       await nativeCatalog.admit(request, backend, signal)
-      return hub?.prepare(request, signal, backend)
+      const releaseHub = await hub?.prepare(request, signal, backend)
+      try {
+        const releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
+        return () => { releasePrivate?.(); releaseHub?.() }
+      } catch (error) { releaseHub?.(); throw error }
     },
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
@@ -293,7 +298,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     // The OS owns ephemeral listener allocation; a shared port-0 pidfile would serialize unrelated embedded servers.
     if (config.port !== 0) instanceLock = acquireInstanceLock(config.port)
     reapStalePrivateTemporaryRoots()
-    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir }, cwd, options.hub)
+    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir }, cwd, options.hub, options.mcpSecrets)
   } catch (error) {
     if (!(error instanceof UnconfirmedBridgeCleanup)) release()
     throw error

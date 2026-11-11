@@ -63,6 +63,7 @@ import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
 import { lineageChildEnv } from '../trace/lineage.js'
 import { withRawProcessCapture } from '../executors/raw-capture.js'
+import { privateMcpSecretValues } from '../private-mcp.js'
 import {
   assertPiOutputTokenRequest,
   assertProfileRequestAuthority,
@@ -1173,17 +1174,13 @@ export function mountChatCompletions(
       // The run pumps the source to completion on its own. This connection is only one reader;
       // dropping it never touches `run.signal` or releases job-owned admission.
       //
-      // Every job-owned resource is released from the JOB'S promise, never from
-      // the delta stream's `finally`: a stream that is never consumed never runs
-      // that `finally`, and `Run.pump` returns without consuming its source when
-      // the run is already committed terminal. `pump()` always settles — it
-      // returns the settled promise on that path — so this binding has no exit
-      // to skip.
+      // Release resources from the job promise: an unconsumed delta iterator never
+      // runs its `finally`, while pump settles even for an already-terminal run.
       // The receipt supplier is read at FAILURE time: the backend retains the
       // receipt on `req` during materialization (before spawn), so a thrown
       // subprocess failure still acknowledges the profile instead of letting
       // the caller misread the whole run as a missing-receipt transport fault.
-      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd)), chatCompletionDeltaOptions(req))
+      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, privateMcpSecretValues(req))), chatCompletionDeltaOptions(req))
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)

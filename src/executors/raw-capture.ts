@@ -7,7 +7,7 @@ import { Transform } from 'node:stream'
 import type { RunSnapshot } from '../runs/types.js'
 
 interface CaptureScope {
-  root: string
+  root?: string
   identity: Pick<RunSnapshot, 'id' | 'requestDigest' | 'provider' | 'environmentId' | 'sessionId' | 'executionId'>
   backend: string
   workspace?: string
@@ -15,16 +15,17 @@ interface CaptureScope {
   failures: Error[]
   nativeSessionIds: Set<string>
   processIds: string[]
+  protectedValues: readonly string[]
 }
 const scopes = new AsyncLocalStorage<CaptureScope>()
 
-/** Bind original process bytes to the existing durable run, independently of normalized deltas. */
-export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: RunSnapshot, backend: string, workspace?: string): AsyncIterable<T> {
+/** Bind process bytes to the durable run after any admitted credential redaction. */
+export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: RunSnapshot, backend: string, workspace?: string, protectedValues: readonly string[] = []): AsyncIterable<T> {
   const root = process.env.BRIDGE_RAW_CAPTURE_DIR
-  if (!root) return source
-  if (!isAbsolute(root)) throw new Error('BRIDGE_RAW_CAPTURE_DIR must be absolute')
+  if (!root && !protectedValues.length) return source
+  if (root && !isAbsolute(root)) throw new Error('BRIDGE_RAW_CAPTURE_DIR must be absolute')
   const scope: CaptureScope = {
-    root: resolve(root), backend, workspace,
+    ...(root && { root: resolve(root) }), backend, workspace, protectedValues,
     identity: { id: snapshot.id, requestDigest: snapshot.requestDigest,
       provider: snapshot.provider, environmentId: snapshot.environmentId,
       sessionId: snapshot.sessionId, executionId: snapshot.executionId },
@@ -58,13 +59,14 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
         await closing
         await Promise.all(scope.pending.map(({ done }) => done))
         try {
-          if (scope.processIds.length) {
+          if (scope.root && scope.processIds.length) {
             const name = createHash('sha256').update(JSON.stringify(scope.identity)).digest('hex') + '.json'
             const fd = openSync(join(scope.root, name), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600)
             try {
               const bytes = Buffer.from(JSON.stringify({ ...scope.identity, backend: scope.backend,
                 nativeSessionIds: [...scope.nativeSessionIds], processIds: scope.processIds,
                 processStreams: scope.failures.length ? 'incomplete' : 'captured', nativeStore: 'external',
+                ...(scope.protectedValues.length && { redaction: 'private-mcp-secrets' }),
               }) + '\n')
               for (let offset = 0; offset < bytes.length;) {
                 const written = writeSync(fd, bytes, offset, bytes.length - offset)
@@ -83,10 +85,51 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
   }
 }
 
+/** Filter exact admitted credential bytes, including a value split across pipe chunks. */
+function protectChild(child: ChildProcess, values: readonly string[]): ChildProcess {
+  if (!values.length) return child
+  const needles = [...new Set(values.flatMap(value => [value, JSON.stringify(value).slice(1, -1)]))]
+    .filter(Boolean).map(value => Buffer.from(value)).sort((a, b) => b.length - a.length)
+  if (!needles.length) return child
+  const keep = Math.max(...needles.map(value => value.length)) - 1
+  for (const stream of ['stdout', 'stderr'] as const) {
+    const source = child[stream]
+    if (!source) continue
+    let pending: Buffer = Buffer.alloc(0)
+    const filter = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        pending = Buffer.concat([pending, chunk])
+        flush(false, this)
+        callback()
+      },
+      flush(callback) { flush(true, this); callback() },
+    })
+    const flush = (final: boolean, output: Transform) => {
+      const limit = final ? pending.length : Math.max(0, pending.length - keep)
+      let at = 0, start = 0
+      while (at < limit) {
+        const match = needles.find(needle => pending.subarray(at, at + needle.length).equals(needle))
+        if (!match) { at++; continue }
+        if (at > start) output.push(pending.subarray(start, at))
+        output.push(Buffer.from('[redacted:MCP]'))
+        at += match.length
+        start = at
+      }
+      if (at > start) output.push(pending.subarray(start, at))
+      pending = pending.subarray(at)
+    }
+    source.on('error', error => filter.destroy(error))
+    child[stream] = source.pipe(filter)
+    child.stdio[stream === 'stdout' ? 1 : 2] = filter
+  }
+  return child
+}
+
 /** All shared executors use this spawn seam; harness adapters do not select capture behavior. */
 export function spawnCaptured(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
   const scope = scopes.getStore()
   if (!scope) return nodeSpawn(command, args, options)
+  if (!scope.root) return protectChild(nodeSpawn(command, args, options), scope.protectedValues)
   if (scope.workspace) {
     const rel = relative(resolve(scope.workspace), scope.root)
     if (!rel || (!rel.startsWith('..') && !isAbsolute(rel))) throw new Error('Raw capture must be outside the agent workspace')
@@ -131,7 +174,7 @@ export function spawnCaptured(command: string, args: readonly string[], options:
     const binding = Buffer.from(JSON.stringify({ ...scope.identity, backend: scope.backend, executable: command }))
     append({ stream: 'protocol', base64Bytes: binding.toString('base64'), sizeBytes: binding.length,
       sha256: createHash('sha256').update(binding).digest('hex'), metadata: { kind: 'bridge-run-binding' } })
-    child = nodeSpawn(command, args, options)
+    child = protectChild(nodeSpawn(command, args, options), scope.protectedValues)
   } catch (error) {
     close(null, null, error instanceof Error ? error.message : String(error))
     throw error
