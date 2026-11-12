@@ -94,8 +94,11 @@ it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as c
   const manifestBytes=await readFile(terminal.nativeCapture.path),manifest=JSON.parse(manifestBytes.toString());expect(manifest.nativeSessions[0].complete).toBe(false);
   const vendorPath=await readFile(join(workspace,'vendor-path'),'utf8'),original=await readFile(vendorPath),sourceHash=createHash('sha256').update(original).digest('hex');
   expect(original.toString()).toContain(toolSecret);expect(original.toString()).toContain(coordSecret);
-  const retained=await files(capture);const decoded:Buffer[]=[];for(const bytes of retained)for(const line of bytes.toString().split('\n')){try{const frame=JSON.parse(line);if(typeof frame.base64Bytes==='string')decoded.push(Buffer.from(frame.base64Bytes,'base64'))}catch{}}
-  for(const value of [toolSecret,coordSecret,hubKey,...tokens])for(const bytes of [...retained,...decoded,Buffer.from(text),Buffer.from(JSON.stringify(terminal))])expect(bytes.includes(Buffer.from(value))).toBe(false);
+  const caps=[...new Set([...original.toString().matchAll(/http:\/\/127\.0\.0\.1:3128\/([A-Za-z0-9_-]+)/g)].map(match=>match[1]!))];expect(caps).toHaveLength(2);
+  const retained=await files(capture),streams=new Map<string,Buffer[]>();
+  for(const bytes of retained)for(const line of bytes.toString().split('\n')){try{const frame=JSON.parse(line);if(typeof frame.processId==='string'&&typeof frame.stream==='string'&&typeof frame.base64Bytes==='string'){const key=`${frame.processId}/${frame.stream}`,chunks=streams.get(key)??[];chunks.push(Buffer.from(frame.base64Bytes,'base64'));streams.set(key,chunks)}}catch{}}
+  const decoded=[...streams.values()].map(chunks=>Buffer.concat(chunks));expect(decoded.length).toBeGreaterThan(0);
+  for(const value of [toolSecret,coordSecret,hubKey,...tokens,...caps])for(const bytes of [...retained,...decoded,Buffer.from(text),Buffer.from(JSON.stringify(terminal))])expect(bytes.includes(Buffer.from(value))).toBe(false);
   expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(sourceHash);
   expect(manifest.bridge.files.some((file:{sourceSha256:string})=>file.sourceSha256===`sha256:${sourceHash}`)).toBe(true);
   lifetime.abort();expect((await fetch(`${server.url}/hub/mcp/grants/${tokens[0]}/tools`)).status).toBe(403);
