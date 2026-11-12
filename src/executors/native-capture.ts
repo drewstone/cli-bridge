@@ -16,6 +16,14 @@ const READ_DIRECTORY = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_
 const CREATE_FILE = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW
 const digest = (bytes: Uint8Array): string => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
 
+export interface NativeProcessTerminal {
+  captureId: string
+  pid: number | null
+  exitCode: number | null
+  signal: NodeJS.Signals | null
+  closedAt: string
+}
+
 export interface NativeCaptureInput {
   snapshot: RunSnapshot
   backend: string
@@ -24,6 +32,7 @@ export interface NativeCaptureInput {
   store?: EffectiveNativeStore
   nativeSessionIds: readonly string[]
   processIds: readonly string[]
+  processes: readonly NativeProcessTerminal[]
   /** Existing process wrapper invokes this only after every spawned child has closed. */
   root: string
   redact(bytes: Uint8Array): Uint8Array
@@ -60,7 +69,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
   const harness = input.backend as 'codex' | 'claude-code'
   const { store, snapshot } = input
   if (!input.cwd || !input.profileDigest || !snapshot.sessionId || input.nativeSessionIds.length !== 1 ||
-    !input.processIds.length || !store || store.harness !== harness || store.basis !== 'host-jail') {
+    !input.processIds.length || input.processIds.length !== input.processes.length || !store || store.harness !== harness || store.basis !== 'host-jail') {
     return unavailable('native-execution-binding-unavailable')
   }
   let home: FileHandle | undefined
@@ -135,8 +144,9 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
       harness, format: harness === 'codex' ? 'codex.rollout-jsonl' : 'claude-code.projects-jsonl',
       executionId: snapshot.executionId ?? snapshot.id, attempt: 1, nativeSessionId: input.nativeSessionIds[0]!,
       copy: 'settled', capturedAt: new Date().toISOString(),
-      // Raw process terminal frames retain actual exit details; do not fabricate one aggregate exit code.
-      process: { pid: null, exitedAt: null, exitCode: null, signal: null },
+      // Preserve an actual single-child receipt; multiple children have individual receipts below.
+      process: input.processes.length === 1 ? { pid: input.processes[0]!.pid, exitedAt: input.processes[0]!.closedAt,
+        exitCode: input.processes[0]!.exitCode, signal: input.processes[0]!.signal } : { pid: null, exitedAt: null, exitCode: null, signal: null },
       files: provenance.map((file) => ({ path: file.payload, store: harness === 'codex' ? '.codex' : '.claude', storePath: `${harness === 'codex' ? '.codex' : '.claude'}/${file.path}`, sizeBytes: file.retainedByteLength,
         sha256: file.retainedSha256, method: 'atomic-file', truncated: file.truncated })),
       complete: familyVerified && !provenance.some((file) => file.redacted),
@@ -145,7 +155,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
     const manifest = { schema: 'tangle.raw-evidence-archive.v2', nativeSessions: [copy],
       bridge: { schema: 'cli-bridge.native-capture.v1', runId: snapshot.id, requestDigest: snapshot.requestDigest, sessionId: snapshot.sessionId,
         executionId: snapshot.executionId, provider: snapshot.provider, environmentId: snapshot.environmentId,
-        profileDigest: input.profileDigest, cwd, nativeStore: store, processIds: input.processIds,
+        profileDigest: input.profileDigest, cwd, nativeStore: store, processIds: input.processIds, processes: input.processes,
         familyVerified, files: provenance,
         family: family?.files.map((file) => ({ path: file.path, nativeSessionId: file.nativeSessionId, sha256: file.sha256, byteLength: file.byteLength })) ?? [] } }
     const bytes = Buffer.from(JSON.stringify(manifest) + '\n')

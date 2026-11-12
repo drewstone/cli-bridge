@@ -11,12 +11,14 @@ import { captureTerminalNativeFamily } from './executors/native-capture.js'
  */
 
 import { join, resolve } from 'node:path'
-import { timingSafeEqual } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
+import { nativeRedactionHistorySchema } from './sessions/legacy-metadata.js'
 import { BackendRegistry } from './backends/registry.js'
+import { BackendError } from './backends/types.js'
 import { createLocalBackend } from './backends/local.js'
 import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
@@ -85,6 +87,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   const sessions = new SessionStore(config.dataDir)
   const extras: BuildAppExtras = { shutdownHooks: [] }
   const nativeRedactors = new Map<string, { binding: Parameters<PrivateRunRedactionObserver>[0]; redactor: ReturnType<typeof privateCopyRedactor> }>()
+  const nativeRedactionEpoch = randomUUID()
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -195,11 +198,33 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
     registry,
-    onRunRedaction: (binding, values) => {
+    onRunRedaction: (binding, values, request) => {
+      const backend = registry.resolve(request.model)?.name
+      const supported = backend === 'codex' || backend === 'claude-code'
+      const previous = supported && binding.sessionId ? sessions.get(binding.sessionId, backend) : null
+      const prior = nativeRedactionHistorySchema.safeParse(previous?.metadata.native_redaction_history)
+      if (supported && previous) {
+        const marker = prior.success ? prior.data : undefined
+        const authority = marker && nativeRedactors.get(`${marker.runId}:${marker.requestDigest}`)?.binding
+        if ((!marker && previous.internalId) || (marker && (
+          marker.sessionId !== binding.sessionId || marker.profileDigest !== binding.profileDigest || marker.cwd !== binding.cwd ||
+          (marker.protectedHistory && (marker.epoch !== nativeRedactionEpoch || !authority ||
+            authority.sessionId !== marker.sessionId || authority.profileDigest !== marker.profileDigest || authority.cwd !== marker.cwd))
+        ))) throw new BackendError('Native conversation redaction history is unavailable; prior private authority cannot be reconstructed. Reconcile the prior run before starting a new native session.',
+          'not_configured', undefined, { providerDispatch: 'not_started' })
+      }
       const redactor = privateCopyRedactor(values)
       const key = `${binding.runId}:${binding.requestDigest}`
       nativeRedactors.set(key, { binding, redactor })
-      try { onRunRedaction?.(Object.freeze({ ...binding, redact: redactor.redact })) }
+      try {
+        onRunRedaction?.(Object.freeze({ ...binding, redact: redactor.redact }))
+        if (supported && binding.sessionId) sessions.remember({ externalId: binding.sessionId, backend, model: request.model,
+          cwd: binding.cwd, metadata: { native_redaction_history: {
+            schema: 'cli-bridge.native-redaction-history.v1', protectedHistory: !!values.length || (prior.success && prior.data.protectedHistory),
+            epoch: nativeRedactionEpoch, runId: binding.runId, requestDigest: binding.requestDigest,
+            sessionId: binding.sessionId, profileDigest: binding.profileDigest, cwd: binding.cwd,
+          } } })
+      }
       catch {
         redactor.close(); nativeRedactors.delete(key)
         throw new Error('Trusted native redaction authority is unavailable')

@@ -1147,6 +1147,13 @@ capture. The existing durable run snapshot retains this reference across reader
 disconnect and Bridge restart. This does not reconstruct a native child after
 Bridge death.
 
+The existing session row checkpoints nonsecret redaction history before a new
+native launch. Continuing a conversation whose earlier protected values are no
+longer resident in this Bridge is refused before dispatch. A Bridge restart can
+read a committed copy, but cannot safely recopy that conversation with only its
+new grants. Legacy native rows without this history also fail closed. Neither
+private values nor hashes of those values are persisted to recover authority.
+
 Native payloads use the existing `tangle.raw-evidence-archive.v2` copy format and
 the harness-sessions family verifier. The manifest adds exact Bridge run,
 profile, CWD, child attribution and source-versus-retained file provenance.

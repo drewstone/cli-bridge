@@ -1,7 +1,7 @@
 // Real OS child, host jail, HTTP authentication and SQLite session mapping. No model service.
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -12,7 +12,9 @@ for (const [harness, override] of [['codex', false], ['claude-code', false], ['c
   const root = await mkdtemp(join(tmpdir(), 'bridge-native-store-'))
   const previous = process.env.CODEX_HOME
   const previousClaude = process.env.CLAUDE_CONFIG_DIR
+  const previousRaw = process.env.BRIDGE_RAW_CAPTURE_DIR
   delete process.env.CLAUDE_CONFIG_DIR
+  delete process.env.BRIDGE_RAW_CAPTURE_DIR
   let server
   try {
     const workspace = join(root, 'workspace'), seed = join(root, 'seed'), state = join(root, 'state')
@@ -95,6 +97,7 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
       assert.equal(capture.status, 'unavailable', 'External/unqualified roots must not become trusted copies')
     } else {
       assert.equal(capture.status, 'retained')
+      assert.ok((await readdir(join(state, 'native'))).every(name => !name.endsWith('.frames')), 'Known child terminal facts do not require opt-in raw frame capture')
       const manifestBytes = await readFile(capture.path)
       assert.equal(manifestBytes.length, capture.byteLength)
       assert.equal(`sha256:${createHash('sha256').update(manifestBytes).digest('hex')}`, capture.sha256)
@@ -106,6 +109,14 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
       assert.equal(manifest.bridge.sessionId, session.externalId)
       assert.equal(manifest.bridge.profileDigest, session.metadata.agent_profile_binding.effectiveProfileDigest)
       assert.equal(manifest.bridge.cwd, workspace)
+      assert.equal(manifest.bridge.processes.length, 1)
+      assert.equal(manifest.bridge.processes[0].captureId, manifest.bridge.processIds[0])
+      assert.ok(manifest.bridge.processes[0].pid > 0)
+      assert.equal(manifest.bridge.processes[0].exitCode, 0)
+      assert.equal(manifest.bridge.processes[0].signal, null)
+      assert.ok(Number.isFinite(Date.parse(manifest.bridge.processes[0].closedAt)))
+      assert.equal(manifest.nativeSessions[0].process.pid, manifest.bridge.processes[0].pid)
+      assert.equal(manifest.nativeSessions[0].process.exitCode, 0)
       assert.equal(manifest.nativeSessions[0].complete, true)
       assert.deepEqual(manifest.nativeSessions[0].missingReasons, [])
       assert.equal(manifest.bridge.files.length, 1)
@@ -137,6 +148,8 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
     await server?.close()
     if (previousClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = previousClaude
+    if (previousRaw === undefined) delete process.env.BRIDGE_RAW_CAPTURE_DIR
+    else process.env.BRIDGE_RAW_CAPTURE_DIR = previousRaw
     if (previous === undefined) delete process.env.CODEX_HOME
     else process.env.CODEX_HOME = previous
     await rm(root, { recursive: true, force: true })

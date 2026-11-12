@@ -5,17 +5,17 @@ import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openS
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { Transform } from 'node:stream'
 import type { RunSnapshot } from '../runs/types.js'
-import type { NativeCaptureInput } from './native-capture.js'
+import type { NativeCaptureInput, NativeProcessTerminal } from './native-capture.js'
 import type { EffectiveNativeStore } from '../jail/types.js'
 
-export type TerminalNativeCapture = (input: Pick<NativeCaptureInput, 'store' | 'nativeSessionIds' | 'processIds'>) => Promise<void>
+export type TerminalNativeCapture = (input: Pick<NativeCaptureInput, 'store' | 'nativeSessionIds' | 'processIds' | 'processes'>) => Promise<void>
 
 interface CaptureScope {
   root?: string
   identity: Pick<RunSnapshot, 'id' | 'requestDigest' | 'provider' | 'environmentId' | 'sessionId' | 'executionId'>
   backend: string
   workspace?: string
-  pending: Array<{ child: ChildProcess; done: Promise<void> }>
+  pending: Array<{ child: ChildProcess; done: Promise<void>; terminal?: NativeProcessTerminal }>
   failures: Error[]
   nativeSessionIds: Set<string>
   processIds: string[]
@@ -70,7 +70,8 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
         await closing
         await Promise.all(scope.pending.map(({ done }) => done))
         try { await scope.terminal?.({ store: scope.nativeStoreConflict ? undefined : scope.nativeStore,
-          nativeSessionIds: [...scope.nativeSessionIds], processIds: scope.processIds }) }
+          nativeSessionIds: [...scope.nativeSessionIds], processIds: scope.processIds,
+          processes: scope.pending.flatMap(({ terminal }) => terminal ? [terminal] : []) }) }
         catch (error) { sourceErrors.push(error) }
         try {
           if (scope.root && scope.processIds.length) {
@@ -154,13 +155,16 @@ function protectChild(child: ChildProcess, values: readonly string[]): ChildProc
   return child
 }
 
-function trackChild(scope: CaptureScope, child: ChildProcess, close: (code: number | null, signal: NodeJS.Signals | null) => void) {
+function trackChild(scope: CaptureScope, child: ChildProcess, captureId: string, close: (code: number | null, signal: NodeJS.Signals | null) => void) {
+  let pending: CaptureScope['pending'][number]
   const done = new Promise<void>(resolveDone => {
     child.once('close', (code, signal) => {
+      pending.terminal = { captureId, pid: child.pid ?? null, exitCode: code, signal, closedAt: new Date().toISOString() }
       try { close(code, signal) } catch (error) { scope.failures.push(error instanceof Error ? error : new Error(String(error))) } finally { resolveDone() }
     })
   })
-  scope.pending.push({ child, done })
+  pending = { child, done }
+  scope.pending.push(pending)
 }
 
 /** All shared executors use this spawn seam; harness adapters do not select capture behavior. */
@@ -169,7 +173,7 @@ export function spawnCaptured(command: string, args: readonly string[], options:
   if (!scope) return nodeSpawn(command, args, options)
   if (!scope.root) {
     const child = protectChild(nodeSpawn(command, args, options), scope.protectedValues)
-    if (scope.terminal) { scope.processIds.push(randomUUID()); trackChild(scope, child, () => {}) }
+    if (scope.terminal) { const id = randomUUID(); scope.processIds.push(id); trackChild(scope, child, id, () => {}) }
     return child
   }
   if (scope.workspace) {
@@ -245,6 +249,6 @@ export function spawnCaptured(command: string, args: readonly string[], options:
   }
   let spawnError: string | undefined
   child.once('error', error => { spawnError = error.message })
-  trackChild(scope, child, (code, signal) => close(code, signal, spawnError))
+  trackChild(scope, child, id, (code, signal) => close(code, signal, spawnError))
   return child
 }

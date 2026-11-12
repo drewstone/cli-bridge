@@ -113,7 +113,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   await writeFile(stdio, `const rl=require('node:readline').createInterface({input:process.stdin});rl.once('line',async line=>{const req=JSON.parse(line);const r=await fetch(${JSON.stringify(url)},{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+process.env.MCP_PRIVATE},body:JSON.stringify({jsonrpc:'2.0',id:2,method:'initialize'})});if(r.status!==200)process.exit(1);console.log(JSON.stringify({jsonrpc:'2.0',id:req.id,result:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'private-peer',version:'1'}}}));rl.close()})`)
   const calls: string[] = []
   const redactors: Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0][] = []
-  const server = await startServer({ cwd: root, quiet: true, handleSignals: false,
+  const createHost = () => startServer({ cwd: root, quiet: true, handleSignals: false,
     config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: backend, BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CODEX_BIN: binary }), port: 0 },
     onRunRedaction: run => redactors.push(run),
     mcpSecrets: { async get(key) { calls.push(key); return key === 'private-tool' ? secret : undefined } },
@@ -121,6 +121,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
       hash: value => createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex'),
       serverForGrant(token) { grantTokens.push(token); return {transport:'http',url:`${server.url}/hub/mcp/grants/${token}`} } },
   })
+  let server = await createHost()
   const profile = { name: 'private-tool-agent', connections:[{connectionId:'hubconn_fixture',capabilities:['fixture.proof'],alias:'hub'}], mcp: {
     remote: { transport: 'http', url, headers: { Authorization: { kind: 'secret-ref', key: 'private-tool', format: 'bearer' } } },
     local: { command: process.execPath, args: [{ kind: 'public', value: stdio }], env: { MCP_PRIVATE: { kind: 'secret-ref', key: 'private-tool' } } },
@@ -169,6 +170,27 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     expect((await readFile(join(root, 'private-config-paths.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(1)
     for (const line of (await readFile(join(root, 'private-config-paths.jsonl'), 'utf8')).trim().split('\n'))
       await expect(access(JSON.parse(line).configPath)).rejects.toThrow()
+    // The original vendor conversation still contains the now-revoked first Hub grant.
+    expect((await readFile(vendorPath,'utf8')).includes(grantTokens[0]!)).toBe(true)
+    await server.close()
+    server = await createHost()
+    const readback = await fetch(`${server.url}/v1/runs/${encodeURIComponent(authority.runId)}`).then(r => r.json())
+    expect(readback.requestDigest).toBe(authority.requestDigest)
+    expect(readback.nativeCapture).toEqual(terminal.nativeCapture)
+    const resume = await fetch(`${server.url}/v1/chat/completions`, { method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({model:`${harness}/test`,session_id:`private-${backend}`,run_id:`restart-private-${backend}`,
+        cwd:root,agent_profile:profile,messages:[{role:'user',content:'Continue the original native conversation'}],
+        metadata:{native_redaction_history:{protectedHistory:false}},
+        env:{AGENT_RUNTIME_COORDINATION_TOKEN:coordination,CLAUDE_CONFIG_DIR:join(root,'claude-home')},
+        runtime_attachments:{mcp:{coord:{transport:'http',url:`http://127.0.0.1:${address.port}/coord`,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}}}) })
+    expect(resume.status).not.toBe(200)
+    expect(await resume.text()).toContain('redaction history is unavailable')
+    expect((await readFile(join(root,'private-config-paths.jsonl'),'utf8')).trim().split('\n')).toHaveLength(1)
+    expect(redactors).toHaveLength(1)
+    expect(methods).toEqual(['tools/list','initialize'])
+    expect(hubInvoked).toBe(1)
+    expect(coordinationInvoked).toBe(1)
+    expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(vendorDigest)
   } finally {
     await server.close()
     for (const redactor of redactors) expect(() => redactor.redact(new Uint8Array())).toThrow('closed')
