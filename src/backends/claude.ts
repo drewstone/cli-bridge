@@ -96,15 +96,15 @@ interface ClaudeNativeUsage {
 
 const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 512
 
-/** Native result cost is a complete provider receipt. Missing cost stays unknown;
- * token counts retain their independent measured/partial provenance. */
+/** Claude Code computes this amount locally from token prices, not a billing receipt.
+ * https://code.claude.com/docs/en/costs#using-the-usage-command */
 function claudeResultUsage(result: ClaudeStreamResult): NonNullable<ChatDelta['usage']> | undefined {
   const usage = normalizeClaudeUsage(result.usage)
   const cost = result.total_cost_usd
-  const billed = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : undefined
-  if (!usage && billed === undefined) return undefined
-  return { ...usage, ...(billed === undefined ? { cost_known: false } : {
-    cost: billed, cost_known: true, cost_provenance: 'provider-receipt', cost_scope: 'total',
+  const estimate = typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : undefined
+  if (!usage && estimate === undefined) return undefined
+  return { ...usage, cost_known: false, ...(estimate === undefined ? {} : {
+    estimated_cost: estimate, cost_provenance: 'catalog-estimate', cost_scope: 'total',
   }) }
 }
 

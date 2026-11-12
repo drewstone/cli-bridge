@@ -1,5 +1,8 @@
 import { spawn } from 'node:child_process'
 import { piResponseIdentityFromEvent } from '../src/backends/pi.js'
+import { ATTR, type ContractSpan } from '@tangle-network/agent-trace-contract'
+import { TraceEmitter } from '../src/trace/emitter.js'
+import { JsonlSpanSink } from '../src/trace/sink.js'
 import { collectNonStreaming } from '../src/streaming/sse.js'
 /** Real native process -> HTTP SSE -> SQLite reopen. No synthetic backend or spawner. */
 import { serve } from '@hono/node-server'
@@ -40,7 +43,9 @@ async function startServer(root: string, bin: string, bounded = false) {
     bin, harness: 'claude-code', timeoutMs: 5000, spawner: hostSpawner,
   }))
   const app = new Hono()
-  mountChatCompletions(app, { registry, sessions: store, retainedRuns: store, runs })
+  mountChatCompletions(app, { registry, sessions: store, retainedRuns: store, runs,
+    trace: new TraceEmitter({ sink: new JsonlSpanSink({ file: join(root, 'spans.jsonl'), maxBytes: 1024 * 1024, maxFiles: 1 }), maxToolSpans: 16 }),
+  })
   const retainedRuns = new RetainedSessionService({ store, registry, runs })
   mountRuns(app, { runs, retainedRuns, retainedStore: store })
   const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 })
@@ -99,7 +104,8 @@ it('persists native final output and usage, replays exact suffixes, and binds re
     const usage = nativeFrames.find((frame) => frame.usage !== undefined)?.usage
     expect(usage).toMatchObject({ prompt_tokens: 23, completion_tokens: 13,
       fresh_input_tokens: 11, cache_read_input_tokens: 7, cache_write_input_tokens: 5,
-      cost: 0.125, cost_known: true, cost_provenance: 'provider-receipt', cost_scope: 'total' })
+      estimated_cost: 0.125, cost_known: false, cost_provenance: 'catalog-estimate', cost_scope: 'total' })
+    expect(usage).not.toHaveProperty('cost')
     const cursor = initialIds[1]!
     const retry = await dispatch(server.url, body, cursor)
     expect(retry.status).toBe(200)
@@ -161,6 +167,9 @@ it('refuses rotated and expired replay cursors after an actual native process co
 
 
 for (const specimen of [
+  { name: 'positive native cost is a catalog estimate', models: ['actual-provider-a'], observed: ['actual-provider-a'], cost: 0.125 },
+  { name: 'zero native cost is a catalog estimate, not billed zero', models: ['actual-provider-a'], observed: ['actual-provider-a'], cost: 0 },
+  { name: 'absent native cost remains unknown without a fabricated amount', models: ['actual-provider-a'], observed: ['actual-provider-a'] },
   { name: 'observed response and repeated provider ID', models: ['actual-provider-a', 'actual-provider-a'], observed: ['actual-provider-a'] },
   { name: 'absent response model', models: [undefined], observed: [] },
   { name: 'synthetic response', models: ['<synthetic>'], observed: [] },
@@ -183,7 +192,8 @@ for (const specimen of [
       ...specimen.models.map((model) => ({ type: 'assistant', isApiErrorMessage: specimen.apiError,
         message: { id: 'same-provider-message', model, usage: { input_tokens: 999, output_tokens: 999 }, content: [{ type: 'text', text: 'fixture text' }] } })),
       { type: 'result', subtype: 'success', session_id: 'evidence-session', result: 'fixture text',
-        ...(nativeUsage === null ? {} : { usage: nativeUsage }) },
+        ...(nativeUsage === null ? {} : { usage: nativeUsage }),
+        ...(specimen.cost === undefined ? {} : { total_cost_usd: specimen.cost }) },
     ]))
     const body = { model: 'claude-code/requested-only', cwd: root, mode: 'byob', stream: true,
       run_id: 'provider-evidence-run', messages: [{ role: 'user', content: 'only exercise this local executable' }] }
@@ -200,12 +210,33 @@ for (const specimen of [
       expect(nonstream.status).toBe(200)
       const completion = await nonstream.json() as {
         model?: string; provider_models?: string[]; provider_model?: string
-        usage: { estimated?: boolean; completion_tokens?: number; prompt_tokens?: number; cost_known?: boolean; cost?: number }
+        usage: { estimated?: boolean; completion_tokens?: number; prompt_tokens?: number; cost_known?: boolean; cost?: number; estimated_cost?: number; cost_provenance?: string; cost_scope?: string }
       }
       expect(completion.model).toBe(specimen.observed.at(-1) ?? body.model)
       expect(completion.provider_models).toEqual(specimen.observed.length ? specimen.observed : undefined)
       expect(completion.provider_model).toBe(specimen.observed.length === 1 ? specimen.observed[0] : undefined)
       const usage = completion.usage
+      const streamedUsage = initial.find((frame) => frame.usage !== undefined)?.usage
+      for (const receipt of [streamedUsage, usage]) {
+        expect(receipt).toMatchObject({ cost_known: false })
+        expect(receipt).not.toHaveProperty('cost')
+        if (specimen.cost === undefined) {
+          expect(receipt).not.toHaveProperty('estimated_cost')
+          expect(receipt).not.toHaveProperty('cost_provenance')
+        } else expect(receipt).toMatchObject({ estimated_cost: specimen.cost, cost_provenance: 'catalog-estimate', cost_scope: 'total' })
+      }
+      // The existing trace contract has no estimate amount field. Its costUsd is billed
+      // spend, so the locally computed figure must never be written there, even at zero.
+      const spans: ContractSpan[] = (await readFile(join(root, 'spans.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      expect(spans).toHaveLength(2)
+      for (const span of spans) {
+        expect(span.attributes[ATTR.costUsd]).toBeUndefined()
+        if (nativeUsage !== null) {
+          expect(span.attributes[ATTR.outputTokens]).toBe(nativeUsage.output_tokens)
+          if ('cache_read_input_tokens' in nativeUsage && nativeUsage.cache_read_input_tokens !== undefined && nativeUsage.cache_creation_input_tokens !== undefined)
+            expect(span.attributes[ATTR.inputTokens]).toBe(nativeUsage.input_tokens + nativeUsage.cache_read_input_tokens + nativeUsage.cache_creation_input_tokens)
+        }
+      }
       expect(usage.estimated).toBe(nativeUsage === null)
       if (nativeUsage !== null) {
         expect(usage.completion_tokens).toBe(nativeUsage.output_tokens)
@@ -214,6 +245,13 @@ for (const specimen of [
         if ('cache_read_input_tokens' in nativeUsage && nativeUsage.cache_read_input_tokens !== undefined && nativeUsage.cache_creation_input_tokens !== undefined) expect(usage.prompt_tokens).toBe(
           nativeUsage.input_tokens + nativeUsage.cache_read_input_tokens + nativeUsage.cache_creation_input_tokens)
         else expect(usage.prompt_tokens).toBeUndefined()
+        if ('cache_read_input_tokens' in nativeUsage) {
+          for (const receipt of [streamedUsage, usage]) expect(receipt).toMatchObject({
+            fresh_input_tokens: nativeUsage.input_tokens,
+            cache_read_input_tokens: nativeUsage.cache_read_input_tokens,
+            cache_write_input_tokens: nativeUsage.cache_creation_input_tokens,
+          })
+        }
       }
       await server.stop()
       server = await startServer(root, bin)

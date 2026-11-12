@@ -76,7 +76,8 @@ for (const event of ${JSON.stringify(native)}) console.log(JSON.stringify(event)
     cacheRead: 15_269,
     cacheWrite: 10_753,
   })
-  assert.equal(spent.usd, 0.0470478)
+  assert.equal(spent.usdKnown, false)
+  assert.equal(spent.usdEstimated, 0.0470478)
 
   const budget = createBudgetPool({ maxIterations: 1, maxTokens: 20_000 }, Date.now())
   budget.observe(spent)
@@ -84,6 +85,7 @@ for (const event of ${JSON.stringify(native)}) console.log(JSON.stringify(event)
   assert.equal(remaining.tokensLeft, 9_241)
   assert.equal(remaining.tokensKnown, true)
   assert.equal(remaining.cacheBreakdownKnown, true)
+  assert.equal(remaining.usdKnown, false)
   assert.equal(remaining.iterationsLeft, 0)
 })
 
