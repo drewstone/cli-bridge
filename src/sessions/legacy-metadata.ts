@@ -98,4 +98,3 @@ export function sanitizeLegacySessionMetadata(value: unknown): Record<string, un
   }
   return metadata
 }
-
