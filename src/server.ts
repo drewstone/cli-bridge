@@ -200,10 +200,10 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     registry,
     onRunRedaction: (binding, values, request) => {
       const backend = registry.resolve(request.model)?.name
-      const supported = backend === 'codex' || backend === 'claude-code'
-      const previous = supported && binding.sessionId ? sessions.get(binding.sessionId, backend) : null
+      const local = backend !== undefined && anyBackendSpawnsOnHost([backend]) && request.execution?.kind !== 'sandbox'
+      const previous = local && binding.sessionId ? sessions.get(binding.sessionId, backend) : null
       const prior = nativeRedactionHistorySchema.safeParse(previous?.metadata.native_redaction_history)
-      if (supported && previous) {
+      if (local && previous) {
         const marker = prior.success ? prior.data : undefined
         const authority = marker && nativeRedactors.get(`${marker.runId}:${marker.requestDigest}`)?.binding
         if (!marker && previous.internalId && sessions.findContextTransferBySessionId(previous.externalId)) {
@@ -222,7 +222,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       nativeRedactors.set(key, { binding, redactor })
       try {
         onRunRedaction?.(Object.freeze({ ...binding, redact: redactor.redact }))
-        if (supported && binding.sessionId) sessions.remember({ externalId: binding.sessionId, backend, model: request.model,
+        if (local && binding.sessionId) sessions.remember({ externalId: binding.sessionId, backend, model: request.model,
           cwd: binding.cwd, metadata: { native_redaction_history: {
             schema: 'cli-bridge.native-redaction-history.v1', protectedHistory: !!values.length || (prior.success && prior.data.protectedHistory),
             epoch: nativeRedactionEpoch, runId: binding.runId, requestDigest: binding.requestDigest,
