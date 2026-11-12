@@ -271,7 +271,7 @@ describe('native harness terminal result followed by actual process exit', () =>
             expect(nativeUsage).toMatchObject(usage)
             if (harness === 'claude') expect(nativeUsage).toMatchObject({
               fresh_input_tokens: 11, cache_read_input_tokens: 7, cache_write_input_tokens: 5,
-              cost: 0.125, cost_known: true, cost_provenance: 'provider-receipt', cost_scope: 'total',
+              estimated_cost: 0.125, cost_known: false, cost_provenance: 'catalog-estimate', cost_scope: 'total',
             })
             // Codex's native cached_input_tokens arrives as the canonical cache split (#314).
             else if (harness === 'codex') expect(nativeUsage).toMatchObject({ cache_read_input_tokens: 7, fresh_input_tokens: 16 })
