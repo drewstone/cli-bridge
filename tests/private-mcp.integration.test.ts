@@ -75,7 +75,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   await writeFile(stdio, `const rl=require('node:readline').createInterface({input:process.stdin});rl.once('line',async line=>{const req=JSON.parse(line);const r=await fetch(${JSON.stringify(url)},{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+process.env.MCP_PRIVATE},body:JSON.stringify({jsonrpc:'2.0',id:2,method:'initialize'})});if(r.status!==200)process.exit(1);console.log(JSON.stringify({jsonrpc:'2.0',id:req.id,result:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'private-peer',version:'1'}}}));rl.close()})`)
   const calls: string[] = []
   const server = await startServer({ cwd: root, quiet: true, handleSignals: false,
-    config: loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_PORT: '0', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: backend, BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CODEX_BIN: binary }),
+    config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: backend, BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CODEX_BIN: binary }), port: 0 },
     mcpSecrets: { async get(key) { calls.push(key); return key === 'private-tool' ? secret : undefined } },
   })
   const profile = { name: 'private-tool-agent', mcp: {
