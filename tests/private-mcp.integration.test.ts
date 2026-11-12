@@ -222,3 +222,58 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     }
   } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); await rm(captureRoot, { recursive: true, force: true }) }
 }, 30000)
+
+it('fences private continuation on a host backend without vendor-family capture', async () => {
+  const root = await mkdtemp(join(tmpdir(),'private-opencode-history-'))
+  const old = 'private-opencode-prior-coordination-canary-a783'
+  const next = 'private-opencode-next-coordination-canary-c294'
+  let expected = old, effects = 0
+  const upstream = createServer((request,response) => {
+    if (request.headers.authorization !== `Bearer ${expected}`) { response.writeHead(403).end(); return }
+    effects++; response.writeHead(200).end('{}')
+  })
+  await new Promise<void>(resolve => upstream.listen(0,'127.0.0.1',resolve))
+  const address = upstream.address(); if (!address || typeof address === 'string') throw new Error('peer did not bind')
+  const bin = join(root,'opencode-peer.cjs')
+  await writeFile(bin,`#!${process.execPath}\nconst fs=require('node:fs');
+if(process.argv.includes('--version')){console.log('opencode 1.0.0');process.exit(0)}
+async function main(){
+ const config=JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG,'utf8'));
+ fs.appendFileSync('native-launches','launched\\n');
+ const auth=config.mcp.coord.headers.Authorization;
+ if((await fetch(config.mcp.coord.url,{headers:{Authorization:auth}})).status!==200)throw new Error('private tool denied');
+ const prior=fs.existsSync('native-conversation')?fs.readFileSync('native-conversation','utf8'):auth;
+ fs.writeFileSync('native-conversation',prior);
+ console.log(JSON.stringify({type:'text',sessionID:'owned-opencode-history',part:{type:'text',text:prior}}));
+ console.log(JSON.stringify({type:'turn.completed',sessionID:'owned-opencode-history',usage:{input_tokens:1,output_tokens:1}}));
+} main().catch(()=>{console.error('native peer failed');process.exitCode=1});`,{mode:0o700})
+  const createHost = () => startServer({ cwd:root,quiet:true,handleSignals:false,
+    config:{...loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_DATA_DIR:join(root,'state'),BRIDGE_BACKENDS:'opencode',OPENCODE_BIN:bin,BRIDGE_TRACE:'off',BRIDGE_JAIL_MODE:'off'}),port:0} })
+  let server = await createHost()
+  const body = (token:string,runId:string) => JSON.stringify({model:'opencode/history-fixture',session_id:'private-opencode-history',run_id:runId,cwd:root,
+    messages:[{role:'user',content:'Use the private tool and continue the native conversation'}],env:{AGENT_RUNTIME_COORDINATION_TOKEN:token},
+    runtime_attachments:{mcp:{coord:{transport:'http',url:`http://127.0.0.1:${address.port}/mcp`,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}}})
+  try {
+    const first = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(old,'private-opencode-first')})
+    const text = await first.text()
+    expect(first.status,text).toBe(200)
+    expect(text).toContain('[redacted:MCP]')
+    expect(text).not.toContain(old)
+    expect(effects).toBe(1)
+    expect(await readFile(join(root,'native-conversation'),'utf8')).toContain(old)
+    await server.close(); expected = next; server = await createHost()
+    const held = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(next,'private-opencode-after-restart')})
+    expect(held.status).not.toBe(200)
+    expect(await held.text()).toContain('redaction history is unavailable')
+    expect((await readFile(join(root,'native-launches'),'utf8')).trim().split('\n')).toHaveLength(1)
+    expect(effects).toBe(1)
+    for (const bytes of await bytesUnder(root,new Set([join(root,'native-conversation')]))) {
+      expect(bytes.includes(Buffer.from(old))).toBe(false)
+      expect(bytes.includes(Buffer.from(next))).toBe(false)
+    }
+  } finally {
+    await server.close()
+    await new Promise<void>(resolve => upstream.close(()=>resolve()))
+    await rm(root,{recursive:true,force:true})
+  }
+},30000)
