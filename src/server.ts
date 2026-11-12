@@ -219,6 +219,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   const hostPolicy = Object.freeze({
     schema: 'cli-bridge.host-policy.v1',
     subscriptionsOnly: config.subscriptionsOnly,
+    bearerRequired: Boolean(config.bearer),
     jail: Object.freeze({ mode: config.jailMode, fallback: config.jailFallback,
       network: Object.freeze({ default: config.jailNetwork ?? 'none', ceiling: config.jailNetwork ?? 'router' }) }),
     trustedPorts: Object.freeze({ privateMcpSecrets: typeof mcpSecrets?.get === 'function', hub: hub !== undefined }),

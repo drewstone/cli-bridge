@@ -460,7 +460,7 @@ cancellation remain available. Admission refusals use HTTP403 and the same SSE/d
 `provider_dispatch: not_started`. The fix names the native command or observed environment override.
 
 The existing bearer-protected `GET /` response includes `hostPolicy` with schema
-`cli-bridge.host-policy.v1`. It reports the immutable startup subscription admission policy,
+`cli-bridge.host-policy.v1`. It reports whether bearer authentication is required, the immutable startup subscription admission policy,
 jail floor/fallback/network default and ceiling, and presence of trusted private-MCP and Hub
 ports. It exposes no credential values, key names, paths or grants. Port presence does not establish
 readiness, permissions or survival after a Bridge process exits. Clients still discover exact-route

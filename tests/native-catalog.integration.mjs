@@ -128,6 +128,7 @@ child.on('close', code => process.exit(code ?? 0));
     const policy = await fetch(server.url, { headers }).then((response) => response.json())
     assert.equal(policy.hostPolicy.schema, 'cli-bridge.host-policy.v1')
     assert.equal(policy.hostPolicy.subscriptionsOnly, true)
+    assert.equal(policy.hostPolicy.bearerRequired, true)
     assert.deepEqual(policy.hostPolicy.trustedPorts, { privateMcpSecrets: false, hub: false })
     assert.ok(!JSON.stringify(policy).includes('native-catalog-public-test-bearer'))
     const catalog = await fetch(`${server.url}/v1/models`, { headers }).then((response) => response.json())

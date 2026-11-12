@@ -28,7 +28,7 @@ describe('bridge capability advertisement', () => {
       expect(response.status).toBe(200)
       await expect(response.json()).resolves.toMatchObject({
         name: 'cli-bridge',
-        hostPolicy: { schema: 'cli-bridge.host-policy.v1', subscriptionsOnly: true,
+        hostPolicy: { schema: 'cli-bridge.host-policy.v1', subscriptionsOnly: true, bearerRequired: true,
           jail: { mode: 'fs-jail', fallback: 'deny', network: { default: 'relay', ceiling: 'relay' } },
           trustedPorts: { privateMcpSecrets: true, hub: false } },
         capabilities: {
