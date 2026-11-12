@@ -67,6 +67,8 @@ interface HostServiceOwner {
 interface HostService {
   owner: HostServiceOwner
   cap: string
+  headers: Readonly<Record<string, string>>
+  protectedValues: readonly string[]
   claimed: boolean
   revoked: boolean
   active: Set<() => void>
@@ -108,22 +110,10 @@ export function registerTrustedHostService(input: {
     paths.set(suffix, new Set(methods))
   }
   if (!paths.size) throw new Error('trusted host service has no admitted paths')
-  const headers: Record<string, string> = {}
-  for (const [name, value] of Object.entries(input.headers ?? {})) {
-    validateHeaderName(name)
-    validateHeaderValue(name, value)
-    if (
-      /^(host|connection|upgrade|content-length|transfer-encoding|expect|trailer|proxy-.*)$/iu.test(name) ||
-      value.length > MAX_HEAD_BYTES
-    )
-      throw new Error('trusted host service header is not an endpoint credential or protocol header')
-    if (headers[name.toLowerCase()] !== undefined) throw new Error('duplicate trusted host service header')
-    headers[name.toLowerCase()] = value
-  }
   const value: HostServiceOwner = {
     target,
     paths,
-    headers,
+    headers: serviceHeaders(input.headers ?? {}),
     revoked: false,
     claims: new Set(),
   }
@@ -138,8 +128,12 @@ export function registerTrustedHostService(input: {
   }
 }
 
-/** Fresh private routing capability per turn, before native parsing, copying, or output redaction. */
-export function claimTrustedHostService(owner: TrustedHostServiceOwner): {
+/** Fresh capability before native parsing/copying/redaction. Headers come only from trusted admission,
+ * including credentials minted after listener registration; owner-fixed headers cannot be replaced. */
+export function claimTrustedHostService(
+  owner: TrustedHostServiceOwner,
+  privateHeaders: Readonly<Record<string, string>> = {},
+): {
   registration: TrustedHostServiceRegistration
   nativeUrl: string
   protectedValues: readonly string[]
@@ -147,10 +141,19 @@ export function claimTrustedHostService(owner: TrustedHostServiceOwner): {
 } {
   const value = owners.get(owner)
   if (!value || value.revoked) throw new Error('unavailable trusted host service owner')
+  const headers = serviceHeaders(privateHeaders, value.headers)
   const cap = randomBytes(32).toString('base64url')
+  // Retain the known credential component too; peers can echo it without its scheme.
+  // No decoding or inference of other secret formats is performed here.
+  const credential = /^(?:Bearer|Basic)[ \t]+(\S+)[ \t]*$/iu.exec(headers.authorization ?? '')?.[1]
+  const protectedValues = Object.freeze([
+    ...new Set([cap, ...Object.values(headers), ...(credential ? [credential] : [])]),
+  ])
   const service: HostService = {
     owner: value,
     cap,
+    headers,
+    protectedValues,
     claimed: false,
     revoked: false,
     active: new Set(),
@@ -161,9 +164,28 @@ export function claimTrustedHostService(owner: TrustedHostServiceOwner): {
   return {
     registration,
     nativeUrl: `http://127.0.0.1:3128/${cap}`,
-    protectedValues: Object.freeze([cap, ...Object.values(value.headers)]),
+    protectedValues,
     revoke: () => revokeService(service),
   }
+}
+
+function serviceHeaders(
+  input: Readonly<Record<string, string>>,
+  fixed: Readonly<Record<string, string>> = {},
+): Readonly<Record<string, string>> {
+  const headers: Record<string, string> = Object.assign(Object.create(null), fixed)
+  for (const [name, value] of Object.entries(input)) {
+    validateHeaderName(name)
+    validateHeaderValue(name, value)
+    if (
+      /^(host|connection|upgrade|content-length|transfer-encoding|expect|trailer|proxy-.*)$/iu.test(name) ||
+      value.length > MAX_HEAD_BYTES
+    )
+      throw new Error('trusted host service header is not an endpoint credential or protocol header')
+    if (Object.hasOwn(headers, name.toLowerCase())) throw new Error('duplicate or fixed trusted host service header')
+    headers[name.toLowerCase()] = value
+  }
+  return Object.freeze(headers)
 }
 
 function revokeService(service: HostService): void {
@@ -209,8 +231,9 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   const allow = new Set(options.allow.map(normalizeTarget))
   const intercepted = new Set((options.intercept?.hosts ?? []).map((host) => host.toLowerCase()))
   const sink = options.log ?? ((line: string) => process.stderr.write(`[jail-egress] ${line}\n`))
-  const protectedValues = admitted.flatMap((service) => [service.cap, ...Object.values(service.owner.headers)]).filter(Boolean)
-  const log = (line: string) => sink(protectedValues.reduce((value, secret) => value.split(secret).join('[redacted]'), line))
+  const protectedValues = admitted.flatMap((service) => service.protectedValues).filter(Boolean)
+  const log = (line: string) =>
+    sink(protectedValues.reduce((value, secret) => value.split(secret).join('[redacted]'), line))
 
   const permitted = (host: string, port: number): boolean => {
     if (intercepted.has(host)) return port === HTTPS_PORT
@@ -353,7 +376,7 @@ async function serveHostService(
     const value = req.headers[name]
     if (typeof value === 'string') headers[name] = value
   }
-  Object.assign(headers, route.service.owner.headers)
+  Object.assign(headers, route.service.headers)
   headers['content-length'] = String(size)
   headers.connection = 'close'
   await new Promise<void>((resolve) => {
