@@ -107,13 +107,24 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
   }
   try {
+    const streams = new Map<string, Buffer[]>()
     for (const bytes of [...await bytesUnder(root), ...await bytesUnder(captureRoot)]) {
       expect(bytes.includes(Buffer.from(secret))).toBe(false)
       for (const line of bytes.toString().split('\n')) {
-        try { const frame = JSON.parse(line); if (frame.base64Bytes) expect(Buffer.from(frame.base64Bytes, 'base64').includes(Buffer.from(secret))).toBe(false) } catch (error) { if (error instanceof SyntaxError) continue; throw error }
+        try {
+          const frame = JSON.parse(line)
+          if (frame.base64Bytes) {
+            const key = `${frame.processId}/${frame.stream}`
+            const stream = streams.get(key) ?? []
+            stream.push(Buffer.from(frame.base64Bytes, 'base64'))
+            streams.set(key, stream)
+          }
+        } catch (error) { if (error instanceof SyntaxError) continue; throw error }
       }
     }
+    for (const chunks of streams.values()) expect(Buffer.concat(chunks).includes(Buffer.from(secret))).toBe(false)
     if (capture) {
+      expect(streams.size).toBeGreaterThan(0)
       const manifests = (await readdir(captureRoot)).filter(file => file.endsWith('.json'))
       expect(manifests.length).toBeGreaterThan(0)
       for (const name of manifests) expect(JSON.parse(await readFile(join(captureRoot, name), 'utf8')).redaction).toBe('private-mcp-secrets')
