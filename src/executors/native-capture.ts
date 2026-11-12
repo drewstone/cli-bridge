@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import {
   BOUND_HARNESS_SESSION_READ_LIMITS as bounds,
   CODEX_HOME_RULE, STORES, claudeCodeRefForFile, codexRefForFile,
-  completeLinePrefix, locateDeclaredSessionFiles, readBoundHarnessSessions, readSessionInput, storeGlob,
+  completeLinePrefix, locateDeclaredSessionFiles, readBoundHarnessSessions, readHeldSessionFile, readSessionInput, storeGlob,
   type NativeSessionCopy,
 } from '@tangle-network/harness-sessions'
 import type { EffectiveNativeStore } from '../jail/types.js'
@@ -115,19 +115,10 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
         parse: (text, file) => readSessionInput(harness, { text }, { ...nativeRef(harness, file.path), label: file.path }, { corruption: 'strict' }),
         read: async (file) => {
           const source = inventory.find((entry) => entry.path === file.path)!
-          const before = await source.handle.stat()
-          total += before.size
-          if (before.size > bounds.maxFileBytes || total > bounds.maxTotalBytes) throw new Error('Native source bytes exceed capture bound')
-          const length = await completeLinePrefix(source.handle, before.size)
-          const bytes = Buffer.alloc(before.size)
-          let at = 0
-          while (at < bytes.length) {
-            const { bytesRead } = await source.handle.read(bytes, at, bytes.length - at, at)
-            if (!bytesRead) throw new Error('Native source ended before its held size')
-            at += bytesRead
-          }
-          const after = await source.handle.stat()
-          if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) throw new Error('Native source changed during terminal capture')
+          const bytes = await readHeldSessionFile(source.handle, Math.min(bounds.maxFileBytes, bounds.maxTotalBytes - total))
+          total += bytes.length
+          const length = await completeLinePrefix(bytes, bytes.length)
+          const sourceSha256 = digest(bytes)
           if (length !== bytes.length) missingReasons.push(`native_incomplete_final_line:${file.path}`)
           const prefix = bytes.subarray(0, length)
           const retained = input.redact(prefix)
@@ -138,7 +129,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
           if (!Buffer.from(input.redact(labels)).equals(labels)) throw new Error('Private native labels cannot become retained identities')
           await writePayload(root, payload, retained)
           provenance.push({ path: file.path, nativeSessionId: file.nativeSessionId, parentNativeSessionId: nativeRef(harness, file.path).parentNativeSessionId,
-            sourceSha256: digest(bytes), sourceByteLength: bytes.length,
+            sourceSha256, sourceByteLength: bytes.length,
             retainedSha256: digest(retained), retainedByteLength: retained.byteLength, payload,
             redacted: !Buffer.from(retained).equals(prefix), truncated: length !== bytes.length })
           return retained
