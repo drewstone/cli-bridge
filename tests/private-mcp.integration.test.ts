@@ -49,8 +49,8 @@ async function main() {
   fs.writeFileSync(path.join(process.cwd(),'private-vendor-path.txt'),vendorFile)
 
 
-  const emit = async (value,secret=protectedValues[0]) => { const line=JSON.stringify(value)+'\n', at=line.indexOf(JSON.stringify(secret).slice(1,-1))+8; process.stdout.write(line.slice(0,at)); await new Promise(resolve=>setTimeout(resolve,10)); process.stdout.write(line.slice(at)) }
-  for (const secret of protectedValues) { process.stderr.write(secret.slice(0,11)); await new Promise(resolve=>setTimeout(resolve,10)); process.stderr.write(secret.slice(11)+'\n') }
+  const emit = async (value,secret=protectedValues[0]) => { const line=JSON.stringify(value)+'\n', at=line.indexOf(JSON.stringify(secret).slice(1,-1))+8; process.stdout.write(line.slice(0,at)); await new Promise(resolve=>setImmediate(resolve)); process.stdout.write(line.slice(at)) }
+  for (const secret of protectedValues) { process.stderr.write(secret.slice(0,11)); await new Promise(resolve=>setImmediate(resolve)); process.stderr.write(secret.slice(11)+'\n') }
   if (claude) {
     console.log(JSON.stringify({type:'system',subtype:'init',session_id:nativeId}))
     for (const secret of protectedValues) await emit({type:'assistant',message:{id:'msg',content:[{type:'text',text:echo}]}},secret)
@@ -251,7 +251,7 @@ async function main(){
  const prior=fs.existsSync('native-conversation')?fs.readFileSync('native-conversation','utf8'):auth;
  fs.writeFileSync('native-conversation',prior);
  const text=Buffer.from(JSON.stringify({type:'text',sessionID:'owned-opencode-history',part:{type:'text',text:prior+' '+auth}})+'\\n');
- for(let at=0;at<text.length;at+=7){process.stdout.write(text.subarray(at,at+7));await new Promise(resolve=>setTimeout(resolve,1));}
+ for(let at=0;at<text.length;at+=7){process.stdout.write(text.subarray(at,at+7));await new Promise(resolve=>setImmediate(resolve));}
  console.log(JSON.stringify({type:'turn.completed',sessionID:'owned-opencode-history',usage:{input_tokens:1,output_tokens:1}}));
 } main().catch(()=>{console.error('native peer failed');process.exitCode=1});`,{mode:0o700})
   const createHost = () => startServer({ cwd:root,quiet:true,handleSignals:false,

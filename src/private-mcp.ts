@@ -19,9 +19,9 @@ export function privateExecutionRedaction(request: ChatRequest, run: Pick<RunSna
     ...(request.runtime_attachments && protectedValues.get(request.runtime_attachments) || []),
     ...(request.runtimeCoordinationBearer ? [request.runtimeCoordinationBearer] : []),
   ])]
-  const protected_ = observe?.({ runId: run.id, requestDigest: run.requestDigest, sessionId: request.session_id ?? null,
+  const augmented = observe?.({ runId: run.id, requestDigest: run.requestDigest, sessionId: request.session_id ?? null,
     profileDigest, cwd: request.cwd ?? null }, values, request)
-  return protected_ || values
+  return [...new Set([...values, ...(augmented ?? [])])]
 }
 
 /** Host-owned grants share the existing private attachment identity, never its JSON value. */
