@@ -72,7 +72,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
     const spoolFromCwd = relative(cwd, root)
     const relativeStore = relative(cwd, storeRoot)
     if (cwd !== input.cwd || storeRoot !== store.root || !relativeStore.startsWith('.agent-home/') ||
-      !spoolFromCwd || (!spoolFromCwd.startsWith('..') && !isAbsolute(spoolFromCwd))) {
+      !spoolFromCwd || (!(spoolFromCwd === '..' || spoolFromCwd.startsWith('../')) && !isAbsolute(spoolFromCwd))) {
       return unavailable('native-store-or-spool-outside-host-policy')
     }
     await mkdir(root, { recursive: true, mode: 0o700 })
@@ -106,6 +106,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
           const before = await source.handle.stat()
           total += before.size
           if (before.size > bounds.maxFileBytes || total > bounds.maxTotalBytes) throw new Error('Native source bytes exceed capture bound')
+          const length = await completeLinePrefix(source.handle, before.size)
           const bytes = Buffer.alloc(before.size)
           let at = 0
           while (at < bytes.length) {
@@ -115,7 +116,6 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
           }
           const after = await source.handle.stat()
           if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) throw new Error('Native source changed during terminal capture')
-          const length = await completeLinePrefix(source.handle, bytes.length)
           if (length !== bytes.length) missingReasons.push(`native_incomplete_final_line:${file.path}`)
           const prefix = bytes.subarray(0, length)
           const retained = input.redact(prefix)

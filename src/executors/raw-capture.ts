@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, writeSync } from 'node:fs'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { Transform } from 'node:stream'
 import type { RunSnapshot } from '../runs/types.js'
 import type { NativeCaptureInput } from './native-capture.js'
@@ -174,7 +174,7 @@ export function spawnCaptured(command: string, args: readonly string[], options:
   }
   if (scope.workspace) {
     const rel = relative(resolve(scope.workspace), scope.root)
-    if (!rel || (!rel.startsWith('..') && !isAbsolute(rel))) throw new Error('Raw capture must be outside the agent workspace')
+    if (!rel || (!(rel === '..' || rel.startsWith(`..${sep}`)) && !isAbsolute(rel))) throw new Error('Raw capture must be outside the agent workspace')
   }
   if (options.stdio !== undefined && options.stdio !== 'pipe' && (!Array.isArray(options.stdio) || options.stdio[1] !== 'pipe' || options.stdio[2] !== 'pipe')) throw new Error('Raw capture requires piped stdout and stderr')
   mkdirSync(scope.root, { recursive: true, mode: 0o700 })
