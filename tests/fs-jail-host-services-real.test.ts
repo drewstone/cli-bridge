@@ -6,6 +6,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
+import { privateCopyRedactor } from '../src/executors/raw-capture.js'
 import { claimTrustedHostService, registerTrustedHostService } from '../src/jail/egress.js'
 import { LinuxBwrapJail } from '../src/jail/linux-bwrap.js'
 import type { JailSpec } from '../src/jail/types.js'
@@ -41,6 +42,10 @@ it.skipIf(!enabled)(
         cancel?.()
         return
       }
+      if (req.url === '/coord') {
+        res.end(req.headers.authorization?.slice('Bearer '.length))
+        return
+      }
       res.setHeader('mcp-session-id', 'scoped-session')
       res.end(JSON.stringify({ path: req.url, body }))
     })
@@ -57,7 +62,6 @@ it.skipIf(!enabled)(
     const coord = registerTrustedHostService({
       url: `${canonical}/coord`,
       paths: { '': ['POST'] },
-      headers: { authorization: 'Bearer actor-only' },
     })
     const run = async (claims: ReturnType<typeof claimTrustedHostService>[], source: string) => {
       const spec: JailSpec = {
@@ -84,16 +88,29 @@ it.skipIf(!enabled)(
         })
         const [code] = await once(child, 'close')
         expect(code, stderr).toBe(0)
-        return JSON.parse(stdout)
+        const redactor = privateCopyRedactor(claims.flatMap((claim) => claim.protectedValues))
+        try {
+          return JSON.parse(Buffer.from(redactor.redact(Buffer.from(stdout))).toString())
+        } finally {
+          redactor.close()
+        }
       } finally {
         await wrapped.cleanup?.()
       }
     }
     const firstHub = claimTrustedHostService(hub.owner)
-    const firstCoord = claimTrustedHostService(coord.owner)
+    const privateHeaders = { Authorization: 'Bearer actor-only' }
+    const firstCoord = claimTrustedHostService(coord.owner, privateHeaders)
+    privateHeaders.Authorization = 'Bearer mutated-after-claim'
     expect(firstHub.protectedValues).toContain('Bearer host-only')
+    expect(firstHub.protectedValues).toContain('host-only')
+    expect(firstCoord.protectedValues).toContain('Bearer actor-only')
+    expect(firstCoord.protectedValues).toContain('actor-only')
     expect(firstHub.protectedValues).toContain(new URL(firstHub.nativeUrl).pathname.slice(1))
     expect(JSON.stringify(firstHub.registration)).toBe('{}')
+    expect(() => claimTrustedHostService(hub.owner, { Authorization: 'Bearer override' })).toThrow('fixed')
+    for (const name of ['Host', 'Content-Length', 'Transfer-Encoding', 'Proxy-Authorization'])
+      expect(() => claimTrustedHostService(coord.owner, { [name]: 'refused' })).toThrow('header')
     try {
       const results = await run(
         [firstHub, firstCoord],
@@ -106,7 +123,7 @@ it.skipIf(!enabled)(
         const out={};
         out.tools=await status(hub+'/tools');
         out.call=await status(hub+'/call',{method:'POST',headers:{authorization:'Bearer spoof','x-unscoped':'must-drop'},body:'allowed'});
-        out.coord=await status(coord,{method:'POST',body:'actor'});
+        const reply=await fetch(coord,{method:'POST',body:'actor'});out.coord=reply.status;out.echo=await reply.text();
         out.root=await status(hub); out.method=await status(hub+'/call');
         out.suffix=await status(hub+'/tools/other'); out.query=await status(hub+'/tools?url='+encodeURIComponent(${JSON.stringify(canonical)}));
         out.foreign=await status('http://127.0.0.1:3128/not-a-cap/tools');
@@ -125,6 +142,7 @@ it.skipIf(!enabled)(
       expect(results.tools).toBe(200)
       expect(results.call).toBe(200)
       expect(results.coord).toBe(200)
+      expect(results.echo).toBe('[redacted:MCP]')
       for (const key of ['root', 'method', 'suffix', 'query', 'foreign', 'loopback', 'large'])
         expect(results[key]).not.toBe(200)
       expect(results.connect).toContain('403')
@@ -148,14 +166,21 @@ it.skipIf(!enabled)(
       expect(calls.some((call) => call.body === 'escape')).toBe(false)
       // Relay cleanup consumes only the turn claim. The trusted owner still admits another turn.
       const secondHub = claimTrustedHostService(hub.owner)
+      const secondCoord = claimTrustedHostService(coord.owner, { authorization: 'Bearer actor-next' })
+      expect(secondCoord.protectedValues).toContain('actor-next')
+      expect(secondCoord.protectedValues).not.toContain('actor-only')
       expect(secondHub.nativeUrl).not.toBe(firstHub.nativeUrl)
       const next = await run(
-        [secondHub],
+        [secondHub, secondCoord],
         `
-      (async()=>{const a=await fetch(${JSON.stringify(firstHub.nativeUrl + '/tools')});const b=await fetch(${JSON.stringify(secondHub.nativeUrl + '/tools')});console.log(JSON.stringify([a.status,b.status]))})().catch(e=>{console.error(e);process.exitCode=1});
+      (async()=>{const a=await fetch(${JSON.stringify(firstHub.nativeUrl + '/tools')});const b=await fetch(${JSON.stringify(secondHub.nativeUrl + '/tools')});const c=await fetch(${JSON.stringify(secondCoord.nativeUrl)},{method:'POST',headers:{authorization:'Bearer native-stale'},body:'renewed'});console.log(JSON.stringify([a.status,b.status,c.status,await c.text()]))})().catch(e=>{console.error(e);process.exitCode=1});
     `,
       )
-      expect(next).toEqual([403, 200])
+      expect(next).toEqual([403, 200, 200, '[redacted:MCP]'])
+      expect(calls.filter((call) => call.path === '/coord').map((call) => call.authorization)).toEqual([
+        'Bearer actor-only',
+        'Bearer actor-next',
+      ])
       // An owner lifetime ending destroys an admitted, in-flight host call.
       const held = claimTrustedHostService(hub.owner)
       cancel = hub.revoke
@@ -169,8 +194,8 @@ it.skipIf(!enabled)(
       ).toBe(true)
       expect(() => claimTrustedHostService(hub.owner)).toThrow('unavailable')
       await expect(run([firstHub], 'console.log(true)')).rejects.toThrow('unavailable')
-    const copied = { ...firstCoord, registration: JSON.parse(JSON.stringify(firstCoord.registration)) }
-    await expect(run([copied], 'console.log(true)')).rejects.toThrow('unavailable')
+      const copied = { ...firstCoord, registration: JSON.parse(JSON.stringify(firstCoord.registration)) }
+      await expect(run([copied], 'console.log(true)')).rejects.toThrow('unavailable')
     } finally {
       hub.revoke()
       coord.revoke()
