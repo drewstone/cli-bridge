@@ -124,6 +124,13 @@ child.on('close', code => process.exit(code ?? 0));
     await assert.rejects(access(unused), { code: 'ENOENT' })
     server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false })
     const headers = { authorization: 'Bearer native-catalog-public-test-bearer', 'content-type': 'application/json' }
+    assert.equal((await fetch(server.url)).status, 401)
+    const policy = await fetch(server.url, { headers }).then((response) => response.json())
+    assert.equal(policy.hostPolicy.schema, 'cli-bridge.host-policy.v1')
+    assert.equal(policy.hostPolicy.subscriptionsOnly, true)
+    assert.equal(policy.hostPolicy.bearerRequired, true)
+    assert.deepEqual(policy.hostPolicy.trustedPorts, { privateMcpSecrets: false, hub: false })
+    assert.ok(!JSON.stringify(policy).includes('native-catalog-public-test-bearer'))
     const catalog = await fetch(`${server.url}/v1/models`, { headers }).then((response) => response.json())
     assert.deepEqual(initialLocal, catalog.data.filter((row) => row.backend !== 'passthrough'), 'serverless and HTTP use identical ordered native model facts')
     const nonNative = catalog.data.filter((row) => row.backend === 'passthrough')
@@ -328,6 +335,8 @@ test('mandatory GTR Codex native deadline default and caller overrides stop befo
     const config = { ...loadConfig(options), port: 0 }
     server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false })
     const headers = { authorization: 'Bearer native-deadline-public-test-bearer', 'content-type': 'application/json' }
+    const host = await fetch(server.url, { headers }).then((response) => response.json())
+    assert.equal(host.hostPolicy.subscriptionsOnly, true, 'the actual final-launch subscription guard is advertised')
     const models = await fetch(`${server.url}/v1/models`, { headers }).then((response) => response.json())
     const native = models.data.find((row) => row.backend === 'codex' && row.default)
     assert.ok(native, 'precondition: the real native account must report a configured default')

@@ -459,6 +459,14 @@ cancellation remain available. Admission refusals use HTTP403 and the same SSE/d
 `type: subscription_required`, `status: 403`, `cause`, `fix`, `harness`, `provider`, and
 `provider_dispatch: not_started`. The fix names the native command or observed environment override.
 
+The existing bearer-protected `GET /` response includes `hostPolicy` with schema
+`cli-bridge.host-policy.v1`. It reports whether bearer authentication is required, the immutable startup subscription admission policy,
+jail floor/fallback/network default and ceiling, and presence of trusted private-MCP and Hub
+ports. It exposes no credential values, key names, paths or grants. Port presence does not establish
+readiness, permissions or survival after a Bridge process exits. Clients still discover exact-route
+capabilities and actual admission still checks the final native invocation. A profile's
+`model.metadata.credentialSource` alone does not enable the process subscription guard.
+
 Lists model ids each ready backend claims, with which harness serves them.
 
 ### `GET /health`
