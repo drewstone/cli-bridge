@@ -27,6 +27,7 @@ import type { SessionRecord } from '../sessions/store.js'
 import { RUNTIME_COORDINATION_ENV_NAME } from '../sessions/retained/contract.js'
 import { resolveAgentProfile, requireMaterializationCwd } from './profile-support.js'
 import { privateMcpCredentials, resolvePrivateMcpValue } from '../private-mcp.js'
+import { privateHostServiceMcp } from '../host-services.js'
 
 export function resolveMcpServers(
   req: ChatRequest,
@@ -96,7 +97,7 @@ export function resolveMcpServers(
     }
   }
 
-  return Object.keys(merged).length > 0 ? merged : null
+  return Object.keys(merged).length > 0 ? privateHostServiceMcp(req, merged, destination.privateMcpConfig) : null
 }
 
 /**

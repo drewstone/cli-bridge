@@ -2,6 +2,7 @@ import { DurableRunWriter } from './sessions/durable-writer.js'
 import { privateCopyRedactor } from './executors/raw-capture.js'
 import { preparePrivateMcp, type PrivateRunRedactionObserver } from './private-mcp.js'
 import { captureTerminalNativeFamily } from './executors/native-capture.js'
+import { createHostServiceBindings } from './host-services.js'
 /**
  * cli-bridge server entry — Hono on Node.
  *
@@ -81,6 +82,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   runs: RunRegistry
   catalog: ProfileCatalog
   extras: BuildAppExtras
+  hostServices: ReturnType<typeof createHostServiceBindings>
 }> {
   // The host policy and its enforcement share an immutable startup snapshot.
   config = { ...config }
@@ -88,6 +90,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   const extras: BuildAppExtras = { shutdownHooks: [] }
   const nativeRedactors = new Map<string, { binding: Parameters<PrivateRunRedactionObserver>[0]; authority: Set<string>; redactor: ReturnType<typeof privateCopyRedactor> }>()
   const nativeRedactionEpoch = randomUUID()
+  const hostServices = createHostServiceBindings()
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -98,6 +101,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   extras.shutdownHooks.push(async () => await runs.shutdown())
+  extras.shutdownHooks.push(async () => hostServices.close())
   extras.shutdownHooks.push(async () => { for (const { redactor, authority } of nativeRedactors.values()) { redactor.close(); authority.clear() }; nativeRedactors.clear() })
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
@@ -173,7 +177,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
 
   const app = new Hono()
-  const hub = hubOptions ? mountHubMcp(app, hubOptions) : undefined
+  const hub = hubOptions ? mountHubMcp(app, hubOptions, hostServices) : undefined
   if (hub) extras.shutdownHooks.push(async () => hub.close())
 
   // Bearer guard — only active when BRIDGE_BEARER is set.
@@ -263,10 +267,12 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     admitSubscription: async (request, backend, signal) => {
       await nativeCatalog.admit(request, backend, signal)
       const releaseHub = await hub?.prepare(request, signal, backend)
+      let releasePrivate: (() => void) | undefined, releaseServices: (() => void) | undefined
       try {
-        const releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
-        return () => { releasePrivate?.(); releaseHub?.() }
-      } catch (error) { releaseHub?.(); throw error }
+        releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
+        releaseServices = await hostServices.prepareCoordination(request, backend)
+        return () => { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } } }
+      } catch (error) { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } }; throw error }
     },
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
@@ -328,7 +334,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     ],
   }))
 
-  return { app, sessions, registry, runs, catalog, extras }
+  return { app, sessions, registry, runs, catalog, extras, hostServices }
   } catch (error) {
     try { await disposeApp({ sessions, extras }) } catch (cleanup) {
       throw new UnconfirmedBridgeCleanup([error, cleanup], 'CLI Bridge startup failed and cleanup was not confirmed')
@@ -454,6 +460,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
   }
   const host = address.address.includes(':') ? `[${address.address}]` : address.address
   const url = `http://${host}:${address.port}`
+  built.hostServices.bindListener(url)
   if (options.handleSignals !== false) {
     process.once('exit', release)
     process.on('SIGTERM', shutdown)
@@ -473,7 +480,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     console.log(config.trace.enabled ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)` : '[cli-bridge] traces: off (BRIDGE_TRACE=off)')
     console.log(`[cli-bridge] jail default: ${jailFloor}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
   }
-  return { url, close }
+  return { url, close, registerCoordinationEndpoint: built.hostServices.registerCoordinationEndpoint }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await startServer()
