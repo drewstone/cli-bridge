@@ -64,6 +64,7 @@ import { resolveCallerTrace } from '../trace/ids.js'
 import { lineageChildEnv } from '../trace/lineage.js'
 import { withRawProcessCapture } from '../executors/raw-capture.js'
 import { privateExecutionRedaction, type PrivateRunRedactionObserver } from '../private-mcp.js'
+import type { NativeCaptureTarget } from '../executors/native-capture.js'
 import {
   assertPiOutputTokenRequest,
   assertProfileRequestAuthority,
@@ -381,6 +382,7 @@ export function mountChatCompletions(
   deps: {
     registry: BackendRegistry
     onRunRedaction?: PrivateRunRedactionObserver
+    captureNative?: NativeCaptureTarget
     admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void | (() => void)>
     /** Captured operator jail defaults; standalone mounts retain process defaults. */
     jailEnv?: NodeJS.ProcessEnv
@@ -1172,15 +1174,12 @@ export function mountChatCompletions(
         },
       })
 
-      // The run pumps the source to completion on its own. This connection is only one reader;
-      // dropping it never touches `run.signal` or releases job-owned admission.
-      //
-      // Release resources from the job promise: an unconsumed delta iterator never
-      // runs its `finally`, while pump settles even for an already-terminal run.
-      // The backend records materialization on req before spawn, so failures still
-      // acknowledge the exact profile rather than appear as transport errors.
+      // Reader disconnect leaves the job and its admission alone. Capture settles
+      // before the job promise releases private grants and native configuration.
       const protectedValues = privateExecutionRedaction(req, run, sessionProfileBinding?.effectiveProfileDigest ?? null, deps.onRunRedaction)
-      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, protectedValues)), chatCompletionDeltaOptions(req))
+      const terminal = deps.captureNative ? async (input: Parameters<import('../executors/raw-capture.js').TerminalNativeCapture>[0]) => run.setNativeCapture(await deps.captureNative!({ ...input,
+        snapshot: run.snapshot(), backend: backend.name, cwd: req.cwd, profileDigest: sessionProfileBinding?.effectiveProfileDigest ?? null })) : undefined
+      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, protectedValues, terminal)), chatCompletionDeltaOptions(req))
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)

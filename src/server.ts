@@ -1,6 +1,7 @@
 import { DurableRunWriter } from './sessions/durable-writer.js'
 import { privateCopyRedactor } from './executors/raw-capture.js'
-import { preparePrivateMcp } from './private-mcp.js'
+import { preparePrivateMcp, type PrivateRunRedactionObserver } from './private-mcp.js'
+import { captureTerminalNativeFamily } from './executors/native-capture.js'
 /**
  * cli-bridge server entry — Hono on Node.
  *
@@ -83,7 +84,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   config = { ...config }
   const sessions = new SessionStore(config.dataDir)
   const extras: BuildAppExtras = { shutdownHooks: [] }
-  const redactors = new Set<ReturnType<typeof privateCopyRedactor>>()
+  const nativeRedactors = new Map<string, { binding: Parameters<PrivateRunRedactionObserver>[0]; redactor: ReturnType<typeof privateCopyRedactor> }>()
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -94,7 +95,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   extras.shutdownHooks.push(async () => await runs.shutdown())
-  extras.shutdownHooks.push(async () => { for (const redactor of redactors) redactor.close(); redactors.clear() })
+  extras.shutdownHooks.push(async () => { for (const { redactor } of nativeRedactors.values()) redactor.close(); nativeRedactors.clear() })
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
     extras.shutdownHooks.push(() => durableWriter.close())
@@ -194,15 +195,31 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
     registry,
-    ...(onRunRedaction ? { onRunRedaction: (binding, values) => {
+    onRunRedaction: (binding, values) => {
       const redactor = privateCopyRedactor(values)
-      redactors.add(redactor)
-      try { onRunRedaction(Object.freeze({ ...binding, redact: redactor.redact })) }
+      const key = `${binding.runId}:${binding.requestDigest}`
+      nativeRedactors.set(key, { binding, redactor })
+      try { onRunRedaction?.(Object.freeze({ ...binding, redact: redactor.redact })) }
       catch {
-        redactor.close(); redactors.delete(redactor)
+        redactor.close(); nativeRedactors.delete(key)
         throw new Error('Trusted native redaction authority is unavailable')
       }
-    } } : {}),
+    },
+    captureNative: (input) => captureTerminalNativeFamily({ ...input,
+      root: process.env.BRIDGE_RAW_CAPTURE_DIR || join(config.dataDir, 'native'),
+      redact: (bytes) => {
+        const exact = nativeRedactors.get(`${input.snapshot.id}:${input.snapshot.requestDigest}`)?.binding
+        if (!exact || exact.sessionId !== input.snapshot.sessionId || exact.cwd !== input.cwd || exact.profileDigest !== input.profileDigest) {
+          throw new Error('Native producer has no exact private redaction authority')
+        }
+        let retained = bytes
+        // A resumed native conversation can include prior turns' now-revoked grants.
+        for (const { binding, redactor } of nativeRedactors.values()) {
+          if (binding.sessionId === exact.sessionId && binding.cwd === exact.cwd && binding.profileDigest === exact.profileDigest) retained = redactor.redact(retained)
+        }
+        return retained
+      },
+    }),
     sessions,
     retainedRuns: sessions,
     durableWriter: durableWriter ?? undefined,

@@ -5,6 +5,10 @@ import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openS
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { Transform } from 'node:stream'
 import type { RunSnapshot } from '../runs/types.js'
+import type { NativeCaptureInput } from './native-capture.js'
+import type { EffectiveNativeStore } from '../jail/types.js'
+
+export type TerminalNativeCapture = (input: Pick<NativeCaptureInput, 'store' | 'nativeSessionIds' | 'processIds'>) => Promise<void>
 
 interface CaptureScope {
   root?: string
@@ -16,16 +20,19 @@ interface CaptureScope {
   nativeSessionIds: Set<string>
   processIds: string[]
   protectedValues: readonly string[]
+  terminal?: TerminalNativeCapture
+  nativeStore?: EffectiveNativeStore
+  nativeStoreConflict?: boolean
 }
 const scopes = new AsyncLocalStorage<CaptureScope>()
 
 /** Bind process bytes to the durable run after any admitted credential redaction. */
-export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: RunSnapshot, backend: string, workspace?: string, protectedValues: readonly string[] = []): AsyncIterable<T> {
+export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: RunSnapshot, backend: string, workspace?: string, protectedValues: readonly string[] = [], terminal?: TerminalNativeCapture): AsyncIterable<T> {
   const root = process.env.BRIDGE_RAW_CAPTURE_DIR
-  if (!root && !protectedValues.length) return source
+  if (!root && !protectedValues.length && !terminal) return source
   if (root && !isAbsolute(root)) throw new Error('BRIDGE_RAW_CAPTURE_DIR must be absolute')
   const scope: CaptureScope = {
-    ...(root && { root: resolve(root) }), backend, workspace, protectedValues,
+    ...(root && { root: resolve(root) }), backend, workspace, protectedValues, terminal,
     identity: { id: snapshot.id, requestDigest: snapshot.requestDigest,
       provider: snapshot.provider, environmentId: snapshot.environmentId,
       sessionId: snapshot.sessionId, executionId: snapshot.executionId },
@@ -40,8 +47,12 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
           const next = await scopes.run(scope, () => iterator.next())
           if (next.done) break
           if (typeof next.value === 'object' && next.value !== null) {
-            const delta = next.value as { internal_session_id?: unknown; finish_reason?: unknown }
+            const delta = next.value as { internal_session_id?: unknown; finish_reason?: unknown; effective_native_store?: EffectiveNativeStore }
             if (typeof delta.internal_session_id === 'string') scope.nativeSessionIds.add(delta.internal_session_id)
+            if (delta.effective_native_store) {
+              if (scope.nativeStore && JSON.stringify(scope.nativeStore) !== JSON.stringify(delta.effective_native_store)) scope.nativeStoreConflict = true
+              scope.nativeStore = delta.effective_native_store
+            }
             if (delta.finish_reason) {
               // The parser has declared its terminal; drain any trailing original bytes.
               for (const { child } of scope.pending) { child.stdout?.resume(); child.stderr?.resume() }
@@ -58,6 +69,9 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
         for (const { child } of scope.pending) { child.stdout?.resume(); child.stderr?.resume() }
         await closing
         await Promise.all(scope.pending.map(({ done }) => done))
+        try { await scope.terminal?.({ store: scope.nativeStoreConflict ? undefined : scope.nativeStore,
+          nativeSessionIds: [...scope.nativeSessionIds], processIds: scope.processIds }) }
+        catch (error) { sourceErrors.push(error) }
         try {
           if (scope.root && scope.processIds.length) {
             const name = createHash('sha256').update(JSON.stringify(scope.identity)).digest('hex') + '.json'
@@ -140,11 +154,24 @@ function protectChild(child: ChildProcess, values: readonly string[]): ChildProc
   return child
 }
 
+function trackChild(scope: CaptureScope, child: ChildProcess, close: (code: number | null, signal: NodeJS.Signals | null) => void) {
+  const done = new Promise<void>(resolveDone => {
+    child.once('close', (code, signal) => {
+      try { close(code, signal) } catch (error) { scope.failures.push(error instanceof Error ? error : new Error(String(error))) } finally { resolveDone() }
+    })
+  })
+  scope.pending.push({ child, done })
+}
+
 /** All shared executors use this spawn seam; harness adapters do not select capture behavior. */
 export function spawnCaptured(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
   const scope = scopes.getStore()
   if (!scope) return nodeSpawn(command, args, options)
-  if (!scope.root) return protectChild(nodeSpawn(command, args, options), scope.protectedValues)
+  if (!scope.root) {
+    const child = protectChild(nodeSpawn(command, args, options), scope.protectedValues)
+    if (scope.terminal) { scope.processIds.push(randomUUID()); trackChild(scope, child, () => {}) }
+    return child
+  }
   if (scope.workspace) {
     const rel = relative(resolve(scope.workspace), scope.root)
     if (!rel || (!rel.startsWith('..') && !isAbsolute(rel))) throw new Error('Raw capture must be outside the agent workspace')
@@ -218,11 +245,6 @@ export function spawnCaptured(command: string, args: readonly string[], options:
   }
   let spawnError: string | undefined
   child.once('error', error => { spawnError = error.message })
-  const done = new Promise<void>(resolveDone => {
-    child.once('close', (code, signal) => {
-      try { close(code, signal, spawnError) } catch (error) { fail(error) } finally { resolveDone() }
-    })
-  })
-  scope.pending.push({ child, done })
+  trackChild(scope, child, (code, signal) => close(code, signal, spawnError))
   return child
 }

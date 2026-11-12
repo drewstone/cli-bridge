@@ -1,5 +1,6 @@
 // Real OS child, host jail, HTTP authentication and SQLite session mapping. No model service.
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -25,20 +26,26 @@ for (const [harness, override] of [['codex', false], ['claude-code', false], ['c
     const bin = join(workspace, 'native-protocol')
     const nativeRoot = harness === 'codex' ? '$CODEX_HOME' : '${CLAUDE_CONFIG_DIR:-$HOME/.claude}'
     const events = harness === 'codex' ? [
-      { type: 'thread.started', thread_id: 'native-store-owned-thread' },
+      { type: 'thread.started', thread_id: '00000000-0000-4000-8000-000000000001' },
       { type: 'item.completed', item: { type: 'agent_message', text: 'fixture complete' } },
       { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
     ] : [
-      { type: 'system', subtype: 'init', session_id: 'native-store-owned-thread' },
+      { type: 'system', subtype: 'init', session_id: '00000000-0000-4000-8000-000000000001' },
       { type: 'assistant', message: { content: [{ type: 'text', text: 'fixture complete' }] } },
-      { type: 'result', subtype: 'success', session_id: 'native-store-owned-thread', usage: { input_tokens: 1, output_tokens: 1 } },
+      { type: 'result', subtype: 'success', session_id: '00000000-0000-4000-8000-000000000001', usage: { input_tokens: 1, output_tokens: 1 } },
     ]
+    const nativeId = '00000000-0000-4000-8000-000000000001'
+    const directory = harness === 'codex' ? 'sessions/2026/11/12' : 'projects/owned-native'
+    const filename = harness === 'codex' ? `rollout-2026-11-12T00-00-00-${nativeId}.jsonl` : `${nativeId}.jsonl`
+    const records = harness === 'codex'
+      ? [{ type: 'session_meta', payload: { id: nativeId, cwd: workspace } }, { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'native capture proof' }] } }]
+      : [{ type: 'user', sessionId: nativeId, cwd: workspace, message: { role: 'user', content: 'native capture proof' } }, { type: 'assistant', sessionId: nativeId, message: { id: 'native-answer', role: 'assistant', content: [{ type: 'text', text: 'complete' }] } }]
     await writeFile(bin, `#!/bin/sh
 set -eu
 if [ "$1" = --version ]; then printf 'codex-cli 0.164.0\\n'; exit; fi
-mkdir -p "${nativeRoot}/sessions"
+mkdir -p "${nativeRoot}/${directory}"
 printf '%s' "${nativeRoot}" > native-store-receipt
-printf '%s\\n' '{"type":"session_meta","payload":{"id":"native-store-owned-thread"}}' > "${nativeRoot}/sessions/owned.jsonl"
+printf '%s\\n' ${records.map(record => `'${JSON.stringify(record)}'`).join(' ')} > "${nativeRoot}/${directory}/${filename}"
 printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
 `, { mode: 0o700 })
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: harness === 'codex' ? 'codex' : 'claude', CODEX_BIN: bin, CLAUDE_BIN: bin,
@@ -50,7 +57,7 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
     assert.equal((await fetch(server.url + endpoint, { headers: { authorization: 'Bearer wrong-fixture' } })).status, 401)
     const response = await fetch(server.url + '/v1/chat/completions', { method: 'POST', headers,
       body: JSON.stringify({ model: `${harness}/native-store-fixture`, cwd: workspace, session_id: 'owned-external-session',
-        run_id: 'owned-native-store-run', messages: [{ role: 'user', content: 'Only exercise the local executable fixture.' }] }) })
+        run_id: 'owned-native-store-run', agent_profile: { name: 'native-capture-fixture' }, messages: [{ role: 'user', content: 'Only exercise the local executable fixture.' }] }) })
     assert.equal(response.status, 200, await response.clone().text())
     const completion = await response.text()
     assert.ok(!completion.includes('effective_native_store'), 'host store metadata must not leak into ordinary completion payloads')
@@ -64,7 +71,7 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
     }
     const session = await lookup()
     assert.equal(session.externalId, 'owned-external-session')
-    assert.equal(session.internalId, 'native-store-owned-thread')
+    assert.equal(session.internalId, '00000000-0000-4000-8000-000000000001')
     assert.equal(session.cwd, workspace)
     const binding = session.metadata.effective_native_store
     assert.ok(binding, 'Actual effective native store binding is missing')
@@ -76,13 +83,56 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
     assert.equal(binding.nativeSessionId, session.internalId)
     assert.equal(binding.runId, 'owned-native-store-run')
     assert.match(binding.requestDigest, /^sha256:[a-f0-9]{64}$/u)
-    assert.ok((await readFile(join(binding.root, 'sessions', 'owned.jsonl'), 'utf8')).includes(session.internalId))
+    const original = await readFile(join(binding.root, directory, filename))
+    assert.ok(original.includes(Buffer.from(session.internalId)))
+    const originalDigest = createHash('sha256').update(original).digest('hex')
+    const runUrl = `${server.url}/v1/runs/owned-native-store-run`
+    const terminal = await fetch(runUrl, { headers }).then(r => r.json())
+    assert.equal(terminal.terminal, true)
+    const capture = terminal.nativeCapture
+    assert.ok(capture, 'Every attempted native producer has an explicit outcome')
+    if (override || process.platform !== 'linux') {
+      assert.equal(capture.status, 'unavailable', 'External/unqualified roots must not become trusted copies')
+    } else {
+      assert.equal(capture.status, 'retained')
+      const manifestBytes = await readFile(capture.path)
+      assert.equal(manifestBytes.length, capture.byteLength)
+      assert.equal(`sha256:${createHash('sha256').update(manifestBytes).digest('hex')}`, capture.sha256)
+      const manifest = JSON.parse(manifestBytes)
+      assert.equal(manifest.bridge.schema, 'cli-bridge.native-capture.v1')
+      assert.equal(manifest.bridge.familyVerified, true)
+      assert.equal(manifest.bridge.runId, terminal.id)
+      assert.equal(manifest.bridge.requestDigest, terminal.requestDigest)
+      assert.equal(manifest.bridge.sessionId, session.externalId)
+      assert.equal(manifest.bridge.profileDigest, session.metadata.agent_profile_binding.effectiveProfileDigest)
+      assert.equal(manifest.bridge.cwd, workspace)
+      assert.equal(manifest.nativeSessions[0].complete, true)
+      assert.deepEqual(manifest.nativeSessions[0].missingReasons, [])
+      assert.equal(manifest.bridge.files.length, 1)
+      const file = manifest.bridge.files[0]
+      assert.equal(file.sourceSha256, `sha256:${originalDigest}`)
+      const retained = await readFile(join(state, 'native', file.payload))
+      assert.deepEqual(retained, original)
+      assert.equal(file.redacted, false)
+      assert.equal(file.truncated, false)
+      const { listCapture, readCapture } = await import('@tangle-network/harness-sessions')
+      const listing = await listCapture(join(state, 'native'), manifest)
+      assert.equal(listing.sessions.length, 1)
+      assert.deepEqual(listing.missing, [])
+      const parsed = []
+      for await (const session of readCapture(join(state, 'native'), manifest)) parsed.push(session)
+      assert.equal(parsed[0].nativeSessionId, nativeId)
+      assert.equal(parsed[0].integrity.truncated, false)
+      assert.deepEqual(parsed[0].integrity.gaps, [])
+    }
+    assert.equal(createHash('sha256').update(await readFile(join(binding.root, directory, filename))).digest('hex'), originalDigest)
     assert.deepEqual((await fetch(server.url + endpoint.replace(`backend=${harness}`, 'backend=pi'), { headers }).then(r => r.json())).data, [])
     assert.equal((await fetch(server.url + '/v1/sessions?session_id=owned-external-session', { headers })).status, 400)
     assert.deepEqual((await fetch(server.url + endpoint.replace('owned-external-session', 'unknown'), { headers }).then(r => r.json())).data, [])
     await server.close()
     server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false })
     assert.deepEqual(await lookup(), session, 'exact binding must survive a Bridge restart without native work')
+    assert.deepEqual((await fetch(`${server.url}/v1/runs/owned-native-store-run`, { headers }).then(r => r.json())).nativeCapture, capture, 'Durable snapshot retains the exact producer reference across Bridge restart')
   } finally {
     await server?.close()
     if (previousClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR

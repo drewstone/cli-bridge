@@ -137,6 +137,9 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     expect(grantTokens).toHaveLength(1)
     expect(redactors).toHaveLength(1)
     const authority = redactors[0]!
+    const terminal = await fetch(`${server.url}/v1/runs/${encodeURIComponent(authority.runId)}`).then(r => r.json())
+    expect(terminal.nativeCapture).toMatchObject({status:'unavailable'})
+    // This HTTP/authentication fixture is deliberately unjailed; it cannot attest a retained native producer copy.
     expect(Object.isFrozen(authority)).toBe(true)
     expect(authority).toMatchObject({sessionId:`private-${backend}`,cwd:root,profileDigest:expect.stringMatching(/^sha256:/),requestDigest:expect.stringMatching(/^sha256:/)})
     vendorPath = await readFile(join(root,'private-vendor-path.txt'),'utf8')

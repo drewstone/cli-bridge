@@ -769,9 +769,9 @@ Claude and Codex local execution resolve these references into private temporary
 configs, removed after the turn. Missing bindings, sandbox execution, other backends,
 and references in argv fail before dispatch. Native stdout/stderr are filtered for
 exact admitted credential bytes before parsing, durable deltas, and raw capture;
-raw capture manifests label this transformation. This does not sanitize a tool's
-independent files or vendor-native session stores; hosts retaining those stores
-must apply their own retention policy.
+raw capture manifests label this transformation. Terminal native copies below
+use the same protected values. A tool's independent files still need their own
+retention policy.
 
 ### Runtime attachments
 
@@ -1124,7 +1124,7 @@ See `deploy/README.md` for Hetzner box (Docker or systemd). Remote deploy requir
 MIT
 
 
-### Original process evidence
+### Process and native evidence
 
 Set `BRIDGE_RAW_CAPTURE_DIR` to a private absolute directory to retain original stdout and stderr for one-shot durable runs.
 Use an enforced filesystem jail whose writable workspace cannot reach that directory.
@@ -1135,9 +1135,30 @@ A terminal records the actual exit and capture errors.
 A separate manifest links those coordinates to native session IDs observed by the backend.
 Capture write failures fail the run; they never become successful capture receipts.
 
-These files can contain sensitive original output.
-The bridge does not expose them over HTTP or redact their bytes.
-Normalized event replay remains separate.
-Native CLI stores remain in their configured private homes and require independent retention with credential files excluded.
-The process manifest does not claim native-store completeness, trusted image identity, or coverage of native subprocess stores.
-Retained native-session API jobs do not yet enter this one-shot capture scope.
+Known admitted custom-MCP values, Hub grants and runtime coordination bearers
+are filtered before parsing or retaining process bytes. Other output can still
+be sensitive. The bridge exposes no download endpoint for these private files.
+
+For Linux host-jailed Claude Code and Codex one-shot runs, the same producer
+captures the exact native family after its child closes and before releasing
+private grants. `RunSnapshot.nativeCapture` identifies the committed private
+manifest by path, digest and byte length, or explicitly names an unavailable
+capture. The existing durable run snapshot retains this reference across reader
+disconnect and Bridge restart. This does not reconstruct a native child after
+Bridge death.
+
+Native payloads use the existing `tangle.raw-evidence-archive.v2` copy format and
+the harness-sessions family verifier. The manifest adds exact Bridge run,
+profile, CWD, child attribution and source-versus-retained file provenance.
+Only transformed copies are written; original vendor files stay unchanged.
+Redaction makes original-byte coverage incomplete even when the retained family
+passes identity and integrity checks. Missing children, unsafe paths, partial
+lines, inventory bounds and unsupported stores remain explicit gaps. Read bounds
+come from `@tangle-network/harness-sessions`.
+
+Without `BRIDGE_RAW_CAPTURE_DIR`, native copies use the private `native`
+subdirectory of `BRIDGE_DATA_DIR`, outside the worker workspace. Raw-frame capture
+remains opt-in. macOS descriptor-relative capture and Pi's retained native-session
+API jobs are unsupported by this producer. The filesystem jail's network policy
+also applies to local MCP/Hub URLs; an unjailed authentication test does not prove
+their reachability from a jailed native process.
