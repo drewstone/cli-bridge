@@ -86,7 +86,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   config = { ...config }
   const sessions = new SessionStore(config.dataDir)
   const extras: BuildAppExtras = { shutdownHooks: [] }
-  const nativeRedactors = new Map<string, { binding: Parameters<PrivateRunRedactionObserver>[0]; redactor: ReturnType<typeof privateCopyRedactor> }>()
+  const nativeRedactors = new Map<string, { binding: Parameters<PrivateRunRedactionObserver>[0]; authority: Set<string>; redactor: ReturnType<typeof privateCopyRedactor> }>()
   const nativeRedactionEpoch = randomUUID()
   try {
   const registry = new BackendRegistry()
@@ -98,7 +98,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   extras.shutdownHooks.push(async () => await runs.shutdown())
-  extras.shutdownHooks.push(async () => { for (const { redactor } of nativeRedactors.values()) redactor.close(); nativeRedactors.clear() })
+  extras.shutdownHooks.push(async () => { for (const { redactor, authority } of nativeRedactors.values()) { redactor.close(); authority.clear() }; nativeRedactors.clear() })
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
     extras.shutdownHooks.push(() => durableWriter.close())
@@ -217,36 +217,39 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
         ))) throw new BackendError('Native conversation redaction history is unavailable; prior private authority cannot be reconstructed. Reconcile the prior run before starting a new native session.',
           'not_configured', undefined, { providerDispatch: 'not_started' })
       }
-      const redactor = privateCopyRedactor(values)
+      const previousAuthority = binding.sessionId ? [...nativeRedactors.values()].find(({ binding: prior }) =>
+        prior.sessionId === binding.sessionId && prior.profileDigest === binding.profileDigest && prior.cwd === binding.cwd)?.authority : undefined
+      const authority = previousAuthority ?? new Set<string>()
+      for (const value of values) authority.add(value)
+      const redactor = privateCopyRedactor(() => [...authority])
       const key = `${binding.runId}:${binding.requestDigest}`
-      nativeRedactors.set(key, { binding, redactor })
+      nativeRedactors.set(key, { binding, authority, redactor })
       try {
         onRunRedaction?.(Object.freeze({ ...binding, redact: redactor.redact }))
         if (local && binding.sessionId) sessions.remember({ externalId: binding.sessionId, backend, model: request.model,
           cwd: binding.cwd, metadata: { native_redaction_history: {
-            schema: 'cli-bridge.native-redaction-history.v1', protectedHistory: !!values.length || (prior.success && prior.data.protectedHistory),
+            schema: 'cli-bridge.native-redaction-history.v1', protectedHistory: !!authority.size || (prior.success && prior.data.protectedHistory),
             epoch: nativeRedactionEpoch, runId: binding.runId, requestDigest: binding.requestDigest,
             sessionId: binding.sessionId, profileDigest: binding.profileDigest, cwd: binding.cwd,
           } } })
       }
       catch {
         redactor.close(); nativeRedactors.delete(key)
+        if (!previousAuthority) authority.clear()
         throw new Error('Trusted native redaction authority is unavailable')
       }
+      // One chunk-safe pre-parser filter receives all credentials this exact conversation has admitted.
+      return [...authority]
     },
     captureNative: (input) => captureTerminalNativeFamily({ ...input,
       root: process.env.BRIDGE_RAW_CAPTURE_DIR || join(config.dataDir, 'native'),
       redact: (bytes) => {
-        const exact = nativeRedactors.get(`${input.snapshot.id}:${input.snapshot.requestDigest}`)?.binding
+        const source = nativeRedactors.get(`${input.snapshot.id}:${input.snapshot.requestDigest}`)
+        const exact = source?.binding
         if (!exact || exact.sessionId !== input.snapshot.sessionId || exact.cwd !== input.cwd || exact.profileDigest !== input.profileDigest) {
           throw new Error('Native producer has no exact private redaction authority')
         }
-        let retained = bytes
-        // A resumed native conversation can include prior turns' now-revoked grants.
-        for (const { binding, redactor } of nativeRedactors.values()) {
-          if (binding.sessionId === exact.sessionId && binding.cwd === exact.cwd && binding.profileDigest === exact.profileDigest) retained = redactor.redact(retained)
-        }
-        return retained
+        return source!.redactor.redact(bytes)
       },
     }),
     sessions,

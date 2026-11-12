@@ -124,13 +124,13 @@ function credentialWriter(values: readonly string[], emit: (bytes: Buffer) => vo
 }
 
 /** Trusted in-process capability; no value crosses the port and server close revokes it. */
-export function privateCopyRedactor(values: readonly string[]) {
-  let current: readonly string[] | undefined = [...values]
+export function privateCopyRedactor(values: readonly string[] | (() => readonly string[])) {
+  let current: readonly string[] | (() => readonly string[]) | undefined = typeof values === 'function' ? values : [...values]
   return {
     redact(bytes: Uint8Array): Uint8Array {
       if (!current) throw new Error('Private run redaction authority is closed')
       const chunks: Buffer[] = []
-      credentialWriter(current, bytes => chunks.push(bytes))(bytes, true)
+      credentialWriter(typeof current === 'function' ? current() : current, bytes => chunks.push(bytes))(bytes, true)
       return Buffer.concat(chunks)
     },
     close() { current = undefined },

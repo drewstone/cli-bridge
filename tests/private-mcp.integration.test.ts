@@ -74,6 +74,20 @@ async function bytesUnder(directory: string, excluded: ReadonlySet<string> = new
   return values
 }
 
+function processStreams(files: readonly Buffer[]): Buffer[] {
+  const streams = new Map<string, Buffer[]>()
+  for (const bytes of files) for (const line of bytes.toString().split('\n')) {
+    try {
+      const frame = JSON.parse(line)
+      if (typeof frame.processId !== 'string' || !['stdout','stderr','protocol'].includes(frame.stream) || typeof frame.base64Bytes !== 'string') continue
+      const key = `${frame.processId}/${frame.stream}`
+      const stream = streams.get(key) ?? []
+      stream.push(Buffer.from(frame.base64Bytes,'base64')); streams.set(key,stream)
+    } catch (error) { if (!(error instanceof SyntaxError)) throw error }
+  }
+  return [...streams.values()].map(chunks => Buffer.concat(chunks))
+}
+
 it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]] as const)('keeps %s MCP credentials private with raw capture %s', async (backend, capture) => {
   const harness = backend === 'claude' ? 'claude-code' : backend
   const root = await mkdtemp(join(tmpdir(), 'private-mcp-'))
@@ -197,25 +211,15 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
   }
   try {
-    const streams = new Map<string, Buffer[]>()
     expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(vendorDigest)
-    for (const bytes of [...await bytesUnder(root,new Set([vendorPath])), ...await bytesUnder(captureRoot)]) {
-      for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(bytes.includes(Buffer.from(value))).toBe(false)
-      for (const line of bytes.toString().split('\n')) {
-        try {
-          const frame = JSON.parse(line)
-          if (frame.base64Bytes) {
-            const key = `${frame.processId}/${frame.stream}`
-            const stream = streams.get(key) ?? []
-            stream.push(Buffer.from(frame.base64Bytes, 'base64'))
-            streams.set(key, stream)
-          }
-        } catch (error) { if (error instanceof SyntaxError) continue; throw error }
-      }
+    const retained = [...await bytesUnder(root,new Set([vendorPath])), ...await bytesUnder(captureRoot)]
+    const streams = processStreams(retained)
+    for (const bytes of [...retained,...streams]) for (const value of [secret,coordination,hubKey,...grantTokens]) {
+      expect(bytes.includes(Buffer.from(value))).toBe(false)
+      expect(bytes.includes(Buffer.from(JSON.stringify(value).slice(1,-1)))).toBe(false)
     }
-    for (const chunks of streams.values()) for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(Buffer.concat(chunks).includes(Buffer.from(value))).toBe(false)
     if (capture) {
-      expect(streams.size).toBeGreaterThan(0)
+      expect(streams.length).toBeGreaterThan(0)
       const manifests = (await readdir(captureRoot)).filter(file => file.endsWith('.json'))
       expect(manifests.length).toBeGreaterThan(0)
       for (const name of manifests) expect(JSON.parse(await readFile(join(captureRoot, name), 'utf8')).redaction).toBe('private-mcp-secrets')
@@ -223,10 +227,12 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); await rm(captureRoot, { recursive: true, force: true }) }
 }, 30000)
 
-it('fences private continuation on a host backend without vendor-family capture', async () => {
+it.each([false,true])('fences historical private output on a host backend without vendor-family capture (raw %s)', async (capture) => {
   const root = await mkdtemp(join(tmpdir(),'private-opencode-history-'))
-  const old = 'private-opencode-prior-coordination-canary-a783'
-  const next = 'private-opencode-next-coordination-canary-c294'
+  const captureRoot = await mkdtemp(join(tmpdir(),'private-opencode-frames-'))
+  vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',capture ? captureRoot : '')
+  const old = 'private-opencode-prior-"coordination"-canary-a783\\tail'
+  const next = 'private-opencode-next-"coordination"-canary-c294\\tail'
   let expected = old, effects = 0
   const upstream = createServer((request,response) => {
     if (request.headers.authorization !== `Bearer ${expected}`) { response.writeHead(403).end(); return }
@@ -244,13 +250,14 @@ async function main(){
  if((await fetch(config.mcp.coord.url,{headers:{Authorization:auth}})).status!==200)throw new Error('private tool denied');
  const prior=fs.existsSync('native-conversation')?fs.readFileSync('native-conversation','utf8'):auth;
  fs.writeFileSync('native-conversation',prior);
- console.log(JSON.stringify({type:'text',sessionID:'owned-opencode-history',part:{type:'text',text:prior}}));
+ const text=Buffer.from(JSON.stringify({type:'text',sessionID:'owned-opencode-history',part:{type:'text',text:prior+' '+auth}})+'\\n');
+ for(let at=0;at<text.length;at+=7){process.stdout.write(text.subarray(at,at+7));await new Promise(resolve=>setTimeout(resolve,1));}
  console.log(JSON.stringify({type:'turn.completed',sessionID:'owned-opencode-history',usage:{input_tokens:1,output_tokens:1}}));
 } main().catch(()=>{console.error('native peer failed');process.exitCode=1});`,{mode:0o700})
   const createHost = () => startServer({ cwd:root,quiet:true,handleSignals:false,
     config:{...loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_DATA_DIR:join(root,'state'),BRIDGE_BACKENDS:'opencode',OPENCODE_BIN:bin,BRIDGE_TRACE:'off',BRIDGE_JAIL_MODE:'off'}),port:0} })
   let server = await createHost()
-  const body = (token:string,runId:string) => JSON.stringify({model:'opencode/history-fixture',session_id:'private-opencode-history',run_id:runId,cwd:root,
+  const body = (token:string,runId:string) => JSON.stringify({stream:true,model:'opencode/history-fixture',session_id:'private-opencode-history',run_id:runId,cwd:root,
     messages:[{role:'user',content:'Use the private tool and continue the native conversation'}],env:{AGENT_RUNTIME_COORDINATION_TOKEN:token},
     runtime_attachments:{mcp:{coord:{transport:'http',url:`http://127.0.0.1:${address.port}/mcp`,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}}})
   try {
@@ -261,19 +268,35 @@ async function main(){
     expect(text).not.toContain(old)
     expect(effects).toBe(1)
     expect(await readFile(join(root,'native-conversation'),'utf8')).toContain(old)
-    await server.close(); expected = next; server = await createHost()
+    expected = next
+    const second = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(next,'private-opencode-live-continuation')})
+    const secondText = await second.text()
+    expect(second.status,secondText).toBe(200)
+    expect(secondText).toContain('[redacted:MCP]')
+    expect(secondText).not.toContain(old)
+    expect(secondText).not.toContain(next)
+    expect(secondText).not.toContain(JSON.stringify(old).slice(1,-1))
+    expect(secondText).not.toContain(JSON.stringify(next).slice(1,-1))
+    expect(effects).toBe(2)
+    await server.close(); server = await createHost()
     const held = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(next,'private-opencode-after-restart')})
     expect(held.status).not.toBe(200)
     expect(await held.text()).toContain('redaction history is unavailable')
-    expect((await readFile(join(root,'native-launches'),'utf8')).trim().split('\n')).toHaveLength(1)
-    expect(effects).toBe(1)
-    for (const bytes of await bytesUnder(root,new Set([join(root,'native-conversation')]))) {
+    expect((await readFile(join(root,'native-launches'),'utf8')).trim().split('\n')).toHaveLength(2)
+    expect(effects).toBe(2)
+    const retained = [...await bytesUnder(root,new Set([join(root,'native-conversation')])),...await bytesUnder(captureRoot)]
+    for (const bytes of [...retained,...processStreams(retained)]) {
       expect(bytes.includes(Buffer.from(old))).toBe(false)
       expect(bytes.includes(Buffer.from(next))).toBe(false)
+      expect(bytes.includes(Buffer.from(JSON.stringify(old).slice(1,-1)))).toBe(false)
+      expect(bytes.includes(Buffer.from(JSON.stringify(next).slice(1,-1)))).toBe(false)
     }
+    if(capture) expect(processStreams(retained).length).toBeGreaterThan(0)
   } finally {
     await server.close()
     await new Promise<void>(resolve => upstream.close(()=>resolve()))
+    vi.unstubAllEnvs()
     await rm(root,{recursive:true,force:true})
+    await rm(captureRoot,{recursive:true,force:true})
   }
 },30000)
