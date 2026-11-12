@@ -34,7 +34,7 @@ const events = fs.existsSync('native-case.json') ? JSON.parse(fs.readFileSync('n
 for (const event of events) process.stdout.write(JSON.stringify(event)+'\\n');
 `
 
-async function startServer(root: string, bin: string, bounded = false) {
+async function startServer(root: string, bin: string, bounded = false, emptyRedactionAugmentation = false) {
   const store = new SessionStore(join(root, 'store'))
   const runs = new RunRegistry(bounded ? {
     maxReplayDeltas: 2, replayRetentionMs: 100, identityRetentionMs: 10000,
@@ -44,6 +44,7 @@ async function startServer(root: string, bin: string, bounded = false) {
   }))
   const app = new Hono()
   mountChatCompletions(app, { registry, sessions: store, retainedRuns: store, runs,
+    ...(emptyRedactionAugmentation ? { onRunRedaction: () => [] } : {}),
     trace: new TraceEmitter({ sink: new JsonlSpanSink({ file: join(root, 'spans.jsonl'), maxBytes: 1024 * 1024, maxFiles: 1 }), maxToolSpans: 16 }),
   })
   const retainedRuns = new RetainedSessionService({ store, registry, runs })
@@ -288,4 +289,30 @@ it('does not promote a Pi configured model plus fingerprint from actual child st
   })(), 'requested-only') as { provider_model?: string; provider_models?: string[] }
   expect(result.provider_models).toBeUndefined()
   expect(result.provider_model).toBeUndefined()
+})
+
+
+it('keeps explicit credentials protected when the route observer adds no historical values', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'bridge-native-empty-redaction-'))
+  const bin = join(root, 'native.cjs')
+  const secret = 'native-empty-augmentation-canary-74ad'
+  await writeFile(bin, nativeProcess)
+  await chmod(bin, 0o755)
+  await writeFile(join(root, 'native-case.json'), JSON.stringify([
+    { type:'system',subtype:'init',session_id:'native-empty-redaction' },
+    { type:'assistant',message:{content:[{type:'text',text:secret}]} },
+    { type:'result',subtype:'success',session_id:'native-empty-redaction',usage:{input_tokens:0,output_tokens:0} },
+  ]))
+  const server = await startServer(root, bin, false, true)
+  try {
+    const response = await dispatch(server.url, { model:'claude-code/protocol-fixture',cwd:root,mode:'byob',stream:true,
+      run_id:'native-empty-redaction-run',session_id:'native-empty-redaction',messages:[{role:'user',content:'echo the native peer output'}],
+      env:{AGENT_RUNTIME_COORDINATION_TOKEN:secret} })
+    const text = await response.text()
+    expect(response.status,text).toBe(200)
+    expect(text).toContain('[redacted:MCP]')
+    expect(text).not.toContain(secret)
+    const snapshot = await fetch(`${server.url}/v1/runs/native-empty-redaction-run`).then(response=>response.text())
+    expect(snapshot).not.toContain(secret)
+  } finally { await server.stop(); await rm(root,{recursive:true,force:true}) }
 })
