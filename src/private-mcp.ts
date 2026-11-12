@@ -12,16 +12,16 @@ export function privateMcpCredentials(request: ChatRequest): ReadonlyMap<string,
 }
 
 /** The transport consumes this private snapshot before parsing or retaining child output. */
-export type PrivateRunRedactionObserver = (run: Omit<Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0], 'redact'>, values: readonly string[], request: ChatRequest) => void
+export type PrivateRunRedactionObserver = (run: Omit<Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0], 'redact'>, values: readonly string[], request: ChatRequest) => readonly string[] | void
 export function privateExecutionRedaction(request: ChatRequest, run: Pick<RunSnapshot, 'id' | 'requestDigest'>, profileDigest: string | null, observe?: PrivateRunRedactionObserver): readonly string[] {
   const values = [...new Set([
     ...(privateMcpCredentials(request)?.values() ?? []),
     ...(request.runtime_attachments && protectedValues.get(request.runtime_attachments) || []),
     ...(request.runtimeCoordinationBearer ? [request.runtimeCoordinationBearer] : []),
   ])]
-  observe?.({ runId: run.id, requestDigest: run.requestDigest, sessionId: request.session_id ?? null,
+  const protected_ = observe?.({ runId: run.id, requestDigest: run.requestDigest, sessionId: request.session_id ?? null,
     profileDigest, cwd: request.cwd ?? null }, values, request)
-  return values
+  return protected_ || values
 }
 
 /** Host-owned grants share the existing private attachment identity, never its JSON value. */
