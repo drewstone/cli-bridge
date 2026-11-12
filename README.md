@@ -1153,6 +1153,10 @@ longer resident in this Bridge is refused before dispatch. A Bridge restart can
 read a committed copy, but cannot safely recopy that conversation with only its
 new grants. Legacy native rows without this history also fail closed. Neither
 private values nor hashes of those values are persisted to recover authority.
+Accepted native context imports currently prove typed selection and receiver
+ownership, but carry no source redaction provenance. Producer-enabled hosts
+therefore refuse their first dispatch rather than label that imported history
+credential-free. Reading a previously committed capture remains supported.
 
 Native payloads use the existing `tangle.raw-evidence-archive.v2` copy format and
 the harness-sessions family verifier. The manifest adds exact Bridge run,

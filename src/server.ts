@@ -206,6 +206,10 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       if (supported && previous) {
         const marker = prior.success ? prior.data : undefined
         const authority = marker && nativeRedactors.get(`${marker.runId}:${marker.requestDigest}`)?.binding
+        if (!marker && previous.internalId && sessions.findContextTransferBySessionId(previous.externalId)) {
+          throw new BackendError('Native context import lacks source redaction provenance; producer-enabled dispatch cannot safely recopy the imported conversation.',
+            'not_configured', undefined, { providerDispatch: 'not_started' })
+        }
         if ((!marker && previous.internalId) || (marker && (
           marker.sessionId !== binding.sessionId || marker.profileDigest !== binding.profileDigest || marker.cwd !== binding.cwd ||
           (marker.protectedHistory && (marker.epoch !== nativeRedactionEpoch || !authority ||
@@ -287,6 +291,8 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     hostPolicy,
     capabilities: {
       profileMaterialization: 'cli-bridge.profile-materialization.v2',
+      // Implemented receipt format only; each terminal capture proves its own availability and integrity.
+      nativeCapture: 'cli-bridge.native-capture.v1',
       usageCostProvenance: 'cli-bridge.usage-cost.v1',
       // Platform attachments carried outside the session-bound profile;
       // dispatchers gate on this flag and refuse loud when it is absent.
