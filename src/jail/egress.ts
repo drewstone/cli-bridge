@@ -30,6 +30,8 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProxySecretBinding } from '@tangle-network/agent-interface'
 import { startEgressRelay, type EgressRelay } from './egress-relay.js'
+export { registerTrustedHostService, claimTrustedHostService } from './egress-relay.js'
+export type { TrustedHostServiceOwner, TrustedHostServiceRegistration } from './egress-relay.js'
 import type { JailSpec } from './types.js'
 
 export type JailNetwork = 'none' | 'router' | 'relay'
@@ -88,7 +90,7 @@ function proxySecretPlaceholder(envName: string): string {
   return `proxy-${envName.toLowerCase().replace(/[^a-z0-9]+/gu, '-')}.${randomBytes(12).toString('base64url')}`
 }
 
-type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin'>
+type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin' | 'trustedHostServices'>
 
 /** Hosts the relay may splice. Router mode stays the Router only; pass-through is relay-only. */
 export function relayAllowHosts(spec: EgressSpec): readonly string[] {
@@ -127,7 +129,7 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
   if (bindings.length && network !== 'relay') throw new Error('proxySecrets require execution.jail.network relay')
   // Created on every path: a write-jail cannot create the mask's mountpoint on the read-only host root.
   const mask = ['--tmpfs', await egressParent()]
-  if (network === 'none') return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
+  if (network === 'none' && !spec.trustedHostServices?.length) return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
 
   const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
@@ -147,7 +149,7 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
       runSecretCommand(spec.proxySecretCommand!, 'revoke', { key: binding.secretRef.key, secret })))
   }
   try {
-    const env: Record<string, string> = proxyEnv()
+    const env: Record<string, string> = network === 'none' ? {} : proxyEnv()
     let tunnel: { host: string; port: number } | undefined
     if (bindings.length) {
       if (!spec.proxySecretCommand) throw new Error('proxySecrets require BRIDGE_PROXY_SECRET_COMMAND')
@@ -160,6 +162,7 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
     relay = await startEgressRelay({
       socketPath,
       allow: relayAllowHosts(spec),
+      trustedHostServices: spec.trustedHostServices,
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
     return {

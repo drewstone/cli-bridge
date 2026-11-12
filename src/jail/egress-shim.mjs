@@ -5,7 +5,9 @@
  * nothing but loopback, so a jailed process has no route anywhere. This shim
  * runs first inside that namespace, listens on loopback, and forwards every
  * connection to the host egress relay's unix socket, which the jail binds in.
- * The jail points HTTPS_PROXY at the listener. A client that ignores the proxy
+ * The jail points HTTPS_PROXY at the listener. Trusted host services also use
+ * private capability URLs at this listener; only the host relay interprets them.
+ * A client that ignores the proxy
  * still has no route, so the relay's allowlist is the enforcement point, not
  * the client's cooperation.
  *
