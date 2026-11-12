@@ -95,6 +95,11 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     expect(rejected.status).not.toBe(200)
     expect(await rejected.text()).toContain('argv')
     expect(calls).toEqual(['private-tool'])
+    const missing = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${harness}/test`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: { ...profile, mcp: { local: { command: process.execPath, env: { MCP_PRIVATE: { kind: 'secret-ref', key: 'unbound' } } } } } }) })
+    expect(missing.status).not.toBe(200)
+    expect(await missing.text()).toContain('missing or invalid')
+    expect(calls).toEqual(['private-tool', 'unbound'])
+    expect((await readFile(join(root, 'private-config-paths.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(1)
     for (const line of (await readFile(join(root, 'private-config-paths.jsonl'), 'utf8')).trim().split('\n'))
       await expect(access(JSON.parse(line).configPath)).rejects.toThrow()
   } finally {
