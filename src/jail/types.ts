@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { ProxySecretBinding } from '@tangle-network/agent-interface'
 import type { JailNetwork } from './egress.js'
+import type { TrustedHostServiceRegistration } from './egress-relay.js'
 
 export interface JailSpec {
   /** Writable scratch root; becomes HOME inside the jail. Must resolve
@@ -21,6 +22,8 @@ export interface JailSpec {
   readConfine?: boolean
   /** Egress (see egress.ts). Omitted means `none`. */
   network?: JailNetwork
+  /** Trusted admission only, never decoded from request JSON. Each claim is adopted by one spawn. */
+  trustedHostServices?: readonly TrustedHostServiceRegistration[]
   /** `relay` only: AgentProfile.proxySecrets, minted and revoked per spawn (see egress.ts). */
   proxySecrets?: ProxySecretBinding[]
   /** `BRIDGE_PROXY_SECRET_COMMAND`, required when `proxySecrets` is non-empty. */

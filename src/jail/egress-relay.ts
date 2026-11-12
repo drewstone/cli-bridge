@@ -1,9 +1,10 @@
 /**
- * Host egress relay for a `router` or `relay` jail.
+ * Host egress relay for a network policy and explicitly admitted host services.
  *
  * The jailed process has no network of its own (see egress-shim.mjs); every
- * connection it makes arrives here as an HTTP CONNECT over a per-spawn unix
- * socket. The relay authorizes the CONNECT target, then requires the TLS
+ * connection arrives over a per-spawn UNIX socket. Parsed capability HTTP
+ * requests reach only host-registered endpoints. HTTPS CONNECT authorizes its
+ * target and requires the TLS
  * ClientHello's SNI to name the same host before a byte leaves the machine, so
  * a client cannot tunnel to an allowed address while naming another origin.
  *
@@ -20,21 +21,168 @@
  * target directly and is exempt.
  */
 
+import { randomBytes } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
-import { connect, createServer, isIP, type Server, type Socket } from 'node:net'
+import {
+  createServer,
+  request,
+  validateHeaderName,
+  validateHeaderValue,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http'
+import { connect, isIP, type Server, type Socket } from 'node:net'
 
 /** Bytes buffered while waiting for the CONNECT head or the ClientHello. */
 const MAX_HEAD_BYTES = 16_384
 /** Deadline for a client to name its target before the connection is dropped. */
 const NAME_DEADLINE_MS = 10_000
 const HTTPS_PORT = 443
+const MAX_SERVICE_BODY_BYTES = 1024 * 1024
+const SERVICE_HEADERS = ['accept', 'content-type', 'mcp-session-id', 'mcp-protocol-version', 'last-event-id'] as const
+const RESPONSE_HEADERS = [
+  'content-type',
+  'content-encoding',
+  'mcp-session-id',
+  'mcp-protocol-version',
+  'cache-control',
+  'retry-after',
+] as const
+declare const trustedHostService: unique symbol
+declare const trustedHostServiceOwner: unique symbol
+/** Host-only authority. JSON and object copies cannot manufacture a registration. */
+export interface TrustedHostServiceRegistration {
+  readonly [trustedHostService]: true
+}
+export interface TrustedHostServiceOwner {
+  readonly [trustedHostServiceOwner]: true
+}
+interface HostServiceOwner {
+  target: URL
+  paths: ReadonlyMap<string, ReadonlySet<string>>
+  headers: Readonly<Record<string, string>>
+  revoked: boolean
+  claims: Set<HostService>
+}
+interface HostService {
+  owner: HostServiceOwner
+  cap: string
+  claimed: boolean
+  revoked: boolean
+  active: Set<() => void>
+}
+const services = new WeakMap<TrustedHostServiceRegistration, HostService>()
+const owners = new WeakMap<TrustedHostServiceOwner, HostServiceOwner>()
+type ServiceMethod = 'GET' | 'POST' | 'DELETE'
+type ServiceRoute = {
+  service: HostService
+  target: URL
+  methods: ReadonlySet<string>
+}
+
+/** Register only an actual host-owned scope/listener. Never derive this authority from wire input. */
+export function registerTrustedHostService(input: {
+  url: string
+  paths: Readonly<Record<string, readonly ServiceMethod[]>>
+  headers?: Readonly<Record<string, string>>
+}): { owner: TrustedHostServiceOwner; revoke(): void } {
+  const target = new URL(input.url)
+  if (
+    target.protocol !== 'http:' ||
+    target.hostname !== '127.0.0.1' ||
+    !target.port ||
+    target.username ||
+    target.password ||
+    target.hash
+  )
+    throw new Error('trusted host service requires an exact HTTP loopback endpoint with a port')
+  const paths = new Map<string, ReadonlySet<string>>()
+  for (const [suffix, methods] of Object.entries(input.paths)) {
+    if (
+      !/^(?:\/[a-z0-9_-]+)*$/iu.test(suffix) ||
+      !methods.length ||
+      methods.some((method) => !['GET', 'POST', 'DELETE'].includes(method))
+    )
+      throw new Error('trusted host service requires exact suffixes and MCP methods')
+    if (target.search && suffix) throw new Error('trusted host service cannot append a suffix to a query endpoint')
+    paths.set(suffix, new Set(methods))
+  }
+  if (!paths.size) throw new Error('trusted host service has no admitted paths')
+  const headers: Record<string, string> = {}
+  for (const [name, value] of Object.entries(input.headers ?? {})) {
+    validateHeaderName(name)
+    validateHeaderValue(name, value)
+    if (
+      /^(host|connection|upgrade|content-length|transfer-encoding|expect|trailer|proxy-.*)$/iu.test(name) ||
+      value.length > MAX_HEAD_BYTES
+    )
+      throw new Error('trusted host service header is not an endpoint credential or protocol header')
+    if (headers[name.toLowerCase()] !== undefined) throw new Error('duplicate trusted host service header')
+    headers[name.toLowerCase()] = value
+  }
+  const value: HostServiceOwner = {
+    target,
+    paths,
+    headers,
+    revoked: false,
+    claims: new Set(),
+  }
+  const owner = Object.freeze({}) as TrustedHostServiceOwner
+  owners.set(owner, value)
+  return {
+    owner,
+    revoke() {
+      value.revoked = true
+      for (const claim of value.claims) revokeService(claim)
+    },
+  }
+}
+
+/** Fresh private routing capability per turn, before native parsing, copying, or output redaction. */
+export function claimTrustedHostService(owner: TrustedHostServiceOwner): {
+  registration: TrustedHostServiceRegistration
+  nativeUrl: string
+  protectedValues: readonly string[]
+  revoke(): void
+} {
+  const value = owners.get(owner)
+  if (!value || value.revoked) throw new Error('unavailable trusted host service owner')
+  const cap = randomBytes(32).toString('base64url')
+  const service: HostService = {
+    owner: value,
+    cap,
+    claimed: false,
+    revoked: false,
+    active: new Set(),
+  }
+  value.claims.add(service)
+  const registration = Object.freeze({}) as TrustedHostServiceRegistration
+  services.set(registration, service)
+  return {
+    registration,
+    nativeUrl: `http://127.0.0.1:3128/${cap}`,
+    protectedValues: Object.freeze([cap, ...Object.values(value.headers)]),
+    revoke: () => revokeService(service),
+  }
+}
+
+function revokeService(service: HostService): void {
+  service.revoked = true
+  service.owner.claims.delete(service)
+  for (const drop of service.active) drop()
+  service.active.clear()
+}
 
 export interface EgressRelayOptions {
   socketPath: string
   /** Reachable targets as `host` (port 443) or `host:port`. */
   allow: readonly string[]
   /** Hosts whose tunnels go to iron-proxy's CONNECT listener instead of the origin. */
-  intercept?: { hosts: readonly string[]; tunnel: { host: string; port: number } }
+  intercept?: {
+    hosts: readonly string[]
+    tunnel: { host: string; port: number }
+  }
+  trustedHostServices?: readonly TrustedHostServiceRegistration[]
   log?: (line: string) => void
 }
 
@@ -43,9 +191,26 @@ export interface EgressRelay {
 }
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
+  const admitted = (options.trustedHostServices ?? []).map((registration) => {
+    const service = services.get(registration)
+    if (!service || service.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
+    return service
+  })
+  if (new Set(admitted).size !== admitted.length) throw new Error('duplicate trusted host service registration')
+  for (const service of admitted) service.claimed = true
+  const routes = new Map<string, ServiceRoute>()
+  for (const service of admitted) {
+    for (const [suffix, methods] of service.owner.paths) {
+      const target = new URL(service.owner.target)
+      target.pathname += suffix
+      routes.set(`/${service.cap}${suffix}`, { service, target, methods })
+    }
+  }
   const allow = new Set(options.allow.map(normalizeTarget))
   const intercepted = new Set((options.intercept?.hosts ?? []).map((host) => host.toLowerCase()))
-  const log = options.log ?? ((line: string) => process.stderr.write(`[jail-egress] ${line}\n`))
+  const sink = options.log ?? ((line: string) => process.stderr.write(`[jail-egress] ${line}\n`))
+  const protectedValues = admitted.flatMap((service) => [service.cap, ...Object.values(service.owner.headers)]).filter(Boolean)
+  const log = (line: string) => sink(protectedValues.reduce((value, secret) => value.split(secret).join('[redacted]'), line))
 
   const permitted = (host: string, port: number): boolean => {
     if (intercepted.has(host)) return port === HTTPS_PORT
@@ -53,19 +218,56 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   }
 
   const open = new Set<Socket>()
-  const server = createServer((client) => {
+  const used = new WeakSet<Socket>()
+  const server = createServer(
+    {
+      maxHeaderSize: MAX_HEAD_BYTES,
+      requestTimeout: NAME_DEADLINE_MS,
+      headersTimeout: NAME_DEADLINE_MS,
+    },
+    (req, res) => {
+      // A connection authorizes one parsed request, never a raw HTTP tunnel.
+      res.setHeader('connection', 'close')
+      if (used.has(req.socket)) return void req.socket.destroy()
+      used.add(req.socket)
+      void serveHostService(req, res, routes).catch(() => {
+        if (!res.headersSent) res.writeHead(502)
+        res.end()
+      })
+    },
+  )
+  server.maxRequestsPerSocket = 1
+  server.on('dropRequest', (_req, socket) => socket.destroy())
+  server.on('upgrade', (_req, socket) => socket.destroy())
+  server.on('checkContinue', (_req, res) => {
+    res.writeHead(417, { connection: 'close' })
+    res.end()
+  })
+  server.on('checkExpectation', (_req, res) => {
+    res.writeHead(417, { connection: 'close' })
+    res.end()
+  })
+  server.on('clientError', (_error, socket) => socket.destroy())
+  server.on('connection', (client) => {
     open.add(client)
     client.once('close', () => open.delete(client))
     client.setNoDelay(true)
+  })
+  server.on('connect', (req, socket, rest) => {
+    const client = socket as Socket
+    if (used.has(client)) return void client.destroy()
+    used.add(client)
+    client.pause()
     const timer = setTimeout(() => client.destroy(), NAME_DEADLINE_MS)
     timer.unref()
     client.on('error', () => clearTimeout(timer))
-    void readUntil(client, (buf) => buf.indexOf('\r\n\r\n') >= 0 ? buf.indexOf('\r\n\r\n') + 4 : null)
-      .then(async ({ head, rest }) => {
-        const target = parseConnect(head)
+    void Promise.resolve()
+      .then(async () => {
+        const target = parseConnect(req.url ?? '')
         if (!target) return deny(client, 405, 'only HTTPS CONNECT is relayed', log, '<not-connect>')
         const { host, port } = target
-        if (!permitted(host, port)) return deny(client, 403, `egress to ${host}:${port} is not allowed`, log, `${host}:${port}`)
+        if (!permitted(host, port))
+          return deny(client, 403, `egress to ${host}:${port} is not allowed`, log, `${host}:${port}`)
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         const hello = await readUntil(client, (buf) => clientHelloEnd(buf), rest)
         const sni = readSni(hello.head)
@@ -80,7 +282,10 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
         if (client.destroyed) return void upstream.destroy()
         log(`allow host=${host}:${port}${intercepted.has(host) ? ' via=iron-proxy' : ''}`)
         upstream.write(Buffer.concat([hello.head, hello.rest]))
-        const drop = () => { upstream.destroy(); client.destroy() }
+        const drop = () => {
+          upstream.destroy()
+          client.destroy()
+        }
         client.once('close', () => upstream.destroy())
         upstream.on('error', drop)
         client.on('error', drop)
@@ -92,14 +297,102 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
         client.destroy()
       })
   })
-  await listen(server, options.socketPath)
+  try {
+    await listen(server, options.socketPath)
+  } catch (error) {
+    for (const service of admitted) revokeService(service)
+    throw error
+  }
   // Close ends live tunnels too, so a held connection cannot delay the proxy kill and revoke.
   return {
-    close: () => new Promise((resolve) => {
-      server.close(() => resolve())
-      for (const socket of open) socket.destroy()
-    }),
+    close: () =>
+      new Promise((resolve) => {
+        for (const service of admitted) revokeService(service)
+        server.close(() => resolve())
+        for (const socket of open) socket.destroy()
+      }),
   }
+}
+
+async function serveHostService(
+  req: IncomingMessage,
+  res: ServerResponse,
+  routes: ReadonlyMap<string, ServiceRoute>,
+): Promise<void> {
+  const route = routes.get(req.url ?? '')
+  if (!route || req.headers.host !== '127.0.0.1:3128' || route.service.revoked || route.service.owner.revoked) {
+    res.writeHead(403)
+    res.end()
+    return
+  }
+  if (!route.methods.has(req.method ?? '')) {
+    res.writeHead(405)
+    res.end()
+    return
+  }
+  const declared = req.headers['content-length']
+  if (declared !== undefined && Number(declared) > MAX_SERVICE_BODY_BYTES) {
+    res.writeHead(413)
+    res.end()
+    return
+  }
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > MAX_SERVICE_BODY_BYTES) {
+      res.writeHead(413)
+      res.end()
+      return
+    }
+    chunks.push(chunk)
+  }
+  if (route.service.revoked || route.service.owner.revoked || req.aborted || res.destroyed) return void res.destroy()
+  const headers: Record<string, string> = {}
+  for (const name of SERVICE_HEADERS) {
+    const value = req.headers[name]
+    if (typeof value === 'string') headers[name] = value
+  }
+  Object.assign(headers, route.service.owner.headers)
+  headers['content-length'] = String(size)
+  headers.connection = 'close'
+  await new Promise<void>((resolve) => {
+    const upstream = request(route.target, {
+      method: req.method,
+      headers,
+      // Host proxy settings cannot redirect a scoped loopback credential.
+      createConnection: () => connect(Number(route.target.port), '127.0.0.1'),
+    })
+    const drop = () => {
+      upstream.destroy()
+      res.destroy()
+      done()
+    }
+    route.service.active.add(drop)
+    const done = () => {
+      route.service.active.delete(drop)
+      res.off('close', drop)
+      resolve()
+    }
+    res.once('close', drop)
+    upstream.once('error', () => {
+      if (!res.headersSent) res.writeHead(502)
+      res.end()
+      done()
+    })
+    upstream.once('response', (response) => {
+      const retained: Record<string, string | string[]> = {}
+      for (const name of RESPONSE_HEADERS) {
+        const value = response.headers[name]
+        if (value !== undefined) retained[name] = value
+      }
+      res.writeHead(response.statusCode ?? 502, retained)
+      response.on('error', drop)
+      res.once('finish', done)
+      response.pipe(res)
+    })
+    upstream.end(Buffer.concat(chunks, size))
+  })
 }
 
 function normalizeTarget(entry: string): string {
@@ -114,9 +407,8 @@ function deny(client: Socket, status: 403 | 405, message: string, log: (line: st
 }
 
 /** `CONNECT host:port HTTP/1.x` → lower-cased host and port, else null. */
-function parseConnect(head: Buffer): { host: string; port: number } | null {
-  const line = head.toString('latin1', 0, head.indexOf('\r\n'))
-  const match = /^CONNECT (\[[0-9a-f:.]+\]|[^\s:]+):(\d{1,5}) HTTP\/1\.[01]$/iu.exec(line)
+function parseConnect(target: string): { host: string; port: number } | null {
+  const match = /^(\[[0-9a-f:.]+\]|[^\s:]+):(\d{1,5})$/iu.exec(target)
   if (!match) return null
   const port = Number(match[2])
   if (port < 1 || port > 65535) return null
