@@ -8,7 +8,7 @@ import test from 'node:test'
 import { tsImport } from 'tsx/esm/api'
 const { loadConfig, startServer } = await tsImport('../src/server.ts', import.meta.url)
 
-for (const [harness, override] of [['codex', false], ['claude-code', false], ['claude-code', true]]) test(`${harness} exact session lookup reports the actual host-visible native store across restart (override ${override})`, { timeout: 30_000 }, async () => {
+for (const [harness, override, unsafeLabels = false] of [['codex', false], ['claude-code', false], ['claude-code', true], ['claude-code', false, true]]) test(`${harness} exact session lookup reports the actual host-visible native store across restart (override ${override}, private label ${unsafeLabels})`, { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'bridge-native-store-'))
   const previous = process.env.CODEX_HOME
   const previousClaude = process.env.CLAUDE_CONFIG_DIR
@@ -25,6 +25,7 @@ for (const [harness, override] of [['codex', false], ['claude-code', false], ['c
     }
     process.env.CODEX_HOME = seed
     await writeFile(join(seed, 'config.toml'), 'model="native-store-fixture"\n')
+    const labelSecret = 'private-native-label-canary-7c53e2'
     const bin = join(workspace, 'native-protocol')
     const nativeRoot = harness === 'codex' ? '$CODEX_HOME' : '${CLAUDE_CONFIG_DIR:-$HOME/.claude}'
     const events = harness === 'codex' ? [
@@ -48,7 +49,15 @@ if [ "$1" = --version ]; then printf 'codex-cli 0.164.0\\n'; exit; fi
 mkdir -p "${nativeRoot}/${directory}"
 printf '%s' "${nativeRoot}" > native-store-receipt
 printf '%s\\n' ${records.map(record => `'${JSON.stringify(record)}'`).join(' ')} > "${nativeRoot}/${directory}/${filename}"
-printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
+${unsafeLabels ? `config=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --mcp-config ]; then shift; config=$1; fi
+  shift
+done
+label=$(sed -n 's/.*"Authorization":[[:space:]]*"Bearer \\([^" ]*\\)".*/\\1/p' "$config" | tr -d '\\r\\n')
+[ -n "$label" ]
+ln -s "${nativeRoot}/${directory}/${filename}" "${nativeRoot}/${directory}/$label.jsonl"
+` : ''}printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
 `, { mode: 0o700 })
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: harness === 'codex' ? 'codex' : 'claude', CODEX_BIN: bin, CLAUDE_BIN: bin,
       BRIDGE_BEARER: 'native-store-public-fixture', BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'fs-jail' }), port: 0 }
@@ -59,6 +68,7 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
     assert.equal((await fetch(server.url + endpoint, { headers: { authorization: 'Bearer wrong-fixture' } })).status, 401)
     const response = await fetch(server.url + '/v1/chat/completions', { method: 'POST', headers,
       body: JSON.stringify({ model: `${harness}/native-store-fixture`, cwd: workspace, session_id: 'owned-external-session',
+        ...(unsafeLabels ? { env:{AGENT_RUNTIME_COORDINATION_TOKEN:labelSecret},runtime_attachments:{mcp:{coord:{transport:'http',url:'http://127.0.0.1:9/mcp',headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}} } : {}),
         run_id: 'owned-native-store-run', agent_profile: { name: 'native-capture-fixture' }, messages: [{ role: 'user', content: 'Only exercise the local executable fixture.' }] }) })
     assert.equal(response.status, 200, await response.clone().text())
     const completion = await response.text()
@@ -93,8 +103,15 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
     assert.equal(terminal.terminal, true)
     const capture = terminal.nativeCapture
     assert.ok(capture, 'Every attempted native producer has an explicit outcome')
-    if (override || process.platform !== 'linux') {
-      assert.equal(capture.status, 'unavailable', 'External/unqualified roots must not become trusted copies')
+    if (override || unsafeLabels || process.platform !== 'linux') {
+      assert.equal(capture.status, 'unavailable', 'External/unqualified roots and private path labels must not become trusted copies')
+      if (unsafeLabels && process.platform === 'linux') {
+        assert.equal(capture.reason, 'native-capture-metadata-requires-redaction')
+        for (const entry of await readdir(join(state,'native'),{recursive:true,withFileTypes:true})) {
+          assert.ok(!entry.name.includes(labelSecret))
+          if (entry.isFile()) assert.ok(!(await readFile(join(entry.parentPath,entry.name))).includes(Buffer.from(labelSecret)))
+        }
+      }
     } else {
       assert.equal(capture.status, 'retained')
       assert.ok((await readdir(join(state, 'native'))).every(name => !name.endsWith('.frames')), 'Known child terminal facts do not require opt-in raw frame capture')

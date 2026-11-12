@@ -78,6 +78,9 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
     const cwd = await realpath(input.cwd)
     const storeRoot = await realpath(store.root)
     const root = resolve(input.root)
+    const identity = Buffer.from(JSON.stringify({ cwd, root, store, runId: snapshot.id, sessionId: snapshot.sessionId,
+      profileDigest: input.profileDigest, nativeSessionIds: input.nativeSessionIds }))
+    if (!Buffer.from(input.redact(identity)).equals(identity)) return unavailable('native-capture-metadata-requires-redaction')
     const spoolFromCwd = relative(cwd, root)
     const relativeStore = relative(cwd, storeRoot)
     if (cwd !== input.cwd || storeRoot !== store.root || !relativeStore.startsWith('.agent-home/') ||
@@ -130,6 +133,9 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
           const retained = input.redact(prefix)
           // Preserve the reader-owned native basename, including Claude's agent-<id> child attribution.
           const payload = `${id}-${provenance.length}/${basename(file.path)}`
+          const labels = Buffer.from(JSON.stringify({ payload, path: file.path, nativeSessionId: file.nativeSessionId,
+            parentNativeSessionId: nativeRef(harness, file.path).parentNativeSessionId }))
+          if (!Buffer.from(input.redact(labels)).equals(labels)) throw new Error('Private native labels cannot become retained identities')
           await writePayload(root, payload, retained)
           provenance.push({ path: file.path, nativeSessionId: file.nativeSessionId, parentNativeSessionId: nativeRef(harness, file.path).parentNativeSessionId,
             sourceSha256: digest(bytes), sourceByteLength: bytes.length,
@@ -159,6 +165,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
         familyVerified, files: provenance,
         family: family?.files.map((file) => ({ path: file.path, nativeSessionId: file.nativeSessionId, sha256: file.sha256, byteLength: file.byteLength })) ?? [] } }
     const bytes = Buffer.from(JSON.stringify(manifest) + '\n')
+    if (!Buffer.from(input.redact(bytes)).equals(bytes)) return unavailable('native-capture-metadata-requires-redaction')
     const committed = await writePayload(root, `${id}.native.json`, bytes)
     // Commit the directory before the terminal snapshot can advertise its manifest.
     const directory = await open(root, READ_DIRECTORY)
