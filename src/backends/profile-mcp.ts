@@ -26,6 +26,7 @@ import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { RUNTIME_COORDINATION_ENV_NAME } from '../sessions/retained/contract.js'
 import { resolveAgentProfile, requireMaterializationCwd } from './profile-support.js'
+import { privateMcpCredentials, resolvePrivateMcpValue } from '../private-mcp.js'
 
 export function resolveMcpServers(
   req: ChatRequest,
@@ -48,7 +49,7 @@ export function resolveMcpServers(
       for (const [name, raw] of Object.entries(profileMcp)) {
         if (!name || !raw || typeof raw !== 'object') continue
         if ((raw as { enabled?: unknown }).enabled === false) continue
-        merged[name] = normalizeMcpServerSpec({ ...raw, type: raw.transport }, name, `mcp[${JSON.stringify(name)}]`)
+        merged[name] = normalizeMcpServerSpec({ ...raw, type: raw.transport }, name, `mcp[${JSON.stringify(name)}]`, { ...destination, secrets: privateMcpCredentials(req) })
       }
     }
   }
@@ -102,16 +103,9 @@ export function resolveMcpServers(
  * Read one `AgentProfileMcpServer` configuration value as the plain string an MCP config file or a
  * server spawn needs.
  *
- * Interface 0.40 retyped `args`/`env`/`headers` from `string` to `AgentProfileConfigValue` — public
- * bytes (`{kind:'public', value}`) or an opaque `{kind:'secret-ref', key}` a private executor
- * resolves. cli-bridge is not that executor: every one of these values ends up in an on-disk MCP
- * config the harness reads (`writeMcpConfigFile`, `materializeMcpServersForPi`,
- * `materializeMcpServersForOpencode`, …), and cli-bridge has no `AgentProfileSecretProvider` to
- * resolve a reference with. So a reference is REFUSED here rather than resolved or rendered:
- * writing the reference object is nonsense to the harness, and writing a placeholder turns an auth
- * failure into what looks like a broken tool. The refusal names the reference KEY, never a value.
- * The one exception is a runtime-attachment header whose secret-ref key is
- * AGENT_RUNTIME_COORDINATION_TOKEN: the in-memory bearer, and only a private MCP config.
+ * Public values pass through unchanged. A trusted embedded host may resolve env/header
+ * references through its secret provider into private Claude/Codex configs; unresolved
+ * references are refused. Runtime coordination headers use their separate in-memory bearer.
  *
  * `args` is refused for a second, stronger reason: those strings become the MCP server's argv,
  * which is readable by every process on the host (`/proc/<pid>/cmdline`) and lies outside every
@@ -131,8 +125,8 @@ function publicMcpConfigString(value: unknown, where: string): string {
     if (config.kind === 'public' && typeof config.value === 'string') return config.value
     if (config.kind === 'secret-ref') {
       throw new BackendError(
-        `AgentProfile ${where} is a secret-ref (${JSON.stringify(config.key)}) and cli-bridge has ` +
-          'no secret provider — resolve it before the request, or declare a public value',
+        `AgentProfile ${where} is a secret-ref (${JSON.stringify(config.key)}) without an admitted ` +
+          'host-owned private MCP secret binding',
         'parse_error',
       )
     }
@@ -181,14 +175,14 @@ function resolveRuntimeCoordinationHeader(
 function publicMcpConfigRecord(
   record: Record<string, AgentProfileConfigValue> | undefined,
   where: string,
-  destination?: { backend: string; privateMcpConfig: boolean; bearer?: string },
+  destination?: { backend: string; privateMcpConfig: boolean; bearer?: string; secrets?: ReadonlyMap<string, string> },
 ): Record<string, string> {
   const out: Record<string, string> = {}
   if (!record || typeof record !== 'object') return out
   for (const [key, value] of Object.entries(record)) {
     if (value === undefined) continue
     const place = `${where}[${JSON.stringify(key)}]`
-    out[key] = resolveRuntimeCoordinationHeader(value, place, destination) ?? publicMcpConfigString(value, place)
+    out[key] = resolvePrivateMcpValue(value, destination) ?? resolveRuntimeCoordinationHeader(value, place, destination) ?? publicMcpConfigString(value, place)
   }
   return out
 }
@@ -197,7 +191,7 @@ function normalizeMcpServerSpec(
   raw: McpServerSpec | Record<string, unknown>,
   name: string,
   where = `mcp.mcpServers[${JSON.stringify(name)}]`,
-  destination?: { backend: string; privateMcpConfig: boolean; bearer?: string },
+  destination?: { backend: string; privateMcpConfig: boolean; bearer?: string; secrets?: ReadonlyMap<string, string> },
 ): McpServerSpec {
   // Defensive copy — drop any unknown fields, coerce types loosely.
   const r = raw as Record<string, unknown>
@@ -212,7 +206,7 @@ function normalizeMcpServerSpec(
     out.args = (r.args as unknown[]).map((a, i) => publicMcpConfigString(a, `${where}.args[${i}]`))
   }
   if (r.env && typeof r.env === 'object') {
-    out.env = publicMcpConfigRecord(r.env as Record<string, AgentProfileConfigValue>, `${where}.env`)
+    out.env = publicMcpConfigRecord(r.env as Record<string, AgentProfileConfigValue>, `${where}.env`, destination)
   }
   if (typeof r.url === 'string') out.url = r.url
   if (r.headers && typeof r.headers === 'object') {

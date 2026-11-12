@@ -1,4 +1,4 @@
-import type { AgentProfileMcpServer } from '@tangle-network/agent-interface';
+import type { AgentProfileMcpServer, AgentProfileSecretProvider } from '@tangle-network/agent-interface';
 import type { HubClient } from '@tangle-network/hub-sdk';
 import type { HubMcpScopeOptions } from '@tangle-network/hub-sdk/mcp';
 import type { Config } from './config.js';
@@ -9,6 +9,8 @@ export interface StartServerOptions {
     /** Embedded callers retain ownership of signals and process-wide error handlers. */
     handleSignals?: boolean;
     quiet?: boolean;
+    /** Trusted embedded-host port. Values stay outside requests, profiles and durable records. */
+    mcpSecrets?: AgentProfileSecretProvider;
     /** Embedded local one-shot runs share this listener's revocable Hub scope. */
     hub?: HubMcpScopeOptions & {
         client: HubClient;

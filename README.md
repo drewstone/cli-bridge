@@ -744,6 +744,20 @@ Per-server fields:
 Without a profile, callers may use body/header `mcp.mcpServers`.
 Sending both is refused before the harness starts.
 
+### Host-owned private MCP credentials
+
+Embedded hosts may pass `startServer({ mcpSecrets: { get: async key => /* host vault */ } })`.
+Declare references in `agent_profile.mcp.<name>.env` or `.headers` as
+`{ "kind": "secret-ref", "key": "tool-account", "format": "bearer" }` (omit `format`
+for raw values). The HTTP API accepts references only; it cannot install a resolver.
+Claude and Codex local execution resolve these references into private temporary
+configs, removed after the turn. Missing bindings, sandbox execution, other backends,
+and references in argv fail before dispatch. Native stdout/stderr are filtered for
+exact admitted credential bytes before parsing, durable deltas, and raw capture;
+raw capture manifests label this transformation. This does not sanitize a tool's
+independent files or vendor-native session stores; hosts retaining those stores
+must apply their own retention policy.
+
 ### Runtime attachments
 
 A dispatching runtime mounts its own MCP endpoints with
