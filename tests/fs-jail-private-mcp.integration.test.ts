@@ -87,6 +87,8 @@ it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as c
   const dispatch=(value:typeof body)=>fetch(`${server!.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(value)});
   const denied=await dispatch({...body,run_id:`unregistered-private-${harness}`});
   expect(denied.status).not.toBe(200);expect(await denied.text()).toContain('live host-owned listener');expect(coordCalls).toBe(0);expect(hubCalls).toBe(0);
+  await expect(readFile(join(workspace,'vendor-path'))).rejects.toMatchObject({code:'ENOENT'});
+  for(const token of tokens)expect((await fetch(`${server.url}/hub/mcp/grants/${token}/tools`)).status).toBe(403);
   server.registerCoordinationEndpoint({runId:'owned-root',actorId:'owned-actor',url:coordUrl,signal:lifetime.signal});
   const response=await dispatch(body);
   const text=await response.text();expect(response.status,text).toBe(200);expect(text).toContain('[redacted:MCP]');expect(hubCalls).toBe(1);expect(coordCalls).toBe(1);
