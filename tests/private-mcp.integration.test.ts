@@ -55,6 +55,7 @@ async function bytesUnder(directory: string): Promise<Buffer[]> {
 }
 
 it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]] as const)('keeps %s MCP credentials private with raw capture %s', async (backend, capture) => {
+  const harness = backend === 'claude' ? 'claude-code' : backend
   const root = await mkdtemp(join(tmpdir(), 'private-mcp-'))
   const captureRoot = await mkdtemp(join(tmpdir(), 'private-mcp-capture-'))
   if (capture) vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR', captureRoot)
@@ -83,14 +84,14 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     local: { command: process.execPath, args: [{ kind: 'public', value: stdio }], env: { MCP_PRIVATE: { kind: 'secret-ref', key: 'private-tool' } } },
   } }
   try {
-    const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${backend}/test`, session_id: `private-${backend}`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: profile }) })
+    const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${harness}/test`, session_id: `private-${backend}`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: profile }) })
     const text = await response.text()
     expect(response.status, text).toBe(200)
     expect(text).toContain('mcp-authenticated [redacted:MCP]')
     expect(calls).toEqual(['private-tool'])
     expect(methods).toEqual(['tools/list', 'initialize'])
     expect(text + JSON.stringify(profile)).not.toContain(secret)
-    const rejected = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${backend}/test`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: { ...profile, mcp: { local: { command: process.execPath, args: [{ kind: 'secret-ref', key: 'private-tool' }] } } } }) })
+    const rejected = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${harness}/test`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: { ...profile, mcp: { local: { command: process.execPath, args: [{ kind: 'secret-ref', key: 'private-tool' }] } } } }) })
     expect(rejected.status).not.toBe(200)
     expect(await rejected.text()).toContain('argv')
     expect(calls).toEqual(['private-tool'])

@@ -37,7 +37,7 @@ export async function preparePrivateMcp(
   }
   if (!references.size) return
   if (!provider) throw new BackendError('This Bridge has no host-owned MCP secret provider', 'not_configured')
-  if (!['claude', 'codex'].includes(backend) || request.execution?.kind === 'sandbox')
+  if (!['claude', 'claude-code', 'codex'].includes(backend) || request.execution?.kind === 'sandbox')
     throw new BackendError(`Private MCP credentials require a local Claude or Codex private config; backend ${JSON.stringify(backend)} is unsupported`, 'not_configured')
   const values = new Map<string, string>()
   for (const [key, { header }] of references) {
@@ -62,7 +62,7 @@ export function resolvePrivateMcpValue(
   destination?: { backend: string; privateMcpConfig: boolean; secrets?: ReadonlyMap<string, string> },
 ): string | undefined {
   if (value?.kind !== 'secret-ref' || !destination?.secrets?.has(value.key)) return
-  if (!destination.privateMcpConfig || !['claude', 'codex'].includes(destination.backend))
+  if (!destination.privateMcpConfig || !['claude', 'claude-code', 'codex'].includes(destination.backend))
     throw new BackendError('MCP credentials cannot be written to a nonprivate backend config', 'parse_error')
   const raw = destination.secrets.get(value.key)!
   return value.format === 'bearer' ? `Bearer ${raw}` : raw
