@@ -63,7 +63,7 @@ import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
 import { lineageChildEnv } from '../trace/lineage.js'
 import { withRawProcessCapture } from '../executors/raw-capture.js'
-import { privateMcpSecretValues } from '../private-mcp.js'
+import { privateExecutionRedaction, type PrivateRunRedactionObserver } from '../private-mcp.js'
 import {
   assertPiOutputTokenRequest,
   assertProfileRequestAuthority,
@@ -380,6 +380,7 @@ export function mountChatCompletions(
   app: Hono,
   deps: {
     registry: BackendRegistry
+    onRunRedaction?: PrivateRunRedactionObserver
     admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void | (() => void)>
     /** Captured operator jail defaults; standalone mounts retain process defaults. */
     jailEnv?: NodeJS.ProcessEnv
@@ -1176,11 +1177,10 @@ export function mountChatCompletions(
       //
       // Release resources from the job promise: an unconsumed delta iterator never
       // runs its `finally`, while pump settles even for an already-terminal run.
-      // The receipt supplier is read at FAILURE time: the backend retains the
-      // receipt on `req` during materialization (before spawn), so a thrown
-      // subprocess failure still acknowledges the profile instead of letting
-      // the caller misread the whole run as a missing-receipt transport fault.
-      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, privateMcpSecretValues(req))), chatCompletionDeltaOptions(req))
+      // The backend records materialization on req before spawn, so failures still
+      // acknowledge the exact profile rather than appear as transport errors.
+      const protectedValues = privateExecutionRedaction(req, run, sessionProfileBinding?.effectiveProfileDigest ?? null, deps.onRunRedaction)
+      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, protectedValues)), chatCompletionDeltaOptions(req))
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)

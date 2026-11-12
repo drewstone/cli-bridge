@@ -1,4 +1,5 @@
 import { DurableRunWriter } from './sessions/durable-writer.js'
+import { privateCopyRedactor } from './executors/raw-capture.js'
 import { preparePrivateMcp } from './private-mcp.js'
 /**
  * cli-bridge server entry — Hono on Node.
@@ -70,7 +71,7 @@ export interface BuildAppExtras {
   shutdownHooks: Array<() => Promise<void>>
 }
 
-export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?: StartServerOptions['hub'], mcpSecrets?: StartServerOptions['mcpSecrets']): Promise<{
+export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?: StartServerOptions['hub'], mcpSecrets?: StartServerOptions['mcpSecrets'], onRunRedaction?: StartServerOptions['onRunRedaction']): Promise<{
   app: Hono
   sessions: SessionStore
   registry: BackendRegistry
@@ -82,6 +83,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   config = { ...config }
   const sessions = new SessionStore(config.dataDir)
   const extras: BuildAppExtras = { shutdownHooks: [] }
+  const redactors = new Set<ReturnType<typeof privateCopyRedactor>>()
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -92,6 +94,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   extras.shutdownHooks.push(async () => await runs.shutdown())
+  extras.shutdownHooks.push(async () => { for (const redactor of redactors) redactor.close(); redactors.clear() })
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
     extras.shutdownHooks.push(() => durableWriter.close())
@@ -191,6 +194,15 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
     registry,
+    ...(onRunRedaction ? { onRunRedaction: (binding, values) => {
+      const redactor = privateCopyRedactor(values)
+      redactors.add(redactor)
+      try { onRunRedaction(Object.freeze({ ...binding, redact: redactor.redact })) }
+      catch {
+        redactor.close(); redactors.delete(redactor)
+        throw new Error('Trusted native redaction authority is unavailable')
+      }
+    } } : {}),
     sessions,
     retainedRuns: sessions,
     durableWriter: durableWriter ?? undefined,
@@ -311,7 +323,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     // The OS owns ephemeral listener allocation; a shared port-0 pidfile would serialize unrelated embedded servers.
     if (config.port !== 0) instanceLock = acquireInstanceLock(config.port)
     reapStalePrivateTemporaryRoots()
-    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir }, cwd, options.hub, options.mcpSecrets)
+    built = await buildApp({ ...config, dataDir: dataDirectoryLock.dataDir }, cwd, options.hub, options.mcpSecrets, options.onRunRedaction)
   } catch (error) {
     if (!(error instanceof UnconfirmedBridgeCleanup)) release()
     throw error

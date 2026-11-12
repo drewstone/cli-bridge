@@ -12,6 +12,15 @@ export interface StartServerOptions {
   quiet?: boolean
   /** Trusted embedded-host port. Values stay outside requests, profiles and durable records. */
   mcpSecrets?: AgentProfileSecretProvider
+  /** Live host-only redaction authority, valid through terminal capture and revoked at server close. */
+  onRunRedaction?: (run: Readonly<{
+    runId: string
+    requestDigest: string
+    sessionId: string | null
+    profileDigest: string | null
+    cwd: string | null
+    redact(bytes: Uint8Array): Uint8Array
+  }>) => void
   /** Embedded local one-shot runs share this listener's revocable Hub scope. */
   hub?: HubMcpScopeOptions & {
     client: HubClient

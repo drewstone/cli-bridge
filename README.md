@@ -459,6 +459,13 @@ cancellation remain available. Admission refusals use HTTP403 and the same SSE/d
 `type: subscription_required`, `status: 403`, `cause`, `fix`, `harness`, `provider`, and
 `provider_dispatch: not_started`. The fix names the native command or observed environment override.
 
+For an embedded host, `startServer({ onRunRedaction })` provides a live redactor bound to the
+actual run, session, profile digest and CWD. It includes admitted custom MCP values, Hub grant
+tokens and Runtime coordination bearers. The callback receives no values or hashes of values.
+It can redact a retained native-file copy after job cleanup while this Bridge remains open;
+server close revokes it. Retain only the redacted copy and mark transformed original-byte coverage
+incomplete. This callback does not upload credentials or reconstruct a terminated Bridge.
+
 The existing bearer-protected `GET /` response includes `hostPolicy` with schema
 `cli-bridge.host-policy.v1`. It reports whether bearer authentication is required, the immutable startup subscription admission policy,
 jail floor/fallback/network default and ceiling, and presence of trusted private-MCP and Hub
