@@ -14,8 +14,8 @@
  */
 
 import { selectJailBackend } from '../jail/index.js'
-import { realpathSync } from 'node:fs'
-import { isAbsolute } from 'node:path'
+import { existsSync, mkdirSync, realpathSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import type { EffectiveNativeStore } from '../jail/types.js'
 import type { JailBackend } from '../jail/index.js'
 import { BackendError } from '../backends/types.js'
@@ -26,6 +26,7 @@ export interface JailedCommand {
   args: string[]
   env: NodeJS.ProcessEnv | undefined
   effectiveNativeStore?: EffectiveNativeStore
+  effectiveHome?: string
   /** Tear-down for backend-owned jail temp state; run once in release(). */
   cleanup?: () => Promise<void> | void
 }
@@ -80,11 +81,21 @@ export async function applyJail(
   // still flows through sanitizeHostEnv at the spawn site, so the host
   // env allowlist continues to apply.
   const env = wrap.env ? { ...(opts.env ?? {}), ...wrap.env } : opts.env
-  return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup, effectiveNativeStore: wrap.effectiveNativeStore }
+  return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup, effectiveNativeStore: wrap.effectiveNativeStore, effectiveHome: wrap.effectiveHome }
 }
 
 /** Called after host sanitization; jail mappings take precedence over launcher environment. */
 export function effectiveNativeStore(opts: SpawnOpts, command: JailedCommand, env: NodeJS.ProcessEnv | undefined): EffectiveNativeStore | undefined {
+  if (opts.nativeStore === 'claude-code') {
+    const home = command.effectiveHome ?? env?.HOME
+    const canonical = home && join(home, '.claude')
+    const root = env?.CLAUDE_CONFIG_DIR || canonical
+    if (command.effectiveHome && root && root === canonical) mkdirSync(root, { recursive: true, mode: 0o700 })
+    if (!root || !isAbsolute(root) || !existsSync(root)) return undefined
+    const resolved = realpathSync(root)
+    const confined = command.effectiveHome && resolved === join(realpathSync(command.effectiveHome), '.claude')
+    return { harness: 'claude-code', root: resolved, basis: confined ? 'host-jail' : 'host-environment' }
+  }
   if (opts.nativeStore !== 'codex') return undefined
   const root = command.effectiveNativeStore?.root ?? env?.CODEX_HOME
   return root && isAbsolute(root) ? { harness: 'codex', root: realpathSync(root), basis: command.effectiveNativeStore?.basis ?? 'host-environment' } : undefined

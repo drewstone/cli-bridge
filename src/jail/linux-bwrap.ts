@@ -143,6 +143,7 @@ export class LinuxBwrapJail implements JailBackend {
     return {
       bin: BWRAP_BIN,
       args: bwrapArgs,
+      effectiveHome: root,
       ...(nativeHome
         ? { effectiveNativeStore: { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } }
         : {}),
