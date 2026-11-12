@@ -78,6 +78,8 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   catalog: ProfileCatalog
   extras: BuildAppExtras
 }> {
+  // The host policy and its enforcement share an immutable startup snapshot.
+  config = { ...config }
   const sessions = new SessionStore(config.dataDir)
   const extras: BuildAppExtras = { shutdownHooks: [] }
   try {
@@ -214,10 +216,20 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountImagesGenerate(app)
   mountMetrics(app)
 
+  const hostPolicy = Object.freeze({
+    schema: 'cli-bridge.host-policy.v1',
+    subscriptionsOnly: config.subscriptionsOnly,
+    jail: Object.freeze({ mode: config.jailMode, fallback: config.jailFallback,
+      network: Object.freeze({ default: config.jailNetwork ?? 'none', ceiling: config.jailNetwork ?? 'router' }) }),
+    trustedPorts: Object.freeze({ privateMcpSecrets: typeof mcpSecrets?.get === 'function', hub: hub !== undefined }),
+  })
+
   app.get('/', (c) => c.json({
     name: 'cli-bridge',
     version: '0.3.0',
     scheme: 'bridge/<harness>/<model>',
+    // Configured enforcement and trusted-port presence, never readiness or grant authority.
+    hostPolicy,
     capabilities: {
       profileMaterialization: 'cli-bridge.profile-materialization.v2',
       usageCostProvenance: 'cli-bridge.usage-cost.v1',
