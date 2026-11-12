@@ -91,9 +91,10 @@ export function effectiveNativeStore(opts: SpawnOpts, command: JailedCommand, en
     const canonical = home && join(home, '.claude')
     const root = env?.CLAUDE_CONFIG_DIR || canonical
     if (command.effectiveHome && root && root === canonical) mkdirSync(root, { recursive: true, mode: 0o700 })
-    return root && isAbsolute(root) && existsSync(root)
-      ? { harness: 'claude-code', root: realpathSync(root), basis: command.effectiveHome ? 'host-jail' : 'host-environment' }
-      : undefined
+    if (!root || !isAbsolute(root) || !existsSync(root)) return undefined
+    const resolved = realpathSync(root)
+    const confined = command.effectiveHome && resolved === join(realpathSync(command.effectiveHome), '.claude')
+    return { harness: 'claude-code', root: resolved, basis: confined ? 'host-jail' : 'host-environment' }
   }
   if (opts.nativeStore !== 'codex') return undefined
   const root = command.effectiveNativeStore?.root ?? env?.CODEX_HOME

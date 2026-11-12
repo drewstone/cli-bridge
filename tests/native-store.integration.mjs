@@ -7,7 +7,7 @@ import test from 'node:test'
 import { tsImport } from 'tsx/esm/api'
 const { loadConfig, startServer } = await tsImport('../src/server.ts', import.meta.url)
 
-for (const harness of ['codex', 'claude-code']) test(`${harness} exact session lookup reports the actual host-visible native store across restart`, { timeout: 30_000 }, async () => {
+for (const [harness, override] of [['codex', false], ['claude-code', false], ['claude-code', true]]) test(`${harness} exact session lookup reports the actual host-visible native store across restart (override ${override})`, { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'bridge-native-store-'))
   const previous = process.env.CODEX_HOME
   const previousClaude = process.env.CLAUDE_CONFIG_DIR
@@ -16,10 +16,14 @@ for (const harness of ['codex', 'claude-code']) test(`${harness} exact session l
   try {
     const workspace = join(root, 'workspace'), seed = join(root, 'seed'), state = join(root, 'state')
     await Promise.all([mkdir(workspace), mkdir(seed)])
+    if (override) {
+      process.env.CLAUDE_CONFIG_DIR = join(workspace, 'external-claude-home')
+      await mkdir(process.env.CLAUDE_CONFIG_DIR)
+    }
     process.env.CODEX_HOME = seed
     await writeFile(join(seed, 'config.toml'), 'model="native-store-fixture"\n')
     const bin = join(workspace, 'native-protocol')
-    const nativeRoot = harness === 'codex' ? '$CODEX_HOME' : '$HOME/.claude'
+    const nativeRoot = harness === 'codex' ? '$CODEX_HOME' : '${CLAUDE_CONFIG_DIR:-$HOME/.claude}'
     const events = harness === 'codex' ? [
       { type: 'thread.started', thread_id: 'native-store-owned-thread' },
       { type: 'item.completed', item: { type: 'agent_message', text: 'fixture complete' } },
@@ -66,9 +70,9 @@ printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
     assert.ok(binding, 'Actual effective native store binding is missing')
     const actualHome = await readFile(join(workspace, 'native-store-receipt'), 'utf8')
     assert.equal(binding.root, await realpath(actualHome))
-    assert.equal(binding.root, await realpath(join(workspace, '.agent-home', harness === 'codex' ? '.codex' : '.claude')))
+    assert.equal(binding.root, await realpath(override ? join(workspace, 'external-claude-home') : join(workspace, '.agent-home', harness === 'codex' ? '.codex' : '.claude')))
     assert.equal(binding.harness, harness)
-    assert.equal(binding.basis, 'host-jail')
+    assert.equal(binding.basis, override ? 'host-environment' : 'host-jail')
     assert.equal(binding.nativeSessionId, session.internalId)
     assert.equal(binding.runId, 'owned-native-store-run')
     assert.match(binding.requestDigest, /^sha256:[a-f0-9]{64}$/u)
