@@ -814,6 +814,11 @@ into the profile when the flag is absent.
 and `env` round-trip through the materialised config file unchanged
 (verified end-to-end in [`tests/mcp-passthrough.test.ts`](./tests/mcp-passthrough.test.ts)).
 
+Claude Code host execution attests its native store from the executor's actual
+jailed HOME mapping, including an explicit config-directory override when present.
+The authenticated exact-session lookup retains this binding with the native session,
+run and request identity; ordinary completion payloads do not expose host paths.
+
 New host Codex sessions retain native rollouts and indexes under `BRIDGE_DATA_DIR/codex/<session-id-sha256>`, including sessions created without MCP.
 The existing session execution lease serializes turns using that home.
 The Codex backend serializes selected account preparation and refresh on one bridge process; access-only jailed turns can run concurrently.

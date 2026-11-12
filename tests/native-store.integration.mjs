@@ -7,33 +7,45 @@ import test from 'node:test'
 import { tsImport } from 'tsx/esm/api'
 const { loadConfig, startServer } = await tsImport('../src/server.ts', import.meta.url)
 
-test('Codex exact session lookup reports the actual host-visible native store across restart', { timeout: 30_000 }, async () => {
+for (const harness of ['codex', 'claude-code']) test(`${harness} exact session lookup reports the actual host-visible native store across restart`, { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'bridge-native-store-'))
   const previous = process.env.CODEX_HOME
+  const previousClaude = process.env.CLAUDE_CONFIG_DIR
+  delete process.env.CLAUDE_CONFIG_DIR
   let server
   try {
     const workspace = join(root, 'workspace'), seed = join(root, 'seed'), state = join(root, 'state')
     await Promise.all([mkdir(workspace), mkdir(seed)])
     process.env.CODEX_HOME = seed
     await writeFile(join(seed, 'config.toml'), 'model="native-store-fixture"\n')
-    const bin = join(workspace, 'codex-protocol')
+    const bin = join(workspace, 'native-protocol')
+    const nativeRoot = harness === 'codex' ? '$CODEX_HOME' : '$HOME/.claude'
+    const events = harness === 'codex' ? [
+      { type: 'thread.started', thread_id: 'native-store-owned-thread' },
+      { type: 'item.completed', item: { type: 'agent_message', text: 'fixture complete' } },
+      { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
+    ] : [
+      { type: 'system', subtype: 'init', session_id: 'native-store-owned-thread' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'fixture complete' }] } },
+      { type: 'result', subtype: 'success', session_id: 'native-store-owned-thread', usage: { input_tokens: 1, output_tokens: 1 } },
+    ]
     await writeFile(bin, `#!/bin/sh
 set -eu
 if [ "$1" = --version ]; then printf 'codex-cli 0.164.0\\n'; exit; fi
-mkdir -p "$CODEX_HOME/sessions"
-printf '%s' "$CODEX_HOME" > native-store-receipt
-printf '%s\\n' '{"type":"session_meta","payload":{"id":"native-store-owned-thread"}}' > "$CODEX_HOME/sessions/owned.jsonl"
-printf '%s\\n' '{"type":"thread.started","thread_id":"native-store-owned-thread"}' '{"type":"item.completed","item":{"type":"agent_message","text":"fixture complete"}}' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+mkdir -p "${nativeRoot}/sessions"
+printf '%s' "${nativeRoot}" > native-store-receipt
+printf '%s\\n' '{"type":"session_meta","payload":{"id":"native-store-owned-thread"}}' > "${nativeRoot}/sessions/owned.jsonl"
+printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
 `, { mode: 0o700 })
-    const config = { ...loadConfig({ BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: 'codex', CODEX_BIN: bin,
+    const config = { ...loadConfig({ BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: harness === 'codex' ? 'codex' : 'claude', CODEX_BIN: bin, CLAUDE_BIN: bin,
       BRIDGE_BEARER: 'native-store-public-fixture', BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'fs-jail' }), port: 0 }
     server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false })
     const headers = { authorization: 'Bearer native-store-public-fixture', 'content-type': 'application/json' }
-    const endpoint = '/v1/sessions?session_id=owned-external-session&backend=codex'
+    const endpoint = `/v1/sessions?session_id=owned-external-session&backend=${harness}`
     assert.equal((await fetch(server.url + endpoint)).status, 401)
     assert.equal((await fetch(server.url + endpoint, { headers: { authorization: 'Bearer wrong-fixture' } })).status, 401)
     const response = await fetch(server.url + '/v1/chat/completions', { method: 'POST', headers,
-      body: JSON.stringify({ model: 'codex/native-store-fixture', cwd: workspace, session_id: 'owned-external-session',
+      body: JSON.stringify({ model: `${harness}/native-store-fixture`, cwd: workspace, session_id: 'owned-external-session',
         run_id: 'owned-native-store-run', messages: [{ role: 'user', content: 'Only exercise the local executable fixture.' }] }) })
     assert.equal(response.status, 200, await response.clone().text())
     const completion = await response.text()
@@ -54,14 +66,14 @@ printf '%s\\n' '{"type":"thread.started","thread_id":"native-store-owned-thread"
     assert.ok(binding, 'Actual effective native store binding is missing')
     const actualHome = await readFile(join(workspace, 'native-store-receipt'), 'utf8')
     assert.equal(binding.root, await realpath(actualHome))
-    assert.equal(binding.root, await realpath(join(workspace, '.agent-home', '.codex')))
-    assert.equal(binding.harness, 'codex')
+    assert.equal(binding.root, await realpath(join(workspace, '.agent-home', harness === 'codex' ? '.codex' : '.claude')))
+    assert.equal(binding.harness, harness)
     assert.equal(binding.basis, 'host-jail')
     assert.equal(binding.nativeSessionId, session.internalId)
     assert.equal(binding.runId, 'owned-native-store-run')
     assert.match(binding.requestDigest, /^sha256:[a-f0-9]{64}$/u)
     assert.ok((await readFile(join(binding.root, 'sessions', 'owned.jsonl'), 'utf8')).includes(session.internalId))
-    assert.deepEqual((await fetch(server.url + endpoint.replace('backend=codex', 'backend=pi'), { headers }).then(r => r.json())).data, [])
+    assert.deepEqual((await fetch(server.url + endpoint.replace(`backend=${harness}`, 'backend=pi'), { headers }).then(r => r.json())).data, [])
     assert.equal((await fetch(server.url + '/v1/sessions?session_id=owned-external-session', { headers })).status, 400)
     assert.deepEqual((await fetch(server.url + endpoint.replace('owned-external-session', 'unknown'), { headers }).then(r => r.json())).data, [])
     await server.close()
@@ -69,6 +81,8 @@ printf '%s\\n' '{"type":"thread.started","thread_id":"native-store-owned-thread"
     assert.deepEqual(await lookup(), session, 'exact binding must survive a Bridge restart without native work')
   } finally {
     await server?.close()
+    if (previousClaude === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousClaude
     if (previous === undefined) delete process.env.CODEX_HOME
     else process.env.CODEX_HOME = previous
     await rm(root, { recursive: true, force: true })

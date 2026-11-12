@@ -71,7 +71,7 @@ export interface JailAuthSource {
 
 /** Host-visible native state observed where the executor applies the real launch mapping. */
 export interface EffectiveNativeStore {
-  readonly harness: 'codex'
+  readonly harness: 'codex' | 'claude-code'
   readonly root: string
   readonly basis: 'host-jail' | 'host-environment'
 }
@@ -84,6 +84,8 @@ export interface JailWrap {
   /** Env overrides to merge onto the child's environment. */
   env?: Record<string, string>
   effectiveNativeStore?: EffectiveNativeStore
+  /** Actual HOME installed by the enforced jail, independent of inherited host env. */
+  effectiveHome?: string
   /** Tear down any backend-owned temp state (e.g. an SBPL profile file). */
   cleanup?: () => Promise<void> | void
 }

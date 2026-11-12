@@ -125,6 +125,7 @@ export class MacosSeatbeltJail implements JailBackend {
 
       return {
         bin: SANDBOX_EXEC_BIN,
+        effectiveHome: root,
         args: ['-f', profilePath, '-D', `HOME=${root}`, '-D', `WORK=${spec.projectDir}`, bin, ...args],
         // sandbox-exec does NOT rewrite the child env; -D only parameterizes the
         // profile. Return the real env so HOME/XDG actually point into the jail.

@@ -65,7 +65,7 @@ export interface ExecutorSaturationSnapshot {
 
 export interface SpawnOpts {
   /** Ask the real host spawner to retain this harness's effective native-home binding. */
-  nativeStore?: 'codex'
+  nativeStore?: 'codex' | 'claude-code'
   /** Abort startup when the owning durable run is cancelled before spawn completes. */
   signal?: AbortSignal
   /** Working directory inside the executor's filesystem. */

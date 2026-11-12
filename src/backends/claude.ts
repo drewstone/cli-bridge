@@ -347,6 +347,8 @@ export class ClaudeBackend implements Backend {
       await admitNativeSubscription(req, { env: childEnv, args, flags: args,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.bin, args, {
+        ...(this.name === 'claude-code' ? { nativeStore: 'claude-code' as const } : {}),
+        signal,
         stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
         cwd,
         env: childEnv,
@@ -362,6 +364,7 @@ export class ClaudeBackend implements Backend {
     }
     const child = spawned.child
     const releaseSpawner = spawned.release
+    const nativeStore = spawned.effectiveNativeStore ? { effective_native_store: spawned.effectiveNativeStore } : {}
 
     // The spawner registers a synchronous 'error' listener so the spawn
     // failure event doesn't crash the process before our own listener
@@ -433,7 +436,7 @@ export class ClaudeBackend implements Backend {
         if (msg.type === 'system' && (msg as ClaudeStreamInit).subtype === 'init') {
           internalSessionId = (msg as ClaudeStreamInit).session_id
           // Retain the provider identity even when the process fails before its result.
-          yield { internal_session_id: internalSessionId }
+          yield { internal_session_id: internalSessionId, ...nativeStore }
           continue
         }
 
@@ -499,7 +502,7 @@ export class ClaudeBackend implements Backend {
       if (usage) yield { usage }
 
       if (signal.aborted) {
-        yield { finish_reason: 'error', internal_session_id: internalSessionId }
+        yield { finish_reason: 'error', internal_session_id: internalSessionId, ...nativeStore }
         return
       }
 
@@ -510,6 +513,7 @@ export class ClaudeBackend implements Backend {
           finish_reason: emittedAnyToolCall ? 'tool_calls' : 'stop',
           ...(typeof terminal.result === 'string' ? { final_text: terminal.result } : {}),
           internal_session_id: terminal.session_id ?? internalSessionId,
+          ...nativeStore,
         }
         return
       }
