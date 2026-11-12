@@ -85,39 +85,54 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
   }
 }
 
-/** Filter exact admitted credential bytes, including a value split across pipe chunks. */
-function protectChild(child: ChildProcess, values: readonly string[]): ChildProcess {
-  if (!values.length) return child
+/** One exact-byte filter for native process streams and trusted retained-copy redaction. */
+function credentialWriter(values: readonly string[], emit: (bytes: Buffer) => void) {
   const needles = [...new Set(values.flatMap(value => [value, JSON.stringify(value).slice(1, -1)]))]
     .filter(Boolean).map(value => Buffer.from(value)).sort((a, b) => b.length - a.length)
-  if (!needles.length) return child
-  const keep = Math.max(...needles.map(value => value.length)) - 1
+  const keep = Math.max(0, ...needles.map(value => value.length - 1))
+  let pending: Buffer = Buffer.alloc(0)
+  return (chunk: Uint8Array, final = false) => {
+    pending = Buffer.concat([pending, chunk])
+    const limit = final ? pending.length : Math.max(0, pending.length - keep)
+    let at = 0, start = 0
+    while (at < limit) {
+      const match = needles.find(needle => pending.subarray(at, at + needle.length).equals(needle))
+      if (!match) { at++; continue }
+      if (at > start) emit(pending.subarray(start, at))
+      emit(Buffer.from('[redacted:MCP]'))
+      at += match.length
+      start = at
+    }
+    if (at > start) emit(pending.subarray(start, at))
+    pending = pending.subarray(at)
+  }
+}
+
+/** Trusted in-process capability; no value crosses the port and server close revokes it. */
+export function privateCopyRedactor(values: readonly string[]) {
+  let current: readonly string[] | undefined = [...values]
+  return {
+    redact(bytes: Uint8Array): Uint8Array {
+      if (!current) throw new Error('Private run redaction authority is closed')
+      const chunks: Buffer[] = []
+      credentialWriter(current, bytes => chunks.push(bytes))(bytes, true)
+      return Buffer.concat(chunks)
+    },
+    close() { current = undefined },
+  }
+}
+
+/** Filter before any parser or raw log observes the process's bytes, including split secrets. */
+function protectChild(child: ChildProcess, values: readonly string[]): ChildProcess {
+  if (!values.length) return child
   for (const stream of ['stdout', 'stderr'] as const) {
     const source = child[stream]
     if (!source) continue
-    let pending: Buffer = Buffer.alloc(0)
+    const write = credentialWriter(values, bytes => filter.push(bytes))
     const filter = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        pending = Buffer.concat([pending, chunk])
-        flush(false, this)
-        callback()
-      },
-      flush(callback) { flush(true, this); callback() },
+      transform(chunk: Buffer, _encoding, callback) { write(chunk); callback() },
+      flush(callback) { write(Buffer.alloc(0), true); callback() },
     })
-    const flush = (final: boolean, output: Transform) => {
-      const limit = final ? pending.length : Math.max(0, pending.length - keep)
-      let at = 0, start = 0
-      while (at < limit) {
-        const match = needles.find(needle => pending.subarray(at, at + needle.length).equals(needle))
-        if (!match) { at++; continue }
-        if (at > start) output.push(pending.subarray(start, at))
-        output.push(Buffer.from('[redacted:MCP]'))
-        at += match.length
-        start = at
-      }
-      if (at > start) output.push(pending.subarray(start, at))
-      pending = pending.subarray(at)
-    }
     source.on('error', error => filter.destroy(error))
     child[stream] = source.pipe(filter)
     child.stdio[stream === 'stdout' ? 1 : 2] = filter

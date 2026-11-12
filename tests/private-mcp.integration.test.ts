@@ -1,9 +1,12 @@
+import { createHash } from 'node:crypto'
+import { HubClient } from '@tangle-network/hub-sdk'
 import { createServer } from 'node:http'
 import { mkdtemp, readFile, readdir, rm, writeFile, access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import { loadConfig, startServer } from '../src/server.js'
+import type { StartServerOptions } from '../src/server-options.js'
 
 const nativePeer = String.raw`
 const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process')
@@ -19,7 +22,7 @@ async function main() {
     const block = name => new RegExp('\\[mcp_servers\\.' + name + '\\]([\\s\\S]*?)(?=\\n\\[|$)').exec(toml)?.[1] ?? ''
     const str = (part, key) => JSON.parse(new RegExp(key + '\\s*=\\s*("(?:[^"\\\\]|\\\\.)*")').exec(part)[1])
     const remote = block('remote'), local = block('local')
-    servers = {remote: {url:str(remote, 'url'), headers:{Authorization:str(remote,'Authorization')}}, local: {command:str(local,'command'), args:JSON.parse(/args\s*=\s*(\[[^\n]*\])/.exec(local)[1]), env:{MCP_PRIVATE:str(local,'MCP_PRIVATE')}}}
+    servers = {hub:{url:str(block('hub'),'url')},coord:{url:str(block('coord'),'url'),headers:{Authorization:str(block('coord'),'Authorization')}},remote: {url:str(remote, 'url'), headers:{Authorization:str(remote,'Authorization')}}, local: {command:str(local,'command'), args:JSON.parse(/args\s*=\s*(\[[^\n]*\])/.exec(local)[1]), env:{MCP_PRIVATE:str(local,'MCP_PRIVATE')}}}
   }
   const remote = await fetch(servers.remote.url, {method:'POST',headers:{'content-type':'application/json',...servers.remote.headers},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/list'})})
   if (remote.status !== 200) throw new Error('MCP HTTP credentials were not admitted')
@@ -28,28 +31,45 @@ async function main() {
   child.stdin.end(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize'})+'\n')
   const answer = await initialized
   if (!answer.result?.protocolVersion) throw new Error('MCP stdio did not initialize')
-  const echo = 'mcp-authenticated ' + servers.local.env.MCP_PRIVATE
-  const emit = async value => { const line=JSON.stringify(value)+'\n', at=line.indexOf(servers.local.env.MCP_PRIVATE)+8; process.stdout.write(line.slice(0,at)); await new Promise(resolve=>setTimeout(resolve,10)); process.stdout.write(line.slice(at)) }
-  process.stderr.write(servers.local.env.MCP_PRIVATE.slice(0,11)); await new Promise(resolve=>setTimeout(resolve,10)); process.stderr.write(servers.local.env.MCP_PRIVATE.slice(11)+'\n')
+  const tools = await fetch(servers.hub.url+'/tools').then(r => r.json())
+  if (!tools.tools?.length) throw new Error('Hub grant did not resolve its tool')
+  const invoked = await fetch(servers.hub.url+'/call',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:tools.tools[0].name,arguments:{proof:true}})}).then(r=>r.json())
+  if (invoked.isError) throw new Error('Hub grant did not authorize its tool')
+  if ((await fetch(servers.coord.url,{headers:servers.coord.headers})).status!==200) throw new Error('Coordination bearer did not reach its private native config')
+  const protectedValues = [servers.local.env.MCP_PRIVATE,servers.hub.url.split('/').pop(),servers.coord.headers.Authorization.slice(7)]
+  const echo = 'mcp-authenticated ' + protectedValues.join(' ')
+  const nativeId = require('node:crypto').randomUUID()
+  const vendorRoot = claude ? (process.env.CLAUDE_CONFIG_DIR || path.join(process.cwd(),'.claude')) : process.env.CODEX_HOME
+  const vendorDir = path.join(vendorRoot,claude?'projects/owned-native':'sessions/2026/11/12')
+  fs.mkdirSync(vendorDir,{recursive:true})
+  const vendorFile = path.join(vendorDir,claude?nativeId+'.jsonl':'rollout-2026-11-12T00-00-00-'+nativeId+'.jsonl')
+  const records = claude ? [{type:'user',sessionId:nativeId,cwd:process.cwd(),message:{role:'user',content:'private native tool proof'}},{type:'assistant',sessionId:nativeId,message:{role:'assistant',content:[{type:'text',text:echo}]}}]
+    : [{type:'session_meta',payload:{id:nativeId,cwd:process.cwd()}},{type:'response_item',payload:{type:'message',role:'assistant',content:[{type:'output_text',text:echo}]}}]
+  fs.writeFileSync(vendorFile,records.map(record=>JSON.stringify(record)).join('\n')+'\n')
+  fs.writeFileSync(path.join(process.cwd(),'private-vendor-path.txt'),vendorFile)
+
+
+  const emit = async (value,secret=protectedValues[0]) => { const line=JSON.stringify(value)+'\n', at=line.indexOf(JSON.stringify(secret).slice(1,-1))+8; process.stdout.write(line.slice(0,at)); await new Promise(resolve=>setTimeout(resolve,10)); process.stdout.write(line.slice(at)) }
+  for (const secret of protectedValues) { process.stderr.write(secret.slice(0,11)); await new Promise(resolve=>setTimeout(resolve,10)); process.stderr.write(secret.slice(11)+'\n') }
   if (claude) {
-    console.log(JSON.stringify({type:'system',subtype:'init',session_id:'private-native'}))
-    await emit({type:'assistant',message:{id:'msg',content:[{type:'text',text:echo}]}})
-    console.log(JSON.stringify({type:'result',subtype:'success',session_id:'private-native',usage:{input_tokens:0,output_tokens:0},total_cost_usd:0}))
+    console.log(JSON.stringify({type:'system',subtype:'init',session_id:nativeId}))
+    for (const secret of protectedValues) await emit({type:'assistant',message:{id:'msg',content:[{type:'text',text:echo}]}},secret)
+    console.log(JSON.stringify({type:'result',subtype:'success',session_id:nativeId,usage:{input_tokens:0,output_tokens:0},total_cost_usd:0}))
   } else {
-    console.log(JSON.stringify({type:'thread.started',thread_id:'private-native'}))
-    await emit({type:'item.completed',item:{id:'message',type:'agent_message',text:echo}})
+    console.log(JSON.stringify({type:'thread.started',thread_id:nativeId}))
+    for (const secret of protectedValues) await emit({type:'item.completed',item:{id:'message',type:'agent_message',text:echo}},secret)
     console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:0,output_tokens:0}}))
   }
 }
 main().catch(() => {console.error('native MCP check failed');process.exitCode=1})
 `
 
-async function bytesUnder(directory: string): Promise<Buffer[]> {
+async function bytesUnder(directory: string, excluded: ReadonlySet<string> = new Set()): Promise<Buffer[]> {
   const values: Buffer[] = []
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const file = join(directory, entry.name)
-    if (entry.isDirectory()) values.push(...await bytesUnder(file))
-    else if (entry.isFile()) values.push(await readFile(file))
+    if (entry.isDirectory()) values.push(...await bytesUnder(file, excluded))
+    else if (entry.isFile() && !excluded.has(file)) values.push(await readFile(file))
   }
   return values
 }
@@ -60,9 +80,26 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   const captureRoot = await mkdtemp(join(tmpdir(), 'private-mcp-capture-'))
   if (capture) vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR', captureRoot)
   else vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR', '')
-  const secret = 'private-mcp-provider-canary-9e5dff'
+  const secret = 'private-mcp-provider-canary-9e5dff-quote-"\\'
   const methods: string[] = []
+  const grantTokens: string[] = []
+  const coordination = 'private-coordination-provider-canary-6ab256'
+  const hubKey = 'public-hub-client-fixture'
+  let hubInvoked = 0, coordinationInvoked = 0
+  let vendorPath = "", vendorDigest = ""
   const upstream = createServer(async (request, response) => {
+    if (request.url?.startsWith('/v1/hub/')) {
+      if (request.headers.authorization !== `Bearer ${hubKey}`) { response.writeHead(403).end(); return }
+      let raw=''; for await (const chunk of request) raw+=chunk
+      const data = request.url === '/v1/hub/connections' ? {connections:[{id:'hubconn_fixture',providerId:'fixture',status:'active'}]}
+        : request.url === '/v1/hub/tools/describe' ? {tool:{path:'fixture.proof',requiredConnectionProviderId:'fixture',inputSchema:{type:'object'}}}
+        : request.url === '/v1/hub/exec' ? (hubInvoked++,{result:{ok:JSON.parse(raw).connectionId==='hubconn_fixture'}}) : undefined
+      response.writeHead(data ? 200 : 404, {'content-type':'application/json'}).end(JSON.stringify({success:!!data,data})); return
+    }
+    if (request.url === '/coord') {
+      if (request.headers.authorization !== `Bearer ${coordination}`) { response.writeHead(403).end(); return }
+      coordinationInvoked++; response.writeHead(200,{'content-type':'application/json'}).end('{"ok":true}'); return
+    }
     if (request.headers.authorization !== `Bearer ${secret}`) { response.writeHead(403).end(); return }
     let raw = ''; for await (const chunk of request) raw += chunk
     const rpc = JSON.parse(raw); methods.push(rpc.method)
@@ -75,21 +112,48 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   await writeFile(binary, `#!${process.execPath}\n${nativePeer}`, { mode: 0o700 })
   await writeFile(stdio, `const rl=require('node:readline').createInterface({input:process.stdin});rl.once('line',async line=>{const req=JSON.parse(line);const r=await fetch(${JSON.stringify(url)},{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+process.env.MCP_PRIVATE},body:JSON.stringify({jsonrpc:'2.0',id:2,method:'initialize'})});if(r.status!==200)process.exit(1);console.log(JSON.stringify({jsonrpc:'2.0',id:req.id,result:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'private-peer',version:'1'}}}));rl.close()})`)
   const calls: string[] = []
+  const redactors: Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0][] = []
   const server = await startServer({ cwd: root, quiet: true, handleSignals: false,
     config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: backend, BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CODEX_BIN: binary }), port: 0 },
+    onRunRedaction: run => redactors.push(run),
     mcpSecrets: { async get(key) { calls.push(key); return key === 'private-tool' ? secret : undefined } },
+    hub: { client: new HubClient({baseUrl:`http://127.0.0.1:${address.port}`,apiKey:hubKey}),
+      hash: value => createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex'),
+      serverForGrant(token) { grantTokens.push(token); return {transport:'http',url:`${server.url}/hub/mcp/grants/${token}`} } },
   })
-  const profile = { name: 'private-tool-agent', mcp: {
+  const profile = { name: 'private-tool-agent', connections:[{connectionId:'hubconn_fixture',capabilities:['fixture.proof'],alias:'hub'}], mcp: {
     remote: { transport: 'http', url, headers: { Authorization: { kind: 'secret-ref', key: 'private-tool', format: 'bearer' } } },
     local: { command: process.execPath, args: [{ kind: 'public', value: stdio }], env: { MCP_PRIVATE: { kind: 'secret-ref', key: 'private-tool' } } },
   } }
   try {
-    const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${harness}/test`, session_id: `private-${backend}`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: profile }) })
+    const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${harness}/test`, session_id: `private-${backend}`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: profile, env:{AGENT_RUNTIME_COORDINATION_TOKEN:coordination,CLAUDE_CONFIG_DIR:join(root,"claude-home")}, runtime_attachments:{mcp:{coord:{transport:'http',url:`http://127.0.0.1:${address.port}/coord`,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}} }) })
     const text = await response.text()
     expect(response.status, text).toBe(200)
     expect(text).toContain('mcp-authenticated [redacted:MCP]')
     expect(calls).toEqual(['private-tool'])
     expect(methods).toEqual(['tools/list', 'initialize'])
+    expect(hubInvoked).toBe(1)
+    expect(coordinationInvoked).toBe(1)
+    expect(grantTokens).toHaveLength(1)
+    expect(redactors).toHaveLength(1)
+    const authority = redactors[0]!
+    expect(Object.isFrozen(authority)).toBe(true)
+    expect(authority).toMatchObject({sessionId:`private-${backend}`,cwd:root,profileDigest:expect.stringMatching(/^sha256:/),requestDigest:expect.stringMatching(/^sha256:/)})
+    vendorPath = await readFile(join(root,'private-vendor-path.txt'),'utf8')
+    expect(vendorPath.startsWith(root+"/")).toBe(true)
+    const source = await readFile(vendorPath)
+    vendorDigest = createHash('sha256').update(source).digest('hex')
+    const copied = Buffer.from(authority.redact(source))
+    expect(createHash("sha256").update(await readFile(vendorPath)).digest("hex")).toBe(vendorDigest)
+    await writeFile(join(captureRoot,"redacted-native.jsonl"),copied)
+    for (const value of [secret,coordination,...grantTokens]) {
+      expect(copied.toString()).not.toContain(value)
+      expect(copied.toString()).not.toContain(JSON.stringify(value).slice(1,-1))
+      expect(JSON.stringify(authority)).not.toContain(value)
+    }
+    expect(copied.toString()).toContain('[redacted:MCP]')
+    expect((await fetch(`${server.url}/hub/mcp/grants/${grantTokens[0]}/tools`)).status).toBe(403)
+    for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(text).not.toContain(value)
     expect(text + JSON.stringify(profile)).not.toContain(secret)
     const rejected = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: `${harness}/test`, messages: [{ role: 'user', content: 'Use the declared tools' }], cwd: root, agent_profile: { ...profile, mcp: { local: { command: process.execPath, args: [{ kind: 'secret-ref', key: 'private-tool' }] } } } }) })
     expect(rejected.status).not.toBe(200)
@@ -104,12 +168,14 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
       await expect(access(JSON.parse(line).configPath)).rejects.toThrow()
   } finally {
     await server.close()
+    for (const redactor of redactors) expect(() => redactor.redact(new Uint8Array())).toThrow('closed')
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
   }
   try {
     const streams = new Map<string, Buffer[]>()
-    for (const bytes of [...await bytesUnder(root), ...await bytesUnder(captureRoot)]) {
-      expect(bytes.includes(Buffer.from(secret))).toBe(false)
+    expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(vendorDigest)
+    for (const bytes of [...await bytesUnder(root,new Set([vendorPath])), ...await bytesUnder(captureRoot)]) {
+      for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(bytes.includes(Buffer.from(value))).toBe(false)
       for (const line of bytes.toString().split('\n')) {
         try {
           const frame = JSON.parse(line)
@@ -122,7 +188,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
         } catch (error) { if (error instanceof SyntaxError) continue; throw error }
       }
     }
-    for (const chunks of streams.values()) expect(Buffer.concat(chunks).includes(Buffer.from(secret))).toBe(false)
+    for (const chunks of streams.values()) for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(Buffer.concat(chunks).includes(Buffer.from(value))).toBe(false)
     if (capture) {
       expect(streams.size).toBeGreaterThan(0)
       const manifests = (await readdir(captureRoot)).filter(file => file.endsWith('.json'))

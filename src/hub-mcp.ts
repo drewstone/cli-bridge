@@ -3,6 +3,7 @@ import { HubMcpScope, createHubMcpRoutes, lowerProfileConnections } from '@tangl
 import type { Hono } from 'hono'
 import type { StartServerOptions } from './server-options.js'
 import { BackendError, type ChatRequest } from './backends/types.js'
+import { protectExecutionValues } from './private-mcp.js'
 
 const workspaceProfiles = new WeakMap<object, AgentProfile>()
 
@@ -36,7 +37,8 @@ export function mountHubMcp(app: Hono, options: NonNullable<StartServerOptions['
         const { workspaceProfile } = lowerProfileConnections(profile, resolved.mcp)
         req.runtime_attachments = { mcp: { ...existing, ...resolved.mcp } }
         if (workspaceProfile) workspaceProfiles.set(req.runtime_attachments, workspaceProfile)
-        return () => { for (const token of resolved.grantTokens) scope.revoke(token) }
+        const releaseProtected = protectExecutionValues(req, resolved.grantTokens)
+        return () => { try { for (const token of resolved.grantTokens) scope.revoke(token) } finally { releaseProtected() } }
       } catch (error) {
         for (const token of resolved.grantTokens) scope.revoke(token)
         throw error

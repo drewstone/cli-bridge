@@ -1,16 +1,40 @@
 import type { AgentProfileConfigValue, AgentProfileSecretProvider } from '@tangle-network/agent-interface'
+import type { StartServerOptions } from './server-options.js'
+import type { RunSnapshot } from './runs/types.js'
 import { BackendError, type ChatRequest } from './backends/types.js'
 
 // A cloned request retains its attachment identity. Neither the values nor the provider enter JSON.
 const credentials = new WeakMap<object, Map<string, string>>()
+const protectedValues = new WeakMap<object, Set<string>>()
 
 export function privateMcpCredentials(request: ChatRequest): ReadonlyMap<string, string> | undefined {
   return request.runtime_attachments && credentials.get(request.runtime_attachments)
 }
 
 /** The transport consumes this private snapshot before parsing or retaining child output. */
-export function privateMcpSecretValues(request: ChatRequest): readonly string[] {
-  return [...(privateMcpCredentials(request)?.values() ?? [])]
+export type PrivateRunRedactionObserver = (run: Omit<Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0], 'redact'>, values: readonly string[]) => void
+export function privateExecutionRedaction(request: ChatRequest, run: Pick<RunSnapshot, 'id' | 'requestDigest'>, profileDigest: string | null, observe?: PrivateRunRedactionObserver): readonly string[] {
+  const values = [...new Set([
+    ...(privateMcpCredentials(request)?.values() ?? []),
+    ...(request.runtime_attachments && protectedValues.get(request.runtime_attachments) || []),
+    ...(request.runtimeCoordinationBearer ? [request.runtimeCoordinationBearer] : []),
+  ])]
+  observe?.({ runId: run.id, requestDigest: run.requestDigest, sessionId: request.session_id ?? null,
+    profileDigest, cwd: request.cwd ?? null }, values)
+  return values
+}
+
+/** Host-owned grants share the existing private attachment identity, never its JSON value. */
+export function protectExecutionValues(request: ChatRequest, values: readonly string[]): () => void {
+  request.runtime_attachments ??= { mcp: {} }
+  const identity = request.runtime_attachments
+  const protected_ = protectedValues.get(identity) ?? new Set<string>()
+  for (const value of values) protected_.add(value)
+  protectedValues.set(identity, protected_)
+  return () => {
+    for (const value of values) protected_.delete(value)
+    if (protected_.size === 0) protectedValues.delete(identity)
+  }
 }
 
 /** Resolve only declared MCP references for an embedded host's private Claude/Codex config. */
