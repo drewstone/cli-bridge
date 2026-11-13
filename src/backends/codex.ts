@@ -221,7 +221,6 @@ export class CodexBackend implements Backend {
       )
     }
     const authSourcePath = resolveCodexAuthPath()
-
     // Reject unsupported profile plans before copying auth or writing MCP
     // credentials into a synthetic CODEX_HOME.
     const provisioned = provisionProfileWorkspace(
@@ -240,6 +239,14 @@ export class CodexBackend implements Backend {
     args.push('--', prompt)
     let releaseHostAuth: (() => void) | undefined
     let codexHome: ReturnType<typeof materializeMcpServersForCodex>
+    let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
+    const releaseState = (): void => {
+      try { codexHome?.cleanup() } finally {
+        try { jailHome?.cleanup() } finally {
+          try { releaseHostAuth?.() } finally { provisioned.cleanup?.() }
+        }
+      }
+    }
     try {
       // Only an unconfined file-backed ChatGPT turn can rotate the shared host
       // credential during inference. Use the effective launch env after profile
@@ -254,19 +261,6 @@ export class CodexBackend implements Backend {
           ? ensurePrivateDataDirectory(nativeHome)
           : undefined,
       )
-    } catch (error) {
-      try { releaseHostAuth?.() } finally { provisioned.cleanup?.() }
-      throw error
-    }
-    let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
-    const releaseState = (): void => {
-      try { codexHome?.cleanup() } finally {
-        try { jailHome?.cleanup() } finally {
-          try { releaseHostAuth?.() } finally { provisioned.cleanup?.() }
-        }
-      }
-    }
-    try {
       // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
       await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
         cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, executor: this.spawner.executionEnvironment })
