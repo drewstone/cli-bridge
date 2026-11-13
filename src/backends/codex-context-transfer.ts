@@ -89,7 +89,7 @@ export class CodexContextTransfer implements PreparedContextTransfer {
     // Drain diagnostics without exposing credentials, transcript, or raw native errors.
     spawned.child.stderr?.resume()
     spawned.child.stdin?.on('error', () => this.fail(new Error('Codex app-server input failed')))
-    spawned.child.on('error', () => this.fail(new Error('Codex app-server failed to start')))
+    spawned.child.on('error', (error) => this.fail(new Error('Codex app-server failed to start', { cause: error })))
     spawned.child.on('close', () => this.fail(new Error('Codex app-server closed before acknowledgement')))
     signal.addEventListener('abort', this.onAbort, { once: true })
     if (signal.aborted) this.onAbort()
@@ -187,7 +187,7 @@ export class CodexContextTransfer implements PreparedContextTransfer {
   }
 
   private readonly onAbort = (): void => {
-    this.fail(new Error('Codex native import cancelled; acknowledgement may be unknown'))
+    this.fail(new Error('Codex native import cancelled; acknowledgement may be unknown', { cause: this.signal.reason }))
     void this.close().catch(() => {})
   }
 

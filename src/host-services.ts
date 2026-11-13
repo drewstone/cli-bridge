@@ -76,14 +76,11 @@ export function privateHostServiceMcp(request: ChatRequest, servers: Record<stri
   for (const [alias, binding] of bindings) {
     const server = servers[alias]
     if (!server) return refused('The declared private host-service MCP alias was not materialized')
-    if (binding.field === 'hub-env') {
-      if (server.env?.TANGLE_HUB_MCP_ENDPOINT !== binding.canonicalUrl) return refused('The Hub stdio endpoint changed after trusted admission')
-      rewritten[alias] = { ...server, env: { ...server.env, TANGLE_HUB_MCP_ENDPOINT: binding.nativeUrl } }
-    } else {
-      if (server.url !== binding.canonicalUrl) return refused('The framework MCP endpoint changed after trusted admission')
-      const headers = Object.fromEntries(Object.entries(server.headers ?? {}).filter(([name]) => !binding.strip.includes(name.toLowerCase())))
-      rewritten[alias] = { ...server, url: binding.nativeUrl, ...(server.headers ? { headers } : {}) }
-    }
+    const hub = binding.field === 'hub-env'
+    if ((hub ? server.env?.TANGLE_HUB_MCP_ENDPOINT : server.url) !== binding.canonicalUrl) return refused(`MCP endpoint ${JSON.stringify(alias)} changed after trusted admission`)
+    const headers = Object.fromEntries(Object.entries(server.headers ?? {}).filter(([name]) => !binding.strip.includes(name.toLowerCase())))
+    rewritten[alias] = hub ? { ...server, env: { ...server.env, TANGLE_HUB_MCP_ENDPOINT: binding.nativeUrl } }
+      : { ...server, url: binding.nativeUrl, ...(server.headers ? { headers } : {}) }
   }
   return rewritten
 }
@@ -170,6 +167,13 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
     },
     /** Claims come only from this authenticated request's runtime_attachments, carrying only its own resolved secret-refs. */
     async preparePrivateEndpoints(request: ChatRequest, backend: string): Promise<() => void> {
+      // bwrap unshares the network, so an authored loopback URL could only hang; only an attachment claims a registered route.
+      // A sandbox request carries no jailSpec unless the sandbox backend runs it, whose loopback is its own.
+      const authored = Object.entries(request.agent_profile?.mcp ?? {}).find(([, server]) => URL.canParse(server.url ?? '')
+        && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(server.url!).hostname))?.[0]
+      const jail = authored && request.jailSpec && backend !== 'sandbox' ? selectJailBackend() : undefined
+      if (jail?.name === 'bwrap' && await jail.isAvailable())
+        return refused(`MCP server ${JSON.stringify(authored)} is on host loopback; a jailed seat reaches it only as a runtime attachment to a live host-registered private endpoint`)
       const bound = request.runtime_attachments && privateBindings.get(request.runtime_attachments)
       const attachments = Object.entries(request.runtime_attachments?.mcp ?? {})
         .filter(([alias, server]) => /^http:/iu.test(server.url ?? '') && !bound?.has(alias))
@@ -179,7 +183,7 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
       const destination = { backend, privateMcpConfig: true, secrets: privateMcpCredentials(request) }
       return bindEach(attachments, ([alias, server]) => {
         const endpoint = privateEndpoints.get(server.url!)
-        if (!endpoint) return refused('A plain-HTTP MCP attachment in the jail requires a live host-registered private endpoint')
+        if (!endpoint) return refused(`Plain-HTTP MCP attachment ${JSON.stringify(alias)} in the jail requires a live host-registered private endpoint`)
         const headers: Record<string, string> = {}
         for (const [name, value] of Object.entries(server.headers ?? {})) {
           if (value.kind !== 'secret-ref')
