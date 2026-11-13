@@ -167,7 +167,10 @@ export class Run {
     }
   }
 
-  /** Producer commitment precedes the existing terminal snapshot transaction. */
+  /**
+   * Producer commitment precedes the existing terminal snapshot transaction. The run's one raw-capture scope
+   * calls this once, after its children close; the terminal check is the only fence a second caller would need.
+   */
   setNativeCapture(capture: NativeRunCapture): void {
     if (this.isTerminal()) throw new Error('Native producer commitment is already closed')
     this.nativeCapture = Object.freeze({ ...capture })

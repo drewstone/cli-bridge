@@ -463,7 +463,8 @@ For an embedded host, `startServer({ onRunRedaction })` provides a live redactor
 actual run, session, profile digest and CWD. It includes admitted custom MCP values, Hub grant
 tokens and Runtime coordination bearers. The callback receives no values or hashes of values.
 It can redact a retained native-file copy after job cleanup while this Bridge remains open;
-server close revokes it. Retain only the redacted copy and mark transformed original-byte coverage
+server close revokes it. Each issued redactor, with the protected values it names, stays in memory
+until that close: one entry per run, so a long-lived embedded host restarts its Bridge to bound it. Retain only the redacted copy and mark transformed original-byte coverage
 incomplete. This callback does not upload credentials or reconstruct a terminated Bridge.
 
 The existing bearer-protected `GET /` response includes `hostPolicy` with schema
@@ -1127,6 +1128,7 @@ MIT
 ### Process and native evidence
 
 Set `BRIDGE_RAW_CAPTURE_DIR` to a private absolute directory to retain original stdout and stderr for one-shot durable runs.
+The Bridge creates that directory, or narrows one its own user owns, to mode 0700; it refuses a link or another user's directory.
 Use an enforced filesystem jail whose writable workspace cannot reach that directory.
 The shared host, scoped-host, and Docker process seam captures bytes before a harness parser decodes them.
 Each private frame records byte length, SHA-256, process ID, sequence, and timestamp.
