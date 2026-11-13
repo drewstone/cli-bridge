@@ -458,6 +458,8 @@ subscription evidence at every new native invocation and retained continuation. 
 cancellation remain available. Admission refusals use HTTP403 and the same SSE/durable error:
 `type: subscription_required`, `status: 403`, `cause`, `fix`, `harness`, `provider`, and
 `provider_dispatch: not_started`. The fix names the native command or observed environment override.
+When the native probe itself fails, the message names its error chain, including the probe's own timeout.
+A request cancelled during the probe ends as `type: aborted` instead.
 
 For an embedded host, `startServer({ onRunRedaction })` provides a live redactor bound to the
 actual run, session, profile digest and CWD. It includes admitted custom MCP values, Hub grant
@@ -814,6 +816,8 @@ replaces the created value for the spawn that turn starts.
 Under the Linux bwrap jail, a plain-HTTP attachment that coordination or Hub routing has not bound is also refused
 before the harness starts unless its exact URL is a live endpoint the embedding host registered with
 `registerPrivateMcpEndpoint`, and such an attachment may carry only secret-ref headers.
+An `agent_profile.mcp` or request `mcp` server whose URL is on host loopback is refused there by name;
+only a runtime attachment can claim a registered endpoint.
 
 Clients discover the channel from `capabilities.runtimeAttachments.mcp` in
 the root document (`GET /`), and must refuse rather than fold the endpoint
