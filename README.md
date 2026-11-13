@@ -811,6 +811,9 @@ or the request `mcp` channel, an `enabled: false` entry, and a value that is
 not a typed MCP server. `runtime_attachments` is also accepted on
 `POST /v1/sessions` and `POST /v1/sessions/:id/turns`, where a turn value
 replaces the created value for the spawn that turn starts.
+Under the Linux bwrap jail, a plain-HTTP attachment that coordination or Hub routing has not bound is also refused
+before the harness starts unless its exact URL is a live endpoint the embedding host registered with
+`registerPrivateMcpEndpoint`, and such an attachment may carry only secret-ref headers.
 
 Clients discover the channel from `capabilities.runtimeAttachments.mcp` in
 the root document (`GET /`), and must refuse rather than fold the endpoint

@@ -2,6 +2,7 @@ import type { AgentProfileConfigValue, AgentProfileSecretProvider } from '@tangl
 import type { StartServerOptions } from './server-options.js'
 import type { RunSnapshot } from './runs/types.js'
 import { BackendError, type ChatRequest } from './backends/types.js'
+import { RUNTIME_COORDINATION_ENV_NAME } from './sessions/retained/contract.js'
 
 // A cloned request retains its attachment identity. Neither the values nor the provider enter JSON.
 const credentials = new WeakMap<object, Map<string, string>>()
@@ -47,14 +48,16 @@ export async function preparePrivateMcp(
   signal: AbortSignal,
 ): Promise<(() => void) | undefined> {
   const references = new Map<string, { header: boolean }>()
-  for (const server of Object.values(request.agent_profile?.mcp ?? {})) {
+  // Runtime attachments resolve through the same host port; their coordination token is the request bearer.
+  const attached = Object.values(request.runtime_attachments?.mcp ?? {})
+  for (const server of [...Object.values(request.agent_profile?.mcp ?? {}), ...attached]) {
     if (server.enabled === false) continue
     for (const value of server.args ?? []) {
       if (value.kind === 'secret-ref') throw new BackendError('MCP secrets cannot appear in argv; use env or headers', 'parse_error')
     }
     for (const [kind, values] of [['env', server.env], ['headers', server.headers]] as const) {
       for (const value of Object.values(values ?? {})) {
-        if (value.kind !== 'secret-ref') continue
+        if (value.kind !== 'secret-ref' || (value.key === RUNTIME_COORDINATION_ENV_NAME && attached.includes(server))) continue
         if (value.format !== undefined && value.format !== 'raw' && value.format !== 'bearer')
           throw new BackendError('MCP secret reference format must be raw or bearer', 'parse_error')
         references.set(value.key, { header: kind === 'headers' || references.get(value.key)?.header === true })
