@@ -11,17 +11,19 @@ export function privateMcpCredentials(request: ChatRequest): ReadonlyMap<string,
   return request.runtime_attachments && credentials.get(request.runtime_attachments)
 }
 
+/** Values every filter removes, and why the run keeps no retained copy when it keeps none. */
+export interface RunRedaction { values: readonly string[]; withheld?: string }
 /** The transport consumes this private snapshot before parsing or retaining child output. */
-export type PrivateRunRedactionObserver = (run: Omit<Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0], 'redact'>, values: readonly string[], request: ChatRequest) => readonly string[] | void
-export function privateExecutionRedaction(request: ChatRequest, run: Pick<RunSnapshot, 'id' | 'requestDigest'>, profileDigest: string | null, observe?: PrivateRunRedactionObserver): readonly string[] {
+export type PrivateRunRedactionObserver = (run: Omit<Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0], 'redact'>, values: readonly string[], request: ChatRequest) => RunRedaction | undefined
+export function privateExecutionRedaction(request: ChatRequest, run: Pick<RunSnapshot, 'id' | 'requestDigest'>, profileDigest: string | null, observe?: PrivateRunRedactionObserver): RunRedaction {
   const values = [...new Set([
     ...(privateMcpCredentials(request)?.values() ?? []),
     ...(request.runtime_attachments && protectedValues.get(request.runtime_attachments) || []),
     ...(request.runtimeCoordinationBearer ? [request.runtimeCoordinationBearer] : []),
   ])]
-  const augmented = observe?.({ runId: run.id, requestDigest: run.requestDigest, sessionId: request.session_id ?? null,
+  const observed = observe?.({ runId: run.id, requestDigest: run.requestDigest, sessionId: request.session_id ?? null,
     profileDigest, cwd: request.cwd ?? null }, values, request)
-  return [...new Set([...values, ...(augmented ?? [])])]
+  return { ...observed, values: [...new Set([...values, ...(observed?.values ?? [])])] }
 }
 
 /** Host-owned grants share the existing private attachment identity, never its JSON value. */

@@ -169,7 +169,7 @@ export class Run {
 
   /** Producer commitment precedes the existing terminal snapshot transaction. */
   setNativeCapture(capture: NativeRunCapture): void {
-    if (this.isTerminal() || this.nativeCapture) throw new Error('Native producer commitment is already closed')
+    if (this.isTerminal()) throw new Error('Native producer commitment is already closed')
     this.nativeCapture = Object.freeze({ ...capture })
   }
 

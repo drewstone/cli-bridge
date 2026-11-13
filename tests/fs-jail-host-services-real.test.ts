@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import { privateCopyRedactor } from '../src/executors/raw-capture.js'
-import { claimTrustedHostService, registerTrustedHostService } from '../src/jail/egress.js'
+import { claimTrustedHostService, registerTrustedHostService } from '../src/jail/egress-relay.js'
 import { LinuxBwrapJail } from '../src/jail/linux-bwrap.js'
 import type { JailSpec } from '../src/jail/types.js'
 

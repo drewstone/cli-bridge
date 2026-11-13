@@ -36,7 +36,6 @@ import {
 } from './retained/interaction-store.js'
 import { parseSafeRetainedMetadata } from './retained/contract.js'
 import { sanitizeLegacySessionMetadata } from './legacy-metadata.js'
-export { sanitizeLegacySessionMetadata } from './legacy-metadata.js'
 
 export { parseSafeRetainedMetadata } from './retained/contract.js'
 

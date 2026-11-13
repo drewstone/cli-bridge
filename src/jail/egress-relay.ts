@@ -32,6 +32,7 @@ import {
   type ServerResponse,
 } from 'node:http'
 import { connect, isIP, type Server, type Socket } from 'node:net'
+import { readRequestBody, RequestTooLargeError } from '../backends/pi-inference-transport.js'
 
 /** Bytes buffered while waiting for the CONNECT head or the ClientHello. */
 const MAX_HEAD_BYTES = 16_384
@@ -51,6 +52,9 @@ const RESPONSE_HEADERS = [
 declare const trustedHostService: unique symbol
 declare const trustedHostServiceOwner: unique symbol
 /** Host-only authority. JSON and object copies cannot manufacture a registration. */
+/** Loopback port the shim listens on inside the jail's private namespace. */
+export const SHIM_PORT = '3128'
+
 export interface TrustedHostServiceRegistration {
   readonly [trustedHostService]: true
 }
@@ -163,7 +167,7 @@ export function claimTrustedHostService(
   services.set(registration, service)
   return {
     registration,
-    nativeUrl: `http://127.0.0.1:3128/${cap}`,
+    nativeUrl: `http://127.0.0.1:${SHIM_PORT}/${cap}`,
     protectedValues,
     revoke: () => revokeService(service),
   }
@@ -343,7 +347,7 @@ async function serveHostService(
   routes: ReadonlyMap<string, ServiceRoute>,
 ): Promise<void> {
   const route = routes.get(req.url ?? '')
-  if (!route || req.headers.host !== '127.0.0.1:3128' || route.service.revoked || route.service.owner.revoked) {
+  if (!route || req.headers.host !== `127.0.0.1:${SHIM_PORT}` || route.service.revoked || route.service.owner.revoked) {
     res.writeHead(403)
     res.end()
     return
@@ -353,22 +357,14 @@ async function serveHostService(
     res.end()
     return
   }
-  const declared = req.headers['content-length']
-  if (declared !== undefined && Number(declared) > MAX_SERVICE_BODY_BYTES) {
+  const body = await readRequestBody(req, MAX_SERVICE_BODY_BYTES).catch((error: unknown) => {
+    if (error instanceof RequestTooLargeError) return undefined
+    throw error
+  })
+  if (!body) {
     res.writeHead(413)
     res.end()
     return
-  }
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    size += chunk.length
-    if (size > MAX_SERVICE_BODY_BYTES) {
-      res.writeHead(413)
-      res.end()
-      return
-    }
-    chunks.push(chunk)
   }
   if (route.service.revoked || route.service.owner.revoked || req.aborted || res.destroyed) return void res.destroy()
   const headers: Record<string, string> = {}
@@ -377,7 +373,7 @@ async function serveHostService(
     if (typeof value === 'string') headers[name] = value
   }
   Object.assign(headers, route.service.headers)
-  headers['content-length'] = String(size)
+  headers['content-length'] = String(body.length)
   headers.connection = 'close'
   await new Promise<void>((resolve) => {
     const upstream = request(route.target, {
@@ -414,7 +410,7 @@ async function serveHostService(
       res.once('finish', done)
       response.pipe(res)
     })
-    upstream.end(Buffer.concat(chunks, size))
+    upstream.end(body)
   })
 }
 

@@ -1,11 +1,12 @@
 /** Trusted host scopes grant routes; authored profiles and HTTP requests cannot register one. */
 import type { AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import { BackendError, type ChatRequest, type McpServerSpec } from './backends/types.js'
-import { claimTrustedHostService, registerTrustedHostService, type TrustedHostServiceOwner } from './jail/egress.js'
+import { claimTrustedHostService, registerTrustedHostService, type TrustedHostServiceOwner } from './jail/egress-relay.js'
 import { selectJailBackend } from './jail/index.js'
 import { protectExecutionValues } from './private-mcp.js'
 import { isSafeWireIdentifier } from './runs/identifiers.js'
 import { RUNTIME_COORDINATION_ENV_NAME } from './sessions/retained/contract.js'
+import type { JailSpec } from './jail/types.js'
 import type { BridgeServer } from './server-options.js'
 
 type Binding = { canonicalUrl: string; nativeUrl: string; field: 'url' | 'hub-env'; stripAuthorization: boolean }
@@ -16,33 +17,33 @@ function refused(message: string): never {
 }
 
 /** The same selected backend later consumes JailSpec; native URLs never assume a shim on other transports. */
-async function usesRelay(request: ChatRequest, backend: string): Promise<boolean> {
-  if (!request.jailSpec) return false
+async function relaySpec(request: ChatRequest, backend: string): Promise<JailSpec | undefined> {
+  const spec = request.jailSpec
+  if (!spec) return undefined
   const jail = selectJailBackend()
-  if (jail.name === 'seatbelt') return false // Preserve the current Mac native URLs; no 3128 listener is installed there.
-  if (!['claude-code', 'codex', 'opencode'].includes(backend) || request.execution?.kind === 'sandbox') {
+  if (jail.name === 'seatbelt') return undefined // Preserve the current Mac native URLs; no shim listener is installed there.
+  if (!['claude', 'claude-code', 'codex', 'opencode'].includes(backend) || request.execution?.kind === 'sandbox') {
     return refused('This backend cannot consume trusted private host-service routing')
   }
   if (jail.name !== 'bwrap' || !await jail.isAvailable()) return refused('Trusted host-service routing requires the available Linux bwrap transport')
-  request.jailSpec.requireEnforcement = true
-  return true
+  spec.requireEnforcement = true
+  return spec
 }
 
-function bindClaim(request: ChatRequest, alias: string, binding: Omit<Binding, 'nativeUrl'>, claim: ReturnType<typeof claimTrustedHostService>): () => void {
-  if (!request.jailSpec) return refused('A trusted host-service claim requires its enforced jail')
-  request.runtime_attachments ??= { mcp: {} }
-  const identity = request.runtime_attachments
+// Callers bind only declared runtime attachments, so the request already carries its attachment identity.
+function bindClaim(request: ChatRequest, spec: JailSpec, alias: string, binding: Omit<Binding, 'nativeUrl'>, claim: ReturnType<typeof claimTrustedHostService>): () => void {
+  const identity = request.runtime_attachments!
   const bindings = privateBindings.get(identity) ?? new Map<string, Binding>()
   if (bindings.has(alias)) return refused('A private MCP alias already has a trusted host-service binding')
   bindings.set(alias, { ...binding, nativeUrl: claim.nativeUrl })
   privateBindings.set(identity, bindings)
   const releaseProtected = protectExecutionValues(request, claim.protectedValues)
-  request.jailSpec.trustedHostServices = [...(request.jailSpec.trustedHostServices ?? []), claim.registration]
+  spec.trustedHostServices = [...(spec.trustedHostServices ?? []), claim.registration]
   return () => {
     try { claim.revoke() } finally {
       bindings.delete(alias)
       if (!bindings.size) privateBindings.delete(identity)
-      request.jailSpec!.trustedHostServices = request.jailSpec!.trustedHostServices?.filter((entry) => entry !== claim.registration)
+      spec.trustedHostServices = spec.trustedHostServices?.filter((entry) => entry !== claim.registration)
       releaseProtected()
     }
   }
@@ -99,13 +100,13 @@ export function createHostServiceBindings() {
       }
       coordinators.set(input.url, { runId: input.runId, actorId: input.actorId, signal: input.signal, owner: service.owner, revoke })
       input.signal.addEventListener('abort', revoke, { once: true })
-      if (input.signal.aborted) revoke()
       return revoke
     },
     async prepareCoordination(request: ChatRequest, backend: string): Promise<() => void> {
       const attachments = Object.entries(request.runtime_attachments?.mcp ?? {}).filter(([, server]) =>
         Object.values(server.headers ?? {}).some((value) => value.kind === 'secret-ref' && value.key === RUNTIME_COORDINATION_ENV_NAME))
-      if (!attachments.length || !await usesRelay(request, backend)) return () => {}
+      const spec = attachments.length ? await relaySpec(request, backend) : undefined
+      if (!spec) return () => {}
       const releases: Array<() => void> = []
       try {
         for (const [alias, server] of attachments) {
@@ -117,14 +118,15 @@ export function createHostServiceBindings() {
             return refused('Framework coordination requires its live host-owned listener and exact private token reference')
           }
           const claim = claimTrustedHostService(owner.owner, { Authorization: `Bearer ${request.runtimeCoordinationBearer}` })
-          try { releases.push(bindClaim(request, alias, { canonicalUrl: server.url!, field: 'url', stripAuthorization: true }, claim)) }
+          try { releases.push(bindClaim(request, spec, alias, { canonicalUrl: server.url!, field: 'url', stripAuthorization: true }, claim)) }
           catch (error) { claim.revoke(); throw error }
         }
         return () => { for (const release of releases.splice(0)) release() }
       } catch (error) { for (const release of releases) release(); throw error }
     },
     async prepareHub(request: ChatRequest, backend: string, servers: Record<string, AgentProfileMcpServer>, tokens: readonly string[]): Promise<() => void> {
-      if (!await usesRelay(request, backend)) return () => {}
+      const spec = await relaySpec(request, backend)
+      if (!spec) return () => {}
       if (closed || !listener) return refused('Hub host-service routing requires this Bridge actual loopback listener')
       const releases: Array<() => void> = []
       try {
@@ -136,7 +138,7 @@ export function createHostServiceBindings() {
           const service = registerTrustedHostService({ url: expected, paths: { '/tools': ['GET'], '/call': ['POST'] } })
           const claim = claimTrustedHostService(service.owner)
           try {
-            const release = bindClaim(request, alias, { canonicalUrl: expected, field: server.url ? 'url' : 'hub-env', stripAuthorization: false }, claim)
+            const release = bindClaim(request, spec, alias, { canonicalUrl: expected, field: server.url ? 'url' : 'hub-env', stripAuthorization: false }, claim)
             const cleanup = () => { if (hubReleases.delete(cleanup)) { try { release() } finally { service.revoke() } } }
             hubReleases.add(cleanup)
             releases.push(cleanup)

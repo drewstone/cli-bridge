@@ -1176,10 +1176,10 @@ export function mountChatCompletions(
 
       // Reader disconnect leaves the job and its admission alone. Capture settles
       // before the job promise releases private grants and native configuration.
-      const protectedValues = privateExecutionRedaction(req, run, sessionProfileBinding?.effectiveProfileDigest ?? null, deps.onRunRedaction)
+      const redaction = privateExecutionRedaction(req, run, sessionProfileBinding?.effectiveProfileDigest ?? null, deps.onRunRedaction)
       const terminal = deps.captureNative ? async (input: Parameters<import('../executors/raw-capture.js').TerminalNativeCapture>[0]) => run.setNativeCapture(await deps.captureNative!({ ...input,
         snapshot: run.snapshot(), backend: backend.name, cwd: req.cwd, profileDigest: sessionProfileBinding?.effectiveProfileDigest ?? null })) : undefined
-      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, protectedValues, terminal)), chatCompletionDeltaOptions(req))
+      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, redaction, terminal)), chatCompletionDeltaOptions(req))
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)

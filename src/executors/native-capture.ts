@@ -1,7 +1,7 @@
 /** Terminal native-family copies share the raw producer spool and precede private lease release. */
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, realpath, type FileHandle } from 'node:fs/promises'
+import { mkdir, open, realpath, rm, type FileHandle } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import {
   BOUND_HARNESS_SESSION_READ_LIMITS as bounds,
@@ -11,6 +11,7 @@ import {
 } from '@tangle-network/harness-sessions'
 import type { EffectiveNativeStore } from '../jail/types.js'
 import type { NativeRunCapture, RunSnapshot } from '../runs/types.js'
+import { isPrivateDirectory } from '../runtime/single-instance.js'
 
 const READ_DIRECTORY = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
 const CREATE_FILE = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW
@@ -74,6 +75,9 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
   }
   let home: FileHandle | undefined
   let files: Awaited<ReturnType<typeof locateDeclaredSessionFiles<string>>>['files'] = []
+  // A capture that commits no manifest removes every payload it wrote.
+  const written: string[] = []
+  const discard = () => Promise.all(written.map((path) => rm(path, { recursive: true, force: true }))).catch(() => undefined)
   try {
     const cwd = await realpath(input.cwd)
     const storeRoot = await realpath(store.root)
@@ -87,11 +91,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
       !spoolFromCwd || (!(spoolFromCwd === '..' || spoolFromCwd.startsWith('../')) && !isAbsolute(spoolFromCwd))) {
       return unavailable('native-store-or-spool-outside-host-policy')
     }
-    await mkdir(root, { recursive: true, mode: 0o700 })
-    const spool = await lstat(root)
-    if (!spool.isDirectory() || spool.isSymbolicLink() || (spool.mode & 0o077) || await realpath(root) !== root || spool.uid !== process.getuid?.()) {
-      return unavailable('native-spool-is-not-private')
-    }
+    if (!isPrivateDirectory(root)) return unavailable('native-spool-is-not-private')
     home = await open(cwd, READ_DIRECTORY)
     const uid = (await home.stat()).uid
     const directories = harness === 'codex' ? CODEX_HOME_RULE.sessionDirs : ['projects']
@@ -127,7 +127,9 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
           const labels = Buffer.from(JSON.stringify({ payload, path: file.path, nativeSessionId: file.nativeSessionId,
             parentNativeSessionId: nativeRef(harness, file.path).parentNativeSessionId }))
           if (!Buffer.from(input.redact(labels)).equals(labels)) throw new Error('Private native labels cannot become retained identities')
-          await writePayload(root, payload, retained)
+          const directory = join(root, dirname(payload))
+          written.push(directory)
+          await writePayload(root, payload, retained).catch(async (error: unknown) => { await rm(directory, { recursive: true, force: true }); throw error })
           provenance.push({ path: file.path, nativeSessionId: file.nativeSessionId, parentNativeSessionId: nativeRef(harness, file.path).parentNativeSessionId,
             sourceSha256, sourceByteLength: bytes.length,
             retainedSha256: digest(retained), retainedByteLength: retained.byteLength, payload,
@@ -145,7 +147,7 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
       process: input.processes.length === 1 ? { pid: input.processes[0]!.pid, exitedAt: input.processes[0]!.closedAt,
         exitCode: input.processes[0]!.exitCode, signal: input.processes[0]!.signal } : { pid: null, exitedAt: null, exitCode: null, signal: null },
       files: provenance.map((file) => ({ path: file.payload, store: harness === 'codex' ? '.codex' : '.claude', storePath: `${harness === 'codex' ? '.codex' : '.claude'}/${file.path}`, sizeBytes: file.retainedByteLength,
-        sha256: file.retainedSha256, method: 'atomic-file', truncated: file.truncated })),
+        sha256: file.retainedSha256, method: file.truncated ? 'byte-prefix' : 'atomic-file', truncated: file.truncated })),
       complete: familyVerified && !provenance.some((file) => file.redacted),
       missingReasons: [...new Set([...missingReasons, ...(provenance.some((file) => file.redacted) ? ['native-original-bytes-redacted'] : [])])],
     }
@@ -156,12 +158,13 @@ export async function captureTerminalNativeFamily(input: NativeCaptureInput): Pr
         familyVerified, files: provenance,
         family: family?.files.map((file) => ({ path: file.path, nativeSessionId: file.nativeSessionId, sha256: file.sha256, byteLength: file.byteLength })) ?? [] } }
     const bytes = Buffer.from(JSON.stringify(manifest) + '\n')
-    if (!Buffer.from(input.redact(bytes)).equals(bytes)) return unavailable('native-capture-metadata-requires-redaction')
+    if (!Buffer.from(input.redact(bytes)).equals(bytes)) { await discard(); return unavailable('native-capture-metadata-requires-redaction') }
+    written.push(join(root, `${id}.native.json`))
     const committed = await writePayload(root, `${id}.native.json`, bytes)
     // Commit the directory before the terminal snapshot can advertise its manifest.
     const directory = await open(root, READ_DIRECTORY)
     try { await directory.sync() } finally { await directory.close() }
     return { status: familyVerified ? 'retained' : 'incomplete', ...committed }
-  } catch { return unavailable('native-capture-failed') }
+  } catch { await discard(); return unavailable('native-capture-failed') }
   finally { await Promise.all(files.map((file) => file.handle.close())); await home?.close() }
 }

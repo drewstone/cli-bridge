@@ -14,11 +14,11 @@ for (const [harness, override, unsafeLabels = false] of [['codex', false], ['cla
   const previousClaude = process.env.CLAUDE_CONFIG_DIR
   const previousRaw = process.env.BRIDGE_RAW_CAPTURE_DIR
   delete process.env.CLAUDE_CONFIG_DIR
-  delete process.env.BRIDGE_RAW_CAPTURE_DIR
   let server
   try {
-    const workspace = join(root, 'workspace'), seed = join(root, 'seed'), state = join(root, 'state')
-    await Promise.all([mkdir(workspace), mkdir(seed)])
+    const workspace = join(root, 'workspace'), seed = join(root, 'seed'), state = join(root, 'state'), captureDir = join(root, 'capture')
+    await Promise.all([mkdir(workspace), mkdir(seed), mkdir(captureDir, { mode: 0o700 })])
+    process.env.BRIDGE_RAW_CAPTURE_DIR = captureDir
     if (override) {
       process.env.CLAUDE_CONFIG_DIR = join(workspace, 'external-claude-home')
       await mkdir(process.env.CLAUDE_CONFIG_DIR)
@@ -107,14 +107,14 @@ ln -s "${nativeRoot}/${directory}/${filename}" "${nativeRoot}/${directory}/$labe
       assert.equal(capture.status, 'unavailable', 'External/unqualified roots and private path labels must not become trusted copies')
       if (unsafeLabels && process.platform === 'linux') {
         assert.equal(capture.reason, 'native-capture-metadata-requires-redaction')
-        for (const entry of await readdir(join(state,'native'),{recursive:true,withFileTypes:true})) {
+        for (const entry of await readdir(captureDir,{recursive:true,withFileTypes:true})) {
           assert.ok(!entry.name.includes(labelSecret))
           if (entry.isFile()) assert.ok(!(await readFile(join(entry.parentPath,entry.name))).includes(Buffer.from(labelSecret)))
         }
       }
     } else {
       assert.equal(capture.status, 'retained')
-      assert.ok((await readdir(join(state, 'native'))).every(name => !name.endsWith('.frames')), 'Known child terminal facts do not require opt-in raw frame capture')
+      assert.ok((await readdir(captureDir)).some(name => name.endsWith('.frames')), 'Native copies share the one opt-in capture directory')
       const manifestBytes = await readFile(capture.path)
       assert.equal(manifestBytes.length, capture.byteLength)
       assert.equal(`sha256:${createHash('sha256').update(manifestBytes).digest('hex')}`, capture.sha256)
@@ -144,11 +144,11 @@ ln -s "${nativeRoot}/${directory}/${filename}" "${nativeRoot}/${directory}/$labe
       assert.equal(file.redacted, false)
       assert.equal(file.truncated, false)
       const { listCapture, readCapture } = await import('@tangle-network/harness-sessions')
-      const listing = await listCapture(join(state, 'native'), manifest)
+      const listing = await listCapture(captureDir, manifest)
       assert.equal(listing.sessions.length, 1)
       assert.deepEqual(listing.missing, [])
       const parsed = []
-      for await (const session of readCapture(join(state, 'native'), manifest)) parsed.push(session)
+      for await (const session of readCapture(captureDir, manifest)) parsed.push(session)
       assert.equal(parsed[0].nativeSessionId, nativeId)
       assert.equal(parsed[0].integrity.truncated, false)
       assert.deepEqual(parsed[0].integrity.gaps, [])

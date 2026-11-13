@@ -100,7 +100,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   const coordination = 'private-coordination-provider-canary-6ab256'
   const hubKey = 'public-hub-client-fixture'
   let hubInvoked = 0, coordinationInvoked = 0
-  let vendorPath = "", vendorDigest = ""
+  let vendorPath = "", vendorDigest = "", resumedVendorPath = ""
   const upstream = createServer(async (request, response) => {
     if (request.url?.startsWith('/v1/hub/')) {
       if (request.headers.authorization !== `Bearer ${hubKey}`) { response.writeHead(403).end(); return }
@@ -198,22 +198,28 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
         metadata:{native_redaction_history:{protectedHistory:false}},
         env:{AGENT_RUNTIME_COORDINATION_TOKEN:coordination,CLAUDE_CONFIG_DIR:join(root,'claude-home')},
         runtime_attachments:{mcp:{coord:{transport:'http',url:`http://127.0.0.1:${address.port}/coord`,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}}}) })
-    expect(resume.status).not.toBe(200)
-    expect(await resume.text()).toContain('redaction history is unavailable')
-    expect((await readFile(join(root,'private-config-paths.jsonl'),'utf8')).trim().split('\n')).toHaveLength(1)
-    expect(redactors).toHaveLength(1)
-    expect(methods).toEqual(['tools/list','initialize'])
-    expect(hubInvoked).toBe(1)
-    expect(coordinationInvoked).toBe(1)
+    // The conversation continues. This Bridge cannot name the first run's grants, so the run keeps no copy.
+    const resumed = await resume.text()
+    expect(resume.status, resumed).toBe(200)
+    for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(resumed).not.toContain(value)
+    const withheld = await fetch(`${server.url}/v1/runs/restart-private-${backend}`).then(r => r.json()) as { nativeCapture: unknown }
+    expect(withheld.nativeCapture).toEqual({ status: 'unavailable', reason: 'native-redaction-history-unavailable' })
+    expect((await readFile(join(root,'private-config-paths.jsonl'),'utf8')).trim().split('\n')).toHaveLength(2)
+    expect(redactors).toHaveLength(2)
+    expect(() => redactors[1]!.redact(new Uint8Array())).toThrow('withheld')
+    expect(methods).toEqual(['tools/list','initialize','tools/list','initialize'])
+    expect(hubInvoked).toBe(2)
+    expect(coordinationInvoked).toBe(2)
+    resumedVendorPath = await readFile(join(root,'private-vendor-path.txt'),'utf8')
     expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(vendorDigest)
   } finally {
     await server.close()
-    for (const redactor of redactors) expect(() => redactor.redact(new Uint8Array())).toThrow('closed')
+    for (const redactor of redactors) expect(() => redactor.redact(new Uint8Array())).toThrow(/closed|withheld/)
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
   }
   try {
     expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(vendorDigest)
-    const retained = [...await bytesUnder(root,new Set([vendorPath])), ...await bytesUnder(captureRoot)]
+    const retained = [...await bytesUnder(root,new Set([vendorPath, resumedVendorPath])), ...await bytesUnder(captureRoot)]
     const streams = processStreams(retained)
     for (const bytes of [...retained,...streams]) for (const value of [secret,coordination,hubKey,...grantTokens]) {
       expect(bytes.includes(Buffer.from(value))).toBe(false)
@@ -279,20 +285,28 @@ async function main(){
     expect(secondText).not.toContain(JSON.stringify(old).slice(1,-1))
     expect(secondText).not.toContain(JSON.stringify(next).slice(1,-1))
     expect(effects).toBe(2)
-    await server.close(); server = await createHost()
-    const held = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(next,'private-opencode-after-restart')})
-    expect(held.status).not.toBe(200)
-    expect(await held.text()).toContain('redaction history is unavailable')
-    expect((await readFile(join(root,'native-launches'),'utf8')).trim().split('\n')).toHaveLength(2)
-    expect(effects).toBe(2)
-    const retained = [...await bytesUnder(root,new Set([join(root,'native-conversation')])),...await bytesUnder(captureRoot)]
-    for (const bytes of [...retained,...processStreams(retained)]) {
-      expect(bytes.includes(Buffer.from(old))).toBe(false)
-      expect(bytes.includes(Buffer.from(next))).toBe(false)
-      expect(bytes.includes(Buffer.from(JSON.stringify(old).slice(1,-1)))).toBe(false)
-      expect(bytes.includes(Buffer.from(JSON.stringify(next).slice(1,-1)))).toBe(false)
-    }
+    const clean = (files: Buffer[]) => { for (const bytes of [...files,...processStreams(files)]) for (const value of [old,next]) {
+      expect(bytes.includes(Buffer.from(value))).toBe(false)
+      expect(bytes.includes(Buffer.from(JSON.stringify(value).slice(1,-1)))).toBe(false)
+    } }
+    const captured = await bytesUnder(captureRoot)
+    const retained = [...await bytesUnder(root,new Set([join(root,'native-conversation')])),...captured]
+    clean(retained)
     if(capture) expect(processStreams(retained).length).toBeGreaterThan(0)
+    await server.close(); server = await createHost()
+    // After a restart the first token is unknown here: the turn runs, its output may carry that revoked token
+    // as on a Bridge without cross-turn redaction, and it keeps no process frames.
+    const resumed = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(next,'private-opencode-after-restart')})
+    const resumedText = await resumed.text()
+    expect(resumed.status,resumedText).toBe(200)
+    expect(resumedText).not.toContain(next)
+    expect((await fetch(`${server.url}/v1/runs/private-opencode-after-restart`).then(r=>r.json()) as {nativeCapture:unknown}).nativeCapture)
+      .toEqual({status:'unavailable',reason:'native-redaction-history-unavailable'})
+    expect((await readFile(join(root,'native-launches'),'utf8')).trim().split('\n')).toHaveLength(3)
+    expect(effects).toBe(3)
+    const frames = await bytesUnder(captureRoot)
+    clean(frames)
+    expect(frames.length).toBe(captured.length)
   } finally {
     await server.close()
     await new Promise<void>(resolve => upstream.close(()=>resolve()))

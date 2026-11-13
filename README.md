@@ -1148,15 +1148,18 @@ disconnect and Bridge restart. This does not reconstruct a native child after
 Bridge death.
 
 The existing session row checkpoints nonsecret redaction history before a new
-native launch. Continuing a conversation whose earlier protected values are no
-longer resident in this Bridge is refused before dispatch. A Bridge restart can
-read a committed copy, but cannot safely recopy that conversation with only its
-new grants. Legacy native rows without this history also fail closed. Neither
-private values nor hashes of those values are persisted to recover authority.
-Accepted native context imports currently prove typed selection and receiver
-ownership, but carry no source redaction provenance. Producer-enabled hosts
-therefore refuse their first dispatch rather than label that imported history
-credential-free. Reading a previously committed capture remains supported.
+native launch. When this Bridge cannot name every protected value a native
+conversation may hold, the turn still runs and keeps no retained copy: no
+process frames, no native copy, and `nativeCapture` names the reason. A
+conversation continued after a Bridge restart reports
+`native-redaction-history-unavailable`, as does a legacy native row without this
+history. An accepted native context import, which carries no source redaction
+provenance, reports `native-context-import-without-redaction-provenance`. The
+unchanged history row keeps every later turn of that conversation withheld.
+Output in such a turn is filtered only for the values admitted since this
+Bridge started, as on a Bridge without cross-turn redaction. Neither private
+values nor hashes of those values are persisted. An embedded host's
+`onRunRedaction` redactor for a withheld run throws with the reason.
 
 Native payloads use the existing `tangle.raw-evidence-archive.v2` copy format and
 the harness-sessions family verifier. The manifest adds exact Bridge run,
@@ -1167,9 +1170,10 @@ passes identity and integrity checks. Missing children, unsafe paths, partial
 lines, inventory bounds and unsupported stores remain explicit gaps. Read bounds
 come from `@tangle-network/harness-sessions`.
 
-Without `BRIDGE_RAW_CAPTURE_DIR`, native copies use the private `native`
-subdirectory of `BRIDGE_DATA_DIR`, outside the worker workspace. Raw-frame capture
-remains opt-in. macOS descriptor-relative capture and Pi's retained native-session
+Native copies are written only to `BRIDGE_RAW_CAPTURE_DIR`, beside the process
+frames; without it a run reports `native-capture-not-configured`. The Bridge
+applies no retention to that directory: its operator owns the byte and age
+bound. A capture that commits no manifest removes the payloads it wrote. macOS descriptor-relative capture and Pi's retained native-session
 API jobs are unsupported by this producer. The filesystem jail's network policy
 also applies to local MCP/Hub URLs; an unjailed authentication test does not prove
 their reachability from a jailed native process.

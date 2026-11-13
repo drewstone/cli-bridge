@@ -29,9 +29,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProxySecretBinding } from '@tangle-network/agent-interface'
-import { startEgressRelay, type EgressRelay } from './egress-relay.js'
-export { registerTrustedHostService, claimTrustedHostService } from './egress-relay.js'
-export type { TrustedHostServiceOwner, TrustedHostServiceRegistration } from './egress-relay.js'
+import { SHIM_PORT, startEgressRelay, type EgressRelay } from './egress-relay.js'
 import type { JailSpec } from './types.js'
 
 export type JailNetwork = 'none' | 'router' | 'relay'
@@ -77,8 +75,6 @@ export interface PreparedEgress {
   cleanup(): Promise<void>
 }
 
-/** Loopback port the shim listens on inside the jail's private namespace. */
-const SHIM_PORT = '3128'
 /** A unix socket path is limited to 108 bytes on Linux. */
 const MAX_SOCKET_PATH = 100
 const SYSTEM_CA_BUNDLES = ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt', '/etc/ssl/cert.pem']
