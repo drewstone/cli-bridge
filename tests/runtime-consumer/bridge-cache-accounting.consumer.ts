@@ -59,7 +59,8 @@ for (const event of ${JSON.stringify(native)}) console.log(JSON.stringify(event)
   for await (const event of run) {
     events.push(event)
   }
-  const spent = executor.resultArtifact().spent
+  const artifact = executor.resultArtifact()
+  const spent = artifact.spent
 
   assert.deepEqual(events.find(event => (event as { kind?: unknown }).kind === 'tokens'), {
     kind: 'tokens',
@@ -76,8 +77,11 @@ for (const event of ${JSON.stringify(native)}) console.log(JSON.stringify(event)
     cacheRead: 15_269,
     cacheWrite: 10_753,
   })
+  // Claude Code prices this figure locally, so Runtime shows it on the result and never debits spend with it.
   assert.equal(spent.usdKnown, false)
-  assert.equal(spent.usdEstimated, 0.0470478)
+  assert.equal(spent.usd, 0)
+  assert.equal(spent.usdEstimated, undefined)
+  assert.equal((artifact.out as { estimatedCostUsd?: unknown }).estimatedCostUsd, 0.0470478)
 
   const budget = createBudgetPool({ maxIterations: 1, maxTokens: 20_000 }, Date.now())
   budget.observe(spent)
