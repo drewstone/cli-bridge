@@ -182,6 +182,9 @@ importers:
       '@tangle-network/agent-trace-contract':
         specifier: ^2.1.0
         version: 2.1.0
+      '@tangle-network/harness-sessions':
+        specifier: 1.0.13
+        version: 1.0.13(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
       '@tangle-network/hub-sdk':
         specifier: ^1.0.5
         version: 1.0.5
@@ -624,8 +627,8 @@ packages:
   '@tangle-network/agent-trace-contract@2.2.0':
     resolution: {integrity: sha512-M7UrrKmaQIvrW2S1PCIsTOHBqP/hKiSjIAbV/Shso78zTYet0bzhJ/vfwfCEs0bfAl1oDsh/tQlZZp66o+YgPg==}
 
-  '@tangle-network/harness-sessions@1.0.1':
-    resolution: {integrity: sha512-RrZLofHn0wLj18AX9I3ObvFNRv3foAcVYefyVQ+sVUPpvq9OtJ/iV1Nl59SF2ZhCc74YaCOodvmDwyg1VY2kpA==}
+  '@tangle-network/harness-sessions@1.0.13':
+    resolution: {integrity: sha512-eyEcSRHSy+iVRl4ekhrHUfM6uIOmLPOu8XXBFz4J0+UFfP6wOUlrTRF/+DhPU9hIV3Vuz2TsFzG0Mr8qsdn5vA==}
     engines: {node: '>=22.13.0'}
     hasBin: true
 
@@ -1790,7 +1793,7 @@ snapshots:
       '@tangle-network/agent-core': 1.0.0(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
       '@tangle-network/agent-interface': 5.10.21
       '@tangle-network/agent-trace-contract': 2.2.0
-      '@tangle-network/harness-sessions': 1.0.1(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
+      '@tangle-network/harness-sessions': 1.0.13(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
       hono: 4.13.14
       linear-sum-assignment: 1.0.9
       re2js: 2.9.0
@@ -1844,7 +1847,7 @@ snapshots:
 
   '@tangle-network/agent-trace-contract@2.2.0': {}
 
-  '@tangle-network/harness-sessions@1.0.1(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))':
+  '@tangle-network/harness-sessions@1.0.13(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))':
     dependencies:
       '@tangle-network/agent-core': 1.0.0(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
       '@tangle-network/agent-trace-contract': 2.2.0
