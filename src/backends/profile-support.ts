@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, posix, resolve } from 'node:path'
 import { registerJailReadable, registerJailWritable } from '../jail/index.js'
 import type { JailSpec } from '../jail/types.js'
-import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
+import { createPrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import type {
   AgentProfile,
   AgentProfileModelHints,
@@ -114,19 +114,14 @@ export function provisionProfileWorkspace(
    */
   systemPrompt?: string
   appendSystemPrompt?: string
-  /**
-   * Release the request-scoped files this provisioning wrote outside the plan.
-   *
-   * Only the opencode path returns one today. The caller MUST invoke it after
-   * the harness process exits.
-   */
+  /** Release the request-scoped files this provisioning wrote outside the plan; call it after the harness exits. */
   cleanup?: () => void
 } {
   delete req.profile_materialization_receipt
   const profile = resolveAgentProfile(req, session)
   if (!profile) return { env: {}, flags: [], written: [] }
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
-  let scoped: OpencodeProfileScope | undefined
+  let scoped: PrivateProfileScope | undefined
   try {
     const plan = materializeProfile(workspaceProfile(req, profile), harness, { skip: ['mcp'], binds: harness === 'codex' ? ['codex.developer-instructions'] : [] })
     // Bind generated --settings to this exact profile. A resumed session retains its already-applied plan.
@@ -145,16 +140,13 @@ export function provisionProfileWorkspace(
     // Freeze the complete identity before moving native resources; receipts and resumes use this digest.
     const planDigest = hashWorkspacePlan(plan)
     const resumesSamePlan = sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest === planDigest
-    if (harness === 'opencode') {
-      scoped = scopeOpencodeProfileConfig(plan, req.jailSpec)
-      plan.files = scoped.workspaceFiles
-    }
+    scoped = harness === 'opencode' ? scopeOpencodeProfileConfig(plan, req.jailSpec)
+      : harness === 'codex' ? scopeCodexInstructions(plan, req.jailSpec) : undefined
     const applied = applyWorkspacePlan(
       plan,
       workspaceCwd,
       resumesSamePlan ? { appliedPlanDigest: hashWorkspacePlan(plan) } : {},
     )
-    // The opencode-native files leave this plan, so the receipt names them here.
     const written = scoped ? [...applied.written, ...scoped.written] : applied.written
     const receipt = retainProfileMaterializationReceipt(
       req,
@@ -204,13 +196,12 @@ const OPENCODE_PROFILE_ROOT_PREFIX = '.cli-bridge-opencode-profile-'
 /** The private directory's name in a materialization receipt, the same on every turn. */
 const OPENCODE_PROFILE_RECEIPT_ROOT = '.cli-bridge-opencode-profile'
 
-interface OpencodeProfileScope {
+/** Each scope moves its files out of `plan` into a private root and rebinds any plan flag that names them. */
+interface PrivateProfileScope {
   /** Env this turn adds on top of the plan's own launch env. */
-  env: Record<string, string>
+  env?: Record<string, string>
   /** Workspace-relative paths written under the private root, for the receipt. */
   written: string[]
-  /** The plan files that still belong in the shared task directory. */
-  workspaceFiles: PlanFile[]
   /** Idempotent; removes the private root. Run it after the process exits. */
   cleanup(): void
 }
@@ -226,7 +217,7 @@ interface OpencodeProfileScope {
 function scopeOpencodeProfileConfig(
   plan: WorkspacePlan,
   jail: JailSpec | null | undefined,
-): OpencodeProfileScope {
+): PrivateProfileScope {
   const isWorkspaceFile = (file: PlanFile): boolean => (file.root ?? 'workspace') === 'workspace'
   const generated = plan.files.filter((file) =>
     file.relPath === OPENCODE_PROJECT_CONFIG_FILE && file.source === 'generated' && isWorkspaceFile(file))
@@ -242,7 +233,7 @@ function scopeOpencodeProfileConfig(
   const nativeFiles = plan.files.filter((file) =>
     file !== configFile && isWorkspaceFile(file) && file.relPath.startsWith(`${OPENCODE_NATIVE_DIR}/`))
   const nativePaths = new Set(nativeFiles)
-  const workspaceFiles = plan.files.filter((file) => file !== configFile && !nativePaths.has(file))
+  plan.files = plan.files.filter((file) => file !== configFile && !nativePaths.has(file))
 
   // Empty profiles still require isolated config; returning early would expose the shared project layer.
   const config = (configFile === undefined ? {} : JSON.parse(configFile.content)) as Record<string, unknown>
@@ -264,14 +255,13 @@ function scopeOpencodeProfileConfig(
 
   // Outside the task workspace, so the agent, its `git add -A` and the grader never see it.
   // opencode installs its config directory's plugin dependencies, so a jail must leave it writable.
-  const root = privateBridgeRoot(jail, OPENCODE_PROFILE_ROOT_PREFIX, 'writable')
-  try {
+  return inPrivateBridgeRoot(jail, OPENCODE_PROFILE_ROOT_PREFIX, 'writable', (root) => {
     const applied = applyWorkspacePlan(
       { harness: plan.harness, files: nativeFiles, env: {}, flags: [], unsupported: [] },
-      root.path,
+      root,
       { existingFiles: 'reject' },
     )
-    const configDir = join(root.path, OPENCODE_NATIVE_DIR)
+    const configDir = join(root, OPENCODE_NATIVE_DIR)
     // A profile with no native files still needs the directory to exist, so the
     // config directory opencode reads is this empty private one and never a
     // populated ambient default.
@@ -279,7 +269,7 @@ function scopeOpencodeProfileConfig(
 
     const spawnConfig = instructions === undefined
       ? config
-      : { ...config, instructions: (instructions as string[]).map((entry) => join(root.path, entry)) }
+      : { ...config, instructions: (instructions as string[]).map((entry) => join(root, entry)) }
     return {
       env: {
         [OPENCODE_PROFILE_CONFIG_ENV]: opencodeProcessConfigValue(spawnConfig),
@@ -290,21 +280,33 @@ function scopeOpencodeProfileConfig(
       // on every turn, and a resumed session's receipt must equal its first turn's, or Runtime
       // refuses the turn ("profile materialization changed across session turns").
       written: applied.written.map((relPath) => posix.join(OPENCODE_PROFILE_RECEIPT_ROOT, relPath)),
-      workspaceFiles,
-      cleanup: root.cleanup,
     }
+  })
+}
+
+/** Codex reads replacement instructions only from the `-c model_instructions_file` file; keep it out of the git-visible task workspace. */
+function scopeCodexInstructions(plan: WorkspacePlan, jail: JailSpec | null | undefined): PrivateProfileScope | undefined {
+  const bound = plan.files.filter((file) => plan.flags.includes(`model_instructions_file=${file.relPath}`))
+  if (bound.length === 0) return undefined
+  plan.files = plan.files.filter((file) => !bound.includes(file))
+  return inPrivateBridgeRoot(jail, '.cli-bridge-codex-profile-', 'readable', (root) => {
+    const { flags, written } = applyWorkspacePlan({ ...plan, files: bound }, root, { existingFiles: 'reject' })
+    plan.flags = flags
+    return { written: written.map((relPath) => posix.join('.cli-bridge-codex-profile', relPath)) }
+  })
+}
+
+/** Apply into a per-turn bridge directory, bound into the turn's jail, that the next bridge start reaps after a SIGKILL. */
+function inPrivateBridgeRoot<T>(jail: JailSpec | null | undefined, prefix: string, mode: 'readable' | 'writable', apply: (root: string) => T): T & { cleanup(): void } {
+  const root = createPrivateTemporaryRoot(tmpdir(), prefix)
+  if (mode === 'writable') registerJailWritable(jail, root.path)
+  else registerJailReadable(jail, root.path)
+  try {
+    return { ...apply(root.path), cleanup: root.cleanup }
   } catch (error) {
     root.cleanup()
     throw error
   }
-}
-
-/** A per-turn bridge directory the next bridge start reaps after a SIGKILL, bound into the turn's jail. */
-function privateBridgeRoot(jail: JailSpec | null | undefined, prefix: string, mode: 'readable' | 'writable'): PrivateTemporaryRoot {
-  const root = createPrivateTemporaryRoot(tmpdir(), prefix)
-  if (mode === 'writable') registerJailWritable(jail, root.path)
-  else registerJailReadable(jail, root.path)
-  return root
 }
 
 /** Merge profile config over the operator's OPENCODE_CONFIG_CONTENT without losing unrelated provider keys.
@@ -364,7 +366,6 @@ export function provisionPiProfile(
   const profile = resolveAgentProfile(req, session)
   if (!profile) return null
 
-  let root: PrivateTemporaryRoot | undefined
   try {
     const genericFiles = profile.resources?.files?.map((file) => file.path) ?? []
     if (genericFiles.length > 0) {
@@ -376,29 +377,19 @@ export function provisionPiProfile(
     assertWorkspacePlanSupported(plan)
     const nativeLoaders = assertPiPlanHasNativeLoaders(plan)
 
-    root = privateBridgeRoot(req.jailSpec, '.cli-bridge-pi-profile-', 'readable')
-    const applied = applyWorkspacePlan(plan, root.path, { existingFiles: 'reject' })
-    const flags = piProfileFlags(plan, applied, root.path, nativeLoaders)
-    const receipt = retainProfileMaterializationReceipt(
-      req,
-      profile,
-      'pi',
-      executionIdentity,
-      plan,
-      applied,
-      inference,
-    )
-
-    return {
-      env: requirePublicPlanEnv(applied.env, 'pi'),
-      flags,
-      written: applied.written,
-      workspacePlanDigest: applied.workspacePlanDigest,
-      receipt,
-      cleanup: root.cleanup,
-    }
+    return inPrivateBridgeRoot(req.jailSpec, '.cli-bridge-pi-profile-', 'readable', (root) => {
+      const applied = applyWorkspacePlan(plan, root, { existingFiles: 'reject' })
+      const flags = piProfileFlags(plan, applied, root, nativeLoaders)
+      const receipt = retainProfileMaterializationReceipt(req, profile, 'pi', executionIdentity, plan, applied, inference)
+      return {
+        env: requirePublicPlanEnv(applied.env, 'pi'),
+        flags,
+        written: applied.written,
+        workspacePlanDigest: applied.workspacePlanDigest,
+        receipt,
+      }
+    })
   } catch (error) {
-    root?.cleanup()
     const message = error instanceof Error ? error.message : String(error)
     throw new BackendError(`AgentProfile workspace materialization failed: ${message}`, 'parse_error', error)
   }

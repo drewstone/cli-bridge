@@ -126,34 +126,35 @@ export class CodexBackend implements Backend {
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd)
     const effort = nativeReasoningControl('codex', resolveRequestedReasoningEffort(req, null))
     const provisioned = provisionProfileWorkspace(req, null, 'codex', cwd, profileExecutionIdentity(req, null, 'codex', effort))
-    // The same per-session home the first `codex exec resume` turn uses.
-    const sessionId = request.plan.destination.sessionId
-    const nativeHome = ensurePrivateDataDirectory(join(stateDir, createHash('sha256').update(sessionId).digest('hex')))
-    const releasePreparation = await this.acquireAuthPreparation(signal)
     let codexHome: ReturnType<typeof materializeMcpServersForCodex>
-    try {
-      codexHome = materializeMcpServersForCodex(resolveMcpServers(req, null, { backend: this.name, privateMcpConfig: true }), resolveCodexAuthPath(), nativeHome)
-    } finally {
-      releasePreparation()
-    }
-    const args = ['app-server', '--listen', 'stdio://', ...provisioned.flags, ...CODEX_DISABLED_FEATURE_ARGS]
-    const { provider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
-    if (provider && provider !== this.name) args.push('-c', `model_provider=${JSON.stringify(provider)}`)
-    if (modelArg) args.push('-c', `model=${JSON.stringify(modelArg)}`)
-    if (effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(effort)}`)
+    const release = (): void => { try { codexHome?.cleanup() } finally { provisioned.cleanup?.() } }
     let prepared: CodexContextTransfer | undefined
     try {
+      // The same per-session home the first `codex exec resume` turn uses.
+      const sessionId = request.plan.destination.sessionId
+      const nativeHome = ensurePrivateDataDirectory(join(stateDir, createHash('sha256').update(sessionId).digest('hex')))
+      const releasePreparation = await this.acquireAuthPreparation(signal)
+      try {
+        codexHome = materializeMcpServersForCodex(resolveMcpServers(req, null, { backend: this.name, privateMcpConfig: true }), resolveCodexAuthPath(), nativeHome)
+      } finally {
+        releasePreparation()
+      }
+      const args = ['app-server', '--listen', 'stdio://', ...provisioned.flags, ...CODEX_DISABLED_FEATURE_ARGS]
+      const { provider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+      if (provider && provider !== this.name) args.push('-c', `model_provider=${JSON.stringify(provider)}`)
+      if (modelArg) args.push('-c', `model=${JSON.stringify(modelArg)}`)
+      if (effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(effort)}`)
       signal.throwIfAborted()
       const spawned = await this.spawner(this.opts.bin, args, {
         signal, stdio: ['pipe', 'pipe', 'pipe'], cwd,
         env: { ...process.env, ...provisioned.env, CODEX_HOME: nativeHome }, sessionId,
       })
-      prepared = new CodexContextTransfer(spawned, request, signal, () => codexHome?.cleanup(), provisioned.receipt)
+      prepared = new CodexContextTransfer(spawned, request, signal, release, provisioned.receipt)
       await prepared.initialize()
       return prepared
     } catch (error) {
       if (prepared) await prepared.close()
-      else codexHome?.cleanup()
+      else release()
       throw error
     }
   }
@@ -204,23 +205,6 @@ export class CodexBackend implements Backend {
       // codex exec resume <id> [prompt]
     }
 
-    // Reject unsupported profile plans before copying auth or writing MCP
-    // credentials into a synthetic CODEX_HOME.
-    const provisioned = provisionProfileWorkspace(
-      req,
-      session,
-      'codex',
-      cwd,
-      profileExecutionIdentity(req, session, 'codex', reasoningEffort),
-    )
-    const launchEnv = { ...process.env, ...provisioned.env }
-    if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
-    // codex -c is last-wins: the Router route follows the split and profile flags.
-    args.push(...provisioned.flags, ...routerArgs)
-    if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
-    const nativeConfigFlags = codexConfigFlags(args)
-    args.push('--', prompt)
-
     // Session leases own native state; the account turn lease owns auth rotation.
     // Keep native state across turns, but regenerate MCP config and auth links.
     const mcpServers = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true })
@@ -237,15 +221,39 @@ export class CodexBackend implements Backend {
       )
     }
     const authSourcePath = resolveCodexAuthPath()
-    // Only an unconfined file-backed ChatGPT turn can rotate the shared host
-    // credential during inference. Use the effective launch env after profile
-    // materialization; Codex exec prefers env API keys and access tokens.
-    const hostSubscription = !req.jailSpec
-      && !hasCodexEnvAuth(launchEnv)
-      && isCodexSubscriptionAuth(authSourcePath)
-    const releaseHostAuth = hostSubscription ? await this.acquireAuthPreparation(signal) : undefined
+    // Reject unsupported profile plans before copying auth or writing MCP
+    // credentials into a synthetic CODEX_HOME.
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'codex',
+      cwd,
+      profileExecutionIdentity(req, session, 'codex', reasoningEffort),
+    )
+    const launchEnv = { ...process.env, ...provisioned.env }
+    if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
+    // codex -c is last-wins: the Router route follows the split and profile flags.
+    args.push(...provisioned.flags, ...routerArgs)
+    if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
+    const nativeConfigFlags = codexConfigFlags(args)
+    args.push('--', prompt)
+    let releaseHostAuth: (() => void) | undefined
     let codexHome: ReturnType<typeof materializeMcpServersForCodex>
+    let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
+    const releaseState = (): void => {
+      try { codexHome?.cleanup() } finally {
+        try { jailHome?.cleanup() } finally {
+          try { releaseHostAuth?.() } finally { provisioned.cleanup?.() }
+        }
+      }
+    }
     try {
+      // Only an unconfined file-backed ChatGPT turn can rotate the shared host
+      // credential during inference. Use the effective launch env after profile
+      // materialization; Codex exec prefers env API keys and access tokens.
+      if (!req.jailSpec && !hasCodexEnvAuth(launchEnv) && isCodexSubscriptionAuth(authSourcePath)) {
+        releaseHostAuth = await this.acquireAuthPreparation(signal)
+      }
       codexHome = materializeMcpServersForCodex(
         mcpServers,
         authSourcePath,
@@ -253,19 +261,6 @@ export class CodexBackend implements Backend {
           ? ensurePrivateDataDirectory(nativeHome)
           : undefined,
       )
-    } catch (error) {
-      releaseHostAuth?.()
-      throw error
-    }
-    let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
-    const releaseState = (): void => {
-      try { codexHome?.cleanup() } finally {
-        try { jailHome?.cleanup() } finally {
-          releaseHostAuth?.()
-        }
-      }
-    }
-    try {
       // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
       await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
         cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, executor: this.spawner.executionEnvironment })
