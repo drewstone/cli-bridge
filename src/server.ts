@@ -88,7 +88,31 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   config = { ...config }
   const sessions = new SessionStore(config.dataDir)
   const extras: BuildAppExtras = { shutdownHooks: [] }
-  const nativeRedactors = new Map<string, { binding: Parameters<PrivateRunRedactionObserver>[0]; authority: Set<string>; redactor: ReturnType<typeof privateCopyRedactor> }>()
+  // One entry per live run, released when its job ends; a conversation keeps only its latest protected run,
+  // whose authority the next turn must match. Externally issued redactors live until server close.
+  type RedactionBinding = Parameters<PrivateRunRedactionObserver>[0]
+  const nativeRedactors = new Map<string, {
+    binding: RedactionBinding; authority: Set<string>; redactor: ReturnType<typeof privateCopyRedactor>; ended?: true
+  }>()
+  const latestRunOf = new Map<string, string>()
+  const runOfRequest = new WeakMap<object, string>()
+  const conversationOf = (binding: RedactionBinding) =>
+    binding.sessionId ? JSON.stringify([binding.sessionId, binding.profileDigest, binding.cwd]) : undefined
+  // Admission releases this after the job, so the run's native capture has already read its entry.
+  const releaseRunRedaction = (request: object) => {
+    const key = runOfRequest.get(request)
+    const entry = key === undefined ? undefined : nativeRedactors.get(key)
+    if (!key || !entry) return
+    entry.ended = true
+    const conversation = conversationOf(entry.binding)
+    if (conversation !== undefined && latestRunOf.get(conversation) === key) {
+      // The next turn of a protected conversation must find this exact authority.
+      if (entry.authority.size > 0) return
+      latestRunOf.delete(conversation)
+    }
+    nativeRedactors.delete(key)
+  }
+  const issuedRedactors = new Set<ReturnType<typeof privateCopyRedactor>>()
   const nativeRedactionEpoch = randomUUID()
   const hostServices = createHostServiceBindings()
   try {
@@ -102,7 +126,11 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   })
   extras.shutdownHooks.push(async () => await runs.shutdown())
   extras.shutdownHooks.push(async () => hostServices.close())
-  extras.shutdownHooks.push(async () => { for (const { redactor, authority } of nativeRedactors.values()) { redactor.close(); authority.clear() }; nativeRedactors.clear() })
+  extras.shutdownHooks.push(async () => {
+    for (const { redactor, authority } of nativeRedactors.values()) { redactor.close(); authority.clear() }
+    for (const redactor of issuedRedactors) redactor.close()
+    nativeRedactors.clear(); latestRunOf.clear(); issuedRedactors.clear()
+  })
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
     extras.shutdownHooks.push(() => durableWriter.close())
@@ -221,24 +249,30 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
         ))) throw new BackendError('Native conversation redaction history is unavailable; prior private authority cannot be reconstructed. Reconcile the prior run before starting a new native session.',
           'not_configured', undefined, { providerDispatch: 'not_started' })
       }
-      const previousAuthority = binding.sessionId ? [...nativeRedactors.values()].find(({ binding: prior }) =>
-        prior.sessionId === binding.sessionId && prior.profileDigest === binding.profileDigest && prior.cwd === binding.cwd)?.authority : undefined
+      const conversation = conversationOf(binding)
+      const previousKey = conversation && latestRunOf.get(conversation)
+      const previousAuthority = previousKey ? nativeRedactors.get(previousKey)?.authority : undefined
       const authority = previousAuthority ?? new Set<string>()
       for (const value of values) authority.add(value)
       const redactor = privateCopyRedactor(() => [...authority])
       const key = `${binding.runId}:${binding.requestDigest}`
       nativeRedactors.set(key, { binding, authority, redactor })
+      runOfRequest.set(request, key)
       try {
-        onRunRedaction?.(Object.freeze({ ...binding, redact: redactor.redact }))
+        if (onRunRedaction) { issuedRedactors.add(redactor); onRunRedaction(Object.freeze({ ...binding, redact: redactor.redact })) }
         if (local && binding.sessionId) sessions.remember({ externalId: binding.sessionId, backend, model: request.model,
           cwd: binding.cwd, metadata: { native_redaction_history: {
             schema: 'cli-bridge.native-redaction-history.v1', protectedHistory: !!authority.size || (prior.success && prior.data.protectedHistory),
             epoch: nativeRedactionEpoch, runId: binding.runId, requestDigest: binding.requestDigest,
             sessionId: binding.sessionId, profileDigest: binding.profileDigest, cwd: binding.cwd,
           } } })
+        if (conversation) {
+          latestRunOf.set(conversation, key)
+          if (previousKey && previousKey !== key && nativeRedactors.get(previousKey)?.ended) nativeRedactors.delete(previousKey)
+        }
       }
       catch {
-        redactor.close(); nativeRedactors.delete(key)
+        redactor.close(); nativeRedactors.delete(key); issuedRedactors.delete(redactor)
         if (!previousAuthority) authority.clear()
         throw new Error('Trusted native redaction authority is unavailable')
       }
@@ -271,7 +305,9 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       try {
         releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
         releaseServices = await hostServices.prepareCoordination(request, backend)
-        return () => { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } } }
+        return () => {
+          try { releaseRunRedaction(request) } finally { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } } }
+        }
       } catch (error) { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } }; throw error }
     },
     trace: new TraceEmitter({
