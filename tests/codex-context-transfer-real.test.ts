@@ -179,9 +179,15 @@ describe('real Codex native context consumer', () => {
         producerHost = await startServer({ cwd: workspace, quiet: true, handleSignals: false,
           config: { ...loadConfig({ BRIDGE_HOST:'127.0.0.1',BRIDGE_BEARER:'fixture-owner',BRIDGE_DATA_DIR:join(directory,'store'),
             BRIDGE_BACKENDS:'codex',CODEX_BIN:codexBin,BRIDGE_JAIL_MODE:'off',BRIDGE_TRACE:'off',BRIDGE_SUBSCRIPTIONS_ONLY:'0' }), port:0 } })
+        // This host lacks the receiver's loopback model provider, so its codex child fails after dispatch (502).
+        // Under test: the import no longer refuses the turn, and the run names why it keeps no native copy.
+        const dispatched = await fetch(`${producerHost.url}/v1/chat/completions`, {method:'POST',headers,body:firstTurn})
+        expect(dispatched.status, await dispatched.text()).toBe(502)
+        const run = await fetch(`${producerHost.url}/v1/runs/${encodeURIComponent(request.plan.destination.runId)}`, { headers }).then(r => r.json()) as { nativeCapture: unknown }
+        expect(run.nativeCapture).toEqual({ status: 'unavailable', reason: 'native-context-import-without-redaction-provenance' })
+        return
       }
-      const result = producerHost ? await fetch(`${producerHost.url}/v1/chat/completions`, {method:'POST',headers,body:firstTurn})
-        : await restarted.request('/v1/chat/completions', { method:'POST',headers,body:firstTurn })
+      const result = await restarted.request('/v1/chat/completions', { method:'POST',headers,body:firstTurn })
       expect(result.status).toBe(200)
       expect(await result.json()).toMatchObject({ choices: [{ message: { content: 'native fixture completion' } }] })
       expect(modelRequests).toHaveLength(1)
@@ -200,11 +206,7 @@ describe('real Codex native context consumer', () => {
       expect(JSON.stringify(modelRequests[0])).toContain('Materialized profile resource 18de')
       expect(readFileSync(join(workspace, 'AGENTS.md'), 'utf8')).toBe(policy)
       expect(statSync(join(workspace, 'AGENTS.md')).mode & 0o777).toBe(0o600)
-      if (producerHost) {
-        // The import carries no source redaction provenance: the turn runs and keeps no native copy.
-        const run = await fetch(`${producerHost.url}/v1/runs/${encodeURIComponent(request.plan.destination.runId)}`, { headers }).then(r => r.json()) as { nativeCapture: unknown }
-        expect(run.nativeCapture).toEqual({ status: 'unavailable', reason: 'native-context-import-without-redaction-provenance' })
-      } else expect(store!.get(request.plan.destination.sessionId, 'codex')?.internalId).toBe(nativeId)
+      expect(store!.get(request.plan.destination.sessionId, 'codex')?.internalId).toBe(nativeId)
     } finally {
       await producerHost?.close()
       await service?.shutdown(1_000)
