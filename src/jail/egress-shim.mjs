@@ -27,7 +27,8 @@ if (!socketPath || !port || !bin) {
   process.exit(2)
 }
 
-const server = createServer((client) => {
+// Half-open: a client that ends its request side still receives the relay reply.
+const server = createServer({ allowHalfOpen: true }, (client) => {
   const upstream = connect(socketPath)
   const close = () => { client.destroy(); upstream.destroy() }
   client.on('error', close)

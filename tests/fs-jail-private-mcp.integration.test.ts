@@ -60,7 +60,7 @@ async function files(directory:string):Promise<Buffer[]> {
 
 it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as const)('keeps %s private tools scoped through an actual filesystem jail',async harness=>{
  const root=await realpath(await mkdtemp(join(tmpdir(),'native-private-jail-'))),workspace=join(root,'workspace'),state=join(root,'state'),capture=join(root,'frames');
- await mkdir(workspace);await mkdir(capture);vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',capture);
+ await mkdir(workspace);await mkdir(capture,{mode:0o700});vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',capture);
  const toolSecret='private-stdio-canary-39ad',coordSecret='private-coordination-canary-81ce',hubKey='private-hub-key-canary-21dc';
  const tokens:string[]=[];let hubCalls=0,coordCalls=0;
  const upstream=createServer(async(req,res)=>{
