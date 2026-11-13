@@ -40,18 +40,23 @@ function bindClaim(
   const bindings = privateBindings.get(identity) ?? new Map<string, Binding>()
   if (bindings.has(alias)) return refused('A private MCP alias already has a trusted host-service binding')
   const claim = claimTrustedHostService(owner, headers)
-  bindings.set(alias, { ...binding, nativeUrl: claim.nativeUrl })
-  privateBindings.set(identity, bindings)
-  const releaseProtected = protectExecutionValues(request, claim.protectedValues)
-  spec.trustedHostServices = [...(spec.trustedHostServices ?? []), claim.registration]
-  return () => {
+  let releaseProtected = () => {}
+  const release = () => {
     try { claim.revoke() } finally {
       bindings.delete(alias)
       if (!bindings.size) privateBindings.delete(identity)
-      spec.trustedHostServices = spec.trustedHostServices?.filter((entry) => entry !== claim.registration)
+      if (spec.trustedHostServices) spec.trustedHostServices = spec.trustedHostServices.filter((entry) => entry !== claim.registration)
       releaseProtected()
     }
   }
+  // Anything that fails after the claim revokes it and removes this alias before the error leaves.
+  try {
+    bindings.set(alias, { ...binding, nativeUrl: claim.nativeUrl })
+    privateBindings.set(identity, bindings)
+    releaseProtected = protectExecutionValues(request, claim.protectedValues)
+    spec.trustedHostServices = [...(spec.trustedHostServices ?? []), claim.registration]
+  } catch (error) { release(); throw error }
+  return release
 }
 
 /** Bind every entry or none: a refusal releases the bindings made before it. */
@@ -60,11 +65,6 @@ function bindEach<T>(entries: readonly T[], bind: (entry: T) => () => void): () 
   try { for (const entry of entries) releases.push(bind(entry)) }
   catch (error) { for (const release of releases) release(); throw error }
   return () => { for (const release of releases.splice(0)) release() }
-}
-
-/** Operator audit context beside the relay's own stderr log. Run ids here are never authority. */
-function audit(event: 'register' | 'claim', runIds: readonly string[], url: string): void {
-  process.stderr.write(`[host-services] private-mcp ${event} run=${runIds.join(',')} endpoint=${new URL(url).host}\n`)
 }
 
 /** Only normalized private config is rewritten. Profile, request and canonical audience remain untouched. */
@@ -88,7 +88,11 @@ export function privateHostServiceMcp(request: ChatRequest, servers: Record<stri
   return rewritten
 }
 
-export function createHostServiceBindings(bearerRequired: boolean) {
+export function createHostServiceBindings(bearerRequired: boolean, quiet = false) {
+  // Operator audit context, silenced with startServer's startup lines. Run ids here are never authority.
+  const audit = (event: 'register' | 'claim', runIds: readonly string[], url: string) => {
+    if (!quiet) process.stderr.write(`[host-services] private-mcp ${event} run=${runIds.join(',')} endpoint=${new URL(url).host}\n`)
+  }
   let listener: string | undefined
   let closed = false
   const hubReleases = new Set<() => void>()
@@ -125,6 +129,7 @@ export function createHostServiceBindings(bearerRequired: boolean) {
     registerPrivateMcpEndpoint(input: Parameters<BridgeServer['registerPrivateMcpEndpoint']>[0]): () => void {
       if (closed || input.signal.aborted || !isSafeWireIdentifier(input.runId))
         return refused('Private MCP registration requires a live signal and a safe run id')
+      if (input.url.includes('?')) return refused('Private MCP registration refuses a URL with a query string')
       const paths = JSON.stringify(Object.keys(input.paths).sort().map((suffix) => [suffix, [...new Set(input.paths[suffix])].sort()]))
       let endpoint = privateEndpoints.get(input.url)
       if (endpoint && endpoint.paths !== paths) return refused('That private MCP endpoint is already registered with different paths')
@@ -164,7 +169,7 @@ export function createHostServiceBindings(bearerRequired: boolean) {
       })
     },
     /** Claims come only from this authenticated request's runtime_attachments, carrying only its own resolved secret-refs. */
-    async preparePrivateMcp(request: ChatRequest, backend: string): Promise<() => void> {
+    async preparePrivateEndpoints(request: ChatRequest, backend: string): Promise<() => void> {
       const bound = request.runtime_attachments && privateBindings.get(request.runtime_attachments)
       const attachments = Object.entries(request.runtime_attachments?.mcp ?? {})
         .filter(([alias, server]) => /^http:/iu.test(server.url ?? '') && !bound?.has(alias))
@@ -177,12 +182,14 @@ export function createHostServiceBindings(bearerRequired: boolean) {
         if (!endpoint) return refused('A plain-HTTP MCP attachment in the jail requires a live host-registered private endpoint')
         const headers: Record<string, string> = {}
         for (const [name, value] of Object.entries(server.headers ?? {})) {
-          if (value.kind !== 'secret-ref') continue
+          if (value.kind !== 'secret-ref')
+            return refused(`Private MCP attachment header ${JSON.stringify(name)} must be a secret-ref; the relay forwards no other header`)
           headers[name] = resolvePrivateMcpValue(value, destination) ?? refused('A private MCP attachment secret was not resolved by its host')
         }
-        audit('claim', [...endpoint.runIds.values()], server.url!)
         const strip = Object.keys(headers).map((name) => name.toLowerCase())
-        return bindClaim(request, spec, alias, { canonicalUrl: server.url!, field: 'url', strip }, endpoint.owner, headers)
+        const release = bindClaim(request, spec, alias, { canonicalUrl: server.url!, field: 'url', strip }, endpoint.owner, headers)
+        audit('claim', [...endpoint.runIds.values()], server.url!)
+        return release
       })
     },
     async prepareHub(request: ChatRequest, backend: string, servers: Record<string, AgentProfileMcpServer>, tokens: readonly string[]): Promise<() => void> {

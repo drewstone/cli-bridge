@@ -5,7 +5,10 @@ import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import type { ChatRequest, McpServerSpec } from '../src/backends/types.js'
+import { createHostServiceBindings, privateHostServiceMcp } from '../src/host-services.js'
 import { LinuxBwrapJail } from '../src/jail/linux-bwrap.js'
+import { privateExecutionRedaction } from '../src/private-mcp.js'
 import { loadConfig, startServer, type BridgeServer } from '../src/server.js'
 
 // Reads its private Codex config, calls every HTTP MCP server once, and reports what each answered.
@@ -74,7 +77,8 @@ describe.skipIf(!new LinuxBwrapJail().isAvailable())('embedder-registered privat
     await writeFile(bin, `#!${process.execPath}\n${native}`, { mode: 0o700 })
     const config = { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_BEARER: BEARER, BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'codex',
       CODEX_BIN: bin, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_JAIL_FALLBACK: 'deny', BRIDGE_JAIL_NETWORK: 'none' }), port: 0 }
-    server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false,
+    // Not quiet, so the operator audit lines reach stderr; the direct binder case below proves quiet silences them.
+    server = await startServer({ config, cwd: workspace, quiet: false, handleSignals: false,
       mcpSecrets: { async get(key) { return key === 'private-tool-key' ? SECRET : undefined } } })
   }, 60_000)
 
@@ -175,6 +179,56 @@ describe.skipIf(!new LinuxBwrapJail().isAvailable())('embedder-registered privat
       expect(nativeConfig).not.toContain('127.0.0.1:3128')
     } finally { lifetime.abort() }
   }, 60_000)
+
+  it('refuses a non-secret header on a private attachment, naming it, and releases the claim made before it', async () => {
+    const lifetime = new AbortController()
+    try {
+      register('graph-run-g', lifetime.signal)
+      const before = calls.length
+      const extra = { transport: 'http', url, headers: { 'X-Trace': { kind: 'public', value: 'visible-trace' } } }
+      const refused = await dispatch({ runtime_attachments: { mcp: { ...attachment().runtime_attachments.mcp, extra } } })
+      expect(refused.status).not.toBe(200)
+      expect((JSON.parse(refused.text) as { error: { message: string } }).error.message)
+        .toContain('Private MCP attachment header "X-Trace" must be a secret-ref')
+      expect(calls).toHaveLength(before)
+      const answered = await dispatch(attachment())
+      expect(answered.status, answered.text).toBe(200)
+      expect(calls).toHaveLength(before + 1)
+    } finally { lifetime.abort() }
+  }, 60_000)
+
+  it('refuses a registration URL with a query string', () => {
+    const lifetime = new AbortController()
+    try {
+      for (const target of [`${url}?token=private`, `${url}?`])
+        expect(() => register('graph-run-q', lifetime.signal, PATHS, target)).toThrow('refuses a URL with a query string')
+    } finally { lifetime.abort() }
+  })
+
+  it('bindClaim revokes its claim and removes the alias when binding fails after the claim', async () => {
+    // No HTTP input fails after a claim, so a sealed JailSpec refuses the trusted-service list after the real claim.
+    const services = createHostServiceBindings(true, true)
+    const lifetime = new AbortController()
+    const writes: string[] = []
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => { writes.push(String(chunk)); return true }) as typeof process.stderr.write)
+    const servers: Record<string, McpServerSpec> = { tool: { type: 'http', url } }
+    const request = (jailSpec: object) => ({ model: 'codex/private-endpoint-proof', messages: [], jailSpec,
+      runtime_attachments: { mcp: { tool: { transport: 'http', url } } } }) as unknown as ChatRequest
+    try {
+      services.registerPrivateMcpEndpoint({ runId: 'graph-run-h', url, paths: PATHS, signal: lifetime.signal })
+      const sealed = request(Object.seal({ root: workspace, projectDir: workspace, requireEnforcement: true }))
+      await expect(services.preparePrivateEndpoints(sealed, 'codex')).rejects.toThrow(TypeError)
+      expect(privateHostServiceMcp(sealed, servers, true)).toBe(servers)
+      expect(privateExecutionRedaction(sealed, { id: 'run-h', requestDigest: 'digest-h' }, null).values).toEqual([])
+      const open = request({ root: workspace, projectDir: workspace })
+      const release = await services.preparePrivateEndpoints(open, 'codex')
+      expect(privateHostServiceMcp(open, servers, true).tool!.url).toMatch(/^http:\/\/127\.0\.0\.1:3128\/[A-Za-z0-9_-]+$/)
+      expect(privateExecutionRedaction(open, { id: 'run-h', requestDigest: 'digest-h' }, null).values).not.toEqual([])
+      release()
+      expect(privateHostServiceMcp(open, servers, true)).toBe(servers)
+      expect(writes.join('')).not.toContain('[host-services]')
+    } finally { stderr.mockRestore(); lifetime.abort(); services.close() }
+  })
 
   it('refuses registration after abort, with an unsafe run id, and after close', async () => {
     const aborted = new AbortController()
