@@ -44,7 +44,7 @@ async function startServer(root: string, bin: string, bounded = false, emptyReda
   }))
   const app = new Hono()
   mountChatCompletions(app, { registry, sessions: store, retainedRuns: store, runs,
-    ...(emptyRedactionAugmentation ? { onRunRedaction: () => [] } : {}),
+    ...(emptyRedactionAugmentation ? { onRunRedaction: () => ({ values: [] }) } : {}),
     trace: new TraceEmitter({ sink: new JsonlSpanSink({ file: join(root, 'spans.jsonl'), maxBytes: 1024 * 1024, maxFiles: 1 }), maxToolSpans: 16 }),
   })
   const retainedRuns = new RetainedSessionService({ store, registry, runs })
