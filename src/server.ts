@@ -111,6 +111,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     }
     nativeRedactors.delete(key)
   }
+  // An embedded host may redact after job cleanup, so its redactors live until close: one per run, unbounded by design.
   const issuedRedactors = new Set<ReturnType<typeof privateCopyRedactor>>()
   const nativeRedactionEpoch = randomUUID()
   const hostServices = createHostServiceBindings()
