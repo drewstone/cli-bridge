@@ -70,7 +70,7 @@ ln -s "${nativeRoot}/${directory}/${filename}" "${nativeRoot}/${directory}/$labe
     const response = await fetch(server.url + '/v1/chat/completions', { method: 'POST', headers,
       // A custom MCP credential is a protected value; a jailed coordination attachment would need a registered listener.
       body: JSON.stringify({ model: `${harness}/native-store-fixture`, cwd: workspace, session_id: 'owned-external-session',
-        agent_profile: { name: 'native-capture-fixture', ...(unsafeLabels ? { mcp: { label: { transport: 'http', url: 'http://127.0.0.1:9/mcp',
+        agent_profile: { name: 'native-capture-fixture', ...(unsafeLabels ? { mcp: { label: { transport: 'http', url: 'https://label.invalid/mcp',
           headers: { Authorization: { kind: 'secret-ref', key: 'label', format: 'bearer' } } } } } : {}) },
         run_id: 'owned-native-store-run', messages: [{ role: 'user', content: 'Only exercise the local executable fixture.' }] }) })
     assert.equal(response.status, 200, await response.clone().text())

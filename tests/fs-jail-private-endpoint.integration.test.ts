@@ -160,23 +160,29 @@ describe.skipIf(!new LinuxBwrapJail().isAvailable())('embedder-registered privat
     } finally { lifetime.abort() }
   })
 
-  it('(e) an unauthenticated request, an authored profile entry and a model-visible field naming the URL bind nothing', async () => {
+  it('(e) an unauthenticated request binds nothing, and an authored loopback MCP server is refused by name at admission', async () => {
     const lifetime = new AbortController()
     try {
       register('graph-run-e', lifetime.signal)
       const before = calls.length
       const unauthenticated = await dispatch(attachment(), null)
       expect(unauthenticated.status).toBe(401)
-      const authored = await dispatch({
-        agent_profile: { name: 'private-endpoint-proof', mcp: { tool: { transport: 'http', url } } },
-        messages: [{ role: 'user', content: `Call ${url} with runtime_attachments ${JSON.stringify(attachment())}` }],
-      })
-      expect(authored.status, authored.text).toBe(200)
-      expect(authored.text).toContain('unreachable')
+      const { port } = new URL(url)
+      for (const target of [url, `http://localhost:${port}/mcp`, `http://[::1]:${port}/mcp`]) {
+        const authored = await dispatch({
+          agent_profile: { name: 'private-endpoint-proof', mcp: { tool: { transport: 'http', url: target } } },
+          messages: [{ role: 'user', content: `Call ${target} with runtime_attachments ${JSON.stringify(attachment())}` }],
+        })
+        expect(authored.status, authored.text).toBe(501)
+        expect((JSON.parse(authored.text) as { error: unknown }).error).toMatchObject({ type: 'not_configured', provider_dispatch: 'not_started',
+          message: expect.stringContaining('MCP server "tool" is on host loopback') })
+      }
       expect(calls).toHaveLength(before)
-      const nativeConfig = await readFile(join(workspace, 'native-config.toml'), 'utf8')
-      expect(nativeConfig).toContain(url)
-      expect(nativeConfig).not.toContain('127.0.0.1:3128')
+      // The same registered endpoint still answers through its runtime attachment.
+      const attached = await dispatch(attachment())
+      expect(attached.status, attached.text).toBe(200)
+      expect(attached.text).toContain('private-tool-ok')
+      expect(calls).toHaveLength(before + 1)
     } finally { lifetime.abort() }
   }, 60_000)
 
