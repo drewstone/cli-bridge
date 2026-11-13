@@ -28,6 +28,8 @@ export interface StartServerOptions {
 }
 export interface BridgeServer {
     url: string;
+    /** Host-only listener authority from Runtime's actual bound publicUrl resolver; never an HTTP route. */
+    registerCoordinationEndpoint(input: { runId: string; actorId: string; url: string; signal: AbortSignal }): () => void;
     /** Stop only this listener and its owned work, then release its durable writer lock. */
     close(): Promise<void>;
 }

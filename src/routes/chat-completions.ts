@@ -64,6 +64,7 @@ import { resolveCallerTrace } from '../trace/ids.js'
 import { lineageChildEnv } from '../trace/lineage.js'
 import { withRawProcessCapture } from '../executors/raw-capture.js'
 import { privateExecutionRedaction, type PrivateRunRedactionObserver } from '../private-mcp.js'
+import type { NativeCaptureTarget } from '../executors/native-capture.js'
 import {
   assertPiOutputTokenRequest,
   assertProfileRequestAuthority,
@@ -381,6 +382,7 @@ export function mountChatCompletions(
   deps: {
     registry: BackendRegistry
     onRunRedaction?: PrivateRunRedactionObserver
+    captureNative?: NativeCaptureTarget
     admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void | (() => void)>
     /** Captured operator jail defaults; standalone mounts retain process defaults. */
     jailEnv?: NodeJS.ProcessEnv
@@ -966,6 +968,24 @@ export function mountChatCompletions(
         req.cwd = session.cwd
       }
       const profile = assertProfileRequestAuthority(req, session)
+      if (!(req.execution?.kind === 'sandbox' && backend.name !== 'sandbox')) {
+        req.jailSpec = resolveJailSpec({
+          execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
+          execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
+          execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
+          cwd: req.cwd ?? process.cwd(),
+          env: deps.jailEnv ?? process.env,
+        })
+        const proxySecrets = req.agent_profile?.proxySecrets
+        if (proxySecrets?.length && !req.jailSpec) {
+          throw new BackendError('agent_profile.proxySecrets require execution.jail with network relay', 'parse_error')
+        }
+        if (req.jailSpec) {
+          req.jailSpec.authSources = authSourcesFor(backend.name)
+          req.jailSpec.vendorHosts = vendorHostsFor(backend.name)
+          if (proxySecrets?.length) req.jailSpec.proxySecrets = proxySecrets
+        }
+      }
       releaseSubscription = await deps.admitSubscription?.(req, backend.name, run.signal)
       if (backend.name === 'pi') assertPiOutputTokenRequest(req, profile)
       const sessionProfileBinding = exactSessionProfileBinding(req, session)
@@ -1021,24 +1041,6 @@ export function mountChatCompletions(
           req,
         )
       } else {
-        // Resolve request confinement against this Bridge's captured operator floor.
-        req.jailSpec = resolveJailSpec({
-          execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
-          execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
-          execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
-          cwd: req.cwd ?? process.cwd(),
-          env: deps.jailEnv ?? process.env,
-        })
-        const proxySecrets = req.agent_profile?.proxySecrets
-        if (proxySecrets?.length && !req.jailSpec) {
-          throw new BackendError('agent_profile.proxySecrets require execution.jail with network relay', 'parse_error')
-        }
-        // Host credentials, vendor hosts and proxySecrets bindings for the confined CLI.
-        if (req.jailSpec) {
-          req.jailSpec.authSources = authSourcesFor(backend.name)
-          req.jailSpec.vendorHosts = vendorHostsFor(backend.name)
-          if (proxySecrets?.length) req.jailSpec.proxySecrets = proxySecrets
-        }
         // The lane rides on the request so the scoped-host executor honours the
         // same reservation. Set even when this bridge has no admission gate:
         // the executor semaphore exists either way.
@@ -1172,15 +1174,12 @@ export function mountChatCompletions(
         },
       })
 
-      // The run pumps the source to completion on its own. This connection is only one reader;
-      // dropping it never touches `run.signal` or releases job-owned admission.
-      //
-      // Release resources from the job promise: an unconsumed delta iterator never
-      // runs its `finally`, while pump settles even for an already-terminal run.
-      // The backend records materialization on req before spawn, so failures still
-      // acknowledge the exact profile rather than appear as transport errors.
-      const protectedValues = privateExecutionRedaction(req, run, sessionProfileBinding?.effectiveProfileDigest ?? null, deps.onRunRedaction)
-      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, protectedValues)), chatCompletionDeltaOptions(req))
+      // Reader disconnect leaves the job and its admission alone. Capture settles
+      // before the job promise releases private grants and native configuration.
+      const redaction = privateExecutionRedaction(req, run, sessionProfileBinding?.effectiveProfileDigest ?? null, deps.onRunRedaction)
+      const terminal = deps.captureNative ? async (input: Parameters<import('../executors/raw-capture.js').TerminalNativeCapture>[0]) => run.setNativeCapture(await deps.captureNative!({ ...input,
+        snapshot: run.snapshot(), backend: backend.name, cwd: req.cwd, profileDigest: sessionProfileBinding?.effectiveProfileDigest ?? null })) : undefined
+      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, redaction, terminal)), chatCompletionDeltaOptions(req))
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)

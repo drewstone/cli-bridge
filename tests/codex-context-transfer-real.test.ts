@@ -19,6 +19,8 @@ import { RetainedSessionService, mountRetainedSessions } from '../src/sessions/r
 import { RunRegistry } from '../src/runs/registry.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { ensurePrivateDataDirectory } from '../src/runtime/single-instance.js'
+import { loadConfig, startServer } from '../src/server.js'
+import type { BridgeServer } from '../src/server-options.js'
 
 const frozenProfile: AgentProfile = {
   name: 'native-transfer-conformance', harness: 'codex',
@@ -70,7 +72,7 @@ function nativeRequest(cwd: string): ContextTransferRequest {
 }
 
 describe('real Codex native context consumer', () => {
-  it('preserves selected typed history once across HTTP ACK loss, receiver restart, and the first resumed model turn', async () => {
+  it.each([false, true])('retains exact native import while the producer privacy boundary is enabled: %s', async (producer) => {
     const directory = mkdtempSync(join(ensurePrivateDataDirectory(join(homedir(), '.cache', 'cli-bridge-native-conformance')), 'case-'))
     const workspace = join(directory, 'workspace')
     const fixtureHome = join(directory, 'home')
@@ -127,6 +129,7 @@ describe('real Codex native context consumer', () => {
     let store: SessionStore | undefined
     let service: RetainedSessionService | undefined
     let runs: RunRegistry | undefined
+    let producerHost: BridgeServer | undefined
     const startReceiver = (): Hono => {
       store = new SessionStore(join(directory, 'store'))
       const registry = new BackendRegistry().register(new CodexBackend({
@@ -161,16 +164,30 @@ describe('real Codex native context consumer', () => {
       expect(receipt.omittedMessageIds).toEqual(['source-omitted'])
       expect(store!.get(request.plan.destination.sessionId, 'codex')?.internalId).toBe(nativeId)
       expect(modelRequests).toHaveLength(0)
-      const result = await restarted.request('/v1/chat/completions', {
-        method: 'POST', headers,
-        body: JSON.stringify({
+      const firstTurn = JSON.stringify({
           model: 'codex/fixture/gpt-5.4', agent_profile: frozenProfile, context_transfer: request,
           provider: 'cli-bridge', environment_id: receipt.environmentId,
           session_id: request.plan.destination.sessionId, run_id: request.plan.destination.runId,
           execution_id: request.plan.destination.executionId, cwd: workspace,
           messages: [{ role: 'user', content: 'First destination user turn e083.' }],
-        }),
-      })
+        })
+      if (producer) {
+        await service!.shutdown(1_000)
+        await runs!.shutdown(1_000)
+        store!.close(); store = undefined
+        service = undefined; runs = undefined
+        producerHost = await startServer({ cwd: workspace, quiet: true, handleSignals: false,
+          config: { ...loadConfig({ BRIDGE_HOST:'127.0.0.1',BRIDGE_BEARER:'fixture-owner',BRIDGE_DATA_DIR:join(directory,'store'),
+            BRIDGE_BACKENDS:'codex',CODEX_BIN:codexBin,BRIDGE_JAIL_MODE:'off',BRIDGE_TRACE:'off',BRIDGE_SUBSCRIPTIONS_ONLY:'0' }), port:0 } })
+        // This host lacks the receiver's loopback model provider, so its codex child fails after dispatch (502).
+        // Under test: the import no longer refuses the turn, and the run names why it keeps no native copy.
+        const dispatched = await fetch(`${producerHost.url}/v1/chat/completions`, {method:'POST',headers,body:firstTurn})
+        expect(dispatched.status, await dispatched.text()).toBe(502)
+        const run = await fetch(`${producerHost.url}/v1/runs/${encodeURIComponent(request.plan.destination.runId)}`, { headers }).then(r => r.json()) as { nativeCapture: unknown }
+        expect(run.nativeCapture).toEqual({ status: 'unavailable', reason: 'native-context-import-without-redaction-provenance' })
+        return
+      }
+      const result = await restarted.request('/v1/chat/completions', { method:'POST',headers,body:firstTurn })
       expect(result.status).toBe(200)
       expect(await result.json()).toMatchObject({ choices: [{ message: { content: 'native fixture completion' } }] })
       expect(modelRequests).toHaveLength(1)
@@ -191,6 +208,7 @@ describe('real Codex native context consumer', () => {
       expect(statSync(join(workspace, 'AGENTS.md')).mode & 0o777).toBe(0o600)
       expect(store!.get(request.plan.destination.sessionId, 'codex')?.internalId).toBe(nativeId)
     } finally {
+      await producerHost?.close()
       await service?.shutdown(1_000)
       await runs?.shutdown(1_000)
       store?.close()

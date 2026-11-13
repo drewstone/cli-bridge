@@ -69,6 +69,11 @@ export interface RunReplayWindow {
   expired: boolean
 }
 
+/** Digest-bound private producer manifest, advertised only after its files are durable. */
+export type NativeRunCapture =
+  | { status: 'retained' | 'incomplete'; path: string; sha256: string; byteLength: number }
+  | { status: 'unavailable'; reason: string }
+
 export interface RunSnapshot {
   id: string
   /** Digest of the normalized execution request bound to this id. */
@@ -95,6 +100,7 @@ export interface RunSnapshot {
   canonicalLastSeq: number
   lifetimeExpiresAt: number | null
   profileMaterialization: ProfileMaterializationReceipt | null
+  nativeCapture?: NativeRunCapture
 }
 
 export interface RunRetention {

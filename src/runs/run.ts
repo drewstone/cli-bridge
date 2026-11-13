@@ -25,6 +25,7 @@ import type {
   RunOwner,
   RunRetention,
   RunSnapshot,
+  NativeRunCapture,
   RunState,
   RunStatus,
   SeqCanonicalEvent,
@@ -51,6 +52,7 @@ export class Run {
   /** The one pump promise; its presence prevents duplicate backend consumption. */
   private settled?: Promise<void>
   private finishing?: Promise<void>
+  private nativeCapture?: NativeRunCapture
   /** Typed failure raised before the backend produced any output. */
   private setupError: unknown
   /**
@@ -161,7 +163,14 @@ export class Run {
         ? null
         : this.startedAt + this.retention.maxLifetimeMs,
       profileMaterialization: this.log.profileReceipt() as ProfileMaterializationReceipt | null,
+      ...(this.nativeCapture ? { nativeCapture: this.nativeCapture } : {}),
     }
+  }
+
+  /** Producer commitment precedes the existing terminal snapshot transaction. */
+  setNativeCapture(capture: NativeRunCapture): void {
+    if (this.isTerminal()) throw new Error('Native producer commitment is already closed')
+    this.nativeCapture = Object.freeze({ ...capture })
   }
 
   setNativeControl(control: NativeSession): void {

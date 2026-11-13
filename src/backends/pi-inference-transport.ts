@@ -1508,9 +1508,9 @@ function decodePathSegment(value: string): string | null {
   }
 }
 
-class RequestTooLargeError extends Error {}
+export class RequestTooLargeError extends Error {}
 
-async function readRequestBody(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
+export async function readRequestBody(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
   const contentLength = request.headers['content-length']
   if (contentLength !== undefined) {
     const declaredBytes = Number(contentLength)

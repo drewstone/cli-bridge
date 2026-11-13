@@ -49,8 +49,8 @@ async function main() {
   fs.writeFileSync(path.join(process.cwd(),'private-vendor-path.txt'),vendorFile)
 
 
-  const emit = async (value,secret=protectedValues[0]) => { const line=JSON.stringify(value)+'\n', at=line.indexOf(JSON.stringify(secret).slice(1,-1))+8; process.stdout.write(line.slice(0,at)); await new Promise(resolve=>setTimeout(resolve,10)); process.stdout.write(line.slice(at)) }
-  for (const secret of protectedValues) { process.stderr.write(secret.slice(0,11)); await new Promise(resolve=>setTimeout(resolve,10)); process.stderr.write(secret.slice(11)+'\n') }
+  const emit = async (value,secret=protectedValues[0]) => { const line=JSON.stringify(value)+'\n', at=line.indexOf(JSON.stringify(secret).slice(1,-1))+8; process.stdout.write(line.slice(0,at)); await new Promise(resolve=>setImmediate(resolve)); process.stdout.write(line.slice(at)) }
+  for (const secret of protectedValues) { process.stderr.write(secret.slice(0,11)); await new Promise(resolve=>setImmediate(resolve)); process.stderr.write(secret.slice(11)+'\n') }
   if (claude) {
     console.log(JSON.stringify({type:'system',subtype:'init',session_id:nativeId}))
     for (const secret of protectedValues) await emit({type:'assistant',message:{id:'msg',content:[{type:'text',text:echo}]}},secret)
@@ -74,6 +74,20 @@ async function bytesUnder(directory: string, excluded: ReadonlySet<string> = new
   return values
 }
 
+function processStreams(files: readonly Buffer[]): Buffer[] {
+  const streams = new Map<string, Buffer[]>()
+  for (const bytes of files) for (const line of bytes.toString().split('\n')) {
+    try {
+      const frame = JSON.parse(line)
+      if (typeof frame.processId !== 'string' || !['stdout','stderr','protocol'].includes(frame.stream) || typeof frame.base64Bytes !== 'string') continue
+      const key = `${frame.processId}/${frame.stream}`
+      const stream = streams.get(key) ?? []
+      stream.push(Buffer.from(frame.base64Bytes,'base64')); streams.set(key,stream)
+    } catch (error) { if (!(error instanceof SyntaxError)) throw error }
+  }
+  return [...streams.values()].map(chunks => Buffer.concat(chunks))
+}
+
 it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]] as const)('keeps %s MCP credentials private with raw capture %s', async (backend, capture) => {
   const harness = backend === 'claude' ? 'claude-code' : backend
   const root = await mkdtemp(join(tmpdir(), 'private-mcp-'))
@@ -86,7 +100,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   const coordination = 'private-coordination-provider-canary-6ab256'
   const hubKey = 'public-hub-client-fixture'
   let hubInvoked = 0, coordinationInvoked = 0
-  let vendorPath = "", vendorDigest = ""
+  let vendorPath = "", vendorDigest = "", resumedVendorPath = ""
   const upstream = createServer(async (request, response) => {
     if (request.url?.startsWith('/v1/hub/')) {
       if (request.headers.authorization !== `Bearer ${hubKey}`) { response.writeHead(403).end(); return }
@@ -113,7 +127,8 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   await writeFile(stdio, `const rl=require('node:readline').createInterface({input:process.stdin});rl.once('line',async line=>{const req=JSON.parse(line);const r=await fetch(${JSON.stringify(url)},{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+process.env.MCP_PRIVATE},body:JSON.stringify({jsonrpc:'2.0',id:2,method:'initialize'})});if(r.status!==200)process.exit(1);console.log(JSON.stringify({jsonrpc:'2.0',id:req.id,result:{protocolVersion:'2024-11-05',capabilities:{},serverInfo:{name:'private-peer',version:'1'}}}));rl.close()})`)
   const calls: string[] = []
   const redactors: Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0][] = []
-  const server = await startServer({ cwd: root, quiet: true, handleSignals: false,
+  let server: Awaited<ReturnType<typeof startServer>>
+  const createHost = (): ReturnType<typeof startServer> => startServer({ cwd: root, quiet: true, handleSignals: false,
     config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: backend, BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CODEX_BIN: binary }), port: 0 },
     onRunRedaction: run => redactors.push(run),
     mcpSecrets: { async get(key) { calls.push(key); return key === 'private-tool' ? secret : undefined } },
@@ -121,6 +136,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
       hash: value => createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex'),
       serverForGrant(token) { grantTokens.push(token); return {transport:'http',url:`${server.url}/hub/mcp/grants/${token}`} } },
   })
+  server = await createHost()
   const profile = { name: 'private-tool-agent', connections:[{connectionId:'hubconn_fixture',capabilities:['fixture.proof'],alias:'hub'}], mcp: {
     remote: { transport: 'http', url, headers: { Authorization: { kind: 'secret-ref', key: 'private-tool', format: 'bearer' } } },
     local: { command: process.execPath, args: [{ kind: 'public', value: stdio }], env: { MCP_PRIVATE: { kind: 'secret-ref', key: 'private-tool' } } },
@@ -137,6 +153,9 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     expect(grantTokens).toHaveLength(1)
     expect(redactors).toHaveLength(1)
     const authority = redactors[0]!
+    const terminal = await fetch(`${server.url}/v1/runs/${encodeURIComponent(authority.runId)}`).then(r => r.json()) as { nativeCapture: unknown }
+    expect(terminal.nativeCapture).toMatchObject({status:'unavailable'})
+    // This HTTP/authentication fixture is deliberately unjailed; it cannot attest a retained native producer copy.
     expect(Object.isFrozen(authority)).toBe(true)
     expect(authority).toMatchObject({sessionId:`private-${backend}`,cwd:root,profileDigest:expect.stringMatching(/^sha256:/),requestDigest:expect.stringMatching(/^sha256:/)})
     vendorPath = await readFile(join(root,'private-vendor-path.txt'),'utf8')
@@ -166,34 +185,133 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
     expect((await readFile(join(root, 'private-config-paths.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(1)
     for (const line of (await readFile(join(root, 'private-config-paths.jsonl'), 'utf8')).trim().split('\n'))
       await expect(access(JSON.parse(line).configPath)).rejects.toThrow()
+    // The original vendor conversation still contains the now-revoked first Hub grant.
+    expect((await readFile(vendorPath,'utf8')).includes(grantTokens[0]!)).toBe(true)
+    await server.close()
+    server = await createHost()
+    const readback = await fetch(`${server.url}/v1/runs/${encodeURIComponent(authority.runId)}`).then(r => r.json()) as { requestDigest: string; nativeCapture: unknown }
+    expect(readback.requestDigest).toBe(authority.requestDigest)
+    expect(readback.nativeCapture).toEqual(terminal.nativeCapture)
+    const resume = await fetch(`${server.url}/v1/chat/completions`, { method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({model:`${harness}/test`,session_id:`private-${backend}`,run_id:`restart-private-${backend}`,
+        cwd:root,agent_profile:profile,messages:[{role:'user',content:'Continue the original native conversation'}],
+        metadata:{native_redaction_history:{protectedHistory:false}},
+        env:{AGENT_RUNTIME_COORDINATION_TOKEN:coordination,CLAUDE_CONFIG_DIR:join(root,'claude-home')},
+        runtime_attachments:{mcp:{coord:{transport:'http',url:`http://127.0.0.1:${address.port}/coord`,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}}}) })
+    // The conversation continues. This Bridge cannot name the first run's grants, so the run keeps no copy.
+    const resumed = await resume.text()
+    expect(resume.status, resumed).toBe(200)
+    for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(resumed).not.toContain(value)
+    const withheld = await fetch(`${server.url}/v1/runs/restart-private-${backend}`).then(r => r.json()) as { nativeCapture: unknown }
+    expect(withheld.nativeCapture).toEqual({ status: 'unavailable', reason: 'native-redaction-history-unavailable' })
+    expect((await readFile(join(root,'private-config-paths.jsonl'),'utf8')).trim().split('\n')).toHaveLength(2)
+    expect(redactors).toHaveLength(2)
+    expect(() => redactors[1]!.redact(new Uint8Array())).toThrow('withheld')
+    expect(methods).toEqual(['tools/list','initialize','tools/list','initialize'])
+    expect(hubInvoked).toBe(2)
+    expect(coordinationInvoked).toBe(2)
+    resumedVendorPath = await readFile(join(root,'private-vendor-path.txt'),'utf8')
+    expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(vendorDigest)
   } finally {
     await server.close()
-    for (const redactor of redactors) expect(() => redactor.redact(new Uint8Array())).toThrow('closed')
+    for (const redactor of redactors) expect(() => redactor.redact(new Uint8Array())).toThrow(/closed|withheld/)
     await new Promise<void>((resolve) => upstream.close(() => resolve()))
   }
   try {
-    const streams = new Map<string, Buffer[]>()
     expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(vendorDigest)
-    for (const bytes of [...await bytesUnder(root,new Set([vendorPath])), ...await bytesUnder(captureRoot)]) {
-      for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(bytes.includes(Buffer.from(value))).toBe(false)
-      for (const line of bytes.toString().split('\n')) {
-        try {
-          const frame = JSON.parse(line)
-          if (frame.base64Bytes) {
-            const key = `${frame.processId}/${frame.stream}`
-            const stream = streams.get(key) ?? []
-            stream.push(Buffer.from(frame.base64Bytes, 'base64'))
-            streams.set(key, stream)
-          }
-        } catch (error) { if (error instanceof SyntaxError) continue; throw error }
-      }
+    const retained = [...await bytesUnder(root,new Set([vendorPath, resumedVendorPath])), ...await bytesUnder(captureRoot)]
+    const streams = processStreams(retained)
+    for (const bytes of [...retained,...streams]) for (const value of [secret,coordination,hubKey,...grantTokens]) {
+      expect(bytes.includes(Buffer.from(value))).toBe(false)
+      expect(bytes.includes(Buffer.from(JSON.stringify(value).slice(1,-1)))).toBe(false)
     }
-    for (const chunks of streams.values()) for (const value of [secret, coordination, hubKey, ...grantTokens]) expect(Buffer.concat(chunks).includes(Buffer.from(value))).toBe(false)
     if (capture) {
-      expect(streams.size).toBeGreaterThan(0)
+      expect(streams.length).toBeGreaterThan(0)
       const manifests = (await readdir(captureRoot)).filter(file => file.endsWith('.json'))
       expect(manifests.length).toBeGreaterThan(0)
       for (const name of manifests) expect(JSON.parse(await readFile(join(captureRoot, name), 'utf8')).redaction).toBe('private-mcp-secrets')
     }
   } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); await rm(captureRoot, { recursive: true, force: true }) }
 }, 30000)
+
+it.each([false,true])('fences historical private output on a host backend without vendor-family capture (raw %s)', async (capture) => {
+  const root = await mkdtemp(join(tmpdir(),'private-opencode-history-'))
+  const captureRoot = await mkdtemp(join(tmpdir(),'private-opencode-frames-'))
+  vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',capture ? captureRoot : '')
+  const old = 'private-opencode-prior-"coordination"-canary-a783\\tail'
+  const next = 'private-opencode-next-"coordination"-canary-c294\\tail'
+  let expected = old, effects = 0
+  const upstream = createServer((request,response) => {
+    if (request.headers.authorization !== `Bearer ${expected}`) { response.writeHead(403).end(); return }
+    effects++; response.writeHead(200).end('{}')
+  })
+  await new Promise<void>(resolve => upstream.listen(0,'127.0.0.1',resolve))
+  const address = upstream.address(); if (!address || typeof address === 'string') throw new Error('peer did not bind')
+  const bin = join(root,'opencode-peer.cjs')
+  await writeFile(bin,`#!${process.execPath}\nconst fs=require('node:fs');
+if(process.argv.includes('--version')){console.log('opencode 1.0.0');process.exit(0)}
+async function main(){
+ const config=JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG,'utf8'));
+ fs.appendFileSync('native-launches','launched\\n');
+ const auth=config.mcp.coord.headers.Authorization;
+ if((await fetch(config.mcp.coord.url,{headers:{Authorization:auth}})).status!==200)throw new Error('private tool denied');
+ const prior=fs.existsSync('native-conversation')?fs.readFileSync('native-conversation','utf8'):auth;
+ fs.writeFileSync('native-conversation',prior);
+ const text=Buffer.from(JSON.stringify({type:'text',sessionID:'owned-opencode-history',part:{type:'text',text:prior+' '+auth}})+'\\n');
+ for(let at=0;at<text.length;at+=7){process.stdout.write(text.subarray(at,at+7));await new Promise(resolve=>setImmediate(resolve));}
+ console.log(JSON.stringify({type:'turn.completed',sessionID:'owned-opencode-history',usage:{input_tokens:1,output_tokens:1}}));
+} main().catch(()=>{console.error('native peer failed');process.exitCode=1});`,{mode:0o700})
+  const createHost = () => startServer({ cwd:root,quiet:true,handleSignals:false,
+    config:{...loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_DATA_DIR:join(root,'state'),BRIDGE_BACKENDS:'opencode',OPENCODE_BIN:bin,BRIDGE_TRACE:'off',BRIDGE_JAIL_MODE:'off'}),port:0} })
+  let server = await createHost()
+  const body = (token:string,runId:string) => JSON.stringify({stream:true,model:'opencode/history-fixture',session_id:'private-opencode-history',run_id:runId,cwd:root,
+    messages:[{role:'user',content:'Use the private tool and continue the native conversation'}],env:{AGENT_RUNTIME_COORDINATION_TOKEN:token},
+    runtime_attachments:{mcp:{coord:{transport:'http',url:`http://127.0.0.1:${address.port}/mcp`,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}}})
+  try {
+    const first = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(old,'private-opencode-first')})
+    const text = await first.text()
+    expect(first.status,text).toBe(200)
+    expect(text).toContain('[redacted:MCP]')
+    expect(text).not.toContain(old)
+    expect(effects).toBe(1)
+    expect(await readFile(join(root,'native-conversation'),'utf8')).toContain(old)
+    expected = next
+    const second = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(next,'private-opencode-live-continuation')})
+    const secondText = await second.text()
+    expect(second.status,secondText).toBe(200)
+    expect(secondText).toContain('[redacted:MCP]')
+    expect(secondText).not.toContain(old)
+    expect(secondText).not.toContain(next)
+    expect(secondText).not.toContain(JSON.stringify(old).slice(1,-1))
+    expect(secondText).not.toContain(JSON.stringify(next).slice(1,-1))
+    expect(effects).toBe(2)
+    const clean = (files: Buffer[]) => { for (const bytes of [...files,...processStreams(files)]) for (const value of [old,next]) {
+      expect(bytes.includes(Buffer.from(value))).toBe(false)
+      expect(bytes.includes(Buffer.from(JSON.stringify(value).slice(1,-1)))).toBe(false)
+    } }
+    const captured = await bytesUnder(captureRoot)
+    const retained = [...await bytesUnder(root,new Set([join(root,'native-conversation')])),...captured]
+    clean(retained)
+    if(capture) expect(processStreams(retained).length).toBeGreaterThan(0)
+    await server.close(); server = await createHost()
+    // After a restart the first token is unknown here: the turn runs, its output may carry that revoked token
+    // as on a Bridge without cross-turn redaction, and it keeps no process frames.
+    const resumed = await fetch(`${server.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:body(next,'private-opencode-after-restart')})
+    const resumedText = await resumed.text()
+    expect(resumed.status,resumedText).toBe(200)
+    expect(resumedText).not.toContain(next)
+    expect((await fetch(`${server.url}/v1/runs/private-opencode-after-restart`).then(r=>r.json()) as {nativeCapture:unknown}).nativeCapture)
+      .toEqual({status:'unavailable',reason:'native-redaction-history-unavailable'})
+    expect((await readFile(join(root,'native-launches'),'utf8')).trim().split('\n')).toHaveLength(3)
+    expect(effects).toBe(3)
+    const frames = await bytesUnder(captureRoot)
+    clean(frames)
+    expect(frames.length).toBe(captured.length)
+  } finally {
+    await server.close()
+    await new Promise<void>(resolve => upstream.close(()=>resolve()))
+    vi.unstubAllEnvs()
+    await rm(root,{recursive:true,force:true})
+    await rm(captureRoot,{recursive:true,force:true})
+  }
+},30000)
