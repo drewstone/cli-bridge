@@ -4,6 +4,7 @@ import type { Hono } from 'hono'
 import type { StartServerOptions } from './server-options.js'
 import { BackendError, type ChatRequest } from './backends/types.js'
 import { protectExecutionValues } from './private-mcp.js'
+import type { createHostServiceBindings } from './host-services.js'
 
 const workspaceProfiles = new WeakMap<object, AgentProfile>()
 
@@ -11,7 +12,7 @@ export function workspaceProfile(req: ChatRequest, original: AgentProfile): Agen
   return (req.runtime_attachments && workspaceProfiles.get(req.runtime_attachments)) ?? original
 }
 
-export function mountHubMcp(app: Hono, options: NonNullable<StartServerOptions['hub']>) {
+export function mountHubMcp(app: Hono, options: NonNullable<StartServerOptions['hub']>, hostServices?: ReturnType<typeof createHostServiceBindings>) {
   const scope = new HubMcpScope(options)
   app.route('/hub/mcp', createHubMcpRoutes(scope))
   return {
@@ -27,6 +28,7 @@ export function mountHubMcp(app: Hono, options: NonNullable<StartServerOptions['
       }
       signal.throwIfAborted()
       const resolved = await scope.resolveConnectionsToMcp(options.client, profile.connections, options.serverForGrant)
+      let releaseServices: (() => void) | undefined
       try {
         signal.throwIfAborted()
         if (resolved.degraded) throw new BackendError(resolved.degraded.message, 'parse_error')
@@ -37,9 +39,11 @@ export function mountHubMcp(app: Hono, options: NonNullable<StartServerOptions['
         const { workspaceProfile } = lowerProfileConnections(profile, resolved.mcp)
         req.runtime_attachments = { mcp: { ...existing, ...resolved.mcp } }
         if (workspaceProfile) workspaceProfiles.set(req.runtime_attachments, workspaceProfile)
+        releaseServices = await hostServices?.prepareHub(req, backend, resolved.mcp, resolved.grantTokens)
         const releaseProtected = protectExecutionValues(req, resolved.grantTokens)
-        return () => { try { for (const token of resolved.grantTokens) scope.revoke(token) } finally { releaseProtected() } }
+        return () => { try { releaseServices?.() } finally { try { for (const token of resolved.grantTokens) scope.revoke(token) } finally { releaseProtected() } } }
       } catch (error) {
+        releaseServices?.()
         for (const token of resolved.grantTokens) scope.revoke(token)
         throw error
       }

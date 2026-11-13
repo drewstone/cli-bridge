@@ -1,6 +1,8 @@
 import { DurableRunWriter } from './sessions/durable-writer.js'
 import { privateCopyRedactor } from './executors/raw-capture.js'
-import { preparePrivateMcp } from './private-mcp.js'
+import { preparePrivateMcp, type PrivateRunRedactionObserver } from './private-mcp.js'
+import { captureTerminalNativeFamily } from './executors/native-capture.js'
+import { createHostServiceBindings } from './host-services.js'
 /**
  * cli-bridge server entry — Hono on Node.
  *
@@ -10,11 +12,12 @@ import { preparePrivateMcp } from './private-mcp.js'
  */
 
 import { join, resolve } from 'node:path'
-import { timingSafeEqual } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
 import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
+import { nativeRedactionHistorySchema } from './sessions/legacy-metadata.js'
 import { BackendRegistry } from './backends/registry.js'
 import { createLocalBackend } from './backends/local.js'
 import { ClaudishBackend } from './backends/claudish.js'
@@ -78,12 +81,39 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   runs: RunRegistry
   catalog: ProfileCatalog
   extras: BuildAppExtras
+  hostServices: ReturnType<typeof createHostServiceBindings>
 }> {
   // The host policy and its enforcement share an immutable startup snapshot.
   config = { ...config }
   const sessions = new SessionStore(config.dataDir)
   const extras: BuildAppExtras = { shutdownHooks: [] }
-  const redactors = new Set<ReturnType<typeof privateCopyRedactor>>()
+  // One entry per live run, released when its job ends; a conversation keeps only its latest protected run,
+  // whose authority the next turn must match. Externally issued redactors live until server close.
+  type RedactionBinding = Parameters<PrivateRunRedactionObserver>[0]
+  const nativeRedactors = new Map<string, {
+    binding: RedactionBinding; authority: Set<string>; redactor: ReturnType<typeof privateCopyRedactor>; ended?: true; withheld?: string
+  }>()
+  const latestRunOf = new Map<string, string>()
+  const runOfRequest = new WeakMap<object, string>()
+  const conversationOf = (binding: RedactionBinding) =>
+    binding.sessionId ? JSON.stringify([binding.sessionId, binding.profileDigest, binding.cwd]) : undefined
+  // Admission releases this after the job, so the run's native capture has already read its entry.
+  const releaseRunRedaction = (request: object) => {
+    const key = runOfRequest.get(request)
+    const entry = key === undefined ? undefined : nativeRedactors.get(key)
+    if (!key || !entry) return
+    entry.ended = true
+    const conversation = conversationOf(entry.binding)
+    if (conversation !== undefined && latestRunOf.get(conversation) === key) {
+      // The next turn of a protected conversation must find this exact authority.
+      if (entry.authority.size > 0) return
+      latestRunOf.delete(conversation)
+    }
+    nativeRedactors.delete(key)
+  }
+  const issuedRedactors = new Set<ReturnType<typeof privateCopyRedactor>>()
+  const nativeRedactionEpoch = randomUUID()
+  const hostServices = createHostServiceBindings()
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -94,7 +124,12 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     maxLifetimeMs: parseEnvNonNegativeInt('BRIDGE_RUN_MAX_LIFETIME_MS', 0),
   })
   extras.shutdownHooks.push(async () => await runs.shutdown())
-  extras.shutdownHooks.push(async () => { for (const redactor of redactors) redactor.close(); redactors.clear() })
+  extras.shutdownHooks.push(async () => hostServices.close())
+  extras.shutdownHooks.push(async () => {
+    for (const { redactor, authority } of nativeRedactors.values()) { redactor.close(); authority.clear() }
+    for (const redactor of issuedRedactors) redactor.close()
+    nativeRedactors.clear(); latestRunOf.clear(); issuedRedactors.clear()
+  })
   const durableWriter = config.asyncDurableWrites ? new DurableRunWriter(config.dataDir) : null
   if (durableWriter) {
     extras.shutdownHooks.push(() => durableWriter.close())
@@ -169,7 +204,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
 
   const app = new Hono()
-  const hub = hubOptions ? mountHubMcp(app, hubOptions) : undefined
+  const hub = hubOptions ? mountHubMcp(app, hubOptions, hostServices) : undefined
   if (hub) extras.shutdownHooks.push(async () => hub.close())
 
   // Bearer guard — only active when BRIDGE_BEARER is set.
@@ -194,15 +229,71 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
     registry,
-    ...(onRunRedaction ? { onRunRedaction: (binding, values) => {
-      const redactor = privateCopyRedactor(values)
-      redactors.add(redactor)
-      try { onRunRedaction(Object.freeze({ ...binding, redact: redactor.redact })) }
+    onRunRedaction: (binding, values, request) => {
+      const backend = registry.resolve(request.model)?.name
+      const local = backend !== undefined && anyBackendSpawnsOnHost([backend]) && request.execution?.kind !== 'sandbox'
+      const previous = local && binding.sessionId ? sessions.get(binding.sessionId, backend) : null
+      const prior = nativeRedactionHistorySchema.safeParse(previous?.metadata.native_redaction_history)
+      // The turn always runs. When this Bridge cannot name every private value the native conversation
+      // may hold, the run keeps no retained copy, and the unchanged history row withholds later turns too.
+      let withheld: string | undefined
+      if (local && previous) {
+        const marker = prior.success ? prior.data : undefined
+        const authority = marker && nativeRedactors.get(`${marker.runId}:${marker.requestDigest}`)?.binding
+        if (!marker && previous.internalId && sessions.findContextTransferBySessionId(previous.externalId)) {
+          withheld = 'native-context-import-without-redaction-provenance'
+        } else if ((!marker && previous.internalId) || (marker && (
+          marker.sessionId !== binding.sessionId || marker.profileDigest !== binding.profileDigest || marker.cwd !== binding.cwd ||
+          (marker.protectedHistory && (marker.epoch !== nativeRedactionEpoch || !authority ||
+            authority.sessionId !== marker.sessionId || authority.profileDigest !== marker.profileDigest || authority.cwd !== marker.cwd))
+        ))) withheld = 'native-redaction-history-unavailable'
+      }
+      const conversation = conversationOf(binding)
+      const previousKey = conversation && latestRunOf.get(conversation)
+      const previousAuthority = previousKey ? nativeRedactors.get(previousKey)?.authority : undefined
+      const authority = previousAuthority ?? new Set<string>()
+      for (const value of values) authority.add(value)
+      const redactor = privateCopyRedactor(() => [...authority])
+      const key = `${binding.runId}:${binding.requestDigest}`
+      nativeRedactors.set(key, { binding, authority, redactor, ...(withheld && { withheld }) })
+      runOfRequest.set(request, key)
+      try {
+        const refuse = () => { throw new Error(`Retained native copies are withheld: ${withheld}`) }
+        if (onRunRedaction) { issuedRedactors.add(redactor); onRunRedaction(Object.freeze({ ...binding, redact: withheld ? refuse : redactor.redact })) }
+        if (local && binding.sessionId && !withheld) sessions.remember({ externalId: binding.sessionId, backend, model: request.model,
+          cwd: binding.cwd, metadata: { native_redaction_history: {
+            schema: 'cli-bridge.native-redaction-history.v1', protectedHistory: !!authority.size || (prior.success && prior.data.protectedHistory),
+            epoch: nativeRedactionEpoch, runId: binding.runId, requestDigest: binding.requestDigest,
+            sessionId: binding.sessionId, profileDigest: binding.profileDigest, cwd: binding.cwd,
+          } } })
+        if (conversation) {
+          latestRunOf.set(conversation, key)
+          if (previousKey && previousKey !== key && nativeRedactors.get(previousKey)?.ended) nativeRedactors.delete(previousKey)
+        }
+      }
       catch {
-        redactor.close(); redactors.delete(redactor)
+        redactor.close(); nativeRedactors.delete(key); issuedRedactors.delete(redactor)
+        if (!previousAuthority) authority.clear()
         throw new Error('Trusted native redaction authority is unavailable')
       }
-    } } : {}),
+      // One chunk-safe pre-parser filter receives all credentials this exact conversation has admitted.
+      return { values: [...authority], ...(withheld && { withheld }) }
+    },
+    // Native copies share the raw-capture directory, whose operator owns retention; unset, none is made.
+    captureNative: async (input) => {
+      const source = nativeRedactors.get(`${input.snapshot.id}:${input.snapshot.requestDigest}`)
+      const root = process.env.BRIDGE_RAW_CAPTURE_DIR
+      if (source?.withheld || !root) return { status: 'unavailable', reason: source?.withheld ?? 'native-capture-not-configured' }
+      return captureTerminalNativeFamily({ ...input, root,
+        redact: (bytes) => {
+          const exact = source?.binding
+          if (!exact || exact.sessionId !== input.snapshot.sessionId || exact.cwd !== input.cwd || exact.profileDigest !== input.profileDigest) {
+            throw new Error('Native producer has no exact private redaction authority')
+          }
+          return source!.redactor.redact(bytes)
+        },
+      })
+    },
     sessions,
     retainedRuns: sessions,
     durableWriter: durableWriter ?? undefined,
@@ -214,10 +305,14 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     admitSubscription: async (request, backend, signal) => {
       await nativeCatalog.admit(request, backend, signal)
       const releaseHub = await hub?.prepare(request, signal, backend)
+      let releasePrivate: (() => void) | undefined, releaseServices: (() => void) | undefined
       try {
-        const releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
-        return () => { releasePrivate?.(); releaseHub?.() }
-      } catch (error) { releaseHub?.(); throw error }
+        releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
+        releaseServices = await hostServices.prepareCoordination(request, backend)
+        return () => {
+          try { releaseRunRedaction(request) } finally { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } } }
+        }
+      } catch (error) { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } }; throw error }
     },
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
@@ -245,6 +340,8 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     hostPolicy,
     capabilities: {
       profileMaterialization: 'cli-bridge.profile-materialization.v2',
+      // Implemented receipt format only; each terminal capture proves its own availability and integrity.
+      nativeCapture: 'cli-bridge.native-capture.v1',
       usageCostProvenance: 'cli-bridge.usage-cost.v1',
       // Platform attachments carried outside the session-bound profile;
       // dispatchers gate on this flag and refuse loud when it is absent.
@@ -277,7 +374,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     ],
   }))
 
-  return { app, sessions, registry, runs, catalog, extras }
+  return { app, sessions, registry, runs, catalog, extras, hostServices }
   } catch (error) {
     try { await disposeApp({ sessions, extras }) } catch (cleanup) {
       throw new UnconfirmedBridgeCleanup([error, cleanup], 'CLI Bridge startup failed and cleanup was not confirmed')
@@ -403,6 +500,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
   }
   const host = address.address.includes(':') ? `[${address.address}]` : address.address
   const url = `http://${host}:${address.port}`
+  built.hostServices.bindListener(url)
   if (options.handleSignals !== false) {
     process.once('exit', release)
     process.on('SIGTERM', shutdown)
@@ -422,7 +520,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     console.log(config.trace.enabled ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)` : '[cli-bridge] traces: off (BRIDGE_TRACE=off)')
     console.log(`[cli-bridge] jail default: ${jailFloor}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
   }
-  return { url, close }
+  return { url, close, registerCoordinationEndpoint: built.hostServices.registerCoordinationEndpoint }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await startServer()

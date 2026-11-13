@@ -104,6 +104,11 @@ export class InstanceLockUnavailableError extends InstanceLockError {
   }
 }
 
+/** True when `path` is, or now is, a local-user-only real directory reached without a link. */
+export function isPrivateDirectory(path: string): boolean {
+  try { return ensurePrivateDataDirectory(path) === path } catch { return false }
+}
+
 /** Create one local-user-only directory for durable bridge state. */
 export function ensurePrivateDataDirectory(inputPath: string): string {
   const requestedPath = resolve(inputPath)

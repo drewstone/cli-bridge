@@ -100,9 +100,9 @@ test.each(['inherit', 'ignore'] as const)('refuses uncapturable %s stdio before 
   expect(readdirSync(root)).toEqual([])
 })
 
-test('refuses an agent-writable evidence root before spawning', async () => {
+test.each(['evidence', '..evidence'])('refuses agent-writable evidence root %s before spawning', async (directory) => {
   const root = fixture();mkdirSync(join(root,'workspace'))
-  process.env.BRIDGE_RAW_CAPTURE_DIR=join(root,'workspace','evidence')
+  process.env.BRIDGE_RAW_CAPTURE_DIR=join(root,'workspace',directory)
   async function* source() { spawnCaptured(process.execPath, ['-e','process.exit(0)'], {}); yield {} }
   await expect(consume(withRawProcessCapture(source(), snapshot('unsafe'), 'any-harness', join(root,'workspace')))).rejects.toThrow('outside the agent workspace')
 })
