@@ -30,6 +30,16 @@ export interface BridgeServer {
     url: string;
     /** Host-only listener authority from Runtime's actual bound publicUrl resolver; never an HTTP route. */
     registerCoordinationEndpoint(input: { runId: string; actorId: string; url: string; signal: AbortSignal }): () => void;
+    /** In-process embedder authority only: no HTTP route, request field or environment variable registers one. Only a
+     * bearer-authenticated request's `runtime_attachments.mcp` entry naming this exact loopback URL claims it, with that
+     * request's own resolved secret-refs. Identical registrations share the route until the last revoke; different paths
+     * are refused. `runId` is audit context, never authority. */
+    registerPrivateMcpEndpoint(input: {
+        runId: string;
+        url: string;
+        paths: Readonly<Record<string, readonly ('GET' | 'POST' | 'DELETE')[]>>;
+        signal: AbortSignal;
+    }): () => void;
     /** Stop only this listener and its owned work, then release its durable writer lock. */
     close(): Promise<void>;
 }

@@ -92,7 +92,7 @@ export function resolveMcpServers(
         { ...raw, type: raw.transport },
         name,
         `runtime_attachments.mcp[${JSON.stringify(name)}]`,
-        { ...destination, bearer: req.runtimeCoordinationBearer },
+        { ...destination, bearer: req.runtimeCoordinationBearer, secrets: privateMcpCredentials(req) },
       )
     }
   }

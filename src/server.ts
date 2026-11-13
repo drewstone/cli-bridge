@@ -114,7 +114,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   // An embedded host may redact after job cleanup, so its redactors live until close: one per run, unbounded by design.
   const issuedRedactors = new Set<ReturnType<typeof privateCopyRedactor>>()
   const nativeRedactionEpoch = randomUUID()
-  const hostServices = createHostServiceBindings()
+  const hostServices = createHostServiceBindings(Boolean(config.bearer))
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -310,8 +310,10 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       try {
         releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
         releaseServices = await hostServices.prepareCoordination(request, backend)
+        const releaseEndpoints = await hostServices.preparePrivateMcp(request, backend)
         return () => {
-          try { releaseRunRedaction(request) } finally { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } } }
+          try { releaseRunRedaction(request) } finally { try { releaseEndpoints() } finally {
+            try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } } } }
         }
       } catch (error) { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } }; throw error }
     },
@@ -521,7 +523,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     console.log(config.trace.enabled ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)` : '[cli-bridge] traces: off (BRIDGE_TRACE=off)')
     console.log(`[cli-bridge] jail default: ${jailFloor}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
   }
-  return { url, close, registerCoordinationEndpoint: built.hostServices.registerCoordinationEndpoint }
+  const { registerCoordinationEndpoint, registerPrivateMcpEndpoint } = built.hostServices
+  return { url, close, registerCoordinationEndpoint, registerPrivateMcpEndpoint }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await startServer()
