@@ -117,7 +117,7 @@ export function provisionProfileWorkspace(
   /**
    * Release the request-scoped files this provisioning wrote outside the plan.
    *
-   * Only the opencode path returns one today. The caller MUST invoke it after
+   * The opencode and codex paths return one. The caller MUST invoke it after
    * the harness process exits.
    */
   cleanup?: () => void
@@ -126,7 +126,7 @@ export function provisionProfileWorkspace(
   const profile = resolveAgentProfile(req, session)
   if (!profile) return { env: {}, flags: [], written: [] }
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
-  let scoped: OpencodeProfileScope | undefined
+  let scoped: PrivateProfileScope | undefined
   try {
     const plan = materializeProfile(workspaceProfile(req, profile), harness, { skip: ['mcp'], binds: harness === 'codex' ? ['codex.developer-instructions'] : [] })
     // Bind generated --settings to this exact profile. A resumed session retains its already-applied plan.
@@ -145,16 +145,15 @@ export function provisionProfileWorkspace(
     // Freeze the complete identity before moving native resources; receipts and resumes use this digest.
     const planDigest = hashWorkspacePlan(plan)
     const resumesSamePlan = sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest === planDigest
-    if (harness === 'opencode') {
-      scoped = scopeOpencodeProfileConfig(plan, req.jailSpec)
-      plan.files = scoped.workspaceFiles
-    }
+    scoped = harness === 'opencode' ? scopeOpencodeProfileConfig(plan, req.jailSpec)
+      : harness === 'codex' ? scopeCodexInstructions(plan, req.jailSpec) : undefined
+    if (scoped) plan.files = scoped.workspaceFiles
     const applied = applyWorkspacePlan(
       plan,
       workspaceCwd,
       resumesSamePlan ? { appliedPlanDigest: hashWorkspacePlan(plan) } : {},
     )
-    // The opencode-native files leave this plan, so the receipt names them here.
+    // The privately scoped files leave this plan, so the receipt names them here.
     const written = scoped ? [...applied.written, ...scoped.written] : applied.written
     const receipt = retainProfileMaterializationReceipt(
       req,
@@ -164,7 +163,7 @@ export function provisionProfileWorkspace(
       plan,
       { ...applied, written, workspacePlanDigest: planDigest },
     )
-    const flags = applied.flags.map((flag, index) => requirePublicPlanValue(flag, `launch flag ${index}`, harness))
+    const flags = (scoped?.flags ?? applied.flags).map((flag, index) => requirePublicPlanValue(flag, `launch flag ${index}`, harness))
     if (harness === 'codex') flags.push(...codexDeveloperInstructionArgs(applied.appendSystemPrompt, flags))
     return {
       ...applied,
@@ -204,9 +203,11 @@ const OPENCODE_PROFILE_ROOT_PREFIX = '.cli-bridge-opencode-profile-'
 /** The private directory's name in a materialization receipt, the same on every turn. */
 const OPENCODE_PROFILE_RECEIPT_ROOT = '.cli-bridge-opencode-profile'
 
-interface OpencodeProfileScope {
+interface PrivateProfileScope {
   /** Env this turn adds on top of the plan's own launch env. */
-  env: Record<string, string>
+  env?: Record<string, string>
+  /** Launch flags bound to the private root, replacing the plan's workspace-bound flags. */
+  flags?: WorkspacePlanReceipt['flags']
   /** Workspace-relative paths written under the private root, for the receipt. */
   written: string[]
   /** The plan files that still belong in the shared task directory. */
@@ -226,7 +227,7 @@ interface OpencodeProfileScope {
 function scopeOpencodeProfileConfig(
   plan: WorkspacePlan,
   jail: JailSpec | null | undefined,
-): OpencodeProfileScope {
+): PrivateProfileScope {
   const isWorkspaceFile = (file: PlanFile): boolean => (file.root ?? 'workspace') === 'workspace'
   const generated = plan.files.filter((file) =>
     file.relPath === OPENCODE_PROJECT_CONFIG_FILE && file.source === 'generated' && isWorkspaceFile(file))
@@ -293,6 +294,25 @@ function scopeOpencodeProfileConfig(
       workspaceFiles,
       cleanup: root.cleanup,
     }
+  } catch (error) {
+    root.cleanup()
+    throw error
+  }
+}
+
+/** Codex reads its replacement instructions only through the file `-c model_instructions_file` names.
+ * Apply that file into a fresh private root per turn, outside the task workspace, so the agent, its
+ * `git status`/`git add -A` and the grader never see it; the materializer binds the flag to that root.
+ */
+function scopeCodexInstructions(plan: WorkspacePlan, jail: JailSpec | null | undefined): PrivateProfileScope | undefined {
+  const bound = plan.files.filter((file) => plan.flags.includes(`model_instructions_file=${file.relPath}`))
+  if (bound.length === 0) return undefined
+  const root = privateBridgeRoot(jail, '.cli-bridge-codex-profile-', 'readable')
+  try {
+    const { flags, written } = applyWorkspacePlan({ ...plan, files: bound }, root.path, { existingFiles: 'reject' })
+    // One stable receipt name: the private root is fresh on every turn.
+    const receiptPaths = written.map((relPath) => posix.join('.cli-bridge-codex-profile', relPath))
+    return { flags, written: receiptPaths, workspaceFiles: plan.files.filter((file) => !bound.includes(file)), cleanup: root.cleanup }
   } catch (error) {
     root.cleanup()
     throw error
