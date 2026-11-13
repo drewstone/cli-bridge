@@ -92,7 +92,7 @@ it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as c
   server.registerCoordinationEndpoint({runId:'owned-root',actorId:'owned-actor',url:coordUrl,signal:lifetime.signal});
   const response=await dispatch(body);
   const text=await response.text();expect(response.status,text).toBe(200);expect(text).toContain('[redacted:MCP]');expect(hubCalls).toBe(1);expect(coordCalls).toBe(1);
-  const terminal=await fetch(`${server.url}/v1/runs/private-native-${harness}`).then(r=>r.json());expect(terminal.nativeCapture.status).toBe('retained');
+  const terminal=await fetch(`${server.url}/v1/runs/private-native-${harness}`).then(r=>r.json()) as {nativeCapture:{status:string;path:string}};expect(terminal.nativeCapture.status).toBe('retained');
   const manifestBytes=await readFile(terminal.nativeCapture.path),manifest=JSON.parse(manifestBytes.toString());expect(manifest.nativeSessions[0].complete).toBe(false);
   const vendorPath=await readFile(join(workspace,'vendor-path'),'utf8'),original=await readFile(vendorPath),sourceHash=createHash('sha256').update(original).digest('hex');
   expect(original.toString()).toContain(toolSecret);expect(original.toString()).toContain(coordSecret);
