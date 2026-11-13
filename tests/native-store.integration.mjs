@@ -61,15 +61,18 @@ ln -s "${nativeRoot}/${directory}/${filename}" "${nativeRoot}/${directory}/$labe
 `, { mode: 0o700 })
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: harness === 'codex' ? 'codex' : 'claude', CODEX_BIN: bin, CLAUDE_BIN: bin,
       BRIDGE_BEARER: 'native-store-public-fixture', BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'fs-jail' }), port: 0 }
-    server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false })
+    const mcpSecrets = { async get(key) { return key === 'label' ? labelSecret : undefined } }
+    server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false, mcpSecrets })
     const headers = { authorization: 'Bearer native-store-public-fixture', 'content-type': 'application/json' }
     const endpoint = `/v1/sessions?session_id=owned-external-session&backend=${harness}`
     assert.equal((await fetch(server.url + endpoint)).status, 401)
     assert.equal((await fetch(server.url + endpoint, { headers: { authorization: 'Bearer wrong-fixture' } })).status, 401)
     const response = await fetch(server.url + '/v1/chat/completions', { method: 'POST', headers,
+      // A custom MCP credential is a protected value; a jailed coordination attachment would need a registered listener.
       body: JSON.stringify({ model: `${harness}/native-store-fixture`, cwd: workspace, session_id: 'owned-external-session',
-        ...(unsafeLabels ? { env:{AGENT_RUNTIME_COORDINATION_TOKEN:labelSecret},runtime_attachments:{mcp:{coord:{transport:'http',url:'http://127.0.0.1:9/mcp',headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}} } : {}),
-        run_id: 'owned-native-store-run', agent_profile: { name: 'native-capture-fixture' }, messages: [{ role: 'user', content: 'Only exercise the local executable fixture.' }] }) })
+        agent_profile: { name: 'native-capture-fixture', ...(unsafeLabels ? { mcp: { label: { transport: 'http', url: 'http://127.0.0.1:9/mcp',
+          headers: { Authorization: { kind: 'secret-ref', key: 'label', format: 'bearer' } } } } } : {}) },
+        run_id: 'owned-native-store-run', messages: [{ role: 'user', content: 'Only exercise the local executable fixture.' }] }) })
     assert.equal(response.status, 200, await response.clone().text())
     const completion = await response.text()
     assert.ok(!completion.includes('effective_native_store'), 'host store metadata must not leak into ordinary completion payloads')
@@ -139,7 +142,7 @@ ln -s "${nativeRoot}/${directory}/${filename}" "${nativeRoot}/${directory}/$labe
       assert.equal(manifest.bridge.files.length, 1)
       const file = manifest.bridge.files[0]
       assert.equal(file.sourceSha256, `sha256:${originalDigest}`)
-      const retained = await readFile(join(state, 'native', file.payload))
+      const retained = await readFile(join(captureDir, file.payload))
       assert.deepEqual(retained, original)
       assert.equal(file.redacted, false)
       assert.equal(file.truncated, false)
