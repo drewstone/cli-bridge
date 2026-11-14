@@ -118,7 +118,7 @@ export class RetainedSessionState {
           admission.requestDigest,
           admission.sessionId,
           { provider: admission.provider, environmentId: admission.environmentId },
-          'model' in persisted ? persisted.model : undefined,
+          persisted.model,
         )
   }
 

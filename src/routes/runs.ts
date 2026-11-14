@@ -90,7 +90,7 @@ export function mountRuns(app: Hono, deps: {
         return streamChatDeltaEvents(
           c,
           (signal) => retainedChatDeltas(retained.runEvents(id, cursor.value, signal)),
-          'model' in retainedSnapshot ? retainedSnapshot.model : undefined,
+          retainedSnapshot.model,
         )
       }
       return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))

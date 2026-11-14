@@ -530,7 +530,7 @@ export class RetainedTurnRunner {
     )
     const snapshot = persisted.terminal
       ? persisted
-      : unknownRunSnapshot(runId, admission.executionId, requestDigest, retained.id, coordinates, 'model' in persisted ? persisted.model : retained.model)
+      : unknownRunSnapshot(runId, admission.executionId, requestDigest, retained.id, coordinates, persisted.model ?? retained.model)
     if (!persisted.terminal) {
       this.store.updateRetainedRun(runId, requestDigest, snapshot)
       this.store.updateRetained(retained.id, { status: 'unknown', runId })
