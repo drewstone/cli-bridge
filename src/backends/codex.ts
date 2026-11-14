@@ -4,6 +4,8 @@ import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { createRequire } from 'node:module'
+const require_fs = (): typeof import('node:fs') => createRequire(import.meta.url)('node:fs')
 import { registerJailReadable } from '../jail/index.js'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
 import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth, PreparedContextTransfer } from './types.js'
@@ -88,14 +90,37 @@ export class CodexBackend implements Backend {
     // Pin the same native home as execution; a PATH wrapper must not allocate another account for a probe.
     effectiveEnv.CODEX_HOME ??= effectiveEnv.HOME ? join(effectiveEnv.HOME, '.codex') : undefined
     let native: CodexContextTransfer | undefined
+    // DIAGNOSTIC ONLY (diag/codex-probe-timing): phase timings for the acceptance jail.
+    const t0 = performance.now(), trace: Record<string, unknown> = { at: new Date().toISOString(), pid: process.pid, bin: this.opts.bin, args, cwd,
+      codexHome: effectiveEnv.CODEX_HOME, envKeys: Object.keys(effectiveEnv).sort(), executor: (await import('../executors/scoped-host.js')).scopedHostExecutorSnapshot() }
+    const mark = (phase: string): void => { trace[phase] = Math.round(performance.now() - t0) }
+    let stderrText = ''
+    const flush = (outcome: string): void => {
+      trace.outcome = outcome; trace.stderr = stderrText.slice(0, 4000)
+      try {
+        const fs = require_fs()
+        if (typeof trace.codexHome === 'string') { try { trace.codexConfig = fs.readFileSync(join(trace.codexHome, 'config.toml'), 'utf8').slice(0, 4000) } catch (e) { trace.codexConfig = String(e) } }
+        fs.appendFileSync('/tmp/codex-probe-trace.jsonl', JSON.stringify(trace) + '\n')
+      } catch {}
+    }
+    const timer = setTimeout(() => { mark('at9500'); trace.snapshotAt9500 = 'pending' }, 9_500)
     try {
-      native = new CodexContextTransfer(await this.spawner(this.opts.bin, args, { signal: bounded, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: effectiveEnv }), undefined, bounded, () => {})
+      const spawned = await this.spawner(this.opts.bin, args, { signal: bounded, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: effectiveEnv })
+      mark('spawned'); trace.childPid = spawned.child.pid
+      spawned.child.once('spawn', () => mark('spawnEvent'))
+      spawned.child.stdout?.once('data', () => mark('firstStdout'))
+      spawned.child.stderr?.on('data', (chunk: Buffer) => { if (!trace.firstStderr) mark('firstStderr'); stderrText += chunk.toString() })
+      spawned.child.once('exit', (code, sig) => { mark('exit'); trace.exitCode = code; trace.exitSignal = sig })
+      native = new CodexContextTransfer(spawned, undefined, bounded, () => {})
       await native.initialize()
+      mark('initialized')
       const facts = await native.readNativeFacts(cwd)
+      mark('facts'); clearTimeout(timer); flush('ok')
       if (effectiveEnv.CODEX_API_KEY?.trim()) Object.assign(facts, { status: 'configured', authMode: 'api_key', fix: process.env.CODEX_API_KEY === effectiveEnv.CODEX_API_KEY ? 'unset CODEX_API_KEY' : 'codex login status' })
       if (effectiveEnv.OPENAI_BASE_URL || effectiveEnv.CODEX_ACCESS_TOKEN) Object.assign(facts, { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' })
       return facts
     } catch (error) {
+      clearTimeout(timer); mark('failed'); trace.error = String(error); flush('error')
       throw bounded.aborted && !signal?.aborted ? new Error(`Codex subscription probe exceeded its own ${timeoutMs / 1000} s timeout`, { cause: error }) : error
     } finally { await native?.close() }
   }
