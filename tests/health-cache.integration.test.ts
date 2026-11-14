@@ -43,30 +43,30 @@ test('real HTTP health caches faults, shares pending native probes, recovers and
   try {
     const missing = join(directory, 'recoverable-agent')
     const health = await open('real-acp', missing)
-    const baseline = hostExecutorSnapshot().probes
+    const baseline = hostExecutorSnapshot().probes_started
     const cold = await health.get()
     expect(cold.status).toBe(503)
     expect(cold.health.cached).toBe(false)
-    expect(hostExecutorSnapshot().probes - baseline).toBe(1)
+    expect(hostExecutorSnapshot().probes_started - baseline).toBe(1)
     for (let i = 0; i < 3; i++) {
       const warm = await health.get()
       expect(warm.health).toMatchObject({ state: cold.health.state, cached: true, probed_at: cold.health.probed_at })
     }
-    expect(hostExecutorSnapshot().probes - baseline).toBe(1)
+    expect(hostExecutorSnapshot().probes_started - baseline).toBe(1)
     const forcedFault = await health.get('?force=1')
     expect(forcedFault.status).toBe(503)
     expect(forcedFault.health.cached).toBe(false)
-    expect(hostExecutorSnapshot().probes - baseline).toBe(2)
+    expect(hostExecutorSnapshot().probes_started - baseline).toBe(2)
     // The agent appears, and its next real --version probe stays open on `hold`.
     await writeFile(hold, '')
     await writeFile(missing, `#!${process.execPath}
 const wait = setInterval(() => { if (!require('node:fs').existsSync(${JSON.stringify(hold)})) { clearInterval(wait); console.log(process.version) } }, 10)
 `, { mode: 0o755 })
     await delay(220)
-    const beforeRefresh = hostExecutorSnapshot().probes
+    const beforeRefresh = hostExecutorSnapshot().probes_started
     const concurrent = await Promise.all(Array.from({ length: 12 }, () => health.get()))
     expect(concurrent.every((result) => result.health.cached && result.health.probed_at === forcedFault.health.probed_at)).toBe(true)
-    expect(hostExecutorSnapshot().probes - beforeRefresh).toBe(1)
+    expect(hostExecutorSnapshot().probes_started - beforeRefresh).toBe(1)
     expect(hostExecutorSnapshot()).toMatchObject({ in_flight: 0, probes_in_flight: 1 })
     const started = performance.now()
     expect((await health.get()).health.cached).toBe(true)
@@ -74,32 +74,32 @@ const wait = setInterval(() => { if (!require('node:fs').existsSync(${JSON.strin
     const beforeForced = health.forces()
     const forceA = health.get('?force=1'), forceB = health.get('?force=1')
     await until(() => health.forces() === beforeForced + 2)
-    expect(hostExecutorSnapshot().probes - beforeRefresh).toBe(1)
+    expect(hostExecutorSnapshot().probes_started - beforeRefresh).toBe(1)
     await rm(hold)
     const [recovered, shared] = await Promise.all([forceA, forceB])
     expect(recovered.status).toBe(200)
     expect(recovered.health).toMatchObject({ state: 'ready', cached: false, version: process.version })
     expect(shared.health).toEqual(recovered.health)
-    expect(hostExecutorSnapshot().probes - beforeRefresh).toBe(1)
+    expect(hostExecutorSnapshot().probes_started - beforeRefresh).toBe(1)
     expect((await health.get()).health).toMatchObject({ cached: true, probed_at: recovered.health.probed_at })
-    expect(hostExecutorSnapshot().probes - beforeRefresh).toBe(1)
+    expect(hostExecutorSnapshot().probes_started - beforeRefresh).toBe(1)
     await health.get('?force=1')
-    expect(hostExecutorSnapshot().probes - beforeRefresh).toBe(2)
+    expect(hostExecutorSnapshot().probes_started - beforeRefresh).toBe(2)
 
     process.env.BRIDGE_HEALTH_CACHE_MS = '0'
     process.env.BRIDGE_HEALTH_NEGATIVE_CACHE_MS = '0'
     const disabledBin = join(directory, 'uncached-agent')
     const disabled = await open('uncached-acp', disabledBin)
-    const beforeDisabled = hostExecutorSnapshot().probes
+    const beforeDisabled = hostExecutorSnapshot().probes_started
     for (let i = 0; i < 3; i++) expect((await disabled.get()).health.cached).toBe(false)
-    expect(hostExecutorSnapshot().probes - beforeDisabled).toBe(3)
+    expect(hostExecutorSnapshot().probes_started - beforeDisabled).toBe(3)
     await symlink(process.execPath, disabledBin)
     for (let i = 0; i < 2; i++) expect((await disabled.get()).health).toMatchObject({ state: 'ready', cached: false })
-    expect(hostExecutorSnapshot().probes - beforeDisabled).toBe(5)
+    expect(hostExecutorSnapshot().probes_started - beforeDisabled).toBe(5)
   } finally {
     await rm(hold, { force: true })
     for (const server of servers) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
-    await until(() => hostExecutorSnapshot().probes_in_flight === 0)
+    await until(() => hostExecutorSnapshot().in_flight === 0 && hostExecutorSnapshot().queued === 0 && hostExecutorSnapshot().probes_in_flight === 0)
     for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key] }
     await rm(directory, { recursive: true, force: true })
   }

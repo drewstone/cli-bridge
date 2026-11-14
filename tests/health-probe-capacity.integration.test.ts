@@ -36,6 +36,8 @@ test('background fault refreshes leave every executor slot to workload and repor
   const directory = await mkdtemp(join(tmpdir(), 'bridge-probe-capacity-'))
   const hold = join(directory, 'hold')
   const max = hostExecutorSnapshot().max
+  expect(max).toBeGreaterThan(0)
+  expect(max).toBeLessThanOrEqual(8)
   // A real CLI that fails its probe, held open while `hold` exists.
   const bins = Array.from({ length: max }, (_, i) => join(directory, `failing-agent-${i}`))
   for (const bin of bins) {
@@ -79,7 +81,7 @@ const wait = setInterval(() => { if (!fs.existsSync(${JSON.stringify(hold)})) { 
   } finally {
     await rm(hold, { force: true })
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
-    await until(() => hostExecutorSnapshot().in_flight === 0 && !hostExecutorSnapshot().probes_in_flight)
+    await until(() => hostExecutorSnapshot().in_flight === 0 && hostExecutorSnapshot().queued === 0 && !hostExecutorSnapshot().probes_in_flight)
     for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key] }
     await rm(directory, { recursive: true, force: true })
   }

@@ -128,7 +128,7 @@ class HostSemaphore {
       acquires: this.acquires,
       timeouts: this.timeouts,
       probes_in_flight: hostProbes.inFlight,
-      probes: hostProbes.started,
+      probes_started: hostProbes.started,
     }
   }
 }
@@ -177,7 +177,7 @@ export interface HostExecutorSnapshot {
   timeouts: number
   /** Health probes running outside the slots above; see `SpawnOpts.probe`. */
   probes_in_flight: number
-  probes: number
+  probes_started: number
 }
 
 /** Shared by the scoped-host executor, whose refusal is the same condition. */

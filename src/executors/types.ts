@@ -116,8 +116,9 @@ export interface SpawnOpts {
    */
   acquireDeadlineMs?: number
   /**
-   * A bounded health probe (`<bin> --version`), not a workload. Host executors
-   * spawn it without a capacity slot and report it as `probes_in_flight`: a
+   * A bounded health probe (`<bin> --version`), not a workload. The host and
+   * scoped-host executors spawn it without a capacity slot, and the host
+   * executor reports it as `probes_in_flight`: a
    * slot it held made `/health` count the bridge's own probes as load, and a
    * spawn preflight refused a box with no workload at all.
    */
