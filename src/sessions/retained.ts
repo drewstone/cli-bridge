@@ -150,14 +150,18 @@ export class RetainedSessionService {
   async capabilities(
     model: string,
     signal?: AbortSignal,
-  ): Promise<AgentEnvironmentCapabilities & { toolCallSpans?: true }> {
+  ): Promise<AgentEnvironmentCapabilities & { toolCallSpans?: true; modelReroutes?: true }> {
     const { backend, capabilities } = await readyBackendCapabilities({
       registry: this.registry,
       model,
       healthProbeTimeoutMs: this.healthProbeTimeoutMs,
       signal,
     })
-    return backend.toolCallSpans ? { ...capabilities, toolCallSpans: true } : capabilities
+    return {
+      ...capabilities,
+      ...(backend.toolCallSpans ? { toolCallSpans: true } : {}),
+      ...(backend.modelReroutes ? { modelReroutes: true } : {}),
+    }
   }
 
   async create(input: RetainedCreateInput, signal?: AbortSignal): Promise<RetainedSessionView> {

@@ -54,6 +54,8 @@ export interface CodexBackendOptions {
 export class CodexBackend implements Backend {
   readonly name = 'codex'
   readonly defaultExecutionTimeoutMs: number
+  // Codex names the served model only when it differs from the request (ModelReroute).
+  readonly modelReroutes = true
   private readonly spawner: Spawner
   private authPreparationTail: Promise<void> = Promise.resolve()
   private nativeImportProtocolQualified = false

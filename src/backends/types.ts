@@ -633,6 +633,8 @@ export interface Backend {
    * agent-runtime runs `modelSilenceMs` only on a route that declares it.
    */
   readonly toolCallSpans?: boolean
+  /** The stream yields provider_models when the provider reports serving a different model than requested. Served as `modelReroutes` on `/v1/capabilities`. */
+  readonly modelReroutes?: boolean
 
   /** Does this backend want to handle requests for `model`? */
   matches(model: string): boolean
