@@ -35,4 +35,5 @@ test('published cli-bridge provider discovers the default codex capability docum
   const extended = await fetch(`${route}&include=modelReroutes`, { headers })
   assert.equal(extended.status, 200)
   assert.equal((await extended.json() as Record<string, unknown>).modelReroutes, true)
+  assert.equal((await fetch(`${route}&include=everything`, { headers })).status, 400)
 })

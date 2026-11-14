@@ -1,6 +1,6 @@
 import { once } from 'node:events'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import Database from 'better-sqlite3'
 import { join } from 'node:path'
@@ -10,8 +10,6 @@ import type { Backend, BackendHealth, ChatDelta, ChatRequest, NativeSession, Nat
 import type { SessionRecord, SessionStore } from '../src/sessions/store.js'
 import { SessionStore as SqliteSessionStore } from '../src/sessions/store.js'
 import { RunRegistry, RunShutdownTimeoutError } from '../src/runs/registry.js'
-import { CodexBackend } from '../src/backends/codex.js'
-import { hostSpawner } from '../src/executors/host.js'
 import { mountRuns } from '../src/routes/runs.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import {
@@ -1082,21 +1080,6 @@ describe('retained Agent Interface sessions', () => {
     expect(capabilities).not.toHaveProperty('interactions')
     expect(capabilities).not.toHaveProperty('toolCallSpans')
     expect(capabilities).not.toHaveProperty('modelReroutes')
-  })
-
-  it('declares modelReroutes for the codex route, whose stream reports a provider reroute', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'bridge-codex-capabilities-'))
-    const bin = join(dir, 'codex')
-    writeFileSync(bin, `#!${process.execPath}\nprocess.stdout.write('codex-cli 0.167.2\\n')\n`)
-    chmodSync(bin, 0o755)
-    try {
-      fixture = setup(new CodexBackend({ bin, timeoutMs: 0, spawner: hostSpawner }))
-      const response = await fixture.app.request('/v1/capabilities?model=codex%2Fgpt-5.1-codex')
-      expect(response.status).toBe(200)
-      expect(await json(response)).toMatchObject({ modelReroutes: true })
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
   })
 
   it('declares toolCallSpans only for a backend whose stream reports a call at its start and end', async () => {
