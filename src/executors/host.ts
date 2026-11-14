@@ -127,9 +127,13 @@ class HostSemaphore {
       max_acquire_deadline_ms: this.maxAcquireDeadlineMs,
       acquires: this.acquires,
       timeouts: this.timeouts,
+      probes_in_flight: hostProbes.inFlight,
+      probes_started: hostProbes.started,
     }
   }
 }
+
+const hostProbes = { inFlight: 0, started: 0 }
 
 /**
  * One saturation refusal, worded so the existing prose signature survives.
@@ -171,6 +175,9 @@ export interface HostExecutorSnapshot {
   max_acquire_deadline_ms: number
   acquires: number
   timeouts: number
+  /** Health probes running outside the slots above; see `SpawnOpts.probe`. */
+  probes_in_flight: number
+  probes_started: number
 }
 
 /** Shared by the scoped-host executor, whose refusal is the same condition. */
@@ -190,7 +197,8 @@ const hostSemaphore = new HostSemaphore(
 )
 
 export const hostSpawner: Spawner = async (bin, args, opts) => {
-  await hostSemaphore.acquire(opts.acquireDeadlineMs, opts.signal)
+  if (opts.probe) { hostProbes.inFlight += 1; hostProbes.started += 1 }
+  else await hostSemaphore.acquire(opts.acquireDeadlineMs, opts.signal)
   let released = false
   let releaseRequested = false
   let jailCleanup: (() => Promise<void> | void) | undefined
@@ -217,7 +225,8 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     await terminate()
     if (!released) {
       released = true
-      hostSemaphore.release()
+      if (opts.probe) hostProbes.inFlight -= 1
+      else hostSemaphore.release()
     }
     if (jailCleanup) await jailCleanup()
   }

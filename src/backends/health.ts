@@ -189,6 +189,7 @@ export async function versionHealth(
     }
     const spawned = await spawner(bin, ['--version'], {
       stdio: ['ignore', 'pipe', 'pipe'],
+      probe: true,
       ...(signal ? { signal } : {}),
       // Spawn where a cwd-less REQUEST spawns. Passing no cwd is what let the
       // probe skip the executor's workspace assertion and run in the image's

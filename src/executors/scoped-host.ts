@@ -454,8 +454,9 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   }
 
   const admissionClass = opts.admissionClass ?? 'bulk'
-  await scopedSemaphore.acquire(admissionClass, opts.acquireDeadlineMs, opts.signal)
-  let semaphoreReleased = false
+  // A health probe takes no workload slot; see `SpawnOpts.probe`.
+  if (!opts.probe) await scopedSemaphore.acquire(admissionClass, opts.acquireDeadlineMs, opts.signal)
+  let semaphoreReleased = opts.probe === true
   const releaseSemaphore = (): void => {
     if (semaphoreReleased) return
     semaphoreReleased = true

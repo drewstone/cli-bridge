@@ -56,7 +56,8 @@ export interface MountHealthOptions {
  *
  * A slot is held for the life of the spawned PROCESS. For a retained backend
  * (pi) that is one live SESSION, idle turns included — so `max` is a ceiling on
- * concurrent live sessions, not on concurrent turns.
+ * concurrent live sessions, not on concurrent turns. This route's own
+ * `--version` probes hold no slot; they appear as `probes_in_flight`.
  */
 function executorSnapshot(): Record<string, unknown> {
   return {
@@ -177,21 +178,6 @@ export interface ReportedHealth extends BackendHealth {
   probed_at: string
   cached: boolean
 }
-
-/**
- * Run `backend.health()` with a hard ceiling. If the underlying probe
- * exceeds `timeoutMs` (which happens when the CLI spawn wedges under
- * heavy load or the binary's I/O stalls), short-circuit to a synthetic
- * `error` result. The actual spawn is left running — caller policy is
- * "report and move on"; an orphan `--version` subprocess is bounded
- * by the OS reaping it after its own `_exit()`. We do NOT use this as
- * a vehicle to forcibly kill the spawn — the cost of killing a
- * legitimately-slow probe is worse than letting it complete in the
- * background.
- *
- * Exported for tests.
- */
-export { boundedProbe }
 
 function resolveEnvMs(key: string, fallback: number): number {
   const raw = process.env[key]
