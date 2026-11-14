@@ -38,12 +38,12 @@ it.skipIf(!new LinuxBwrapJail().isAvailable())('a subscriptions-only codex probe
     mcpSecrets: { async get(key) { return key === 'tool' ? 'private-tool-token-5f0c2b7e9a14d3c8' : undefined } } })
   const lifetime = new AbortController()
   try {
-    server.registerPrivateMcpEndpoint({ runId: 'probe-run', url, paths: { '': ['POST', 'GET', 'DELETE'] }, signal: lifetime.signal })
     const elapsed: number[] = []
     for (let run = 0; run < 5; run++) {
+      server.registerPrivateMcpEndpoint({ runId: `probe-run-${run}`, url, paths: { '': ['POST', 'GET', 'DELETE'] }, signal: lifetime.signal })
       const started = performance.now()
       const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer probe' },
-        body: JSON.stringify({ model: 'codex/probe-fixture', run_id: 'probe-run', session_id: `probe-${run}`, cwd, messages: [{ role: 'user', content: 'answer' }],
+        body: JSON.stringify({ model: 'codex/probe-fixture', run_id: `probe-run-${run}`, session_id: `probe-${run}`, cwd, messages: [{ role: 'user', content: 'answer' }],
           agent_profile: { name: 'probe-fixture', harness: 'codex', model: { provider: 'openai', default: 'probe-fixture' } },
           runtime_attachments: { mcp: { custom: { transport: 'http', url, headers: { Authorization: { kind: 'secret-ref', key: 'tool', format: 'bearer' } } } } } }) })
       const text = await response.text()
