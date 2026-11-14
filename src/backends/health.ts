@@ -220,7 +220,9 @@ export async function versionHealth(
       }
     })
     if (onAbort) signal?.removeEventListener('abort', onAbort)
-    if ('aborted' in closed) {
+    // Node answers its own `signal` with an AbortError on the child before the
+    // group is gone, so any abort, however reported, waits for terminate.
+    if ('aborted' in closed || signal?.aborted) {
       await spawned.terminate?.().catch(() => {})
       return { name, state: 'error', detail: 'health probe aborted' }
     }
