@@ -78,7 +78,7 @@ export class CodexBackend implements Backend {
   /** The existing app-server transport reads the exact native route; it never creates a thread or turn. */
   readonly readCatalog: CodexCatalogReader = async ({ model, cwd, env, flags, signal }): Promise<NativeModelFacts> => {
     if (this.spawner.executionEnvironment !== 'host') return { provider: null, status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' }
-    const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10_000)])
+    const timeoutMs = 10_000, bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(timeoutMs)])
     const args = ['app-server', '--listen', 'stdio://']
     const selection = splitCodexModel(this.extractModel(model))
     if (selection.provider && selection.provider !== this.name) args.push('-c', `model_provider=${JSON.stringify(selection.provider)}`)
@@ -87,15 +87,17 @@ export class CodexBackend implements Backend {
     const effectiveEnv = sanitizeHostEnv(env, cwd)!
     // Pin the same native home as execution; a PATH wrapper must not allocate another account for a probe.
     effectiveEnv.CODEX_HOME ??= effectiveEnv.HOME ? join(effectiveEnv.HOME, '.codex') : undefined
-    const spawned = await this.spawner(this.opts.bin, args, { signal: bounded, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: effectiveEnv })
-    const native = new CodexContextTransfer(spawned, undefined, bounded, () => {})
+    let native: CodexContextTransfer | undefined
     try {
+      native = new CodexContextTransfer(await this.spawner(this.opts.bin, args, { signal: bounded, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: effectiveEnv }), undefined, bounded, () => {})
       await native.initialize()
       const facts = await native.readNativeFacts(cwd)
       if (effectiveEnv.CODEX_API_KEY?.trim()) Object.assign(facts, { status: 'configured', authMode: 'api_key', fix: process.env.CODEX_API_KEY === effectiveEnv.CODEX_API_KEY ? 'unset CODEX_API_KEY' : 'codex login status' })
       if (effectiveEnv.OPENAI_BASE_URL || effectiveEnv.CODEX_ACCESS_TOKEN) Object.assign(facts, { status: 'unknown', authMode: 'unknown', source: 'native_status', fix: 'codex login status' })
       return facts
-    } finally { await native.close() }
+    } catch (error) {
+      throw bounded.aborted && !signal?.aborted ? new Error(`Codex subscription probe exceeded its own ${timeoutMs / 1000} s timeout`, { cause: error }) : error
+    } finally { await native?.close() }
   }
 
   contextTransferAvailable(): boolean {
