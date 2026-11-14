@@ -99,6 +99,14 @@ const scenarios: Scenario[] = [
   // An agent that explains itself before its settle fence (factory run 70dbfcba): the last json fence is the result.
   { name: 'prose-before-json-fence', terminal: true, exitCode: 0,
     frame: (json) => `Draft:\n\n\`\`\`json\n{"draft": true}\n\`\`\`\n\nI'm rejecting this one: the draft was wrong.\n\n\`\`\`json\n${json}\n\`\`\`` },
+  // A plan node that settled with a bare object after its prose (factory-episodes-v4, agent-container
+  // 18475 and 18871): the object on the last line is the result. Prose redacted, layout kept.
+  { name: 'prose-before-bare-json', terminal: true, exitCode: 0,
+    frame: (json) => `I checked main at abc1234, and the issue still holds there.\n\n- **Where:** \`setup\` in \`scripts/a.sh\` sets {it} once.\n- **Why:** the update path never calls it.\n\nThe plan below changes two files.\n\n${json}` },
+  { name: 'json-fence-beats-trailing-object', terminal: true, exitCode: 0,
+    frame: (json) => `Plan:\n\n\`\`\`json\n${json}\n\`\`\`\n\n{"draft": true}` },
+  { name: 'line-start-object-before-prose', terminal: true, exitCode: 0,
+    finalText: 'Verdict:\n{"approved": false}\nThat is my answer.', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'bare-json-in-prose', terminal: true, exitCode: 0, finalText: 'Verdict: {"approved": false}', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'invalid-final-json', terminal: true, exitCode: 0, finalText: 'native result is not JSON', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'late-model-refusal', terminal: true, exitCode: 7, diagnostic: 'unknown model: protocol-fixture-model', failureType: 'MODEL_NOT_FOUND' },
