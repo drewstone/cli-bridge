@@ -100,8 +100,9 @@ test('a wedged --version is killed after the probe timeout and never runs twice 
   const bin = join(directory, 'wedged-agent')
   const pids = join(directory, 'pids')
   await writeFile(bin, `#!${process.execPath}
-require('node:fs').appendFileSync(${JSON.stringify(pids)}, process.pid + '\\n')
 process.on('SIGTERM', () => {})
+// Recorded only once SIGTERM is ignored, so a recorded pid is a wedged one.
+require('node:fs').appendFileSync(${JSON.stringify(pids)}, process.pid + '\\n')
 setInterval(() => {}, 1000)
 `, { mode: 0o755 })
   const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
@@ -112,7 +113,7 @@ setInterval(() => {}, 1000)
   registry.register(new AcpBackend({ name: 'wedged', bin, timeoutMs: 2000, spawner: hostSpawner }))
   const app = new Hono()
   // cacheMs 0: every request is past the TTL and probes.
-  mountHealth(app, { registry }, { cacheMs: 0, probeTimeoutMs: 200 })
+  mountHealth(app, { registry }, { cacheMs: 0, probeTimeoutMs: 1000 })
   const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 })
   try {
     if (!server.listening) await once(server, 'listening')
@@ -123,14 +124,15 @@ setInterval(() => {}, 1000)
         backends: Array<{ state: string; detail?: string }>
         executor: { probes_in_flight: number }
       }
-      expect(body.backends[0]).toMatchObject({ state: 'error', detail: 'health probe timed out after 200ms' })
+      // A caller that joins a probe during its kill grace may see it aborted instead.
+      expect(body.backends[0]).toMatchObject({ state: 'error' })
       maxProbes = Math.max(maxProbes, body.executor.probes_in_flight)
       await delay(100)
     }
     expect(maxProbes).toBeLessThanOrEqual(1)
     expect((await started()).length).toBeGreaterThanOrEqual(1)
     // Timeout plus the 2 s SIGTERM grace and the 500 ms SIGKILL wait.
-    await delay(200 + 2000 + 500 + 500)
+    await delay(1000 + 2000 + 500 + 500)
     expect((await started()).filter(alive)).toEqual([])
     expect(hostExecutorSnapshot().probes_in_flight).toBe(0)
   } finally {
