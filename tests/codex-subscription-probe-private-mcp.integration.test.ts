@@ -12,10 +12,11 @@ const codex = String.raw`
 const fs=require('node:fs');
 if(process.argv.includes('--version')){console.log('codex-cli 0.164.0');process.exit(0)}
 if(process.argv.includes('app-server')){
- fs.appendFileSync('app-server-probes','started\n');
  require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);if(r.id===undefined)return;
   const result=r.method==='config/read'?{config:{model_provider:'openai',model:'probe-fixture'},origins:{}}:r.method==='account/read'?{account:{type:'chatgpt'},requiresOpenaiAuth:true}:{};
-  process.stdout.write(JSON.stringify({id:r.id,result})+'\n')});
+  process.stdout.write(JSON.stringify({id:r.id,result})+'\n');
+  // The probe's last request: record the span from this process's start to its answer.
+  if(r.method==='account/read')fs.appendFileSync('app-server-probe-ms',Math.round(Date.now()-performance.timeOrigin)+'\n')});
 }else if(process.argv.includes('exec')){
  const id='00000000-0000-4000-8000-0000000000'+String(Date.now()%100).padStart(2,'0');
  for(const event of [{type:'thread.started',thread_id:id},{type:'item.completed',item:{type:'agent_message',text:'probe-answered'}},{type:'turn.completed',usage:{input_tokens:0,output_tokens:0}}])console.log(JSON.stringify(event));
@@ -51,9 +52,10 @@ it.skipIf(!new LinuxBwrapJail().isAvailable())('a subscriptions-only codex probe
       expect(response.status, text).toBe(200)
       expect(text).toContain('probe-answered')
     }
-    console.log(`codex probe with private MCP: request ms ${elapsed.join(', ')}`)
-    expect(Math.max(...elapsed)).toBeLessThan(2_000)
-    expect((await readFile(join(cwd, 'app-server-probes'), 'utf8')).split('\n').filter(Boolean).length).toBeGreaterThanOrEqual(5)
+    const probes = (await readFile(join(cwd, 'app-server-probe-ms'), 'utf8')).split('\n').filter(Boolean).map(Number)
+    console.log(`codex probe with private MCP: probe ms ${probes.join(', ')}; request ms ${elapsed.join(', ')}`)
+    expect(probes.length).toBeGreaterThanOrEqual(5)
+    expect(Math.max(...probes)).toBeLessThan(2_000)
   } finally {
     lifetime.abort(); await server.close(); await new Promise<void>((resolve) => tool.close(() => resolve())); await rm(root, { recursive: true, force: true })
   }
