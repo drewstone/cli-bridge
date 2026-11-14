@@ -13,16 +13,18 @@ export class FinalOutput {
   }
 
   result(required: boolean): { final_output: unknown } | undefined {
-    const text = (this.native ?? this.text).trim().replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, '$1')
-    try {
-      const value: unknown = JSON.parse(text)
-      if (required && (!value || typeof value !== 'object' || Array.isArray(value)))
-        throw new Error('JSON object required')
-      return { final_output: value }
-    } catch {
-      if (required)
-        throw new BackendReportedFailureError('Harness completed without a final JSON object', 'HARNESS_OUTPUT_INVALID')
-      return undefined
+    const text = (this.native ?? this.text).trim()
+    const whole = text.replace(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i, '$1')
+    // Agents often explain themselves before the settle fence; the last json fence is the answer.
+    const fenced = [...text.matchAll(/```json[ \t]*\n([\s\S]*?)\n```/gi)].at(-1)?.[1]
+    for (const candidate of fenced === undefined ? [whole] : [whole, fenced]) {
+      let value: unknown
+      try { value = JSON.parse(candidate) } catch { continue }
+      if (!required || (value && typeof value === 'object' && !Array.isArray(value))) return { final_output: value }
+      break
     }
+    if (required)
+      throw new BackendReportedFailureError('Harness completed without a final JSON object', 'HARNESS_OUTPUT_INVALID')
+    return undefined
   }
 }
