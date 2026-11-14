@@ -118,6 +118,7 @@ export class RetainedSessionState {
           admission.requestDigest,
           admission.sessionId,
           { provider: admission.provider, environmentId: admission.environmentId },
+          'model' in persisted ? persisted.model : undefined,
         )
   }
 
@@ -200,8 +201,10 @@ export function unknownRunSnapshot(
   requestDigest: string,
   sessionId: string,
   coordinates: RetainedRunCoordinates,
+  model?: unknown,
 ): DurableRetainedRunSnapshot {
   return {
+    ...(typeof model === 'string' && model ? { model } : {}),
     id: runId,
     executionId,
     requestDigest,
@@ -241,7 +244,7 @@ export function retainedRunSnapshot(
     )
   }
   if (value.status === 'unknown') {
-    return unknownRunSnapshot(runId, executionId, requestDigest, sessionId, coordinates)
+    return unknownRunSnapshot(runId, executionId, requestDigest, sessionId, coordinates, value.model)
   }
   return {
     ...structuredClone(value),

@@ -90,7 +90,7 @@ export function mountRuns(app: Hono, deps: {
         return streamChatDeltaEvents(
           c,
           (signal) => retainedChatDeltas(retained.runEvents(id, cursor.value, signal)),
-          'cli-bridge',
+          'model' in retainedSnapshot ? retainedSnapshot.model : undefined,
         )
       }
       return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))
@@ -104,13 +104,6 @@ export function mountRuns(app: Hono, deps: {
         if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
         return retainedRunError(c, error)
       }
-      if (deps.retainedStore?.getRetainedRun(id)?.owner === 'one-shot') {
-        return streamChatDeltaEvents(
-          c,
-          (signal) => retainedChatDeltas(retained.runEvents(id, cursor.value, signal)),
-          'cli-bridge',
-        )
-      }
       return streamRetainedRunEvents(c, (signal) => retained.runEvents(id, cursor.value, signal))
     }
     try {
@@ -119,8 +112,9 @@ export function mountRuns(app: Hono, deps: {
       if (error instanceof RunReplayCursorError) return replayCursorError(c, error)
       throw error
     }
-    setRunHeaders(c, run.snapshot())
-    return streamRunEvents(c, run, 'cli-bridge', cursor.value)
+    const snapshot = run.snapshot()
+    setRunHeaders(c, snapshot)
+    return streamRunEvents(c, run, snapshot.model, cursor.value)
   })
 
   // POST (not DELETE) — cancelling mutates the run's lifecycle and is the

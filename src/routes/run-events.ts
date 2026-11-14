@@ -48,7 +48,7 @@ export function resolveRunEventCursor(
 export function streamRunEvents(
   c: Context,
   run: Run,
-  model: string,
+  model: string | undefined,
   afterSeq: number,
 ): Response {
   return streamChatDeltaEvents(c, (signal) => run.attach(afterSeq, signal), model)
@@ -58,7 +58,7 @@ export function streamRunEvents(
 export function streamChatDeltaEvents(
   c: Context,
   source: (signal: AbortSignal) => AsyncIterable<{ seq: number; delta: import('../backends/types.js').ChatDelta }>,
-  model: string,
+  model: string | undefined,
 ): Response {
   return streamSSE(c, async (stream) => {
     const meta = makeChunkMeta(model)

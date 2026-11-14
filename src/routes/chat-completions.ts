@@ -818,6 +818,7 @@ export function mountChatCompletions(
       const runEnvironmentId = exactCoordinates.value?.environmentId ?? ENVIRONMENT_ID
       claim = deps.runs.claim(runId, requestDigest, {
         owner: 'one-shot',
+        model: req.model,
         provider: runProvider,
         environmentId: runEnvironmentId,
         sessionId: runSessionId,
@@ -1326,6 +1327,7 @@ function persistedOneShotSnapshot(admission: RetainedRunAdmission) {
         admission.requestDigest,
         admission.sessionId,
         { provider: admission.provider, environmentId: admission.environmentId },
+        'model' in persisted ? persisted.model : undefined,
       )
 }
 

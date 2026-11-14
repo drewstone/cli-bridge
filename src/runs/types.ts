@@ -30,6 +30,8 @@ export interface RunClaimOptions {
   executionId?: string
   provider?: string
   environmentId?: string
+  /** The request's model; replay frames carry it as the live stream did. */
+  model?: string
   commitDelta?: (input: { runId: string; sequence: number; delta: ChatDelta }) => void | Promise<void>
   commitSnapshot?: (snapshot: RunSnapshot) => void | Promise<void>
   commitCanonicalEvent?: (input: {
@@ -95,6 +97,7 @@ export interface RunSnapshot {
   identityExpiresAt: number | null
   provider?: string
   environmentId?: string
+  model?: string
   sessionId?: string
   executionId?: string
   canonicalLastSeq: number

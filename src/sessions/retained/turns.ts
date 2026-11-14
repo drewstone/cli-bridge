@@ -307,6 +307,7 @@ export class RetainedTurnRunner {
     try {
       claim = this.runs.claim(runId, requestDigest, {
         owner: 'retained',
+        model: retained.model,
         sessionId: id,
         executionId,
         provider: providerName,
@@ -345,7 +346,7 @@ export class RetainedTurnRunner {
         snapshot: unknownRunSnapshot(runId, executionId, requestDigest, id, {
           provider: providerName,
           environmentId,
-        }),
+        }, retained.model),
       })
     } catch (error) {
       if (claim.created) this.runs.releaseClaim(runId, claim.run)
@@ -529,7 +530,7 @@ export class RetainedTurnRunner {
     )
     const snapshot = persisted.terminal
       ? persisted
-      : unknownRunSnapshot(runId, admission.executionId, requestDigest, retained.id, coordinates)
+      : unknownRunSnapshot(runId, admission.executionId, requestDigest, retained.id, coordinates, 'model' in persisted ? persisted.model : retained.model)
     if (!persisted.terminal) {
       this.store.updateRetainedRun(runId, requestDigest, snapshot)
       this.store.updateRetained(retained.id, { status: 'unknown', runId })
