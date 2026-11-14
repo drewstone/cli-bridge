@@ -228,6 +228,9 @@ importers:
       '@tangle-network/agent-profile-materialize':
         specifier: 1.1.72
         version: 1.1.72(@tangle-network/agent-interface@5.10.21)
+      '@tangle-network/agent-provider-cli-bridge':
+        specifier: 2.0.15
+        version: 2.0.15(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
       '@tangle-network/agent-runtime':
         specifier: 10.0.0
         version: 10.0.0(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(@tangle-network/agent-eval@1.0.29(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7)))(@tangle-network/agent-interface@5.10.21)(@tangle-network/sandbox@1.0.393(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7)))
@@ -620,6 +623,10 @@ packages:
     peerDependencies:
       '@tangle-network/agent-interface': 5.10.21
 
+  '@tangle-network/agent-provider-cli-bridge@2.0.15':
+    resolution: {integrity: sha512-sN0SXORBjEIXcl08mTZ+9k9wICBviPaL8kzNhttemQoPQ7EiYuFoIlDnT7jfLtnmOcr6psMWCduVpIQaI6Q+RA==}
+    engines: {node: '>=22.19.0'}
+
   '@tangle-network/agent-runtime@10.0.0':
     resolution: {integrity: sha512-PJAP/ZE+HCI0+I0eHlH4XUCgU/qPJ42HsY3t/lHBEnecLUpPIgxMQj4pIUQLsVm43ziJAAWbCTtbzXpAjUjmxg==}
     engines: {node: '>=22.19.0'}
@@ -637,6 +644,9 @@ packages:
 
   '@tangle-network/agent-trace-contract@2.2.2':
     resolution: {integrity: sha512-46CGFTHw1E+Fvykjdf3tS0ysQugv+DdM9TptHjALVeFzO+Z4Baiw6XWJLYiP3fx/UEk3QCIiITD1qoPi8XfgkA==}
+
+  '@tangle-network/cli-agent-registry@0.15.86':
+    resolution: {integrity: sha512-njFUyTDjCN2TCXZfs0TzZfsEfokuVap47iNpAARIX+ks3tJZvBTKwsXrGdu8BWc1BwvgYNtOFNBbkJu3T3j1lQ==}
 
   '@tangle-network/harness-sessions@1.0.13':
     resolution: {integrity: sha512-eyEcSRHSy+iVRl4ekhrHUfM6uIOmLPOu8XXBFz4J0+UFfP6wOUlrTRF/+DhPU9hIV3Vuz2TsFzG0Mr8qsdn5vA==}
@@ -1125,6 +1135,9 @@ packages:
   jose@6.2.13:
     resolution: {integrity: sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==}
 
+  jose@6.2.15:
+    resolution: {integrity: sha512-qdF6ewcZARtef63fJ9AKKZPgxw+t7USH6HLXYcD4CrdmSvDp79rpJSPFEKc90QBeGS63u1KQtN2MZQHC0yDIzA==}
+
   json-schema-traverse@1.0.0:
     resolution: {integrity: sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug==}
 
@@ -1465,6 +1478,10 @@ packages:
 
   undici-types@8.9.0:
     resolution: {integrity: sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==}
+
+  undici@8.12.3:
+    resolution: {integrity: sha512-+fdndUTwBP86cVjihTp21hZHo7d6oj1c/47XPA3lL8mM0XHs+C4EkcjmgRsFnFk2f/UONGDy9ItBItmXsLOQHw==}
+    engines: {node: '>=22.19.0'}
 
   unpipe@1.0.0:
     resolution: {integrity: sha512-pjy2bYhSsufwWlKwPc+l3cN7+wuJlK6uz0YdJEOlQDbl6jo/YlPi4mb8agUkVC8BF7V8NuzeyPNqRksA3hztKQ==}
@@ -1836,6 +1853,16 @@ snapshots:
     dependencies:
       '@tangle-network/agent-interface': 5.10.21
 
+  '@tangle-network/agent-provider-cli-bridge@2.0.15(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))':
+    dependencies:
+      '@tangle-network/agent-core': 1.0.4(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))
+      '@tangle-network/agent-interface': 5.10.21
+      '@tangle-network/agent-profile-materialize': 1.1.72(@tangle-network/agent-interface@5.10.21)
+      '@tangle-network/cli-agent-registry': 0.15.86
+      undici: 8.12.3
+    transitivePeerDependencies:
+      - '@modelcontextprotocol/sdk'
+
   '@tangle-network/agent-runtime@10.0.0(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))(@tangle-network/agent-eval@1.0.29(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7)))(@tangle-network/agent-interface@5.10.21)(@tangle-network/sandbox@1.0.393(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7)))':
     dependencies:
       '@earendil-works/pi-codemode': 1.5.0
@@ -1861,6 +1888,12 @@ snapshots:
   '@tangle-network/agent-trace-contract@2.2.0': {}
 
   '@tangle-network/agent-trace-contract@2.2.2': {}
+
+  '@tangle-network/cli-agent-registry@0.15.86':
+    dependencies:
+      '@tangle-network/agent-interface': 5.10.21
+      jose: 6.2.15
+      zod: 4.6.7
 
   '@tangle-network/harness-sessions@1.0.13(@modelcontextprotocol/sdk@1.32.2(zod@4.6.7))':
     dependencies:
@@ -2302,6 +2335,8 @@ snapshots:
 
   jose@6.2.13: {}
 
+  jose@6.2.15: {}
+
   json-schema-traverse@1.0.0: {}
 
   json-schema-typed@8.0.2: {}
@@ -2679,6 +2714,8 @@ snapshots:
       '@typescript/typescript-win32-x64': 7.0.2
 
   undici-types@8.9.0: {}
+
+  undici@8.12.3: {}
 
   unpipe@1.0.0: {}
 

@@ -386,6 +386,12 @@ durable receipt here, and the bridge admits only the first turn that presents th
 exact transfer at the accepted coordinates; any other dispatch to that session is
 refused until that turn has completed.
 
+The default capability document carries only keys that agent-interface's strict
+`AgentEnvironmentCapabilitiesSchema` accepts. `modelReroutes: true` (the stream
+reports a provider reroute as `provider_models`; Codex routes) is served only on
+`GET /v1/capabilities?model=…&include=modelReroutes`; any other `include` value
+is refused with 400.
+
 HTTP receipt loss can replay an acknowledged import after restart. An uncertain
 native create or inject acknowledgement remains pending and is never repeated.
 Codex's public history projections do not expose the selected raw import before

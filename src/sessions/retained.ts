@@ -150,6 +150,7 @@ export class RetainedSessionService {
   async capabilities(
     model: string,
     signal?: AbortSignal,
+    include: { modelReroutes?: boolean } = {},
   ): Promise<AgentEnvironmentCapabilities & { toolCallSpans?: true; modelReroutes?: true }> {
     const { backend, capabilities } = await readyBackendCapabilities({
       registry: this.registry,
@@ -160,7 +161,7 @@ export class RetainedSessionService {
     return {
       ...capabilities,
       ...(backend.toolCallSpans ? { toolCallSpans: true } : {}),
-      ...(backend.modelReroutes ? { modelReroutes: true } : {}),
+      ...(include.modelReroutes && backend.modelReroutes ? { modelReroutes: true } : {}),
     }
   }
 

@@ -22,8 +22,14 @@ export function mountRetainedSessions(
     if (!model) {
       return c.json({ error: { message: 'model query parameter is required', type: 'invalid_request_error' } }, 400)
     }
+    // Default documents carry only keys the published strict capability schema accepts.
+    const include = (c.req.query('include') ?? '').split(',').filter(Boolean)
+    const unknown = include.filter(key => key !== 'modelReroutes')
+    if (unknown.length) {
+      return c.json({ error: { message: `unsupported include: ${unknown.join(',')}; supported: modelReroutes`, type: 'invalid_request_error' } }, 400)
+    }
     try {
-      return c.json(await service.capabilities(model, c.req.raw.signal))
+      return c.json(await service.capabilities(model, c.req.raw.signal, { modelReroutes: include.includes('modelReroutes') }))
     } catch (error) {
       return retainedError(c, error)
     }
