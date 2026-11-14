@@ -107,14 +107,16 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
 function credentialWriter(values: readonly string[], emit: (bytes: Buffer) => void) {
   const needles = [...new Set(values.flatMap(value => [value, JSON.stringify(value).slice(1, -1)]))]
     .filter(Boolean).map(value => Buffer.from(value)).sort((a, b) => b.length - a.length)
-  const keep = Math.max(0, ...needles.map(value => value.length - 1))
   let pending: Buffer = Buffer.alloc(0)
   return (chunk: Uint8Array, final = false) => {
     pending = Buffer.concat([pending, chunk])
-    const limit = final ? pending.length : Math.max(0, pending.length - keep)
     let at = 0, start = 0
-    while (at < limit) {
-      const match = needles.find(needle => pending.subarray(at, at + needle.length).equals(needle))
+    while (at < pending.length) {
+      const rest = pending.subarray(at)
+      // Hold only a tail that may still become a secret. A fixed-width hold kept each
+      // request/response reply's newline until exit, deadlocking interactive protocols.
+      if (!final && needles.some(needle => needle.length > rest.length && needle.subarray(0, rest.length).equals(rest))) break
+      const match = needles.find(needle => rest.subarray(0, needle.length).equals(needle))
       if (!match) { at++; continue }
       if (at > start) emit(pending.subarray(start, at))
       emit(Buffer.from('[redacted:MCP]'))
