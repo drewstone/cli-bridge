@@ -85,7 +85,7 @@ import {
 } from '../sessions/retained/contract.js'
 import { ENVIRONMENT_ID, RetainedSessionError } from '../sessions/retained/types.js'
 import { wireIdentifierSchema } from '../runs/identifiers.js'
-import { retainedRunSnapshot, unknownRunSnapshot } from '../sessions/retained/state.js'
+import { durableRunSnapshot, retainedRunSnapshot } from '../sessions/retained/state.js'
 import type { RetainedEventRecord } from '../sessions/store.js'
 import { chatDeltaFromRetainedEvent } from '../runs/persisted-chat-event.js'
 
@@ -1286,7 +1286,7 @@ async function respondFromPersistedRun(
   afterSeq: number,
   store: Pick<SessionStore, 'retainedEventsAfterRun'>,
 ): Promise<Response> {
-  const snapshot = persistedOneShotSnapshot(admission)
+  const snapshot = durableRunSnapshot(admission)
   try {
     assertPersistedReplayCursor(admission, afterSeq)
   } catch (error) {
@@ -1310,39 +1310,12 @@ async function respondFromPersistedRun(
   }
 }
 
-function persistedOneShotSnapshot(admission: RetainedRunAdmission) {
-  const persisted = retainedRunSnapshot(
-    admission.snapshot,
-    admission.runId,
-    admission.executionId,
-    admission.requestDigest,
-    admission.sessionId,
-    { provider: admission.provider, environmentId: admission.environmentId },
-  )
-  return persisted.terminal
-    ? persisted
-    : unknownRunSnapshot(
-        admission.runId,
-        admission.executionId,
-        admission.requestDigest,
-        admission.sessionId,
-        { provider: admission.provider, environmentId: admission.environmentId },
-        persisted.model,
-      )
-}
-
 function assertPersistedReplayCursor(
   admission: RetainedRunAdmission,
   afterSeq: number,
 ): void {
-  const persisted = retainedRunSnapshot(
-    admission.snapshot,
-    admission.runId,
-    admission.executionId,
-    admission.requestDigest,
-    admission.sessionId,
-    { provider: admission.provider, environmentId: admission.environmentId },
-  )
+  const persisted = retainedRunSnapshot(admission.snapshot, admission.runId, admission.executionId, admission.requestDigest,
+    admission.sessionId, { provider: admission.provider, environmentId: admission.environmentId })
   const lastSeq = 'lastSeq' in persisted ? persisted.lastSeq : 0
   const replay = 'replay' in persisted ? persisted.replay : undefined
   const firstAvailableSeq = replay?.firstAvailableSeq ?? 1
