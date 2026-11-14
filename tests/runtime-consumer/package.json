@@ -3,12 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsx --test bridge-cache-accounting.consumer.ts"
+    "test": "tsx --test bridge-cache-accounting.consumer.ts capability-discovery.consumer.ts"
   },
   "devDependencies": {
     "@tangle-network/agent-eval": "1.0.29",
     "@tangle-network/agent-interface": "5.10.21",
     "@tangle-network/agent-profile-materialize": "1.1.72",
+    "@tangle-network/agent-provider-cli-bridge": "2.0.15",
     "@tangle-network/agent-runtime": "10.0.0",
     "@tangle-network/sandbox": "1.0.393",
     "tsx": "^4.23.15"
