@@ -87,6 +87,8 @@ interface Scenario {
   frame?: (json: string) => string
   nativeError?: string
   signal?: NodeJS.Signals
+  /** The run does not require JSON: it succeeds, and a trailing object is not a final_output. */
+  optional?: true
 }
 const scenarios: Scenario[] = [
   { name: 'success', terminal: true, exitCode: 0 },
@@ -97,6 +99,16 @@ const scenarios: Scenario[] = [
   // An agent that explains itself before its settle fence (factory run 70dbfcba): the last json fence is the result.
   { name: 'prose-before-json-fence', terminal: true, exitCode: 0,
     frame: (json) => `Draft:\n\n\`\`\`json\n{"draft": true}\n\`\`\`\n\nI'm rejecting this one: the draft was wrong.\n\n\`\`\`json\n${json}\n\`\`\`` },
+  // A plan node that settled with a bare object after its prose (factory-episodes-v4, agent-container
+  // 18475 and 18871): the object on the last line is the result. Prose redacted, layout kept.
+  { name: 'prose-before-bare-json', terminal: true, exitCode: 0,
+    frame: (json) => `I checked main at abc1234, and the issue still holds there.\n\n- **Where:** \`setup\` in \`scripts/a.sh\` sets {it} once.\n- **Why:** the update path never calls it.\n\nThe plan below changes two files.\n\n${json}` },
+  { name: 'optional-output-ignores-trailing-object', terminal: true, exitCode: 0, optional: true,
+    frame: (json) => `Here is an example config:\n${json}` },
+  { name: 'json-fence-beats-trailing-object', terminal: true, exitCode: 0,
+    frame: (json) => `Plan:\n\n\`\`\`json\n${json}\n\`\`\`\n\n{"draft": true}` },
+  { name: 'line-start-object-before-prose', terminal: true, exitCode: 0,
+    finalText: 'Verdict:\n{"approved": false}\nThat is my answer.', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'bare-json-in-prose', terminal: true, exitCode: 0, finalText: 'Verdict: {"approved": false}', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'invalid-final-json', terminal: true, exitCode: 0, finalText: 'native result is not JSON', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'late-model-refusal', terminal: true, exitCode: 7, diagnostic: 'unknown model: protocol-fixture-model', failureType: 'MODEL_NOT_FOUND' },
@@ -239,7 +251,7 @@ describe('native harness terminal result followed by actual process exit', () =>
         const registry = new RunRegistry({ maxLifetimeMs: 5000 })
         try {
           const { run } = registry.claim(`${harness}-${scenario.name}`, `fixture:${harness}:${scenario.name}`)
-          const pumping = run.pump(backend.chat(request, null, run.signal), { requireFinalOutput: true })
+          const pumping = run.pump(backend.chat(request, null, run.signal), { requireFinalOutput: !scenario.optional })
           const deltas: ChatDelta[] = []
           for await (const { delta } of run.attach()) {
             if (delta.finish_reason === 'stop' || delta.finish_reason === 'tool_calls' || Object.hasOwn(delta, 'final_output')) {
@@ -286,7 +298,7 @@ describe('native harness terminal result followed by actual process exit', () =>
             expect(run.snapshot().status).toBe('done')
             expect(run.failure()).toBeUndefined()
             expect(deltas.filter((delta) => Object.hasOwn(delta, 'final_output'))
-              .map((delta) => delta.final_output)).toEqual([finalOutput])
+              .map((delta) => delta.final_output)).toEqual(scenario.optional ? [] : [finalOutput])
             expect(deltas.filter((delta) => delta.finish_reason === (harness === 'codex' || harness === 'claude' ? 'tool_calls' : 'stop'))).toHaveLength(1)
             if (harness === 'claude') expect(deltas.flatMap((delta) => delta.tool_results ?? []))
               .toEqual([{ id: 'toolu_fixture', name: 'Bash', status: 'error', error: 'exit 1' }])
