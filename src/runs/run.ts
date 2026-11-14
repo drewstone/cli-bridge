@@ -78,6 +78,7 @@ export class Run {
     private readonly commitSnapshot?: RunClaimOptions['commitSnapshot'],
     private readonly commitCanonicalEvent?: RunClaimOptions['commitCanonicalEvent'],
     private readonly onNativeControlLost?: RunClaimOptions['onNativeControlLost'],
+    readonly model?: string,
   ) {
     this.log = new RunReplayLog({
       runId: id,
@@ -156,6 +157,7 @@ export class Run {
       identityExpiresAt: this.log.identityExpiry(),
       ...(this.provider ? { provider: this.provider } : {}),
       ...(this.environmentId ? { environmentId: this.environmentId } : {}),
+      ...(this.model ? { model: this.model } : {}),
       ...(this.sessionId ? { sessionId: this.sessionId } : {}),
       ...(this.executionId ? { executionId: this.executionId } : {}),
       canonicalLastSeq: this.log.canonicalLastSeq(),

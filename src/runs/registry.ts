@@ -147,6 +147,7 @@ export class RunRegistry {
       options.commitSnapshot,
       options.commitCanonicalEvent,
       options.onNativeControlLost,
+      options.model,
     )
     this.runs.set(id, run)
     return { run, created: true }

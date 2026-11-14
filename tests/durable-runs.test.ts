@@ -363,7 +363,10 @@ describe('durable run contract', () => {
       expect(replay.headers.get('x-run-environment-id')).toBe(exact.environment_id)
       expect(replay.headers.get('x-run-session-id')).toBe(exact.session_id)
       expect(replay.headers.get('x-run-execution-id')).toBe(exact.execution_id)
-      expect(await replay.text()).toContain('one')
+      const replayed = await replay.text()
+      expect(replayed).toContain('one')
+      // Replayed frames name the run's model, as the live stream did; the SDK takes it as the served model.
+      expect(frameModels(replayed)).toEqual([model])
 
       const run: AgentExactRunControlRef = {
         runId,
@@ -426,6 +429,9 @@ describe('durable run contract', () => {
       expect(replayed.headers.get('x-run-request-digest')).toBe(requestDigest)
       expect(await replayed.text()).toContain('one')
       expect(await fetchChildStatus(second.port, runId)).toMatchObject({ status: 'done', terminal: true })
+      const events = await fetch(`http://127.0.0.1:${second.port}/v1/runs/${runId}/events`, { headers: { 'Last-Event-ID': '0' } })
+      expect(events.status).toBe(200)
+      expect(frameModels(await events.text())).toEqual(['durable/test'])
 
       const cancellation = cancellationRequest(
         'actual-process-restart-cancellation',
@@ -1246,6 +1252,11 @@ async function fetchChildChat(port: number, body: object): Promise<Response> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+/** The distinct `model` values of every JSON chunk in an SSE body. */
+function frameModels(body: string): unknown[] {
+  return [...new Set(body.split('\n').filter((line) => line.startsWith('data: {')).map((line) => (JSON.parse(line.slice(6)) as { model?: unknown }).model))]
 }
 
 async function fetchChildStatus(port: number, runId: string): Promise<Record<string, unknown>> {

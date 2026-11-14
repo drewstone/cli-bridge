@@ -11,7 +11,7 @@
 import type { NativeSession } from '../../backends/types.js'
 import type { Run, RunRegistry } from '../../runs/registry.js'
 import type { RunSnapshot } from '../../runs/registry.js'
-import type { RetainedSessionRecord, RetainedSessionStatus, SessionStore } from '../store.js'
+import type { RetainedRunAdmission, RetainedSessionRecord, RetainedSessionStatus, SessionStore } from '../store.js'
 import { recordValue } from './json-values.js'
 import {
   type DurableRetainedRunSnapshot,
@@ -101,24 +101,7 @@ export class RetainedSessionState {
     const live = this.runs.get(runId)
     if (live) return live.snapshot()
     const admission = this.store.getRetainedRun(runId)
-    if (!admission) return null
-    const persisted = retainedRunSnapshot(
-      admission.snapshot,
-      admission.runId,
-      admission.executionId,
-      admission.requestDigest,
-      admission.sessionId,
-      { provider: admission.provider, environmentId: admission.environmentId },
-    )
-    return persisted.terminal
-      ? persisted
-      : unknownRunSnapshot(
-          admission.runId,
-          admission.executionId,
-          admission.requestDigest,
-          admission.sessionId,
-          { provider: admission.provider, environmentId: admission.environmentId },
-        )
+    return admission ? durableRunSnapshot(admission) : null
   }
 
   /**
@@ -194,14 +177,24 @@ export class RetainedSessionState {
   }
 }
 
+/** A persisted run's snapshot; a non-terminal one is unknown until its owner reconciles it. */
+export function durableRunSnapshot(admission: RetainedRunAdmission): DurableRetainedRunSnapshot {
+  const coordinates = { provider: admission.provider, environmentId: admission.environmentId }
+  const persisted = retainedRunSnapshot(admission.snapshot, admission.runId, admission.executionId, admission.requestDigest, admission.sessionId, coordinates)
+  return persisted.terminal ? persisted
+    : unknownRunSnapshot(admission.runId, admission.executionId, admission.requestDigest, admission.sessionId, coordinates, persisted.model)
+}
+
 export function unknownRunSnapshot(
   runId: string,
   executionId: string,
   requestDigest: string,
   sessionId: string,
   coordinates: RetainedRunCoordinates,
+  model?: unknown,
 ): DurableRetainedRunSnapshot {
   return {
+    ...(typeof model === 'string' && model ? { model } : {}),
     id: runId,
     executionId,
     requestDigest,
@@ -241,7 +234,7 @@ export function retainedRunSnapshot(
     )
   }
   if (value.status === 'unknown') {
-    return unknownRunSnapshot(runId, executionId, requestDigest, sessionId, coordinates)
+    return unknownRunSnapshot(runId, executionId, requestDigest, sessionId, coordinates, value.model)
   }
   return {
     ...structuredClone(value),

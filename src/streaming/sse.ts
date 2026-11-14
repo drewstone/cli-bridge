@@ -12,7 +12,7 @@ import { addUsage, type CollectedUsage } from '../usage.js'
 
 export interface ChunkMeta {
   id: string
-  model: string
+  model: string | undefined
   created: number
 }
 
@@ -153,7 +153,7 @@ export function deltaToSseComment(delta: ChatDelta): string | null {
   return `: keepalive source=${source} elapsed=${elapsedMs}\n\n`
 }
 
-export function makeChunkMeta(model: string): ChunkMeta {
+export function makeChunkMeta(model: string | undefined): ChunkMeta {
   return {
     id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
     model,

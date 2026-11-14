@@ -61,6 +61,7 @@ export type DurableRetainedRunSnapshot =
       readonly sessionId: string
       readonly provider: string
       readonly environmentId: string
+      readonly model?: string
     }
 
 export interface RetainedSessionView {
