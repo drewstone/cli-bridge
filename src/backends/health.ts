@@ -59,8 +59,10 @@ export async function boundedProbe(
     if (waiterReleased) return
     waiterReleased = true
     active!.waiters -= 1
+    // The aborted probe stays registered until its process is gone, so a
+    // caller arriving during the kill grace shares it instead of spawning a
+    // second `--version` beside a wedged one.
     if (active!.waiters === 0 && !active!.settled) {
-      if (activeBackendProbes.get(backend) === active) activeBackendProbes.delete(backend)
       active!.controller.abort(new Error('health probe has no waiting callers'))
     }
   }
@@ -198,7 +200,8 @@ export async function versionHealth(
     })
     release = spawned.release
     const child = spawned.child
-    const closed = await new Promise<{ code: number | null; stdout: string; stderr: string } | { spawnFailure: string }>((resolve) => {
+    let onAbort: (() => void) | undefined
+    const closed = await new Promise<{ code: number | null; stdout: string; stderr: string } | { spawnFailure: string } | { aborted: true }>((resolve) => {
       const stdout = new BoundedDiagnosticBuffer()
       const stderr = new BoundedDiagnosticBuffer()
       child.stdout?.on('data', (b) => { stdout.append(b) })
@@ -207,7 +210,22 @@ export async function versionHealth(
       child.on('close', (code) => {
         resolve({ code, stdout: stdout.render(), stderr: stderr.render() })
       })
+      // Node's spawn `signal` sends SIGTERM to the leader only, and a wedged
+      // `--version` that ignores it never closes. Stop the probe through the
+      // executor's terminate, which kills the whole group and escalates.
+      if (signal) {
+        onAbort = () => { resolve({ aborted: true }) }
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) onAbort()
+      }
     })
+    if (onAbort) signal?.removeEventListener('abort', onAbort)
+    // Node answers its own `signal` with an AbortError on the child before the
+    // group is gone, so any abort, however reported, waits for terminate.
+    if ('aborted' in closed || signal?.aborted) {
+      await spawned.terminate?.().catch(() => {})
+      return { name, state: 'error', detail: 'health probe aborted' }
+    }
     if ('spawnFailure' in closed) {
       return { name, state: 'unavailable', detail: `spawn failed: ${closed.spawnFailure}` }
     }
