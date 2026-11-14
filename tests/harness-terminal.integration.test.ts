@@ -83,6 +83,8 @@ interface Scenario {
   diagnostic?: string
   failureType?: string
   finalText?: string
+  /** Frames the structured result inside the harness's final message; success assertions apply. */
+  frame?: (json: string) => string
   nativeError?: string
   signal?: NodeJS.Signals
 }
@@ -92,6 +94,10 @@ const scenarios: Scenario[] = [
   { name: 'late-native-error', terminal: true, exitCode: 0, nativeError: 'late native failure after a provisional result' },
   { name: 'late-process-failure', terminal: true, exitCode: 7, diagnostic: 'native process failed after reporting its result', failureType: 'NODE_DOWN' },
   { name: 'truncated-native-stream', terminal: false, exitCode: 0 },
+  // An agent that explains itself before its settle fence (factory run 70dbfcba): the last json fence is the result.
+  { name: 'prose-before-json-fence', terminal: true, exitCode: 0,
+    frame: (json) => `Draft:\n\n\`\`\`json\n{"draft": true}\n\`\`\`\n\nI'm rejecting this one: the draft was wrong.\n\n\`\`\`json\n${json}\n\`\`\`` },
+  { name: 'bare-json-in-prose', terminal: true, exitCode: 0, finalText: 'Verdict: {"approved": false}', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'invalid-final-json', terminal: true, exitCode: 0, finalText: 'native result is not JSON', failureType: 'HARNESS_OUTPUT_INVALID' },
   { name: 'late-model-refusal', terminal: true, exitCode: 7, diagnostic: 'unknown model: protocol-fixture-model', failureType: 'MODEL_NOT_FOUND' },
   { name: 'preterminal-auth-refusal', terminal: false, exitCode: 9, diagnostic: 'authentication required: login required', failureType: 'SEAT_NOT_LOGGED_IN' },
@@ -187,7 +193,7 @@ describe('native harness terminal result followed by actual process exit', () =>
         const cwd = await mkdtemp(join(scratch, `${harness}-${scenario.name}-`))
         const bin = join(cwd, 'native-protocol.cjs')
         const finalOutput = { fixture: harness, ok: true }
-        const finalText = scenario.finalText ?? JSON.stringify(finalOutput)
+        const finalText = scenario.finalText ?? (scenario.frame ?? String)(JSON.stringify(finalOutput))
         await writeFile(bin, executable)
         await chmod(bin, 0o755)
         await writeFile(join(cwd, 'native-case.json'), JSON.stringify({
@@ -276,7 +282,7 @@ describe('native harness terminal result followed by actual process exit', () =>
             // Codex's native cached_input_tokens arrives as the canonical cache split (#314).
             else if (harness === 'codex') expect(nativeUsage).toMatchObject({ cache_read_input_tokens: 7, fresh_input_tokens: 16 })
           }
-          if (scenario.name === 'success') {
+          if (scenario.name === 'success' || scenario.frame) {
             expect(run.snapshot().status).toBe('done')
             expect(run.failure()).toBeUndefined()
             expect(deltas.filter((delta) => Object.hasOwn(delta, 'final_output'))
