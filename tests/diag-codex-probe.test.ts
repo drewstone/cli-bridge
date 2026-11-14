@@ -31,7 +31,7 @@ for event in [
 ]: print(json.dumps(event))
 `
 
-it.each(['none', 'mcp'] as const)('diag: probe timing with %s', async (variant) => {
+it.each(['mcp', 'none', 'mcp'] as const)('diag: probe timing with %s', async (variant) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'diag-probe-'))), cwd = join(root, 'workspace'), home = join(root, 'home')
   await mkdir(cwd); await mkdir(home)
   vi.stubEnv('HOME', home)

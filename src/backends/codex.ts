@@ -103,7 +103,19 @@ export class CodexBackend implements Backend {
         fs.appendFileSync('/tmp/codex-probe-trace.jsonl', JSON.stringify(trace) + '\n')
       } catch {}
     }
-    const timer = setTimeout(() => { mark('at9500'); trace.snapshotAt9500 = 'pending' }, 9_500)
+    const timer = setTimeout(() => {
+      mark('at9500')
+      const fs = require_fs(), pid = trace.childPid as number | undefined
+      const read = (path: string): string => { try { return fs.readFileSync(path, 'utf8').slice(0, 3000) } catch (e) { return String(e) } }
+      const ls = (path: string): Record<string, string> => { try { return Object.fromEntries(fs.readdirSync(path).map((fd) => { try { return [fd, fs.readlinkSync(join(path, fd))] } catch (e) { return [fd, String(e)] } })) } catch (e) { return { error: String(e) } } }
+      if (pid) {
+        trace.procStatus = read(`/proc/${pid}/status`).split('\n').filter((l) => /^(State|PPid|Name|SigBlk|SigIgn)/u.test(l)).join('; ')
+        trace.procCmdline = read(`/proc/${pid}/cmdline`).replace(/\0/gu, ' ')
+        trace.procWchan = read(`/proc/${pid}/wchan`); trace.procSyscall = read(`/proc/${pid}/syscall`)
+        trace.procFds = ls(`/proc/${pid}/fd`)
+        try { trace.procChildren = fs.readdirSync(`/proc/${pid}/task`).map((t) => read(`/proc/${pid}/task/${t}/children`)) } catch (e) { trace.procChildren = String(e) }
+      }
+    }, 9_500)
     try {
       const spawned = await this.spawner(this.opts.bin, args, { signal: bounded, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: effectiveEnv })
       mark('spawned'); trace.childPid = spawned.child.pid
