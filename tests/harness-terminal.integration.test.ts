@@ -87,6 +87,8 @@ interface Scenario {
   frame?: (json: string) => string
   nativeError?: string
   signal?: NodeJS.Signals
+  /** Codex reports the provider served a different model than requested (ModelReroute). */
+  reroute?: boolean
 }
 const scenarios: Scenario[] = [
   { name: 'success', terminal: true, exitCode: 0 },
@@ -103,7 +105,11 @@ const scenarios: Scenario[] = [
   { name: 'preterminal-auth-refusal', terminal: false, exitCode: 9, diagnostic: 'authentication required: login required', failureType: 'SEAT_NOT_LOGGED_IN' },
 ]
 
-function nativeEvents(harness: Harness, finalText: string, terminal: boolean): unknown[] {
+// codex-rs/exec event_processor_with_jsonl_output.rs renders ModelReroute as an error item.
+const rerouted = { type: 'item.completed',
+  item: { id: 'reroute', type: 'error', message: 'model rerouted: gpt-5.1-codex -> gpt-5.1-codex-mini (HighRiskCyberActivity)' } }
+
+function nativeEvents(harness: Harness, finalText: string, terminal: boolean, reroute = false): unknown[] {
   if (harness === 'claude') {
     return [
       { type: 'system', subtype: 'init', session_id: 'fixture-claude-session', model: 'protocol-fixture-model' },
@@ -119,6 +125,8 @@ function nativeEvents(harness: Harness, finalText: string, terminal: boolean): u
   }
   if (harness === 'codex') return [
     { type: 'thread.started', thread_id: 'fixture-codex-thread' },
+    // Each rerouted response repeats the notice; the served model is reported once.
+    ...(reroute ? [rerouted, rerouted] : []),
     { type: 'item.completed', item: { id: 'progress', type: 'agent_message', text: progress } },
     { type: 'item.completed', item: { id: 'command', type: 'command_execution', command: 'echo protocol-fixture', status: 'completed', exit_code: 0 } },
     { type: 'item.completed', item: { id: 'mcp', type: 'mcp_tool_call', server: 'fixture', tool: 'lookup', arguments: { key: 'fixture' }, status: 'completed' } },
@@ -182,7 +190,8 @@ describe('native harness terminal result followed by actual process exit', () =>
       : scenarios.filter((scenario) => ['success', 'late-native-error', 'late-process-failure', 'signal-death'].includes(scenario.name))
     const cases: Scenario[] = harness === 'codex'
       ? selected.flatMap((scenario) => scenario.name === 'success'
-        ? codexArguments.map((argumentsCase) => ({ ...scenario, codexArguments: argumentsCase }))
+        ? [...codexArguments.map((argumentsCase) => ({ ...scenario, codexArguments: argumentsCase })),
+          { ...scenario, name: 'model-reroute', reroute: true }]
         : [scenario])
       : harness === 'kimi'
         ? [...selected, { name: 'json-content-nonzero-without-terminal', terminal: false, exitCode: 7,
@@ -197,7 +206,7 @@ describe('native harness terminal result followed by actual process exit', () =>
         await writeFile(bin, executable)
         await chmod(bin, 0o755)
         await writeFile(join(cwd, 'native-case.json'), JSON.stringify({
-          ...scenario, events: nativeEvents(harness, finalText, scenario.terminal),
+          ...scenario, events: nativeEvents(harness, finalText, scenario.terminal, scenario.reroute),
         }))
         let codexLaunches = 0
         const observedCodexSpawner: Spawner = (command, args, options) => {
@@ -272,6 +281,12 @@ describe('native harness terminal result followed by actual process exit', () =>
             }
           }
           expect(deltas.map((delta) => delta.content ?? '').join('')).toBe(progress + finalText)
+          if (harness === 'codex') {
+            // Silence is not provider evidence: only a reroute names the served model.
+            const served = scenario.reroute ? ['gpt-5.1-codex-mini'] : []
+            expect(deltas.flatMap((delta) => delta.provider_models ?? [])).toEqual(served)
+            expect(deltas.flatMap((delta) => delta.model ? [delta.model] : [])).toEqual(served)
+          }
           if (scenario.terminal && ['claude', 'codex', 'kimi', 'opencode'].includes(harness)) {
             const nativeUsage = deltas.find((delta) => delta.usage !== undefined)?.usage
             expect(nativeUsage).toMatchObject(usage)
@@ -282,7 +297,7 @@ describe('native harness terminal result followed by actual process exit', () =>
             // Codex's native cached_input_tokens arrives as the canonical cache split (#314).
             else if (harness === 'codex') expect(nativeUsage).toMatchObject({ cache_read_input_tokens: 7, fresh_input_tokens: 16 })
           }
-          if (scenario.name === 'success' || scenario.frame) {
+          if (scenario.name === 'success' || scenario.frame || scenario.reroute) {
             expect(run.snapshot().status).toBe('done')
             expect(run.failure()).toBeUndefined()
             expect(deltas.filter((delta) => Object.hasOwn(delta, 'final_output'))

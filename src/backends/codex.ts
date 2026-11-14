@@ -385,6 +385,7 @@ export class CodexBackend implements Backend {
       let sawError: BackendFailureReason | null = null
       let sawTerminal = false
       let usage: ChatDelta['usage']
+      const servedModels = new Set<string>()
 
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
@@ -403,6 +404,14 @@ export class CodexBackend implements Backend {
 
         if (type === 'error') {
           sawError = codexFailureReason(ev)
+          continue
+        }
+
+        const served = reroutedModel(ev)
+        if (served) {
+          // Only a reroute names the served model; codex is silent when it matches or is unknown.
+          if (!servedModels.has(served)) yield { model: served, provider_models: [served] }
+          servedModels.add(served)
           continue
         }
 
@@ -820,22 +829,16 @@ function extractToolCall(
  * we'd rather capture text from a slightly-wrong shape than silently
  * drop it.
  */
-function extractText(ev: Record<string, unknown>): string | null {
-  // Common patterns we've seen
-  const candidates: unknown[] = [
-    ev.text,
-    ev.content,
-    (ev.message as Record<string, unknown> | undefined)?.text,
-    (ev.message as Record<string, unknown> | undefined)?.content,
-    (ev.item as Record<string, unknown> | undefined)?.text,
-    (ev.item as Record<string, unknown> | undefined)?.content,
-    (ev.delta as Record<string, unknown> | undefined)?.text,
-    (ev.delta as Record<string, unknown> | undefined)?.content,
-  ]
-  for (const c of candidates) {
-    if (typeof c === 'string' && c.length > 0) return c
-  }
-  return null
+function extractText(ev: Record<string, unknown>): string | undefined {
+  const [message, item, delta] = [asRecord(ev.message), asRecord(ev.item), asRecord(ev.delta)]
+  return firstString(ev.text, ev.content, message?.text, message?.content, item?.text, item?.content, delta?.text, delta?.content)
+}
+
+/** `codex exec --json` renders ModelReroute as an error item (exec/src/event_processor_with_jsonl_output.rs). */
+function reroutedModel(ev: Record<string, unknown>): string | undefined {
+  const item = ev.type === 'item.completed' ? asRecord(ev.item) : null
+  if (item?.type !== 'error' || typeof item.message !== 'string') return undefined
+  return /^model rerouted: \S+ -> (\S+) \([^)]*\)$/u.exec(item.message)?.[1]
 }
 
 /** Forward only effective native configuration selectors to the read-only app-server. */
