@@ -239,7 +239,7 @@ export interface ChatRequest {
   mode?: BridgeMode
   /** Approval policy for native interaction-capable retained or one-shot turns. */
   interaction_policy?: 'interactive' | 'unattended-deny' | 'unattended-allow'
-  /** Exact interaction kinds admitted for this turn. */
+  /** Interaction kinds the caller requested for this turn; absent when it named none. */
   interactions?: RequestedInteractions
   /**
    * OpenAI-compatible response-format hint. CLI harnesses have no
@@ -726,6 +726,8 @@ export interface NativeSession {
    * in the turn's events under that id.
    */
   steer?(prompt: string, operationId?: string): Promise<void>
+  /** False when this running process cannot honor a later turn's requested interaction kinds. */
+  acceptsInteractions?(requested: RequestedInteractions | undefined): boolean
   abort(): Promise<void>
   respondToNativeInteraction(id: string, response: Record<string, unknown>): Promise<void>
   contextBoundary(input: {

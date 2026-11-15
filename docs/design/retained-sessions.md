@@ -1,6 +1,6 @@
 # Retained sessions and native interactions
 
-Status: implemented for the Pi and Claude Code native backends, with the generic one-shot durable contract exposed for ready non-native routes.
+Status: implemented for the Pi native backend, with the generic one-shot durable contract exposed for ready non-native routes.
 
 This surface keeps one native CLI process behind a durable bridge session.
 
@@ -282,50 +282,6 @@ Pi rejects `maxVisibleOutputTokens` and `maxReasoningTokens` because its selecte
 `reasoningEffort` remains a quality control and never acts as a numeric reasoning-token limit.
 
 `AgentProfile.model.metadata` is not a Pi token authority, and `metadata.maxTokens` is rejected.
-
-## Claude Code native implementation
-
-`ClaudeNativeBackend` serves `claude-code/*`; its one-shot `chat` path is `ClaudeBackend`'s, unchanged, and `claudish` stays one-shot.
-
-One `claude --print --input-format stream-json --output-format stream-json --verbose --replay-user-messages --permission-prompt-tool stdio` process serves every turn of a session, with stdin held open.
-
-It reuses `ClaudeBackend`'s profile, MCP, setting-source, auto-memory, subscription-admission and spawn options; a fresh session gets its id from `--session-id`.
-
-Each turn is one stdin `user` message with a bridge-made `uuid`.
-
-The turn ends at the `result` that leaves none of its messages `queued`, and the bridge then reads the last native message `uuid` as the context boundary `claude:<session>:<uuid>`.
-
-That `uuid` is the native transcript entry id, so any native activity between turns changes the boundary.
-
-`POST /v1/sessions/:id/steer` writes the message into the running process.
-
-Claude acknowledges it with `command_lifecycle` `queued` for that `uuid`; the steer returns `accepted` only after that acknowledgement, and an absent acknowledgement returns `effect_unknown`.
-
-Claude applies a queued message at the next tool boundary of the same turn, so the steer can change what the agent does next; a message Claude reaches only after the turn's `result` runs as a further native turn inside the same bridge run.
-
-When Claude applies it (`command_lifecycle` `started`), the run's events carry a raw `{ type: 'steer', operationId, commandUuid, state: 'applied' }`; a steer dropped before it applied carries `state: 'cancelled'`.
-
-The steer endpoint does not wait for `applied`: the native-control lane it holds also carries permission answers, and a steer waiting for a tool boundary could block the answer that tool needs.
-
-Permission prompts are `can_use_tool` control requests carrying the tool, its input and its `tool_use_id`.
-
-The bridge publishes each as a `permission` interaction with one `select` grant field.
-
-`allow_once` answers `allow` with the unchanged input; every other answer denies.
-
-Claude echoes the `control_response` it consumed exactly once, and the response route acknowledges only after that echo.
-
-Control requests the bridge does not implement are answered with an error so a turn cannot stall on them.
-
-Cancellation sends the `interrupt` control request, then stops the process tree, as Pi does.
-
-Close ends stdin so Claude writes its transcript and exits, then stops what remains; the transcript stays in the Claude native store.
-
-Measured against Claude Code 2.1.325: one process served four turns; a mid-turn message changed the same turn's actions; a repeated message `uuid` and a repeated permission answer each had one effect; `interrupt` answered `success` and the process took the next turn.
-
-The real proof is `tests/claude-native-real.test.ts`, gated by `CLI_BRIDGE_REAL_CLAUDE_TESTS=1`, against a logged-in subscription seat.
-
-Not proven: whether parallel tool calls ask permission concurrently, so `concurrentRequests` stays `false`.
 
 ## MCP and ACP boundary
 

@@ -19,21 +19,11 @@
  * model-id prefixes makes the choice explicit at call time.
  */
 
-import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
-import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
-import type {
-  Backend,
-  ChatDelta,
-  ChatRequest,
-  BackendHealth,
-  NativeSession,
-  NativeSessionBackend,
-  NativeSubscriptionAdmission,
-} from './types.js'
+import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
-import { assertModeSupported, ModeNotSupportedError, type BridgeMode } from '../modes.js'
+import { ModeNotSupportedError, type BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
   admitNativeSubscription,
@@ -54,14 +44,13 @@ import {
 import { contentToText, toolResult } from './content.js'
 import { registerJailReadable } from '../jail/index.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
-import { resolveSpawnerCwd, type SpawnOpts, type Spawner } from '../executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
-import { ClaudeNativeSession } from './claude-native-session.js'
 
 interface ClaudeStreamInit {
   type: 'system'
@@ -99,7 +88,7 @@ type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamR
  * Claude Code's native receipt is not OpenAI usage: `input_tokens` is fresh
  * input, while cache reads and writes live in their own fields.
  */
-export interface ClaudeNativeUsage {
+interface ClaudeNativeUsage {
   input_tokens?: number
   cache_creation_input_tokens?: number
   cache_read_input_tokens?: number
@@ -107,8 +96,6 @@ export interface ClaudeNativeUsage {
 }
 
 const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 512
-/** Leads the user message when system content overflowed the launch argument cap. */
-const SYSTEM_FALLBACK_PREFIX = '[SYSTEM INSTRUCTIONS]\n'
 
 /** Claude Code computes this amount locally from token prices, not a billing receipt.
  * https://code.claude.com/docs/en/costs#using-the-usage-command */
@@ -128,7 +115,7 @@ function claudeResultUsage(result: ClaudeStreamResult): NonNullable<ChatDelta['u
  * input. When Claude omits, invalidates, or overflows part of its cache split,
  * preserve the named classes but do not invent a total.
  */
-export function normalizeClaudeUsage(usage: ClaudeNativeUsage | undefined): NonNullable<ChatDelta['usage']> | undefined {
+function normalizeClaudeUsage(usage: ClaudeNativeUsage | undefined): NonNullable<ChatDelta['usage']> | undefined {
   if (!usage) return undefined
 
   const freshInput = tokenCount(usage.input_tokens)
@@ -167,7 +154,7 @@ function sumTokenCounts(...values: number[]): number | undefined {
   return Number.isSafeInteger(total) ? total : undefined
 }
 
-export function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
+function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
   const fallback = 'provider returned an error result'
   if (!detail) return fallback
 
@@ -225,10 +212,10 @@ export interface ClaudeBackendOptions {
 export class ClaudeBackend implements Backend {
   readonly name: string
   readonly defaultExecutionTimeoutMs: number
-  protected readonly bin: string
+  private readonly bin: string
   private readonly anthropicBaseUrl: string | null
   private readonly prefix: string
-  protected readonly spawner: Spawner
+  private readonly spawner: Spawner
 
   constructor(opts: ClaudeBackendOptions) {
     this.name = opts.harness ?? 'claude'
@@ -290,19 +277,95 @@ export class ClaudeBackend implements Backend {
     // JSON-mode directive, etc.) goes through --append-system-prompt
     // regardless of which user-message transport is chosen — see
     // buildArgs/composeStdinInput.
-    const { args, childEnv, stdinInput, userFitsInArgv, mcpMaterialized } = this.prepareLaunch(req, session, mode, cwd)
-    // The file holds the coordination bearer. Every exit, including an abort
-    // before the process try, removes it.
+    // Validate and apply the profile before allocating request-scoped MCP
+    // files. A rejected plan must never strand a config containing secrets.
+    //
+    // Ordered before composeStdinInput because the profile's additive prompt is
+    // part of the system content whose size decides argv-vs-stdin. Composing
+    // stdin against a smaller block than buildArgs will emit lets the two
+    // disagree at the cap, and the disagreement drops the system content from
+    // BOTH transports rather than degrading it into the user message.
+    const appliedReasoningEffort = nativeReasoningControl(
+      'claude-code',
+      resolveRequestedReasoningEffort(req, session),
+    )
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'claude-code',
+      cwd,
+      profileExecutionIdentity(req, session, 'claude-code', appliedReasoningEffort),
+    )
+    const profilePrompt = {
+      ...(provisioned.systemPrompt === undefined
+        ? {}
+        : { systemPrompt: provisioned.systemPrompt }),
+      ...(provisioned.appendSystemPrompt === undefined
+        ? {}
+        : { appendSystemPrompt: provisioned.appendSystemPrompt }),
+    }
+
+    const stdinInput = this.composeStdinInput(req, session, profilePrompt)
+    const userText = stdinInput.messages[0]?.content ?? ''
+    const PROMPT_ARGV_LIMIT = 120 * 1024
+    const userFitsInArgv = Buffer.byteLength(userText, 'utf8') <= PROMPT_ARGV_LIMIT
+
+    // Materialize MCP servers (if any) into a temp config file BEFORE
+    // building args — buildArgs needs the path. Tracked so we can clean
+    // up the temp dir after the subprocess exits.
+    //
+    // One MCP authority reaches this point: profile MCP for an exact profile,
+    // otherwise body/header MCP. `resolveMcpServers` refuses mixed channels.
+    const mcpMaterialized = writeMcpConfigFile(
+      resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }),
+      req.session_id,
+    )
+    // The file holds the coordination bearer. Every exit, including a throw
+    // while building argv and an abort before the process try, removes it.
     try {
+    // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
+    // expose its dir read-only so the confined claude can still read the
+    // `--mcp-config` path. Same idiom as kimi/opencode. Measured without it:
+    // `claude exited 1: Invalid MCP configuration: MCP config file not found`.
+    if (mcpMaterialized) {
+      registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
+    }
+    const args = this.buildArgs(req, session, mode, mcpMaterialized, {
+      userTextForArgv: userFitsInArgv ? userText : undefined,
+      profilePrompt,
+    })
+
+    const childEnv: NodeJS.ProcessEnv = { ...process.env }
+    if (this.anthropicBaseUrl) {
+      childEnv.ANTHROPIC_BASE_URL = this.anthropicBaseUrl
+    }
+
+    // Argv mode: stdin is ignored. Stdin mode: stdin is piped (we
+    // write the NDJSON payload below). The split here matches the
+    // contract claude-code-cli expects for each --input-format.
+    Object.assign(childEnv, provisioned.env)
+    // Auto-memory lives in the host user's `~/.claude/projects/<cwd>/memory`
+    // and is injected whatever `--setting-sources` says, so notes the host, or
+    // an earlier profile in the same directory, wrote there would reach every
+    // later turn. Set after the plan env: it is host state, never profile input.
+    childEnv.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+    args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       await admitNativeSubscription(req, { env: childEnv, args, flags: args,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
-      // Argv mode: stdin is ignored. Stdin mode: stdin is piped (we
-      // write the NDJSON payload below). The split here matches the
-      // contract claude-code-cli expects for each --input-format.
-      spawned = await this.spawner(this.bin, args, this.spawnOptions(req, signal, cwd, childEnv,
-        userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe']))
+      spawned = await this.spawner(this.bin, args, {
+        ...(this.name === 'claude-code' ? { nativeStore: 'claude-code' as const } : {}),
+        signal,
+        stdio: userFitsInArgv ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
+        cwd,
+        env: childEnv,
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
+        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
+        ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
+      })
     } catch (error) {
       mcpMaterialized?.cleanup()
       throw error
@@ -496,127 +559,6 @@ export class ClaudeBackend implements Backend {
   }
 
   /**
-   * Profile, MCP config, argv and environment for one Claude process.
-   *
-   * The caller owns `mcpMaterialized.cleanup()` once this returns; a throw
-   * here has already removed it. `retained` keeps stdin open as the
-   * stream-json input and answers permission prompts over that channel.
-   */
-  protected prepareLaunch(
-    req: ChatRequest,
-    session: SessionRecord | null,
-    mode: BridgeMode,
-    cwd: string | undefined,
-    retained = false,
-  ): {
-    args: string[]
-    childEnv: NodeJS.ProcessEnv
-    stdinInput: { messages: Array<{ role: 'user'; content: string }> }
-    userFitsInArgv: boolean
-    mcpMaterialized: MaterializedMcpConfig | null
-  } {
-    // Validate and apply the profile before allocating request-scoped MCP
-    // files. A rejected plan must never strand a config containing secrets.
-    //
-    // Ordered before composeStdinInput because the profile's additive prompt is
-    // part of the system content whose size decides argv-vs-stdin. Composing
-    // stdin against a smaller block than buildArgs will emit lets the two
-    // disagree at the cap, and the disagreement drops the system content from
-    // BOTH transports rather than degrading it into the user message.
-    const appliedReasoningEffort = nativeReasoningControl(
-      'claude-code',
-      resolveRequestedReasoningEffort(req, session),
-    )
-    const provisioned = provisionProfileWorkspace(
-      req,
-      session,
-      'claude-code',
-      cwd,
-      profileExecutionIdentity(req, session, 'claude-code', appliedReasoningEffort),
-    )
-    const profilePrompt = {
-      ...(provisioned.systemPrompt === undefined
-        ? {}
-        : { systemPrompt: provisioned.systemPrompt }),
-      ...(provisioned.appendSystemPrompt === undefined
-        ? {}
-        : { appendSystemPrompt: provisioned.appendSystemPrompt }),
-    }
-
-    const stdinInput = this.composeStdinInput(req, session, profilePrompt)
-    const userText = stdinInput.messages[0]?.content ?? ''
-    const PROMPT_ARGV_LIMIT = 120 * 1024
-    const userFitsInArgv = !retained && Buffer.byteLength(userText, 'utf8') <= PROMPT_ARGV_LIMIT
-    if (retained && userText.startsWith(SYSTEM_FALLBACK_PREFIX)) {
-      // A retained process takes every turn on stdin, so system content that
-      // overflows `--append-system-prompt` has no slot to degrade into.
-      throw new BackendError('claude retained session system content exceeds the 120 KiB launch argument limit', 'not_configured')
-    }
-
-    // Materialize MCP servers (if any) into a temp config file BEFORE
-    // building args — buildArgs needs the path. Tracked so we can clean
-    // up the temp dir after the subprocess exits.
-    //
-    // One MCP authority reaches this point: profile MCP for an exact profile,
-    // otherwise body/header MCP. `resolveMcpServers` refuses mixed channels.
-    const mcpMaterialized = writeMcpConfigFile(
-      resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }),
-      req.session_id,
-    )
-    try {
-      // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
-      // expose its dir read-only so the confined claude can still read the
-      // `--mcp-config` path. Same idiom as kimi/opencode. Measured without it:
-      // `claude exited 1: Invalid MCP configuration: MCP config file not found`.
-      if (mcpMaterialized) {
-        registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
-      }
-      const args = this.buildArgs(req, session, mode, mcpMaterialized, {
-        userTextForArgv: userFitsInArgv ? userText : undefined,
-        profilePrompt,
-        ...(retained ? { retained } : {}),
-      })
-
-      const childEnv: NodeJS.ProcessEnv = { ...process.env }
-      if (this.anthropicBaseUrl) {
-        childEnv.ANTHROPIC_BASE_URL = this.anthropicBaseUrl
-      }
-      Object.assign(childEnv, provisioned.env)
-      // Auto-memory lives in the host user's `~/.claude/projects/<cwd>/memory`
-      // and is injected whatever `--setting-sources` says, so notes the host, or
-      // an earlier profile in the same directory, wrote there would reach every
-      // later turn. Set after the plan env: it is host state, never profile input.
-      childEnv.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
-      args.push(...provisioned.flags)
-      return { args, childEnv, stdinInput, userFitsInArgv, mcpMaterialized }
-    } catch (error) {
-      mcpMaterialized?.cleanup()
-      throw error
-    }
-  }
-
-  protected spawnOptions(
-    req: ChatRequest,
-    signal: AbortSignal | undefined,
-    cwd: string | undefined,
-    env: NodeJS.ProcessEnv,
-    stdio: ['ignore' | 'pipe', 'pipe', 'pipe'],
-  ): SpawnOpts {
-    return {
-      ...(this.name === 'claude-code' ? { nativeStore: 'claude-code' as const } : {}),
-      signal,
-      stdio,
-      cwd,
-      env,
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-      ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
-      ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
-      ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
-    }
-  }
-
-  /**
    * Build the argv for `claude -p …`. Extracted so tests can verify
    * flag composition (json-mode, hosted-safe, resume, model) without
    * spawning a real subprocess.
@@ -635,8 +577,6 @@ export class ClaudeBackend implements Backend {
       userTextForArgv?: string
       /** Prompt intents the profile plan carries, each bound to its own flag below. */
       profilePrompt?: { systemPrompt?: string; appendSystemPrompt?: string }
-      /** One process for many turns: stdin stays the input channel and the host answers permission prompts. */
-      retained?: true
     },
   ): string[] {
     // Two transport modes — see chat() for the rationale:
@@ -648,9 +588,6 @@ export class ClaudeBackend implements Backend {
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
       : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
-    // Echo every consumed stdin message with the caller's uuid, the proof a
-    // retained turn or steer entered the conversation (measured on 2.1.325).
-    if (opts?.retained) args.push('--replay-user-messages')
     const effort = nativeReasoningControl('claude-code', resolveRequestedReasoningEffort(req, session))
     if (effort) args.push('--effort', effort)
 
@@ -753,10 +690,6 @@ export class ClaudeBackend implements Backend {
         '--permission-mode', 'plan',
         '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
       )
-    } else if (opts?.retained) {
-      // A retained session is interactive: each prompt arrives on stdout as a
-      // `can_use_tool` control request and its answer goes back on stdin.
-      args.push('--permission-prompt-tool', 'stdio')
     } else if (mode === 'byob') {
       args.push('--dangerously-skip-permissions')
     }
@@ -844,7 +777,7 @@ export class ClaudeBackend implements Backend {
       || Buffer.byteLength(systemMerged, 'utf8') <= APPEND_LIMIT
     const content = systemFitsInArgv
       ? userText
-      : `${SYSTEM_FALLBACK_PREFIX}${systemMerged}\n\n[USER]\n${userText}`
+      : `[SYSTEM INSTRUCTIONS]\n${systemMerged}\n\n[USER]\n${userText}`
 
     return { messages: [{ role: 'user', content }] }
   }
@@ -862,128 +795,4 @@ export class ClaudeBackend implements Backend {
     }
     return null
   }
-}
-
-/**
- * Claude Code with one retained process per session: every turn, steer and
- * permission answer goes to the same `--input-format stream-json` process.
- * The one-shot `chat` path is inherited unchanged. Claudish stays one-shot.
- */
-export class ClaudeNativeBackend extends ClaudeBackend implements NativeSessionBackend {
-  readonly nativeModes = ['byob'] as const
-
-  nativeCapabilities(): AgentEnvironmentCapabilities {
-    return CLAUDE_NATIVE_CAPABILITIES
-  }
-
-  async startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
-    const mode: BridgeMode = req.mode ?? 'byob'
-    assertModeSupported(this.name, mode, this.nativeModes,
-      'a retained Claude session runs native tools and asks the caller before each one')
-    if (req.interaction_policy === 'unattended-allow') {
-      throw new BackendError(
-        'retained Claude sessions require interaction_policy=interactive; use one-shot for explicit unattended policy',
-        'capability_denied',
-      )
-    }
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
-    const providerSessionId = session?.internalId || randomUUID()
-    const { args, childEnv, mcpMaterialized } = this.prepareLaunch(req, session, mode, cwd, true)
-    let spawned: Awaited<ReturnType<Spawner>> | null = null
-    try {
-      // buildArgs resumes a known session; a fresh one gets its id up front so
-      // the bridge records it before the first turn.
-      if (!session?.internalId) args.push('--session-id', providerSessionId)
-      const invocation = { env: childEnv, args, flags: args, cwd: cwd ?? process.cwd(), model: req.model,
-        executor: this.spawner.executionEnvironment }
-      await admitNativeSubscription(req, invocation)
-      req.subscriptionAdmission?.require()
-      spawned = await this.spawner(this.bin, args, this.spawnOptions(req, signal, cwd, childEnv, ['pipe', 'pipe', 'pipe']))
-      const earlySpawnError = spawned.spawnError?.()
-      if (earlySpawnError) throw new BackendError('claude subprocess failed to start', 'upstream', earlySpawnError)
-      if (!spawned.child.stdin || !spawned.child.stdout) {
-        throw new BackendError('claude subprocess has no stdin/stdout pipes', 'upstream')
-      }
-      const native = new ClaudeNativeSession(spawned, {
-        capabilities: CLAUDE_NATIVE_CAPABILITIES,
-        requestTimeoutMs: this.defaultExecutionTimeoutMs > 0
-          ? Math.min(this.defaultExecutionTimeoutMs, NATIVE_ACK_TIMEOUT_CAP_MS)
-          : 0,
-        providerSessionId,
-        cleanup: () => mcpMaterialized?.cleanup(),
-      })
-      return Object.assign(native, {
-        // A later turn reuses this process, so it re-presents the exact launch that was admitted.
-        async admitSubscription(admission: NativeSubscriptionAdmission): Promise<void> {
-          await admitNativeSubscription({ ...req, subscriptionAdmission: admission }, invocation)
-          admission.require()
-        },
-      })
-    } catch (error) {
-      const failures: unknown[] = []
-      try {
-        if (spawned) await terminateSpawned(spawned)
-      } catch (cleanupError) {
-        failures.push(cleanupError)
-      }
-      try { spawned?.release() } catch (cleanupError) { failures.push(cleanupError) }
-      try { mcpMaterialized?.cleanup() } catch (cleanupError) { failures.push(cleanupError) }
-      if (failures.length > 0) throw new AggregateError([error, ...failures], 'claude native session startup and cleanup failed')
-      throw error
-    }
-  }
-}
-
-/** Upper bound on waiting for Claude to acknowledge one stdin message. */
-const NATIVE_ACK_TIMEOUT_CAP_MS = 30_000
-
-/**
- * What a retained Claude session proves. The bridge owns streaming, replay,
- * identities, idempotency and admission; the process proves continuation
- * (one process, its last native message id as the boundary), permission
- * interactions (`can_use_tool`, answer echoed on consumption) and steering.
- */
-const CLAUDE_NATIVE_CAPABILITIES: AgentEnvironmentCapabilities = {
-  profile: {
-    namedProfiles: false,
-    systemPrompt: { replace: true, append: true },
-    instructions: true,
-    tools: true,
-    permissions: true,
-    mcp: true,
-    subagents: true,
-    resources: { files: true, instructions: true, tools: true, skills: true, agents: true, commands: true },
-    hooks: false,
-    modes: true,
-    runtimeUpdate: false,
-    validation: true,
-  },
-  streaming: { live: true, replay: true, detach: true, turnIdempotency: true },
-  retainedControl: {
-    exactRunIdentity: true,
-    resultIdentity: true,
-    eventIdentity: true,
-    cancellationIdempotency: true,
-  },
-  nativeContinuation: {
-    atomicBoundary: true,
-    requestIdempotency: true,
-    admissionControl: true,
-  },
-  sessions: { continue: true, list: true, messages: true },
-  interactions: {
-    kinds: ['permission'],
-    answerFieldTypes: ['select'],
-    responseScopes: ['interaction'],
-    secretAnswers: false,
-    // Parallel tool calls may each ask; one-at-a-time delivery is unmeasured.
-    concurrentRequests: false,
-    replay: true,
-    responseIdempotency: true,
-  },
-  workspace: { read: true, write: true, exec: true, git: true, upload: false, download: false },
-  branching: { checkpoint: false, fork: false },
-  placement: true,
-  usage: true,
-  confidential: false,
 }
