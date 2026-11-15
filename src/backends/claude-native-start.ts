@@ -18,9 +18,10 @@ import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.
 const ACK_TIMEOUT_CAP_MS = 30_000
 
 /**
- * Claude Code with one retained process per session. `byob` launches with
- * `--dangerously-skip-permissions` like one-shot `byob`; a session whose first
- * turn requests the `permission` interaction asks the caller before each tool.
+ * Claude Code with one retained process per session. Like Pi's, a retained
+ * session is interactive: every tool asks the caller (`--permission-prompt-tool
+ * stdio`), and a turn that does not admit `permission` has each prompt denied.
+ * One-shot `byob` keeps skipping prompts.
  */
 export class ClaudeNativeBackend extends ClaudeBackend implements NativeSessionBackend {
   readonly nativeModes = ['byob'] as const
@@ -40,7 +41,6 @@ export class ClaudeNativeBackend extends ClaudeBackend implements NativeSessionB
   async startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
     const mode = req.mode ?? 'byob'
     assertModeSupported(this.name, mode, this.nativeModes)
-    const promptPermissions = req.interactions?.permission === true
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     const effort = nativeReasoningControl('claude-code', resolveRequestedReasoningEffort(req, session))
     const provisioned = provisionProfileWorkspace(req, session, 'claude-code', cwd,
@@ -51,7 +51,7 @@ export class ClaudeNativeBackend extends ClaudeBackend implements NativeSessionB
       if (mcp) registerJailReadable(req.jailSpec, dirname(mcp.configPath))
       const args = this.buildArgs(req, session, mode, mcp, {
         profilePrompt: { systemPrompt: provisioned.systemPrompt, appendSystemPrompt: provisioned.appendSystemPrompt },
-        retained: { promptPermissions },
+        retained: true,
       })
       args.push(...provisioned.flags)
       const providerSessionId = session?.internalId || randomUUID()
@@ -72,7 +72,7 @@ export class ClaudeNativeBackend extends ClaudeBackend implements NativeSessionB
       const spawnError = spawned.spawnError?.()
       if (spawnError || !spawned.child.stdin || !spawned.child.stdout)
         throw new BackendError('claude subprocess failed to start with stdin and stdout pipes', 'upstream', spawnError)
-      const native = new ClaudeNativeSession(spawned, this.nativeCapabilities(), providerSessionId, promptPermissions,
+      const native = new ClaudeNativeSession(spawned, this.nativeCapabilities(), providerSessionId,
         this.defaultExecutionTimeoutMs > 0 ? Math.min(this.defaultExecutionTimeoutMs, ACK_TIMEOUT_CAP_MS) : 0,
         () => mcp?.cleanup())
       return Object.assign(native, {

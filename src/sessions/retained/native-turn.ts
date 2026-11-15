@@ -56,11 +56,11 @@ export interface NativeTurnInput {
   onProviderSessionId: (providerSessionId: string) => void
 }
 
+/**
+ * The one turn driver: it owns the loop, the raw fallback, deferred denials
+ * and the failing catch. Pi's step is inline below; Claude's is `claudeStep`.
+ */
 export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ event: StreamEvent }> {
-  if (input.native instanceof ClaudeNativeSession) {
-    yield* claudeCanonicalTurn(input)
-    return
-  }
   const { native, run, sessionId, prompt, backendName } = input
   yield { event: { type: 'status', status: 'started' } }
   const text = new Map<number, string>()
@@ -70,11 +70,16 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   let lastTurnFailure: string | null = null
   let responseIdentity: PiResponseIdentity | undefined
   const deferredDenials: Promise<void>[] = []
+  const claude = native instanceof ClaudeNativeSession ? claudeStep(input, native, deferredDenials) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
       const event = recordValue(raw)
       if (!event) {
         yield { event: { type: 'raw', backend: backendName, event: raw } }
+        continue
+      }
+      if (claude) {
+        for (const translated of claude(event) ?? [{ type: 'raw', backend: backendName, event: raw } satisfies StreamEvent]) yield { event: translated }
         continue
       }
       const type = String(event.type ?? '')
@@ -224,13 +229,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
         type === 'response' && event.command === 'prompt' && event.success === true
         && recordValue(event.data)?.disposition === 'handled'
       )) {
-        yield {
-          event: {
-            type: 'status',
-            status: lastTurnFailure ? 'failed' : 'completed',
-            ...(lastTurnFailure ? { detail: lastTurnFailure } : {}),
-          },
-        }
+        yield { event: settledStatus(lastTurnFailure) }
         continue
       }
       yield { event: { type: 'raw', backend: backendName, event: raw } }
@@ -276,134 +275,114 @@ function admitInteraction(
   return { type: 'interaction', request: interaction.request }
 }
 
+function settledStatus(failure: string | null): StreamEvent {
+  return { type: 'status', status: failure ? 'failed' : 'completed', ...(failure ? { detail: failure } : {}) }
+}
+
+/** Per process: Claude's `total_cost_usd` is cumulative per process, so each `result` sends only its increase. */
+const claudeCostTotals = new WeakMap<ClaudeNativeSession, number>()
+
 /**
- * Claude Code stream-json lines as canonical events. Claude prints whole
- * content blocks, so each text block is one part whose delta is its text.
- * Lines with no canonical form, including `command_lifecycle` and the
- * bridge's `steer` receipts, are kept as `raw` events.
+ * Claude's step: one stream-json line to canonical events, or null to keep it
+ * as `raw`. Claude prints whole content blocks, so each text block is one
+ * part. The first failure sticks, as in one-shot.
  */
-async function* claudeCanonicalTurn(input: NativeTurnInput): AsyncIterable<{ event: StreamEvent }> {
-  const { native, run, sessionId, prompt, backendName } = input
-  yield { event: { type: 'status', status: 'started' } }
+function claudeStep(
+  input: NativeTurnInput,
+  native: ClaudeNativeSession,
+  deferredDenials: Promise<void>[],
+): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId, backendName } = input
   const tools = new Map<string, { name: string; args: Record<string, unknown> }>()
+  const models = new Set<string>()
   let nextContentIndex = 0
-  let lastTurnFailure: string | null = null
-  const deferredDenials: Promise<void>[] = []
-  try {
-    for await (const raw of native.turn(prompt, run.signal)) {
-      const event = recordValue(raw)
-      if (!event) {
-        yield { event: { type: 'raw', backend: backendName, event: raw } }
-        continue
+  let failure: string | null = null
+  const raw = (event: unknown): StreamEvent => ({ type: 'raw', backend: backendName, event })
+  return (event) => {
+    const type = String(event.type ?? '')
+    const out: StreamEvent[] = []
+    if (type === 'system' && event.subtype === 'init') {
+      const id = stringValue(event.session_id)
+      if (id) {
+        input.onProviderSessionId(id)
+        out.push({ type: 'session.updated', sessionId: boundedRuntimeId(id), time: { updated: Date.now() } })
       }
-      const type = String(event.type ?? '')
-      if (type === 'system' && event.subtype === 'init') {
-        const id = stringValue(event.session_id)
-        if (id) {
-          input.onProviderSessionId(id)
-          yield { event: { type: 'session.updated', sessionId: boundedRuntimeId(id), time: { updated: Date.now() } } }
-        }
-        yield { event: { type: 'status', status: 'processing' } }
-        continue
-      }
-      if (type === 'assistant') {
-        const message = recordValue(event.message)
-        for (const item of message && Array.isArray(message.content) ? message.content : []) {
-          const block = recordValue(item)
-          if (!block) continue
-          if (block.type === 'text' && stringValue(block.text)) {
-            const text = block.text as string
-            if (event.isApiErrorMessage === true) lastTurnFailure = sanitizeUpstreamErrorDetail(text)
-            yield { event: textEvent(sessionId, run.id, nextContentIndex++, text, text) }
-          } else if (block.type === 'thinking' && stringValue(block.thinking)) {
-            const thinking = block.thinking as string
-            yield { event: reasoningEvent(sessionId, run.id, nextContentIndex++, thinking, thinking) }
-          } else if (block.type === 'tool_use') {
-            const id = stringValue(block.id)
-            const name = stringValue(block.name)
-            if (!id || !name) continue
-            const args = recordValue(block.input) ?? {}
-            tools.set(id, { name, args })
-            yield { event: { type: 'message.part.updated', part: toolPart(sessionId, run.id, id, name, args, 'pending') } }
-          }
-        }
-        continue
-      }
-      if (type === 'user') {
-        const message = recordValue(event.message)
-        let translated = false
-        for (const item of message && Array.isArray(message.content) ? message.content : []) {
-          const block = recordValue(item)
-          const id = block?.type === 'tool_result' ? stringValue(block.tool_use_id) : null
-          const tool = id ? tools.get(id) : undefined
-          if (!block || !id || !tool) continue
-          translated = true
-          const failed = block.is_error === true
-          const outcome = failed
-            ? { error: typeof block.content === 'string' ? block.content : JSON.stringify(block.content), result: block.content }
-            : { result: block.content }
-          yield {
-            event: {
-              type: 'message.part.updated',
-              part: toolPart(sessionId, run.id, id, tool.name, tool.args, failed ? 'error' : 'completed', outcome),
-            },
-          }
-        }
-        // The prompt and steer echoes stay raw: they are the consumption receipts.
-        if (!translated) yield { event: { type: 'raw', backend: backendName, event: raw } }
-        continue
-      }
-      if (type === 'control_request') {
-        const request = recordValue(event.request)
-        const nativeId = stringValue(event.request_id)
-        const permission = request?.subtype === 'can_use_tool' && nativeId ? request : null
-        const interaction = permission && nativeId
-          ? interactionFromClaude(run, permission, nativeId, sessionId, input.providerName, input.environmentId)
-          : null
-        if (interaction) {
-          yield { event: admitInteraction(input, interaction, deferredDenials) }
-          continue
-        }
-        // Claude waits on every permission request; one the bridge cannot
-        // publish is refused rather than left to stall the turn.
-        if (permission && nativeId) deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
-        yield {
-          event: {
-            type: 'warning',
-            code: 'unsupported_interaction',
-            message: 'Claude emitted a control request cli-bridge cannot answer safely',
-          },
-        }
-        continue
-      }
-      if (type === 'result') {
-        const usage = claudeUsageEvent(event)
-        if (usage) yield { event: { type: 'raw', backend: backendName, event: usage } }
-        lastTurnFailure = event.is_error === true || event.subtype !== 'success'
-          ? sanitizeUpstreamErrorDetail(stringValue(event.result) ?? `result ${String(event.subtype ?? 'error')}`)
-          : null
-        yield { event: { type: 'raw', backend: backendName, event: raw } }
-        continue
-      }
-      if (type === CLAUDE_TURN_SETTLED) {
-        yield {
-          event: {
-            type: 'status',
-            status: lastTurnFailure ? 'failed' : 'completed',
-            ...(lastTurnFailure ? { detail: lastTurnFailure } : {}),
-          },
-        }
-        continue
-      }
-      yield { event: { type: 'raw', backend: backendName, event: raw } }
+      out.push({ type: 'status', status: 'processing' })
+      return out
     }
-    await Promise.all(deferredDenials)
-  } catch (error) {
-    if (!run.signal.aborted)
-      yield {
-        event: { type: 'status', status: 'failed', detail: error instanceof Error ? error.message : String(error) },
+    if (type === 'assistant') {
+      const message = recordValue(event.message)
+      const model = stringValue(message?.model)
+      const observation = `${String(message?.id)}:${model}`
+      // Served model identity, reported as one-shot and Pi report it.
+      if (event.isApiErrorMessage !== true && model && model !== '<synthetic>' && !models.has(observation)) {
+        models.add(observation)
+        out.push(raw({ type: 'raw', data: { model, provider_models: [model] } }))
       }
-    throw error
+      let unrecognised = false
+      for (const item of message && Array.isArray(message.content) ? message.content : []) {
+        const block = recordValue(item)
+        const text = stringValue(block?.text)
+        const thinking = stringValue(block?.thinking)
+        const id = stringValue(block?.id)
+        const name = stringValue(block?.name)
+        if (block?.type === 'text' && text) {
+          if (event.isApiErrorMessage === true) failure ??= sanitizeUpstreamErrorDetail(text)
+          out.push(textEvent(sessionId, run.id, nextContentIndex++, text, text))
+        } else if (block?.type === 'thinking' && thinking) {
+          out.push(reasoningEvent(sessionId, run.id, nextContentIndex++, thinking, thinking))
+        } else if (block?.type === 'tool_use' && id && name) {
+          const args = recordValue(block.input) ?? {}
+          tools.set(id, { name, args })
+          out.push({ type: 'message.part.updated', part: toolPart(sessionId, run.id, id, name, args, 'pending') })
+        } else if (block?.type !== 'thinking') unrecognised = true
+      }
+      // Blocks with no canonical form (redacted thinking, server tools) keep the whole line as raw.
+      if (unrecognised) out.push(raw(event))
+      return out
+    }
+    if (type === 'user') {
+      const message = recordValue(event.message)
+      for (const item of message && Array.isArray(message.content) ? message.content : []) {
+        const block = recordValue(item)
+        const id = block?.type === 'tool_result' ? stringValue(block.tool_use_id) : null
+        const tool = id ? tools.get(id) : undefined
+        if (!block || !id || !tool) continue
+        const failed = block.is_error === true
+        const outcome = failed
+          ? { error: typeof block.content === 'string' ? block.content : JSON.stringify(block.content), result: block.content }
+          : { result: block.content }
+        out.push({ type: 'message.part.updated',
+          part: toolPart(sessionId, run.id, id, tool.name, tool.args, failed ? 'error' : 'completed', outcome) })
+      }
+      // The prompt and steer echoes stay raw: they are the consumption receipts.
+      return out.length > 0 ? out : null
+    }
+    if (type === 'control_request') {
+      const request = recordValue(event.request)
+      const nativeId = stringValue(event.request_id)
+      if (request?.subtype !== 'can_use_tool' || !nativeId) return null
+      const interaction = interactionFromClaude(run, request, nativeId, sessionId, input.providerName, input.environmentId)
+      if (interaction) return [admitInteraction(input, interaction, deferredDenials)]
+      // Claude waits on every permission request; one the bridge cannot publish is refused.
+      deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
+      return [{ type: 'warning', code: 'unsupported_interaction', message: 'Claude emitted a permission request cli-bridge cannot publish' }]
+    }
+    if (type === 'error') {
+      failure ??= sanitizeUpstreamErrorDetail(stringValue(recordValue(event.error)?.message) ?? stringValue(event.message) ?? undefined)
+      return null
+    }
+    if (type === 'result') {
+      const total = typeof event.total_cost_usd === 'number' && Number.isFinite(event.total_cost_usd) ? event.total_cost_usd : undefined
+      const previous = claudeCostTotals.get(native) ?? 0
+      if (total !== undefined) claudeCostTotals.set(native, Math.max(total, previous))
+      const usage = claudeUsageEvent(event, total === undefined || total < previous ? undefined : total - previous)
+      if (event.is_error === true || event.subtype !== 'success')
+        failure ??= sanitizeUpstreamErrorDetail(stringValue(event.result) ?? `result ${String(event.subtype ?? 'error')}`)
+      return [...(usage ? [raw(usage)] : []), raw(event)]
+    }
+    if (type === CLAUDE_TURN_SETTLED) return [settledStatus(failure)]
+    return null
   }
 }
 
@@ -425,13 +404,10 @@ function interactionFromClaude(
   return permissionInteraction(run, nativeId, `Permission: ${tool}`, body || null, sessionId, providerName, environmentId)
 }
 
-/** Claude's per-result usage receipt; its dollar figure is Claude Code's own estimate. */
-function claudeUsageEvent(result: Record<string, unknown>): AgentEnvironmentEvent | null {
+/** Claude's per-result usage receipt; `cost` is this result's share of Claude Code's own estimate. */
+function claudeUsageEvent(result: Record<string, unknown>, cost: number | undefined): AgentEnvironmentEvent | null {
   const usage = normalizeClaudeUsage((recordValue(result.usage) ?? undefined) as ClaudeNativeUsage | undefined)
   if (!usage) return null
-  const cost = typeof result.total_cost_usd === 'number' && Number.isFinite(result.total_cost_usd) && result.total_cost_usd >= 0
-    ? result.total_cost_usd
-    : undefined
   const rawUsage = {
     ...(usage.input_tokens === undefined ? {} : { prompt_tokens: usage.input_tokens }),
     ...(usage.output_tokens === undefined ? {} : { completion_tokens: usage.output_tokens }),

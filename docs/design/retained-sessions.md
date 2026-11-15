@@ -285,11 +285,9 @@ Pi rejects `maxVisibleOutputTokens` and `maxReasoningTokens` because its selecte
 
 ## Claude Code native implementation
 
-One `claude --print --input-format stream-json --replay-user-messages` process serves every turn of a session with stdin held open; `byob` launches with `--dangerously-skip-permissions` unless the first turn requests the `permission` interaction, and a later turn asking for the other posture is refused with `501 capability_denied`.
+One `claude --print --input-format stream-json --replay-user-messages --permission-prompt-tool stdio` process serves every turn of a session with stdin held open; like Pi, every tool asks the caller, and a turn that does not admit `permission` has each prompt denied.
 
-A steer is `accepted` once Claude reports `command_lifecycle` `queued` for it; when Claude applies it at the next tool boundary the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }`.
-
-A turn settles at the first `result` before which every message of that turn has started; the context boundary is the last native message id, read between turns.
+A steer is `accepted` once Claude reports `command_lifecycle` `queued`; when Claude applies it the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }`. A turn settles at the first `result` before which all its messages had started.
 
 ## MCP and ACP boundary
 

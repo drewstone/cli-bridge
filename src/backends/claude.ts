@@ -577,8 +577,8 @@ export class ClaudeBackend implements Backend {
       userTextForArgv?: string
       /** Prompt intents the profile plan carries, each bound to its own flag below. */
       profilePrompt?: { systemPrompt?: string; appendSystemPrompt?: string }
-      /** One process for many stdin turns; `promptPermissions` asks the host before each tool. */
-      retained?: { promptPermissions: boolean }
+      /** One process for many stdin turns that asks the host before each tool. */
+      retained?: true
     },
   ): string[] {
     // Two transport modes — see chat() for the rationale:
@@ -694,7 +694,7 @@ export class ClaudeBackend implements Backend {
         '--permission-mode', 'plan',
         '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
       )
-    } else if (opts?.retained?.promptPermissions) {
+    } else if (opts?.retained) {
       args.push('--permission-prompt-tool', 'stdio')
     } else if (mode === 'byob') {
       args.push('--dangerously-skip-permissions')
