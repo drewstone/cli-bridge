@@ -1,7 +1,6 @@
 /**
- * SSE writer contract: ChatDelta.keepalive must surface as an SSE
- * comment (RFC: lines starting with `:` are dropped by every conforming
- * client) and MUST NOT appear in the OpenAI-visible delta stream.
+ * SSE writer contract: ChatDelta.keepalive MUST NOT appear in the
+ * OpenAI-visible delta stream as content or a tool call.
  *
  * This guards against a regression class we hit in production: backends
  * synthesizing fake `tool_calls` to signal subprocess liveness, which
@@ -13,22 +12,8 @@ import type { ChatDelta } from '../src/backends/types.js'
 import {
   collectNonStreaming,
   deltaToOpenAIChunk,
-  deltaToSseComment,
   makeChunkMeta,
 } from '../src/streaming/sse.js'
-
-describe('deltaToSseComment', () => {
-  it('renders keepalive deltas as SSE comments with source + elapsedMs', () => {
-    const out = deltaToSseComment({ keepalive: { source: 'kimi', elapsedMs: 30000 } })
-    expect(out).toBe(': keepalive source=kimi elapsed=30000\n\n')
-  })
-
-  it('returns null for non-keepalive deltas', () => {
-    expect(deltaToSseComment({ content: 'hello' })).toBeNull()
-    expect(deltaToSseComment({ tool_calls: [{ id: 'a', name: 'b', arguments: '{}' }] })).toBeNull()
-    expect(deltaToSseComment({ finish_reason: 'stop' })).toBeNull()
-  })
-})
 
 describe('deltaToOpenAIChunk', () => {
   const meta = makeChunkMeta('test-model')

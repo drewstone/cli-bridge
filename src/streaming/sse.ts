@@ -18,10 +18,8 @@ export interface ChunkMeta {
 
 /**
  * Convert a `ChatDelta` into an OpenAI-shaped chat.completion.chunk
- * `data: …` line. Returns `null` for deltas that carry only a
- * `keepalive` signal — those must be rendered as SSE comments by the
- * caller (see `deltaToSseComment`) so they don't appear in the
- * OpenAI-visible delta stream.
+ * `data: …` line. Returns `null` for a keepalive or bridge-metadata
+ * delta; the caller renders those with `deltaToBridgeOnlyFrame`.
  */
 export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | null {
   const hasFinalOutput = Object.hasOwn(delta, 'final_output')
@@ -35,10 +33,8 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
   const hasUsage = !!delta.usage
   const hasProfileMaterialization = !!delta.profile_materialization
 
-  // Pure keepalive deltas don't go on the OpenAI wire — surface as SSE
-  // comments via `deltaToSseComment` instead. `internal_session_id`-only
-  // deltas are also non-OpenAI metadata (consumed by the session store)
-  // and are intentionally skipped here.
+  // Keepalive and `internal_session_id`-only deltas carry no OpenAI
+  // content; `deltaToBridgeOnlyFrame` renders them instead.
   if (!hasContent && !hasReasoning && !hasIdentity && !hasToolCalls && !hasToolResults && !hasFinish && !hasUsage && !hasProfileMaterialization && !hasFinalOutput) {
     return null
   }
@@ -138,19 +134,30 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
 }
 
 /**
- * Render a `keepalive` delta as a raw SSE comment (RFC: lines starting
- * with `:` are comments and silently dropped by every conforming SSE
- * client — OpenAI/AI SDK/LiteLLM included). Returns `null` for deltas
- * without a keepalive. The string includes the trailing `\n\n` framing.
+ * Render a numbered delta that has no OpenAI content: a keepalive or bridge
+ * metadata such as `internal_session_id`. The frame keeps its id so replay
+ * stays contiguous, and it carries data because the SSE rules never dispatch
+ * a frame without data: a spec-compliant re-encoder drops it, and Runtime then
+ * fails the run with a replay gap. OpenAI clients skip the `choices: []` chunk
+ * like a usage chunk. The comment line names the frame in the raw stream.
  *
- * Comment lines also serve as transport heartbeats: they keep the TCP
- * connection alive across NAT/proxies and prevent client-side fetch
- * idle timeouts during long subprocess silences.
+ * A keepalive chunk omits `model`: Runtime turns a frame with `model` into a
+ * chunk, and every chunk resets its model-silence bound, which a liveness
+ * heartbeat must not do. A metadata chunk names the model like every other
+ * chunk, because it is usually the first one and OpenAI SDK clients read the
+ * response model from the first chunk.
  */
-export function deltaToSseComment(delta: ChatDelta): string | null {
-  if (!delta.keepalive) return null
-  const { source, elapsedMs } = delta.keepalive
-  return `: keepalive source=${source} elapsed=${elapsedMs}\n\n`
+export function deltaToBridgeOnlyFrame(seq: number, delta: ChatDelta, meta: ChunkMeta): string {
+  const keepalive = delta.keepalive
+  const note = keepalive ? `keepalive source=${keepalive.source} elapsed=${keepalive.elapsedMs}` : 'bridge-metadata'
+  const data = JSON.stringify({
+    id: meta.id,
+    object: 'chat.completion.chunk',
+    created: meta.created,
+    ...(keepalive ? {} : { model: delta.model ?? meta.model }),
+    choices: [],
+  })
+  return `id: ${seq}\n: ${note}\ndata: ${data}\n\n`
 }
 
 export function makeChunkMeta(model: string | undefined): ChunkMeta {
