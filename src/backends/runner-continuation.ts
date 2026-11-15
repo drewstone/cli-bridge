@@ -103,5 +103,11 @@ export async function* continueTurn(
     ? { ...session, internalId: interruption.nativeSessionId }
     : { externalId: interruption.nativeSessionId, backend: backend.name, internalId: interruption.nativeSessionId,
         cwd: req.cwd ?? null, turns: 1, createdAt: Date.now(), lastUsedAt: Date.now(), metadata: {} }
-  yield* backend.runRunner(resumed, resumedSession, signal, newRunnerWatch())
+  // Codex numbers its items per process, so the resumed runner reuses ids the dead one announced.
+  const own = (id: string): string => `${id}.resumed`
+  for await (const delta of backend.runRunner(resumed, resumedSession, signal, newRunnerWatch())) {
+    yield { ...delta,
+      ...(delta.tool_calls ? { tool_calls: delta.tool_calls.map((call) => ({ ...call, id: own(call.id) })) } : {}),
+      ...(delta.tool_results ? { tool_results: delta.tool_results.map((result) => ({ ...result, id: own(result.id) })) } : {}) }
+  }
 }
