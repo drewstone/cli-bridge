@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
-import { createServer, type Server } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { test } from 'node:test'
 import { encodeSSEFrame, streamSSEFrames } from '@tangle-network/agent-core/sse'
 import { createExecutor } from '@tangle-network/agent-runtime/kernel'
@@ -24,10 +23,16 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
  * A proxy that decodes every event stream with agent-core's spec-compliant parser and writes
  * each dispatched frame back out, the way a test proxy or an SSE-aware gateway does. A frame the
  * SSE rules never dispatch (no data line) does not survive it. Every raw upstream frame is
- * recorded so the test can prove the stream it relayed held the frame kinds under test.
+ * recorded so the test can prove the stream it relayed held the frame kinds under test; a
+ * relay that fails destroys its response so the client sees the failure.
  */
-async function startReencodingProxy(upstream: string, rawFrames: string[]): Promise<{ url: string; server: Server }> {
-  const server = createServer(async (req, res) => {
+async function startReencodingProxy(upstream: string, rawFrames: string[]): Promise<{
+  url: string
+  server: Server
+  settled: () => Promise<unknown>
+}> {
+  const relays = new Set<Promise<void>>()
+  const relay = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const chunks: Buffer[] = []
     for await (const chunk of req) chunks.push(chunk as Buffer)
     const headers = new Headers()
@@ -47,7 +52,7 @@ async function startReencodingProxy(upstream: string, rawFrames: string[]): Prom
     res.writeHead(answer.status, out)
     if (!answer.body) return void res.end()
     if (!answer.headers.get('content-type')?.includes('text/event-stream')) {
-      Readable.fromWeb(answer.body as import('node:stream/web').ReadableStream).pipe(res)
+      res.end(Buffer.from(await answer.arrayBuffer()))
       return
     }
     const [forParser, forRecord] = answer.body.tee()
@@ -60,11 +65,16 @@ async function startReencodingProxy(upstream: string, rawFrames: string[]): Prom
     for await (const frame of streamSSEFrames(forParser)) res.write(encodeSSEFrame(frame))
     await recorded
     res.end()
+  }
+  const server = createServer((req, res) => {
+    const done = relay(req, res).catch(() => { res.destroy() })
+    relays.add(done)
+    void done.finally(() => relays.delete(done))
   })
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('proxy did not bind')
-  return { url: `http://127.0.0.1:${address.port}`, server }
+  return { url: `http://127.0.0.1:${address.port}`, server, settled: () => Promise.all(relays) }
 }
 
 // A real process emits the native wire protocol, including a silent pause that the bridge reports
@@ -118,9 +128,13 @@ setTimeout(() => {
   const run = executor.execute('relay this run through a re-encoder', new AbortController().signal)
   if (!isAsyncIterable(run)) throw new Error('bridge execution did not stream')
   for await (const _event of run) { /* drain */ }
+  // Runtime stops at [DONE]; wait until the proxy has recorded the whole upstream stream.
+  await relay.settled()
 
   const numbered = rawFrames.filter(frame => /^id: /mu.test(frame))
   assert.ok(numbered.some(frame => frame.includes(': keepalive source=claude')), 'the relayed stream held a numbered keepalive')
   assert.ok(numbered.some(frame => frame.includes(': bridge-metadata')), 'the relayed stream held a numbered metadata frame')
   for (const frame of numbered) assert.match(frame, /^data: /mu, `numbered frame without data: ${JSON.stringify(frame)}`)
+  // A keepalive must not reach Runtime as a chunk: a chunk resets Runtime's model-silence bound.
+  for (const frame of numbered.filter(frame => frame.includes(': keepalive'))) assert.doesNotMatch(frame, /"model"/u)
 })

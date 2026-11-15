@@ -138,16 +138,25 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
  * metadata such as `internal_session_id`. The frame keeps its id so replay
  * stays contiguous, and it carries data because the SSE rules never dispatch
  * a frame without data: a spec-compliant re-encoder drops it, and Runtime then
- * fails the run with a replay gap. The `choices: []` chunk omits `model`, so
- * Runtime reads it as a numbered event with nothing to apply, the same way it
- * read the earlier id-only comment, and OpenAI clients skip it like a usage
- * chunk. The comment line names the frame for people reading the raw stream.
+ * fails the run with a replay gap. OpenAI clients skip the `choices: []` chunk
+ * like a usage chunk. The comment line names the frame in the raw stream.
+ *
+ * A keepalive chunk omits `model`: Runtime turns a frame with `model` into a
+ * chunk, and every chunk resets its model-silence bound, which a liveness
+ * heartbeat must not do. A metadata chunk names the model like every other
+ * chunk, because it is usually the first one and OpenAI SDK clients read the
+ * response model from the first chunk.
  */
 export function deltaToBridgeOnlyFrame(seq: number, delta: ChatDelta, meta: ChunkMeta): string {
-  const note = delta.keepalive
-    ? `keepalive source=${delta.keepalive.source} elapsed=${delta.keepalive.elapsedMs}`
-    : 'bridge-metadata'
-  const data = JSON.stringify({ id: meta.id, object: 'chat.completion.chunk', created: meta.created, choices: [] })
+  const keepalive = delta.keepalive
+  const note = keepalive ? `keepalive source=${keepalive.source} elapsed=${keepalive.elapsedMs}` : 'bridge-metadata'
+  const data = JSON.stringify({
+    id: meta.id,
+    object: 'chat.completion.chunk',
+    created: meta.created,
+    ...(keepalive ? {} : { model: delta.model ?? meta.model }),
+    choices: [],
+  })
   return `id: ${seq}\n: ${note}\ndata: ${data}\n\n`
 }
 
