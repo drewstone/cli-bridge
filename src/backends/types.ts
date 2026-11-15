@@ -615,6 +615,27 @@ export interface ChatDelta {
    * AI SDK.
    */
   keepalive?: { source: string; elapsedMs: number }
+  /**
+   * The native process tree now running this turn, retained so a restarted
+   * bridge can kill and drain it before it continues the turn. Never on the wire.
+   */
+  runner?: { backend: string; pid: number; scope?: string; mode: BridgeMode; cwd?: string }
+  /**
+   * The bridge continued this turn in the same native session after its runner
+   * died. The interrupted tool calls were never re-run by the bridge; the model
+   * was told to check their effect. Rendered on the SSE frame and in the run snapshot.
+   */
+  continuation?: RunContinuation
+}
+
+export interface RunContinuation {
+  reason: 'runner_exit' | 'bridge_restart'
+  previous_pid: number
+  /** Signal or exit that ended the previous runner, when the bridge observed it. */
+  previous_exit?: string
+  native_session_id: string
+  interrupted_tool_calls: Array<{ id: string; name: string }>
+  resumed_at: string
 }
 
 export interface BackendHealth {

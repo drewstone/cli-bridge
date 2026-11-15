@@ -149,13 +149,15 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
  */
 export function deltaToBridgeOnlyFrame(seq: number, delta: ChatDelta, meta: ChunkMeta): string {
   const keepalive = delta.keepalive
-  const note = keepalive ? `keepalive source=${keepalive.source} elapsed=${keepalive.elapsedMs}` : 'bridge-metadata'
+  const note = keepalive ? `keepalive source=${keepalive.source} elapsed=${keepalive.elapsedMs}`
+    : delta.continuation ? 'continuation' : 'bridge-metadata'
   const data = JSON.stringify({
     id: meta.id,
     object: 'chat.completion.chunk',
     created: meta.created,
     ...(keepalive ? {} : { model: delta.model ?? meta.model }),
     choices: [],
+    ...(delta.continuation ? { continuation: delta.continuation } : {}),
   })
   return `id: ${seq}\n: ${note}\ndata: ${data}\n\n`
 }

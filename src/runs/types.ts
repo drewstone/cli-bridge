@@ -1,6 +1,6 @@
 /** Shared value shapes for one durable run: its output log, snapshot, and claim inputs. */
 
-import type { ChatDelta, ProfileMaterializationReceipt } from '../backends/types.js'
+import type { ChatDelta, ProfileMaterializationReceipt, RunContinuation } from '../backends/types.js'
 import type { InteractionRequest, RuntimeEventEnvelope, StreamEvent } from '@tangle-network/agent-interface'
 
 /** A buffered delta plus its per-run monotonic sequence number. */
@@ -32,6 +32,8 @@ export interface RunClaimOptions {
   environmentId?: string
   /** The request's model; replay frames carry it as the live stream did. */
   model?: string
+  /** Continue a run an earlier bridge process committed through this sequence. */
+  startAfterSeq?: number
   commitDelta?: (input: { runId: string; sequence: number; delta: ChatDelta }) => void | Promise<void>
   commitSnapshot?: (snapshot: RunSnapshot) => void | Promise<void>
   commitCanonicalEvent?: (input: {
@@ -104,6 +106,8 @@ export interface RunSnapshot {
   lifetimeExpiresAt: number | null
   profileMaterialization: ProfileMaterializationReceipt | null
   nativeCapture?: NativeRunCapture
+  /** Each time the bridge continued this turn after its runner died. */
+  continuations?: RunContinuation[]
 }
 
 export interface RunRetention {

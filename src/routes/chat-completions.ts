@@ -970,22 +970,7 @@ export function mountChatCompletions(
       }
       const profile = assertProfileRequestAuthority(req, session)
       if (!(req.execution?.kind === 'sandbox' && backend.name !== 'sandbox')) {
-        req.jailSpec = resolveJailSpec({
-          execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
-          execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
-          execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
-          cwd: req.cwd ?? process.cwd(),
-          env: deps.jailEnv ?? process.env,
-        })
-        const proxySecrets = req.agent_profile?.proxySecrets
-        if (proxySecrets?.length && !req.jailSpec) {
-          throw new BackendError('agent_profile.proxySecrets require execution.jail with network relay', 'parse_error')
-        }
-        if (req.jailSpec) {
-          req.jailSpec.authSources = authSourcesFor(backend.name)
-          req.jailSpec.vendorHosts = vendorHostsFor(backend.name)
-          if (proxySecrets?.length) req.jailSpec.proxySecrets = proxySecrets
-        }
+        req.jailSpec = hostRequestJail(req, backend.name, deps.jailEnv ?? process.env)
       }
       releaseSubscription = await deps.admitSubscription?.(req, backend.name, run.signal)
       if (backend.name === 'pi') assertPiOutputTokenRequest(req, profile)
@@ -1201,6 +1186,27 @@ export function mountChatCompletions(
 
     return respondFromRun(c, run, req, afterSeq)
   })
+}
+
+/** The host jail one request runs under; a bridge-restart continuation resolves it the same way. */
+export function hostRequestJail(req: ChatRequest, backendName: string, env: NodeJS.ProcessEnv): ChatRequest['jailSpec'] {
+  const jailSpec = resolveJailSpec({
+    execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
+    execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
+    execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
+    cwd: req.cwd ?? process.cwd(),
+    env,
+  })
+  const proxySecrets = req.agent_profile?.proxySecrets
+  if (proxySecrets?.length && !jailSpec) {
+    throw new BackendError('agent_profile.proxySecrets require execution.jail with network relay', 'parse_error')
+  }
+  if (jailSpec) {
+    jailSpec.authSources = authSourcesFor(backendName)
+    jailSpec.vendorHosts = vendorHostsFor(backendName)
+    if (proxySecrets?.length) jailSpec.proxySecrets = proxySecrets
+  }
+  return jailSpec
 }
 
 /** The subset of the non-streaming completion body this route reasons about. */

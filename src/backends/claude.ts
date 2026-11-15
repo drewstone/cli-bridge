@@ -96,6 +96,31 @@ interface ClaudeNativeUsage {
 
 const MAX_UPSTREAM_ERROR_DETAIL_CHARS = 512
 
+/** What one runner process showed before it ended, for deciding a continuation. */
+interface RunnerWatch {
+  pid?: number
+  nativeSessionId?: string
+  /** tool_use ids announced without a tool_result yet, with their tool names. */
+  openTools: Map<string, string>
+  /** The signal that killed the runner before its result event. */
+  exit?: string
+  /** Its scope was killed and found empty. */
+  drained: boolean
+}
+
+export interface RunnerInterruption {
+  reason: 'runner_exit' | 'bridge_restart'
+  pid: number
+  exit?: string
+  nativeSessionId: string
+  openTools: ReadonlyMap<string, string>
+}
+
+function continuableInterruption(watch: RunnerWatch, signal: AbortSignal): RunnerInterruption | null {
+  if (signal.aborted || !watch.exit || !watch.drained || !watch.nativeSessionId || watch.pid === undefined) return null
+  return { reason: 'runner_exit', pid: watch.pid, exit: watch.exit, nativeSessionId: watch.nativeSessionId, openTools: watch.openTools }
+}
+
 /** Claude Code computes this amount locally from token prices, not a billing receipt.
  * https://code.claude.com/docs/en/costs#using-the-usage-command */
 function claudeResultUsage(result: ClaudeStreamResult): NonNullable<ChatDelta['usage']> | undefined {
@@ -234,10 +259,70 @@ export class ClaudeBackend implements Backend {
     return versionHealth(this.name, this.bin, this.spawner, this.anthropicBaseUrl ? `via ${this.anthropicBaseUrl}` : undefined, signal)
   }
 
+  /**
+   * One turn. When its runner dies by a signal the bridge did not send, the
+   * turn continues once in the same native session (see `continueTurn`).
+   */
   async *chat(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    const watch: RunnerWatch = { openTools: new Map(), drained: false }
+    try {
+      yield* this.runProcess(req, session, signal, watch)
+    } catch (error) {
+      const interruption = continuableInterruption(watch, signal)
+      if (!interruption) throw error
+      yield* this.continueTurn(req, session, interruption, signal)
+    }
+  }
+
+  /**
+   * Resume an interrupted turn once with `--resume <native id>` and a fixed
+   * message. The caller has already killed and drained the dead runner's scope.
+   * Claude Code itself answers a dangling tool_use with an "interrupted"
+   * tool_result when it loads the session (measured on 2.1.325), so the bridge
+   * never writes Claude's session file and never re-runs the tool. If this
+   * resume dies too, the turn fails as before: one resume per kill.
+   */
+  async *continueTurn(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    interruption: RunnerInterruption,
+    signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    const tools = [...interruption.openTools].map(([id, name]) => ({ id, name }))
+    yield { continuation: {
+      reason: interruption.reason,
+      previous_pid: interruption.pid,
+      ...(interruption.exit ? { previous_exit: interruption.exit } : {}),
+      native_session_id: interruption.nativeSessionId,
+      interrupted_tool_calls: tools,
+      resumed_at: new Date().toISOString(),
+    } }
+    const notice = tools.length > 0
+      ? tools.map((tool) => `The tool call ${tool.name} (${tool.id}) was interrupted and may have partially run; check its effect before acting again.`).join(' ')
+      : 'Your previous response was cut off before it finished.'
+    const resumed: ChatRequest = {
+      ...req,
+      messages: [
+        ...(req.messages ?? []).filter((message) => message.role === 'system'),
+        { role: 'user', content: `The process running this turn stopped unexpectedly and CLI Bridge resumed your session. ${notice} Do not repeat a step that already completed; continue the task from where it stopped.` },
+      ],
+    }
+    const resumedSession: SessionRecord = session
+      ? { ...session, internalId: interruption.nativeSessionId }
+      : { externalId: interruption.nativeSessionId, backend: this.name, internalId: interruption.nativeSessionId,
+          cwd: req.cwd ?? null, turns: 1, createdAt: Date.now(), lastUsedAt: Date.now(), metadata: {} }
+    yield* this.runProcess(resumed, resumedSession, signal, { openTools: new Map(), drained: false })
+  }
+
+  private async *runProcess(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+    watch: RunnerWatch,
   ): AsyncIterable<ChatDelta> {
     const mode: BridgeMode = req.mode ?? 'byob'
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
@@ -383,6 +468,10 @@ export class ClaudeBackend implements Backend {
     let emittedAnyToolCall = false
     const toolNames = new Map<string, string>() // tool_use id -> name, for the tool_result that answers it
     try {
+      if (child.pid !== undefined) {
+        watch.pid = child.pid
+        yield { runner: { backend: this.name, pid: child.pid, ...(spawned.scope ? { scope: spawned.scope } : {}), mode, ...(cwd ? { cwd } : {}) } }
+      }
       let internalSessionId: string | undefined
       let terminal: ClaudeStreamResult | undefined
       const observations = new Set<string>()
@@ -435,6 +524,7 @@ export class ClaudeBackend implements Backend {
 
         if (msg.type === 'system' && (msg as ClaudeStreamInit).subtype === 'init') {
           internalSessionId = (msg as ClaudeStreamInit).session_id
+          watch.nativeSessionId = internalSessionId
           // Retain the provider identity even when the process fails before its result.
           yield { internal_session_id: internalSessionId, ...nativeStore }
           continue
@@ -467,6 +557,7 @@ export class ClaudeBackend implements Backend {
                 }],
               }
               toolNames.set(block.id, block.name)
+              watch.openTools.set(block.id, block.name)
               emittedAnyToolCall = true
             }
           }
@@ -478,6 +569,7 @@ export class ClaudeBackend implements Backend {
           const content = (msg as { message?: { content?: unknown } }).message?.content
           for (const block of Array.isArray(content) ? (content as Array<Record<string, unknown>>) : []) {
             const name = toolNames.get(String(block.tool_use_id))
+            if (block.type === 'tool_result') watch.openTools.delete(String(block.tool_use_id))
             if (block.type === 'tool_result' && name) yield { tool_results: [toolResult(String(block.tool_use_id), name, block.is_error === true, block.content)] }
           }
           continue
@@ -507,6 +599,8 @@ export class ClaudeBackend implements Backend {
       }
 
       if (sawError || (apiError && (closed.code !== 0 || closed.signal !== null))) throw new BackendError(`claude upstream error: ${sawError || apiError}`, 'upstream')
+      // A signal the bridge did not send, before the turn's result: the runner was killed.
+      if (!terminal && closed.signal !== null) watch.exit = closed.signal
       await assertSuccessfulHarnessExit(spawned, 'claude', () => stderr.render())
       if (terminal) {
         yield {
@@ -531,7 +625,8 @@ export class ClaudeBackend implements Backend {
       // Always tear down the whole subtree before releasing the slot.
       // Reaps MCP servers and tool sub-processes claude spawned. Pre-fix
       // this was `child.kill('SIGTERM')` which leaked grand-children.
-      await terminateSpawned(spawned)
+      // A continuation needs proof the whole tree is gone: a scope that cgroup.kill emptied.
+      watch.drained = (await terminateSpawned(spawned)) === 'stopped' && spawned.scope !== undefined
       releaseSpawner()
       mcpMaterialized?.cleanup()
     }

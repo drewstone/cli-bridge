@@ -944,6 +944,14 @@ export class SessionStore implements RetainedInteractionPersistence {
     return claim()
   }
 
+  /** One-shot runs whose last committed snapshot was not terminal: an earlier process owned them. */
+  unsettledOneShotRuns(): RetainedRunAdmission[] {
+    const rows = this.db.prepare(
+      "SELECT run_id FROM retained_run_admissions WHERE owner = 'one-shot' AND json_extract(snapshot_json, '$.terminal') = 0",
+    ).all() as Array<{ run_id: string }>
+    return rows.map((row) => this.getRetainedRun(row.run_id)!)
+  }
+
   getRetainedRun(runId: string): RetainedRunAdmission | null {
     const row = this.db.prepare(
       'SELECT * FROM retained_run_admissions WHERE run_id = ?',

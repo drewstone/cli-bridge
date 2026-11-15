@@ -79,9 +79,11 @@ export class Run {
     private readonly commitCanonicalEvent?: RunClaimOptions['commitCanonicalEvent'],
     private readonly onNativeControlLost?: RunClaimOptions['onNativeControlLost'],
     readonly model?: string,
+    startAfterSeq = 0,
   ) {
     this.log = new RunReplayLog({
       runId: id,
+      startAfterSeq,
       retention,
       isClosed: () => this.isTerminal() || this.disposed,
       onIdentityExpired: () => onForget(id, this),
@@ -166,6 +168,7 @@ export class Run {
         : this.startedAt + this.retention.maxLifetimeMs,
       profileMaterialization: this.log.profileReceipt() as ProfileMaterializationReceipt | null,
       ...(this.nativeCapture ? { nativeCapture: this.nativeCapture } : {}),
+      ...(this.log.continuations().length ? { continuations: this.log.continuations() } : {}),
     }
   }
 
