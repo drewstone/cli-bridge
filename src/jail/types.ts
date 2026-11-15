@@ -24,6 +24,8 @@ export interface JailSpec {
   network?: JailNetwork
   /** Trusted admission only, never decoded from request JSON. Each claim is adopted by one spawn. */
   trustedHostServices?: readonly TrustedHostServiceRegistration[]
+  /** Trusted admission only: host loopback ports this spawn reaches at the same address in its netns. */
+  hostLoopbackPorts?: readonly number[]
   /** `relay` only: AgentProfile.proxySecrets, minted and revoked per spawn (see egress.ts). */
   proxySecrets?: ProxySecretBinding[]
   /** `BRIDGE_PROXY_SECRET_COMMAND`, required when `proxySecrets` is non-empty. */

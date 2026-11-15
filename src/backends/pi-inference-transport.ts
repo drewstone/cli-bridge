@@ -863,6 +863,8 @@ export async function provisionPiInferenceTransport(
       mode: 0o600,
       flag: 'wx',
     })
+    // The proxy relays HTTP POST only; Pi's default `auto` first tries a Codex WebSocket it refuses.
+    writeFileSync(join(agentDir, 'settings.json'), '{"transport":"sse"}\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     // Pi may create package/cache state at startup. Keep every write in the
     // request directory; never point it back at the credential-bearing source.
     mkdirSync(join(agentDir, 'npm'), { mode: 0o700 })

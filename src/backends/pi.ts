@@ -571,6 +571,8 @@ export class PiBackend implements NativeSessionBackend {
       )
       advancePhase('session_and_mcp')
       registerJailWritable(req.jailSpec, inference.agentDir, inference.sessionDir)
+      // The jail unshares the network, so its 127.0.0.1 is not the proxy's; forward that one port in.
+      if (req.jailSpec) req.jailSpec.hostLoopbackPorts = [Number(new URL(inference.localBaseUrl).port)]
       args.push('--session-dir', inference.sessionDir)
       if (req.session_id) {
         ensurePiSessionFile(
