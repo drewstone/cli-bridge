@@ -1,6 +1,6 @@
 /**
  * Bridge start: continue the turns an earlier bridge process left running, for
- * every backend that declares a native resume (`runRunner`: Claude, Codex).
+ * every backend that declares a native resume (`runRunner`: Claude, Codex, opencode).
  *
  * A one-shot run whose last snapshot is not terminal lost its owner. Its
  * retained events name the runner's scope and native session. When that scope
