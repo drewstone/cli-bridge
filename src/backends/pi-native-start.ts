@@ -199,6 +199,8 @@ export async function startPiNativeSession(
     })
     advancePhase('reserve_session')
     registerJailWritable(req.jailSpec, inference.agentDir, inference.sessionDir)
+    // The jail's 127.0.0.1 is not the proxy's: forward that one port in, as the one-shot path does (pi.ts).
+    if (req.jailSpec) req.jailSpec.hostLoopbackPorts = [Number(new URL(inference.localBaseUrl).port)]
     args.push('--session-dir', inference.sessionDir)
     ensurePiSessionFile(
       inference.sessionDir,
