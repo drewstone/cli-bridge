@@ -7,9 +7,9 @@
  * coding-agent execution and rejects hosted-safe/hosted-sandboxed until
  * we verify Gemini's tool-disable and sandbox semantics end-to-end.
  *
- * The Gemini CLI is less stable than Claude/Codex/opencode in its
- * machine-readable output surface, so this backend treats stdout as
- * text and best-effort parses JSONL if a future CLI emits it.
+ * Gemini's stream-json protocol carries native session, assistant, tool, and
+ * terminal usage events. Model labels in init/stats can fall back to the
+ * request and therefore do not establish provider response identity.
  */
 
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
@@ -72,6 +72,7 @@ export class GeminiBackend implements Backend {
     const model = this.extractModel(req.model)
     const args = this.buildArgs(req.model)
     if (model) args.push('--model', model)
+    if (session?.internalId) args.push('--resume', session.internalId)
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
 
     // Validate the profile before touching project-scoped Gemini settings,
@@ -149,6 +150,11 @@ export class GeminiBackend implements Backend {
       let sawError: string | null = null
       let assistantText = ''
       let incremental = false
+      const tools = new Map<string, string>()
+      let nativeSessionId: string | undefined
+      let nativeUsage: ChatDelta['usage']
+      let nativeProtocol = false
+      let terminalResult = false
 
       for await (const next of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (next.kind === 'progress') {
@@ -161,12 +167,43 @@ export class GeminiBackend implements Backend {
         const parsed = parseMaybeJson(line)
         if (parsed) {
           const type = String(parsed.type ?? parsed.event ?? '')
+          if (['init', 'message', 'tool_use', 'tool_result', 'result'].includes(type)) nativeProtocol = true
+          if (type === 'init') {
+            if (typeof parsed.session_id === 'string' && parsed.session_id.length > 0) {
+              if ((session?.internalId && parsed.session_id !== session.internalId)
+                || (nativeSessionId && parsed.session_id !== nativeSessionId)) {
+                throw new BackendError('gemini resumed a different native session', 'upstream')
+              }
+              nativeSessionId = parsed.session_id
+              yield { internal_session_id: nativeSessionId }
+            }
+            continue
+          }
+          if (type === 'message' && parsed.role !== 'assistant') continue
+          if (type === 'result') {
+            terminalResult = true
+            if (parsed.error || (parsed.status !== undefined && parsed.status !== 'success')) {
+              sawError = String((parsed.error as Record<string, unknown> | undefined)?.message
+                ?? `native result status ${String(parsed.status ?? 'error')}`)
+            }
+            nativeUsage = geminiUsage(parsed.stats)
+            continue
+          }
+          if (type === 'tool_result') {
+            const id = typeof parsed.tool_id === 'string' ? parsed.tool_id : undefined
+            const name = id ? tools.get(id) : undefined
+            if (id && name && (parsed.status === 'success' || parsed.status === 'error')) {
+              yield { tool_results: [{ id, name, status: parsed.status === 'success' ? 'completed' : 'error',
+                ...(typeof parsed.output === 'string' ? { output: parsed.output } : {}),
+                ...(parsed.error ? { error: typeof parsed.error === 'string' ? parsed.error
+                  : String((parsed.error as Record<string, unknown>).message ?? 'gemini tool failed') } : {}),
+              }] }
+            }
+            continue
+          }
           if (type.toLowerCase().includes('error') || parsed.error) {
-            sawError = String(
-              parsed.message
-              ?? (parsed.error as Record<string, unknown> | undefined)?.message
-              ?? 'gemini error',
-            )
+            sawError = String(parsed.message
+              ?? (parsed.error as Record<string, unknown> | undefined)?.message ?? 'gemini error')
             continue
           }
           const text = extractText(parsed)
@@ -180,6 +217,7 @@ export class GeminiBackend implements Backend {
           }
           const toolCall = extractToolCall(parsed)
           if (toolCall) {
+            tools.set(toolCall.id, toolCall.name)
             yield { tool_calls: [toolCall] }
             assistantText = ''
             incremental = false
@@ -193,12 +231,19 @@ export class GeminiBackend implements Backend {
       }
 
       await waitForProcessClose(child)
+      if (nativeUsage) yield { usage: nativeUsage }
       if (signal.aborted) {
         yield { finish_reason: 'error' }
         return
       }
       await assertSuccessfulHarnessExit(spawned, 'gemini', () => stderr.render())
       if (sawError) throw new BackendError(`gemini: ${sawError}`, 'upstream')
+      if (nativeProtocol && !terminalResult) {
+        throw new BackendError('gemini stream ended without a terminal result', 'upstream')
+      }
+      if (session?.internalId && !nativeSessionId) {
+        throw new BackendError('gemini did not confirm its resumed native session', 'upstream')
+      }
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`gemini produced no output: ${stderr.render(300)}`, 'upstream')
       }
@@ -293,19 +338,54 @@ function extractToolCall(ev: Record<string, unknown>): { id: string; name: strin
     ?? (ev.tool_call as Record<string, unknown> | undefined)
     ?? (/tool|function/i.test(type) ? ev : undefined)
   if (!holder) return null
-  const name = holder.name ?? holder.tool ?? (holder.function as Record<string, unknown> | undefined)?.name
+  const name = holder.name ?? holder.tool_name ?? holder.tool ?? (holder.function as Record<string, unknown> | undefined)?.name
   if (typeof name !== 'string' || !name) return null
   const rawArgs =
     holder.args
+    ?? holder.parameters
     ?? holder.arguments
     ?? holder.input
     ?? (holder.function as Record<string, unknown> | undefined)?.arguments
     ?? {}
-  const id = String(holder.id ?? holder.callId ?? holder.call_id ?? `${name}-${Math.random().toString(36).slice(2, 10)}`)
+  const id = holder.id ?? holder.tool_id ?? holder.callId ?? holder.call_id
+  if (typeof id !== 'string' || id.length === 0) return null
   return {
     id,
     name,
     arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs),
+  }
+}
+
+/** StreamStats reports candidates separately from hidden output; only a reconciled total proves inclusive output. */
+function geminiUsage(value: unknown): ChatDelta['usage'] {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const stats = value as Record<string, unknown>
+  const count = (key: string): number | undefined => {
+    const value = stats[key]
+    if (value === undefined) return undefined
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+      throw new BackendError(`gemini reported invalid ${key} token count`, 'upstream')
+    }
+    return value
+  }
+  const input = count('input_tokens')
+  const output = count('output_tokens')
+  const total = count('total_tokens')
+  const cached = count('cached')
+  const fresh = count('input')
+  if (input === undefined && cached === undefined && fresh === undefined) return undefined
+  if (input !== undefined && ((cached !== undefined && cached > input)
+    || (fresh !== undefined && fresh > input)
+    || (cached !== undefined && fresh !== undefined && cached + fresh !== input))) {
+    throw new BackendError('gemini reported inconsistent input token classes', 'upstream')
+  }
+  return {
+    ...(input === undefined ? {} : { input_tokens: input }),
+    ...(input !== undefined && output !== undefined && total === input + output ? { output_tokens: output } : {}),
+    ...(cached === undefined ? {} : { cache_read_input_tokens: cached }),
+    ...(fresh === undefined ? {} : { fresh_input_tokens: fresh }),
+    estimated: false,
+    cost_known: false,
   }
 }
 
