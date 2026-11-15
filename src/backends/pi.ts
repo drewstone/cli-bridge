@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { performance } from 'node:perf_hooks'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth, NativeSessionBackend } from './types.js'
 import { versionHealth } from './health.js'
@@ -848,6 +849,8 @@ export class PiBackend implements NativeSessionBackend {
       const { code: exitCode, signal: exitSignal } = await waitForProcessClose(child)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
+      // Pi's hang-up reaches the proxy through the jail's forwarder sockets a few ms after its exit.
+      for (let wait = 0; wait < 50 && inference!.traffic().inFlightRequests > 0; wait++) await sleep(20)
 
       const inferenceTraffic = inference!.traffic()
       const observedModelRequests = inferenceTraffic.generationRequests

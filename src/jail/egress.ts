@@ -185,12 +185,13 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
 /** This spawn's socket for one host loopback port; each connection is spliced to that port only. */
 async function startLoopbackBridge(socketPath: string, port: number): Promise<() => Promise<void>> {
   const open = new Set<Socket>()
-  const server = createServer({ allowHalfOpen: true }, (client) => {
+  // Not half-open: the jail side ending means its process left, and the service must see that hang-up now.
+  const server = createServer((client) => {
     const upstream = connect(port, '127.0.0.1')
     const close = () => { client.destroy(); upstream.destroy() }
     for (const socket of [client, upstream]) {
       open.add(socket)
-      socket.once('close', () => open.delete(socket))
+      socket.once('close', () => { open.delete(socket); close() })
       socket.on('error', close)
     }
     client.pipe(upstream).pipe(client)
