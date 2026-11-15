@@ -18,6 +18,7 @@ import type { SessionRecord } from '../sessions/store.js'
 import type { BridgeMode } from '../modes.js'
 import type { JailSpec } from '../jail/index.js'
 import type { EffectiveNativeStore } from '../jail/types.js'
+import type { NativeResumeBackend } from './runner-continuation.js'
 import type { CallerTrace } from '../trace/ids.js'
 import type {
   AgentEnvironmentCapabilities,
@@ -692,6 +693,9 @@ export interface Backend {
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta>
+
+  /** Declared by a backend whose CLI resumes a session by id; see runner-continuation.ts. */
+  runRunner?: NativeResumeBackend['runRunner']
 }
 
 /** Native side effects are separated so the receiver can persist each acknowledgement. */

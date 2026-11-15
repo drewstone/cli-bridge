@@ -1,13 +1,15 @@
 /**
- * Bridge start: continue the Claude turns an earlier bridge process left running.
+ * Bridge start: continue the turns an earlier bridge process left running, for
+ * every backend that declares a native resume (`runRunner`: Claude, Codex).
  *
  * A one-shot run whose last snapshot is not terminal lost its owner. Its
  * retained events name the runner's scope and native session. When that scope
  * still holds tasks, the runner outlived the bridge (measured: a Claude runner
- * wrote its next step 45 s after the bridge was SIGKILLed). The scope is killed
- * and drained first, and only then is the turn resumed once, under the same run
- * id and after its last committed sequence, so a reader that reattaches with
- * Last-Event-ID sees the continuation event and the rest of the turn.
+ * wrote its next step 45 s after the bridge was SIGKILLed, and so does a Codex
+ * runner). The scope is killed and drained first, and only then is the turn
+ * resumed once, under the same run id and after its last committed sequence, so
+ * a reader that reattaches with Last-Event-ID sees the continuation event and
+ * the rest of the turn.
  *
  * The continuation holds the session's execution lease, and it resends the
  * system messages its runner record retained.
@@ -18,7 +20,7 @@
  */
 
 import type { ChatDelta, ChatRequest } from '../backends/types.js'
-import { ClaudeBackend } from '../backends/claude.js'
+import { continueTurn, type NativeResumeBackend } from '../backends/runner-continuation.js'
 import type { BackendRegistry } from '../backends/registry.js'
 import { drainOrphanScope } from '../executors/scoped-host.js'
 import { hostRequestJail } from '../jail/host-request.js'
@@ -54,7 +56,7 @@ async function continueRun(
   if (!runner?.scope || !await drainOrphanScope(runner.scope)) return
   const backend = deps.registry.byName(runner.backend)
   const nativeSessionId = deltas.findLast((delta) => delta.internal_session_id)?.internal_session_id
-  if (!(backend instanceof ClaudeBackend) || !nativeSessionId || deltas.some((delta) => delta.continuation)) {
+  if (!backend?.runRunner || !nativeSessionId || deltas.some((delta) => delta.continuation)) {
     console.error(`[cli-bridge] run ${admission.runId}: killed its orphaned runner ${runner.pid}; the turn stays unknown`)
     return
   }
@@ -98,6 +100,6 @@ async function continueRun(
   // The continuation owns the session lane like any turn, so a new turn on it waits.
   const lease = session ? await deps.store.acquireExecution(admission.sessionId, backend.name) : null
   const interruption = { reason: 'bridge_restart' as const, pid: runner.pid, nativeSessionId, openTools }
-  void run.pump(backend.continueTurn(req, session, interruption, run.signal), chatCompletionDeltaOptions(req))
+  void run.pump(continueTurn(backend as NativeResumeBackend, req, session, interruption, run.signal), chatCompletionDeltaOptions(req))
     .finally(() => lease?.release())
 }
