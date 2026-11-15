@@ -2,7 +2,7 @@
  * Continue one turn once after its native runner dies, for any backend whose CLI
  * resumes a session by id. The backend runs one runner process per call and
  * resumes `session.internalId` with its own argv (Claude `--resume <id>`, Codex
- * `exec resume <id>`); everything else here is shared.
+ * `exec resume <id>`, opencode `run -s <id>`); everything else here is shared.
  */
 
 import type { SpawnResult } from '../executors/types.js'
@@ -72,9 +72,10 @@ export async function* chatContinuing(
 /**
  * Resume an interrupted turn once with a fixed message. The caller has already
  * killed and drained the dead runner's scope, so the bridge never re-runs a tool
- * and never writes the native session file. Both CLIs accept a session that ends
+ * and never writes the native session file. Each CLI accepts a session that ends
  * on a tool call with no result (measured: Claude Code 2.1.325 answers it with an
- * "interrupted" tool_result; Codex 0.169.0 resumes the rollout as it is). If this
+ * "interrupted" tool_result; Codex 0.169.0 resumes the rollout as it is; opencode
+ * 1.18.33 resumes a session whose bash part was still running). If this
  * resume dies too, the turn fails as before: one resume per kill.
  */
 export async function* continueTurn(

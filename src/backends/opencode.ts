@@ -48,6 +48,7 @@ import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
+import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
 
@@ -79,10 +80,17 @@ export class OpencodeBackend implements Backend {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
-  async *chat(
+  /** One turn; it continues once in the same native session when its runner dies (see `chatContinuing`). */
+  chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
+    return chatContinuing(this, req, session, signal)
+  }
+
+  /** One runner process; `session.internalId` resumes with `opencode run -s <id>`. */
+  async *runRunner(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
+    watch: RunnerWatch,
   ): AsyncIterable<ChatDelta> {
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
@@ -244,6 +252,10 @@ export class OpencodeBackend implements Backend {
     if (signal.aborted) onAbort()
 
     try {
+      if (child.pid !== undefined) {
+        watch.pid = child.pid
+        yield runnerDelta(this.name, child.pid, spawned, req.mode ?? 'byob', cwd, req)
+      }
       let internalSessionId: string | undefined
       const stderr = new BoundedDiagnosticBuffer()
       child.stderr?.on('data', (b) => { stderr.append(b) })
@@ -277,6 +289,7 @@ export class OpencodeBackend implements Backend {
       let toolSession: string | null = null
       // Steps yield their own usage as they finish; a non-step usage event is the fallback only for a stream with no step receipt.
       let sawStepUsage = false
+      let sawTerminal = false
       let fallbackUsage: UsageReceipt | undefined
       const progressIntervalMs = Math.max(10, Number(process.env.OPENCODE_PROGRESS_MS ?? 30_000))
 
@@ -304,6 +317,7 @@ export class OpencodeBackend implements Backend {
         const sessId = pickSessionId(ev)
         if (sessId && !internalSessionId) {
           internalSessionId = sessId
+          watch.nativeSessionId = sessId
           yield { internal_session_id: internalSessionId }
         }
 
@@ -325,11 +339,14 @@ export class OpencodeBackend implements Backend {
           const started = extractToolUse(ev)
           if (started && !startedTools.has(started.id)) {
             startedTools.add(started.id)
+            watch.openTools.set(started.id, started.name)
             yield { tool_calls: [started] }
             emittedToolCall = true
           }
           continue
         }
+        // Every step ends on a receipt; the turn's last one gives a reason other than `tool-calls`.
+        if (isStepReceipt(ev) && (ev.part as { reason?: unknown } | undefined)?.reason !== 'tool-calls') sawTerminal = true
         const eventUsage = extractUsage(ev)
         if (eventUsage && !isStepReceipt(ev)) fallbackUsage = eventUsage
         else if (eventUsage) { sawStepUsage = true; yield { usage: { ...eventUsage, model_call: true } } }
@@ -390,11 +407,15 @@ export class OpencodeBackend implements Backend {
         // start gets only its outcome here; one it missed is reported whole, call and outcome.
         if (toolCall && !startedTools.has(toolCall.id)) { yield { tool_calls: [toolCall] }; emittedToolCall = true }
         const toolResult = extractToolResult(ev)
-        if (toolResult) yield { tool_results: [toolResult] }
+        if (toolResult) { watch.openTools.delete(toolResult.id); yield { tool_results: [toolResult] } }
 
       }
 
-      await waitForProcessClose(child)
+      const closed = await waitForProcessClose(child)
+      // A signal the bridge did not send, before the turn's last step finished: the runner was killed.
+      // A wrapper that does not exec opencode (opencode-isolated runs it under `timeout`) reports that as exit 128+n.
+      const killed = closed.signal ?? (closed.code !== null && closed.code > 128 ? `exit ${closed.code}` : null)
+      if (!sawTerminal && killed) watch.exit = killed
       // Each step's usage already went out as its own model call; a run that printed no step receipts reports its total.
       if (!sawStepUsage && fallbackUsage) yield { usage: fallbackUsage }
 
@@ -419,8 +440,9 @@ export class OpencodeBackend implements Backend {
       signal.removeEventListener('abort', onAbort)
       // A terminal response and slot reuse both wait for executor-owned
       // termination. In Docker mode this includes the in-container process,
-      // not merely the local attach client.
-      await terminateSpawned(spawned)
+      // not merely the local attach client. A continuation needs proof the whole
+      // tree is gone: a scope that cgroup.kill emptied.
+      watch.drained = (await terminateSpawned(spawned)) === 'stopped' && spawned.scope !== undefined
       releaseSpawner()
       mcpMaterialized?.cleanup()
       // Only after the process is gone: opencode rereads its config directory
