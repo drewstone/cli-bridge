@@ -720,7 +720,12 @@ export interface NativeSession {
   providerSessionId(): string | null
   admitSubscription?(admission: NativeSubscriptionAdmission): Promise<void>
   turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown>
-  steer?(prompt: string): Promise<void>
+  /**
+   * Deliver input to the running turn. `operationId` is the caller's control
+   * operation; a provider that observes when the input is applied reports it
+   * in the turn's events under that id.
+   */
+  steer?(prompt: string, operationId?: string): Promise<void>
   abort(): Promise<void>
   respondToNativeInteraction(id: string, response: Record<string, unknown>): Promise<void>
   contextBoundary(input: {

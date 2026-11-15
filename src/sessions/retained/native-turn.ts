@@ -33,6 +33,8 @@ import {
 } from '../../backends/pi.js'
 import type { Run } from '../../runs/registry.js'
 import { piPermissionPublicTitle, piPermissionTokenFromTitle } from '../../backends/pi-interaction.js'
+import { normalizeClaudeUsage, sanitizeUpstreamErrorDetail, type ClaudeNativeUsage } from '../../backends/claude.js'
+import { CLAUDE_TURN_SETTLED, ClaudeNativeSession } from '../../backends/claude-native-session.js'
 import { numberValue, recordValue, stringValue } from './json-values.js'
 
 export interface NativeTurnInput {
@@ -55,6 +57,10 @@ export interface NativeTurnInput {
 }
 
 export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ event: StreamEvent }> {
+  if (input.native instanceof ClaudeNativeSession) {
+    yield* claudeCanonicalTurn(input)
+    return
+  }
   const { native, run, sessionId, prompt, backendName } = input
   yield { event: { type: 'status', status: 'started' } }
   const text = new Map<number, string>()
@@ -170,35 +176,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
           input.environmentId,
         )
         if (interaction) {
-          if (
-            (input.interactions as Readonly<Record<string, boolean | undefined>>)[
-              interaction.request.kind
-            ] !== true
-          ) {
-            // Let the provider resume from its yielded UI request before
-            // writing the cancellation. Pi installs its response waiter on
-            // that resume, not while this event is being translated.
-            const denial = new Promise<void>((resolve, reject) => {
-              setImmediate(() => {
-                void input.onUnrequestedInteraction({
-                  run,
-                  request: interaction.request,
-                  nativeId: interaction.nativeId,
-                }).then(resolve, reject)
-              })
-            })
-            deferredDenials.push(denial)
-            yield {
-              event: {
-                type: 'warning',
-                code: 'interaction_not_requested',
-                message: `${interaction.request.kind} interaction was denied because this turn did not request it`,
-              },
-            }
-            continue
-          }
-          run.registerInteraction({ request: interaction.request, nativeId: interaction.nativeId })
-          yield { event: { type: 'interaction', request: interaction.request } }
+          yield { event: admitInteraction(input, interaction, deferredDenials) }
         } else if (isFireAndForgetUi(event)) {
           yield { event: { type: 'raw', backend: backendName, event: raw } }
         } else {
@@ -264,6 +242,216 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
         event: { type: 'status', status: 'failed', detail: error instanceof Error ? error.message : String(error) },
       }
     throw error
+  }
+}
+
+/**
+ * Publish a provider dialog this turn requested, or deny one it did not.
+ * The denial waits one tick so the provider has resumed from the yielded
+ * request (Pi installs its response waiter on that resume).
+ */
+function admitInteraction(
+  input: NativeTurnInput,
+  interaction: { request: InteractionRequest; nativeId: string },
+  deferredDenials: Promise<void>[],
+): StreamEvent {
+  if ((input.interactions as Readonly<Record<string, boolean | undefined>>)[interaction.request.kind] !== true) {
+    const denial = new Promise<void>((resolve, reject) => {
+      setImmediate(() => {
+        void input.onUnrequestedInteraction({
+          run: input.run,
+          request: interaction.request,
+          nativeId: interaction.nativeId,
+        }).then(resolve, reject)
+      })
+    })
+    deferredDenials.push(denial)
+    return {
+      type: 'warning',
+      code: 'interaction_not_requested',
+      message: `${interaction.request.kind} interaction was denied because this turn did not request it`,
+    }
+  }
+  input.run.registerInteraction({ request: interaction.request, nativeId: interaction.nativeId })
+  return { type: 'interaction', request: interaction.request }
+}
+
+/**
+ * Claude Code stream-json lines as canonical events. Claude prints whole
+ * content blocks, so each text block is one part whose delta is its text.
+ * Lines with no canonical form, including `command_lifecycle` and the
+ * bridge's `steer` receipts, are kept as `raw` events.
+ */
+async function* claudeCanonicalTurn(input: NativeTurnInput): AsyncIterable<{ event: StreamEvent }> {
+  const { native, run, sessionId, prompt, backendName } = input
+  yield { event: { type: 'status', status: 'started' } }
+  const tools = new Map<string, { name: string; args: Record<string, unknown> }>()
+  let nextContentIndex = 0
+  let lastTurnFailure: string | null = null
+  const deferredDenials: Promise<void>[] = []
+  try {
+    for await (const raw of native.turn(prompt, run.signal)) {
+      const event = recordValue(raw)
+      if (!event) {
+        yield { event: { type: 'raw', backend: backendName, event: raw } }
+        continue
+      }
+      const type = String(event.type ?? '')
+      if (type === 'system' && event.subtype === 'init') {
+        const id = stringValue(event.session_id)
+        if (id) {
+          input.onProviderSessionId(id)
+          yield { event: { type: 'session.updated', sessionId: boundedRuntimeId(id), time: { updated: Date.now() } } }
+        }
+        yield { event: { type: 'status', status: 'processing' } }
+        continue
+      }
+      if (type === 'assistant') {
+        const message = recordValue(event.message)
+        for (const item of message && Array.isArray(message.content) ? message.content : []) {
+          const block = recordValue(item)
+          if (!block) continue
+          if (block.type === 'text' && stringValue(block.text)) {
+            const text = block.text as string
+            if (event.isApiErrorMessage === true) lastTurnFailure = sanitizeUpstreamErrorDetail(text)
+            yield { event: textEvent(sessionId, run.id, nextContentIndex++, text, text) }
+          } else if (block.type === 'thinking' && stringValue(block.thinking)) {
+            const thinking = block.thinking as string
+            yield { event: reasoningEvent(sessionId, run.id, nextContentIndex++, thinking, thinking) }
+          } else if (block.type === 'tool_use') {
+            const id = stringValue(block.id)
+            const name = stringValue(block.name)
+            if (!id || !name) continue
+            const args = recordValue(block.input) ?? {}
+            tools.set(id, { name, args })
+            yield { event: { type: 'message.part.updated', part: toolPart(sessionId, run.id, id, name, args, 'pending') } }
+          }
+        }
+        continue
+      }
+      if (type === 'user') {
+        const message = recordValue(event.message)
+        let translated = false
+        for (const item of message && Array.isArray(message.content) ? message.content : []) {
+          const block = recordValue(item)
+          const id = block?.type === 'tool_result' ? stringValue(block.tool_use_id) : null
+          const tool = id ? tools.get(id) : undefined
+          if (!block || !id || !tool) continue
+          translated = true
+          const failed = block.is_error === true
+          const outcome = failed
+            ? { error: typeof block.content === 'string' ? block.content : JSON.stringify(block.content), result: block.content }
+            : { result: block.content }
+          yield {
+            event: {
+              type: 'message.part.updated',
+              part: toolPart(sessionId, run.id, id, tool.name, tool.args, failed ? 'error' : 'completed', outcome),
+            },
+          }
+        }
+        // The prompt and steer echoes stay raw: they are the consumption receipts.
+        if (!translated) yield { event: { type: 'raw', backend: backendName, event: raw } }
+        continue
+      }
+      if (type === 'control_request') {
+        const request = recordValue(event.request)
+        const nativeId = stringValue(event.request_id)
+        const permission = request?.subtype === 'can_use_tool' && nativeId ? request : null
+        const interaction = permission && nativeId
+          ? interactionFromClaude(run, permission, nativeId, sessionId, input.providerName, input.environmentId)
+          : null
+        if (interaction) {
+          yield { event: admitInteraction(input, interaction, deferredDenials) }
+          continue
+        }
+        // Claude waits on every permission request; one the bridge cannot
+        // publish is refused rather than left to stall the turn.
+        if (permission && nativeId) deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
+        yield {
+          event: {
+            type: 'warning',
+            code: 'unsupported_interaction',
+            message: 'Claude emitted a control request cli-bridge cannot answer safely',
+          },
+        }
+        continue
+      }
+      if (type === 'result') {
+        const usage = claudeUsageEvent(event)
+        if (usage) yield { event: { type: 'raw', backend: backendName, event: usage } }
+        lastTurnFailure = event.is_error === true || event.subtype !== 'success'
+          ? sanitizeUpstreamErrorDetail(stringValue(event.result) ?? `result ${String(event.subtype ?? 'error')}`)
+          : null
+        yield { event: { type: 'raw', backend: backendName, event: raw } }
+        continue
+      }
+      if (type === CLAUDE_TURN_SETTLED) {
+        yield {
+          event: {
+            type: 'status',
+            status: lastTurnFailure ? 'failed' : 'completed',
+            ...(lastTurnFailure ? { detail: lastTurnFailure } : {}),
+          },
+        }
+        continue
+      }
+      yield { event: { type: 'raw', backend: backendName, event: raw } }
+    }
+    await Promise.all(deferredDenials)
+  } catch (error) {
+    if (!run.signal.aborted)
+      yield {
+        event: { type: 'status', status: 'failed', detail: error instanceof Error ? error.message : String(error) },
+      }
+    throw error
+  }
+}
+
+function interactionFromClaude(
+  run: Run,
+  request: Record<string, unknown>,
+  nativeId: string,
+  sessionId: string,
+  providerName: string,
+  environmentId: string,
+): { request: InteractionRequest; nativeId: string } | null {
+  const tool = (stringValue(request.display_name) ?? stringValue(request.tool_name) ?? 'tool')
+    .replace(/[^\p{L}\p{N} .,_:\/-]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, 120) || 'tool'
+  const input = recordValue(request.input)
+  const body = [stringValue(request.description), input ? JSON.stringify(input) : null]
+    .filter((part): part is string => part !== null)
+    .join('\n')
+    .slice(0, 4_000)
+  return permissionInteraction(run, nativeId, `Permission: ${tool}`, body || null, sessionId, providerName, environmentId)
+}
+
+/** Claude's per-result usage receipt; its dollar figure is Claude Code's own estimate. */
+function claudeUsageEvent(result: Record<string, unknown>): AgentEnvironmentEvent | null {
+  const usage = normalizeClaudeUsage((recordValue(result.usage) ?? undefined) as ClaudeNativeUsage | undefined)
+  if (!usage) return null
+  const cost = typeof result.total_cost_usd === 'number' && Number.isFinite(result.total_cost_usd) && result.total_cost_usd >= 0
+    ? result.total_cost_usd
+    : undefined
+  const rawUsage = {
+    ...(usage.input_tokens === undefined ? {} : { prompt_tokens: usage.input_tokens }),
+    ...(usage.output_tokens === undefined ? {} : { completion_tokens: usage.output_tokens }),
+    ...(usage.fresh_input_tokens === undefined ? {} : { fresh_input_tokens: usage.fresh_input_tokens }),
+    ...(usage.cache_read_input_tokens === undefined ? {} : { cache_read_input_tokens: usage.cache_read_input_tokens }),
+    ...(usage.cache_write_input_tokens === undefined ? {} : { cache_write_input_tokens: usage.cache_write_input_tokens }),
+    estimated: false,
+    cost_known: false,
+  }
+  return {
+    type: 'usage',
+    data: { usage: rawUsage, ...(cost === undefined ? {} : { estimatedCostUsd: cost }) },
+    ...(usage.input_tokens === undefined || usage.output_tokens === undefined ? {} : { usage: {
+      inputTokens: usage.input_tokens,
+      outputTokens: usage.output_tokens,
+      ...(usage.cache_read_input_tokens === undefined ? {} : { cacheReadInputTokens: usage.cache_read_input_tokens }),
+      ...(usage.cache_write_input_tokens === undefined ? {} : { cacheCreationInputTokens: usage.cache_write_input_tokens }),
+    } }),
+    usageMode: 'delta',
+    providerEvent: { usage: rawUsage },
   }
 }
 
@@ -396,6 +584,20 @@ function interactionFromPi(
   if (!nativeId || method !== 'select') return null
   const title = stringValue(event.title)
   if (!title || !piPermissionTokenFromTitle(title)) return null
+  return permissionInteraction(run, nativeId, piPermissionPublicTitle(title), stringValue(event.message), sessionId,
+    providerName, environmentId)
+}
+
+/** One provider permission prompt as a canonical interaction bound to this exact run. */
+function permissionInteraction(
+  run: Run,
+  nativeId: string,
+  title: string,
+  body: string | null,
+  sessionId: string,
+  providerName: string,
+  environmentId: string,
+): { request: InteractionRequest; nativeId: string } | null {
   const interactionId = boundedRuntimeId(`${run.id}:interaction:${nativeId}`)
   const binding = {
     runId: run.id,
@@ -408,8 +610,8 @@ function interactionFromPi(
   const material: InteractionRequestMaterial = {
     id: interactionId,
     kind: 'permission',
-    title: piPermissionPublicTitle(title),
-    ...(stringValue(event.message) ? { body: stringValue(event.message)! } : {}),
+    title,
+    ...(body ? { body } : {}),
     answerSpec: permissionAnswerSpec({ allowFeedback: false }),
     responseScopes: ['interaction'],
     binding,
