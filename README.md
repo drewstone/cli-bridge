@@ -290,6 +290,7 @@ The bridge binds the id atomically to the normalized execution request before ad
 - `GET /v1/runs/:id`, replay, cancellation, and chat responses expose the same six fields so control retries never reconstruct identity from backend defaults.
 
 For `stream: true`, every output delta has a monotonically increasing SSE `id`.
+Every numbered frame carries a `data:` line, because SSE parsers and re-encoders never dispatch a frame without data; keepalive and bridge-metadata frames carry an empty `choices: []` chunk.
 Reconnect with the same request and `Last-Event-ID: N` to receive only events after `N`.
 An ahead cursor returns `409 invalid_replay_cursor`.
 A cursor older than the retained window returns `410 expired_replay_cursor`; the bridge never silently restarts at event zero.
