@@ -33,6 +33,7 @@ import { createNativeCatalog } from './native-catalog.js'
 import { mountProfiles } from './routes/profiles.js'
 import { mountSessions } from './routes/sessions.js'
 import { mountRuns } from './routes/runs.js'
+import { continueInterruptedRuns } from './runs/continue-interrupted.js'
 import { RetainedSessionService, mountRetainedSessions } from './sessions/retained.js'
 import { mountCadRender } from './routes/cad-render.js'
 import { mountImagesGenerate } from './routes/images-generate.js'
@@ -203,6 +204,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   const nativeCatalog = createNativeCatalog(config, codexBackend instanceof CodexBackend ? codexBackend.readCatalog : undefined, cwd)
   const retained = new RetainedSessionService({ store: sessions, registry, runs, admitSubscription: nativeCatalog.admit })
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
+  await continueInterruptedRuns({ store: sessions, runs, registry, durableWriter, jailEnv })
 
   const app = new Hono()
   const hub = hubOptions ? mountHubMcp(app, hubOptions, hostServices) : undefined

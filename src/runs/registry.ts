@@ -148,6 +148,7 @@ export class RunRegistry {
       options.commitCanonicalEvent,
       options.onNativeControlLost,
       options.model,
+      options.startAfterSeq,
     )
     this.runs.set(id, run)
     return { run, created: true }
