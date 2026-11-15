@@ -856,6 +856,7 @@ export function mountChatCompletions(
           provider: run.provider ?? backend.name,
           environmentId: run.environmentId ?? ENVIRONMENT_ID,
           snapshot: run.snapshot(),
+          systemMessages: (req.messages ?? []).filter((message) => message.role === 'system'),
         })
       } catch (error) {
         deps.runs.releaseClaim(runId, run)

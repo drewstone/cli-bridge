@@ -9,6 +9,9 @@
  * id and after its last committed sequence, so a reader that reattaches with
  * Last-Event-ID sees the continuation event and the rest of the turn.
  *
+ * The continuation holds the session's execution lease, and it resends the
+ * turn's retained system messages.
+ *
  * Every other unsettled run stays `unknown`, as before: no recorded scope, a
  * scope that is already empty, no native session id, or a run that was already
  * continued once.
@@ -66,7 +69,7 @@ async function continueRun(
   }
   const req: ChatRequest = {
     model,
-    messages: [],
+    messages: (admission.systemMessages ?? []) as ChatRequest['messages'],
     stream: true,
     mode: runner.mode,
     ...(runner.cwd ? { cwd: runner.cwd } : {}),
@@ -92,6 +95,9 @@ async function continueRun(
       ? durableWriter.commit({ method: 'updateRetainedRun', args: [admission.runId, admission.requestDigest, next] })
       : void store.updateRetainedRun(admission.runId, admission.requestDigest, next),
   })
+  // The continuation owns the session lane like any turn, so a new turn on it waits.
+  const lease = session ? await deps.store.acquireExecution(admission.sessionId, backend.name) : null
   const interruption = { reason: 'bridge_restart' as const, pid: runner.pid, nativeSessionId, openTools }
   void run.pump(backend.continueTurn(req, session, interruption, run.signal), chatCompletionDeltaOptions(req))
+    .finally(() => lease?.release())
 }
