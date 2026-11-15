@@ -51,6 +51,35 @@ async function tempProjectDir(): Promise<string> {
   return realpath(dir)
 }
 
+it('confines a trusted snapshot reader to held readonly source and exact shared SQLite companions', async () => {
+  const projectDir = await tempProjectDir()
+  const code = await tempProjectDir()
+  const spec = { root: '.agent-home', projectDir, readConfine: true, requireEnforcement: true,
+    exactReadPaths: [code],
+    readOnlyDescriptors: [{ fd: 3, path: '/native-store' }, { fd: 4, path: '/native-store/opencode.db' }, { fd: 7, path: '/native-source' }],
+    sqliteCompanionDescriptors: [{ fd: 5, path: '/native-store/opencode.db-wal' }, { fd: 6, path: '/native-store/opencode.db-shm' }] }
+  const wrap = await new LinuxBwrapJail().wrap(process.execPath, ['snapshot.mjs'], spec)
+  if (wrap.cleanup) cleanups.push(async () => { await wrap.cleanup?.() })
+  expect(seqIndex(wrap.args, '--ro-bind-try', code, code)).toBeGreaterThan(seqIndex(wrap.args, '--tmpfs', '/tmp'))
+  expect(seqIndex(wrap.args, '--ro-bind-fd', '3', '/native-store')).toBeGreaterThan(-1)
+  expect(seqIndex(wrap.args, '--ro-bind-fd', '4', '/native-store/opencode.db')).toBeGreaterThan(seqIndex(wrap.args, '--ro-bind-fd', '3', '/native-store'))
+  expect(seqIndex(wrap.args, '--ro-bind-fd', '7', '/native-source')).toBeGreaterThan(-1)
+  expect(wrap.args.flatMap((arg, index) => arg === '--bind-fd' ? [wrap.args.slice(index + 1, index + 3)] : [])).toEqual([
+    ['5', '/native-store/opencode.db-wal'], ['6', '/native-store/opencode.db-shm'],
+  ])
+  expect(seqIndex(wrap.args, '--setenv', 'TMPDIR', '/tmp')).toBeGreaterThan(-1)
+  expect(wrap.args).toContain('--unshare-net')
+  for (const ambient of ['/etc', '/opt', homedir(), join(homedir(), '.cache'), join(homedir(), '.gitconfig')]) {
+    expect(wrap.args).not.toContain(ambient)
+  }
+  const writable = wrap.args.flatMap((arg, index) => arg === '--bind' ? [wrap.args[index + 1]] : [])
+  expect(writable).toEqual([projectDir, join(projectDir, '.agent-home')])
+  await expect(new LinuxBwrapJail().wrap(process.execPath, [], { ...spec, extraReadablePaths: ['/opt'] })).rejects.toThrow(/exact read job/)
+  await expect(new LinuxBwrapJail().wrap(process.execPath, [], { ...spec, exactReadPaths: [homedir()] })).rejects.toThrow(/HOME/)
+  await expect(new LinuxBwrapJail().wrap(process.execPath, [], { ...spec, sqliteCompanionDescriptors: [{ fd: 5, path: '/native-store/opencode.db' }] })).rejects.toThrow(/SQLite companion/)
+  await expect(new MacosSeatbeltJail().wrap(process.execPath, [], spec)).rejects.toThrow(/Linux/)
+})
+
 describe('MacosSeatbeltJail.wrap', () => {
   it('emits a sandbox-exec invocation whose profile denies file-write* and re-allows the jail root', async () => {
     const projectDir = await tempProjectDir()

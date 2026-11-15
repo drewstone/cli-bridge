@@ -1,6 +1,6 @@
 /** Recorded Gemini CLI 0.68.0 stream-json shapes, replayed by a real child through
  * the HTTP route and SQLite session owner. No model service or operator auth. */
-import { afterEach, beforeEach, expect, it } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,6 +10,8 @@ import { BackendRegistry } from '../src/backends/registry.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { SessionStore } from '../src/sessions/store.js'
+import { hostSpawner } from '../src/executors/host.js'
+import type { SpawnOpts, Spawner } from '../src/executors/types.js'
 
 const nativeId = '11111111-2222-4333-8444-555555555555'
 const init = { type: 'init', session_id: nativeId, model: 'gemini-2.5-flash' }
@@ -18,8 +20,11 @@ const stats = { input_tokens: 200, output_tokens: 40, total_tokens: 246, cached:
   models: { 'gemini-provider-response-version': { input_tokens: 200, output_tokens: 40 } } }
 const result = { type: 'result', status: 'success', stats }
 let cwd: string, sessions: SessionStore, runs: RunRegistry, app: Hono
+let launch: SpawnOpts | undefined
 
 beforeEach(() => {
+  vi.stubEnv('GEMINI_SANDBOX', undefined)
+  launch = undefined
   cwd = mkdtempSync(join(tmpdir(), 'bridge-gemini-boundary-'))
   const bin = join(cwd, 'native-protocol.cjs')
   writeFileSync(bin, `#!${process.execPath}\nconst fs = require('node:fs');
@@ -33,13 +38,36 @@ process.stdin.on('end', () => {
   sessions = new SessionStore(join(cwd, 'state'))
   runs = new RunRegistry()
   app = new Hono()
-  mountChatCompletions(app, { registry: new BackendRegistry().register(new GeminiBackend({ bin, timeoutMs: 5000 })), sessions, runs })
+  const spawner: Spawner = Object.assign(async (command: string, args: string[], options: SpawnOpts) => {
+    launch = options
+    return hostSpawner(command, args, options)
+  }, { executionEnvironment: hostSpawner.executionEnvironment })
+  mountChatCompletions(app, { registry: new BackendRegistry().register(new GeminiBackend({ bin, timeoutMs: 5000, spawner })), sessions, runs })
 })
 
 afterEach(async () => {
   await runs.shutdown()
   sessions.close()
   rmSync(cwd, { recursive: true, force: true })
+  vi.unstubAllEnvs()
+})
+
+it.each([
+  { setting: undefined, flag: undefined, store: undefined },
+  { setting: 'false', flag: '--sandbox=false', store: 'gemini' },
+  { setting: '0', flag: '--sandbox=false', store: 'gemini' },
+  { setting: 'true', flag: '--sandbox', store: undefined },
+  { setting: 'docker', flag: '--sandbox=docker', store: undefined },
+])('preserves explicit native sandbox choice $setting without guessing an outer store', async ({ setting, flag, store }) => {
+  vi.stubEnv('GEMINI_SANDBOX', setting)
+  const response = await post([init, answer, result])
+  expect(response.status).toBe(200)
+  await response.text()
+  const args = JSON.parse(readFileSync(join(cwd, 'launch.json'), 'utf8')) as string[]
+  expect(args.filter(arg => arg.startsWith('--sandbox'))).toEqual(flag ? [flag] : [])
+  expect(launch?.nativeStore).toBe(store)
+  expect(launch?.env?.GEMINI_SANDBOX).toBe(setting)
+  expect(launch?.envPassthroughKeys).toContain('GEMINI_SANDBOX')
 })
 
 async function post(events: unknown[], stream = false) {

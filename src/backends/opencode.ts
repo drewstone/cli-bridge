@@ -188,6 +188,12 @@ export class OpencodeBackend implements Backend {
     if (session?.internalId) args.push('-s', session.internalId)
 
     args.push(...provisioned.flags)
+    // Native automatic title generation makes a separate model call that run's
+    // step receipts do not account for. Supply only a new-session default, while
+    // preserving an existing explicit flag or a resumed session's native title.
+    if (!session?.internalId && !args.some(arg => arg === '--title' || arg.startsWith('--title='))) {
+      args.push('--title', 'cli-bridge')
+    }
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       const envPassthroughKeys = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']
@@ -203,6 +209,7 @@ export class OpencodeBackend implements Backend {
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
+        nativeStore: 'opencode',
         // Preserve the operator's existing proxy and trust roots. Keep the host
         // sanitizer in force; these names are not request-controlled.
         envPassthroughKeys,
@@ -302,9 +309,14 @@ export class OpencodeBackend implements Backend {
         // on a session.created / session.started event, or as a top
         // level session field on many events.
         const sessId = pickSessionId(ev)
+        if (sessId && ((internalSessionId && sessId !== internalSessionId)
+          || (session?.internalId && sessId !== session.internalId))) {
+          throw new BackendError('opencode changed its bound native session', 'upstream')
+        }
         if (sessId && !internalSessionId) {
           internalSessionId = sessId
-          yield { internal_session_id: internalSessionId }
+          yield { internal_session_id: internalSessionId,
+            ...(spawned.effectiveNativeStore ? { effective_native_store: spawned.effectiveNativeStore } : {}) }
         }
 
         const type = String(ev.type ?? '')
@@ -509,28 +521,36 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
   const part = ev.part as Record<string, unknown> | undefined
   const tokens = part?.tokens as Record<string, unknown> | undefined
   const cache = tokens?.cache as Record<string, unknown> | undefined
-
+  if (!isStepReceipt(ev)) return null
+  // Native step receipts normalize absent counters to zero. Failure records can
+  // also retain old counters, so neither proves measured zero or fresh usage.
+  if (ev.error || part?.error || part?.reason === 'error' || part?.finish === 'error') return { estimated: false, cost_known: false }
+  const observed = (value: unknown): number | undefined => {
+    const numeric = nonnegativeFinite(value)
+    return numeric !== undefined && numeric > 0 ? numeric : undefined
+  }
   return usageFromValues({
     // OpenCode reports input/output *excluding* cache and reasoning.
-    // OpenAI totals include those categories, so reconstruct full compute.
+    // Inclusive totals require every native class; partial sums are not totals.
     input_tokens: sumKnown([
-      tokens?.input_tokens ?? tokens?.input,
-      cache?.read,
-      cache?.write,
+      observed(tokens?.input_tokens ?? tokens?.input),
+      observed(cache?.read),
+      observed(cache?.write),
     ]),
-    fresh_input_tokens: tokens?.input_tokens ?? tokens?.input,
-    cache_read_input_tokens: cache?.read,
-    cache_write_input_tokens: cache?.write,
+    fresh_input_tokens: observed(tokens?.input_tokens ?? tokens?.input),
+    cache_read_input_tokens: observed(cache?.read),
+    cache_write_input_tokens: observed(cache?.write),
     output_tokens: sumKnown([
-      tokens?.output_tokens ?? tokens?.output,
-      tokens?.reasoning,
+      observed(tokens?.output_tokens ?? tokens?.output),
+      observed(tokens?.reasoning),
     ]),
-    reasoning_output_tokens: tokens?.reasoning,
-    cost: part?.cost ?? ev.cost,
-  })
+    reasoning_output_tokens: observed(tokens?.reasoning),
+    // The native value can combine billed and catalog amounts and defaults to
+    // zero. It cannot establish either a receipt or a complete cost estimate.
+  }, true)
 }
 
-function usageFromValues(values: Record<string, unknown>): UsageReceipt | null {
+function usageFromValues(values: Record<string, unknown>, nativeMeasured = false): UsageReceipt | null {
   const inputTokens = nonnegativeFinite(values.input_tokens)
   const freshInputTokens = nonnegativeFinite(values.fresh_input_tokens)
   const cacheReadInputTokens = nonnegativeFinite(values.cache_read_input_tokens)
@@ -538,15 +558,16 @@ function usageFromValues(values: Record<string, unknown>): UsageReceipt | null {
   const outputTokens = nonnegativeFinite(values.output_tokens)
   const reasoningOutputTokens = nonnegativeFinite(values.reasoning_output_tokens)
   const cost = nonnegativeFinite(values.cost)
-  if (
+  if (!nativeMeasured && (
     inputTokens === undefined
     && freshInputTokens === undefined
     && cacheReadInputTokens === undefined
     && cacheWriteInputTokens === undefined
     && outputTokens === undefined
     && cost === undefined
-  ) return null
+  )) return null
   return {
+    ...(nativeMeasured ? { estimated: false } : {}),
     ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
     ...(freshInputTokens !== undefined ? { fresh_input_tokens: freshInputTokens } : {}),
     ...(cacheReadInputTokens !== undefined ? { cache_read_input_tokens: cacheReadInputTokens } : {}),
@@ -578,14 +599,12 @@ function nonnegativeFinite(value: unknown): number | undefined {
 
 function sumKnown(values: unknown[]): number | undefined {
   let total = 0
-  let sawValue = false
   for (const value of values) {
     const numeric = nonnegativeFinite(value)
-    if (numeric === undefined) continue
+    if (numeric === undefined) return undefined
     total += numeric
-    sawValue = true
   }
-  return sawValue ? total : undefined
+  return total
 }
 
 function extractText(ev: Record<string, unknown>): string | null {

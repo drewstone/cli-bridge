@@ -96,10 +96,15 @@ export class GeminiBackend implements Backend {
     let spawned: Awaited<ReturnType<Spawner>>
     try {
       const childEnv = { ...process.env, ...provisioned.env }
-      await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
+      const envPassthroughKeys = ['GEMINI_SANDBOX']
+      await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags, envPassthroughKeys,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
+        // Saved native settings may enable another sandbox. Only an explicit
+        // operator selection of false proves direct execution; preserve all others.
+        ...(args.filter(arg => /^--sandbox(?:=|$)|^-s(?:=|$)/u.test(arg)).join('\n') === '--sandbox=false' ? { nativeStore: 'gemini' as const } : {}),
+        envPassthroughKeys,
         cwd,
         env: childEnv,
         ...(req.session_id ? { sessionId: req.session_id } : {}),
@@ -175,7 +180,8 @@ export class GeminiBackend implements Backend {
                 throw new BackendError('gemini resumed a different native session', 'upstream')
               }
               nativeSessionId = parsed.session_id
-              yield { internal_session_id: nativeSessionId }
+              yield { internal_session_id: nativeSessionId,
+                ...(spawned.effectiveNativeStore ? { effective_native_store: spawned.effectiveNativeStore } : {}) }
             }
             continue
           }
@@ -306,7 +312,8 @@ export function geminiYoloFlag(): string | null {
 
 export function geminiSandboxFlag(): string | null {
   const raw = process.env.GEMINI_SANDBOX?.trim()
-  if (!raw || raw === '0' || raw === 'false') return null
+  if (!raw) return null
+  if (raw === '0' || raw === 'false') return '--sandbox=false'
   return raw === '1' || raw === 'true' ? '--sandbox' : `--sandbox=${raw}`
 }
 

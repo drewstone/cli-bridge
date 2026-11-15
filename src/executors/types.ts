@@ -65,7 +65,7 @@ export interface ExecutorSaturationSnapshot {
 
 export interface SpawnOpts {
   /** Ask the real host spawner to retain this harness's effective native-home binding. */
-  nativeStore?: 'codex' | 'claude-code'
+  nativeStore?: 'codex' | 'claude-code' | 'opencode' | 'gemini'
   /** Abort startup when the owning durable run is cancelled before spawn completes. */
   signal?: AbortSignal
   /** Working directory inside the executor's filesystem. */
@@ -82,7 +82,7 @@ export interface SpawnOpts {
    */
   envPassthroughKeys?: readonly string[]
   /** Stdio config — defaults to ['ignore', 'pipe', 'pipe']. */
-  stdio?: ['ignore' | 'pipe' | 'inherit', 'pipe' | 'inherit', 'pipe' | 'inherit']
+  stdio?: ['ignore' | 'pipe' | 'inherit', 'pipe' | 'inherit', 'pipe' | 'inherit', ...number[]]
   /** Sticky session id (Docker variant uses this to route to a warm slot). */
   sessionId?: string
   /**

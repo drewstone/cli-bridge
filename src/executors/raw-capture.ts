@@ -72,9 +72,11 @@ export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: Run
         for (const { child } of scope.pending) { child.stdout?.resume(); child.stderr?.resume() }
         await closing
         await Promise.all(scope.pending.map(({ done }) => done))
-        try { await scope.terminal?.({ store: scope.nativeStoreConflict ? undefined : scope.nativeStore,
+        // A trusted terminal reader may launch a confined snapshot worker. Its binary
+        // output must reach the copy redactor before any durable process-frame writer.
+        try { await scopes.exit(() => scope.terminal?.({ store: scope.nativeStoreConflict ? undefined : scope.nativeStore,
           nativeSessionIds: [...scope.nativeSessionIds], processIds: scope.processIds,
-          processes: scope.pending.flatMap(({ terminal }) => terminal ? [terminal] : []) }) }
+          processes: scope.pending.flatMap(({ terminal }) => terminal ? [terminal] : []) })) }
         catch (error) { sourceErrors.push(error) }
         try {
           if (scope.root && scope.processIds.length) {

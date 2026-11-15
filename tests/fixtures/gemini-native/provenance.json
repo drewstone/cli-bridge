@@ -1,0 +1,29 @@
+{
+  "cli": "@google/gemini-cli@0.68.0",
+  "npmIntegrity": "sha512-eq7AWY+YCijNGKVwyiRjN+GuOdXU/djuOZhX18p+HDmNyUqFdqH7C5V6vDJLl1uffhRPhGijePV+YvY8lymrbQ==",
+  "capturedAt": "2026-11-15T05:42:53Z",
+  "file": "native-0.68.0.jsonl",
+  "sha256": "6237044909209b2721207fdf70ab51e402175d629dc1026fa3987813f620282c",
+  "source": "Unmodified session written by the real packaged CLI against a localhost scripted Google API, with isolated HOME and no external provider credentials or inference.",
+  "nativeArguments": [
+    "--model",
+    "gemini-2.5-flash",
+    "--prompt",
+    "Read fixture.txt and report its marker. This is a local protocol fixture.",
+    "--output-format",
+    "stream-json",
+    "--skip-trust",
+    "--session-id",
+    "11111111-2222-4333-8444-555555555555"
+  ],
+  "script": "First streamGenerateContent response calls read_file with file_path fixture.txt. The actual native tool reads GEMINI-SESSION-READER-PROOF followed by a newline. The second response returns GEMINI-SESSION-READER-PROOF complete. Each response records input100, output20, cached7 and thoughts3.",
+  "identityControl": "Both responses supply modelVersion gemini-2.5-flash-reader-proof; the session still records requested gemini-2.5-flash. A separate actual native run without response.modelVersion reports the requested model in result.stats.models. Neither persisted model nor a matching summary key proves provider identity.",
+  "upstreamFormat": "https://github.com/google-gemini/gemini-cli/blob/4ed06ed0ddc523a6d356a4ad35ddfea331041888/packages/core/src/services/chatRecordingTypes.ts",
+  "terminalControl": {
+    "source": "The exact released0.68.0 bundle writes response text and usage before separately recording completed tools; its conversation records contain no durable turn-end marker. The upstreamFormat link is a schema reference, not a claim that this later source exactly matches the released callsite.",
+    "bundle": "bundle/chunk-RCB6BI5H.js",
+    "bundleSha256": "8cddc5b439108f43e41692d8a534e2a76e61151376e33d121e5b1cc2895423ff",
+    "nativePrefix": "Lines1\u20136 or1\u20137 of native-0.68.0.jsonl retain an empty assistant with measured usage before line8 attaches the actual read_file. Neither those exact prefixes nor the final-looking reply alone establish successful completion.",
+    "readerOutcome": "open unless an explicit error is recorded; success requires separately bound transport/lifecycle evidence. Empty assistant records remain attempts without counting as observed replies."
+  }
+}

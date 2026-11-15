@@ -227,6 +227,7 @@ Behavior:
 - Pi streams the model's reasoning (`thinking_delta`) as `choices[0].delta.reasoning`, coalesced to 256 characters or 250 ms per chunk. Reasoning never enters `message.content`; the retained event log keeps it on the inner event as `reasoning`
 - Pi publishes `provider_models` only from its explicit provider `responseModel`, preserving any response fingerprint. One-shot and retained native turns share this projection and token accounting: input includes fresh input, cache reads and cache writes; missing token classes remain unknown, and native catalog costs remain estimates. A configured `model` or fingerprint without `responseModel` does not establish served identity.
 - Gemini retains its native session ID and confirms the same ID on `--resume`. Its stream-json assistant output, exact tool calls/results, and positive reported input/cache subtotals survive the bridge; an incomplete native stream fails even after exit zero. Native stats default missing token classes to zero and aggregate requests without per-response coverage, so normalized inclusive output and complete usage remain unknown. Fresh input requires observed input and cache terms; an all-zero native record suppresses text-token estimates. Native visible-output details remain in the harness's raw evidence and session reader, outside normalized complete usage. Its init/stats model labels can fall back to the requested model and do not establish served identity.
+- OpenCode preserves positive native step counters but leaves default-zero and failed-step counters unknown. Inclusive totals require every component; a later measured call cannot fill an earlier unknown call. New native sessions receive a default title to prevent a separate unaccounted title-generation call, preserving an explicit native title flag and resumed titles. Published materializer `1.1.113` carries the native profile description and permission behavior used by the actual OpenCode 2.3 integration check.
 - Pi model traffic uses a request-scoped local forwarder. The Pi process, its Bash tools, and descendants receive only a short-lived local token—not daemon provider or GitHub credentials—and the forwarder closes when the run ends. The jail's own network namespace reaches only the forwarder's port, through a per-spawn socket, and Pi uses its SSE transport because the forwarder relays HTTP requests only. Request bodies and non-authentication headers pass through unchanged, including provider prompt-caching controls. Exact-model inspection defaults to a 256 MiB request maximum; callers can raise it with `maxInferenceRequestBytes`, and operators can set `CLI_BRIDGE_PI_MAX_REQUEST_BYTES`
 - Runtime may send `X-Cli-Bridge-Model-Credential` for a protected Pi model call. The bridge accepts this header only over a loopback socket, never stores it in request, session, trace, or replay data, and binds its SHA-256 digest into durable run identity so a changed token cannot resume an existing run.
 - Pi's isolated transport requires `PI_EXECUTOR=host` plus `execution.jail.mode=fs-jail` on a Linux host with bubblewrap. The bridge refuses before credential resolution when real read isolation is unavailable, and `BRIDGE_JAIL_FALLBACK=warn` cannot downgrade a Pi request. Docker refuses because its separate network cannot reach the bridge's loopback address without reintroducing mounted provider credentials
@@ -1157,7 +1158,7 @@ Known admitted custom-MCP values, Hub grants and runtime coordination bearers
 are filtered before parsing or retaining process bytes. Other output can still
 be sensitive. The bridge exposes no download endpoint for these private files.
 
-For Linux host-jailed Claude Code and Codex one-shot runs, the same producer
+For Linux host-jailed Claude Code, Codex and supported Gemini/OpenCode one-shot runs, the same producer
 captures the exact native family after its child closes and before releasing
 private grants. `RunSnapshot.nativeCapture` identifies the committed private
 manifest by path, digest and byte length, or explicitly names an unavailable
@@ -1182,11 +1183,52 @@ values nor hashes of those values are persisted. An embedded host's
 Native payloads use the existing `tangle.raw-evidence-archive.v2` copy format and
 the harness-sessions family verifier. The manifest adds exact Bridge run,
 profile, CWD, child attribution and source-versus-retained file provenance.
-Only transformed copies are written; original vendor files stay unchanged.
+Only transformed session copies enter the archive. Native conversation rows stay unchanged;
+the SQLite capture path may initialize its exact shared coordination files as described below.
 Redaction makes original-byte coverage incomplete even when the retained family
 passes identity and integrity checks. Missing children, unsafe paths, partial
 lines, inventory bounds and unsupported stores remain explicit gaps. Read bounds
 come from `@tangle-network/harness-sessions`.
+
+OpenCode capture requires the installed reader's `captureOpenCodeSessionStore`
+and `readOpenCodeSessionSnapshot` APIs. Older readers explicitly report
+`opencode-session-snapshot-capability-unavailable`. The jail attests the actual
+XDG store; a trusted worker invokes the reader inside the existing Linux read
+jail. Held directory and primary-file descriptors supply the read-only native store,
+so pathname swaps cannot retarget those mounts. Only exact installed code and library
+paths are available; the worker inherits no auth, Git config, cache or network.
+Its deadline and output bounds also contain malformed SQLite journals.
+Only the actual, owned, single-link WAL and SHM files receive writable descriptor
+mounts. Bridge creates a missing companion exclusively, never truncates or unlinks
+one, and leaves it available to native SQLite. A read-only SQLite connection holds
+a real read lock while the worker verifies the main and companion inodes against
+a separate read-only source view. The shared reader then takes one locked SQLite snapshot and projects only the selected native
+session and its recorded descendants. Temporary projections exist only in the
+worker's ephemeral tmpfs. Account credentials and
+unrelated sessions from the vendor database are never copied. The retained
+manifest binds every verified native ID and parent to one physical SQLite
+payload. Its source hashes and lengths describe that selected-session projection,
+not the full vendor database. If an admitted secret occurs in the projected
+bytes, capture reports `native-binary-redaction-required` and retains no database:
+byte substitution cannot safely redact SQLite pages. This capability does not
+turn OpenCode's configured model or default token zeros into observed evidence.
+This handles normally closed WAL stores without freezing an early snapshot or
+depending on native process latency. Unsafe or unavailable companions, changed
+source identities, missing jail support and failed reads refuse capture. The worker
+uses ordinary SQLite locking; arbitrary writes outside that locking discipline do
+not become trusted execution evidence. It does not use immutable reads, writable
+database/directory mounts, or raw database staging.
+
+Gemini capture requires the installed JSON/JSONL reader. It uses the actual
+sanitized native home, selects the full session ID from held native records,
+and verifies the header's project hash against the process workspace. Shortened
+filename collisions cannot select another conversation. The operator must have
+explicitly selected `GEMINI_SANDBOX=false` or `0`; Bridge preserves that choice in
+native argv and environment. An unset value leaves saved native sandbox settings
+in force and its mapping unqualified. A nested Gemini sandbox has no attested
+outer-host store and remains unsupported. The native
+transcript has no successful-turn terminal marker: its complete byte coverage
+does not replace the separately retained stream result and process closure.
 
 Native copies are written only to `BRIDGE_RAW_CAPTURE_DIR`, beside the process
 frames; without it a run reports `native-capture-not-configured`. The Bridge

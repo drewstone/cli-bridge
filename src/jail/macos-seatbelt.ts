@@ -39,6 +39,7 @@ export class MacosSeatbeltJail implements JailBackend {
   }
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
+    if (spec.exactReadPaths || spec.readOnlyDescriptors?.length || spec.sqliteCompanionDescriptors?.length) throw new Error('Exact read jobs require the Linux filesystem jail')
     const root = resolveJailRoot(spec.root, spec.projectDir)
     // Create the redirected HOME/XDG dirs under the (canonical) root so the CLI
     // can write to them; they sit inside `root`, already in the writable set.

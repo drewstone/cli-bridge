@@ -11,7 +11,8 @@ import type { ChatDelta } from './backends/types.js'
 
 export interface CollectedUsage {
   modelRequests: number
-  /** True after at least one token-bearing receipt; cost-only receipts do not affect completeness. */
+  /** True after a token-bearing or explicitly observed model-call receipt;
+   * cost-only receipts do not affect completeness. */
   hasTokenUsage: boolean
   inputTokens: number
   inputTokensKnown: boolean
@@ -52,7 +53,7 @@ export function addUsage(
   next: NonNullable<ChatDelta['usage']>,
 ): CollectedUsage {
   const totalCost = next.cost_scope === 'total'
-  const hasTokenReceipt = nonnegativeFinite(next.input_tokens)
+  const hasTokenReceipt = next.model_call === true || nonnegativeFinite(next.input_tokens)
     || nonnegativeFinite(next.fresh_input_tokens)
     || nonnegativeFinite(next.cache_read_input_tokens)
     || nonnegativeFinite(next.cache_write_input_tokens)

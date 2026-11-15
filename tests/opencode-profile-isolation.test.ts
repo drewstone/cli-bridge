@@ -382,7 +382,7 @@ describe('opencode profiles in a shared task workspace', () => {
       }
       const gate = process.env.TEST_GATE
       const reply = () => {
-        console.log(JSON.stringify({ type: 'text', sessionID: 'native-' + process.pid, part: { text: read() } }))
+        console.log(JSON.stringify({ type: 'text', sessionID: process.env.TEST_NATIVE_SESSION || 'native-' + process.pid, part: { text: read() } }))
       }
       if (!gate) reply()
       else {
@@ -390,8 +390,11 @@ describe('opencode profiles in a shared task workspace', () => {
       }
     `
     const gates = new Map<string, string>()
-    const spawner: Spawner = async (_bin, _args, opts) => {
-      const env = { ...opts.env, ...(gates.has(opts.sessionId ?? '') ? { TEST_GATE: gates.get(opts.sessionId ?? '') } : {}) }
+    const spawner: Spawner = async (_bin, args, opts) => {
+      const resume = args.indexOf('-s')
+      const env = { ...opts.env,
+        ...(resume >= 0 ? { TEST_NATIVE_SESSION: args[resume + 1] } : {}),
+        ...(gates.has(opts.sessionId ?? '') ? { TEST_GATE: gates.get(opts.sessionId ?? '') } : {}) }
       const child = spawn(process.execPath, ['-e', script], { cwd: opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
       return { child, release() {}, spawnError: () => null }
     }

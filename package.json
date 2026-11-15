@@ -20,7 +20,7 @@
     "test:package": "node --test tests/package.integration.mjs",
     "test:seats": "node --test tests/local-seats.integration.mjs",
     "test": "node --check tests/runtime-consumer/live-opencode.mjs && vitest run && pnpm run test:native-store && pnpm run test:runtime-consumer",
-    "test:native-store": "node --test tests/native-store.integration.mjs",
+    "test:native-store": "node --test tests/native-store.integration.mjs tests/opencode-native-capture.integration.mjs tests/gemini-native-capture.integration.mjs",
     "test:runtime-consumer": "pnpm --filter cli-bridge-runtime-consumer-regression test",
     "test:local-inference": "node tests/runtime-consumer/live-opencode.mjs",
     "test:scoped-host-real": "CLI_BRIDGE_REAL_CGROUP_TESTS=1 vitest run tests/scoped-host.test.ts",
@@ -35,7 +35,7 @@
   "dependencies": {
     "@hono/node-server": "^2.1.5",
     "@tangle-network/agent-interface": "5.10.25",
-    "@tangle-network/agent-profile-materialize": "1.1.72",
+    "@tangle-network/agent-profile-materialize": "1.1.113",
     "@tangle-network/agent-trace-contract": "^2.1.0",
     "@tangle-network/harness-sessions": "1.0.13",
     "@tangle-network/hub-sdk": "^1.0.5",

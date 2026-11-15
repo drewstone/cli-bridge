@@ -16,7 +16,7 @@
 import { selectJailBackend } from '../jail/index.js'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
-import type { EffectiveNativeStore } from '../jail/types.js'
+import { canonicalizeJailPath, type EffectiveNativeStore } from '../jail/types.js'
 import type { JailBackend } from '../jail/index.js'
 import { BackendError } from '../backends/types.js'
 import type { SpawnOpts } from './types.js'
@@ -86,6 +86,29 @@ export async function applyJail(
 
 /** Called after host sanitization; jail mappings take precedence over launcher environment. */
 export function effectiveNativeStore(opts: SpawnOpts, command: JailedCommand, env: NodeJS.ProcessEnv | undefined): EffectiveNativeStore | undefined {
+  if (opts.nativeStore === 'opencode') {
+    // Both enforced jail owners install XDG_DATA_HOME beneath their actual HOME.
+    // The operator's inherited XDG value does not override bwrap's --setenv.
+    const confinedRoot = command.effectiveHome && join(realpathSync(command.effectiveHome), '.local/share/opencode')
+    const dataHome = env?.XDG_DATA_HOME || (env?.HOME && join(env.HOME, '.local/share'))
+    const root = confinedRoot || (dataHome && join(dataHome, 'opencode'))
+    if (confinedRoot && canonicalizeJailPath(confinedRoot) === confinedRoot) mkdirSync(confinedRoot, { recursive: true, mode: 0o700 })
+    if (!root || !isAbsolute(root) || !existsSync(root)) return undefined
+    const resolved = realpathSync(root)
+    return { harness: 'opencode', root: resolved, basis: resolved === confinedRoot ? 'host-jail' : 'host-environment' }
+  }
+  if (opts.nativeStore === 'gemini') {
+    // Native Gemini's home() uses GEMINI_CLI_HOME before os.homedir(). Only the
+    // sanitized child environment counts; an admitted override must not be mislabeled.
+    if (env?.SANDBOX || (env?.GEMINI_SANDBOX && !['0', 'false'].includes(env.GEMINI_SANDBOX.trim()))) return undefined
+    const home = env?.GEMINI_CLI_HOME || command.effectiveHome || env?.HOME
+    const root = home && join(home, '.gemini')
+    const confinedRoot = command.effectiveHome && join(realpathSync(command.effectiveHome), '.gemini')
+    if (root && root === confinedRoot && canonicalizeJailPath(root) === root) mkdirSync(root, { recursive: true, mode: 0o700 })
+    if (!root || !isAbsolute(root) || !existsSync(root)) return undefined
+    const resolved = realpathSync(root)
+    return { harness: 'gemini', root: resolved, basis: resolved === confinedRoot ? 'host-jail' : 'host-environment' }
+  }
   if (opts.nativeStore === 'claude-code') {
     const home = command.effectiveHome ?? env?.HOME
     const canonical = home && join(home, '.claude')

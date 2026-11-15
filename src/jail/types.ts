@@ -20,6 +20,15 @@ export interface JailSpec {
   extraReadablePaths?: string[]
   /** fs-jail: allowlisted reads, fresh /tmp, workspace read-write. */
   readConfine?: boolean
+  /** Trusted internal read job: replace ambient system/toolchain/cache reads with this
+   * exact allowlist. Linux only; no auth, Git config, extra mounts or egress are inherited. */
+  exactReadPaths?: readonly string[]
+  /** Trusted exact-read jobs only. These are explicitly inherited child descriptors,
+   * mounted read-only at private destinations, so source-directory renames cannot retarget a read. */
+  readOnlyDescriptors?: readonly { fd: number; path: string }[]
+  /** Trusted exact-read jobs only: shared SQLite WAL/SHM metadata files. The
+   * database and containing directory remain read-only; arbitrary writes are refused. */
+  sqliteCompanionDescriptors?: readonly { fd: number; path: string }[]
   /** Egress (see egress.ts). Omitted means `none`. */
   network?: JailNetwork
   /** Trusted admission only, never decoded from request JSON. Each claim is adopted by one spawn. */
@@ -76,7 +85,7 @@ export interface JailAuthSource {
 
 /** Host-visible native state observed where the executor applies the real launch mapping. */
 export interface EffectiveNativeStore {
-  readonly harness: 'codex' | 'claude-code'
+  readonly harness: 'codex' | 'claude-code' | 'opencode' | 'gemini'
   readonly root: string
   readonly basis: 'host-jail' | 'host-environment'
 }

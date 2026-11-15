@@ -39,7 +39,15 @@ export class LinuxBwrapJail implements JailBackend {
   }
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
-    const config = await gitConfigSources(spec.projectDir, spec.extraWritablePaths)
+    if ((spec.readOnlyDescriptors?.length || spec.sqliteCompanionDescriptors?.length) && !spec.exactReadPaths) throw new Error('Descriptor mounts require an exact read job')
+    if (spec.exactReadPaths && (!spec.readConfine || (spec.network && spec.network !== 'none')
+      || spec.authSources?.length || spec.extraReadablePaths?.length || spec.extraWritablePaths?.length
+      || spec.trustedHostServices?.length || spec.hostLoopbackPorts?.length || spec.proxySecrets?.length)) {
+      throw new Error('An exact read job requires confinement without inherited mounts, auth or network')
+    }
+    const config = spec.exactReadPaths
+      ? { sources: [], binds: [], hooks: [], cleanup: async () => {} }
+      : await gitConfigSources(spec.projectDir, spec.extraWritablePaths)
     let egress: PreparedEgress | undefined
     try {
       egress = await prepareEgress(spec)
@@ -53,7 +61,7 @@ export class LinuxBwrapJail implements JailBackend {
   private async wrapWithGitConfig(bin: string, args: string[], spec: JailSpec, config: Awaited<ReturnType<typeof gitConfigSources>>, egress: PreparedEgress): Promise<JailWrap> {
     const root = resolveJailRoot(spec.root, spec.projectDir)
     await prepareJailHome(root)
-    ignoreJailRoot(spec.projectDir, root)
+    if (!spec.exactReadPaths) ignoreJailRoot(spec.projectDir, root)
     const availableAuthSources = [...(spec.authSources ?? []), ...config.sources].filter((source) =>
       existsSync(source.source),
     )
@@ -69,9 +77,9 @@ export class LinuxBwrapJail implements JailBackend {
         throw new Error('a copy-writable jail auth source requires envVar')
       }
     }
-    const resolver = spec.readConfine ? tryRealpath('/etc/resolv.conf') : null
+    const resolver = spec.readConfine && !spec.exactReadPaths ? tryRealpath('/etc/resolv.conf') : null
     if (resolver && !statSync(resolver).isFile()) throw new Error('DNS resolver is not a regular file')
-    const hooks = spec.readConfine ? gitHookReadPaths(spec.projectDir, config.hooks) : undefined
+    const hooks = spec.readConfine && !spec.exactReadPaths ? gitHookReadPaths(spec.projectDir, config.hooks) : undefined
     await removeStaleAuthCopies(root)
     const copiedWritableAuth = await copyAuthIntoJail(
       root,
@@ -93,13 +101,13 @@ export class LinuxBwrapJail implements JailBackend {
     ]
 
     if (spec.readConfine) {
-      for (const path of SYSTEM_RO_PATHS) bwrapArgs.push('--ro-bind-try', path, path)
+      for (const path of spec.exactReadPaths ? [] : SYSTEM_RO_PATHS) bwrapArgs.push('--ro-bind-try', path, path)
       bwrapArgs.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp')
-      for (const path of toolchainReadPaths(bin, spec.projectDir)) {
+      for (const path of spec.exactReadPaths ? [] : toolchainReadPaths(bin, spec.projectDir)) {
         bwrapArgs.push('--ro-bind-try', path, path)
       }
-      for (const path of hooks!.paths) bwrapArgs.push('--ro-bind-try', path, path)
-      for (const [alias, target] of hooks!.links) bwrapArgs.push('--symlink', target, alias)
+      for (const path of hooks?.paths ?? []) bwrapArgs.push('--ro-bind-try', path, path)
+      for (const [alias, target] of hooks?.links ?? []) bwrapArgs.push('--symlink', target, alias)
       bwrapArgs.push('--bind', spec.projectDir, spec.projectDir)
     } else {
       bwrapArgs.push(
@@ -114,9 +122,30 @@ export class LinuxBwrapJail implements JailBackend {
       bwrapArgs.push('--bind', path, path)
     }
     const writableExtras = new Set(spec.extraWritablePaths ?? [])
-    for (const path of spec.extraReadablePaths ?? []) {
+    for (const path of spec.exactReadPaths ?? spec.extraReadablePaths ?? []) {
+      if (spec.exactReadPaths && (!isAbsolute(path) || !isSafeReadPath(canonicalizeJailPath(path), canonicalizeJailPath(homedir()), canonicalizeJailPath(spec.projectDir)))) {
+        throw new Error('An exact read path cannot expose HOME or a workspace ancestor')
+      }
       if (writableExtras.has(path)) continue
       bwrapArgs.push('--ro-bind-try', path, path)
+    }
+    const descriptorFds = new Set<number>(), descriptorPaths = new Set<string>()
+    for (const descriptor of spec.readOnlyDescriptors ?? []) {
+      if (!Number.isSafeInteger(descriptor.fd) || descriptor.fd < 3 || !/^\/(?:native-store(?:\/opencode\.db)?|native-source)$/u.test(descriptor.path)
+        || descriptorFds.has(descriptor.fd) || descriptorPaths.has(descriptor.path)) {
+        throw new Error('A native read descriptor requires an inherited FD and a private destination')
+      }
+      descriptorFds.add(descriptor.fd); descriptorPaths.add(descriptor.path)
+      bwrapArgs.push('--ro-bind-fd', String(descriptor.fd), descriptor.path)
+    }
+    for (const descriptor of spec.sqliteCompanionDescriptors ?? []) {
+      if (!Number.isSafeInteger(descriptor.fd) || descriptor.fd < 3 || !/^\/native-store\/opencode\.db-(?:wal|shm)$/u.test(descriptor.path)
+        || descriptorFds.has(descriptor.fd) || descriptorPaths.has(descriptor.path)
+        || !descriptorPaths.has('/native-store') || !descriptorPaths.has('/native-store/opencode.db') || !descriptorPaths.has('/native-source')) {
+        throw new Error('A SQLite companion requires a distinct inherited FD under the pinned read-only store')
+      }
+      descriptorFds.add(descriptor.fd); descriptorPaths.add(descriptor.path)
+      bwrapArgs.push('--bind-fd', String(descriptor.fd), descriptor.path)
     }
     // Writable root last so it wins over any read-only mount above it.
     bwrapArgs.push('--bind', root, root)
@@ -134,7 +163,10 @@ export class LinuxBwrapJail implements JailBackend {
     bwrapArgs.push(...egress.bwrapArgs)
     for (const [key, value] of Object.entries(egress.env)) bwrapArgs.push('--setenv', key, value)
 
-    for (const [key, value] of Object.entries(jailEnv(root))) {
+    // An internal reader's temporary projections disappear with its private tmpfs;
+    // no pre-redaction database is staged on the host filesystem.
+    const environment = { ...jailEnv(root), ...(spec.exactReadPaths ? { TMPDIR: '/tmp' } : {}) }
+    for (const [key, value] of Object.entries(environment)) {
       bwrapArgs.push('--setenv', key, value)
     }
 
