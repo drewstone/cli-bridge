@@ -93,8 +93,6 @@ export interface RetainedRunAdmission {
   provider: string
   environmentId: string
   snapshot: unknown
-  /** The turn's role:system messages, which a bridge-restart continuation resends. */
-  systemMessages?: unknown[]
   createdAt: number
   updatedAt: number
 }
@@ -279,7 +277,6 @@ const EXPECTED_SESSION_SCHEMA: Record<string, ExpectedColumn[]> = {
     { name: 'provider', type: 'TEXT', notnull: 1, defaultValue: "'cli-bridge'", pk: 0 },
     { name: 'environment_id', type: 'TEXT', notnull: 1, defaultValue: "'cli-bridge'", pk: 0 },
     { name: 'owner', type: 'TEXT', notnull: 1, defaultValue: "'retained'", pk: 0 },
-    { name: 'system_messages_json', type: 'TEXT', notnull: 0, defaultValue: null, pk: 0 },
   ],
   interaction_operations: INTERACTION_OPERATION_COLUMNS,
   retained_control_operations: [
@@ -431,8 +428,7 @@ export class SessionStore implements RetainedInteractionPersistence {
         updated_at INTEGER NOT NULL,
         provider TEXT NOT NULL DEFAULT 'cli-bridge',
         environment_id TEXT NOT NULL DEFAULT 'cli-bridge',
-        owner TEXT NOT NULL DEFAULT 'retained',
-        system_messages_json TEXT
+        owner TEXT NOT NULL DEFAULT 'retained'
       );
       CREATE INDEX IF NOT EXISTS idx_retained_run_admissions_session ON retained_run_admissions(session_id, created_at);
       CREATE TABLE IF NOT EXISTS retained_control_operations (
@@ -534,9 +530,6 @@ export class SessionStore implements RetainedInteractionPersistence {
       }
       if (!names.has('owner')) {
         this.db.exec("ALTER TABLE retained_run_admissions ADD COLUMN owner TEXT NOT NULL DEFAULT 'retained'")
-      }
-      if (!names.has('system_messages_json')) {
-        this.db.exec('ALTER TABLE retained_run_admissions ADD COLUMN system_messages_json TEXT')
       }
     })()
   }
@@ -913,15 +906,14 @@ export class SessionStore implements RetainedInteractionPersistence {
     provider: string
     environmentId: string
     snapshot: unknown
-    systemMessages?: unknown[]
   }): RetainedRunClaim {
     const claim = this.db.transaction((): RetainedRunClaim => {
       const owner = input.owner ?? 'retained'
       const now = Date.now()
       const inserted = this.db.prepare(
         `INSERT INTO retained_run_admissions
-         (run_id, session_id, execution_id, request_digest, snapshot_json, created_at, updated_at, provider, environment_id, owner, system_messages_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (run_id, session_id, execution_id, request_digest, snapshot_json, created_at, updated_at, provider, environment_id, owner)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(run_id) DO NOTHING`,
       ).run(
         input.runId,
@@ -934,7 +926,6 @@ export class SessionStore implements RetainedInteractionPersistence {
         input.provider,
         input.environmentId,
         owner,
-        input.systemMessages?.length ? JSON.stringify(input.systemMessages) : null,
       )
       const admission = this.getRetainedRun(input.runId)
       if (!admission) throw new Error(`retained run admission ${JSON.stringify(input.runId)} was not persisted`)
@@ -953,7 +944,6 @@ export class SessionStore implements RetainedInteractionPersistence {
     return claim()
   }
 
-  /** One-shot runs whose last committed snapshot was not terminal: an earlier process owned them. */
   unsettledOneShotRuns(): RetainedRunAdmission[] {
     const rows = this.db.prepare(
       "SELECT run_id FROM retained_run_admissions WHERE owner = 'one-shot' AND json_extract(snapshot_json, '$.terminal') = 0",
@@ -975,7 +965,6 @@ export class SessionStore implements RetainedInteractionPersistence {
       provider: row.provider as string,
       environmentId: row.environment_id as string,
       snapshot: JSON.parse(row.snapshot_json as string) as unknown,
-      ...(row.system_messages_json ? { systemMessages: JSON.parse(row.system_messages_json as string) as unknown[] } : {}),
       createdAt: row.created_at as number,
       updatedAt: row.updated_at as number,
     }
@@ -1099,13 +1088,6 @@ export class SessionStore implements RetainedInteractionPersistence {
       'SELECT * FROM retained_events WHERE session_id = ? AND run_id = ? AND sequence > ? ORDER BY sequence ASC',
     ).all(sessionId, runId, afterSequence) as Record<string, unknown>[]
     return rows.map(row => this.hydrateRetainedEvent(row))
-  }
-
-  latestRetainedEventForRun(sessionId: string, runId: string): RetainedEventRecord | null {
-    const row = this.db.prepare(
-      'SELECT * FROM retained_events WHERE session_id = ? AND run_id = ? ORDER BY sequence DESC LIMIT 1',
-    ).get(sessionId, runId) as Record<string, unknown> | undefined
-    return row ? this.hydrateRetainedEvent(row) : null
   }
 
   retainedRun(runId: string): { sessionId: string; lastSequence: number } | null {

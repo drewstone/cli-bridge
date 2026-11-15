@@ -619,7 +619,11 @@ export interface ChatDelta {
    * The native process tree now running this turn, retained so a restarted
    * bridge can kill and drain it before it continues the turn. Never on the wire.
    */
-  runner?: { backend: string; pid: number; scope?: string; mode: BridgeMode; cwd?: string }
+  runner?: {
+    backend: string; pid: number; scope?: string; mode: BridgeMode; cwd?: string
+    /** The turn's role:system texts, each split into chunks under the retained-string bound. */
+    system?: string[][]
+  }
   /**
    * The bridge continued this turn in the same native session after its runner
    * died. The interrupted tool calls were never re-run by the bridge; the model

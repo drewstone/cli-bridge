@@ -47,9 +47,7 @@ import { describeRunFailure } from '../runs/error-shape.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
-import { resolveJailSpec } from '../jail/resolve-spec.js'
-import { authSourcesFor } from '../jail/auth-preserve.js'
-import { vendorHostsFor } from '../jail/egress.js'
+import { hostRequestJail } from '../jail/host-request.js'
 import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionSlot } from '../admission.js'
 import {
   type Run,
@@ -856,7 +854,6 @@ export function mountChatCompletions(
           provider: run.provider ?? backend.name,
           environmentId: run.environmentId ?? ENVIRONMENT_ID,
           snapshot: run.snapshot(),
-          systemMessages: (req.messages ?? []).filter((message) => message.role === 'system'),
         })
       } catch (error) {
         deps.runs.releaseClaim(runId, run)
@@ -1187,27 +1184,6 @@ export function mountChatCompletions(
 
     return respondFromRun(c, run, req, afterSeq)
   })
-}
-
-/** The host jail one request runs under; a bridge-restart continuation resolves it the same way. */
-export function hostRequestJail(req: ChatRequest, backendName: string, env: NodeJS.ProcessEnv): ChatRequest['jailSpec'] {
-  const jailSpec = resolveJailSpec({
-    execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
-    execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
-    execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
-    cwd: req.cwd ?? process.cwd(),
-    env,
-  })
-  const proxySecrets = req.agent_profile?.proxySecrets
-  if (proxySecrets?.length && !jailSpec) {
-    throw new BackendError('agent_profile.proxySecrets require execution.jail with network relay', 'parse_error')
-  }
-  if (jailSpec) {
-    jailSpec.authSources = authSourcesFor(backendName)
-    jailSpec.vendorHosts = vendorHostsFor(backendName)
-    if (proxySecrets?.length) jailSpec.proxySecrets = proxySecrets
-  }
-  return jailSpec
 }
 
 /** The subset of the non-streaming completion body this route reasons about. */

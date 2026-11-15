@@ -470,7 +470,9 @@ export class ClaudeBackend implements Backend {
     try {
       if (child.pid !== undefined) {
         watch.pid = child.pid
-        yield { runner: { backend: this.name, pid: child.pid, ...(spawned.scope ? { scope: spawned.scope } : {}), mode, ...(cwd ? { cwd } : {}) } }
+        const system = (req.messages ?? []).filter((m) => m.role === 'system').map((m) => contentToText(m.content).match(/[\s\S]{1,16000}/gu) ?? [])
+        yield { runner: { backend: this.name, pid: child.pid, ...(spawned.scope ? { scope: spawned.scope } : {}), mode,
+          ...(cwd ? { cwd } : {}), ...(system.length ? { system } : {}) } }
       }
       let internalSessionId: string | undefined
       let terminal: ClaudeStreamResult | undefined

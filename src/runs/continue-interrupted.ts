@@ -10,7 +10,7 @@
  * Last-Event-ID sees the continuation event and the rest of the turn.
  *
  * The continuation holds the session's execution lease, and it resends the
- * turn's retained system messages.
+ * system messages its runner record retained.
  *
  * Every other unsettled run stays `unknown`, as before: no recorded scope, a
  * scope that is already empty, no native session id, or a run that was already
@@ -21,7 +21,7 @@ import type { ChatDelta, ChatRequest } from '../backends/types.js'
 import { ClaudeBackend } from '../backends/claude.js'
 import type { BackendRegistry } from '../backends/registry.js'
 import { drainOrphanScope } from '../executors/scoped-host.js'
-import { hostRequestJail } from '../routes/chat-completions.js'
+import { hostRequestJail } from '../jail/host-request.js'
 import type { DurableRunWriter } from '../sessions/durable-writer.js'
 import type { RetainedRunAdmission, SessionStore } from '../sessions/store.js'
 import { chatDeltaFromRetainedEvent } from './persisted-chat-event.js'
@@ -69,7 +69,7 @@ async function continueRun(
   }
   const req: ChatRequest = {
     model,
-    messages: (admission.systemMessages ?? []) as ChatRequest['messages'],
+    messages: (runner.system ?? []).map((chunks) => ({ role: 'system' as const, content: chunks.join('') })),
     stream: true,
     mode: runner.mode,
     ...(runner.cwd ? { cwd: runner.cwd } : {}),
