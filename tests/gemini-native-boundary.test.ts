@@ -79,8 +79,10 @@ it('retains native session, exact tool outcomes and measured usage across two HT
   expect(second.status).toBe(200)
   const body = await second.json() as any
   expect(body.choices[0].message.content).toBe('native answer')
-  expect(body.usage).toMatchObject({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
+  expect(body.usage).toMatchObject({ prompt_tokens: 100,
     cache_read_input_tokens: 7, fresh_input_tokens: 93, estimated: false, cost_known: false })
+  expect(body.usage).not.toHaveProperty('completion_tokens')
+  expect(body.usage).not.toHaveProperty('total_tokens')
   expect(body).not.toHaveProperty('provider_models')
   const args = JSON.parse(readFileSync(join(cwd, 'launch.json'), 'utf8')) as string[]
   expect(args.slice(args.indexOf('--resume'), args.indexOf('--resume') + 2)).toEqual(['--resume', nativeId])
@@ -100,4 +102,21 @@ it.each([
   if (body.choices) expect(body.choices[0].finish_reason).toBe('error')
   else expect(response.status).toBeGreaterThanOrEqual(400)
   expect(sessions.get('caller-session', 'gemini')?.internalId).toBe(nativeId)
+})
+
+it.each([
+  { name: 'absent usage', reported: { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached: 0, input: 0 }, input: undefined },
+  { name: 'prompt-only usage', reported: { input_tokens: 200, output_tokens: 0, total_tokens: 0, cached: 0, input: 200 }, input: 200 },
+])('keeps actual Gemini default-zero $name unknown without a text estimate', async ({ reported, input }) => {
+  // Both shapes were emitted by real Gemini 0.68.0 against a localhost provider:
+  // missing usageMetadata and usageMetadata containing only promptTokenCount.
+  const response = await post([init, answer, { ...result, stats: reported }])
+  const body = await response.json() as any
+  expect(body.choices[0].message.content).toBe('native answer')
+  expect(body.usage.prompt_tokens).toBe(input)
+  for (const field of ['completion_tokens', 'total_tokens', 'cache_read_input_tokens', 'fresh_input_tokens']) {
+    expect(body.usage).not.toHaveProperty(field)
+  }
+  expect(body.usage.estimated).not.toBe(true)
+  expect(body.usage.cost_known).toBe(false)
 })

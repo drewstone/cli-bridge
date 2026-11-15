@@ -356,7 +356,8 @@ function extractToolCall(ev: Record<string, unknown>): { id: string; name: strin
   }
 }
 
-/** StreamStats reports candidates separately from hidden output; only a reconciled total proves inclusive output. */
+/** StreamStats defaults missing classes to zero and aggregates across requests without
+ * per-response coverage. Keep observed input/cache subtotals; inclusive output stays unknown. */
 function geminiUsage(value: unknown): ChatDelta['usage'] {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
   const stats = value as Record<string, unknown>
@@ -369,8 +370,8 @@ function geminiUsage(value: unknown): ChatDelta['usage'] {
     return value
   }
   const input = count('input_tokens')
-  const output = count('output_tokens')
-  const total = count('total_tokens')
+  count('output_tokens')
+  count('total_tokens')
   const cached = count('cached')
   const fresh = count('input')
   if (input === undefined && cached === undefined && fresh === undefined) return undefined
@@ -380,10 +381,12 @@ function geminiUsage(value: unknown): ChatDelta['usage'] {
     throw new BackendError('gemini reported inconsistent input token classes', 'upstream')
   }
   return {
-    ...(input === undefined ? {} : { input_tokens: input }),
-    ...(input !== undefined && output !== undefined && total === input + output ? { output_tokens: output } : {}),
-    ...(cached === undefined ? {} : { cache_read_input_tokens: cached }),
-    ...(fresh === undefined ? {} : { fresh_input_tokens: fresh }),
+    ...(input !== undefined && input > 0 ? { input_tokens: input } : {}),
+    ...(cached !== undefined && cached > 0 ? { cache_read_input_tokens: cached } : {}),
+    // Native fresh input is derived using a possibly defaulted cache count.
+    ...(input !== undefined && input > 0 && cached !== undefined && cached > 0
+      && fresh !== undefined && fresh + cached === input ? { fresh_input_tokens: fresh } : {}),
+    // Even an all-zero native record suppresses the route's text-token estimate.
     estimated: false,
     cost_known: false,
   }
