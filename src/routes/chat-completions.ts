@@ -47,9 +47,7 @@ import { describeRunFailure } from '../runs/error-shape.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
-import { resolveJailSpec } from '../jail/resolve-spec.js'
-import { authSourcesFor } from '../jail/auth-preserve.js'
-import { vendorHostsFor } from '../jail/egress.js'
+import { hostRequestJail } from '../jail/host-request.js'
 import { AdmissionRejectedError, type AdmissionClass, type AdmissionGate, type AdmissionSlot } from '../admission.js'
 import {
   type Run,
@@ -970,22 +968,7 @@ export function mountChatCompletions(
       }
       const profile = assertProfileRequestAuthority(req, session)
       if (!(req.execution?.kind === 'sandbox' && backend.name !== 'sandbox')) {
-        req.jailSpec = resolveJailSpec({
-          execMode: req.execution?.kind === 'host' ? req.execution.jail?.mode : undefined,
-          execRoot: req.execution?.kind === 'host' ? req.execution.jail?.root : undefined,
-          execNetwork: req.execution?.kind === 'host' ? req.execution.jail?.network : undefined,
-          cwd: req.cwd ?? process.cwd(),
-          env: deps.jailEnv ?? process.env,
-        })
-        const proxySecrets = req.agent_profile?.proxySecrets
-        if (proxySecrets?.length && !req.jailSpec) {
-          throw new BackendError('agent_profile.proxySecrets require execution.jail with network relay', 'parse_error')
-        }
-        if (req.jailSpec) {
-          req.jailSpec.authSources = authSourcesFor(backend.name)
-          req.jailSpec.vendorHosts = vendorHostsFor(backend.name)
-          if (proxySecrets?.length) req.jailSpec.proxySecrets = proxySecrets
-        }
+        req.jailSpec = hostRequestJail(req, backend.name, deps.jailEnv ?? process.env)
       }
       releaseSubscription = await deps.admitSubscription?.(req, backend.name, run.signal)
       if (backend.name === 'pi') assertPiOutputTokenRequest(req, profile)

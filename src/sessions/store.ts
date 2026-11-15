@@ -944,6 +944,13 @@ export class SessionStore implements RetainedInteractionPersistence {
     return claim()
   }
 
+  unsettledOneShotRuns(): RetainedRunAdmission[] {
+    const rows = this.db.prepare(
+      "SELECT run_id FROM retained_run_admissions WHERE owner = 'one-shot' AND json_extract(snapshot_json, '$.terminal') = 0",
+    ).all() as Array<{ run_id: string }>
+    return rows.map((row) => this.getRetainedRun(row.run_id)!)
+  }
+
   getRetainedRun(runId: string): RetainedRunAdmission | null {
     const row = this.db.prepare(
       'SELECT * FROM retained_run_admissions WHERE run_id = ?',
@@ -1081,13 +1088,6 @@ export class SessionStore implements RetainedInteractionPersistence {
       'SELECT * FROM retained_events WHERE session_id = ? AND run_id = ? AND sequence > ? ORDER BY sequence ASC',
     ).all(sessionId, runId, afterSequence) as Record<string, unknown>[]
     return rows.map(row => this.hydrateRetainedEvent(row))
-  }
-
-  latestRetainedEventForRun(sessionId: string, runId: string): RetainedEventRecord | null {
-    const row = this.db.prepare(
-      'SELECT * FROM retained_events WHERE session_id = ? AND run_id = ? ORDER BY sequence DESC LIMIT 1',
-    ).get(sessionId, runId) as Record<string, unknown> | undefined
-    return row ? this.hydrateRetainedEvent(row) : null
   }
 
   retainedRun(runId: string): { sessionId: string; lastSequence: number } | null {

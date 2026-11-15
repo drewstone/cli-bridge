@@ -157,6 +157,11 @@ export interface SpawnResult {
   spawnError?(): Error | null
   /** Optional executor-specific diagnosis of a failed launch. */
   diagnoseExit?(exitCode: number | null, stderr: string): Promise<string | null>
+  /**
+   * The systemd scope unit that holds the whole process tree, when the executor made one.
+   * Process groups do not bound a harness: Claude Code starts each Bash tool with setsid.
+   */
+  readonly scope?: string
 }
 
 /** Describe a failed native child, preserving signal and diagnostic information. */

@@ -13,7 +13,7 @@ import {
   canonicalCandidateDigest,
   type RuntimeEventEnvelope,
 } from '@tangle-network/agent-interface'
-import type { ChatDelta } from '../backends/types.js'
+import type { ChatDelta, RunContinuation } from '../backends/types.js'
 import { RunReplayCursorError } from './errors.js'
 import type {
   CanonicalEventInput,
@@ -38,7 +38,9 @@ export interface RunReplayLogOptions {
   /** The run-id binding expired — the registry may forget this run. */
   onIdentityExpired: () => void
   /** Persist the run checkpoint after the delta is in the local replay log. */
-  onDeltaCommitted?: (checkpoint: Pick<RunSnapshot, 'lastSeq' | 'replay' | 'profileMaterialization'>) => void | Promise<void>
+  onDeltaCommitted?: (checkpoint: Pick<RunSnapshot, 'lastSeq' | 'replay' | 'profileMaterialization' | 'continuations'>) => void | Promise<void>
+  /** Sequences an earlier bridge process already committed for this run. */
+  startAfterSeq?: number
   commitDelta?: RunClaimOptions['commitDelta']
   commitCanonicalEvent?: RunClaimOptions['commitCanonicalEvent']
   /** A canonical commit failed; the owning run records the outcome as unknown. */
@@ -51,7 +53,7 @@ export class RunReplayLog {
   private readonly deltas: SeqDelta[] = []
   private deltaBytes = 0
   private readonly canonical: SeqCanonicalEvent[] = []
-  private seq = 0
+  private seq: number
   private canonicalSeq = 0
   private attachedReaders = 0
   private replayExpiresAt: number | null = null
@@ -60,10 +62,17 @@ export class RunReplayLog {
   private replayTimer: ReturnType<typeof setTimeout> | null = null
   private identityTimer: ReturnType<typeof setTimeout> | null = null
   private profileMaterialization: ChatDelta['profile_materialization'] | null = null
+  private continuationList: RunContinuation[] = []
   private readonly waiters = new Set<Waiter>()
   private readonly canonicalSubscribers = new Set<CanonicalEventListener>()
 
-  constructor(private readonly options: RunReplayLogOptions) {}
+  constructor(private readonly options: RunReplayLogOptions) {
+    this.seq = options.startAfterSeq ?? 0
+  }
+
+  continuations(): RunContinuation[] {
+    return structuredClone(this.continuationList)
+  }
 
   lastSeq(): number {
     return this.seq
@@ -126,6 +135,7 @@ export class RunReplayLog {
       throw new Error(`run ${JSON.stringify(this.options.runId)} emitted conflicting profile materialization receipts`)
     }
     const sequence = this.seq + 1
+    const continuations = committed.continuation ? [...this.continuationList, committed.continuation] : this.continuationList
     let evicted = 0
     let retainedCount = this.deltas.length + 1
     let bytes = this.deltaBytes + approximateDeltaBytes(committed)
@@ -146,6 +156,7 @@ export class RunReplayLog {
           retainedBytes: bytes,
         },
         profileMaterialization: receipt ? structuredClone(receipt) : null,
+        ...(continuations.length ? { continuations: structuredClone(continuations) } : {}),
       })
     } catch (error) {
       this.options.onCommitFailure(error)
@@ -158,6 +169,7 @@ export class RunReplayLog {
     this.deltas.push({ seq: sequence, delta: committed })
     this.deltaBytes = bytes
     this.profileMaterialization = receipt ? structuredClone(receipt) : null
+    this.continuationList = continuations
     this.wakeAll()
   }
 

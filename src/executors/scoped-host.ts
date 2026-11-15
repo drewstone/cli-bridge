@@ -417,25 +417,58 @@ async function stopScopeUnit(unitName: string): Promise<void> {
   }
 }
 
-async function killCgroup(unitName: string): Promise<void> {
+/**
+ * Kill every task in one owned scope and return only once the scope is empty.
+ * A bridge restart calls this with a unit an earlier bridge process recorded.
+ */
+export async function killCgroup(unitName: string): Promise<void> {
   const controlGroup = await resolveUnitControlGroup(unitName)
   const currentControlGroup = resolveProcessControlGroup(process.pid)
   if (controlGroup && isOwnedScopeControlGroup(controlGroup, unitName, currentControlGroup)) {
     const cgPath = `/sys/fs/cgroup${controlGroup}`
+    let killed = false
     try {
       if (!statSync(cgPath).isDirectory()) throw new Error('scope cgroup is not a directory')
       // cgroup.kill (Linux 5.14+) SIGKILLs every task in the cgroup
       // atomically. Faster than walking cgroup.procs and ignores
       // pgid manipulation by descendants.
       await writeFile(`${cgPath}/cgroup.kill`, '1')
-      return
+      killed = true
     } catch {
       // fall through to systemctl
+    }
+    if (killed) {
+      for (let waited = 0; waited < 5_000; waited += 20) {
+        if (!scopePopulated(cgPath)) return
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      throw new Error(`scope ${unitName} still has tasks 5 s after cgroup.kill`)
     }
   }
   // Safe fallback: stop only the exact random unit. Never infer a kill target
   // from the launcher's PID when ownership could not be proven.
   await stopScopeUnit(unitName)
+}
+
+/**
+ * Kill and drain a scope an earlier bridge process recorded. True only when the
+ * scope still held tasks, which proves its runner outlived that bridge.
+ */
+export async function drainOrphanScope(unitName: string): Promise<boolean> {
+  const controlGroup = await resolveUnitControlGroup(unitName)
+  if (!controlGroup || !isOwnedScopeControlGroup(controlGroup, unitName, resolveProcessControlGroup(process.pid))) return false
+  if (!scopePopulated(`/sys/fs/cgroup${controlGroup}`)) return false
+  await killCgroup(unitName)
+  return true
+}
+
+/** A removed cgroup directory is an empty one. */
+function scopePopulated(cgPath: string): boolean {
+  try {
+    return /^populated 1$/mu.test(readFileSync(`${cgPath}/cgroup.events`, 'utf8'))
+  } catch {
+    return false
+  }
 }
 
 /** The request cannot finish until its owned scope stop has settled. */
@@ -569,6 +602,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     terminate: () => terminateScopedWorkload(child, unitName, stopScope),
     release,
     spawnError: () => spawnError,
+    scope: unitName,
   }
   return result
 }
