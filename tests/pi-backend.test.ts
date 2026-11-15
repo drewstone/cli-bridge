@@ -422,6 +422,7 @@ describe('PiBackend', () => {
 
     expect(deltas.filter((delta) => delta.content)).toContainEqual({
       model: responseModel,
+      provider_models: [responseModel],
       system_fingerprint: 'fp_a18b46594c_prod0820_fp8_kvcache_20260402',
       content: 'identified',
     })
@@ -430,6 +431,10 @@ describe('PiBackend', () => {
     expect(deltas.find((delta) => delta.profile_materialization)?.system_fingerprint)
       .toBe('fp_a18b46594c_prod0820_fp8_kvcache_20260402')
     expect(deltas.find((delta) => delta.finish_reason)?.model).toBe(responseModel)
+    expect(deltas.find((delta) => delta.finish_reason)?.provider_models).toEqual([responseModel])
+    expect(piResponseIdentityFromEvent({
+      type: 'message_start', message: { model: 'configured-model', system_fingerprint: 'fp_configured' },
+    })).toBeUndefined()
   })
 
   it('accepts a profile default that already contains a nested provider model', () => {

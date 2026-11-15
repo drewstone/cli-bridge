@@ -93,6 +93,7 @@ export function deltaToOpenAIChunk(delta: ChatDelta, meta: ChunkMeta): string | 
         ...(isNonnegativeFinite(usage.model_requests) ? { model_requests: usage.model_requests } : {}),
         ...(isNonnegativeFinite(usage.input_tokens) ? { prompt_tokens: usage.input_tokens } : {}),
         ...(isNonnegativeFinite(usage.output_tokens) ? { completion_tokens: usage.output_tokens } : {}),
+        ...(isNonnegativeFinite(usage.reasoning_output_tokens) ? { reasoning_tokens: usage.reasoning_output_tokens } : {}),
         ...(isNonnegativeFinite(usage.input_tokens) && isNonnegativeFinite(usage.output_tokens)
           ? { total_tokens: usage.input_tokens + usage.output_tokens }
           : {}),
@@ -214,6 +215,7 @@ export async function collectNonStreaming(
         ...(usage.modelRequests > 0 ? { model_requests: usage.modelRequests } : {}),
         ...(usage.inputTokensKnown ? { prompt_tokens: usage.inputTokens } : {}),
         ...(usage.outputTokensKnown ? { completion_tokens: usage.outputTokens } : {}),
+        ...(usage.reasoningOutputTokensKnown ? { reasoning_tokens: usage.reasoningOutputTokens } : {}),
         ...(usage.inputTokensKnown && usage.outputTokensKnown
           ? { total_tokens: usage.inputTokens + usage.outputTokens }
           : {}),

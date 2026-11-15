@@ -548,7 +548,12 @@ export class RetainedNativeContinuation {
     let text = ''
     const textParts = new Map<string, string>()
     let usage: TokenUsage | undefined
+    let incompleteUsage = false
+    const providerModels = new Set<string>()
     for (const event of events) {
+      for (const model of Array.isArray(event.data.provider_models) ? event.data.provider_models : []) {
+        if (typeof model === 'string' && model.length > 0) providerModels.add(model)
+      }
       const normalized = event.normalized
       const part = normalized?.type === 'message.part.updated'
         ? normalized.part
@@ -562,6 +567,7 @@ export class RetainedNativeContinuation {
         text += event.data.delta
       }
       usage = addTokenUsage(usage, event.usage)
+      if (event.type === 'usage' && event.usage === undefined) incompleteUsage = true
     }
     const failure = live?.failure()
     return AgentTurnResultSchema.parse({
@@ -571,12 +577,14 @@ export class RetainedNativeContinuation {
         ? {}
         : { error: failure instanceof Error ? failure.message : `retained run ended with status ${snapshot.status}` }),
       sessionId,
-      ...(usage ? { usage } : {}),
+      ...(usage && !incompleteUsage ? { usage } : {}),
       metadata: {
         runId,
         executionId: snapshot.executionId ?? runId,
         requestDigest: snapshot.requestDigest,
         status: snapshot.status,
+        ...(providerModels.size ? { provider_models: [...providerModels] } : {}),
+        ...(snapshot.status === 'done' && providerModels.size === 1 ? { provider_model: [...providerModels][0] } : {}),
       },
       events,
     })
@@ -798,7 +806,7 @@ function ensureDifferentDigest(requestDigest: string, candidate: string): `sha25
 function environmentEvent(event: { type: string; [key: string]: unknown }): AgentEnvironmentEvent {
   const raw = event.type === 'raw' ? event.event : undefined
   const rawRecord = recordValue(raw)
-  if (rawRecord?.type === 'usage' && recordValue(rawRecord.usage)) {
+  if ((rawRecord?.type === 'usage' || rawRecord?.type === 'raw') && recordValue(rawRecord.data)) {
     return rawRecord as unknown as AgentEnvironmentEvent
   }
   return {

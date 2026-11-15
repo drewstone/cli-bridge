@@ -325,6 +325,49 @@ describe('Pi native RPC adapter', () => {
     runs = null
   })
 
+  it.each(['responseModel', 'model'])('projects only explicit %s evidence and shared cache usage over HTTP', async field => {
+    dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-evidence-`)
+    store = new SessionStore(dir)
+    runs = new RunRegistry()
+    const observedModel = 'provider-model@releaseA'
+    const protocol = rpcChild.replace(
+      '"usage": {"input": 4, "output": 2}',
+      `"${field}": "${observedModel}", "system_fingerprint": "releaseA", `
+      + '"usage": {"input": 4, "cacheRead": 7, "cacheWrite": 11, "output": 2, "reasoning": 1, "cost": 0.04}',
+    )
+    const backend = new PiBackend({
+      bin: 'pi', timeoutMs: 10_000,
+      spawner: makeChildSpawner([], undefined, protocol),
+      transportResolver: testPiInferenceTransport(),
+    })
+    const registry = new BackendRegistry().register(backend)
+    const service = new RetainedSessionService({ store, registry, runs })
+    const app = new Hono()
+    mountRetainedSessions(app, service)
+    expect((await app.request('/v1/sessions', { method: 'POST', body: JSON.stringify({
+      id: 'evidence-session', model: 'pi/test/requested-model', cwd: dir,
+    }) })).status).toBe(201)
+    expect((await app.request('/v1/sessions/evidence-session/turns', { method: 'POST', body: JSON.stringify({
+      message: 'observe this response', run_id: 'evidence-run', execution_id: 'evidence-execution',
+    }) })).status).toBe(202)
+    await waitFor(() => store!.getRetained('evidence-session')?.turns === 1)
+    const response = await app.request('/v1/sessions/evidence-session/events')
+    const envelopes = [...(await response.text()).matchAll(/data: (\{.*\})\r?\n/gu)].map(match => JSON.parse(match[1]!))
+    const projections = envelopes.filter(item => item.event.type === 'raw').map(item => item.event.event)
+    expect(projections.flatMap(event => event.data?.provider_models ?? [])).toEqual(
+      field === 'responseModel' ? [observedModel, observedModel] : [],
+    )
+    const usage = projections.find(event => event.type === 'usage')
+    expect(usage).toMatchObject({ type: 'usage', usageMode: 'delta',
+      data: { modelRequests: 1, estimatedCostUsd: 0.04 },
+      usage: { inputTokens: 22, outputTokens: 2, reasoningTokens: 1, cacheReadInputTokens: 7, cacheCreationInputTokens: 11 },
+      providerEvent: { usage: { prompt_tokens: 22, fresh_input_tokens: 4,
+        cache_read_input_tokens: 7, cache_write_input_tokens: 11, completion_tokens: 2, reasoning_tokens: 1, cost_known: false, estimated: false } },
+    })
+    expect(usage.usage.cost).toBeUndefined()
+    expect(usage.providerEvent.usage.cost).toBeUndefined()
+  })
+
   it('joins retained Pi auth and prestart evidence before any child is spawned', async () => {
     dir = mkdtempSync(`${tmpdir()}/cli-bridge-pi-native-prestart-`)
     const lifecycle = { children: [] as ReturnType<typeof spawn>[], releases: 0, terminations: 0 }
