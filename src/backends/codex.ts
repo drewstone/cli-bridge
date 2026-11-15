@@ -28,7 +28,7 @@ import {
 import {
   resolvePromptMessages,
 } from './profile-prompt.js'
-import { contentToText } from './content.js'
+import { contentToText, toolResult } from './content.js'
 import { validateUpstreamBaseUrl } from './pi-inference-transport.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { sanitizeHostEnv } from '../executors/host.js'
@@ -41,6 +41,7 @@ import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from '
 import { nativeReasoningControl, workspaceCwdPathForBase, type ContextTransferRequest } from '@tangle-network/agent-interface'
 import { CODEX_NATIVE_IMPORT_VERSION, CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
 import { CODEX_DISABLED_FEATURE_ARGS, assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
+import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -163,18 +164,17 @@ export class CodexBackend implements Backend {
     }
   }
 
-  async *chat(
-    req: ChatRequest,
-    session: SessionRecord | null,
-    signal: AbortSignal,
-  ): AsyncIterable<ChatDelta> {
-    yield* this.chatOwned(req, session, signal)
+  /** One turn; it continues once in the same native thread when its runner dies (see `chatContinuing`). */
+  chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
+    return chatContinuing(this, req, session, signal)
   }
 
-  private async *chatOwned(
+  /** One runner process; `session.internalId` resumes with `codex exec resume <id>`. */
+  async *runRunner(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
+    watch: RunnerWatch,
   ): AsyncIterable<ChatDelta> {
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
     // Codex has `--sandbox` flags but we haven't verified end-to-end that
@@ -375,6 +375,10 @@ export class CodexBackend implements Backend {
         onAbort()
         throw new BackendError('Codex launch was aborted', 'aborted')
       }
+      if (child.pid !== undefined) {
+        watch.pid = child.pid
+        yield runnerDelta(this.name, child.pid, spawned, req.mode ?? 'byob', cwd, req)
+      }
       let internalSessionId: string | undefined
       const stderr = new BoundedDiagnosticBuffer()
       child.stderr?.on('data', (b) => { stderr.append(b) })
@@ -400,6 +404,7 @@ export class CodexBackend implements Backend {
 
         if (type === 'thread.started' && typeof ev.thread_id === 'string') {
           internalSessionId = ev.thread_id
+          watch.nativeSessionId = internalSessionId
           yield { internal_session_id: internalSessionId, ...nativeStore }
           continue
         }
@@ -417,19 +422,26 @@ export class CodexBackend implements Backend {
           continue
         }
 
-        const toolCall = extractToolCall(ev)
+        const item = asRecord(ev.item)
+        const toolCall = type === 'item.started' || type === 'item.completed' ? extractToolCall(item) : null
         if (toolCall) {
-          yield { tool_calls: [toolCall] }
-          emittedToolCall = true
+          // Announce a tool when it starts and answer it when it ends, so the
+          // retained run shows which call was in flight if its runner dies.
+          if (!watch.openTools.has(toolCall.id)) {
+            yield { tool_calls: [toolCall] }
+            emittedToolCall = true
+          }
+          if (type === 'item.started') watch.openTools.set(toolCall.id, toolCall.name)
+          else {
+            watch.openTools.delete(toolCall.id)
+            yield { tool_results: [toolResult(toolCall.id, toolCall.name, item?.status === 'failed', item?.aggregated_output)] }
+          }
           // Fall through to extractText: a tool item can also carry a
           // string result payload, which consumers audit as evidence.
         }
 
         const text = extractText(ev)
-        if (text) {
-          const item = ev.item as { type?: unknown } | undefined
-          yield { content: text, ...(item?.type === 'agent_message' ? { final_text: text } : {}) }
-        }
+        if (text) yield { content: text, ...(item?.type === 'agent_message' ? { final_text: text } : {}) }
 
         if (type === 'turn.completed' || type === 'thread.completed') {
           sawTerminal = true
@@ -438,7 +450,9 @@ export class CodexBackend implements Backend {
         }
       }
 
-      await waitForProcessClose(child)
+      const closed = await waitForProcessClose(child)
+      // A signal the bridge did not send, before the turn's terminal event: the runner was killed.
+      if (!sawTerminal && closed.signal !== null) watch.exit = closed.signal
       if (usage) yield { usage }
 
       if (signal.aborted) {
@@ -469,7 +483,8 @@ export class CodexBackend implements Backend {
       // Reap the whole subtree — codex spawns sub-processes for MCP
       // tool calls, model HTTP I/O, etc. and we owe them a clean exit.
       try {
-        await finishProcess()
+        // A continuation needs proof the whole tree is gone: a scope that cgroup.kill emptied.
+        watch.drained = await finishProcess() === 'stopped' && spawned.scope !== undefined
       } finally {
         try { releaseSpawner() } finally { releaseState() }
       }
@@ -769,8 +784,8 @@ function firstString(...values: unknown[]): string | undefined {
 
 /**
  * Item types that carry tool activity rather than assistant text.
- * `codex exec --json` reports each tool invocation as an
- * `item.completed` whose `item.type` names the tool class:
+ * `codex exec --json` reports each tool invocation as an `item.started`
+ * and then an `item.completed` whose `item.type` names the tool class:
  *   command_execution — {command, aggregated_output, exit_code, status}
  *   mcp_tool_call     — {server, tool, arguments?, status}
  *   web_search        — {query}
@@ -781,10 +796,8 @@ function firstString(...values: unknown[]): string | undefined {
  * call" unless the call is a first-class delta.
  */
 function extractToolCall(
-  ev: Record<string, unknown>,
+  item: Record<string, unknown> | null,
 ): { id: string; name: string; arguments: string } | null {
-  if (String(ev.type ?? '') !== 'item.completed') return null
-  const item = ev.item as Record<string, unknown> | undefined
   if (!item) return null
   const itemType = String(item.type ?? '')
   const id = String(item.id ?? '')
