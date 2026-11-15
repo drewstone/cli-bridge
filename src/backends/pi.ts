@@ -1034,6 +1034,7 @@ export interface PiUsageReceipt {
   cacheRead?: number
   cacheWrite?: number
   output?: number
+  reasoning?: number
   estimatedCost?: number
 }
 
@@ -1068,13 +1069,11 @@ export function piResponseIdentityFromEvent(
   for (const candidate of candidates) {
     if (!candidate) continue
     const responseModel = nonEmptyString(candidate.responseModel)
-    const configuredModel = nonEmptyString(candidate.model)
     if (!model && responseModel) model = responseModel
     if (!fingerprint) {
       fingerprint = nonEmptyString(candidate.system_fingerprint)
         ?? nonEmptyString(candidate.systemFingerprint)
     }
-    if (!model && fingerprint && configuredModel) model = configuredModel
     if (model && fingerprint) break
   }
   if (!model) return undefined
@@ -1088,7 +1087,7 @@ export function piResponseIdentityFromEvent(
   }
 }
 
-function mergePiResponseIdentity(
+export function mergePiResponseIdentity(
   current: PiResponseIdentity | undefined,
   next: PiResponseIdentity,
 ): PiResponseIdentity {
@@ -1123,10 +1122,11 @@ function mergePiResponseIdentity(
   }
 }
 
-function piResponseIdentityDelta(identity: PiResponseIdentity | undefined): Pick<ChatDelta, 'model' | 'system_fingerprint'> {
+export function piResponseIdentityDelta(identity: PiResponseIdentity | undefined): Pick<ChatDelta, 'model' | 'provider_models' | 'system_fingerprint'> {
   if (!identity) return {}
   return {
     model: identity.model,
+    provider_models: [identity.model],
     ...(identity.systemFingerprint ? { system_fingerprint: identity.systemFingerprint } : {}),
   }
 }
@@ -1278,12 +1278,14 @@ function piUsageFromRecord(usage: Record<string, unknown>): PiUsageReceipt | und
     usage.output ?? usage.outputTokens ?? usage.completion_tokens,
     'output',
   )
+  const reasoning = piTokenCount(usage.reasoning ?? usage.reasoningTokens ?? usage.reasoning_tokens, 'reasoning')
   if (
     nativeInput === undefined
     && openAiInput === undefined
     && cacheRead === undefined
     && cacheWrite === undefined
     && output === undefined
+    && reasoning === undefined
   ) {
     return undefined
   }
@@ -1302,6 +1304,7 @@ function piUsageFromRecord(usage: Record<string, unknown>): PiUsageReceipt | und
     ...(cacheRead !== undefined ? { cacheRead } : {}),
     ...(cacheWrite !== undefined ? { cacheWrite } : {}),
     ...(output !== undefined ? { output } : {}),
+    ...(reasoning !== undefined ? { reasoning } : {}),
     ...(cost !== undefined ? { estimatedCost: cost } : {}),
   }
 }
@@ -1313,6 +1316,7 @@ export function piTokenUsage(receipt: PiUsageReceipt): NonNullable<ChatDelta['us
     ...(receipt.cacheRead !== undefined ? { cache_read_input_tokens: receipt.cacheRead } : {}),
     ...(receipt.cacheWrite !== undefined ? { cache_write_input_tokens: receipt.cacheWrite } : {}),
     ...(receipt.output !== undefined ? { output_tokens: receipt.output } : {}),
+    ...(receipt.reasoning !== undefined ? { reasoning_output_tokens: receipt.reasoning } : {}),
   }
 }
 

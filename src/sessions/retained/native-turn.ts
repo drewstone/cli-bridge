@@ -23,6 +23,14 @@ import {
   type ToolState,
 } from '@tangle-network/agent-interface'
 import type { NativeSession } from '../../backends/types.js'
+import {
+  mergePiResponseIdentity,
+  piResponseIdentityDelta,
+  piResponseIdentityFromEvent,
+  piUsageReceiptsFromEvent,
+  type PiResponseIdentity,
+  type PiUsageReceipt,
+} from '../../backends/pi.js'
 import type { Run } from '../../runs/registry.js'
 import { piPermissionPublicTitle, piPermissionTokenFromTitle } from '../../backends/pi-interaction.js'
 import { numberValue, recordValue, stringValue } from './json-values.js'
@@ -54,6 +62,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   const toolParts = new Map<string, Part>()
   let nextContentIndex = 0
   let lastTurnFailure: string | null = null
+  let responseIdentity: PiResponseIdentity | undefined
   const deferredDenials: Promise<void>[] = []
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
@@ -63,6 +72,18 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
         continue
       }
       const type = String(event.type ?? '')
+      const observedIdentity = piResponseIdentityFromEvent(event)
+      if (observedIdentity) {
+        const merged = mergePiResponseIdentity(responseIdentity, observedIdentity)
+        if (merged.model !== responseIdentity?.model || merged.systemFingerprint !== responseIdentity?.systemFingerprint) {
+          // Preserve the same explicit provider observation as the one-shot path.
+          // Configured native models and compatibility routes never enter this projection.
+          yield { event: { type: 'raw', backend: backendName, event: {
+            type: 'raw', data: piResponseIdentityDelta(merged),
+          } } }
+        }
+        responseIdentity = merged
+      }
       if (type === 'session') {
         if (typeof event.id === 'string') input.onProviderSessionId(event.id)
         if (typeof event.id === 'string')
@@ -193,8 +214,9 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
       }
       if (type === 'turn_end') {
         lastTurnFailure = nativeTurnFailure(event.message)
-        const usage = usageFromPi(event)
-        if (usage) yield { event: { type: 'raw', backend: backendName, event: usageEnvironmentEvent(usage) } }
+        for (const receipt of piUsageReceiptsFromEvent(event)) {
+          yield { event: { type: 'raw', backend: backendName, event: usageEnvironmentEvent(receipt, responseIdentity) } }
+        }
         yield { event: { type: 'model-processing', phase: 'generating' } }
         continue
       }
@@ -401,26 +423,6 @@ function isFireAndForgetUi(event: Record<string, unknown>): boolean {
   return ['notify', 'setStatus', 'setWidget', 'setTitle', 'set_editor_text'].includes(String(event.method ?? ''))
 }
 
-function usageFromPi(event: Record<string, unknown>): Record<string, number> | null {
-  const message = recordValue(event.message)
-  const usage = recordValue(event.usage) ?? recordValue(message?.usage)
-  if (!usage) return null
-  const result: Record<string, number> = {}
-  for (const [key, target] of [
-    ['input', 'inputTokens'],
-    ['output', 'outputTokens'],
-    ['cacheRead', 'cacheReadInputTokens'],
-    ['cacheWrite', 'cacheCreationInputTokens'],
-    ['reasoning', 'reasoningTokens'],
-    ['cost', 'cost'],
-  ] as const) {
-    const value = usage[key]
-    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) result[target] = value
-  }
-  if (typeof result.inputTokens !== 'number' || typeof result.outputTokens !== 'number') return null
-  return result
-}
-
 function nativeTurnFailure(message: unknown): string | null {
   const value = recordValue(message)
   if (!value) return null
@@ -435,8 +437,36 @@ function durablePlanFromNative(value: Record<string, unknown> | null): DurablePl
   return parsed.success ? parsed.data : null
 }
 
-function usageEnvironmentEvent(usage: Record<string, number>): AgentEnvironmentEvent {
-  return { type: 'usage', data: {}, usage: usage as AgentEnvironmentEvent['usage'] }
+function usageEnvironmentEvent(receipt: PiUsageReceipt, identity: PiResponseIdentity | undefined): AgentEnvironmentEvent {
+  const rawUsage = {
+    model_requests: 1,
+    ...(receipt.input === undefined ? {} : { prompt_tokens: receipt.input }),
+    ...(receipt.output === undefined ? {} : { completion_tokens: receipt.output }),
+    ...(receipt.reasoning === undefined ? {} : { reasoning_tokens: receipt.reasoning }),
+    ...(receipt.freshInput === undefined ? {} : { fresh_input_tokens: receipt.freshInput }),
+    ...(receipt.cacheRead === undefined ? {} : { cache_read_input_tokens: receipt.cacheRead }),
+    ...(receipt.cacheWrite === undefined ? {} : { cache_write_input_tokens: receipt.cacheWrite }),
+    estimated: false,
+    cost_known: false,
+  }
+  return {
+    type: 'usage',
+    data: {
+      ...piResponseIdentityDelta(identity),
+      modelRequests: 1,
+      usage: rawUsage,
+      ...(receipt.estimatedCost === undefined ? {} : { estimatedCostUsd: receipt.estimatedCost }),
+    },
+    ...(receipt.input === undefined || receipt.output === undefined ? {} : { usage: {
+      inputTokens: receipt.input,
+      outputTokens: receipt.output,
+      ...(receipt.reasoning === undefined ? {} : { reasoningTokens: receipt.reasoning }),
+      ...(receipt.cacheRead === undefined ? {} : { cacheReadInputTokens: receipt.cacheRead }),
+      ...(receipt.cacheWrite === undefined ? {} : { cacheCreationInputTokens: receipt.cacheWrite }),
+    } }),
+    usageMode: 'delta',
+    providerEvent: { usage: rawUsage },
+  }
 }
 
 function boundedRuntimeId(candidate: string): string {

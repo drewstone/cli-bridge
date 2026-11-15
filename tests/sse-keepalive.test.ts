@@ -96,6 +96,22 @@ describe('deltaToOpenAIChunk', () => {
 })
 
 describe('collectNonStreaming', () => {
+  it('preserves measured reasoning as an output subset and keeps incomplete reasoning totals unknown', async () => {
+    const receipt: ChatDelta = { usage: { input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 2 } }
+    const wire = JSON.parse(deltaToOpenAIChunk(receipt, makeChunkMeta('test'))!.slice('data: '.length))
+    expect(wire.usage).toMatchObject({ prompt_tokens: 4, completion_tokens: 3, reasoning_tokens: 2, total_tokens: 7 })
+    const complete = await collectNonStreaming((async function* () { yield receipt; yield receipt })(), 'test') as {
+      usage: Record<string, number>
+    }
+    expect(complete.usage).toMatchObject({ prompt_tokens: 8, completion_tokens: 6, reasoning_tokens: 4, total_tokens: 14 })
+    const partial = await collectNonStreaming((async function* () {
+      yield receipt
+      yield { usage: { input_tokens: 1, output_tokens: 1 } }
+    })(), 'test') as { usage: Record<string, number> }
+    expect(partial.usage).toMatchObject({ prompt_tokens: 5, completion_tokens: 4 })
+    expect(partial.usage.reasoning_tokens).toBeUndefined()
+  })
+
   it('strips keepalive deltas from the non-streaming response body', async () => {
     async function* deltas(): AsyncIterable<ChatDelta> {
       yield { keepalive: { source: 'kimi', elapsedMs: 30000 } }

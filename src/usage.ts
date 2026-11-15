@@ -23,6 +23,8 @@ export interface CollectedUsage {
   cacheWriteInputTokensKnown: boolean
   outputTokens: number
   outputTokensKnown: boolean
+  reasoningOutputTokens: number
+  reasoningOutputTokensKnown: boolean
   cost: number
   /**
    * False when any contributing record omitted `cost`, which makes `cost` a
@@ -55,6 +57,7 @@ export function addUsage(
     || nonnegativeFinite(next.cache_read_input_tokens)
     || nonnegativeFinite(next.cache_write_input_tokens)
     || nonnegativeFinite(next.output_tokens)
+    || nonnegativeFinite(next.reasoning_output_tokens)
   const hadTokenReceipt = current?.hasTokenUsage ?? false
   const trustedProvenance = next.cost_provenance === 'provider-receipt'
     || next.cost_provenance === 'billing-receipt'
@@ -93,6 +96,10 @@ export function addUsage(
     outputTokensKnown: hasTokenReceipt
       ? (!hadTokenReceipt || current?.outputTokensKnown === true) && nonnegativeFinite(next.output_tokens)
       : current?.outputTokensKnown ?? false,
+    reasoningOutputTokens: (current?.reasoningOutputTokens ?? 0) + finiteTokenCount(next.reasoning_output_tokens),
+    reasoningOutputTokensKnown: hasTokenReceipt
+      ? (!hadTokenReceipt || current?.reasoningOutputTokensKnown === true) && nonnegativeFinite(next.reasoning_output_tokens)
+      : current?.reasoningOutputTokensKnown ?? false,
     cost: totalCost ? (trustedCost ?? 0) : (current?.cost ?? 0) + (trustedCost ?? 0),
     costComplete: totalCost
       ? trustedCost !== undefined
