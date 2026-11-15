@@ -858,11 +858,10 @@ export async function provisionPiInferenceTransport(
         },
       },
     }
-    writeFileSync(join(agentDir, 'models.json'), `${JSON.stringify(models, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-      flag: 'wx',
-    })
+    const privateNewFile = { encoding: 'utf8', mode: 0o600, flag: 'wx' } as const
+    writeFileSync(join(agentDir, 'models.json'), `${JSON.stringify(models, null, 2)}\n`, privateNewFile)
+    // The proxy relays HTTP POST only; Pi's default `auto` first tries a Codex WebSocket it refuses.
+    writeFileSync(join(agentDir, 'settings.json'), '{"transport":"sse"}\n', privateNewFile)
     // Pi may create package/cache state at startup. Keep every write in the
     // request directory; never point it back at the credential-bearing source.
     mkdirSync(join(agentDir, 'npm'), { mode: 0o700 })

@@ -25,6 +25,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { connect, createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -86,7 +87,7 @@ function proxySecretPlaceholder(envName: string): string {
   return `proxy-${envName.toLowerCase().replace(/[^a-z0-9]+/gu, '-')}.${randomBytes(12).toString('base64url')}`
 }
 
-type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin' | 'trustedHostServices'>
+type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin' | 'trustedHostServices' | 'hostLoopbackPorts'>
 
 /** Hosts the relay may splice. Router mode stays the Router only; pass-through is relay-only. */
 export function relayAllowHosts(spec: EgressSpec): readonly string[] {
@@ -125,19 +126,21 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
   if (bindings.length && network !== 'relay') throw new Error('proxySecrets require execution.jail.network relay')
   // Created on every path: a write-jail cannot create the mask's mountpoint on the read-only host root.
   const mask = ['--tmpfs', await egressParent()]
-  if (network === 'none' && !spec.trustedHostServices?.length) return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
+  if (network === 'none' && !spec.trustedHostServices?.length && !spec.hostLoopbackPorts?.length) return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
 
   const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
-  if (socketPath.length > MAX_SOCKET_PATH) {
+  if (`${socketPath}65535`.length > MAX_SOCKET_PATH) {
     await rm(shared, { recursive: true, force: true })
     throw new Error(`egress socket path exceeds ${MAX_SOCKET_PATH} bytes; set TMPDIR to a shorter directory`)
   }
   let proxy: Awaited<ReturnType<typeof startIronProxy>> | undefined
   let relay: EgressRelay | undefined
+  const bridges: Array<() => Promise<void>> = []
   const intercepts: JailEgressIntercept[] = []
   const cleanup = async () => {
     await relay?.close()
+    await Promise.all(bridges.map((close) => close()))
     if (proxy) { proxy.child.kill('SIGTERM'); await rm(proxy.dir, { recursive: true, force: true }) }
     await rm(shared, { recursive: true, force: true })
     // Revoke after the proxy is gone, so no in-flight request can still use the value.
@@ -161,16 +164,46 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
       trustedHostServices: spec.trustedHostServices,
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
+    // Each host loopback port gets its own socket; the relay still refuses every other destination.
+    const pairs = [socketPath, SHIM_PORT]
+    for (const port of spec.hostLoopbackPorts ?? []) {
+      bridges.push(await startLoopbackBridge(`${socketPath}${port}`, port))
+      pairs.push(`${socketPath}${port}`, String(port))
+    }
     return {
       bwrapArgs: [...mask, '--ro-bind', shared, shared, '--ro-bind', EGRESS_SHIM_PATH, EGRESS_SHIM_PATH],
       env,
-      prefix: [process.execPath, EGRESS_SHIM_PATH, socketPath, SHIM_PORT],
+      prefix: [process.execPath, EGRESS_SHIM_PATH, ...pairs, '--'],
       cleanup,
     }
   } catch (error) {
     await cleanup()
     throw error
   }
+}
+
+/** This spawn's socket for one host loopback port; each connection is spliced to that port only. */
+async function startLoopbackBridge(socketPath: string, port: number): Promise<() => Promise<void>> {
+  const open = new Set<Socket>()
+  // Not half-open: the jail side ending means its process left, and the service must see that hang-up now.
+  const server = createServer((client) => {
+    const upstream = connect(port, '127.0.0.1')
+    const close = () => { client.destroy(); upstream.destroy() }
+    for (const socket of [client, upstream]) {
+      open.add(socket)
+      socket.once('close', () => { open.delete(socket); close() })
+      socket.on('error', close)
+    }
+    client.pipe(upstream).pipe(client)
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, () => resolve())
+  })
+  return () => new Promise((resolve) => {
+    server.close(() => resolve())
+    for (const socket of open) socket.destroy()
+  })
 }
 
 async function mintIntercept(command: string, binding: ProxySecretBinding): Promise<JailEgressIntercept> {

@@ -101,7 +101,6 @@ export function parsePiModelId(model: string): PiModelSpec {
   return { provider: rest.slice(0, slash), model: rest.slice(slash + 1) }
 }
 
-
 /**
  * Pi's MCP adapter keeps its compact proxy by default. A request profile,
  * however, declares actual tools rather than a second protocol the model must
@@ -564,13 +563,12 @@ export class PiBackend implements NativeSessionBackend {
         {
           ...(req.session_id ? { sessionId: req.session_id } : {}),
           ...(runCwd ? { projectDir: runCwd } : {}),
-          ...(modelHints === undefined
-            ? {}
-            : { modelHints }),
+          ...(modelHints === undefined ? {} : { modelHints }),
         },
       )
       advancePhase('session_and_mcp')
       registerJailWritable(req.jailSpec, inference.agentDir, inference.sessionDir)
+      if (req.jailSpec) req.jailSpec.hostLoopbackPorts = [Number(new URL(inference.localBaseUrl).port)]
       args.push('--session-dir', inference.sessionDir)
       if (req.session_id) {
         ensurePiSessionFile(
@@ -846,6 +844,8 @@ export class PiBackend implements NativeSessionBackend {
       const { code: exitCode, signal: exitSignal } = await waitForProcessClose(child)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
+      // Pi's hang-up reaches the proxy through the jail's forwarder sockets a few ms after its exit.
+      for (let wait = 0; wait < 50 && inference!.traffic().inFlightRequests > 0; wait++) await delayBeforeRetry(20, signal)
 
       const inferenceTraffic = inference!.traffic()
       const observedModelRequests = inferenceTraffic.generationRequests
