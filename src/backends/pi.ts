@@ -845,7 +845,7 @@ export class PiBackend implements NativeSessionBackend {
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
       // Pi's hang-up reaches the proxy through the jail's forwarder sockets a few ms after its exit.
-      for (let wait = 0; wait < 50 && inference!.traffic().inFlightRequests > 0; wait++) await new Promise((done) => setTimeout(done, 20))
+      for (let wait = 0; wait < 50 && inference!.traffic().inFlightRequests > 0; wait++) await delayBeforeRetry(20, signal)
 
       const inferenceTraffic = inference!.traffic()
       const observedModelRequests = inferenceTraffic.generationRequests
