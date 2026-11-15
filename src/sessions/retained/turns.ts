@@ -289,13 +289,6 @@ export class RetainedTurnRunner {
       )
     }
     const existingNative = existingControl?.session ?? null
-    if (existingNative?.acceptsInteractions && !existingNative.acceptsInteractions(input.interactions)) {
-      throw new RetainedSessionError(
-        'the running native process was launched for a different interaction posture than this turn requests',
-        501,
-        'capability_denied',
-      )
-    }
     if (existingControl && existingNative) {
       const inspected = await existingControl.run.inspectNativeControl(existingNative, async (native) => {
         const proof = await verifyRetainedBoundary(native, retained, runId, {
@@ -564,7 +557,7 @@ export class RetainedTurnRunner {
       }],
       session_id: record.id,
       interaction_policy: 'interactive',
-      ...(input.interactions ? { interactions } : {}),
+      interactions,
       ...(record.cwd ? { cwd: record.cwd } : {}),
       ...(typeof mode === 'string' ? { mode: mode as ChatRequest['mode'] } : {}),
       ...(config.execution ? { execution: config.execution as ChatRequest['execution'] } : {}),

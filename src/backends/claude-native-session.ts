@@ -9,7 +9,6 @@ import {
   canonicalCandidateDigest,
   type AgentEnvironmentCapabilities,
   type NativeContextBoundaryProof,
-  type RequestedInteractions,
 } from '@tangle-network/agent-interface'
 import type { NativeSession } from './types.js'
 import { BackendError } from './types.js'
@@ -48,7 +47,6 @@ export class ClaudeNativeSession implements NativeSession {
     spawned: Awaited<ReturnType<Spawner>>,
     readonly capabilities: AgentEnvironmentCapabilities,
     private readonly sessionId: string,
-    private readonly promptPermissions: boolean,
     private readonly ackTimeoutMs: number,
     cleanup: () => void,
   ) {
@@ -70,11 +68,6 @@ export class ClaudeNativeSession implements NativeSession {
   isClosed(): boolean { return this.life.closed }
   onClose(listener: (reason: Error) => void): () => void { return this.life.onClose(listener) }
   whenClosed(): Promise<void> { return this.life.whenClosed() }
-
-  /** A process launched without permission prompts cannot honor a turn that asks for them, nor the reverse. */
-  acceptsInteractions(requested: RequestedInteractions | undefined): boolean {
-    return requested === undefined || (requested.permission === true) === this.promptPermissions
-  }
 
   async *turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
     if (this.life.closed) throw new BackendError('claude native session is closed', 'upstream')
