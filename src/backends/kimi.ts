@@ -198,7 +198,7 @@ export class KimiBackend implements Backend {
           // Subprocess liveness signal — kimi has emitted no stdout for
           // `progressIntervalMs` and may be doing internal think work
           // (stream-json is buffered). Yield as keepalive so the SSE
-          // writer renders an SSE comment that keeps the socket alive
+          // writer renders a numbered keepalive frame that keeps the socket alive
           // without injecting a fake OpenAI tool_call into the response.
           // See ChatDelta.keepalive (backends/types.ts) for the contract.
           yield {

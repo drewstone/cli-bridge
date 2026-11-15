@@ -2,7 +2,7 @@ import type { Context } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Run } from '../runs/registry.js'
 import { RunReplayCursorError } from '../runs/registry.js'
-import { deltaToOpenAIChunk, deltaToSseComment, makeChunkMeta } from '../streaming/sse.js'
+import { deltaToBridgeOnlyFrame, deltaToOpenAIChunk, makeChunkMeta } from '../streaming/sse.js'
 
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000
 
@@ -104,14 +104,9 @@ export function streamChatDeltaEvents(
           await writeSse(JSON.stringify({ error: delta.error }), seq)
           break
         }
-        const comment = deltaToSseComment(delta)
-        if (comment) {
-          if (!await writeRaw(`id: ${seq}\n${comment}`)) break
-          continue
-        }
         const chunk = deltaToOpenAIChunk(delta, meta)
         if (!chunk) {
-          if (!await writeRaw(`id: ${seq}\n: bridge-metadata\n\n`)) break
+          if (!await writeRaw(deltaToBridgeOnlyFrame(seq, delta, meta))) break
           continue
         }
         const payload = chunk.slice('data: '.length).replace(/\n\n$/, '')
