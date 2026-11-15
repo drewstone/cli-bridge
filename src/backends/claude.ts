@@ -416,7 +416,7 @@ export class ClaudeBackend implements Backend {
       // during long internal-think pauses when claude-code emits no
       // stdout for >30s (stream-json is buffered). The progress event
       // becomes a `keepalive` ChatDelta that the SSE writer renders as
-      // an `: keepalive` comment.
+      // a numbered keepalive frame.
       const progressIntervalMs = Math.max(10, Number(process.env.CLAUDE_PROGRESS_MS ?? 30_000))
       for await (const event of readProcessLines({ child, stdout: child.stdout, progressIntervalMs })) {
         if (event.kind === 'progress') {

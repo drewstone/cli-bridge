@@ -604,9 +604,10 @@ export interface ChatDelta {
    * Subprocess-liveness signal. Backends emit this when the upstream CLI
    * is silently buffering (no stdout for >N seconds) so the SSE writer
    * can surface a transport-level heartbeat without polluting the
-   * OpenAI delta stream. SSE writer renders as a comment
-   * (`: keepalive source=<x> elapsed=<ms>\n\n`) — OpenAI clients ignore
-   * SSE comments per spec. `collectNonStreaming` drops these entirely.
+   * OpenAI delta stream. The SSE writer renders it as a numbered frame
+   * with a `: keepalive source=<x> elapsed=<ms>` comment and an empty
+   * `choices: []` chunk (`deltaToBridgeOnlyFrame`). `collectNonStreaming`
+   * drops these entirely.
    *
    * Do NOT use `tool_calls` for liveness — synthetic tool names violate
    * the OpenAI tool_calls contract (every name must be a tool the

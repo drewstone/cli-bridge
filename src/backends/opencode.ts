@@ -284,7 +284,7 @@ export class OpencodeBackend implements Backend {
         if (next.kind === 'progress') {
           // Subprocess liveness signal — opencode has emitted no stdout
           // for `progressIntervalMs`. Yield as keepalive so the SSE
-          // writer renders an SSE comment that keeps the socket alive
+          // writer renders a numbered keepalive frame that keeps the socket alive
           // without injecting a fake OpenAI tool_call into the response.
           // See ChatDelta.keepalive (backends/types.ts) for the contract.
           yield {
