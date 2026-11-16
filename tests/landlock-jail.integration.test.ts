@@ -160,6 +160,17 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
     }
   }, 60_000)
 
+  it('does not let child PATH replace the trusted interpreter', async () => {
+    const tools = join(base, 'hostile-path'); await mkdir(tools)
+    await writeFile(join(tools, 'python3'), '#!/bin/sh\necho interpreter-substituted\nexit 0\n', { mode: 0o700 })
+    const code = `require('node:assert/strict').throws(()=>require('node:fs').readFileSync(${JSON.stringify(outside)}),{code:'EACCES'});console.log('confined')`
+    const result = await hostSpawner(process.execPath, ['-e', code], { cwd: workspace, jail: spec(), env: { PATH: tools } })
+    try {
+      const observed = await output(result.child)
+      expect(observed.code, observed.stderr).toBe(0); expect(observed.stdout.trim()).toBe('confined')
+    } finally { await result.terminate(); result.release() }
+  })
+
   it('refuses remapped binds and write-jail rather than widening the boundary', async () => {
     await expect(jail.wrap('/bin/true', [], { ...spec(), readConfine: false })).rejects.toThrow('write-jail')
     await expect(jail.wrap('/bin/true', [], spec({ authSources: [{ source: readonly, jailRel: '.auth', mode: 'read-only' }] }))).rejects.toThrow('remapped bind')

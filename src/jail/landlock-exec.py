@@ -75,9 +75,11 @@ try:
         with open(sys.argv[1], encoding='utf-8') as stream:
             policy = json.load(stream)
         libc = ctypes.CDLL(None, use_errno=True)
+        parent = os.getppid()
         check(libc.prctl(1, signal.SIGKILL, 0, 0, 0))  # PR_SET_PDEATHSIG
-        if os.getppid() != policy['parent']:
+        if os.getppid() != parent:
             raise RuntimeError('launcher parent exited')
+        os.kill(policy['parent'], 0)  # The Bridge must still exist, including under a scope wrapper.
         restrict(policy)
         os.environ.update(policy['env'])
         os.chdir(policy['cwd'])

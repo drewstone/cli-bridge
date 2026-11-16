@@ -165,7 +165,7 @@ export function isSafeReadPath(p: string, home: string, base: string): boolean {
 }
 
 /** Absolute on-PATH location of `bin` (or `bin` itself if absolute), else null. */
-function whichPath(bin: string): string | null {
+export function whichPath(bin: string): string | null {
   if (isAbsolute(bin)) return existsSync(bin) ? bin : null
   for (const dir of (process.env.PATH ?? '').split(delimiter)) {
     if (!dir) continue
@@ -188,4 +188,3 @@ function tryRealpath(p: string): string | null {
     return null
   }
 }
-
