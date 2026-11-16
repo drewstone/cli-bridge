@@ -3,9 +3,57 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from '../src/config.js'
-import { buildApp } from '../src/server.js'
+import { buildApp, localBackends } from '../src/server.js'
 
 describe('bridge capability advertisement', () => {
+  it('registers the advertised local drivers through canonical harness aliases without claiming readiness', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-local-drivers-'))
+    const config = loadConfig({
+      BRIDGE_BACKENDS: localBackends.map(backend => backend.harness).join(','),
+      BRIDGE_DATA_DIR: dataDir,
+      BRIDGE_TRACE: 'off',
+      ...Object.fromEntries(localBackends.map(backend => [
+        `${backend.name.toUpperCase()}_BIN`, join(dataDir, `missing-${backend.name}`),
+      ])),
+    })
+    const built = await buildApp(config, dataDir)
+    try {
+      const response = await built.app.request('/health')
+      expect(response.status).toBe(503)
+      const result = await response.json() as { backends: { name: string; state: string }[] }
+      expect(result.backends.map((backend: { name: string }) => backend.name).sort())
+        .toEqual(localBackends.map(backend => backend.harness).sort())
+      expect(result.backends.every((backend: { state: string }) => backend.state !== 'ready')).toBe(true)
+    } finally {
+      for (const shutdown of built.extras.shutdownHooks) await shutdown()
+      built.sessions.close()
+      rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the operator backend selection a ceiling after alias normalization', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-selected-drivers-'))
+    const config = loadConfig({
+      BRIDGE_BACKENDS: 'claude-code,claude,kimi-code',
+      BRIDGE_DATA_DIR: dataDir,
+      BRIDGE_TRACE: 'off',
+      CLAUDE_BIN: join(dataDir, 'missing-claude'),
+      KIMI_BIN: join(dataDir, 'missing-kimi'),
+    })
+    const built = await buildApp(config, dataDir)
+    try {
+      const result = await (await built.app.request('/health')).json() as { backends: { name: string }[] }
+      expect(result.backends.map((backend: { name: string }) => backend.name).sort())
+        .toEqual(['claude-code', 'kimi-code'])
+      const unavailable = await built.app.request('/v1/capabilities?model=prime/provider/model')
+      expect(unavailable.status).toBe(404)
+    } finally {
+      for (const shutdown of built.extras.shutdownHooks) await shutdown()
+      built.sessions.close()
+      rmSync(dataDir, { recursive: true, force: true })
+    }
+  })
+
   it('advertises profile and cost receipt versions on the cheap root endpoint', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cli-bridge-capabilities-'))
     const config = loadConfig({
