@@ -991,6 +991,46 @@ Host execution is the supported local executor. `<NAME>_EXECUTOR=host` and
 settings are refused at startup; requests containing `execution.netJail` are
 rejected. Use the maintained container platform for network confinement.
 
+## Filesystem jail on Linux
+
+`BRIDGE_JAIL_MODE=fs-jail` prefers bubblewrap when its unprivileged probe works.
+Otherwise the bridge probes the packaged Python launcher for Landlock enforcement.
+It needs `python3`, a supported architecture and ABI (see `src/jail/landlock-exec.py`);
+missing support preserves the existing startup refusal. No compiled helper or install
+step is required. macOS continues to use sandbox-exec.
+
+Both Linux backends consume the same filesystem path policy: system/toolchain and
+explicit readable paths are read-only; the workspace, jail home and explicit
+writable paths permit writes. HOME, XDG directories and TMPDIR point into the jail
+home. Landlock restrictions survive exec and are inherited by descendants.
+A failed rule or launcher exits without executing the command.
+
+| Boundary | Bubblewrap | Landlock | Residual risk / refusal |
+| --- | --- | --- | --- |
+| Path mappings | Bind source at destination | Same-path grants only | Any remapped bind is refused, including read-only auth/config snapshots; use a spec without remaps. |
+| Temporary files | Private `/tmp` mount | Private TMPDIR under jail home; shared `/tmp` has no grant | Hardcoded `/tmp` access fails unless the spec explicitly exposes that exact path. |
+| Egress state | Masks siblings with tmpfs | No broad grant covering the egress parent; only own CA files granted | Metadata remains visible; older ABIs do not mediate pathname Unix-socket connects. |
+| `/proc` and `/dev` | Private proc and device mounts | No proc grant; only null, zero, random and urandom device grants | No virtualized process view; kernel metadata operations are outside Landlock's filesystem allowlist. |
+| Process and IPC | Separate PID/IPC/UTS namespaces | Host namespaces; launcher dies when its parent exits | No PID, signal or IPC isolation. |
+| Network | Separate network namespace with relay shim | TCP connects limited to the spawn's ephemeral relay port and explicit host loopback ports; no TCP bind grants | A port rule applies to every address; UDP on older ABIs and Unix sockets are outside this boundary. Other host processes can reach the host-side listener. |
+| Write jail | Host-wide read-only mount with hidden egress state | Refused; use fs-jail | Additive grants cannot hide a subtree of a host-wide read grant. |
+
+Landlock does **not** supply relay-grade network isolation. Router/relay requests
+and host loopback access are refused unless the operator explicitly sets
+`BRIDGE_JAIL_HOST_EGRESS_ENFORCED=1` (default off). Set this only when host policy
+already enforces egress, including UDP, same-port remote addresses and access to
+other local services/sockets. This assertion is operator configuration, never a
+request field, and adds no key to served capability or policy documents.
+Trusted private host-service aliases and Pi's isolated transport still require
+bubblewrap; they do not use the Landlock transport.
+
+The integration proof is `tests/landlock-jail.integration.test.ts`. Run it with
+`CLI_BRIDGE_REQUIRE_LANDLOCK=1` to make an unavailable kernel a failure rather than
+a skip. Each confinement case also runs against an unconfined launcher and must
+fail its boundary assertion. Kernel and ABI are printed with the result. See the
+[kernel UAPI documentation](https://docs.kernel.org/userspace-api/landlock.html)
+for the rights and limits of each ABI.
+
 ## Traces
 
 Every chat request emits one OTLP span, in the shape defined by

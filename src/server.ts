@@ -1,3 +1,4 @@
+import { JAIL_HOST_EGRESS_ENV } from './config.js'
 import { DurableRunWriter } from './sessions/durable-writer.js'
 import { privateCopyRedactor } from './executors/raw-capture.js'
 import { preparePrivateMcp, type PrivateRunRedactionObserver } from './private-mcp.js'
@@ -143,6 +144,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
 
   const jailEnv = {
     BRIDGE_JAIL_MODE: config.jailMode,
+    [JAIL_HOST_EGRESS_ENV]: config.jailHostEgressEnforced ? '1' : '0',
     BRIDGE_JAIL_ROOT: config.jailRoot ?? undefined,
     BRIDGE_JAIL_RO_PATHS: config.jailReadablePaths.join(','),
     BRIDGE_JAIL_RW_PATHS: config.jailWritablePaths.join(','),

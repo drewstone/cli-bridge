@@ -44,6 +44,8 @@ export interface JailSpec {
   ironProxyBin?: string
   /** Refuse the operator's unconfined warn fallback for this request. */
   requireEnforcement?: boolean
+  /** Trusted operator assertion: external host policy enforces egress for a port-only jail. */
+  hostEgressEnforced?: boolean
   /** Captured operator fallback; absent means refuse unconfined execution. */
   fallback?: 'deny' | 'warn'
   /** Host auth paths exposed inside the jail. Populated per backend. */
@@ -97,6 +99,7 @@ export interface JailWrap {
 
 export interface JailBackend {
   readonly name: string
+  readonly networkCapability?: 'namespace' | 'tcp-port'
   /** Whether this backend can run on the current host (right OS + tools). */
   isAvailable(): boolean | Promise<boolean>
   wrap(bin: string, args: string[], spec: JailSpec): JailWrap | Promise<JailWrap>

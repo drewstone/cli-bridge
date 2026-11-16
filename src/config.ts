@@ -30,6 +30,12 @@ type NativeHarnessConfig = {
   [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string
 } & { [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number }
 
+/** Operator assertion only; never accepted from a request or exposed as a capability key. */
+export const JAIL_HOST_EGRESS_ENV = 'BRIDGE_JAIL_HOST_EGRESS_ENFORCED'
+export function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean {
+  return env[JAIL_HOST_EGRESS_ENV] === '1'
+}
+
 export interface Config extends NativeHarnessConfig {
   host: string
   port: number
@@ -84,6 +90,7 @@ export interface Config extends NativeHarnessConfig {
   /** Explicit policy when the configured OS jail is unavailable. */
   jailFallback: 'deny' | 'warn'
   /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
+  jailHostEgressEnforced?: boolean
   jailNetwork?: JailNetwork
   /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
   ironProxyBin?: string
@@ -206,6 +213,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
     jailMode: jailFloor({ ...env, BRIDGE_JAIL_MODE: parseJailMode(env.BRIDGE_JAIL_MODE) }),
+    jailHostEgressEnforced: hostEnforcesJailEgress(env),
     jailFallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     ...optional('jailNetwork', parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')),
     ...optional('ironProxyBin', env.BRIDGE_IRON_PROXY_BIN?.trim() || undefined),

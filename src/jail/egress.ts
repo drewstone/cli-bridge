@@ -25,7 +25,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { connect, createServer, type Socket } from 'node:net'
+import { connect, createServer, type Socket, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -73,6 +73,11 @@ export interface PreparedEgress {
   env: Record<string, string>
   /** argv placed before the CLI: the in-jail shim, when any egress is allowed. */
   prefix: string[]
+  /** Host TCP ports admitted by the Landlock transport; empty denies all TCP. */
+  tcpConnectPorts?: number[]
+  /** No broad filesystem grant may reveal another spawn’s egress state. */
+  hiddenParent?: string
+  readablePaths?: string[]
   cleanup(): Promise<void>
 }
 
@@ -120,13 +125,13 @@ async function egressParent(): Promise<string> {
   return EGRESS_PARENT
 }
 
-export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
+export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | 'tcp-port' = 'namespace'): Promise<PreparedEgress> {
   const network = spec.network ?? 'none'
   const bindings = spec.proxySecrets ?? []
   if (bindings.length && network !== 'relay') throw new Error('proxySecrets require execution.jail.network relay')
   // Created on every path: a write-jail cannot create the mask's mountpoint on the read-only host root.
   const mask = ['--tmpfs', await egressParent()]
-  if (network === 'none' && !spec.trustedHostServices?.length && !spec.hostLoopbackPorts?.length) return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
+  if (network === 'none' && !spec.trustedHostServices?.length && !spec.hostLoopbackPorts?.length) return { bwrapArgs: mask, env: {}, prefix: [], hiddenParent: EGRESS_PARENT, tcpConnectPorts: [], cleanup: async () => {} }
 
   const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
@@ -164,6 +169,26 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
       trustedHostServices: spec.trustedHostServices,
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
+    if (transport === 'tcp-port') {
+      // Listen outside the domain: no bind permission or shared fixed shim port is needed inside it.
+      const sockets = new Set<Socket>()
+      const listener = createServer({ allowHalfOpen: true }, (client) => {
+        const upstream = connect(socketPath)
+        for (const socket of [client, upstream]) {
+          sockets.add(socket)
+          socket.on('error', () => { client.destroy(); upstream.destroy() })
+          socket.on('close', () => sockets.delete(socket))
+        }
+        client.pipe(upstream).pipe(client)
+      })
+      await new Promise<void>((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
+      bridges.push(() => new Promise<void>((resolve) => { listener.close(() => resolve()); for (const socket of sockets) socket.destroy() }))
+      const port = (listener.address() as AddressInfo).port
+      Object.assign(env, network === 'none' ? {} : proxyEnv(port))
+      return { bwrapArgs: [], env, prefix: [], hiddenParent: EGRESS_PARENT,
+        tcpConnectPorts: [port, ...(spec.hostLoopbackPorts ?? [])],
+        readablePaths: proxy ? [join(shared, 'ca.crt'), join(shared, 'ca-bundle.crt')] : [], cleanup }
+    }
     // Each host loopback port gets its own socket; the relay still refuses every other destination.
     const pairs = [socketPath, SHIM_PORT]
     for (const port of spec.hostLoopbackPorts ?? []) {
@@ -232,8 +257,8 @@ function runSecretCommand(command: string, verb: 'mint' | 'revoke', input: objec
   })
 }
 
-function proxyEnv(): Record<string, string> {
-  const url = `http://127.0.0.1:${SHIM_PORT}`
+function proxyEnv(port: number | string = SHIM_PORT): Record<string, string> {
+  const url = `http://127.0.0.1:${port}`
   return {
     HTTPS_PROXY: url, https_proxy: url, HTTP_PROXY: url, http_proxy: url, ALL_PROXY: url, all_proxy: url,
     NO_PROXY: 'localhost,127.0.0.1,::1', no_proxy: 'localhost,127.0.0.1,::1',
