@@ -8,7 +8,6 @@
  */
 
 import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailNetwork, parseJailPathList, parseRelayAllow } from './jail/resolve-spec.js'
-import type { JailNetwork } from './jail/egress.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 
@@ -39,6 +38,8 @@ export function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean {
 /** Linux backend selection is operator-owned; bubblewrap remains the default. */
 export const JAIL_BACKEND_ENV = 'BRIDGE_JAIL_BACKEND'
 export type LinuxJailBackend = 'bwrap' | 'landlock'
+/** Public operator network policy; execution code re-exports this single definition. */
+export type JailNetwork = 'none' | 'router' | 'relay'
 export function configuredJailBackend(env: NodeJS.ProcessEnv = process.env): LinuxJailBackend {
   const value = env[JAIL_BACKEND_ENV]
   if (value === undefined || value === '' || value === 'bwrap') return 'bwrap'

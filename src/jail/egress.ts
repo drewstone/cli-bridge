@@ -33,7 +33,8 @@ import type { ProxySecretBinding } from '@tangle-network/agent-interface'
 import { SHIM_PORT, adoptTcpHostServices, startEgressRelay, type EgressRelay } from './egress-relay.js'
 import type { JailSpec } from './types.js'
 
-export type JailNetwork = 'none' | 'router' | 'relay'
+import type { JailNetwork } from '../config.js'
+export type { JailNetwork } from '../config.js'
 /** Openness order; an operator floor caps a request at its own rank. */
 export const JAIL_NETWORK_RANK: Record<JailNetwork, number> = { none: 0, router: 1, relay: 2 }
 /** The Tangle Router: the only origin a `router` spawn reaches. */
