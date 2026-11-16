@@ -336,9 +336,23 @@ if(process.argv.includes('--version')){console.log('fixture 1.0.0');process.exit
       await rename(readonly, original); await symlink(outside, readonly)
       const result = await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] }))
       expect(result.code, result.stdout + result.stderr).toBe(126)
-      expect(result.stderr).toContain('path identity changed')
+      expect(result.stderr).toMatch(/path identity changed|Too many levels of symbolic links/)
       expect(result.stdout).toBe('')
     } finally { await rm(readonly, { force: true }); await rename(original, readonly); await wrapped.cleanup?.() }
+  })
+
+  it('refuses a parent symlink even when the leaf identity still matches', async () => {
+    const directory = join(base, 'grant-parent'), original = directory + '.original', alternate = join(base, 'grant-alternate')
+    await mkdir(directory); await mkdir(alternate)
+    const file = join(directory, 'leaf'); await writeFile(file, 'allowed')
+    await link(file, join(alternate, 'leaf'))
+    const wrapped = await jail.wrap(process.execPath, ['-e', "console.log('must-not-execute-through-parent-alias')"], spec({ extraReadablePaths: [file] }))
+    try {
+      await rename(directory, original); await symlink(alternate, directory)
+      const result = await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] }))
+      expect(result.code, result.stdout + result.stderr).toBe(126)
+      expect(result.stderr).toContain('Too many levels of symbolic links'); expect(result.stdout).toBe('')
+    } finally { await rm(directory, { force: true }); await rename(original, directory); await wrapped.cleanup?.() }
   })
 
   it('starts an unprivileged real payload with no held Linux capabilities', async () => {

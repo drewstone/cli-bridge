@@ -1029,7 +1029,8 @@ Every Landlock request, including `network: none`, is refused with HTTP 501 unle
 `BRIDGE_JAIL_HOST_EGRESS_ENFORCED=1` (default off). This is an operator assertion
 that external host policy already supplies the missing isolation. Host policy must
 deny all network traffic from jailed commands except ordinary TCP connections to
-the permitted loopback relay ports; `none` admits no ports. It must also prevent
+the permitted loopback relay ports; `none` itself grants no ports, while trusted
+host-service or loopback grants admit only their declared ports. It must also prevent
 access to other host services and sockets. The bridge, its relays and the payload
 share a user and network namespace, so a user-only firewall rule cannot distinguish
 them. Landlock is not a replacement for network or mount namespaces. This assertion

@@ -38,6 +38,16 @@ class CapabilityData(ctypes.Structure):
                 ('inheritable', ctypes.c_uint32)]
 
 
+class OpenHow(ctypes.Structure):
+    _fields_ = [('flags', ctypes.c_uint64), ('mode', ctypes.c_uint64), ('resolve', ctypes.c_uint64)]
+
+
+def open_path(libc, path):
+    # openat2 is syscall 437 on every admitted architecture; reject all symlink components atomically.
+    how = OpenHow(os.O_PATH | os.O_CLOEXEC, 0, 0x04)  # RESOLVE_NO_SYMLINKS
+    return check(libc.syscall(437, -100, path.encode(), ctypes.byref(how), ctypes.sizeof(how)))
+
+
 def restrict(policy):
     if platform.machine() not in ('x86_64', 'aarch64', 'riscv64'):
         raise RuntimeError('unknown architecture syscall table')
@@ -49,6 +59,7 @@ def restrict(policy):
     check(libc.capget(ctypes.byref(header), ctypes.byref(capabilities)))
     if os.geteuid() == 0 or any(c.effective or c.permitted or c.inheritable for c in capabilities):
         raise RuntimeError('Landlock requires a non-root user with no Linux capabilities')
+    os.close(open_path(libc, '/'))  # Availability includes the path-resolution primitive.
     abi = check(libc.syscall(444, 0, 0, 1))
     # Refuse future ABIs rather than silently omitting new filesystem rights.
     if not 4 <= abi <= 8:
@@ -65,7 +76,7 @@ def restrict(policy):
     ruleset = check(libc.syscall(444, ctypes.byref(attrs), (24 if abi >= 6 else 16), 0))
     for entry in policy.get('paths', []):
         try:
-            fd = os.open(entry['path'], os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
+            fd = open_path(libc, entry['path'])
         except FileNotFoundError:
             if entry.get('optional', False):
                 continue
