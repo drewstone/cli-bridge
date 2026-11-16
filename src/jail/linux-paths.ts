@@ -7,7 +7,8 @@ import { copyAuthIntoJail, gitConfigSources, removeAuthCopies, removeStaleAuthCo
 import { canonicalizeJailPath, ignoreJailRoot, jailEnv, prepareJailHome, resolveJailRoot, type JailSpec } from './types.js'
 
 export interface LinuxPathRule { source: string; destination: string; writable: boolean; optional?: boolean }
-const SYSTEM_RO_PATHS = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32', '/etc', '/opt']
+// Nix executables refer to loaders and libraries in sibling immutable store entries.
+const SYSTEM_RO_PATHS = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32', '/etc', '/opt', '/nix/store']
 
 export async function prepareLinuxPaths(bin: string, spec: JailSpec) {
   const config = await gitConfigSources(spec.projectDir, spec.extraWritablePaths)
