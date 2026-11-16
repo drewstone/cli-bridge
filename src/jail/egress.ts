@@ -1,8 +1,8 @@
 /**
- * Per-spawn egress for the Linux jail. Every jailed spawn runs in a fresh
- * network namespace; its policy decides what, if anything, leaves it:
+ * Per-spawn egress for the Linux jail. Namespace backends isolate routes;
+ * the opt-in port-only backend requires external host enforcement for every policy:
  *
- *   none    no route at all. Replays and evals: a candidate cannot fetch the
+ *   none    no admitted route (host enforcement is required for port-only jails). Replays and evals: a candidate cannot fetch the
  *           published fix.
  *   router  model calls only: the egress relay admits just the declared
  *           router hosts.
@@ -73,7 +73,7 @@ export interface PreparedEgress {
   env: Record<string, string>
   /** argv placed before the CLI: the in-jail shim, when any egress is allowed. */
   prefix: string[]
-  /** Host TCP ports admitted by the Landlock transport; empty denies all TCP. */
+  /** Host TCP ports admitted by the Landlock transport; empty denies plain TCP. */
   tcpConnectPorts?: number[]
   /** No broad filesystem grant may reveal another spawn’s egress state. */
   hiddenParent?: string

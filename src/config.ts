@@ -36,6 +36,16 @@ export function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean {
   return env[JAIL_HOST_EGRESS_ENV] === '1'
 }
 
+/** Linux backend selection is operator-owned; bubblewrap remains the default. */
+export const JAIL_BACKEND_ENV = 'BRIDGE_JAIL_BACKEND'
+export type LinuxJailBackend = 'bwrap' | 'landlock'
+export function configuredJailBackend(env: NodeJS.ProcessEnv = process.env): LinuxJailBackend {
+  const value = env[JAIL_BACKEND_ENV]
+  if (value === undefined || value === '' || value === 'bwrap') return 'bwrap'
+  if (value === 'landlock') return value
+  throw new Error(`invalid ${JAIL_BACKEND_ENV}: expected bwrap|landlock`)
+}
+
 export interface Config extends NativeHarnessConfig {
   host: string
   port: number
@@ -91,6 +101,8 @@ export interface Config extends NativeHarnessConfig {
   jailFallback: 'deny' | 'warn'
   /** Trusted assertion that host policy supplies the Landlock transport’s missing egress isolation. */
   jailHostEgressEnforced?: boolean
+  /** Captured operator Linux backend; never accepted from request JSON. */
+  jailBackend?: LinuxJailBackend
   /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
   jailNetwork?: JailNetwork
   /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
@@ -215,6 +227,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
     jailMode: jailFloor({ ...env, BRIDGE_JAIL_MODE: parseJailMode(env.BRIDGE_JAIL_MODE) }),
     jailHostEgressEnforced: hostEnforcesJailEgress(env),
+    jailBackend: configuredJailBackend(env),
     jailFallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     ...optional('jailNetwork', parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')),
     ...optional('ironProxyBin', env.BRIDGE_IRON_PROXY_BIN?.trim() || undefined),

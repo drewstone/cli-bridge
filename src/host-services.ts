@@ -22,7 +22,7 @@ function refused(message: string): never {
 async function relaySpec(request: ChatRequest, backend: string): Promise<JailSpec | undefined> {
   const spec = request.jailSpec
   if (!spec) return undefined
-  const jail = selectJailBackend()
+  const jail = selectJailBackend(process.platform, spec.backend)
   if (jail.name === 'seatbelt') return undefined // Preserve the current Mac native URLs; no shim listener is installed there.
   if (!['claude', 'claude-code', 'codex', 'opencode'].includes(backend) || request.execution?.kind === 'sandbox') {
     return refused('This backend cannot consume trusted private host-service routing')
@@ -41,7 +41,7 @@ async function bindClaim(
 ): Promise<() => void> {
   const identity = request.runtime_attachments!
   if (privateBindings.get(identity)?.has(alias)) return refused('A private MCP alias already has a trusted host-service binding')
-  const claim = selectJailBackend().networkCapability === 'tcp-port'
+  const claim = selectJailBackend(process.platform, spec.backend).networkCapability === 'tcp-port'
     ? await claimTcpHostService(owner, headers) : claimTrustedHostService(owner, headers)
   const bindings = privateBindings.get(identity) ?? new Map<string, Binding>()
   if (bindings.has(alias)) { claim.revoke(); return refused('A private MCP alias already has a trusted host-service binding') }
@@ -176,7 +176,7 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
       // A sandbox request carries no jailSpec unless the sandbox backend runs it, whose loopback is its own.
       const authored = Object.entries(request.agent_profile?.mcp ?? {}).find(([, server]) => URL.canParse(server.url ?? '')
         && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(server.url!).hostname))?.[0]
-      const jail = authored && request.jailSpec && backend !== 'sandbox' ? selectJailBackend() : undefined
+      const jail = authored && request.jailSpec && backend !== 'sandbox' ? selectJailBackend(process.platform, request.jailSpec.backend) : undefined
       if (jail?.networkCapability && await jail.isAvailable())
         return refused(`MCP server ${JSON.stringify(authored)} is on host loopback; a jailed seat reaches it only as a runtime attachment to a live host-registered private endpoint`)
       const bound = request.runtime_attachments && privateBindings.get(request.runtime_attachments)

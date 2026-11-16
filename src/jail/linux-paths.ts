@@ -8,7 +8,7 @@ import { canonicalizeJailPath, ignoreJailRoot, jailEnv, prepareJailHome, resolve
 
 export interface LinuxPathRule { source: string; destination: string; writable: boolean; optional?: boolean }
 // Nix executables refer to loaders and libraries in sibling immutable store entries.
-const SYSTEM_RO_PATHS = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32', '/etc', '/opt', '/nix/store']
+const SYSTEM_RO_PATHS = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32', '/etc', '/opt']
 
 export async function prepareLinuxPaths(bin: string, spec: JailSpec) {
   const config = await gitConfigSources(spec.projectDir, spec.extraWritablePaths)
@@ -52,7 +52,9 @@ export async function prepareLinuxPaths(bin: string, spec: JailSpec) {
     const paths: LinuxPathRule[] = []
     const add = (source: string, writable = false, destination = source, optional = false) => paths.push({ source, destination, writable, optional })
     if (spec.readConfine) {
-      for (const path of [...SYSTEM_RO_PATHS, ...toolchainReadPaths(bin, spec.projectDir), ...hooks!.paths]) add(path, false, path, true)
+      const tools = toolchainReadPaths(bin, spec.projectDir)
+      if (tools.some((path) => path.startsWith('/nix/store/'))) tools.push('/nix/store')
+      for (const path of [...SYSTEM_RO_PATHS, ...tools, ...hooks!.paths]) add(path, false, path, true)
       add(spec.projectDir, true)
     } else {
       add('/')
