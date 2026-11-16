@@ -31,8 +31,7 @@ export class LinuxLandlockJail implements JailBackend {
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     if (!spec.readConfine) refuse('write-jail: a host-wide read grant cannot hide sibling egress state; use fs-jail')
-    if ((spec.network !== undefined && spec.network !== 'none' || spec.trustedHostServices?.length || spec.hostLoopbackPorts?.length)
-      && !spec.hostEgressEnforced) refuse(`relay-grade isolation without ${JAIL_HOST_EGRESS_ENV}=1`)
+    if (!spec.hostEgressEnforced) refuse(`relay-grade isolation without ${JAIL_HOST_EGRESS_ENV}=1`)
     // Trusted service aliases currently require the namespace shim’s fixed listener.
     if (spec.trustedHostServices?.length) refuse('trusted host-service aliases: they require the namespace transport')
     const python = whichPath('python3')

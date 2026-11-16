@@ -42,7 +42,7 @@ async function run(code: string, spec: JailSpec, unconfined = false) {
 }
 
 function spec(extra: Partial<JailSpec> = {}): JailSpec {
-  return { root, projectDir: workspace, readConfine: true, network: 'none', extraReadablePaths: [readonly], ...extra }
+  return { root, projectDir: workspace, readConfine: true, hostEgressEnforced: true, network: 'none', extraReadablePaths: [readonly], ...extra }
 }
 
 async function discriminate(name: string, code: string, policy = spec()) {
@@ -119,7 +119,7 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
   })
 
-  function config(allow = false, network: 'none' | 'relay' = 'none') {
+  function config(allow = true, network: 'none' | 'relay' = 'none') {
     return { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(base, `state-${allow}-${network}`), BRIDGE_BACKENDS: 'codex',
       CODEX_BIN: backendBin, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_JAIL_FALLBACK: 'deny', BRIDGE_JAIL_NETWORK: network,
       [JAIL_HOST_EGRESS_ENV]: allow ? '1' : '0' }), port: 0 }
@@ -143,6 +143,19 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
       await expect(startServer({ config: config(), cwd: workspace, quiet: true, handleSignals: false }))
         .rejects.toThrow("CLI Bridge jail floor 'fs-jail' is unavailable. Enable a supported jail backend, or unset the jail floor.")
     } finally { process.env.PATH = forcePath }
+  }, 60_000)
+
+  it('requires the operator egress assertion for network none before a real backend turn', async () => {
+    for (const allow of [false, true]) {
+      const server = await startServer({ config: config(allow), cwd: workspace, quiet: true, handleSignals: false })
+      try {
+        const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ stream: false, model: 'codex/confinement-proof', cwd: workspace, messages: [{ role: 'user', content: 'Reply' }] }) })
+        const body = await response.text()
+        if (allow) { expect(response.status, body).toBe(200); expect(body).toContain('confined-turn-ok') }
+        else { expect(response.status, body).toBe(501); expect(body).toContain(`relay-grade isolation without ${JAIL_HOST_EGRESS_ENV}=1`); expect(body).not.toContain('confined-turn-ok') }
+      } finally { await server.close() }
+    }
   }, 60_000)
 
   it('g: relay-required HTTP turn is refused unless the operator asserts host egress enforcement', async () => {
