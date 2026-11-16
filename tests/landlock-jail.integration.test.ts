@@ -1,6 +1,6 @@
 /** Real kernel confinement, including deliberately unconfined negative controls. */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { link, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer, type AddressInfo } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
 import { watch } from 'node:fs'
@@ -330,15 +330,20 @@ if(process.argv.includes('--version')){console.log('fixture 1.0.0');process.exit
   })
 
   it('refuses a changed grant identity between preparation and the real launcher', async () => {
-    const original = readonly + '.original'
-    const wrapped = await jail.wrap(process.execPath, ['-e', `console.log(require('node:fs').readFileSync(${JSON.stringify(outside)},'utf8'))`], spec())
+    const file = join(base, 'identity-readable'), original = file + '.original'
+    await writeFile(file, 'allowed')
+    const wrapped = await jail.wrap(process.execPath, ['-e', `console.log(require('node:fs').readFileSync(${JSON.stringify(outside)},'utf8'))`], spec({ extraReadablePaths: [file] }))
+    let moved = false
     try {
-      await rename(readonly, original); await symlink(outside, readonly)
+      await rename(file, original); moved = true; await symlink(outside, file)
       const result = await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] }))
       expect(result.code, result.stdout + result.stderr).toBe(126)
       expect(result.stderr).toMatch(/path identity changed|Too many levels of symbolic links/)
       expect(result.stdout).toBe('')
-    } finally { await rm(readonly, { force: true }); await rename(original, readonly); await wrapped.cleanup?.() }
+    } finally {
+      if (moved) { await rm(file, { force: true }); await rename(original, file) }
+      await wrapped.cleanup?.()
+    }
   })
 
   it('refuses a parent symlink even when the leaf identity still matches', async () => {
@@ -368,8 +373,10 @@ print('unprivileged')`
   })
 
   it('refuses remapped binds and write-jail rather than widening the boundary', async () => {
+    const source = join(base, 'remapped-auth-source'); await writeFile(source, 'auth-fixture')
+    expect(await readFile(source, 'utf8')).toBe('auth-fixture')
     await expect(jail.wrap('/bin/true', [], { ...spec(), readConfine: false })).rejects.toThrow('write-jail')
-    await expect(jail.wrap('/bin/true', [], spec({ authSources: [{ source: readonly, jailRel: '.auth', mode: 'read-only' }] }))).rejects.toThrow('remapped bind')
+    await expect(jail.wrap('/bin/true', [], spec({ authSources: [{ source, jailRel: '.auth', mode: 'read-only' }] }))).rejects.toThrow('remapped bind')
   })
 })
 
