@@ -25,6 +25,18 @@ export const localHarnesses = [
   ['pi', 'pi', 'pi', ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null],
 ] as const
 
+/**
+ * Local drivers registered by the server. This is routing metadata, not proof
+ * of installation, authentication, model availability or profile capabilities.
+ * Consumers must still use the selected driver's admission contract.
+ */
+export const localBackends = [
+  ...localHarnesses.map(([name, harness]) => ({ name, harness, kind: 'native' as const })),
+  { name: 'hermes', harness: 'hermes', kind: 'acp' },
+  { name: 'openclaw', harness: 'openclaw', kind: 'acp' },
+  { name: 'prime', harness: 'prime', kind: 'prime' },
+] as const
+
 type NativeHarnessConfig = {
   [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string
 } & { [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number }
@@ -184,7 +196,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     (env.BRIDGE_BACKENDS ?? 'claude,kimi,gemini,sandbox')
       .split(',')
       .map(s => s.trim())
-      .filter(Boolean),
+      .filter(Boolean)
+      .map(name => localBackends.find(backend => backend.harness === name)?.name ?? name),
   )
 
   assertListenerConfig({ host, port, bearer })

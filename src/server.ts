@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { configuredJailBackend, JAIL_BACKEND_ENV, JAIL_HOST_EGRESS_ENV, anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
+import { configuredJailBackend, JAIL_BACKEND_ENV, JAIL_HOST_EGRESS_ENV, anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localBackends, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { nativeRedactionHistorySchema } from './sessions/legacy-metadata.js'
 import { BackendRegistry } from './backends/registry.js'
@@ -154,12 +154,23 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     ...(config.proxySecretCommand ? { BRIDGE_PROXY_SECRET_COMMAND: config.proxySecretCommand } : {}),
     ...(config.jailRelayAllow?.length ? { BRIDGE_JAIL_RELAY_ALLOW: config.jailRelayAllow.join(',') } : {}),
   }
-  // Register enabled native harnesses before remote execution.
-  for (const [name, harness] of localHarnesses) {
+  // The public routing metadata and actual registration share one owner.
+  for (const { name, kind } of localBackends) {
     if (!config.backends.has(name)) continue
-    const bin = config[`${name}Bin`]
-    registry.register(createLocalBackend(config, name, {
-      stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}) }))
+    if (kind === 'native') {
+      registry.register(createLocalBackend(config, name, {
+        stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}) }))
+    } else if (kind === 'acp') {
+      registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
+    } else if (kind === 'prime') {
+      registry.register(new PrimeBackend({
+        bin: config.primeBin,
+        timeoutMs: config.primeTimeoutMs,
+        stateDir: join(config.dataDir, name),
+        ...(config.primeModelsJson ? { modelsJsonPath: config.primeModelsJson } : {}),
+        ...(config.primePersistentAgentDir ? { persistentAgentDir: config.primePersistentAgentDir } : {}),
+      }))
+    }
   }
   if (config.backends.has('claudish')) {
     if (!config.claudishUrl) {
@@ -169,22 +180,6 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
       claudishUrl: config.claudishUrl,
-    }))
-  }
-  // ACP-protocol agents (driven via `<bin> acp`): hermes, openclaw. Registered when
-  // BRIDGE_BACKENDS lists them; health reports `unavailable` if the binary is absent.
-  for (const name of ['hermes', 'openclaw'] as const) {
-    if (config.backends.has(name)) registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
-  }
-  // prime-agent (the pi fork) — host-spawned `--mode rpc` with a bridge-owned
-  // isolated HOME per run; see PrimeBackend for the daemon-avoidance contract.
-  if (config.backends.has('prime')) {
-    registry.register(new PrimeBackend({
-      bin: config.primeBin,
-      timeoutMs: config.primeTimeoutMs,
-      stateDir: join(config.dataDir, 'prime'),
-      ...(config.primeModelsJson ? { modelsJsonPath: config.primeModelsJson } : {}),
-      ...(config.primePersistentAgentDir ? { persistentAgentDir: config.primePersistentAgentDir } : {}),
     }))
   }
   if (config.backends.has('sandbox')) {
@@ -391,7 +386,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
 }
 
 export type { BridgeServer, StartServerOptions } from './server-options.js'
-export { loadConfig }
+export { loadConfig, localBackends }
 export { detectLocalSeats } from './local-seats.js'
 export { listLocalModels } from './local-models.js'
 

@@ -89,6 +89,15 @@ For native model discovery without starting an HTTP listener or creating executi
 entries and authentication facts as `/v1/models`. It reads local metadata only and rejects on cancellation;
 it does not validate an execution jail or start a model turn.
 
+`localBackends` from the package root is the server-owned list of local driver
+registrations, with `name` (the `BRIDGE_BACKENDS` key), canonical `harness`, and
+driver `kind`. `loadConfig` accepts either the key or the canonical harness name.
+Use this metadata to route an explicit harness even when it publishes no model
+catalog. It does not establish that a binary, login, model, or requested profile
+feature is available; backend health, capability negotiation and native admission
+remain authoritative. `BRIDGE_SUBSCRIPTIONS_ONLY=1` continues to refuse routes
+without verified subscription admission.
+
 ## Local checks
 
 Local Beelink gate (set `TOUCHED_INTEGRATION_TEST` to the affected integration test file; the gate installs from the frozen pnpm lockfile): `beelink-gate auto https://github.com/drewstone/cli-bridge.git "$(git rev-parse HEAD)" -- sh -c 'pnpm typecheck && pnpm exec vitest run "$1"' _ "${TOUCHED_INTEGRATION_TEST:?set touched integration test path}"`. Live inference still runs locally through `pnpm test:local-inference` with its explicit model and filesystem-jail prerequisites.
