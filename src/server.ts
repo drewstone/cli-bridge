@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { JAIL_BACKEND_ENV, JAIL_HOST_EGRESS_ENV, anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
+import { configuredJailBackend, JAIL_BACKEND_ENV, JAIL_HOST_EGRESS_ENV, anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { nativeRedactionHistorySchema } from './sessions/legacy-metadata.js'
 import { BackendRegistry } from './backends/registry.js'
@@ -143,7 +143,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
 
   const jailEnv = {
     BRIDGE_JAIL_MODE: config.jailMode,
-    [JAIL_BACKEND_ENV]: config.jailBackend ?? 'bwrap',
+    [JAIL_BACKEND_ENV]: config.jailBackend ?? configuredJailBackend(),
     [JAIL_HOST_EGRESS_ENV]: config.jailHostEgressEnforced ? '1' : '0',
     BRIDGE_JAIL_ROOT: config.jailRoot ?? undefined,
     BRIDGE_JAIL_RO_PATHS: config.jailReadablePaths.join(','),

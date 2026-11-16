@@ -68,7 +68,7 @@ export class LinuxLandlockJail implements JailBackend {
       for (const path of egress.readablePaths ?? []) paths.push({ path, writable: false, optional: false })
       const pinned = paths.flatMap((entry) => {
         try {
-          const path = canonicalizeJailPath(entry.path)
+          const path = entry.writable ? resolve(entry.path) : canonicalizeJailPath(entry.path)
           const identity = statSync(path, { bigint: true })
           return [{ ...entry, path, dev: String(identity.dev), ino: String(identity.ino) }]
         } catch (error) {
