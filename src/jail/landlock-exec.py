@@ -29,11 +29,26 @@ def check(result):
     return result
 
 
+class CapabilityHeader(ctypes.Structure):
+    _fields_ = [('version', ctypes.c_uint32), ('pid', ctypes.c_int)]
+
+
+class CapabilityData(ctypes.Structure):
+    _fields_ = [('effective', ctypes.c_uint32), ('permitted', ctypes.c_uint32),
+                ('inheritable', ctypes.c_uint32)]
+
+
 def restrict(policy):
     if platform.machine() not in ('x86_64', 'aarch64', 'riscv64'):
         raise RuntimeError('unknown architecture syscall table')
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
+    # ABIs accepted here have no capability mediation. Refuse privileged launchers.
+    header = CapabilityHeader(0x20080522, 0)  # Linux capability ABI v3 (two u32 words).
+    capabilities = (CapabilityData * 2)()
+    check(libc.capget(ctypes.byref(header), ctypes.byref(capabilities)))
+    if os.geteuid() == 0 or any(c.effective or c.permitted or c.inheritable for c in capabilities):
+        raise RuntimeError('Landlock requires a non-root user with no Linux capabilities')
     abi = check(libc.syscall(444, 0, 0, 1))
     # Refuse future ABIs rather than silently omitting new filesystem rights.
     if not 4 <= abi <= 8:
@@ -50,14 +65,18 @@ def restrict(policy):
     ruleset = check(libc.syscall(444, ctypes.byref(attrs), (24 if abi >= 6 else 16), 0))
     for entry in policy.get('paths', []):
         try:
-            fd = os.open(entry['path'], os.O_PATH | os.O_CLOEXEC)
+            fd = os.open(entry['path'], os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
         except FileNotFoundError:
             if entry.get('optional', False):
                 continue
             raise
         try:
+            identity = os.fstat(fd)
+            if (stat.S_ISLNK(identity.st_mode) or str(identity.st_dev) != entry['dev']
+                    or str(identity.st_ino) != entry['ino']):
+                raise RuntimeError('path identity changed before enforcement')
             access = fs if entry['writable'] else 13  # EXECUTE | READ_FILE | READ_DIR
-            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            if not stat.S_ISDIR(identity.st_mode):
                 access &= 1 | 2 | 4 | (1 << 14) | (1 << 15)
             rule = PathRule(access, fd)
             check(libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0))
@@ -88,7 +107,18 @@ try:
         os.kill(policy['parent'], 0)  # The Bridge must still exist, including under a scope wrapper.
         restrict(policy)
         os.environ.update(policy['env'])
+        # The outer scope may need its bus transport; the confined payload must not inherit it.
+        socket_env = {'XDG_RUNTIME_DIR', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'GPG_AGENT_INFO',
+                      'GNOME_KEYRING_CONTROL', 'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY',
+                      'ICEAUTHORITY', 'SESSION_MANAGER', 'PULSE_SERVER', 'PIPEWIRE_REMOTE',
+                      'SWAYSOCK', 'I3SOCK', 'TMUX', 'STY', 'DOCKER_HOST', 'CONTAINER_HOST'}
+        for key in list(os.environ):
+            if key.startswith('DBUS_') or key.endswith(('_SOCK', '_SOCKET')) or key in socket_env:
+                os.environ.pop(key, None)
         os.chdir(policy['cwd'])
+        for name in ('SIGPIPE', 'SIGXFSZ'):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), signal.SIG_DFL)
         os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
 except Exception as error:
     print('landlock-exec: refused: ' + str(error), file=sys.stderr)

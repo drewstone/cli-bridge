@@ -41,7 +41,7 @@ export async function applyJail(
   bin: string,
   args: string[],
   opts: SpawnOpts,
-  backend: JailBackend = selectJailBackend(),
+  backend: JailBackend = selectJailBackend(process.platform, opts.jail?.backend),
 ): Promise<JailedCommand> {
   if (!opts.jail) return { bin, args, env: opts.env }
 

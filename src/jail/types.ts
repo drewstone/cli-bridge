@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { ProxySecretBinding } from '@tangle-network/agent-interface'
 import type { JailNetwork } from './egress.js'
+import type { LinuxJailBackend } from '../config.js'
 import type { TrustedHostServiceRegistration } from './egress-relay.js'
 
 export interface JailSpec {
@@ -46,6 +47,8 @@ export interface JailSpec {
   requireEnforcement?: boolean
   /** Trusted operator assertion: external host policy enforces egress for a port-only jail. */
   hostEgressEnforced?: boolean
+  /** Operator backend captured with this spec; request JSON cannot choose it. */
+  backend?: LinuxJailBackend
   /** Captured operator fallback; absent means refuse unconfined execution. */
   fallback?: 'deny' | 'warn'
   /** Host auth paths exposed inside the jail. Populated per backend. */

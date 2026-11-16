@@ -1,3 +1,4 @@
+import { configuredJailBackend, type LinuxJailBackend } from '../config.js'
 import { LinuxLandlockJail } from './linux-landlock.js'
 import { LinuxBwrapJail } from './linux-bwrap.js'
 import { MacosSeatbeltJail } from './macos-seatbelt.js'
@@ -84,11 +85,11 @@ export function registerJailArgumentRewrite(
   ]
 }
 
-export function selectJailBackend(platform: NodeJS.Platform = process.platform): JailBackend {
-  if (platform === 'linux') {
-    const bwrap = new LinuxBwrapJail()
-    return bwrap.isAvailable() ? bwrap : new LinuxLandlockJail()
-  }
+export function selectJailBackend(
+  platform: NodeJS.Platform = process.platform, choice: LinuxJailBackend = configuredJailBackend(),
+): JailBackend {
+  if (choice === 'landlock') return new LinuxLandlockJail()
+  if (platform === 'linux') return new LinuxBwrapJail()
   if (platform === 'darwin') return new MacosSeatbeltJail()
   return noopJail
 }

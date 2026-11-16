@@ -1,6 +1,6 @@
 /** Operator jail floor wins over a weaker request. `off` returns null. The writable root stays inside `<cwd>/.agent-home`. */
 
-import { hostEnforcesJailEgress } from '../config.js'
+import { configuredJailBackend, hostEnforcesJailEgress } from '../config.js'
 import { homedir } from 'node:os'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { canonicalizeJailPath, resolveJailRoot } from './types.js'
@@ -80,6 +80,7 @@ export function resolveJailSpec(input: ResolveJailSpecInput): JailSpec | null {
     root,
     projectDir,
     hostEgressEnforced: hostEnforcesJailEgress(env),
+    backend: configuredJailBackend(env),
     fallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     ...egressFields(jailNetwork(input.execNetwork, env), env),
     ...(mode === 'fs-jail' ? { readConfine: true } : {}),

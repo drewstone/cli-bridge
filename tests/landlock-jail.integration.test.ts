@@ -67,13 +67,14 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
     await writeFile(join(tools, 'bwrap'), '#!/bin/sh\nexit 1\n', { mode: 0o700 })
     forcePath = `${tools}${delimiter}${savedEnv.PATH}`
     process.env.PATH = forcePath; process.env.HOME = home
+    process.env.BRIDGE_JAIL_BACKEND = 'landlock'
     process.env.GIT_CONFIG_GLOBAL = join(home, 'absent-config')
     delete process.env.XDG_CONFIG_HOME; delete process.env.GIT_PRIVACY_DENYLIST
     standin = join(base, 'unconfined.py')
     await writeFile(standin, "import json,os,sys\nwith open(sys.argv[1]) as f: p=json.load(f)\nos.environ.update(p['env'])\nos.chdir(p['cwd'])\nos.execvpe(sys.argv[2],sys.argv[2:],os.environ)\n")
     backendBin = join(workspace, 'codex.cjs')
     // Same native event protocol fixture as the existing jailed private-endpoint integration.
-    await writeFile(backendBin, `#!${process.execPath}\nif(process.argv.includes('--version')) { console.log('fixture 1.0.0'); process.exit(0) }\nfor(const e of [{type:'thread.started',thread_id:'00000000-0000-4000-8000-000000000043'},{type:'item.completed',item:{type:'agent_message',text:'confined-turn-ok'}},{type:'turn.completed',usage:{input_tokens:0,output_tokens:0}}]) console.log(JSON.stringify(e))\n`, { mode: 0o700 })
+    await writeFile(backendBin, `#!${process.execPath}\nif(process.argv.includes('--version')) { console.log('fixture 1.0.0'); process.exit(0) }\nrequire('node:assert/strict').throws(()=>require('node:fs').readFileSync(${JSON.stringify(outside)}),{code:'EACCES'});\nfor(const e of [{type:'thread.started',thread_id:'00000000-0000-4000-8000-000000000043'},{type:'item.completed',item:{type:'agent_message',text:'confined-turn-ok'}},{type:'turn.completed',usage:{input_tokens:0,output_tokens:0}}]) console.log(JSON.stringify(e))\n`, { mode: 0o700 })
     expect(selectJailBackend().name).toBe('landlock')
     console.log(`kernel=${spawnSync('uname', ['-r'], { encoding: 'utf8' }).stdout.trim()} Landlock ABI=${probe.stdout.trim()}`)
   })
@@ -119,10 +120,10 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
   })
 
-  function config(allow = true, network: 'none' | 'relay' = 'none') {
+  function config(allow = true, network: 'none' | 'relay' = 'none', selected = true) {
     return { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(base, `state-${allow}-${network}`), BRIDGE_BACKENDS: 'codex',
       CODEX_BIN: backendBin, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'fs-jail', BRIDGE_JAIL_FALLBACK: 'deny', BRIDGE_JAIL_NETWORK: network,
-      [JAIL_HOST_EGRESS_ENV]: allow ? '1' : '0' }), port: 0 }
+      ...(selected ? { BRIDGE_JAIL_BACKEND: 'landlock' } : {}), [JAIL_HOST_EGRESS_ENV]: allow ? '1' : '0' }), port: 0 }
   }
 
   it('e/f: fs-jail server starts without bubblewrap and a real backend turn completes', async () => {
@@ -144,6 +145,54 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
         .rejects.toThrow("CLI Bridge jail floor 'fs-jail' is unavailable. Enable a supported jail backend, or unset the jail floor.")
     } finally { process.env.PATH = forcePath }
   }, 60_000)
+
+  it('captures a custom-env Landlock selection independently of the daemon environment', async () => {
+    process.env.BRIDGE_JAIL_BACKEND = 'bwrap'
+    let server: Awaited<ReturnType<typeof startServer>> | undefined
+    try {
+      server = await startServer({ config: config(true), cwd: workspace, quiet: true, handleSignals: false })
+      const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ stream: false, model: 'codex/confinement-proof', cwd: workspace, messages: [{ role: 'user', content: 'Reply' }] }) })
+      const body = await response.text()
+      // The native fixture also asserts a real file outside the grants gets EACCES.
+      expect(response.status, body).toBe(200); expect(body).toContain('confined-turn-ok')
+    } finally { await server?.close(); process.env.BRIDGE_JAIL_BACKEND = 'landlock' }
+  }, 60_000)
+
+  it('refuses a custom-env server with no backend choice when bubblewrap is unavailable', async () => {
+    let server: Awaited<ReturnType<typeof startServer>> | undefined, error: unknown
+    try {
+      try { server = await startServer({ config: config(true, 'none', false), cwd: workspace, quiet: true, handleSignals: false }) }
+      catch (caught) { error = caught }
+      expect(error, 'no operator choice must preserve the unavailable bubblewrap refusal').toBeDefined()
+      expect(String(error)).toContain("CLI Bridge jail floor 'fs-jail' is unavailable")
+    } finally { await server?.close() }
+  }, 60_000)
+
+  it('requires an explicit Landlock selection when bubblewrap cannot spawn', async () => {
+    delete process.env.BRIDGE_JAIL_BACKEND
+    let result: Awaited<ReturnType<typeof hostSpawner>> | undefined, error: unknown
+    try {
+      try { result = await hostSpawner(process.execPath, ['-e', "console.log('unexpected-automatic-fallback')"], { cwd: workspace, jail: spec() }) }
+      catch (caught) { error = caught }
+      if (result) { await output(result.child); await result.terminate?.(); result.release() }
+      expect(error, 'unselected Landlock must never replace unavailable bubblewrap').toBeDefined()
+      expect(selectJailBackend().name).toBe('bwrap')
+    } finally { process.env.BRIDGE_JAIL_BACKEND = 'landlock' }
+    const selected = await run("console.log('explicit-landlock')", spec())
+    expect(selected.code, selected.stderr).toBe(0); expect(selected.stdout.trim()).toBe('explicit-landlock')
+  })
+
+  it('removes host socket-discovery variables from the real Landlock payload', async () => {
+    const keys = ['DBUS_SESSION_BUS_ADDRESS', 'DBUS_SYSTEM_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'SSH_AUTH_SOCK', 'GPG_AGENT_INFO', 'WAYLAND_DISPLAY', 'DOCKER_HOST', 'CUSTOM_SOCKET']
+    const wrapped = await jail.wrap(process.execPath, ['-e', `const a=require('node:assert/strict');for(const k of ${JSON.stringify(keys)})a.equal(process.env[k],undefined,k);console.log('socket-env-absent')`], spec())
+    const inherited = Object.fromEntries(keys.map((key) => [key, '/host/socket-proof']))
+    try {
+      // Simulate the outer scope's final transport injection, after any executor sanitization.
+      const result = await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH, ...inherited }, stdio: ['ignore', 'pipe', 'pipe'] }))
+      expect(result.code, result.stderr).toBe(0); expect(result.stdout.trim()).toBe('socket-env-absent')
+    } finally { await wrapped.cleanup?.() }
+  })
 
   it('requires the operator egress assertion for network none before a real backend turn', async () => {
     for (const allow of [false, true]) {
@@ -198,6 +247,40 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
       const observed = await output(result.child)
       expect(observed.code, observed.stderr).toBe(0); expect(observed.stdout.trim()).toBe('confined')
     } finally { await result.terminate?.(); result.release() }
+  })
+
+  it('refuses read-only paths nested beneath a writable grant before a real spawn', async () => {
+    const directory = join(base, 'nested-writable'), file = join(directory, 'readonly')
+    await mkdir(directory); await writeFile(file, 'unchanged')
+    let error: unknown
+    try { await run(`require('node:fs').writeFileSync(${JSON.stringify(file)},'changed')`, spec({ extraWritablePaths: [directory], extraReadablePaths: [file] })) }
+    catch (caught) { error = caught }
+    expect(String(error)).toContain('read-only path nested in a writable grant')
+    expect(await readFile(file, 'utf8')).toBe('unchanged')
+  })
+
+  it('refuses a changed grant identity between preparation and the real launcher', async () => {
+    const original = readonly + '.original'
+    const wrapped = await jail.wrap(process.execPath, ['-e', `console.log(require('node:fs').readFileSync(${JSON.stringify(outside)},'utf8'))`], spec())
+    try {
+      await rename(readonly, original); await symlink(outside, readonly)
+      const result = await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] }))
+      expect(result.code, result.stdout + result.stderr).toBe(126)
+      expect(result.stderr).toContain('path identity changed')
+      expect(result.stdout).toBe('')
+    } finally { await rm(readonly, { force: true }); await rename(original, readonly); await wrapped.cleanup?.() }
+  })
+
+  it('starts an unprivileged real payload with no held Linux capabilities', async () => {
+    const code = `import ctypes,os
+class H(ctypes.Structure):_fields_=[('version',ctypes.c_uint32),('pid',ctypes.c_int)]
+class D(ctypes.Structure):_fields_=[('effective',ctypes.c_uint32),('permitted',ctypes.c_uint32),('inheritable',ctypes.c_uint32)]
+h=H(0x20080522,0);d=(D*2)()
+assert ctypes.CDLL(None).capget(ctypes.byref(h),ctypes.byref(d))==0
+assert os.geteuid()!=0 and not any(x.effective or x.permitted or x.inheritable for x in d)
+print('unprivileged')`
+    const result = await run(`const p=require('node:child_process').spawnSync('python3',['-I','-S','-c',${JSON.stringify(code)}],{encoding:'utf8'});require('node:assert/strict').equal(p.status,0,p.stderr);process.stdout.write(p.stdout)`, spec())
+    expect(result.code, result.stderr).toBe(0); expect(result.stdout.trim()).toBe('unprivileged')
   })
 
   it('refuses remapped binds and write-jail rather than widening the boundary', async () => {
