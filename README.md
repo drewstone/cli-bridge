@@ -1010,8 +1010,8 @@ A failed rule or launcher exits without executing the command.
 | Path mappings | Bind source at destination | Same-path grants only | Any remapped bind is refused, including read-only auth/config snapshots; use a spec without remaps. |
 | Temporary files | Private `/tmp` mount | Private TMPDIR under jail home; shared `/tmp` has no grant | Hardcoded `/tmp` access fails unless the spec explicitly exposes that exact path. |
 | Egress state | Masks siblings with tmpfs | No broad grant covering the egress parent; only own CA files granted | Metadata remains visible; older ABIs do not mediate pathname Unix-socket connects. |
-| `/proc` and `/dev` | Private proc and device mounts | No proc grant; only null, zero, random and urandom device grants | No virtualized process view; kernel metadata operations are outside Landlock's filesystem allowlist. |
-| Process and IPC | Separate PID/IPC/UTS namespaces | Host namespaces; launcher dies when its parent exits | No PID, signal or IPC isolation. |
+| `/proc` and `/dev` | Private proc and device mounts | No proc grant; only null, zero, random and urandom device grants | No virtualized process view; kernel metadata operations are outside Landlock's filesystem allowlist. Real harness behavior without `/proc` remains unproven by the native protocol fixture. |
+| Process and IPC | Separate PID/IPC/UTS namespaces | Host namespaces; launcher dies when its parent exits; ABI 6+ scopes deny signals and abstract Unix-socket connections outside the domain | No PID namespace. On ABI 4/5, same-user host processes (including the Bridge) can be signalled, and abstract Unix sockets remain reachable. |
 | Network | Separate network namespace with relay shim | TCP connects limited to the spawn's ephemeral relay port and explicit host loopback ports; no TCP bind grants | A port rule applies to every address; UDP on older ABIs and Unix sockets are outside this boundary. Other host processes can reach the host-side listener. |
 | Write jail | Host-wide read-only mount with hidden egress state | Refused; use fs-jail | Additive grants cannot hide a subtree of a host-wide read grant. |
 

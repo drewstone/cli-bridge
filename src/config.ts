@@ -89,8 +89,9 @@ export interface Config extends NativeHarnessConfig {
   jailMode: 'off' | 'write-jail' | 'fs-jail'
   /** Explicit policy when the configured OS jail is unavailable. */
   jailFallback: 'deny' | 'warn'
-  /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
+  /** Trusted assertion that host policy supplies the Landlock transport’s missing egress isolation. */
   jailHostEgressEnforced?: boolean
+  /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
   jailNetwork?: JailNetwork
   /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
   ironProxyBin?: string

@@ -32,7 +32,7 @@ async function output(child: ChildProcess) {
 async function run(code: string, spec: JailSpec, unconfined = false) {
   if (!unconfined) {
     const result = await hostSpawner(process.execPath, ['-e', code], { cwd: workspace, jail: spec, env: { PATH: process.env.PATH } })
-    try { return await output(result.child) } finally { await result.terminate(); result.release() }
+    try { return await output(result.child) } finally { await result.terminate?.(); result.release() }
   }
   const wrapped = await jail.wrap(process.execPath, ['-e', code], spec)
   // Replace only the launcher. The same argv, policy, env and cwd reach the command.
@@ -160,6 +160,22 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
     }
   }, 60_000)
 
+  it('measures signal and abstract Unix-socket residuals, and scopes them on ABI 6+', async () => {
+    const address = `\0landlock-proof-${process.pid}-${Date.now()}`
+    const listener = createServer((socket) => socket.end())
+    await new Promise<void>((resolve, reject) => { listener.once('error', reject); listener.listen(address, resolve) })
+    const code = `const a=require('node:assert/strict'),net=require('node:net');
+      let signal='ok';try{process.kill(${process.pid},0)}catch(e){signal=e.code}
+      const scoped=${Number(probe.stdout.trim()) >= 6};
+      a.equal(signal==='ok',!scoped);
+      new Promise(r=>{const s=net.connect({path:${JSON.stringify(address)}});s.on('connect',()=>{s.destroy();r('ok')});s.on('error',e=>r(e.code))})
+      .then(result=>a.equal(result==='ok',!scoped)).catch(e=>{console.error(e);process.exitCode=1});`
+    try {
+      if (Number(probe.stdout.trim()) >= 6) await discriminate('signal/abstract socket scopes', code)
+      else { const result = await run(code, spec()); expect(result.code, result.stderr).toBe(0); console.log('ABI 4/5 residuals measured: signal 0 and host abstract Unix socket allowed; scopes unavailable') }
+    } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
+  })
+
   it('does not let child PATH replace the trusted interpreter', async () => {
     const tools = join(base, 'hostile-path'); await mkdir(tools)
     await writeFile(join(tools, 'python3'), '#!/bin/sh\necho interpreter-substituted\nexit 0\n', { mode: 0o700 })
@@ -168,7 +184,7 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
     try {
       const observed = await output(result.child)
       expect(observed.code, observed.stderr).toBe(0); expect(observed.stdout.trim()).toBe('confined')
-    } finally { await result.terminate(); result.release() }
+    } finally { await result.terminate?.(); result.release() }
   })
 
   it('refuses remapped binds and write-jail rather than widening the boundary', async () => {

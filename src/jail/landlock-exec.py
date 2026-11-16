@@ -36,12 +36,18 @@ def restrict(policy):
     libc.syscall.restype = ctypes.c_long
     abi = check(libc.syscall(444, 0, 0, 1))
     # Refuse future ABIs rather than silently omitting new filesystem rights.
-    if not 4 <= abi <= 12:
+    if not 4 <= abi <= 8:
         raise RuntimeError('unsupported Landlock ABI: ' + str(abi))
-    fs = (1 << (15 if abi < 5 else 16 if abi < 9 else 17)) - 1
-    net = 3 if abi < 10 else 15
-    attrs = (ctypes.c_uint64 * 2)(fs, net)
-    ruleset = check(libc.syscall(444, ctypes.byref(attrs), ctypes.sizeof(attrs), 0))
+    # UAPI masks and ABI compatibility switch:
+    # https://docs.kernel.org/userspace-api/landlock.html#defining-and-enforcing-a-security-policy
+    # ABI 4: FS bits 0..14; ABI 5 adds IOCTL_DEV (bit 15). ABIs 6..8 add no FS rights.
+    # https://docs.kernel.org/userspace-api/landlock.html#filesystem-flags
+    fs = (1 << (15 if abi == 4 else 16)) - 1
+    net = 3  # BIND_TCP (bit 0) | CONNECT_TCP (bit 1), present since ABI 4.
+    # ABI 6 scopes: ABSTRACT_UNIX_SOCKET (bit 0) | SIGNAL (bit 1).
+    # https://docs.kernel.org/userspace-api/landlock.html#scope-flags
+    attrs = (ctypes.c_uint64 * 3)(fs, net, 3 if abi >= 6 else 0)
+    ruleset = check(libc.syscall(444, ctypes.byref(attrs), (24 if abi >= 6 else 16), 0))
     for entry in policy.get('paths', []):
         try:
             fd = os.open(entry['path'], os.O_PATH | os.O_CLOEXEC)
