@@ -21,7 +21,7 @@
  * target directly and is exempt.
  */
 
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import {
   createServer,
@@ -76,6 +76,7 @@ interface HostService {
   claimed: boolean
   revoked: boolean
   active: Set<() => void>
+  tcp?: { port: number; close(): Promise<void> }
 }
 const services = new WeakMap<TrustedHostServiceRegistration, HostService>()
 const owners = new WeakMap<TrustedHostServiceOwner, HostServiceOwner>()
@@ -173,6 +174,48 @@ export function claimTrustedHostService(
   }
 }
 
+/** Allocate the URL before native config materialization; adoption still belongs to one spawn. */
+export async function claimTcpHostService(
+  owner: TrustedHostServiceOwner,
+  headers: Readonly<Record<string, string>> = {},
+): Promise<ReturnType<typeof claimTrustedHostService>> {
+  const claim = claimTrustedHostService(owner, headers)
+  const service = services.get(claim.registration)!
+  let relay: EgressRelay | undefined
+  try {
+    relay = await startEgressRelay({ allow: [], tcp: true, deferAdoption: true, trustedHostServices: [claim.registration] })
+    const port = relay.port
+    if (service.revoked || service.owner.revoked) throw new Error('trusted service was released during listener allocation')
+    if (!port) throw new Error('trusted TCP service did not obtain a loopback port')
+    service.tcp = { port, close: relay.close }
+    return { ...claim, nativeUrl: `http://127.0.0.1:${port}/${service.cap}` }
+  } catch (error) { claim.revoke(); await relay?.close(); throw error }
+}
+
+function availableServices(registrations: readonly TrustedHostServiceRegistration[] = []): HostService[] {
+  const admitted = registrations.map((registration) => {
+    const service = services.get(registration)
+    if (!service || service.revoked || service.owner.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
+    return service
+  })
+  if (new Set(admitted).size !== admitted.length) throw new Error('duplicate trusted host service registration')
+  return admitted
+}
+
+/** One launcher adopts these ports; a second cannot borrow the registration or its listener. */
+export function adoptTcpHostServices(registrations: readonly TrustedHostServiceRegistration[] = []) {
+  const admitted = availableServices(registrations)
+  if (admitted.some((service) => !service.tcp)) throw new Error('trusted service needs the TCP claim transport')
+  for (const service of admitted) service.claimed = true
+  return {
+    ports: admitted.map((service) => service.tcp!.port),
+    cleanup: async () => {
+      for (const service of admitted) revokeService(service)
+      await Promise.all(admitted.map((service) => service.tcp!.close()))
+    },
+  }
+}
+
 function serviceHeaders(
   input: Readonly<Record<string, string>>,
   fixed: Readonly<Record<string, string>> = {},
@@ -197,10 +240,15 @@ function revokeService(service: HostService): void {
   service.owner.claims.delete(service)
   for (const drop of service.active) drop()
   service.active.clear()
+  if (service.tcp) void service.tcp.close()
 }
 
 export interface EgressRelayOptions {
-  socketPath: string
+  socketPath?: string
+  /** Host loopback listener for one protected claim; no in-jail shim. */
+  tcp?: boolean
+  /** URL allocation precedes the owning launcher’s adoption. */
+  deferAdoption?: boolean
   /** Reachable targets as `host` (port 443) or `host:port`. */
   allow: readonly string[]
   /** Hosts whose tunnels go to iron-proxy's CONNECT listener instead of the origin. */
@@ -213,17 +261,17 @@ export interface EgressRelayOptions {
 }
 
 export interface EgressRelay {
+  port?: number
   close(): Promise<void>
 }
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
-  const admitted = (options.trustedHostServices ?? []).map((registration) => {
-    const service = services.get(registration)
-    if (!service || service.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
-    return service
-  })
-  if (new Set(admitted).size !== admitted.length) throw new Error('duplicate trusted host service registration')
-  for (const service of admitted) service.claimed = true
+  const admitted = availableServices(options.trustedHostServices)
+  if (!options.deferAdoption) {
+    if (admitted.some((service) => service.tcp)) throw new Error('TCP service registration requires the TCP transport')
+    for (const service of admitted) service.claimed = true
+  }
+  let expectedHost = `127.0.0.1:${SHIM_PORT}`
   const routes = new Map<string, ServiceRoute>()
   for (const service of admitted) {
     for (const [suffix, methods] of service.owner.paths) {
@@ -257,7 +305,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
       res.setHeader('connection', 'close')
       if (used.has(req.socket)) return void req.socket.destroy()
       used.add(req.socket)
-      void serveHostService(req, res, routes).catch(() => {
+      void serveHostService(req, res, routes, expectedHost).catch(() => {
         if (!res.headersSent) res.writeHead(502)
         res.end()
       })
@@ -325,16 +373,23 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
       })
   })
   try {
-    await listen(server, options.socketPath)
+    if (options.tcp) {
+      await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+      expectedHost = `127.0.0.1:${(server.address() as { port: number }).port}`
+    } else {
+      if (!options.socketPath) throw new Error('egress relay needs its Unix socket path')
+      await listen(server, options.socketPath)
+    }
   } catch (error) {
     for (const service of admitted) revokeService(service)
     throw error
   }
   // Close ends live tunnels too, so a held connection cannot delay the proxy kill and revoke.
   return {
+    ...(options.tcp ? { port: (server.address() as { port: number }).port } : {}),
     close: () =>
       new Promise((resolve) => {
-        for (const service of admitted) revokeService(service)
+        if (!options.deferAdoption) for (const service of admitted) revokeService(service)
         server.close(() => resolve())
         for (const socket of open) socket.destroy()
       }),
@@ -345,9 +400,18 @@ async function serveHostService(
   req: IncomingMessage,
   res: ServerResponse,
   routes: ReadonlyMap<string, ServiceRoute>,
+  expectedHost: string,
 ): Promise<void> {
-  const route = routes.get(req.url ?? '')
-  if (!route || req.headers.host !== `127.0.0.1:${SHIM_PORT}` || route.service.revoked || route.service.owner.revoked) {
+  const path = req.url ?? ''
+  const token = Buffer.from(path.split('/')[1] ?? '', 'utf8')
+  let route: ServiceRoute | undefined
+  // Do not use a secret-bearing URL as a hash-table key for authentication.
+  for (const [registeredPath, candidate] of routes) {
+    const secret = Buffer.from(candidate.service.cap, 'utf8')
+    const matches = token.length === secret.length && timingSafeEqual(token, secret)
+    if (matches && path.slice(token.length + 1) === registeredPath.slice(secret.length + 1)) route = candidate
+  }
+  if (!route || req.headers.host !== expectedHost || !route.service.claimed || route.service.revoked || route.service.owner.revoked) {
     res.writeHead(403)
     res.end()
     return

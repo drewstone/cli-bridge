@@ -1012,7 +1012,7 @@ A failed rule or launcher exits without executing the command.
 | Egress state | Masks siblings with tmpfs | No broad grant covering the egress parent; only own CA files granted | Metadata remains visible; older ABIs do not mediate pathname Unix-socket connects. |
 | `/proc` and `/dev` | Private proc and device mounts | No proc grant; only null, zero, random and urandom device grants | No virtualized process view; kernel metadata operations are outside Landlock's filesystem allowlist. Real harness behavior without `/proc` remains unproven by the native protocol fixture. |
 | Process and IPC | Separate PID/IPC/UTS namespaces | Host namespaces; launcher dies when its parent exits; ABI 6+ scopes deny signals and abstract Unix-socket connections outside the domain | No PID namespace. On ABI 4/5, same-user host processes (including the Bridge) can be signalled, and abstract Unix sockets remain reachable. |
-| Network | Separate network namespace with relay shim | TCP connects limited to the spawn's ephemeral relay port and explicit host loopback ports; no TCP bind grants | A port rule applies to every address; UDP on older ABIs and Unix sockets are outside this boundary. Other host processes can reach the host-side listener. |
+| Network | Separate network namespace with relay shim | TCP connects limited to the spawn's ephemeral relay port and explicit host loopback ports; no TCP bind grants | A port rule applies to every address; UDP on older ABIs and Unix sockets are outside this boundary. Other local processes, including the same user, can reach a claim listener; its random per-claim URL secret is compared in constant time. Only the owning jail receives its port grant, and release closes the listener. |
 | Write jail | Host-wide read-only mount with hidden egress state | Refused; use fs-jail | Additive grants cannot hide a subtree of a host-wide read grant. |
 
 Landlock does **not** supply relay-grade network isolation. Router/relay requests
@@ -1021,8 +1021,11 @@ and host loopback access are refused unless the operator explicitly sets
 already enforces egress, including UDP, same-port remote addresses and access to
 other local services/sockets. This assertion is operator configuration, never a
 request field, and adds no key to served capability or policy documents.
-Trusted private host-service aliases and Pi's isolated transport still require
-bubblewrap; they do not use the Landlock transport.
+Trusted private host-service aliases use one ephemeral loopback listener per claim
+when that assertion is enabled. Protected headers remain in the host relay, and
+claims cannot be adopted by a second spawn. Their URL must exist before native
+configuration is written, so they cannot share the later per-spawn proxy listener.
+Pi's isolated transport continues to require bubblewrap.
 
 The integration proof is `tests/landlock-jail.integration.test.ts`. Run it with
 `CLI_BRIDGE_REQUIRE_LANDLOCK=1` to make an unavailable kernel a failure rather than

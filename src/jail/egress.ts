@@ -30,7 +30,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProxySecretBinding } from '@tangle-network/agent-interface'
-import { SHIM_PORT, startEgressRelay, type EgressRelay } from './egress-relay.js'
+import { SHIM_PORT, adoptTcpHostServices, startEgressRelay, type EgressRelay } from './egress-relay.js'
 import type { JailSpec } from './types.js'
 
 export type JailNetwork = 'none' | 'router' | 'relay'
@@ -131,7 +131,10 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
   if (bindings.length && network !== 'relay') throw new Error('proxySecrets require execution.jail.network relay')
   // Created on every path: a write-jail cannot create the mask's mountpoint on the read-only host root.
   const mask = ['--tmpfs', await egressParent()]
-  if (network === 'none' && !spec.trustedHostServices?.length && !spec.hostLoopbackPorts?.length) return { bwrapArgs: mask, env: {}, prefix: [], hiddenParent: EGRESS_PARENT, tcpConnectPorts: [], cleanup: async () => {} }
+  if (network === 'none' && !spec.hostLoopbackPorts?.length && (transport === 'tcp-port' || !spec.trustedHostServices?.length)) {
+    const claims = transport === 'tcp-port' ? adoptTcpHostServices(spec.trustedHostServices) : undefined
+    return { bwrapArgs: mask, env: {}, prefix: [], hiddenParent: EGRESS_PARENT, tcpConnectPorts: claims?.ports ?? [], cleanup: claims?.cleanup ?? (async () => {}) }
+  }
 
   const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
@@ -141,10 +144,12 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
   }
   let proxy: Awaited<ReturnType<typeof startIronProxy>> | undefined
   let relay: EgressRelay | undefined
+  let tcpServices: ReturnType<typeof adoptTcpHostServices> | undefined
   const bridges: Array<() => Promise<void>> = []
   const intercepts: JailEgressIntercept[] = []
   const cleanup = async () => {
     await relay?.close()
+    await tcpServices?.cleanup()
     await Promise.all(bridges.map((close) => close()))
     if (proxy) { proxy.child.kill('SIGTERM'); await rm(proxy.dir, { recursive: true, force: true }) }
     await rm(shared, { recursive: true, force: true })
@@ -153,6 +158,7 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
       runSecretCommand(spec.proxySecretCommand!, 'revoke', { key: binding.secretRef.key, secret })))
   }
   try {
+    if (transport === 'tcp-port') tcpServices = adoptTcpHostServices(spec.trustedHostServices)
     const env: Record<string, string> = network === 'none' ? {} : proxyEnv()
     let tunnel: { host: string; port: number } | undefined
     if (bindings.length) {
@@ -166,7 +172,7 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
     relay = await startEgressRelay({
       socketPath,
       allow: relayAllowHosts(spec),
-      trustedHostServices: spec.trustedHostServices,
+      trustedHostServices: transport === 'namespace' ? spec.trustedHostServices : undefined,
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
     if (transport === 'tcp-port') {
@@ -186,7 +192,7 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
       const port = (listener.address() as AddressInfo).port
       Object.assign(env, network === 'none' ? {} : proxyEnv(port))
       return { bwrapArgs: [], env, prefix: [], hiddenParent: EGRESS_PARENT,
-        tcpConnectPorts: [port, ...(spec.hostLoopbackPorts ?? [])],
+        tcpConnectPorts: [port, ...(tcpServices?.ports ?? []), ...(spec.hostLoopbackPorts ?? [])],
         readablePaths: proxy ? [join(shared, 'ca.crt'), join(shared, 'ca-bundle.crt')] : [], cleanup }
     }
     // Each host loopback port gets its own socket; the relay still refuses every other destination.
