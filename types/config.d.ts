@@ -6,7 +6,6 @@
  * not a warning — an accidental open proxy to your personal subscription
  * keys is the failure mode we refuse to allow.
  */
-import type { JailNetwork } from './jail/egress.js';
 export declare const maxCodexSubscriptionTurnMs: number;
 /** Native harness identities only; model selection and seat syntax belong to agent-interface. */
 export declare const localHarnesses: readonly [readonly ['claude', 'claude-code', 'claude auth login', readonly ['auth', 'status', '--json'], 'anthropic'], readonly ['codex', 'codex', 'codex login', readonly ['login', 'status'], 'openai'], readonly ['opencode', 'opencode', 'opencode auth login', readonly ['auth', 'list', '--pure'], null], readonly ['kimi', 'kimi-code', 'kimi login', readonly ['--version'], null], readonly ['gemini', 'gemini', 'gemini', readonly ['--version'], 'google'], readonly ['cursor', 'cursor', 'cursor-agent login', readonly ['status', '--format', 'json'], 'cursor'], readonly ['pi', 'pi', 'pi', readonly ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null]];
@@ -21,6 +20,8 @@ export declare function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean;
 /** Linux backend selection is operator-owned; bubblewrap remains the default. */
 export declare const JAIL_BACKEND_ENV = "BRIDGE_JAIL_BACKEND";
 export type LinuxJailBackend = 'bwrap' | 'landlock';
+/** Public operator network policy; execution code re-exports this single definition. */
+export type JailNetwork = 'none' | 'router' | 'relay';
 export declare function configuredJailBackend(env?: NodeJS.ProcessEnv): LinuxJailBackend;
 export interface Config extends NativeHarnessConfig {
     host: string;
