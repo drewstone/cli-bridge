@@ -18,7 +18,8 @@
  * Only port 443 is reachable unless an allow entry names `host:port`. Resolved
  * addresses in private, loopback, link-local and metadata ranges are refused;
  * an allow entry that is itself a literal address is an operator naming the
- * target directly and is exempt.
+ * target directly and is exempt on direct dials. Proxy dials always refuse private
+ * literals and localhost names before CONNECT.
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
@@ -636,7 +637,7 @@ function bypassesProxy(host: string, port: number, entries: readonly string[]): 
 async function dial(host: string, port: number, allow: ReadonlySet<string>, proxy: ReturnType<typeof captureOuterProxy>): Promise<Socket> {
   // The configured proxy is operator-named. CONNECT leaves target DNS to it.
   if (proxy && !bypassesProxy(host, port, proxy.bypass)) {
-    if (isIP(host) && isBlockedAddress(host)) throw new Error(`blocked-address host=${host}`)
+    if ((isIP(host) && isBlockedAddress(host)) || /(^|\.)localhost\.?$/u.test(host)) throw new Error(`blocked-address host=${host}`)
     return openTunnel(proxy, host, port)
   }
   const literal = isIP(host) !== 0
