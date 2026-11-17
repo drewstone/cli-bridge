@@ -93,7 +93,7 @@ function proxySecretPlaceholder(envName: string): string {
   return `proxy-${envName.toLowerCase().replace(/[^a-z0-9]+/gu, '-')}.${randomBytes(12).toString('base64url')}`
 }
 
-type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin' | 'trustedHostServices' | 'hostLoopbackPorts'>
+type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin' | 'trustedHostServices' | 'hostLoopbackPorts' | 'outerProxyEnforced'>
 
 /** Hosts the relay may splice. Router mode stays the Router only; pass-through is relay-only. */
 export function relayAllowHosts(spec: EgressSpec): readonly string[] {
@@ -175,6 +175,7 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
       ...(transport === 'tcp-port' ? { tcp: true, proxyAuthorization } : { socketPath }),
       allow: relayAllowHosts(spec),
       trustedHostServices: transport === 'namespace' ? spec.trustedHostServices : undefined,
+      outerProxyEnforced: spec.outerProxyEnforced,
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
     if (transport === 'tcp-port') {

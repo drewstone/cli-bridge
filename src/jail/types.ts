@@ -47,6 +47,8 @@ export interface JailSpec {
   requireEnforcement?: boolean
   /** Trusted operator assertion: external host policy enforces egress for a port-only jail. */
   hostEgressEnforced?: boolean
+  /** Trusted operator assertion: the host `HTTPS_PROXY` refuses private destinations. */
+  outerProxyEnforced?: boolean
   /** Operator backend captured with this spec; request JSON cannot choose it. */
   backend?: LinuxJailBackend
   /** Captured operator fallback; absent means refuse unconfined execution. */

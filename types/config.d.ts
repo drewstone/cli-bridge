@@ -40,6 +40,7 @@ type NativeHarnessConfig = {
 export declare const JAIL_HOST_EGRESS_ENV = "BRIDGE_JAIL_HOST_EGRESS_ENFORCED";
 export declare const JAIL_OUTER_PROXY_ENV = "BRIDGE_JAIL_OUTER_PROXY_ENFORCED";
 export declare function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean;
+export declare function outerProxyEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean;
 /** Linux backend selection is operator-owned; bubblewrap remains the default. */
 export declare const JAIL_BACKEND_ENV = "BRIDGE_JAIL_BACKEND";
 export type LinuxJailBackend = 'bwrap' | 'landlock';
@@ -101,6 +102,8 @@ export interface Config extends NativeHarnessConfig {
     jailFallback: 'deny' | 'warn';
     /** Trusted assertion that host policy supplies the Landlock transport’s missing egress isolation. */
     jailHostEgressEnforced?: boolean;
+    /** Trusted assertion that the host `HTTPS_PROXY` refuses private destinations for Landlock relays. */
+    jailOuterProxyEnforced?: boolean;
     /** Captured operator Linux backend; never accepted from request JSON. */
     jailBackend?: LinuxJailBackend;
     /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
