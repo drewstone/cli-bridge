@@ -53,6 +53,10 @@ it.skipIf(!ENABLED)('admits and completes a credential-free free-model turn in t
     expect(request.jailSpec, 'BRIDGE_JAIL_MODE=fs-jail resolves a host jail').toBeTruthy()
     const signal = new AbortController().signal
     await createNativeCatalog(config, undefined, cwd).admit(request, 'opencode', signal)
+    // Admission's host-side `opencode models` initializes the user's config directory. The reported
+    // failure had admission off, so the jailed turn found it uninitialized and had to write it.
+    const hostIgnore = join(home, '.config', 'opencode', '.gitignore')
+    await rm(hostIgnore, { force: true })
     const deltas: ChatDelta[] = []
     for await (const delta of new OpencodeBackend({ bin: BIN, timeoutMs: 120_000 }).chat(request, null, signal)) deltas.push(delta)
     const failure = deltas.find((delta) => delta.finish_reason === 'error')
@@ -63,6 +67,7 @@ it.skipIf(!ENABLED)('admits and completes a credential-free free-model turn in t
     const jailedConfig = join(cwd, '.agent-home', '.config', 'opencode')
     expect(existsSync(join(jailedConfig, 'opencode.json')), 'the user config was seeded into the jail').toBe(true)
     expect(existsSync(join(jailedConfig, '.gitignore')), 'OpenCode wrote its config directory inside the jail').toBe(true)
+    expect(existsSync(hostIgnore), 'the jailed turn never wrote the host config directory').toBe(false)
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]
