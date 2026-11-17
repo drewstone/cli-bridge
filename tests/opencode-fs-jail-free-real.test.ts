@@ -17,6 +17,7 @@ import { afterAll, expect, it } from 'vitest'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { loadConfig } from '../src/config.js'
+import { hostRequestJail } from '../src/jail/host-request.js'
 import { createNativeCatalog } from '../src/native-catalog.js'
 
 const BIN = process.env.OPENCODE_BIN ?? join(homedir(), '.opencode/bin/opencode')
@@ -47,6 +48,9 @@ it.skipIf(!ENABLED)('admits and completes a credential-free free-model turn in t
       messages: [{ role: 'user', content: 'Reply with the single word: ok' }],
       agent_profile: { name: 'free', harness: 'opencode', prompt: { appendSystemPrompt: 'Reply with exactly one word.' } },
     }
+    // The chat route resolves the host jail before admission; the backend confines the turn only when it is set.
+    request.jailSpec = hostRequestJail(request, 'opencode', process.env)
+    expect(request.jailSpec, 'BRIDGE_JAIL_MODE=fs-jail resolves a host jail').toBeTruthy()
     const signal = new AbortController().signal
     await createNativeCatalog(config, undefined, cwd).admit(request, 'opencode', signal)
     const deltas: ChatDelta[] = []
@@ -55,6 +59,10 @@ it.skipIf(!ENABLED)('admits and completes a credential-free free-model turn in t
     expect(failure, `turn failed: ${JSON.stringify(failure ?? {})}`).toBeUndefined()
     expect(deltas.some((delta) => typeof delta.content === 'string' && delta.content.length > 0)).toBe(true)
     expect(deltas.at(-1)).toMatchObject({ finish_reason: 'stop' })
+    // The turn ran confined: OpenCode's startup write landed in the jail HOME's seeded config directory.
+    const jailedConfig = join(cwd, '.agent-home', '.config', 'opencode')
+    expect(existsSync(join(jailedConfig, 'opencode.json')), 'the user config was seeded into the jail').toBe(true)
+    expect(existsSync(join(jailedConfig, '.gitignore')), 'OpenCode wrote its config directory inside the jail').toBe(true)
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key]
