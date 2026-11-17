@@ -1,7 +1,7 @@
 /** Real kernel confinement, including deliberately unconfined negative controls. */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { link, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
-import { createServer, type AddressInfo } from 'node:net'
+import { connect, createServer, type AddressInfo } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
 import { watch } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { hostSpawner } from '../src/executors/host.js'
 import { LinuxLandlockJail, selectJailBackend } from '../src/jail/index.js'
-import { configuredJailBackend, JAIL_HOST_EGRESS_ENV } from '../src/config.js'
+import { configuredJailBackend, JAIL_HOST_EGRESS_ENV, JAIL_OUTER_PROXY_ENV } from '../src/config.js'
 import { resolveJailSpec } from '../src/jail/resolve-spec.js'
 import { startEgressRelay } from '../src/jail/egress-relay.js'
 import type { JailSpec } from '../src/jail/types.js'
@@ -274,9 +274,9 @@ finally:
       for (const key of keys) delete process.env[key]
       if (proxy) process.env[lower ? 'https_proxy' : 'HTTPS_PROXY'] = proxy
       process.env[lower ? 'no_proxy' : 'NO_PROXY'] = noProxy
-      if (proxy && declared) process.env.BRIDGE_JAIL_OUTER_PROXY_ENFORCED = '1'
       phase = 'verification'
-      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['example.com', 'localhost', 'localhost.', 'service.localhost', 'service.localhost.', '127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '172.16.5.4', '0.0.0.0', '::1', '::', 'fe80::1', 'fd00::1', 'fc00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', `127.0.0.1:${originPort}`] }))
+      // The declaration is captured operator configuration; the daemon environment's copy stays unset.
+      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', outerProxyEnforced: declared, passThroughHosts: ['example.com', 'localhost', 'localhost.', 'service.localhost', 'service.localhost.', '127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '172.16.5.4', '0.0.0.0', '::1', '::', 'fe80::1', 'fd00::1', 'fc00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', `127.0.0.1:${originPort}`] }))
       phase = 'request'
       // Relay configuration must remain captured, even if the bridge environment changes afterwards.
       process.env.HTTPS_PROXY = 'http://127.0.0.1:1'; process.env.NO_PROXY = '*'
@@ -323,6 +323,57 @@ finally:
       await Promise.all([origin, outer].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))))
     }
   }, 60_000)
+
+  it('fails a silent outer proxy within the CONNECT deadline and frees the executor slot', async () => {
+    const { hostExecutorSnapshot } = await import('../src/executors/host.js')
+    const sockets = new Set<import('node:net').Socket>()
+    let accepted!: () => void
+    const connected = new Promise<void>((resolve) => { accepted = resolve })
+    // Accepts the relay's CONNECT and never answers it.
+    const silent = createServer((socket) => { sockets.add(socket); socket.on('error', () => {}); socket.resume(); accepted() })
+    await new Promise<void>((resolve) => silent.listen(0, '127.0.0.1', resolve))
+    const keys = ['HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy', JAIL_OUTER_PROXY_ENV] as const
+    const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+    for (const key of keys) delete process.env[key]
+    Object.assign(process.env, { HTTPS_PROXY: `http://127.0.0.1:${(silent.address() as AddressInfo).port}`, [JAIL_OUTER_PROXY_ENV]: '1' })
+    let timer: NodeJS.Timeout | undefined
+    try {
+      const jailSpec = resolveJailSpec({ cwd: workspace, execMode: 'fs-jail', execNetwork: 'router', env: { ...process.env, [JAIL_HOST_EGRESS_ENV]: '1' } })!
+      const before = hostExecutorSnapshot().in_flight, started = Date.now()
+      const spawned = hostSpawner(process.execPath, ['-e', ''], { cwd: workspace, jail: jailSpec, env: { PATH: process.env.PATH } })
+      const settled = Promise.race([
+        spawned.then(async (result) => { await result.terminate?.(); result.release(); return 'spawned' }, (error: Error) => error.message),
+        new Promise<string>((resolve) => { timer = setTimeout(resolve, 15_000, 'still pending after 15 s') }),
+      ])
+      await Promise.race([connected, settled])
+      expect(hostExecutorSnapshot().in_flight, 'the spawn holds a slot while the proxy is silent').toBe(before + 1)
+      expect(await settled).toContain('proxy-connect-timeout')
+      console.log(`silent outer proxy: spawn refused after ${Date.now() - started} ms`)
+      for (let i = 0; i < 50 && hostExecutorSnapshot().in_flight !== before; i++) await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(hostExecutorSnapshot().in_flight, 'the refused spawn frees its slot').toBe(before)
+    } finally {
+      clearTimeout(timer)
+      for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key] }
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve) => silent.close(() => resolve()))
+    }
+  }, 30_000)
+
+  it('keeps a network-none loopback relay off an undeclared outer proxy', async () => {
+    const listener = createServer((socket) => { socket.on('error', () => {}); socket.end('loopback-ok') })
+    await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve))
+    const prior = process.env.HTTPS_PROXY
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:9'
+    try {
+      const port = (listener.address() as AddressInfo).port
+      const result = await run(`const s=require('node:net').connect(${port},'127.0.0.1');let b='';s.on('data',d=>b+=d);s.on('end',()=>console.log(b));s.on('error',e=>{console.error(e);process.exitCode=1})`,
+        spec({ hostLoopbackPorts: [port] }))
+      expect(result.code, result.stderr).toBe(0); expect(result.stdout.trim()).toBe('loopback-ok')
+    } finally {
+      if (prior === undefined) delete process.env.HTTPS_PROXY; else process.env.HTTPS_PROXY = prior
+      await new Promise<void>((resolve) => listener.close(() => resolve()))
+    }
+  })
 
   it('refuses pathname Unix sockets, including user-manager sockets, while the unconfined control connects', async () => {
     const { stat } = await import('node:fs/promises')
@@ -577,7 +628,7 @@ print('socket filter enforced')`
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
   })
 
-  it('routes protected host-service claims only to their owning jailed run and closes them on release', async () => {
+  it('routes protected host-service claims only to their owning jailed run, refuses them once revoked and closes them after the run', async () => {
     const secret = 'host-service-proof-canary-7b9e'
     const calls: string[] = []
     const endpoint = createHttpServer(async (request, response) => {
@@ -622,11 +673,22 @@ if(process.argv.includes('--version')){console.log('fixture 1.0.0');process.exit
           headers: { Authorization: { kind: 'secret-ref', key: 'host-service-key', format: 'bearer' } } } } } }) })
       .then(async (response) => ({ status: response.status, text: await response.text() }))
     let held: ReturnType<typeof dispatch> | undefined, secondHeld: ReturnType<typeof dispatch> | undefined
+    // Spawn cleanup runs after the response, so poll with bare connects; no request reaches a live claim.
+    const closed = async (target: string) => {
+      for (let i = 0; i < 100; i++) {
+        const code = await new Promise<string | undefined>((resolve) => { const s = connect(Number(new URL(target).port), '127.0.0.1')
+          s.once('connect', () => { s.destroy(); resolve('open') }); s.once('error', (e: NodeJS.ErrnoException) => resolve(e.code)) })
+        if (code === 'ECONNREFUSED') return true
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return false
+    }
     try {
       server.registerPrivateMcpEndpoint({ runId: 'landlock-service-proof', url: `http://127.0.0.1:${(endpoint.address() as AddressInfo).port}/mcp`, paths: { '': ['POST'] }, signal: lifetime.signal })
       const first = await dispatch('call-service')
       expect(first.status, first.text).toBe(200); expect(first.text).toContain('200 host-service-ok'); expect(first.text).not.toContain(secret)
       expect(calls).toEqual([`Bearer ${secret}`])
+      expect(await closed(await readFile(join(workspace, 'host-service-url'), 'utf8')), 'a completed run closes its claim listener').toBe(true)
       await rm(ready); held = dispatch('hold-service')
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { watcher.close(); reject(new Error('jailed host-service call did not finish')) }, 10_000)
@@ -654,10 +716,13 @@ if(process.argv.includes('--version')){console.log('fixture 1.0.0');process.exit
       expect((await fetch(url, { method: 'POST', body: '{}' })).status).toBe(200)
       console.log('two live claimed runs: own claims 200; second to first port EACCES; unconfined control 200')
       lifetime.abort()
-      await expect(fetch(url, { method: 'POST', body: '{}' })).rejects.toThrow()
+      // The held run keeps its port grant, so its revoked claim keeps the port bound and refuses.
+      const revoked = await fetch(url, { method: 'POST', body: '{}' }).then((r) => r.status, (e: Error & { cause?: { code?: string } }) => e.cause?.code ?? e.message)
+      expect(revoked, 'a revoked claim refuses while its run is alive').toBe(403)
       await writeFile(release, 'go')
       const completed = await held
       expect(completed.status, completed.text).toBe(200); expect(completed.text).toContain('host-service-ok')
+      expect(await closed(url), 'the held run closes its revoked claim listener on exit').toBe(true)
     } finally {
       lifetime.abort(); await writeFile(release, 'go'); await writeFile(join(workspace, 'second-host-service-release'), 'go')
       await Promise.all([held?.catch(() => undefined), secondHeld?.catch(() => undefined)])
