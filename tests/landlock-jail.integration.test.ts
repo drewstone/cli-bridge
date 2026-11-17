@@ -147,7 +147,8 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
 
   it('blocks Fast Open send syscalls and still mediates TCP_FASTOPEN_CONNECT', async () => {
     let connections = 0
-    const listener = createServer((socket) => { connections++; socket.on('error', () => {}); socket.end() })
+    const sockets = new Set<import('node:net').Socket>()
+    const listener = createServer((socket) => { connections++; sockets.add(socket); socket.once('close', () => sockets.delete(socket)); socket.on('error', () => {}); socket.end() })
     await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve))
     try {
       const port = (listener.address() as AddressInfo).port
@@ -181,8 +182,9 @@ else:
  raise AssertionError('TCP_FASTOPEN_CONNECT bypassed connect mediation')
 finally:
  s.close()`
-      const code = `const p=require('node:child_process').spawnSync('python3',['-I','-S','-c',${JSON.stringify(python)}],{encoding:'utf8'});require('node:assert/strict').equal(p.status,0,p.stderr);process.stdout.write(p.stdout)`
+      const code = `const p=require('node:child_process').spawnSync('python3',['-I','-S','-c',${JSON.stringify(python)}],{encoding:'utf8',timeout:5000});require('node:assert/strict').equal(p.status,0,p.error?.message || p.stderr);process.stdout.write(p.stdout)`
       const red = await run(code, spec(), true)
+      console.log('TFO control exit=' + red.code + ' ' + red.stderr.trim())
       expect(red.code, red.stderr).not.toBe(0); expect(red.stderr).toContain('MSG_FASTOPEN connected')
       await new Promise((resolve) => setTimeout(resolve, 100))
       expect(connections, 'unconfined Fast Open must reach the listener').toBe(1)
@@ -192,16 +194,21 @@ finally:
       await new Promise((resolve) => setTimeout(resolve, 100))
       expect(connections, 'jailed sends and connect must not reach the listener').toBe(1)
       console.log('TFO: unconfined connected; jailed sendto/sendmsg/sendmmsg EACCES; ' + green.stdout.trim())
-    } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
-  })
+    } finally { for (const socket of sockets) socket.destroy(); await new Promise<void>((resolve) => listener.close(() => resolve())) }
+  }, 15_000)
 
   it('requires credentials before opening a TCP relay and challenges plain HTTP requests', async () => {
     await expect(startEgressRelay({ tcp: true, allow: [] })).rejects.toThrow('requires proxy authorization')
     const relay = await startEgressRelay({ tcp: true, proxyAuthorization: 'Basic integration-only', allow: [] })
     try {
-      const response = await fetch(`http://127.0.0.1:${relay.port}/`)
+      const { get } = await import('node:http')
+      const response = await new Promise<{ status?: number; challenge?: string }>((resolve, reject) => {
+        get(`http://127.0.0.1:${relay.port}/`, (res) => {
+          res.resume(); res.once('end', () => resolve({ status: res.statusCode, challenge: res.headers['proxy-authenticate'] }))
+        }).once('error', reject)
+      })
       expect(response.status).toBe(407)
-      expect(response.headers.get('proxy-authenticate')).toBe('Basic realm="cli-bridge"')
+      expect(response.challenge).toBe('Basic realm="cli-bridge"')
     } finally { await relay.close() }
   })
 
@@ -290,9 +297,9 @@ print('socket filter enforced')`
   it('f: both backends unusable retain the floor refusal text', async () => {
     const tools = join(base, 'unavailable'); await mkdir(tools)
     for (const bin of ['bwrap', 'python3']) await writeFile(join(tools, bin), '#!/bin/sh\nexit 126\n', { mode: 0o700 })
-    const code = `import { startServer } from ${JSON.stringify(new URL('../src/server.ts', import.meta.url).href)};
+    const code = `import { startServer, loadConfig } from ${JSON.stringify(new URL('../src/server.ts', import.meta.url).href)};
       import a from 'node:assert/strict';
-      await a.rejects(startServer({config:${JSON.stringify(config())},cwd:${JSON.stringify(workspace)},quiet:true,handleSignals:false}),/CLI Bridge jail floor 'fs-jail' is unavailable/);`
+      await a.rejects(startServer({config:loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_BACKENDS:'codex',BRIDGE_DATA_DIR:${JSON.stringify(join(base, 'unavailable-state'))},BRIDGE_JAIL_MODE:'fs-jail',BRIDGE_JAIL_BACKEND:'landlock'}),cwd:${JSON.stringify(workspace)},quiet:true,handleSignals:false}),/CLI Bridge jail floor 'fs-jail' is unavailable/);`
     const result = await output(spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], {
       env: { ...process.env, PATH: tools }, stdio: ['ignore', 'pipe', 'pipe'],
     }))
@@ -310,6 +317,7 @@ print('socket filter enforced')`
       a.equal(new LinuxLandlockJail().isAvailable(),false);
       for(let i=0;i<2;i++){
         const p=await hostSpawner(process.execPath,['-e',"console.log('explicit-warn-fallback')"],{cwd:${JSON.stringify(workspace)},jail:${JSON.stringify(spec({ backend: 'landlock', fallback: 'warn' }))}});
+        p.child.stdout.on('data',b=>process.stdout.write(b));p.child.stderr.on('data',b=>process.stderr.write(b));
         await new Promise((resolve,reject)=>{p.child.once('error',reject);p.child.once('close',c=>{try{a.equal(c,0);resolve()}catch(e){reject(e)}})});p.release();
       }
       a.equal(readFileSync(${JSON.stringify(count)},'utf8'),'probe\\n');`
