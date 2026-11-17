@@ -260,7 +260,7 @@ finally:
     const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
     const payload = (host: string, port: number) => `const a=require('node:assert/strict'),http=require('node:http'),tls=require('node:tls'),fs=require('node:fs'),u=new URL(process.env.HTTPS_PROXY);
       const req=http.request({host:u.hostname,port:u.port,method:'CONNECT',path:${JSON.stringify(host + ':' + port)},headers:{'Proxy-Authorization':'Basic '+Buffer.from(u.username+':'+u.password).toString('base64')}});
-      req.on('connect',(res,socket)=>{a.equal(res.statusCode,200);const stream=tls.connect({socket,servername:${JSON.stringify(host)},ca:fs.readFileSync(${JSON.stringify(cert)})},()=>stream.write('GET / HTTP/1.1\r\nHost: '+${JSON.stringify(host)}+'\r\nConnection: close\r\n\r\n'));
+      req.on('connect',(res,socket)=>{a.equal(res.statusCode,200);const stream=tls.connect({socket,servername:${JSON.stringify(host)},ca:fs.readFileSync(${JSON.stringify(cert)})},()=>stream.write(${JSON.stringify('GET / HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n')}));
         let body='';stream.on('data',b=>body+=b);stream.on('end',()=>{a.match(body,/outer-proxy-ok!/);console.log('outer-proxy-request-ok')});stream.on('error',()=>{console.error('TLS refused');process.exitCode=1})});
       req.on('error',()=>{console.error('CONNECT refused');process.exitCode=1});req.end();setTimeout(()=>process.exit(2),5000).unref();`
     const request = async (host: string, port: number, proxy?: string, noProxy = '', lower = false) => {
