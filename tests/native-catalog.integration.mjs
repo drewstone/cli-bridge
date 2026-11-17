@@ -1,3 +1,5 @@
+// deploy-check: full run only. It needs the host's native Claude Code (~/.local/bin/claude) and passthrough model
+// routes; a Beelink gate has neither, so both of its runnable cases failed there (gate beelink2-1dcb75c7975fe88543bd683fd00a8ceb).
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import assert from 'node:assert/strict'
