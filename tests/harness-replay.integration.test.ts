@@ -282,7 +282,8 @@ it('does not promote a Pi configured model plus fingerprint from actual child st
   for await (const bytes of child.stdout) stdout += bytes.toString()
   await closed
   const identities = stdout.trim().split('\n').map((line) => piResponseIdentityFromEvent(JSON.parse(line)))
-  expect(identities[0]).toEqual({ model: 'configured-only@fp_control', systemFingerprint: 'fp_control' })
+  // A configured model with no observed response model is not provider evidence (3db7801).
+  expect(identities[0]).toBeUndefined()
   expect(identities[1]).toEqual({ model: 'observed-response@fp_actual', systemFingerprint: 'fp_actual' })
   const result = await collectNonStreaming((async function* () {
     for (const identity of identities) if (identity) yield { model: identity.model, system_fingerprint: identity.systemFingerprint }
