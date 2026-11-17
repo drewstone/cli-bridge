@@ -191,7 +191,7 @@ function readEnvInt(name: string, fallback: number, allowZero = false): number {
 }
 
 const hostSemaphore = new HostSemaphore(
-  readEnvInt('BRIDGE_HOST_MAX_CONCURRENCY', DEFAULT_MAX, true),
+  readEnvInt('BRIDGE_HOST_MAX_CONCURRENCY', DEFAULT_MAX, false),
   readEnvInt('BRIDGE_HOST_ACQUIRE_DEADLINE_MS', DEFAULT_ACQUIRE_DEADLINE_MS),
   readEnvInt('BRIDGE_HOST_MAX_ACQUIRE_DEADLINE_MS', DEFAULT_MAX_ACQUIRE_DEADLINE_MS),
 )
