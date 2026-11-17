@@ -1505,10 +1505,12 @@ describe('Pi inference credential isolation', () => {
 
       const alias = join(tempDir('cli-bridge-pi-session-alias-'), 'sessions')
       symlinkSync(cwd, alias)
+      // The shared jail isWithin resolves existing aliases, so the check before mkdir already refuses
+      // this one; the realpath check after mkdir stays for a root swapped between the two.
       await expect(provisionPiInferenceTransport(
         fixtureTransport({ sourceSessionDir: alias }),
         { sessionId: 'symlinked-inside', projectDir: cwd },
-      )).rejects.toThrow(/resolves inside the readable workspace/u)
+      )).rejects.toThrow(/inside the readable workspace/u)
     } finally {
       await Promise.all(provisioned.map(async (transport) => transport.cleanup()))
     }
