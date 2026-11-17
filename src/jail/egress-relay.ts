@@ -221,6 +221,7 @@ export interface EgressRelay {
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
   if (options.tcp && !options.proxyAuthorization) throw new Error('TCP egress relay requires proxy authorization')
+  const outerProxy = captureOuterProxy()
   const admitted = (options.trustedHostServices ?? []).map((registration) => {
     const service = services.get(registration)
     if (!service || service.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
@@ -316,7 +317,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
         }
         const upstream = intercepted.has(host)
           ? await openTunnel(options.intercept!.tunnel, host, port)
-          : await dial(host, port, allow)
+          : await dial(host, port, allow, outerProxy)
         clearTimeout(timer)
         if (client.destroyed) return void upstream.destroy()
         log(`allow host=${host}:${port}${intercepted.has(host) ? ' via=iron-proxy' : ''}`)
@@ -532,7 +533,35 @@ function readSni(buf: Buffer): string | undefined {
   return name
 }
 
-async function dial(host: string, port: number, allow: ReadonlySet<string>): Promise<Socket> {
+/** The bridge owns this configuration; never consult a jailed child's proxy URL. */
+function captureOuterProxy() {
+  const value = process.env.HTTPS_PROXY || process.env.https_proxy
+  if (!value) return undefined
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' || !url.hostname) throw new Error()
+    const authorization = url.username || url.password
+      ? 'Basic ' + Buffer.from(`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`).toString('base64') : undefined
+    return { host: url.hostname.replace(/^\[|\]$/gu, ''), port: Number(url.port || 80), authorization,
+      bypass: (process.env.NO_PROXY || process.env.no_proxy || '').toLowerCase().split(/[,\s]+/u).filter(Boolean) }
+  } catch { throw new Error('host HTTPS_PROXY requires a valid HTTP proxy URL') }
+}
+
+function bypassesProxy(host: string, port: number, entries: readonly string[]): boolean {
+  return entries.some((entry) => {
+    if (entry === '*') return true
+    const match = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/u.exec(entry)
+    if (!match || (match[2] && Number(match[2]) !== port)) return false
+    const raw = match[1]!.replace(/^\[|\]$/gu, '')
+    const suffixOnly = raw.startsWith('.') || raw.startsWith('*.')
+    const name = raw.replace(/^\*?\./u, '')
+    return (!suffixOnly && host === name) || host.endsWith('.' + name)
+  })
+}
+
+async function dial(host: string, port: number, allow: ReadonlySet<string>, proxy: ReturnType<typeof captureOuterProxy>): Promise<Socket> {
+  // The configured proxy is operator-named. CONNECT leaves target DNS to it.
+  if (proxy && !bypassesProxy(host, port, proxy.bypass)) return openTunnel(proxy, host, port)
   const literal = isIP(host) !== 0
   const addresses = literal ? [host] : (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address)
   const operatorNamed = literal && (allow.has(host) || allow.has(`${host}:${port}`))
@@ -541,19 +570,20 @@ async function dial(host: string, port: number, allow: ReadonlySet<string>): Pro
   return await connectTo(address, port)
 }
 
-/** CONNECT through iron-proxy's tunnel listener; resolves once it answers 200. */
-async function openTunnel(tunnel: { host: string; port: number }, host: string, port: number): Promise<Socket> {
+/** CONNECT through an operator-owned proxy; resolves once it answers 200. */
+async function openTunnel(tunnel: { host: string; port: number; authorization?: string }, host: string, port: number): Promise<Socket> {
   const socket = await connectTo(tunnel.host, tunnel.port)
-  socket.on('error', () => socket.destroy())
-  socket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`)
-  const { head, rest } = await readUntil(socket, (buf) => buf.indexOf('\r\n\r\n') >= 0 ? buf.indexOf('\r\n\r\n') + 4 : null)
-  if (!/^HTTP\/1\.[01] 200 /u.test(head.toString('latin1'))) {
-    socket.destroy()
-    throw new Error(`iron-proxy-refused host=${host}`)
-  }
-  if (rest.length) socket.unshift(rest)
-  socket.resume()
-  return socket
+  socket.setTimeout(NAME_DEADLINE_MS, () => socket.destroy(new Error('proxy-connect-timeout')))
+  try {
+    const target = `${isIP(host) === 6 ? `[${host}]` : host}:${port}`
+    socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${tunnel.authorization ? `Proxy-Authorization: ${tunnel.authorization}\r\n` : ''}\r\n`)
+    const { head, rest } = await readUntil(socket, (buf) => buf.indexOf('\r\n\r\n') >= 0 ? buf.indexOf('\r\n\r\n') + 4 : null)
+    if (!/^HTTP\/1\.[01] 200 /u.test(head.toString('latin1'))) throw new Error(`proxy-refused host=${host}`)
+    socket.setTimeout(0)
+    if (rest.length) socket.unshift(rest)
+    socket.resume()
+    return socket
+  } catch (error) { socket.destroy(); throw error }
 }
 
 function connectTo(host: string, port: number): Promise<Socket> {

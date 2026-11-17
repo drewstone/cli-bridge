@@ -75,7 +75,7 @@ def restrict_sockets(libc):
         (0x15, 1, 0, socket_nr),         # 7: socket -> domain (9)
         (0x15, 0, 11, pair_nr),          # 8: socketpair -> domain, others ALLOW (20)
         (0x20, 0, 0, 16),                # 9: load domain
-        (0x15, 9, 0, 1),                 # 10: AF_UNIX -> ALLOW (20)
+        (0x15, 9, 0, 1),                 # 10: AF_UNIX socketpair -> ALLOW (20)
         (0x15, 1, 0, 2),                 # 11: AF_INET -> type (13)
         (0x15, 0, 6, 10),                # 12: AF_INET6, otherwise EACCES (19)
         (0x20, 0, 0, 24),                # 13: load type
@@ -99,7 +99,21 @@ def restrict_sockets(libc):
             (0x06, 0, 0, 0x0005000d),
             (0x20, 0, 0, 0),              # restore syscall before next dispatch
         ])
-    instructions[6:6] = fastopen
+    # Pathname Unix connects bypass Landlock. Only connected stream pairs are local-only.
+    # Datagram pairs can be retargeted to pathname peers with connect/sendto.
+    instructions[6:6] = fastopen + [
+        (0x15, 0, 3, socket_nr),
+        (0x20, 0, 0, 16),
+        (0x15, 0, 1, 1),                 # socket(AF_UNIX) -> EACCES
+        (0x06, 0, 0, 0x0005000d),
+        (0x20, 0, 0, 0),
+        (0x15, 0, 4, pair_nr),
+        (0x20, 0, 0, 24),
+        (0x54, 0, 0, 0xfff7f7ff),        # strip CLOEXEC | NONBLOCK
+        (0x15, 1, 0, 1),                 # stream socketpair only
+        (0x06, 0, 0, 0x0005000d),
+        (0x20, 0, 0, 0),
+    ]
     filters = (SockFilter * len(instructions))(*(SockFilter(*i) for i in instructions))
     program = SockFprog(len(filters), filters)
     check(libc.prctl(22, 2, ctypes.byref(program), 0, 0))  # PR_SET_SECCOMP, FILTER
