@@ -175,14 +175,16 @@ print('socket filter enforced')`
 
   it('preserves a global Git config, relative includes and conditional includes at read-only snapshot paths', async () => {
     const previous = process.env.GIT_CONFIG_GLOBAL
-    const config = join(base, 'global-gitconfig'), included = join(base, 'included-gitconfig')
+    const config = join(base, 'global-gitconfig'), included = join(base, 'included-gitconfig'), conditional = join(base, 'conditional-gitconfig')
+    expect(spawnSync('git', ['init', '-q', workspace]).status).toBe(0)
     await writeFile(included, '[review]\n included = preserved\n')
-    await writeFile(config, '[review]\n value = global\n[include]\n path = ./included-gitconfig\n[includeIf "gitdir:' + workspace + '/.git"]\n path = ./included-gitconfig\n')
+    await writeFile(conditional, '[review]\n conditional = matched\n')
+    await writeFile(config, '[review]\n value = global\n[include]\n path = ./included-gitconfig\n[includeIf "gitdir:' + workspace + '/.git"]\n path = ./conditional-gitconfig\n')
     process.env.GIT_CONFIG_GLOBAL = config
     try {
       const result = await run(`const a=require('node:assert/strict'),fs=require('node:fs'),cp=require('node:child_process');
-        for(const [key,value] of [['review.value','global'],['review.included','preserved']]){
-          const p=cp.spawnSync('git',['config','--includes','--global','--get',key],{encoding:'utf8'});a.equal(p.status,0,p.stderr);a.equal(p.stdout.trim(),value)}
+        for(const [key,value] of [['review.value','global'],['review.included','preserved'],['review.conditional','matched']]){
+          const p=cp.spawnSync('git',['config','--get',key],{encoding:'utf8'});a.equal(p.status,0,p.stderr);a.equal(p.stdout.trim(),value)}
         a.throws(()=>fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL,'changed'),{code:'EACCES'});
         a.throws(()=>fs.readFileSync(${JSON.stringify(config)}),{code:'EACCES'});`, spec())
       expect(result.code, result.stderr).toBe(0)
