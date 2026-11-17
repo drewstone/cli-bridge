@@ -1268,3 +1268,4 @@ bound. A capture that commits no manifest removes the payloads it wrote. macOS d
 API jobs are unsupported by this producer. The filesystem jail's network policy
 also applies to local MCP/Hub URLs; an unjailed authentication test does not prove
 their reachability from a jailed native process.
+
