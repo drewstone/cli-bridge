@@ -158,6 +158,8 @@ export function jailEnv(root: string): Record<string, string> {
   return {
     HOME: root,
     TMPDIR: join(root, '.tmp'),
+    // Claude Code ignores TMPDIR and writes /tmp/claude-<uid>, which seatbelt denies (EPERM).
+    CLAUDE_CODE_TMPDIR: join(root, '.tmp'),
     XDG_CONFIG_HOME: join(root, '.config'),
     XDG_CACHE_HOME: join(root, '.cache'),
     XDG_DATA_HOME: join(root, '.local', 'share'),
