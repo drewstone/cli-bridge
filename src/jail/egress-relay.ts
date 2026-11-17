@@ -213,6 +213,8 @@ export interface EgressRelayOptions {
     tunnel: { host: string; port: number }
   }
   trustedHostServices?: readonly TrustedHostServiceRegistration[]
+  /** Captured `BRIDGE_JAIL_OUTER_PROXY_ENFORCED`; the relay never reads it from the environment. */
+  outerProxyEnforced?: boolean
   log?: (line: string) => void
 }
 
@@ -223,7 +225,8 @@ export interface EgressRelay {
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
   if (options.tcp && !options.proxyAuthorization) throw new Error('TCP egress relay requires proxy authorization')
-  const outerProxy = captureOuterProxy()
+  // Namespace relays and relays with no allowed host dial directly.
+  const outerProxy = options.tcp && options.allow.length ? captureOuterProxy(options.outerProxyEnforced) : undefined
   // A declaration alone is insufficient: require live policy refusals, not
   // authentication failures, DNS errors or an unreachable proxy. Never fall back.
   if (outerProxy) for (const host of ['127.0.0.1', 'localhost']) {
@@ -493,7 +496,9 @@ function readUntil(
     if (check()) return
     socket.on('data', onData)
     socket.once('end', onEnd)
-    socket.once('error', onEnd)
+    socket.once('error', reject)
+    // A destroy without an error emits only close.
+    socket.once('close', onEnd)
     socket.resume()
   })
 }
@@ -544,10 +549,10 @@ function readSni(buf: Buffer): string | undefined {
 }
 
 /** The bridge owns this configuration; never consult a jailed child's proxy URL. */
-function captureOuterProxy() {
+function captureOuterProxy(declared = false) {
   const value = process.env.HTTPS_PROXY || process.env.https_proxy
   if (!value) return undefined
-  if (process.env[JAIL_OUTER_PROXY_ENV] !== '1') {
+  if (!declared) {
     throw new Error(`host HTTPS_PROXY requires ${JAIL_OUTER_PROXY_ENV}=1 and verified private-destination refusals`)
   }
   try {
@@ -606,10 +611,14 @@ async function openTunnel(tunnel: { host: string; port: number; authorization?: 
 
 function connectTo(host: string, port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const socket = connect({ host, port, timeout: NAME_DEADLINE_MS }, () => { socket.off('error', reject); socket.setTimeout(0); resolve(socket) })
+    const onTimeout = () => { socket.destroy(); reject(new Error(`connect-timeout ${host}:${port}`)) }
+    // The connect deadline ends at connect; a caller's own timeout must not find this listener.
+    const socket = connect({ host, port, timeout: NAME_DEADLINE_MS }, () => {
+      socket.off('error', reject); socket.off('timeout', onTimeout); socket.setTimeout(0); resolve(socket)
+    })
     socket.setNoDelay(true)
     socket.once('error', reject)
-    socket.once('timeout', () => { socket.destroy(); reject(new Error(`connect-timeout ${host}:${port}`)) })
+    socket.once('timeout', onTimeout)
   })
 }
 
