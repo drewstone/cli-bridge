@@ -1007,6 +1007,10 @@ never substitutes another backend. An operator may explicitly select
 `BRIDGE_JAIL_BACKEND=landlock`; it needs an unprivileged user with no held Linux
 capabilities, `python3`, and an architecture and ABI accepted by
 `src/jail/landlock-exec.py`. Missing support preserves the startup refusal.
+Before a host switches to Landlock, one real claude turn and one real codex turn
+must pass under it on that host. At release only OpenCode had a real turn through
+the Landlock relay (a strict-egress Tangle Sandbox, kernel 6.8, ABI 4).
+Use the host's own subscription logins for those turns; never add an API key.
 The selected backend is captured with each request's operator policy, including
 when an embedded server loads configuration from a custom environment. No compiled
 helper or install step is required. macOS continues to use sandbox-exec unless an
