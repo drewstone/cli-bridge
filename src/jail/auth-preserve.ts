@@ -228,19 +228,20 @@ export async function gitConfigSources(cwd = process.cwd(), writablePaths: reado
   const cleanup = () => rm(directory, { recursive: true, force: true })
   const snapshots = new Map([...prepared.keys()].map((path, i) => [path, join(directory, String(i))]))
   const global = samePaths ? join(directory, 'global') : undefined
+  const relocate = (entries: Entry[]) => entries.map(({ key, value }) => ({ key,
+    value: samePaths && /^include(?:if\..*)?\.path$/i.test(key) && value ? snapshots.get(value) ?? value : value }))
   const binds: Array<{ source: string; destination: string }> = [], sources: JailAuthSource[] = []
   try {
     for (const [destination, entries] of prepared) {
       const source = snapshots.get(destination)!
-      const text = serialize(entries.map(({ key, value }) => ({ key,
-        value: samePaths && /^include(?:if\..*)?\.path$/i.test(key) && value ? snapshots.get(value) ?? value : value })))
+      const text = serialize(relocate(entries))
       await writeFile(source, text, { mode: 0o600 }); binds.push({ source, destination: samePaths ? source : destination })
       if (!samePaths) for (const [file, jailRel] of roots) if (file === destination) sources.push({ source, jailRel, mode: 'read-only' })
     }
     if (global) {
       // Git reads XDG before ~/.gitconfig; explicit GIT_CONFIG_GLOBAL has just one root.
-      const text = roots.slice().reverse().flatMap(([path]) => snapshots.has(path) ? [{ key: 'include.path', value: snapshots.get(path) }] : [])
-      await writeFile(global, serialize(text), { mode: 0o600 }); binds.push({ source: global, destination: global })
+      const text = roots.slice().reverse().flatMap(([path]) => prepared.get(path) ?? [])
+      await writeFile(global, serialize(relocate(text)), { mode: 0o600 }); binds.push({ source: global, destination: global })
     }
     const privacy = process.env.GIT_PRIVACY_DENYLIST || join(home, '.config/privacy/denylist')
     if (existsSync(privacy)) sources.push({ source: privacy, jailRel: '.config/privacy/denylist', mode: 'read-only', envVar: 'GIT_PRIVACY_DENYLIST' })

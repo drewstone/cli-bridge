@@ -109,7 +109,7 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
   })
 
   it('d: relay TCP port works, another loopback TCP port and all TCP binds fail', async () => {
-    const listener = createServer((socket) => socket.end('outside'))
+    const listener = createServer((socket) => { socket.on('error', () => {}); socket.end('outside') })
     await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve))
     try {
       const port = (listener.address() as AddressInfo).port
@@ -182,7 +182,7 @@ print('socket filter enforced')`
     try {
       const result = await run(`const a=require('node:assert/strict'),fs=require('node:fs'),cp=require('node:child_process');
         for(const [key,value] of [['review.value','global'],['review.included','preserved']]){
-          const p=cp.spawnSync('git',['config','--global','--get',key],{encoding:'utf8'});a.equal(p.status,0,p.stderr);a.equal(p.stdout.trim(),value)}
+          const p=cp.spawnSync('git',['config','--includes','--global','--get',key],{encoding:'utf8'});a.equal(p.status,0,p.stderr);a.equal(p.stdout.trim(),value)}
         a.throws(()=>fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL,'changed'),{code:'EACCES'});
         a.throws(()=>fs.readFileSync(${JSON.stringify(config)}),{code:'EACCES'});`, spec())
       expect(result.code, result.stderr).toBe(0)
