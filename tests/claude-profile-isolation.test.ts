@@ -115,6 +115,10 @@ describe('Claude profiles in a shared task workspace', () => {
       return { child, release() {}, spawnError: () => null }
     }
     const backend = new ClaudeBackend({ bin: 'claude', harness: 'claude-code', timeoutMs: 0, spawner })
+    // A bridge started from inside a Claude Code session inherits that session's identity.
+    const parentSession = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'parent', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/parent.sock' }
+    const saved = Object.fromEntries(Object.keys(parentSession).map((key) => [key, process.env[key]]))
+    Object.assign(process.env, parentSession)
     try {
       const req: ChatRequest = {
         cwd,
@@ -135,7 +139,12 @@ describe('Claude profiles in a shared task workspace', () => {
       expect(launch!.args).toContain('--settings')
       expect(launch!.args).not.toContain('--bare')
       expect(launch!.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1')
+      for (const key of Object.keys(parentSession)) expect(launch!.env[key], key).toBeUndefined()
     } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
       rmSync(cwd, { recursive: true, force: true })
     }
   })
