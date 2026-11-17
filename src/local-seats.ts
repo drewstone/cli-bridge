@@ -12,8 +12,9 @@ export interface LocalSeat {
   /** Native configured default, never a served model identity. */
   defaultModel?: string
   status: 'authenticated' | 'configured' | 'signed_out' | 'missing' | 'unknown'
-  authMode: 'subscription' | 'api_key' | 'unknown'
-  source: 'native_status' | 'native_store'
+  /** `free`: the harness's own catalog prices this exact model at zero and it needs no credential. */
+  authMode: 'subscription' | 'free' | 'api_key' | 'unknown'
+  source: 'native_status' | 'native_store' | 'native_catalog'
   fix?: string
 }
 
@@ -90,6 +91,14 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
           : auth.type === 'api' && typeof auth.key === 'string' && !!auth.key.trim() ? 'api_key' : 'unknown'
         Object.assign(fact, { provider: mode === 'unknown' ? null : options.provider, status: mode === 'unknown' ? 'unknown' : 'configured',
           authMode: mode, source: 'native_store', fix: 'opencode auth list --pure' })
+        // With no stored credential, OpenCode can still serve a model its own catalog prices at zero
+        // (`opencode/*-free` needs no login). That route spends nothing, so it is ready as a free route.
+        if (mode === 'unknown' && options.model) {
+          const listed = await probe(bin, ['models', options.provider, '--verbose'], native.env)
+          if (listed.code === 0 && opencodeFreeModel(listed.stdout, options.provider, options.model))
+            Object.assign(fact, { provider: options.provider, status: 'authenticated', authMode: 'free', source: 'native_catalog',
+              fix: `opencode models ${options.provider} --verbose` })
+        }
       } else if (key === 'opencode' && result.code === 0) {
         const output = (result.stdout + result.stderr).replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
         fact.authMode = /\boauth\b/iu.test(output) ? 'subscription' : /\bapi\b/iu.test(output) ? 'api_key' : 'unknown'
@@ -118,6 +127,21 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
   }))
   options.signal?.throwIfAborted()
   return results.map((result) => { if (result.status === 'rejected') throw result.reason; return result.value })
+}
+
+/**
+ * True when `opencode models <provider> --verbose` prices `<provider>/<model>` at zero for input,
+ * output and cache. The command prints each model's id line, then its catalog entry as a JSON
+ * object whose closing brace is the first unindented `}`. Anything unparsable is not free.
+ */
+function opencodeFreeModel(output: string, provider: string, model: string): boolean {
+  const lines = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '').split('\n').map((line) => line.trimEnd())
+  const start = lines.indexOf(`${provider}/${model}`), end = start < 0 ? -1 : lines.indexOf('}', start + 1)
+  if (start < 0 || lines[start + 1] !== '{' || end < 0) return false
+  try {
+    const cost = object(object(JSON.parse(lines.slice(start + 1, end + 1).join('\n'))).cost), cache = object(cost.cache)
+    return [cost.input, cost.output, cache.read ?? 0, cache.write ?? 0].every((value) => value === 0)
+  } catch { return false }
 }
 
 /** Read Gemini's selected native auth mode without retrieving a key from its keychain. */

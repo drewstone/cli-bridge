@@ -72,6 +72,14 @@ const CLAUDE_SEED_ENTRIES = ['.credentials.json', 'credentials.json', 'settings.
 /** OpenCode stores credentials beside a writable database and log directory. */
 const OPENCODE_SEED_ENTRIES = ['auth.json'] as const
 
+/**
+ * OpenCode 1.19 writes `.gitignore` (and plugin install files) into its global config directory at
+ * startup, so a read-only bind exits every jailed turn with `FileSystem.writeFile` before any model
+ * call. Seed the user's config surface; OpenCode recreates its own install files in the jail.
+ */
+const OPENCODE_CONFIG_SEED_ENTRIES = ['opencode.json', 'opencode.jsonc', 'config.json', 'AGENTS.md',
+  'agent', 'agents', 'command', 'commands', 'mode', 'modes', 'plugin', 'plugins', 'tool', 'tools', 'themes'] as const
+
 /** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME
  * override (matches how the backends resolve config/auth at runtime). */
 export function backendHome(): string {
@@ -129,9 +137,9 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     // OpenCode writes its database and logs below XDG_DATA_HOME before a turn.
     // Seed only auth.json so the jailed data directory stays small and writable.
     for (const entry of out) {
-      if (entry.jailRel !== '.local/share/opencode') continue
+      if (entry.jailRel !== '.local/share/opencode' && entry.jailRel !== '.config/opencode') continue
       entry.mode = 'seed-writable'
-      entry.only = [...OPENCODE_SEED_ENTRIES]
+      entry.only = [...(entry.jailRel === '.config/opencode' ? OPENCODE_CONFIG_SEED_ENTRIES : OPENCODE_SEED_ENTRIES)]
     }
   }
   if (backendName === 'kimi-code' || backendName === 'kimi') {
