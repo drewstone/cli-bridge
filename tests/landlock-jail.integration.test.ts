@@ -214,14 +214,14 @@ finally:
     } finally { await relay.close() }
   })
 
-  it('chains the bridge outer proxy without local target DNS, preserving NO_PROXY and the allowlist', async () => {
+  it('requires a verified private-destination policy for outer CONNECT, preserving NO_PROXY and the allowlist', async () => {
     const { createServer: httpServer } = await import('node:http')
     const { createServer: tlsServer } = await import('node:tls')
     const { connect } = await import('node:net')
     const { randomBytes } = await import('node:crypto')
     const key = join(workspace, 'outer-key.pem'), cert = join(workspace, 'outer-cert.pem')
     const generated = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert,
-      '-days', '1', '-subj', '/CN=relay-upstream.invalid', '-addext', 'subjectAltName=DNS:relay-upstream.invalid,DNS:localhost,IP:127.0.0.1'], { encoding: 'utf8' })
+      '-days', '1', '-subj', '/CN=example.com', '-addext', 'subjectAltName=DNS:example.com,DNS:localhost,IP:127.0.0.1'], { encoding: 'utf8' })
     expect(generated.status, generated.stderr).toBe(0)
     const sockets = new Set<import('node:net').Socket>()
     let tlsRequests = 0
@@ -236,7 +236,8 @@ finally:
     })
     origin.on('tlsClientError', () => {})
     const outer = httpServer()
-    const records: Array<{ target: string; authorized: boolean }> = []
+    const records: Array<{ target: string; authorized: boolean; phase: string }> = []
+    let phase = 'verification', privateStatus = 403
     const password = randomBytes(24).toString('hex')
     const expected = 'Basic ' + Buffer.from('operator:' + password).toString('base64')
     for (const server of [origin, outer]) server.on('connection', (socket) => {
@@ -246,8 +247,11 @@ finally:
     const originPort = (origin.address() as AddressInfo).port
     outer.on('connect', (req, socket, head) => {
       const authorized = req.headers['proxy-authorization'] === expected
-      records.push({ target: req.url!, authorized })
+      records.push({ target: req.url!, authorized, phase })
       if (!authorized) { socket.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n'); return }
+      if (req.url !== 'example.com:443' && privateStatus !== 200) {
+        socket.end(`HTTP/1.1 ${privateStatus} Refused\r\n\r\n`); return
+      }
       const upstream = connect(originPort, '127.0.0.1', () => {
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         if (head.length) upstream.write(head)
@@ -258,30 +262,43 @@ finally:
     })
     await new Promise<void>((resolve) => outer.listen(0, '127.0.0.1', resolve))
     const url = `http://operator:${password}@127.0.0.1:${(outer.address() as AddressInfo).port}`
-    const keys = ['HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy'] as const
+    const keys = ['HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy', 'BRIDGE_JAIL_OUTER_PROXY_ENFORCED'] as const
     const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
     const payload = (host: string, port: number) => `const a=require('node:assert/strict'),http=require('node:http'),tls=require('node:tls'),fs=require('node:fs'),u=new URL(process.env.HTTPS_PROXY);
-      const req=http.request({host:u.hostname,port:u.port,method:'CONNECT',path:${JSON.stringify(host + ':' + port)},headers:{'Proxy-Authorization':'Basic '+Buffer.from(u.username+':'+u.password).toString('base64')}});
+      const req=http.request({host:u.hostname,port:u.port,method:'CONNECT',path:${JSON.stringify((host.includes(':') ? '[' + host + ']' : host) + ':' + port)},headers:{'Proxy-Authorization':'Basic '+Buffer.from(u.username+':'+u.password).toString('base64')}});
       req.on('connect',(res,socket)=>{a.equal(res.statusCode,200);const stream=tls.connect({socket,servername:${JSON.stringify(host)},ca:fs.readFileSync(${JSON.stringify(cert)})},()=>stream.write(${JSON.stringify('GET / HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n')}));
         let body='';stream.on('data',b=>body+=b);stream.on('end',()=>{a.match(body,/outer-proxy-ok!/);console.log('outer-proxy-request-ok')});stream.on('error',()=>{console.error('TLS refused');process.exitCode=1})});
       req.on('error',()=>{console.error('CONNECT refused');process.exitCode=1});req.end();setTimeout(()=>process.exit(2),5000).unref();`
-    const request = async (host: string, port: number, proxy?: string, noProxy = '', lower = false) => {
+    const request = async (host: string, port: number, proxy?: string, noProxy = '', lower = false, declared = true) => {
       for (const key of keys) delete process.env[key]
       if (proxy) process.env[lower ? 'https_proxy' : 'HTTPS_PROXY'] = proxy
       process.env[lower ? 'no_proxy' : 'NO_PROXY'] = noProxy
-      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['relay-upstream.invalid', 'localhost', `127.0.0.1:${originPort}`] }))
+      if (proxy && declared) process.env.BRIDGE_JAIL_OUTER_PROXY_ENFORCED = '1'
+      phase = 'verification'
+      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['example.com', 'localhost', '127.0.0.1', '10.1.2.3', '::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', `127.0.0.1:${originPort}`] }))
+      phase = 'request'
       // Relay configuration must remain captured, even if the bridge environment changes afterwards.
       process.env.HTTPS_PROXY = 'http://127.0.0.1:1'; process.env.NO_PROXY = '*'
       try { return await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] })) }
       finally { await wrapped.cleanup?.() }
     }
     try {
-      let result = await request('relay-upstream.invalid', 443, url)
+      await expect(request('example.com', 443, url, '', false, false)).rejects.toThrow('BRIDGE_JAIL_OUTER_PROXY_ENFORCED')
+      expect(records).toHaveLength(0)
+      for (const status of [200, 407, 502]) {
+        privateStatus = status
+        await expect(request('example.com', 443, url)).rejects.toThrow('private-destination refusal not verified')
+      }
+      privateStatus = 403
+      let result = await request('example.com', 443, url, '', true)
       expect(result.code, result.stderr).toBe(0)
-      result = await request('localhost', 443, url, '', true)
-      expect(result.code, result.stderr).toBe(0)
-      expect(records).toEqual([{ target: 'relay-upstream.invalid:443', authorized: true }, { target: 'localhost:443', authorized: true }])
-      expect(tlsRequests).toBe(2)
+      expect(tlsRequests).toBe(1)
+      result = await request('localhost', 443, url)
+      expect(result.code, 'private destination through the outer proxy must be refused').not.toBe(0)
+      for (const host of ['127.0.0.1', '10.1.2.3', '::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1']) {
+        result = await request(host, 443, url)
+        expect(result.code, `private literal ${host} must be refused before CONNECT`).not.toBe(0)
+      }
       result = await request('localhost', 443)
       expect(result.code, 'direct private-address control must be refused').not.toBe(0)
       result = await request('localhost', 443, url, 'localhost:443')
@@ -290,15 +307,19 @@ finally:
       expect(result.code, result.stderr).toBe(0)
       result = await request('not-allowed.invalid', 443, url)
       expect(result.code, 'outer proxy must not bypass the relay allowlist').not.toBe(0)
-      expect(records).toHaveLength(2)
-      expect(tlsRequests).toBe(3)
-      console.log('outer CONNECT: unresolved/private targets succeed with Basic auth; direct private and unlisted targets refused; NO_PROXY operator-literal dial succeeds')
+      expect(records.filter((r) => r.phase === 'request')).toEqual([
+        { target: 'example.com:443', authorized: true, phase: 'request' },
+        { target: 'localhost:443', authorized: true, phase: 'request' },
+      ])
+      expect(records.every((r) => r.authorized)).toBe(true)
+      expect(tlsRequests).toBe(2)
+      console.log('outer CONNECT: public TLS request succeeds; private names refused by verified proxy; private literals refused before CONNECT; permissive/407/502 proxies and undeclared policy refuse startup; NO_PROXY direct control succeeds')
     } finally {
       for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key] }
       for (const socket of sockets) socket.destroy()
       await Promise.all([origin, outer].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))))
     }
-  }, 30_000)
+  }, 60_000)
 
   it('refuses pathname Unix sockets, including user-manager sockets, while the unconfined control connects', async () => {
     const { stat } = await import('node:fs/promises')
