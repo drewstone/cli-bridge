@@ -183,7 +183,7 @@ export async function claimTcpHostService(
   const service = services.get(claim.registration)!
   let relay: EgressRelay | undefined
   try {
-    relay = await startEgressRelay({ allow: [], tcp: true, trustedHostServices: [claim.registration] })
+    relay = await startRelay({ allow: [], tcp: true, trustedHostServices: [claim.registration] })
     const port = relay.port
     if (service.revoked || service.owner.revoked) throw new Error('trusted service was released during listener allocation')
     if (!port) throw new Error('trusted TCP service did not obtain a loopback port')
@@ -264,6 +264,12 @@ export interface EgressRelay {
 }
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
+  if (options.tcp && !options.proxyAuthorization) throw new Error('TCP egress relay requires proxy authorization')
+  return startRelay(options)
+}
+
+// Claim listeners authenticate their random URL in serveHostService; they are not CONNECT proxies.
+async function startRelay(options: EgressRelayOptions): Promise<EgressRelay> {
   const admitted = availableServices(options.trustedHostServices)
   if (!options.tcp) {
     if (admitted.some((service) => service.tcp)) throw new Error('TCP service registration requires the TCP transport')
@@ -307,7 +313,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     (req, res) => {
       // A connection authorizes one parsed request, never a raw HTTP tunnel.
       res.setHeader('connection', 'close')
-      if (!authorized(req)) { res.writeHead(407); res.end(); return }
+      if (!authorized(req)) { res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="cli-bridge"' }); res.end(); return }
       if (used.has(req.socket)) return void req.socket.destroy()
       used.add(req.socket)
       void serveHostService(req, res, routes, expectedHost).catch(() => {
@@ -335,7 +341,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   })
   server.on('connect', (req, socket, rest) => {
     const client = socket as Socket
-    if (!authorized(req)) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n'); return }
+    if (!authorized(req)) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="cli-bridge"\r\nConnection: close\r\n\r\n'); return }
     if (used.has(client)) return void client.destroy()
     used.add(client)
     client.pause()
