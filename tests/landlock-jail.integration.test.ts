@@ -1,7 +1,7 @@
 /** Real kernel confinement, including deliberately unconfined negative controls. */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { link, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
-import { createServer, type AddressInfo } from 'node:net'
+import { connect, createServer, type AddressInfo } from 'node:net'
 import { createServer as createHttpServer } from 'node:http'
 import { watch } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -628,7 +628,7 @@ print('socket filter enforced')`
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
   })
 
-  it('routes protected host-service claims only to their owning jailed run and closes them on release', async () => {
+  it('routes protected host-service claims only to their owning jailed run, refuses them once revoked and closes them after the run', async () => {
     const secret = 'host-service-proof-canary-7b9e'
     const calls: string[] = []
     const endpoint = createHttpServer(async (request, response) => {
@@ -673,11 +673,22 @@ if(process.argv.includes('--version')){console.log('fixture 1.0.0');process.exit
           headers: { Authorization: { kind: 'secret-ref', key: 'host-service-key', format: 'bearer' } } } } } }) })
       .then(async (response) => ({ status: response.status, text: await response.text() }))
     let held: ReturnType<typeof dispatch> | undefined, secondHeld: ReturnType<typeof dispatch> | undefined
+    // Spawn cleanup runs after the response, so poll with bare connects; no request reaches a live claim.
+    const closed = async (target: string) => {
+      for (let i = 0; i < 100; i++) {
+        const code = await new Promise<string | undefined>((resolve) => { const s = connect(Number(new URL(target).port), '127.0.0.1')
+          s.once('connect', () => { s.destroy(); resolve('open') }); s.once('error', (e: NodeJS.ErrnoException) => resolve(e.code)) })
+        if (code === 'ECONNREFUSED') return true
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return false
+    }
     try {
       server.registerPrivateMcpEndpoint({ runId: 'landlock-service-proof', url: `http://127.0.0.1:${(endpoint.address() as AddressInfo).port}/mcp`, paths: { '': ['POST'] }, signal: lifetime.signal })
       const first = await dispatch('call-service')
       expect(first.status, first.text).toBe(200); expect(first.text).toContain('200 host-service-ok'); expect(first.text).not.toContain(secret)
       expect(calls).toEqual([`Bearer ${secret}`])
+      expect(await closed(await readFile(join(workspace, 'host-service-url'), 'utf8')), 'a completed run closes its claim listener').toBe(true)
       await rm(ready); held = dispatch('hold-service')
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { watcher.close(); reject(new Error('jailed host-service call did not finish')) }, 10_000)
@@ -705,10 +716,13 @@ if(process.argv.includes('--version')){console.log('fixture 1.0.0');process.exit
       expect((await fetch(url, { method: 'POST', body: '{}' })).status).toBe(200)
       console.log('two live claimed runs: own claims 200; second to first port EACCES; unconfined control 200')
       lifetime.abort()
-      await expect(fetch(url, { method: 'POST', body: '{}' })).rejects.toThrow()
+      // The held run keeps its port grant, so its revoked claim keeps the port bound and refuses.
+      const revoked = await fetch(url, { method: 'POST', body: '{}' }).then((r) => r.status, (e: Error & { cause?: { code?: string } }) => e.cause?.code ?? e.message)
+      expect(revoked, 'a revoked claim refuses while its run is alive').toBe(403)
       await writeFile(release, 'go')
       const completed = await held
       expect(completed.status, completed.text).toBe(200); expect(completed.text).toContain('host-service-ok')
+      expect(await closed(url), 'the held run closes its revoked claim listener on exit').toBe(true)
     } finally {
       lifetime.abort(); await writeFile(release, 'go'); await writeFile(join(workspace, 'second-host-service-release'), 'go')
       await Promise.all([held?.catch(() => undefined), secondHeld?.catch(() => undefined)])

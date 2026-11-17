@@ -242,7 +242,8 @@ function revokeService(service: HostService): void {
   service.owner.claims.delete(service)
   for (const drop of service.active) drop()
   service.active.clear()
-  if (service.tcp) void service.tcp.close()
+  // An adopted port stays bound, answering 403, until its spawn's cleanup closes it.
+  if (service.tcp && !service.claimed) void service.tcp.close()
 }
 
 export interface EgressRelayOptions {
