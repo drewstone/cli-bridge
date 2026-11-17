@@ -94,10 +94,11 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
         // With no stored credential, OpenCode can still serve a model its own catalog prices at zero
         // (`opencode/*-free` needs no login). That route spends nothing, so it is ready as a free route.
         if (mode === 'unknown' && options.model) {
-          const listed = await probe(bin, ['models', options.provider, '--verbose'], native.env)
+          // `--pure`: the turn's config loads Bridge plugins, whose cold start outlasts the probe timeout.
+          const listed = await probe(bin, ['models', options.provider, '--verbose', '--pure'], native.env)
           if (listed.code === 0 && opencodeFreeModel(listed.stdout, options.provider, options.model))
             Object.assign(fact, { provider: options.provider, status: 'authenticated', authMode: 'free', source: 'native_catalog',
-              fix: `opencode models ${options.provider} --verbose` })
+              fix: `opencode models ${options.provider} --verbose --pure` })
         }
       } else if (key === 'opencode' && result.code === 0) {
         const output = (result.stdout + result.stderr).replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
