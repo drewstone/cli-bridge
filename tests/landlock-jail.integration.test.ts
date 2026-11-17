@@ -247,7 +247,8 @@ finally:
       const authorized = req.headers['proxy-authorization'] === expected
       records.push({ target: req.url!, authorized, phase })
       if (!authorized) { socket.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n'); return }
-      if (req.url !== 'example.com:443' && privateStatus !== 200) {
+      // After startup verification, the proxy is deliberately permissive: local targets must never reach CONNECT.
+      if (req.url !== 'example.com:443' && phase === 'verification' && privateStatus !== 200) {
         socket.end(`HTTP/1.1 ${privateStatus} Refused\r\n\r\n`); return
       }
       const upstream = connect(originPort, '127.0.0.1', () => {
@@ -273,7 +274,7 @@ finally:
       process.env[lower ? 'no_proxy' : 'NO_PROXY'] = noProxy
       if (proxy && declared) process.env.BRIDGE_JAIL_OUTER_PROXY_ENFORCED = '1'
       phase = 'verification'
-      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['example.com', 'localhost', '127.0.0.1', '10.1.2.3', '::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', `127.0.0.1:${originPort}`] }))
+      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['example.com', 'localhost', 'localhost.', 'service.localhost', 'service.localhost.', '127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', `127.0.0.1:${originPort}`] }))
       phase = 'request'
       // Relay configuration must remain captured, even if the bridge environment changes afterwards.
       process.env.HTTPS_PROXY = 'http://127.0.0.1:1'; process.env.NO_PROXY = '*'
@@ -291,9 +292,11 @@ finally:
       let result = await request('example.com', 443, url, '', true)
       expect(result.code, result.stderr).toBe(0)
       expect(tlsRequests).toBe(1)
-      result = await request('localhost', 443, url)
-      expect(result.code, 'private destination through the outer proxy must be refused').not.toBe(0)
-      for (const host of ['127.0.0.1', '10.1.2.3', '::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1']) {
+      for (const host of ['localhost', 'localhost.', 'service.localhost', 'service.localhost.']) {
+        result = await request(host, 443, url)
+        expect(result.code, `local name ${host} must be refused before CONNECT`).not.toBe(0)
+      }
+      for (const host of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1']) {
         result = await request(host, 443, url)
         expect(result.code, `private literal ${host} must be refused before CONNECT`).not.toBe(0)
       }
@@ -307,11 +310,10 @@ finally:
       expect(result.code, 'outer proxy must not bypass the relay allowlist').not.toBe(0)
       expect(records.filter((r) => r.phase === 'request')).toEqual([
         { target: 'example.com:443', authorized: true, phase: 'request' },
-        { target: 'localhost:443', authorized: true, phase: 'request' },
       ])
       expect(records.every((r) => r.authorized)).toBe(true)
       expect(tlsRequests).toBe(2)
-      console.log('outer CONNECT: public TLS request succeeds; private names refused by verified proxy; private literals refused before CONNECT; permissive/407/502 proxies and undeclared policy refuse startup; NO_PROXY direct control succeeds')
+      console.log('outer CONNECT: public TLS request succeeds; private/local targets refused before CONNECT even with permissive proxy; private literals refused before CONNECT; permissive/407/502 proxies and undeclared policy refuse startup; NO_PROXY direct control succeeds')
     } finally {
       for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key] }
       for (const socket of sockets) socket.destroy()
