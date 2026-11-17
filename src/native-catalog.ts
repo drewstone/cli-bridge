@@ -17,7 +17,8 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader, 
   const context = (cwd: string, signal?: AbortSignal, sourceEnv: NodeJS.ProcessEnv = process.env, flags?: readonly string[]) => {
     const cache = new Map<string, Promise<NativeModelFacts>>()
     return (row: CatalogRow): Promise<NativeModelFacts> => {
-      const key = `${row.backend}:${row.provider ?? ''}:${row.backend === 'codex' || row.backend === 'pi' ? row.id : ''}`
+      // OpenCode facts depend on the model too: a credential-free provider serves only its zero-cost models.
+      const key = `${row.backend}:${row.provider ?? ''}:${row.backend === 'codex' || row.backend === 'pi' || row.backend === 'opencode' ? row.id : ''}`
       const pending = cache.get(key)
       if (pending) return pending
       const descriptor = localHarnesses.find(([, harness]) => harness === row.backend)
@@ -61,7 +62,8 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader, 
           facts.provider = null
           if (!facts.fix && descriptor) facts.fix = [descriptor[0], ...descriptor[3]].join(' ')
         }
-        if (!facts.provider || facts.status !== 'authenticated' || facts.authMode !== 'subscription') refuse(facts)
+        // Subscriptions-only refuses per-token spend; a route the harness's own catalog prices at zero spends nothing.
+        if (!facts.provider || facts.status !== 'authenticated' || (facts.authMode !== 'subscription' && facts.authMode !== 'free')) refuse(facts)
         checked = true
       }
       request.subscriptionAdmission = { check, require() {
