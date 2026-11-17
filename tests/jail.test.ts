@@ -89,6 +89,8 @@ describe('MacosSeatbeltJail.wrap', () => {
     expect(wrap.env?.HOME).toBe(expectedRoot)
     expect(wrap.env?.XDG_CONFIG_HOME).toBe(join(expectedRoot, '.config'))
     expect(wrap.env?.XDG_CACHE_HOME).toBe(join(expectedRoot, '.cache'))
+    // Claude Code 2.1.3xx ignores TMPDIR; without this it failed `EPERM ... open '/tmp/claude-501'`.
+    expect(wrap.env?.CLAUDE_CODE_TMPDIR).toBe(join(expectedRoot, '.tmp'))
   })
 
   it('links the host keychain directory into the jail HOME', async () => {
