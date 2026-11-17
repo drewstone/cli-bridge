@@ -136,7 +136,7 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
 
   const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
-  if (`${socketPath}65535`.length > MAX_SOCKET_PATH) {
+  if (transport !== 'tcp-port' && `${socketPath}65535`.length > MAX_SOCKET_PATH) {
     await rm(shared, { recursive: true, force: true })
     throw new Error(`egress socket path exceeds ${MAX_SOCKET_PATH} bytes; set TMPDIR to a shorter directory`)
   }

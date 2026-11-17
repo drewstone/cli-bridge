@@ -10,6 +10,7 @@ import { prepareEgress } from './egress.js'
 import { prepareLinuxPaths, whichPath } from './linux-paths.js'
 import { canonicalizeJailPath, isWithin, type JailBackend, type JailSpec, type JailWrap } from './types.js'
 
+let available: boolean | undefined
 const LAUNCHER = fileURLToPath(new URL('./landlock-exec.py', import.meta.url))
 const refuse = (reason: string): never => { throw new BackendError(`Landlock jail refuses ${reason}`, 'not_configured') }
 
@@ -18,11 +19,12 @@ export class LinuxLandlockJail implements JailBackend {
   readonly networkCapability = 'tcp-port' as const
 
   isAvailable(): boolean {
-    if (process.platform !== 'linux') return false
+    if (available !== undefined) return available
+    if (process.platform !== 'linux') return available = false
     const python = whichPath('python3')
-    if (!python) return false
+    if (!python) return available = false
     const probe = spawnSync(canonicalizeJailPath(python), ['-I', '-S', LAUNCHER, '--probe'], { stdio: 'ignore', timeout: 5000 })
-    return probe.status === 0
+    return available = probe.status === 0
   }
 
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {

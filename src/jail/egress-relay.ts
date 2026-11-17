@@ -220,6 +220,7 @@ export interface EgressRelay {
 }
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
+  if (options.tcp && !options.proxyAuthorization) throw new Error('TCP egress relay requires proxy authorization')
   const admitted = (options.trustedHostServices ?? []).map((registration) => {
     const service = services.get(registration)
     if (!service || service.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
@@ -264,7 +265,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     (req, res) => {
       // A connection authorizes one parsed request, never a raw HTTP tunnel.
       res.setHeader('connection', 'close')
-      if (!authorized(req)) { res.writeHead(407); res.end(); return }
+      if (!authorized(req)) { res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="cli-bridge"' }); res.end(); return }
       if (used.has(req.socket)) return void req.socket.destroy()
       used.add(req.socket)
       void serveHostService(req, res, routes).catch(() => {
@@ -292,7 +293,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   })
   server.on('connect', (req, socket, rest) => {
     const client = socket as Socket
-    if (!authorized(req)) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n'); return }
+    if (!authorized(req)) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="cli-bridge"\r\nConnection: close\r\n\r\n'); return }
     if (used.has(client)) return void client.destroy()
     used.add(client)
     client.pause()

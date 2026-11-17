@@ -59,10 +59,10 @@ class SockFprog(ctypes.Structure):
 
 def restrict_sockets(libc):
     # seccomp_data: nr at 0, audit arch at 4, socket domain/type/protocol at 16/24/32.
-    arch, socket_nr, pair_nr = {
-        'x86_64': (0xc000003e, 41, 53),
-        'aarch64': (0xc00000b7, 198, 199),
-        'riscv64': (0xc00000f3, 198, 199),
+    arch, socket_nr, pair_nr, sendto_nr, sendmsg_nr, sendmmsg_nr = {
+        'x86_64': (0xc000003e, 41, 53, 44, 46, 307),
+        'aarch64': (0xc00000b7, 198, 199, 206, 211, 269),
+        'riscv64': (0xc00000f3, 198, 199, 206, 211, 269),
     }[platform.machine()]
     instructions = [
         (0x20, 0, 0, 4),                 # 0: load arch
@@ -88,6 +88,18 @@ def restrict_sockets(libc):
         (0x06, 0, 0, 0x7fff0000),        # 20: ALLOW
         (0x06, 0, 0, 0x00050026),        # 21: ERRNO ENOSYS; runtimes can fall back
     ]
+    # TFO sends can connect without security_socket_connect. seccomp_data.args
+    # starts at 16 with 8-byte slots; these little-endian ABIs put the low word first.
+    fastopen = []
+    for nr, offset in ((sendto_nr, 40), (sendmsg_nr, 32), (sendmmsg_nr, 40)):
+        fastopen.extend([
+            (0x15, 0, 3, nr),             # non-matching syscall -> reload nr
+            (0x20, 0, 0, offset),         # low 32 bits of flags
+            (0x45, 0, 1, 0x20000000),     # JSET MSG_FASTOPEN -> EACCES
+            (0x06, 0, 0, 0x0005000d),
+            (0x20, 0, 0, 0),              # restore syscall before next dispatch
+        ])
+    instructions[6:6] = fastopen
     filters = (SockFilter * len(instructions))(*(SockFilter(*i) for i in instructions))
     program = SockFprog(len(filters), filters)
     check(libc.prctl(22, 2, ctypes.byref(program), 0, 0))  # PR_SET_SECCOMP, FILTER
@@ -140,12 +152,13 @@ def restrict(policy):
             os.close(fd)
     # Bun/JSC reads maps for stack bounds and stat/statm/cgroup for runtime metrics.
     # Open the launcher's numeric PID without following /proc/self. Exec preserves it.
-    fd = open_path(libc, '/proc/' + str(os.getpid()))
-    try:
-        rule = PathRule(4 | 8, fd)  # READ_FILE | READ_DIR, never writes or sibling PIDs
-        check(libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0))
-    finally:
-        os.close(fd)
+    for name in ('maps', 'stat', 'statm', 'cgroup'):
+        fd = open_path(libc, '/proc/' + str(os.getpid()) + '/' + name)
+        try:
+            rule = PathRule(4, fd)  # READ_FILE only; no net/* or child PID grants
+            check(libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0))
+        finally:
+            os.close(fd)
     for port in policy.get('connect', []):
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise RuntimeError('invalid TCP port')

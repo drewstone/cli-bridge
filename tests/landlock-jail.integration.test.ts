@@ -10,6 +10,7 @@ import { hostSpawner } from '../src/executors/host.js'
 import { LinuxLandlockJail, selectJailBackend } from '../src/jail/index.js'
 import { configuredJailBackend, JAIL_HOST_EGRESS_ENV } from '../src/config.js'
 import { resolveJailSpec } from '../src/jail/resolve-spec.js'
+import { startEgressRelay } from '../src/jail/egress-relay.js'
 import type { JailSpec } from '../src/jail/types.js'
 import { loadConfig, startServer } from '../src/server.js'
 
@@ -125,7 +126,7 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
       const auth='Basic '+Buffer.from(u.username+':'+u.password).toString('base64');
       const check=(credential,status)=>new Promise((resolve,reject)=>{
         const s=net.connect(Number(u.port),'127.0.0.1',()=>s.write('CONNECT router.tangle.tools:443 HTTP/1.1\\r\\nHost: router.tangle.tools:443\\r\\n'+(credential?'Proxy-Authorization: '+credential+'\\r\\n':'')+'\\r\\n'));
-        s.once('error',reject);s.once('data',b=>{s.destroy();try{a.match(b.toString(),new RegExp('^HTTP/1.1 '+status));resolve()}catch(e){reject(e)}})});
+        s.once('error',reject);s.once('data',b=>{s.destroy();try{a.match(b.toString(),new RegExp('^HTTP/1.1 '+status));if(status===407)a.match(b.toString(),/Proxy-Authenticate: Basic realm="cli-bridge"/i);resolve()}catch(e){reject(e)}})});
       (async()=>{await check('',407);await check('Basic invalid',407);await check(auth,200);console.log(u.port);setInterval(()=>{},1000)})().catch(e=>{console.error(e);process.exitCode=1});`
     const relay = await hostSpawner(process.execPath, ['-e', relayCode], { cwd: workspace,
       jail: spec({ root: join(workspace, '.relay-home'), network: 'router' }), env: { PATH: process.env.PATH } })
@@ -143,6 +144,66 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
         s.once('error',e=>a.equal(e.code,'EACCES'));`)
     } finally { await relay.terminate?.(); relay.release() }
   }, 30_000)
+
+  it('blocks Fast Open send syscalls and still mediates TCP_FASTOPEN_CONNECT', async () => {
+    let connections = 0
+    const listener = createServer((socket) => { connections++; socket.on('error', () => {}); socket.end() })
+    await new Promise<void>((resolve) => listener.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = (listener.address() as AddressInfo).port
+      const python = `import ctypes,errno,platform,socket
+libc=ctypes.CDLL(None,use_errno=True)
+addr=('127.0.0.1',${port})
+s=socket.socket();s.settimeout(2)
+try:
+ s.sendto(b'x',0x20000000,addr)
+except OSError as e:
+ assert e.errno==errno.EACCES,e
+else:
+ raise AssertionError('MSG_FASTOPEN connected')
+finally:
+ s.close()
+# Null message pointers must not hide a missing seccomp denial behind EFAULT.
+# The extra bit verifies JSET rather than equality on flags; high bits are ignored.
+nrs=(44,46,307) if platform.machine()=='x86_64' else (206,211,269)
+for nr in nrs:
+ s=socket.socket()
+ args=(s.fileno(),0,0,ctypes.c_ulonglong(0x120000040)) if nr!=nrs[1] else (s.fileno(),0,ctypes.c_ulonglong(0x120000040))
+ result=libc.syscall(nr,*args);error=ctypes.get_errno();s.close()
+ assert result==-1 and error==errno.EACCES,(nr,result,error)
+s=socket.socket();s.settimeout(2);s.setsockopt(socket.IPPROTO_TCP,30,1)
+try:
+ s.connect(addr)
+except OSError as e:
+ assert e.errno==errno.EACCES,e
+ print('TCP_FASTOPEN_CONNECT connect returned EACCES')
+else:
+ raise AssertionError('TCP_FASTOPEN_CONNECT bypassed connect mediation')
+finally:
+ s.close()`
+      const code = `const p=require('node:child_process').spawnSync('python3',['-I','-S','-c',${JSON.stringify(python)}],{encoding:'utf8'});require('node:assert/strict').equal(p.status,0,p.stderr);process.stdout.write(p.stdout)`
+      const red = await run(code, spec(), true)
+      expect(red.code, red.stderr).not.toBe(0); expect(red.stderr).toContain('MSG_FASTOPEN connected')
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(connections, 'unconfined Fast Open must reach the listener').toBe(1)
+      const green = await run(code, spec())
+      expect(green.code, green.stderr).toBe(0)
+      expect(green.stdout).toContain('TCP_FASTOPEN_CONNECT connect returned EACCES')
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(connections, 'jailed sends and connect must not reach the listener').toBe(1)
+      console.log('TFO: unconfined connected; jailed sendto/sendmsg/sendmmsg EACCES; ' + green.stdout.trim())
+    } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
+  })
+
+  it('requires credentials before opening a TCP relay and challenges plain HTTP requests', async () => {
+    await expect(startEgressRelay({ tcp: true, allow: [] })).rejects.toThrow('requires proxy authorization')
+    const relay = await startEgressRelay({ tcp: true, proxyAuthorization: 'Basic integration-only', allow: [] })
+    try {
+      const response = await fetch(`http://127.0.0.1:${relay.port}/`)
+      expect(response.status).toBe(407)
+      expect(response.headers.get('proxy-authenticate')).toBe('Basic realm="cli-bridge"')
+    } finally { await relay.close() }
+  })
 
   it('enforces ordinary TCP sockets and refuses UDP, MPTCP, netlink and io_uring in descendants', async () => {
     const python = `import ctypes,errno,os,socket
@@ -173,6 +234,18 @@ print('socket filter enforced')`
     console.log('host MPTCP probe exit=' + mptcp.status + ' ' + (mptcp.stdout || mptcp.stderr).trim())
   })
 
+  it('allows git config --global writes when no host global config exists', async () => {
+    const previous = process.env.GIT_CONFIG_GLOBAL
+    delete process.env.GIT_CONFIG_GLOBAL
+    try {
+      const result = await run(`const a=require('node:assert/strict'),cp=require('node:child_process');
+        a.equal(process.env.GIT_CONFIG_GLOBAL,undefined);
+        let p=cp.spawnSync('git',['config','--global','review.local','writable'],{encoding:'utf8'});a.equal(p.status,0,p.stderr);
+        p=cp.spawnSync('git',['config','--global','--get','review.local'],{encoding:'utf8'});a.equal(p.status,0,p.stderr);a.equal(p.stdout.trim(),'writable');`, spec())
+      expect(result.code, result.stderr).toBe(0)
+    } finally { if (previous !== undefined) process.env.GIT_CONFIG_GLOBAL = previous }
+  })
+
   it('preserves a global Git config, relative includes and conditional includes at read-only snapshot paths', async () => {
     const previous = process.env.GIT_CONFIG_GLOBAL
     const config = join(base, 'global-gitconfig'), included = join(base, 'included-gitconfig'), conditional = join(base, 'conditional-gitconfig')
@@ -191,10 +264,11 @@ print('socket filter enforced')`
     } finally { if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = previous }
   })
 
-  it('reads only its own proc directory and refuses sibling process contents', async () => {
+  it('reads only own runtime proc files and refuses socket discovery and sibling contents', async () => {
     await discriminate('own proc grant', `const fs=require('node:fs'),a=require('node:assert/strict');
       a.match(fs.readFileSync('/proc/self/maps','utf8'),/r.xp/);
-      for(const p of ['/proc/${process.pid}/maps','/proc/${process.pid}/environ','/proc/stat'])a.throws(()=>fs.readFileSync(p),{code:'EACCES'});`)
+      for(const name of ['stat','statm','cgroup'])fs.readFileSync('/proc/self/'+name);
+      for(const p of ['/proc/self/net/tcp','/proc/self/net/tcp6','/proc/self/net/unix','/proc/self/environ','/proc/${process.pid}/maps','/proc/${process.pid}/environ','/proc/stat'])a.throws(()=>fs.readFileSync(p),{code:'EACCES'});`)
   })
 
   function config(allow = true, network: 'none' | 'relay' = 'none', selected = true) {
@@ -216,12 +290,36 @@ print('socket filter enforced')`
   it('f: both backends unusable retain the floor refusal text', async () => {
     const tools = join(base, 'unavailable'); await mkdir(tools)
     for (const bin of ['bwrap', 'python3']) await writeFile(join(tools, bin), '#!/bin/sh\nexit 126\n', { mode: 0o700 })
-    process.env.PATH = tools
-    try {
-      await expect(startServer({ config: config(), cwd: workspace, quiet: true, handleSignals: false }))
-        .rejects.toThrow("CLI Bridge jail floor 'fs-jail' is unavailable. Enable a supported jail backend, or unset the jail floor.")
-    } finally { process.env.PATH = forcePath }
+    const code = `import { startServer } from ${JSON.stringify(new URL('../src/server.ts', import.meta.url).href)};
+      import a from 'node:assert/strict';
+      await a.rejects(startServer({config:${JSON.stringify(config())},cwd:${JSON.stringify(workspace)},quiet:true,handleSignals:false}),/CLI Bridge jail floor 'fs-jail' is unavailable/);`
+    const result = await output(spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], {
+      env: { ...process.env, PATH: tools }, stdio: ['ignore', 'pipe', 'pipe'],
+    }))
+    expect(result.code, result.stderr).toBe(0)
   }, 60_000)
+
+  it('caches a timed-out probe across instances while retaining the warn fallback', async () => {
+    const tools = join(base, 'slow-probe'); await mkdir(tools)
+    const count = join(tools, 'probes')
+    await writeFile(join(tools, 'python3'), `#!/bin/sh\necho probe >> ${JSON.stringify(count)}\nexec /bin/sleep 30\n`, { mode: 0o700 })
+    const code = `import a from 'node:assert/strict';
+      import {readFileSync} from 'node:fs';
+      import {LinuxLandlockJail} from ${JSON.stringify(new URL('../src/jail/linux-landlock.ts', import.meta.url).href)};
+      import {hostSpawner} from ${JSON.stringify(new URL('../src/executors/host.ts', import.meta.url).href)};
+      a.equal(new LinuxLandlockJail().isAvailable(),false);
+      for(let i=0;i<2;i++){
+        const p=await hostSpawner(process.execPath,['-e',"console.log('explicit-warn-fallback')"],{cwd:${JSON.stringify(workspace)},jail:${JSON.stringify(spec({ backend: 'landlock', fallback: 'warn' }))}});
+        await new Promise((resolve,reject)=>{p.child.once('error',reject);p.child.once('close',c=>{try{a.equal(c,0);resolve()}catch(e){reject(e)}})});p.release();
+      }
+      a.equal(readFileSync(${JSON.stringify(count)},'utf8'),'probe\\n');`
+    const result = await output(spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], {
+      env: { ...process.env, PATH: tools }, stdio: ['ignore', 'pipe', 'pipe'],
+    }))
+    expect(result.code, result.stderr).toBe(0)
+    expect(result.stdout.match(/explicit-warn-fallback/g)).toHaveLength(2)
+    expect(result.stderr.match(/UNCONFINED/g)).toHaveLength(1)
+  }, 15_000)
 
   it('captures a custom-env Landlock selection independently of the daemon environment', async () => {
     process.env.BRIDGE_JAIL_BACKEND = 'bwrap'

@@ -227,7 +227,7 @@ export async function gitConfigSources(cwd = process.cwd(), writablePaths: reado
   const directory = await mkdtemp(join(parent, 'cli-bridge-git-'))
   const cleanup = () => rm(directory, { recursive: true, force: true })
   const snapshots = new Map([...prepared.keys()].map((path, i) => [path, join(directory, String(i))]))
-  const global = samePaths ? join(directory, 'global') : undefined
+  const global = samePaths && prepared.size > 0 ? join(directory, 'global') : undefined
   const relocate = (entries: Entry[]) => entries.map(({ key, value }) => ({ key,
     value: samePaths && /^include(?:if\..*)?\.path$/i.test(key) && value ? snapshots.get(value) ?? value : value }))
   const binds: Array<{ source: string; destination: string }> = [], sources: JailAuthSource[] = []
