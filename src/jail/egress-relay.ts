@@ -22,6 +22,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { JAIL_OUTER_PROXY_ENV } from '../config.js'
 import { lookup } from 'node:dns/promises'
 import {
   createServer,
@@ -222,6 +223,12 @@ export interface EgressRelay {
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
   if (options.tcp && !options.proxyAuthorization) throw new Error('TCP egress relay requires proxy authorization')
   const outerProxy = captureOuterProxy()
+  // A declaration alone is insufficient: require live policy refusals, not
+  // authentication failures, DNS errors or an unreachable proxy. Never fall back.
+  if (outerProxy) for (const host of ['127.0.0.1', 'localhost']) {
+    const probe = await openTunnel(outerProxy, host, HTTPS_PORT, 403)
+    probe.destroy()
+  }
   const admitted = (options.trustedHostServices ?? []).map((registration) => {
     const service = services.get(registration)
     if (!service || service.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
@@ -243,6 +250,8 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   const protectedValues = admitted.flatMap((service) => service.protectedValues).filter(Boolean)
   const log = (line: string) =>
     sink(protectedValues.reduce((value, secret) => value.split(secret).join('[redacted]'), line))
+
+  if (outerProxy) log('outer-proxy verified private-destination refusals')
 
   const permitted = (host: string, port: number): boolean => {
     if (intercepted.has(host)) return port === HTTPS_PORT
@@ -320,7 +329,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
           : await dial(host, port, allow, outerProxy)
         clearTimeout(timer)
         if (client.destroyed) return void upstream.destroy()
-        log(`allow host=${host}:${port}${intercepted.has(host) ? ' via=iron-proxy' : ''}`)
+        log(`allow host=${host}:${port}${intercepted.has(host) ? ' via=iron-proxy' : outerProxy && !bypassesProxy(host, port, outerProxy.bypass) ? ' via=outer-proxy' : ''}`)
         upstream.write(Buffer.concat([hello.head, hello.rest]))
         const drop = () => {
           upstream.destroy()
@@ -537,6 +546,9 @@ function readSni(buf: Buffer): string | undefined {
 function captureOuterProxy() {
   const value = process.env.HTTPS_PROXY || process.env.https_proxy
   if (!value) return undefined
+  if (process.env[JAIL_OUTER_PROXY_ENV] !== '1') {
+    throw new Error(`host HTTPS_PROXY requires ${JAIL_OUTER_PROXY_ENV}=1 and verified private-destination refusals`)
+  }
   try {
     const url = new URL(value)
     if (url.protocol !== 'http:' || !url.hostname) throw new Error()
@@ -561,7 +573,10 @@ function bypassesProxy(host: string, port: number, entries: readonly string[]): 
 
 async function dial(host: string, port: number, allow: ReadonlySet<string>, proxy: ReturnType<typeof captureOuterProxy>): Promise<Socket> {
   // The configured proxy is operator-named. CONNECT leaves target DNS to it.
-  if (proxy && !bypassesProxy(host, port, proxy.bypass)) return openTunnel(proxy, host, port)
+  if (proxy && !bypassesProxy(host, port, proxy.bypass)) {
+    if (isIP(host) && isBlockedAddress(host)) throw new Error(`blocked-address host=${host}`)
+    return openTunnel(proxy, host, port)
+  }
   const literal = isIP(host) !== 0
   const addresses = literal ? [host] : (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address)
   const operatorNamed = literal && (allow.has(host) || allow.has(`${host}:${port}`))
@@ -570,15 +585,17 @@ async function dial(host: string, port: number, allow: ReadonlySet<string>, prox
   return await connectTo(address, port)
 }
 
-/** CONNECT through an operator-owned proxy; resolves once it answers 200. */
-async function openTunnel(tunnel: { host: string; port: number; authorization?: string }, host: string, port: number): Promise<Socket> {
+/** CONNECT through an operator-owned proxy; verification requires a policy refusal. */
+async function openTunnel(tunnel: { host: string; port: number; authorization?: string }, host: string, port: number, expectedStatus = 200): Promise<Socket> {
   const socket = await connectTo(tunnel.host, tunnel.port)
   socket.setTimeout(NAME_DEADLINE_MS, () => socket.destroy(new Error('proxy-connect-timeout')))
   try {
     const target = `${isIP(host) === 6 ? `[${host}]` : host}:${port}`
     socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${tunnel.authorization ? `Proxy-Authorization: ${tunnel.authorization}\r\n` : ''}\r\n`)
     const { head, rest } = await readUntil(socket, (buf) => buf.indexOf('\r\n\r\n') >= 0 ? buf.indexOf('\r\n\r\n') + 4 : null)
-    if (!/^HTTP\/1\.[01] 200 /u.test(head.toString('latin1'))) throw new Error(`proxy-refused host=${host}`)
+    const status = /^HTTP\/1\.[01] (\d{3}) /u.exec(head.toString('latin1'))?.[1]
+    if (Number(status) !== expectedStatus) throw new Error(expectedStatus === 403
+      ? 'outer-proxy private-destination refusal not verified' : `proxy-refused host=${host}`)
     socket.setTimeout(0)
     if (rest.length) socket.unshift(rest)
     socket.resume()
@@ -605,9 +622,13 @@ function listen(server: Server, socketPath: string): Promise<void> {
 /** Private, loopback, link-local, CGNAT, benchmark, multicast, reserved, NAT64/6to4 and metadata ranges. */
 function isBlockedAddress(ip: string): boolean {
   if (isIP(ip) === 6) {
-    const v6 = ip.toLowerCase()
-    if (v6.startsWith('::ffff:')) return isBlockedAddress(v6.slice(7))
-    return v6 === '::1' || v6 === '::' || v6.startsWith('fe80:') || v6.startsWith('fc') || v6.startsWith('fd')
+    const v6 = new URL(`http://[${ip}]/`).hostname.slice(1, -1)
+    const mapped = /^::ffff:([0-9a-f]+):([0-9a-f]+)$/u.exec(v6)
+    if (mapped) {
+      const high = parseInt(mapped[1]!, 16), low = parseInt(mapped[2]!, 16)
+      return isBlockedAddress(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`)
+    }
+    return v6 === '::1' || v6 === '::' || /^fe[89ab]/u.test(v6) || v6.startsWith('fc') || v6.startsWith('fd')
       || v6.startsWith('64:ff9b:') || v6.startsWith('2002:') || v6.startsWith('ff')
   }
   const [a, b] = ip.split('.').map(Number)

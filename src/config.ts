@@ -43,6 +43,7 @@ type NativeHarnessConfig = {
 
 /** Operator assertion only; never accepted from a request or exposed as a capability key. */
 export const JAIL_HOST_EGRESS_ENV = 'BRIDGE_JAIL_HOST_EGRESS_ENFORCED'
+export const JAIL_OUTER_PROXY_ENV = 'BRIDGE_JAIL_OUTER_PROXY_ENFORCED'
 export function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean {
   return env[JAIL_HOST_EGRESS_ENV] === '1'
 }
