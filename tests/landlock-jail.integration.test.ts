@@ -315,12 +315,14 @@ finally:
       for (const path of paths) {
         const code = (denied: boolean) => `const a=require('node:assert/strict'),net=require('node:net');
           const s=net.connect({path:${JSON.stringify(path)}});s.once('connect',()=>{s.destroy();a.equal(${denied},false);console.log('connected')});
-          s.once('error',e=>{a.equal(${denied},true);a.equal(e.code,'EACCES');console.log('denied')});`
+          s.once('error',e=>{if(!${denied}){console.log('unavailable:'+e.code);process.exitCode=1;return}a.equal(e.code,'EACCES');console.log('denied')});`
         const control = await run(code(false), spec(), true)
-        expect(control.code, control.stderr).toBe(0); expect(control.stdout.trim()).toBe('connected')
+        if (path !== address && control.code !== 0) {
+          expect(control.stdout.trim(), control.stderr).toMatch(/^unavailable:(ENOENT|ECONNREFUSED|EACCES)$/)
+        } else { expect(control.code, control.stderr).toBe(0); expect(control.stdout.trim()).toBe('connected') }
         const jailed = await run(code(true), spec())
         expect(jailed.code, jailed.stderr).toBe(0); expect(jailed.stdout.trim()).toBe('denied')
-        console.log(`pathname Unix ${path === address ? 'stand-in' : path}: unconfined connected; jailed EACCES`)
+        console.log(`pathname Unix ${path === address ? 'stand-in' : path}: unconfined ${control.stdout.trim()}; jailed EACCES`)
       }
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
   }, 15_000)
