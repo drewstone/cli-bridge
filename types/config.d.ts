@@ -38,6 +38,7 @@ type NativeHarnessConfig = {
 };
 /** Operator assertion only; never accepted from a request or exposed as a capability key. */
 export declare const JAIL_HOST_EGRESS_ENV = "BRIDGE_JAIL_HOST_EGRESS_ENFORCED";
+export declare const JAIL_OUTER_PROXY_ENV = "BRIDGE_JAIL_OUTER_PROXY_ENFORCED";
 export declare function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean;
 /** Linux backend selection is operator-owned; bubblewrap remains the default. */
 export declare const JAIL_BACKEND_ENV = "BRIDGE_JAIL_BACKEND";
