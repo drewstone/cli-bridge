@@ -21,7 +21,7 @@
  * target directly and is exempt.
  */
 
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import {
   createServer,
@@ -31,7 +31,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http'
-import { connect, isIP, type Server, type Socket } from 'node:net'
+import { connect, isIP, type Server, type Socket, type AddressInfo } from 'node:net'
 import { readRequestBody, RequestTooLargeError } from '../backends/pi-inference-transport.js'
 
 /** Bytes buffered while waiting for the CONNECT head or the ClientHello. */
@@ -200,7 +200,9 @@ function revokeService(service: HostService): void {
 }
 
 export interface EgressRelayOptions {
-  socketPath: string
+  socketPath?: string
+  tcp?: boolean
+  proxyAuthorization?: string
   /** Reachable targets as `host` (port 443) or `host:port`. */
   allow: readonly string[]
   /** Hosts whose tunnels go to iron-proxy's CONNECT listener instead of the origin. */
@@ -213,6 +215,7 @@ export interface EgressRelayOptions {
 }
 
 export interface EgressRelay {
+  port?: number
   close(): Promise<void>
 }
 
@@ -244,6 +247,12 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     return allow.has(port === HTTPS_PORT ? host : `${host}:${port}`)
   }
 
+  const authorized = (req: IncomingMessage) => {
+    if (!options.proxyAuthorization) return true
+    const value = Buffer.from(req.headers['proxy-authorization'] ?? '')
+    const expected = Buffer.from(options.proxyAuthorization)
+    return value.length === expected.length && timingSafeEqual(value, expected)
+  }
   const open = new Set<Socket>()
   const used = new WeakSet<Socket>()
   const server = createServer(
@@ -255,6 +264,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     (req, res) => {
       // A connection authorizes one parsed request, never a raw HTTP tunnel.
       res.setHeader('connection', 'close')
+      if (!authorized(req)) { res.writeHead(407); res.end(); return }
       if (used.has(req.socket)) return void req.socket.destroy()
       used.add(req.socket)
       void serveHostService(req, res, routes).catch(() => {
@@ -282,6 +292,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   })
   server.on('connect', (req, socket, rest) => {
     const client = socket as Socket
+    if (!authorized(req)) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n'); return }
     if (used.has(client)) return void client.destroy()
     used.add(client)
     client.pause()
@@ -325,13 +336,15 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
       })
   })
   try {
-    await listen(server, options.socketPath)
+    if (options.tcp) await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+    else await listen(server, options.socketPath!)
   } catch (error) {
     for (const service of admitted) revokeService(service)
     throw error
   }
   // Close ends live tunnels too, so a held connection cannot delay the proxy kill and revoke.
   return {
+    port: options.tcp ? (server.address() as AddressInfo).port : undefined,
     close: () =>
       new Promise((resolve) => {
         for (const service of admitted) revokeService(service)

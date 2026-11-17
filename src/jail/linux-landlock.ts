@@ -1,21 +1,16 @@
 /** Landlock fallback: filesystem allowlist and TCP ports, without namespace isolation. */
 import { existsSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JAIL_HOST_EGRESS_ENV } from '../config.js'
 import { BackendError } from '../backends/types.js'
 import { prepareEgress } from './egress.js'
 import { prepareLinuxPaths, whichPath } from './linux-paths.js'
-import { canonicalizeJailPath, type JailBackend, type JailSpec, type JailWrap } from './types.js'
+import { canonicalizeJailPath, isWithin, type JailBackend, type JailSpec, type JailWrap } from './types.js'
 
 const LAUNCHER = fileURLToPath(new URL('./landlock-exec.py', import.meta.url))
-const beneath = (parent: string, path: string) => {
-  const rel = relative(canonicalizeJailPath(parent), canonicalizeJailPath(path))
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
-}
 const refuse = (reason: string): never => { throw new BackendError(`Landlock jail refuses ${reason}`, 'not_configured') }
 
 export class LinuxLandlockJail implements JailBackend {
@@ -38,13 +33,11 @@ export class LinuxLandlockJail implements JailBackend {
     const python = whichPath('python3')
     if (!python) refuse('an unavailable Python interpreter')
     const interpreter = canonicalizeJailPath(python!)
-    const policy = await prepareLinuxPaths(bin, spec)
+    const policy = await prepareLinuxPaths(bin, spec, true)
     if (interpreter.startsWith('/nix/store/')) policy.paths.push({ source: '/nix/store', destination: '/nix/store', writable: false, optional: true })
     let egress: Awaited<ReturnType<typeof prepareEgress>> | undefined
-    let directory: string | undefined
     const cleanup = async () => {
-      try { if (directory) await rm(directory, { recursive: true, force: true }) }
-      finally { try { await egress?.cleanup() } finally { await policy.cleanup() } }
+      try { await egress?.cleanup() } finally { await policy.cleanup() }
     }
     try {
       for (const path of policy.paths) {
@@ -53,15 +46,12 @@ export class LinuxLandlockJail implements JailBackend {
       const writable = policy.paths.filter((p) => p.writable)
       if (writable.some((p) => canonicalizeJailPath(p.source) !== resolve(p.source))) refuse('a redirected writable path')
       if (policy.paths.some((p) => !p.writable && (!p.optional || existsSync(p.source))
-        && writable.some((w) => beneath(w.source, p.source)))) refuse('a read-only path nested in a writable grant')
+        && writable.some((w) => isWithin(w.source, p.source)))) refuse('a read-only path nested in a writable grant')
       egress = await prepareEgress(spec, this.networkCapability)
       // Landlock grants are additive: a parent grant cannot mask a private subtree.
-      if (egress.hiddenParent && policy.paths.some((p) => beneath(p.source, egress!.hiddenParent!))) refuse('a path grant exposing the hidden egress directory')
-      if (writable.some((p) => beneath(p.source, LAUNCHER) || beneath(p.source, interpreter))) refuse('writable launcher or interpreter storage')
-      const parent = [tmpdir(), '/tmp'].find((p) => writable.every((rule) => !beneath(rule.source, p)))
-      if (!parent) refuse('policy storage inside writable paths')
-      directory = await mkdtemp(join(parent!, 'cli-bridge-landlock-'))
-      const file = join(directory, 'policy.json')
+      if (egress.hiddenParent && policy.paths.some((p) => isWithin(p.source, egress!.hiddenParent!))) refuse('a path grant exposing the hidden egress directory')
+      if (writable.some((p) => isWithin(p.source, LAUNCHER) || isWithin(p.source, interpreter))) refuse('writable launcher or interpreter storage')
+      const file = join(policy.directory, 'policy.json')
       const paths = policy.paths.map((p) => ({ path: p.source, writable: p.writable, optional: p.optional }))
       // Devices are individual grants; host /proc and the rest of /dev stay closed.
       for (const path of ['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom']) paths.push({ path, writable: true, optional: false })

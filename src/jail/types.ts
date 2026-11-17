@@ -227,3 +227,9 @@ export async function prepareJailHome(root: string): Promise<void> {
     await mkdir(join(root, rel), { recursive: true })
   }
 }
+
+/** Whether a path is a directory itself or beneath it, after resolving existing aliases. */
+export function isWithin(base: string, path: string): boolean {
+  const rel = relative(canonicalizeJailPath(resolve(base)), canonicalizeJailPath(resolve(path)))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+}

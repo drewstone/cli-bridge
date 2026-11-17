@@ -1,4 +1,4 @@
-import { configuredJailBackend, type LinuxJailBackend } from '../config.js'
+import { type LinuxJailBackend } from '../config.js'
 import { LinuxLandlockJail } from './linux-landlock.js'
 import { LinuxBwrapJail } from './linux-bwrap.js'
 import { MacosSeatbeltJail } from './macos-seatbelt.js'
@@ -86,7 +86,7 @@ export function registerJailArgumentRewrite(
 }
 
 export function selectJailBackend(
-  platform: NodeJS.Platform = process.platform, choice: LinuxJailBackend = configuredJailBackend(),
+  platform: NodeJS.Platform, choice: LinuxJailBackend,
 ): JailBackend {
   if (choice === 'landlock') return new LinuxLandlockJail()
   if (platform === 'linux') return new LinuxBwrapJail()

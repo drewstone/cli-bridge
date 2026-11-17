@@ -1,9 +1,7 @@
 /** Linux namespace jail. The shared path policy owns filesystem grants. */
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants } from 'node:fs'
-import { delimiter, join } from 'node:path'
 import { prepareEgress } from './egress.js'
-import { prepareLinuxPaths } from './linux-paths.js'
+import { prepareLinuxPaths, whichPath } from './linux-paths.js'
 import type { JailBackend, JailSpec, JailWrap } from './types.js'
 export { toolchainReadPaths, isSafeReadPath } from './linux-paths.js'
 const BWRAP_BIN = 'bwrap'
@@ -12,7 +10,7 @@ export class LinuxBwrapJail implements JailBackend {
   readonly name = 'bwrap'
   readonly networkCapability = 'namespace' as const
   isAvailable(): boolean {
-    return process.platform === 'linux' && onPath(BWRAP_BIN) && canRunUnprivileged()
+    return process.platform === 'linux' && !!whichPath(BWRAP_BIN) && canRunUnprivileged()
   }
   async wrap(bin: string, args: string[], spec: JailSpec): Promise<JailWrap> {
     const policy = await prepareLinuxPaths(bin, spec)
@@ -35,19 +33,6 @@ export class LinuxBwrapJail implements JailBackend {
         cleanup: async () => { try { await activeEgress.cleanup() } finally { await policy.cleanup() } } }
     } catch (error) { try { await egress?.cleanup() } finally { await policy.cleanup() }; throw error }
   }
-}
-
-function onPath(bin: string): boolean {
-  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
-    if (!dir) continue
-    try {
-      accessSync(join(dir, bin), constants.X_OK)
-      return true
-    } catch {
-      // not in this dir; keep scanning
-    }
-  }
-  return false
 }
 
 let probed: boolean | undefined

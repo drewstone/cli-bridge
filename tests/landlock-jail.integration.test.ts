@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { hostSpawner } from '../src/executors/host.js'
 import { LinuxLandlockJail, selectJailBackend } from '../src/jail/index.js'
-import { JAIL_HOST_EGRESS_ENV } from '../src/config.js'
+import { configuredJailBackend, JAIL_HOST_EGRESS_ENV } from '../src/config.js'
 import { resolveJailSpec } from '../src/jail/resolve-spec.js'
 import type { JailSpec } from '../src/jail/types.js'
 import { loadConfig, startServer } from '../src/server.js'
@@ -75,7 +75,7 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
     backendBin = join(workspace, 'codex.cjs')
     // Same native event protocol fixture as the existing jailed private-endpoint integration.
     await writeFile(backendBin, `#!${process.execPath}\nif(process.argv.includes('--version')) { console.log('fixture 1.0.0'); process.exit(0) }\nrequire('node:assert/strict').throws(()=>require('node:fs').readFileSync(${JSON.stringify(outside)}),{code:'EACCES'});\nfor(const e of [{type:'thread.started',thread_id:'00000000-0000-4000-8000-000000000043'},{type:'item.completed',item:{type:'agent_message',text:'confined-turn-ok'}},{type:'turn.completed',usage:{input_tokens:0,output_tokens:0}}]) console.log(JSON.stringify(e))\n`, { mode: 0o700 })
-    expect(selectJailBackend().name).toBe('landlock')
+    expect(selectJailBackend(process.platform, configuredJailBackend()).name).toBe('landlock')
     console.log(`kernel=${spawnSync('uname', ['-r'], { encoding: 'utf8' }).stdout.trim()} Landlock ABI=${probe.stdout.trim()}`)
   })
   afterAll(async () => {
@@ -118,6 +118,81 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
         (async()=>{a.equal(await connect(Number(new URL(process.env.HTTP_PROXY).port)),'ok');a.equal(await connect(${port}),'EACCES');
         const bound=await new Promise(r=>{const s=net.createServer();s.on('error',e=>r(e.code));s.listen(0,'127.0.0.1',()=>s.close(()=>r('ok')))});a.equal(bound,'EACCES')})().catch(e=>{console.error(e);process.exitCode=1})`, spec({ network: 'router', hostEgressEnforced: true }))
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
+  })
+
+  it('isolates a concurrent network-none spawn from an authenticated relay spawn', async () => {
+    const relayCode = `const net=require('node:net'),a=require('node:assert/strict'),u=new URL(process.env.HTTPS_PROXY);
+      const auth='Basic '+Buffer.from(u.username+':'+u.password).toString('base64');
+      const check=(credential,status)=>new Promise((resolve,reject)=>{
+        const s=net.connect(Number(u.port),'127.0.0.1',()=>s.write('CONNECT router.tangle.tools:443 HTTP/1.1\\r\\nHost: router.tangle.tools:443\\r\\n'+(credential?'Proxy-Authorization: '+credential+'\\r\\n':'')+'\\r\\n'));
+        s.once('error',reject);s.once('data',b=>{s.destroy();try{a.match(b.toString(),new RegExp('^HTTP/1.1 '+status));resolve()}catch(e){reject(e)}})});
+      (async()=>{await check('',407);await check('Basic invalid',407);await check(auth,200);console.log(u.port);setInterval(()=>{},1000)})().catch(e=>{console.error(e);process.exitCode=1});`
+    const relay = await hostSpawner(process.execPath, ['-e', relayCode], { cwd: workspace,
+      jail: spec({ root: join(workspace, '.relay-home'), network: 'router' }), env: { PATH: process.env.PATH } })
+    try {
+      const port = await new Promise<number>((resolve, reject) => {
+        let stderr = ''
+        const timer = setTimeout(() => reject(new Error('relay readiness timeout: ' + stderr)), 10_000)
+        relay.child.stderr!.on('data', (b) => { stderr += b })
+        relay.child.once('exit', (code) => { clearTimeout(timer); reject(new Error('relay exited ' + code + ': ' + stderr)) })
+        relay.child.stdout!.once('data', (b) => { clearTimeout(timer); resolve(Number(String(b).trim())) })
+      })
+      expect(port).toBeGreaterThan(0)
+      await discriminate('two-spawn relay isolation', `const a=require('node:assert/strict'),net=require('node:net');
+        const s=net.connect(${port},'127.0.0.1');s.once('connect',()=>{s.destroy();a.fail('borrowed concurrent relay')});
+        s.once('error',e=>a.equal(e.code,'EACCES'));`)
+    } finally { await relay.terminate?.(); relay.release() }
+  }, 30_000)
+
+  it('enforces ordinary TCP sockets and refuses UDP, MPTCP, netlink and io_uring in descendants', async () => {
+    const python = `import ctypes,errno,os,socket
+libc=ctypes.CDLL(None,use_errno=True)
+# Actual kernel probes, including MPTCP even when the host disables it.
+for family in (socket.AF_INET,socket.AF_INET6):
+ for kind in (socket.SOCK_STREAM,socket.SOCK_STREAM|socket.SOCK_CLOEXEC|socket.SOCK_NONBLOCK):
+  for protocol in (0,socket.IPPROTO_TCP):
+   s=socket.socket(family,kind,protocol);s.close()
+ for kind,protocol in ((socket.SOCK_DGRAM,0),(socket.SOCK_STREAM,262),(socket.SOCK_RAW,0)):
+  result=libc.socket(family,kind,protocol);error=ctypes.get_errno()
+  if result>=0: os.close(result)
+  assert result==-1 and error==errno.EACCES,(family,kind,protocol,result,error)
+result=libc.socket(socket.AF_NETLINK,socket.SOCK_RAW,4);error=ctypes.get_errno()
+if result>=0: os.close(result)
+assert result==-1 and error==errno.EACCES,(result,error)
+params=ctypes.create_string_buffer(256)
+result=libc.syscall(425,1,ctypes.byref(params));error=ctypes.get_errno()
+if result>=0: os.close(result)
+assert result==-1 and error==errno.ENOSYS,(result,error)
+# AF_UNIX stream/dgram socketpairs are needed by local IPC and remain usable.
+for kind in (socket.SOCK_STREAM,socket.SOCK_DGRAM):
+ a,b=socket.socketpair(socket.AF_UNIX,kind);a.send(b'ipc');assert b.recv(3)==b'ipc';a.close();b.close()
+print('socket filter enforced')`
+    const code = `const p=require('node:child_process').spawnSync('python3',['-I','-S','-c',${JSON.stringify(python)}],{encoding:'utf8'});require('node:assert/strict').equal(p.status,0,p.stderr);process.stdout.write(p.stdout)`
+    await discriminate('seccomp socket filter', code)
+    const mptcp = spawnSync('python3', ['-c', "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_STREAM,262); print('MPTCP enabled');s.close()"], { encoding: 'utf8' })
+    console.log('host MPTCP probe exit=' + mptcp.status + ' ' + (mptcp.stdout || mptcp.stderr).trim())
+  })
+
+  it('preserves a global Git config, relative includes and conditional includes at read-only snapshot paths', async () => {
+    const previous = process.env.GIT_CONFIG_GLOBAL
+    const config = join(base, 'global-gitconfig'), included = join(base, 'included-gitconfig')
+    await writeFile(included, '[review]\n included = preserved\n')
+    await writeFile(config, '[review]\n value = global\n[include]\n path = ./included-gitconfig\n[includeIf "gitdir:' + workspace + '/.git"]\n path = ./included-gitconfig\n')
+    process.env.GIT_CONFIG_GLOBAL = config
+    try {
+      const result = await run(`const a=require('node:assert/strict'),fs=require('node:fs'),cp=require('node:child_process');
+        for(const [key,value] of [['review.value','global'],['review.included','preserved']]){
+          const p=cp.spawnSync('git',['config','--global','--get',key],{encoding:'utf8'});a.equal(p.status,0,p.stderr);a.equal(p.stdout.trim(),value)}
+        a.throws(()=>fs.writeFileSync(process.env.GIT_CONFIG_GLOBAL,'changed'),{code:'EACCES'});
+        a.throws(()=>fs.readFileSync(${JSON.stringify(config)}),{code:'EACCES'});`, spec())
+      expect(result.code, result.stderr).toBe(0)
+    } finally { if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = previous }
+  })
+
+  it('reads only its own proc directory and refuses sibling process contents', async () => {
+    await discriminate('own proc grant', `const fs=require('node:fs'),a=require('node:assert/strict');
+      a.match(fs.readFileSync('/proc/self/maps','utf8'),/r.xp/);
+      for(const p of ['/proc/${process.pid}/maps','/proc/${process.pid}/environ','/proc/stat'])a.throws(()=>fs.readFileSync(p),{code:'EACCES'});`)
   })
 
   function config(allow = true, network: 'none' | 'relay' = 'none', selected = true) {
@@ -177,15 +252,15 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
       catch (caught) { error = caught }
       if (result) { await output(result.child); await result.terminate?.(); result.release() }
       expect(error, 'unselected Landlock must never replace unavailable bubblewrap').toBeDefined()
-      expect(selectJailBackend().name).toBe('bwrap')
+      expect(selectJailBackend(process.platform, configuredJailBackend()).name).toBe('bwrap')
     } finally { process.env.BRIDGE_JAIL_BACKEND = 'landlock' }
     const selected = await run("console.log('explicit-landlock')", spec())
     expect(selected.code, selected.stderr).toBe(0); expect(selected.stdout.trim()).toBe('explicit-landlock')
   })
 
   it('removes host socket-discovery variables from the real Landlock payload', async () => {
-    const keys = ['DBUS_SESSION_BUS_ADDRESS', 'DBUS_SYSTEM_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'SSH_AUTH_SOCK', 'GPG_AGENT_INFO', 'WAYLAND_DISPLAY', 'DOCKER_HOST', 'CUSTOM_SOCKET']
-    const wrapped = await jail.wrap(process.execPath, ['-e', `const a=require('node:assert/strict');for(const k of ${JSON.stringify(keys)})a.equal(process.env[k],undefined,k);console.log('socket-env-absent')`], spec())
+    const keys = ['DBUS_SESSION_BUS_ADDRESS', 'DBUS_SYSTEM_BUS_ADDRESS', 'SSH_AUTH_SOCK', 'GPG_AGENT_INFO', 'WAYLAND_DISPLAY', 'DOCKER_HOST', 'CUSTOM_SOCKET']
+    const wrapped = await jail.wrap(process.execPath, ['-e', `const a=require('node:assert/strict');for(const k of ${JSON.stringify(keys)})a.equal(process.env[k],undefined,k);a.equal(process.env.XDG_RUNTIME_DIR,process.env.HOME+'/.runtime');console.log('socket-env-absent')`], spec())
     const inherited = Object.fromEntries(keys.map((key) => [key, '/host/socket-proof']))
     try {
       // Simulate the outer scope's final transport injection, after any executor sanitization.

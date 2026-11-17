@@ -48,6 +48,51 @@ def open_path(libc, path):
     return check(libc.syscall(437, -100, path.encode(), ctypes.byref(how), ctypes.sizeof(how)))
 
 
+class SockFilter(ctypes.Structure):
+    _fields_ = [('code', ctypes.c_ushort), ('jt', ctypes.c_ubyte),
+                ('jf', ctypes.c_ubyte), ('k', ctypes.c_uint32)]
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [('len', ctypes.c_ushort), ('filter', ctypes.POINTER(SockFilter))]
+
+
+def restrict_sockets(libc):
+    # seccomp_data: nr at 0, audit arch at 4, socket domain/type/protocol at 16/24/32.
+    arch, socket_nr, pair_nr = {
+        'x86_64': (0xc000003e, 41, 53),
+        'aarch64': (0xc00000b7, 198, 199),
+        'riscv64': (0xc00000f3, 198, 199),
+    }[platform.machine()]
+    instructions = [
+        (0x20, 0, 0, 4),                 # 0: load arch
+        (0x15, 1, 0, arch),              # 1: native ABI only
+        (0x06, 0, 0, 0x80000000),        # 2: KILL_PROCESS
+        (0x20, 0, 0, 0),                 # 3: load syscall
+        (0x35, 0, 1, 0x40000000),        # 4: reject x32 ABI too
+        (0x06, 0, 0, 0x80000000),        # 5: KILL_PROCESS
+        (0x15, 14, 0, 425),              # 6: io_uring_setup -> ENOSYS (21)
+        (0x15, 1, 0, socket_nr),         # 7: socket -> domain (9)
+        (0x15, 0, 11, pair_nr),          # 8: socketpair -> domain, others ALLOW (20)
+        (0x20, 0, 0, 16),                # 9: load domain
+        (0x15, 9, 0, 1),                 # 10: AF_UNIX -> ALLOW (20)
+        (0x15, 1, 0, 2),                 # 11: AF_INET -> type (13)
+        (0x15, 0, 6, 10),                # 12: AF_INET6, otherwise EACCES (19)
+        (0x20, 0, 0, 24),                # 13: load type
+        (0x54, 0, 0, 0xfff7f7ff),        # 14: strip SOCK_CLOEXEC | SOCK_NONBLOCK
+        (0x15, 0, 3, 1),                 # 15: SOCK_STREAM only, else EACCES (19)
+        (0x20, 0, 0, 32),                # 16: load protocol
+        (0x15, 2, 0, 0),                 # 17: protocol 0 -> ALLOW (20)
+        (0x15, 1, 0, 6),                 # 18: IPPROTO_TCP -> ALLOW, else EACCES (19)
+        (0x06, 0, 0, 0x0005000d),        # 19: ERRNO EACCES
+        (0x06, 0, 0, 0x7fff0000),        # 20: ALLOW
+        (0x06, 0, 0, 0x00050026),        # 21: ERRNO ENOSYS; runtimes can fall back
+    ]
+    filters = (SockFilter * len(instructions))(*(SockFilter(*i) for i in instructions))
+    program = SockFprog(len(filters), filters)
+    check(libc.prctl(22, 2, ctypes.byref(program), 0, 0))  # PR_SET_SECCOMP, FILTER
+
+
 def restrict(policy):
     if platform.machine() not in ('x86_64', 'aarch64', 'riscv64'):
         raise RuntimeError('unknown architecture syscall table')
@@ -93,12 +138,21 @@ def restrict(policy):
             check(libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0))
         finally:
             os.close(fd)
+    # Bun/JSC reads maps for stack bounds and stat/statm/cgroup for runtime metrics.
+    # Open the launcher's numeric PID without following /proc/self. Exec preserves it.
+    fd = open_path(libc, '/proc/' + str(os.getpid()))
+    try:
+        rule = PathRule(4 | 8, fd)  # READ_FILE | READ_DIR, never writes or sibling PIDs
+        check(libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0))
+    finally:
+        os.close(fd)
     for port in policy.get('connect', []):
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise RuntimeError('invalid TCP port')
         rule = NetRule(2, port)  # CONNECT_TCP; no BIND_TCP or UDP grants
         check(libc.syscall(445, ruleset, 2, ctypes.byref(rule), 0))
     check(libc.prctl(38, 1, 0, 0, 0))  # PR_SET_NO_NEW_PRIVS
+    restrict_sockets(libc)
     check(libc.syscall(446, ruleset, 0))
     os.close(ruleset)
     return abi
@@ -117,7 +171,6 @@ try:
             raise RuntimeError('launcher parent exited')
         os.kill(policy['parent'], 0)  # The Bridge must still exist, including under a scope wrapper.
         restrict(policy)
-        os.environ.update(policy['env'])
         # The outer scope may need its bus transport; the confined payload must not inherit it.
         socket_env = {'XDG_RUNTIME_DIR', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'GPG_AGENT_INFO',
                       'GNOME_KEYRING_CONTROL', 'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY',
@@ -126,6 +179,7 @@ try:
         for key in list(os.environ):
             if key.startswith('DBUS_') or key.endswith(('_SOCK', '_SOCKET')) or key in socket_env:
                 os.environ.pop(key, None)
+        os.environ.update(policy['env'])
         os.chdir(policy['cwd'])
         for name in ('SIGPIPE', 'SIGXFSZ'):
             if hasattr(signal, name):
