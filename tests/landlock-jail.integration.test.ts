@@ -214,6 +214,117 @@ finally:
     } finally { await relay.close() }
   })
 
+  it('chains the bridge outer proxy without local target DNS, preserving NO_PROXY and the allowlist', async () => {
+    const { createServer: httpServer } = await import('node:http')
+    const { createServer: tlsServer } = await import('node:tls')
+    const { connect } = await import('node:net')
+    const { randomBytes } = await import('node:crypto')
+    const key = join(workspace, 'outer-key.pem'), cert = join(workspace, 'outer-cert.pem')
+    const generated = spawnSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert,
+      '-days', '1', '-subj', '/CN=relay-upstream.invalid', '-addext', 'subjectAltName=DNS:relay-upstream.invalid,DNS:localhost,IP:127.0.0.1'], { encoding: 'utf8' })
+    expect(generated.status, generated.stderr).toBe(0)
+    const sockets = new Set<import('node:net').Socket>()
+    let tlsRequests = 0
+    const origin = tlsServer({ key: await readFile(key), cert: await readFile(cert) }, (socket) => {
+      let head = ''
+      socket.on('data', (b) => {
+        head += b.toString()
+        if (!head.includes('\r\n\r\n')) return
+        tlsRequests++
+        socket.end('HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nouter-proxy-ok!')
+      })
+    })
+    origin.on('tlsClientError', () => {})
+    const outer = httpServer()
+    const records: Array<{ target: string; authorized: boolean }> = []
+    const password = randomBytes(24).toString('hex')
+    const expected = 'Basic ' + Buffer.from('operator:' + password).toString('base64')
+    for (const server of [origin, outer]) server.on('connection', (socket) => {
+      sockets.add(socket); socket.once('close', () => sockets.delete(socket)); socket.on('error', () => {})
+    })
+    await new Promise<void>((resolve) => origin.listen(0, '127.0.0.1', resolve))
+    const originPort = (origin.address() as AddressInfo).port
+    outer.on('connect', (req, socket, head) => {
+      const authorized = req.headers['proxy-authorization'] === expected
+      records.push({ target: req.url!, authorized })
+      if (!authorized) { socket.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n'); return }
+      const upstream = connect(originPort, '127.0.0.1', () => {
+        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+        if (head.length) upstream.write(head)
+        socket.pipe(upstream).pipe(socket)
+      })
+      sockets.add(upstream); upstream.once('close', () => sockets.delete(upstream))
+      upstream.on('error', () => socket.destroy()); socket.once('close', () => upstream.destroy())
+    })
+    await new Promise<void>((resolve) => outer.listen(0, '127.0.0.1', resolve))
+    const url = `http://operator:${password}@127.0.0.1:${(outer.address() as AddressInfo).port}`
+    const keys = ['HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy'] as const
+    const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+    const payload = (host: string, port: number) => `const a=require('node:assert/strict'),http=require('node:http'),tls=require('node:tls'),fs=require('node:fs'),u=new URL(process.env.HTTPS_PROXY);
+      const req=http.request({host:u.hostname,port:u.port,method:'CONNECT',path:${JSON.stringify(host + ':' + port)},headers:{'Proxy-Authorization':'Basic '+Buffer.from(u.username+':'+u.password).toString('base64')}});
+      req.on('connect',(res,socket)=>{a.equal(res.statusCode,200);const stream=tls.connect({socket,servername:${JSON.stringify(host)},ca:fs.readFileSync(${JSON.stringify(cert)})},()=>stream.write(${JSON.stringify('GET / HTTP/1.1\r\nHost: ' + host + '\r\nConnection: close\r\n\r\n')}));
+        let body='';stream.on('data',b=>body+=b);stream.on('end',()=>{a.match(body,/outer-proxy-ok!/);console.log('outer-proxy-request-ok')});stream.on('error',()=>{console.error('TLS refused');process.exitCode=1})});
+      req.on('error',()=>{console.error('CONNECT refused');process.exitCode=1});req.end();setTimeout(()=>process.exit(2),5000).unref();`
+    const request = async (host: string, port: number, proxy?: string, noProxy = '', lower = false) => {
+      for (const key of keys) delete process.env[key]
+      if (proxy) process.env[lower ? 'https_proxy' : 'HTTPS_PROXY'] = proxy
+      process.env[lower ? 'no_proxy' : 'NO_PROXY'] = noProxy
+      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['relay-upstream.invalid', 'localhost', `127.0.0.1:${originPort}`] }))
+      // Relay configuration must remain captured, even if the bridge environment changes afterwards.
+      process.env.HTTPS_PROXY = 'http://127.0.0.1:1'; process.env.NO_PROXY = '*'
+      try { return await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] })) }
+      finally { await wrapped.cleanup?.() }
+    }
+    try {
+      let result = await request('relay-upstream.invalid', 443, url)
+      expect(result.code, result.stderr).toBe(0)
+      result = await request('localhost', 443, url, '', true)
+      expect(result.code, result.stderr).toBe(0)
+      expect(records).toEqual([{ target: 'relay-upstream.invalid:443', authorized: true }, { target: 'localhost:443', authorized: true }])
+      expect(tlsRequests).toBe(2)
+      result = await request('localhost', 443)
+      expect(result.code, 'direct private-address control must be refused').not.toBe(0)
+      result = await request('localhost', 443, url, 'localhost:443')
+      expect(result.code, 'NO_PROXY bypass retains the direct private-address guard').not.toBe(0)
+      result = await request('127.0.0.1', originPort, url, `127.0.0.1:${originPort}`)
+      expect(result.code, result.stderr).toBe(0)
+      result = await request('not-allowed.invalid', 443, url)
+      expect(result.code, 'outer proxy must not bypass the relay allowlist').not.toBe(0)
+      expect(records).toHaveLength(2)
+      expect(tlsRequests).toBe(3)
+      console.log('outer CONNECT: unresolved/private targets succeed with Basic auth; direct private and unlisted targets refused; NO_PROXY operator-literal dial succeeds')
+    } finally {
+      for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key] }
+      for (const socket of sockets) socket.destroy()
+      await Promise.all([origin, outer].map((server) => new Promise<void>((resolve) => server.close(() => resolve()))))
+    }
+  }, 30_000)
+
+  it('refuses pathname Unix sockets, including user-manager sockets, while the unconfined control connects', async () => {
+    const { stat } = await import('node:fs/promises')
+    const address = join(base, 'user-manager.sock')
+    const listener = createServer((socket) => { socket.resume(); socket.on('error', () => {}); socket.end() })
+    await new Promise<void>((resolve) => listener.listen(address, resolve))
+    const paths = [address]
+    for (const suffix of ['bus', 'systemd/private']) {
+      const path = `/run/user/${process.getuid!()}/${suffix}`
+      if (await stat(path).then((s) => s.isSocket(), () => false)) paths.push(path)
+    }
+    if (paths.length === 1) console.log('canonical user-manager/session-bus sockets absent; testing same-uid stand-in')
+    try {
+      for (const path of paths) {
+        const code = (denied: boolean) => `const a=require('node:assert/strict'),net=require('node:net');
+          const s=net.connect({path:${JSON.stringify(path)}});s.once('connect',()=>{s.destroy();a.equal(${denied},false);console.log('connected')});
+          s.once('error',e=>{a.equal(${denied},true);a.equal(e.code,'EACCES');console.log('denied')});`
+        const control = await run(code(false), spec(), true)
+        expect(control.code, control.stderr).toBe(0); expect(control.stdout.trim()).toBe('connected')
+        const jailed = await run(code(true), spec())
+        expect(jailed.code, jailed.stderr).toBe(0); expect(jailed.stdout.trim()).toBe('denied')
+        console.log(`pathname Unix ${path === address ? 'stand-in' : path}: unconfined connected; jailed EACCES`)
+      }
+    } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
+  }, 15_000)
+
   it('enforces ordinary TCP sockets and refuses UDP, MPTCP, netlink and io_uring in descendants', async () => {
     const python = `import ctypes,errno,os,socket
 libc=ctypes.CDLL(None,use_errno=True)
@@ -233,9 +344,12 @@ params=ctypes.create_string_buffer(256)
 result=libc.syscall(425,1,ctypes.byref(params));error=ctypes.get_errno()
 if result>=0: os.close(result)
 assert result==-1 and error==errno.ENOSYS,(result,error)
-# AF_UNIX stream/dgram socketpairs are needed by local IPC and remain usable.
-for kind in (socket.SOCK_STREAM,socket.SOCK_DGRAM):
+# Connected stream pairs support local IPC; datagram pairs can retarget pathname sockets.
+for kind in (socket.SOCK_STREAM,socket.SOCK_STREAM|socket.SOCK_CLOEXEC|socket.SOCK_NONBLOCK):
  a,b=socket.socketpair(socket.AF_UNIX,kind);a.send(b'ipc');assert b.recv(3)==b'ipc';a.close();b.close()
+for kind in (socket.SOCK_DGRAM,socket.SOCK_SEQPACKET):
+ fds=(ctypes.c_int*2)();result=libc.socketpair(socket.AF_UNIX,kind,0,fds);error=ctypes.get_errno()
+ assert result==-1 and error==errno.EACCES,(kind,result,error)
 print('socket filter enforced')`
     const code = `const p=require('node:child_process').spawnSync('python3',['-I','-S','-c',${JSON.stringify(python)}],{encoding:'utf8'});require('node:assert/strict').equal(p.status,0,p.stderr);process.stdout.write(p.stdout)`
     await discriminate('seccomp socket filter', code)
@@ -253,6 +367,20 @@ print('socket filter enforced')`
         p=cp.spawnSync('git',['config','--global','--get','review.local'],{encoding:'utf8'});a.equal(p.status,0,p.stderr);a.equal(p.stdout.trim(),'writable');`, spec())
       expect(result.code, result.stderr).toBe(0)
     } finally { if (previous !== undefined) process.env.GIT_CONFIG_GLOBAL = previous }
+  })
+
+  it('keeps the credentialed launcher policy beneath the hidden egress parent and removes it on cleanup', async () => {
+    const wrapped = await jail.wrap(process.execPath, ['-e', `const a=require('node:assert/strict'),fs=require('node:fs');a.throws(()=>fs.readFileSync(process.argv[1]),{code:'EACCES'});console.log('policy-hidden')`], spec({ network: 'relay' }))
+    const file = wrapped.args[3]!
+    const { prepareEgress } = await import('../src/jail/egress.js')
+    const hidden = await prepareEgress(spec(), 'tcp-port')
+    try { expect(file.startsWith(hidden.hiddenParent! + '/')).toBe(true) } finally { await hidden.cleanup() }
+    wrapped.args.push(file)
+    try {
+      const result = await output(spawn(wrapped.bin, wrapped.args, { cwd: workspace, env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'] }))
+      expect(result.code, result.stderr).toBe(0); expect(result.stdout.trim()).toBe('policy-hidden')
+    } finally { await wrapped.cleanup?.() }
+    await expect(readFile(file)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('preserves a global Git config, relative includes and conditional includes at read-only snapshot paths', async () => {
@@ -287,7 +415,7 @@ print('socket filter enforced')`
   }
 
   it('e/f: fs-jail server starts without bubblewrap and a real backend turn completes', async () => {
-    const server = await startServer({ config: config(), cwd: workspace, quiet: true, handleSignals: false })
+    const server = await startServer({ config: config(), cwd: workspace, quiet: false, handleSignals: false })
     try {
       const response = await fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ stream: false, model: 'codex/confinement-proof', cwd: workspace, messages: [{ role: 'user', content: 'Reply' }] }) })
@@ -407,7 +535,7 @@ print('socket filter enforced')`
     }
   }, 60_000)
 
-  it('measures signal and abstract Unix-socket residuals, and scopes them on ABI 6+', async () => {
+  it('measures signal scopes and refuses abstract Unix-socket creation on every ABI', async () => {
     const address = `\0landlock-proof-${process.pid}-${Date.now()}`
     const listener = createServer((socket) => socket.end())
     await new Promise<void>((resolve, reject) => { listener.once('error', reject); listener.listen(address, resolve) })
@@ -416,10 +544,10 @@ print('socket filter enforced')`
       const scoped=${Number(probe.stdout.trim()) >= 6};
       a.equal(signal==='ok',!scoped);
       new Promise(r=>{const s=net.connect({path:${JSON.stringify(address)}});s.on('connect',()=>{s.destroy();r('ok')});s.on('error',e=>r(e.code))})
-      .then(result=>a.equal(result==='ok',!scoped)).catch(e=>{console.error(e);process.exitCode=1});`
+      .then(result=>a.equal(result,'EACCES')).catch(e=>{console.error(e);process.exitCode=1});`
     try {
       if (Number(probe.stdout.trim()) >= 6) await discriminate('signal/abstract socket scopes', code)
-      else { const result = await run(code, spec()); expect(result.code, result.stderr).toBe(0); console.log('ABI 4/5 residuals measured: signal 0 and host abstract Unix socket allowed; scopes unavailable') }
+      else { const result = await run(code, spec()); expect(result.code, result.stderr).toBe(0); console.log('ABI 4/5 residuals measured: signal 0 allowed; AF_UNIX creation refused by seccomp; kernel scopes unavailable') }
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
   })
 

@@ -1,7 +1,7 @@
 /** Landlock fallback: filesystem allowlist and TCP ports, without namespace isolation. */
 import { existsSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JAIL_HOST_EGRESS_ENV } from '../config.js'
@@ -36,8 +36,11 @@ export class LinuxLandlockJail implements JailBackend {
     const policy = await prepareLinuxPaths(bin, spec, true)
     if (interpreter.startsWith('/nix/store/')) policy.paths.push({ source: '/nix/store', destination: '/nix/store', writable: false, optional: true })
     let egress: Awaited<ReturnType<typeof prepareEgress>> | undefined
+    let launcherDirectory: string | undefined
     const cleanup = async () => {
-      try { await egress?.cleanup() } finally { await policy.cleanup() }
+      try { await egress?.cleanup() } finally {
+        try { if (launcherDirectory) await rm(launcherDirectory, { recursive: true, force: true }) } finally { await policy.cleanup() }
+      }
     }
     try {
       for (const path of policy.paths) {
@@ -51,7 +54,9 @@ export class LinuxLandlockJail implements JailBackend {
       // Landlock grants are additive: a parent grant cannot mask a private subtree.
       if (egress.hiddenParent && policy.paths.some((p) => isWithin(p.source, egress!.hiddenParent!))) refuse('a path grant exposing the hidden egress directory')
       if (writable.some((p) => isWithin(p.source, LAUNCHER) || isWithin(p.source, interpreter))) refuse('writable launcher or interpreter storage')
-      const file = join(policy.directory, 'policy.json')
+      if (!egress.hiddenParent) refuse('launcher policy without hidden egress storage')
+      launcherDirectory = await mkdtemp(join(egress.hiddenParent!, 'policy-'))
+      const file = join(launcherDirectory, 'policy.json')
       const paths = policy.paths.map((p) => ({ path: p.source, writable: p.writable, optional: p.optional }))
       // Devices are individual grants; host /proc and the rest of /dev stay closed.
       for (const path of ['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom']) paths.push({ path, writable: true, optional: false })
