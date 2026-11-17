@@ -156,7 +156,7 @@ describe.skipIf(!enabled)(`Landlock real spawn (ABI ${probe.stdout.trim() || 'un
       const python = `import ctypes,errno,platform,socket
 libc=ctypes.CDLL(None,use_errno=True)
 addr=('127.0.0.1',${port})
-s=socket.socket();s.settimeout(2)
+s=socket.socket()
 try:
  s.sendto(b'x',0x20000000,addr)
 except OSError as e:
@@ -173,7 +173,7 @@ for nr in nrs:
  args=(s.fileno(),0,0,ctypes.c_ulonglong(0x120000040)) if nr!=nrs[1] else (s.fileno(),0,ctypes.c_ulonglong(0x120000040))
  result=libc.syscall(nr,*args);error=ctypes.get_errno();s.close()
  assert result==-1 and error==errno.EACCES,(nr,result,error)
-s=socket.socket();s.settimeout(2);s.setsockopt(socket.IPPROTO_TCP,30,1)
+s=socket.socket();s.setsockopt(socket.IPPROTO_TCP,30,1)
 try:
  s.connect(addr)
 except OSError as e:
