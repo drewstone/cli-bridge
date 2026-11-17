@@ -8,7 +8,6 @@
  */
 
 import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailNetwork, parseJailPathList, parseRelayAllow } from './jail/resolve-spec.js'
-import type { JailNetwork } from './jail/egress.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 
@@ -41,6 +40,28 @@ export const localBackends = [
 type NativeHarnessConfig = {
   [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string
 } & { [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number }
+
+/** Operator assertion only; never accepted from a request or exposed as a capability key. */
+export const JAIL_HOST_EGRESS_ENV = 'BRIDGE_JAIL_HOST_EGRESS_ENFORCED'
+export const JAIL_OUTER_PROXY_ENV = 'BRIDGE_JAIL_OUTER_PROXY_ENFORCED'
+export function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean {
+  return env[JAIL_HOST_EGRESS_ENV] === '1'
+}
+export function outerProxyEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean {
+  return env[JAIL_OUTER_PROXY_ENV] === '1'
+}
+
+/** Linux backend selection is operator-owned; bubblewrap remains the default. */
+export const JAIL_BACKEND_ENV = 'BRIDGE_JAIL_BACKEND'
+export type LinuxJailBackend = 'bwrap' | 'landlock'
+/** Public operator network policy; execution code re-exports this single definition. */
+export type JailNetwork = 'none' | 'router' | 'relay'
+export function configuredJailBackend(env: NodeJS.ProcessEnv = process.env): LinuxJailBackend {
+  const value = env[JAIL_BACKEND_ENV]
+  if (value === undefined || value === '' || value === 'bwrap') return 'bwrap'
+  if (value === 'landlock') return value
+  throw new Error(`invalid ${JAIL_BACKEND_ENV}: expected bwrap|landlock`)
+}
 
 export interface Config extends NativeHarnessConfig {
   host: string
@@ -95,6 +116,12 @@ export interface Config extends NativeHarnessConfig {
   jailMode: 'off' | 'write-jail' | 'fs-jail'
   /** Explicit policy when the configured OS jail is unavailable. */
   jailFallback: 'deny' | 'warn'
+  /** Trusted assertion that host policy supplies the Landlock transport’s missing egress isolation. */
+  jailHostEgressEnforced?: boolean
+  /** Trusted assertion that the host `HTTPS_PROXY` refuses private destinations for Landlock relays. */
+  jailOuterProxyEnforced?: boolean
+  /** Captured operator Linux backend; never accepted from request JSON. */
+  jailBackend?: LinuxJailBackend
   /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
   jailNetwork?: JailNetwork
   /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
@@ -219,6 +246,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     sandboxProfilesDir: resolve(env.SANDBOX_PROFILES_DIR ?? './profiles'),
     sandboxTimeoutMs: parseExecutionTimeoutMs('SANDBOX_TIMEOUT_MS', env.SANDBOX_TIMEOUT_MS, defaultTimeout),
     jailMode: jailFloor({ ...env, BRIDGE_JAIL_MODE: parseJailMode(env.BRIDGE_JAIL_MODE) }),
+    jailHostEgressEnforced: hostEnforcesJailEgress(env),
+    jailOuterProxyEnforced: outerProxyEnforcesJailEgress(env),
+    jailBackend: configuredJailBackend(env),
     jailFallback: env.BRIDGE_JAIL_FALLBACK === 'warn' ? 'warn' : 'deny',
     ...optional('jailNetwork', parseJailNetwork(env.BRIDGE_JAIL_NETWORK, 'BRIDGE_JAIL_NETWORK')),
     ...optional('ironProxyBin', env.BRIDGE_IRON_PROXY_BIN?.trim() || undefined),

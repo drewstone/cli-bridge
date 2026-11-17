@@ -36,6 +36,17 @@ type NativeHarnessConfig = {
 } & {
     [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number;
 };
+/** Operator assertion only; never accepted from a request or exposed as a capability key. */
+export declare const JAIL_HOST_EGRESS_ENV = "BRIDGE_JAIL_HOST_EGRESS_ENFORCED";
+export declare const JAIL_OUTER_PROXY_ENV = "BRIDGE_JAIL_OUTER_PROXY_ENFORCED";
+export declare function hostEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean;
+export declare function outerProxyEnforcesJailEgress(env: NodeJS.ProcessEnv): boolean;
+/** Linux backend selection is operator-owned; bubblewrap remains the default. */
+export declare const JAIL_BACKEND_ENV = "BRIDGE_JAIL_BACKEND";
+export type LinuxJailBackend = 'bwrap' | 'landlock';
+/** Public operator network policy; execution code re-exports this single definition. */
+export type JailNetwork = 'none' | 'router' | 'relay';
+export declare function configuredJailBackend(env?: NodeJS.ProcessEnv): LinuxJailBackend;
 export interface Config extends NativeHarnessConfig {
     host: string;
     port: number;
@@ -49,7 +60,7 @@ export interface Config extends NativeHarnessConfig {
     /** ACP-protocol agents driven via `<bin> acp` (AcpBackend). */
     hermesBin: string;
     openclawBin: string;
-      primeBin: string;
+    primeBin: string;
     primeTimeoutMs: number;
     /** Operator models.json materialized into every isolated prime agent dir. Null = none configured. */
     primeModelsJson: string | null;
@@ -85,21 +96,18 @@ export interface Config extends NativeHarnessConfig {
     sandboxProfilesDir: string;
     /** Operator timeout fallback sent to sandbox-api when the caller omits one. Zero means none. */
     sandboxTimeoutMs: number;
-    /**
-     * Default jail mode for host-executed CLIs, from `BRIDGE_JAIL_MODE`
-     * (off|write-jail|fs-jail, default off; `WORKER_FS_JAIL=1` is a shorthand
-     * for fs-jail). A per-request `execution.jail.mode` may raise (never lower)
-     * this floor. In `write-jail` the host filesystem is read-only and the CLI's
-     * writes are confined to the jail root; `fs-jail` additionally confines
-     * READS to a minimal system+toolchain allowlist so the CLI cannot read the
-     * host repo or sibling run scratch dirs (bwrap Linux only; write-jail on
-     * macOS via sandbox-exec; no-op elsewhere).
-     */
+    /** `BRIDGE_JAIL_MODE`. A request may raise this floor, never lower it. */
     jailMode: 'off' | 'write-jail' | 'fs-jail';
     /** Explicit policy when the configured OS jail is unavailable. */
     jailFallback: 'deny' | 'warn';
+    /** Trusted assertion that host policy supplies the Landlock transport’s missing egress isolation. */
+    jailHostEgressEnforced?: boolean;
+    /** Trusted assertion that the host `HTTPS_PROXY` refuses private destinations for Landlock relays. */
+    jailOuterProxyEnforced?: boolean;
+    /** Captured operator Linux backend; never accepted from request JSON. */
+    jailBackend?: LinuxJailBackend;
     /** `BRIDGE_JAIL_NETWORK`: default and ceiling for a spawn's egress (none < router < relay). Unset: default none, ceiling router. */
-    jailNetwork?: 'none' | 'router' | 'relay';
+    jailNetwork?: JailNetwork;
     /** `BRIDGE_IRON_PROXY_BIN`: agent-container's pinned iron-proxy, for `relay` spawns with proxySecrets. */
     ironProxyBin?: string;
     /** `BRIDGE_PROXY_SECRET_COMMAND`: mints and revokes a proxySecrets credential per spawn (see jail/egress.ts). */
@@ -140,8 +148,8 @@ export interface TraceConfig {
     /** Cap on TOOL spans per request; the observed count is still reported in full. */
     maxToolSpans: number;
 }
+/** Shared listener safety for environment and embedded callers; only embedding permits port 0. */
 export declare function assertListenerConfig({ host, port, bearer }: Pick<Config, 'host' | 'port' | 'bearer'>, ephemeral?: boolean): void;
+export declare function anyBackendSpawnsOnHost(backends: Iterable<string>): boolean;
 export declare function loadConfig(env?: NodeJS.ProcessEnv): Config;
 export {};
-
-export declare function anyBackendSpawnsOnHost(backends: Iterable<string>): boolean;

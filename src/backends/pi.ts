@@ -3,6 +3,7 @@
  * MCP requires the installed pi-mcp-adapter and exact profile/request configuration, otherwise refuse.
  * Native text/thinking/tool/usage events retain their OpenAI and canonical event projections below.
  */
+import { configuredJailBackend } from '../config.js'
 
 import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -335,9 +336,8 @@ export class PiBackend implements NativeSessionBackend {
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
     // Retained Pi currently requires its Linux inference-isolation path.
-    // Availability must enforce the same precondition as actual startup.
     if (this.spawner.executionEnvironment === 'host') {
-      const jailBackend = selectJailBackend()
+      const jailBackend = selectJailBackend(process.platform, configuredJailBackend(this.opts.jailEnv))
       if (jailBackend.name !== 'bwrap' || !(await jailBackend.isAvailable())) {
         return {
           name: this.name,
@@ -459,7 +459,7 @@ export class PiBackend implements NativeSessionBackend {
       )
     }
     if (this.spawner.executionEnvironment === 'host') {
-      const jailBackend = selectJailBackend()
+      const jailBackend = selectJailBackend(process.platform, req.jailSpec?.backend ?? configuredJailBackend(this.opts.jailEnv))
       if (
         !req.jailSpec?.readConfine
         || jailBackend.name !== 'bwrap'
