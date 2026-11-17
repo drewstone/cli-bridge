@@ -1,5 +1,5 @@
 /** Trusted host scopes grant routes; authored profiles and HTTP requests cannot register one. */
-import { JAIL_HOST_EGRESS_ENV } from './config.js'
+import { configuredJailBackend, JAIL_HOST_EGRESS_ENV, type LinuxJailBackend } from './config.js'
 import type { AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import { BackendError, type ChatRequest, type McpServerSpec } from './backends/types.js'
 import { claimTcpHostService, claimTrustedHostService, registerTrustedHostService, type TrustedHostServiceOwner } from './jail/egress-relay.js'
@@ -19,10 +19,10 @@ function refused(message: string): never {
 }
 
 /** The same selected backend later consumes JailSpec; native URLs never assume a shim on other transports. */
-async function relaySpec(request: ChatRequest, backend: string): Promise<JailSpec | undefined> {
+async function relaySpec(request: ChatRequest, backend: string, backendChoice: LinuxJailBackend): Promise<JailSpec | undefined> {
   const spec = request.jailSpec
   if (!spec) return undefined
-  const jail = selectJailBackend(process.platform, spec.backend)
+  const jail = selectJailBackend(process.platform, request.jailSpec?.backend ?? backendChoice)
   if (jail.name === 'seatbelt') return undefined // Preserve the current Mac native URLs; no shim listener is installed there.
   if (!['claude', 'claude-code', 'codex', 'opencode'].includes(backend) || request.execution?.kind === 'sandbox') {
     return refused('This backend cannot consume trusted private host-service routing')
@@ -30,6 +30,7 @@ async function relaySpec(request: ChatRequest, backend: string): Promise<JailSpe
   if (!jail.networkCapability || !await jail.isAvailable()) return refused('Trusted host-service routing requires an available Linux jail transport')
   if (jail.networkCapability === 'tcp-port' && !spec.hostEgressEnforced)
     return refused(`Trusted TCP host-service routing requires ${JAIL_HOST_EGRESS_ENV}=1`)
+  spec.backend ??= backendChoice
   spec.requireEnforcement = true
   return spec
 }
@@ -41,7 +42,7 @@ async function bindClaim(
 ): Promise<() => void> {
   const identity = request.runtime_attachments!
   if (privateBindings.get(identity)?.has(alias)) return refused('A private MCP alias already has a trusted host-service binding')
-  const claim = selectJailBackend(process.platform, spec.backend).networkCapability === 'tcp-port'
+  const claim = selectJailBackend(process.platform, spec.backend ?? 'bwrap').networkCapability === 'tcp-port'
     ? await claimTcpHostService(owner, headers) : claimTrustedHostService(owner, headers)
   const bindings = privateBindings.get(identity) ?? new Map<string, Binding>()
   if (bindings.has(alias)) { claim.revoke(); return refused('A private MCP alias already has a trusted host-service binding') }
@@ -90,7 +91,7 @@ export function privateHostServiceMcp(request: ChatRequest, servers: Record<stri
   return rewritten
 }
 
-export function createHostServiceBindings(bearerRequired: boolean, quiet = false) {
+export function createHostServiceBindings(bearerRequired: boolean, quiet = false, backendChoice = configuredJailBackend()) {
   // Operator audit context, silenced with startServer's startup lines. Run ids here are never authority.
   const audit = (event: 'register' | 'claim', runIds: readonly string[], url: string) => {
     if (!quiet) process.stderr.write(`[host-services] private-mcp ${event} run=${runIds.join(',')} endpoint=${new URL(url).host}\n`)
@@ -156,7 +157,7 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
     async prepareCoordination(request: ChatRequest, backend: string): Promise<() => void> {
       const attachments = Object.entries(request.runtime_attachments?.mcp ?? {}).filter(([, server]) =>
         Object.values(server.headers ?? {}).some((value) => value.kind === 'secret-ref' && value.key === RUNTIME_COORDINATION_ENV_NAME))
-      const spec = attachments.length ? await relaySpec(request, backend) : undefined
+      const spec = attachments.length ? await relaySpec(request, backend, backendChoice) : undefined
       if (!spec) return () => {}
       return bindEach(attachments, ([alias, server]) => {
         const authorization = Object.entries(server.headers ?? {}).filter(([name]) => name.toLowerCase() === 'authorization')
@@ -176,13 +177,13 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
       // A sandbox request carries no jailSpec unless the sandbox backend runs it, whose loopback is its own.
       const authored = Object.entries(request.agent_profile?.mcp ?? {}).find(([, server]) => URL.canParse(server.url ?? '')
         && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(server.url!).hostname))?.[0]
-      const jail = authored && request.jailSpec && backend !== 'sandbox' ? selectJailBackend(process.platform, request.jailSpec.backend) : undefined
+      const jail = authored && request.jailSpec && backend !== 'sandbox' ? selectJailBackend(process.platform, request.jailSpec?.backend ?? backendChoice) : undefined
       if (jail?.networkCapability && await jail.isAvailable())
         return refused(`MCP server ${JSON.stringify(authored)} is on host loopback; a jailed seat reaches it only as a runtime attachment to a live host-registered private endpoint`)
       const bound = request.runtime_attachments && privateBindings.get(request.runtime_attachments)
       const attachments = Object.entries(request.runtime_attachments?.mcp ?? {})
         .filter(([alias, server]) => /^http:/iu.test(server.url ?? '') && !bound?.has(alias))
-      const spec = attachments.length ? await relaySpec(request, backend) : undefined
+      const spec = attachments.length ? await relaySpec(request, backend, backendChoice) : undefined
       if (!spec) return () => {}
       if (!bearerRequired) return refused('Private MCP routing requires a bearer-authenticated Bridge')
       const destination = { backend, privateMcpConfig: true, secrets: privateMcpCredentials(request) }
@@ -202,7 +203,7 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
       })
     },
     async prepareHub(request: ChatRequest, backend: string, servers: Record<string, AgentProfileMcpServer>, tokens: readonly string[]): Promise<() => void> {
-      const spec = await relaySpec(request, backend)
+      const spec = await relaySpec(request, backend, backendChoice)
       if (!spec) return () => {}
       if (closed || !listener) return refused('Hub host-service routing requires this Bridge actual loopback listener')
       return bindEach(Object.entries(servers), async ([alias, server]) => {

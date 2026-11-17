@@ -1020,29 +1020,32 @@ checked again by the launcher before enforcement. The Nix store is exposed only
 when a selected toolchain or the Landlock interpreter needs it.
 HOME, configuration/cache directories and TMPDIR point into the jail home. The
 Landlock payload receives no host session-bus, runtime-directory or socket-discovery
-environment variables, even when an outer scope wrapper needs them. Restrictions
+environment variables, even when an outer scope wrapper needs them. The policy then supplies its jail-local runtime directory. Restrictions
 survive exec and are inherited by descendants. A failed rule or launcher exits
 without executing the command.
 
 | Boundary | Bubblewrap | Landlock | Residual risk / refusal |
 | --- | --- | --- | --- |
-| Path mappings | Bind source at destination | Same-path grants only | Any remapped bind is refused, including read-only auth/config snapshots. A host with such mappings may start but refuse requests. |
+| Path mappings | Bind source at destination | Same-path grants only | Any remapped bind is refused, including remapped read-only auth. Global Git snapshots use their own read-only paths and `GIT_CONFIG_GLOBAL`. A host with such mappings may start but refuse requests. |
 | Temporary files | Private `/tmp` mount | Private TMPDIR under jail home; shared `/tmp` has no grant | Hardcoded `/tmp` access fails unless the spec explicitly exposes that exact path. |
 | Egress state | Masks siblings with tmpfs | No broad grant covering the egress parent; only own CA files granted | Pathname Unix-socket connections are unmediated on every accepted ABI. |
-| `/proc`, devices and metadata | Private proc/device mounts and read-only binds | No proc grant; only null, zero, random and urandom device grants | Metadata remains visible. Mode, ownership, timestamps and extended attributes are outside this allowlist, including on ungranted files the user owns. Real harness behavior without `/proc` remains unproven by the native protocol fixture. |
+| `/proc`, devices and metadata | Private proc/device mounts and read-only binds | Read-only own numeric `/proc/<pid>` for runtime stack bounds and metrics; only null, zero, random and urandom device grants | Metadata remains visible. Mode, ownership, timestamps and extended attributes are outside this allowlist, including on ungranted files the user owns. Other process directories and host proc files have no read grant. Exec preserves the numeric PID grant; forked children inherit it, not a new grant for their PID. |
 | Process and IPC | Separate PID/IPC/UTS namespaces | Host namespaces; direct launcher dies when its parent exits; signal and abstract-socket scopes where supported | No PID namespace or whole-tree parent-death guarantee. Without kernel scopes, same-user signalling and abstract Unix sockets remain reachable. |
-| Network | Separate network namespace with relay shim | Plain TCP connects limited by port grants; no plain TCP bind grants | Ports do not restrict addresses. UDP, pathname Unix sockets and other stream protocols are outside these TCP rules on every accepted ABI. Other local processes, including the same user, can reach a claim listener; its random per-claim URL secret is compared in constant time. Only the owning jail receives its port grant, and release closes the listener. |
+| Network | Separate network namespace with relay shim | Seccomp allows only ordinary TCP Internet sockets and AF_UNIX; TCP connects limited by port grants, with no TCP bind grants | Ports do not restrict addresses. UDP, MPTCP, other Internet protocols, netlink and io_uring creation are refused by seccomp. AF_UNIX remains available. The TCP relay creates no pathname socket and requires a per-spawn proxy credential; other host processes can still reach its listener. Host-service claims have a separate random URL credential, compared in constant time; release closes each claim listener. |
 | Write jail | Host-wide read-only mount with hidden egress state | Refused; use fs-jail | A configured write-jail floor can pass the availability probe but each Landlock request is refused. |
 
 Every Landlock request, including `network: none`, is refused with HTTP 501 unless
 `BRIDGE_JAIL_HOST_EGRESS_ENFORCED=1` (default off). This is an operator assertion
-that external host policy already supplies the missing isolation. Host policy must
-deny all network traffic from jailed commands except ordinary TCP connections to
-the permitted loopback relay ports; `none` itself grants no ports, while trusted
-host-service or loopback grants admit only their declared ports. It must also prevent
-access to other host services and sockets. The bridge, its relays and the payload
-share a user and network namespace, so a user-only firewall rule cannot distinguish
-them. Landlock is not a replacement for network or mount namespaces. This assertion
+that the box's external egress policy is strict. The launcher also enforces a
+seccomp socket filter under NO_NEW_PRIVS, independent of the assertion. Only
+AF_INET/AF_INET6 SOCK_STREAM with protocol zero or IPPROTO_TCP may be created;
+AF_UNIX stays available, and io_uring_setup is refused. Landlock then admits only
+the spawn's TCP ports. A user-only firewall cannot distinguish the bridge and
+payload, which share a user and network namespace. Host policy must still protect
+other host services and pathname Unix sockets; Landlock supplies no mount or
+network namespace. If the box's egress policy stops being strict, the operator
+must restart the bridge with the assertion cleared, or clear the assertion and
+restart before admitting further work. It is captured at startup. This assertion
 and the backend choice are never request fields and add no served capability or
 policy keys. Trusted private host-service aliases use one ephemeral loopback listener
 per claim when that assertion is enabled. Protected headers remain in the host relay,

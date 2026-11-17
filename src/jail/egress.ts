@@ -25,7 +25,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { connect, createServer, type Socket, type AddressInfo } from 'node:net'
+import { connect, createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -170,28 +170,16 @@ export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | '
       tunnel = proxy.tunnel
       Object.assign(env, await trustEnv(shared, proxy.caCert), credentialEnv(intercepts))
     }
+    const proxyAuthorization = transport === 'tcp-port' ? `Basic ${Buffer.from(`spawn:${randomBytes(32).toString('base64url')}`).toString('base64')}` : undefined
     relay = await startEgressRelay({
-      socketPath,
+      ...(transport === 'tcp-port' ? { tcp: true, proxyAuthorization } : { socketPath }),
       allow: relayAllowHosts(spec),
       trustedHostServices: transport === 'namespace' ? spec.trustedHostServices : undefined,
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
     if (transport === 'tcp-port') {
-      // Listen outside the domain: no bind permission or shared fixed shim port is needed inside it.
-      const sockets = new Set<Socket>()
-      const listener = createServer({ allowHalfOpen: true }, (client) => {
-        const upstream = connect(socketPath)
-        for (const socket of [client, upstream]) {
-          sockets.add(socket)
-          socket.on('error', () => { client.destroy(); upstream.destroy() })
-          socket.on('close', () => sockets.delete(socket))
-        }
-        client.pipe(upstream).pipe(client)
-      })
-      await new Promise<void>((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
-      bridges.push(() => new Promise<void>((resolve) => { listener.close(() => resolve()); for (const socket of sockets) socket.destroy() }))
-      const port = (listener.address() as AddressInfo).port
-      Object.assign(env, network === 'none' ? {} : proxyEnv(port))
+      const port = relay.port!
+      Object.assign(env, network === 'none' ? {} : proxyEnv(port, proxyAuthorization))
       return { bwrapArgs: [], env, prefix: [], hiddenParent: EGRESS_PARENT,
         tcpConnectPorts: [port, ...(tcpServices?.ports ?? []), ...(spec.hostLoopbackPorts ?? [])],
         readablePaths: proxy ? [join(shared, 'ca.crt'), join(shared, 'ca-bundle.crt')] : [], cleanup }
@@ -264,8 +252,9 @@ function runSecretCommand(command: string, verb: 'mint' | 'revoke', input: objec
   })
 }
 
-function proxyEnv(port: number | string = SHIM_PORT): Record<string, string> {
-  const url = `http://127.0.0.1:${port}`
+function proxyEnv(port: number | string = SHIM_PORT, authorization?: string): Record<string, string> {
+  const credential = authorization ? `${Buffer.from(authorization.slice(6), 'base64').toString()}@` : ''
+  const url = `http://${credential}127.0.0.1:${port}`
   return {
     HTTPS_PROXY: url, https_proxy: url, HTTP_PROXY: url, http_proxy: url, ALL_PROXY: url, all_proxy: url,
     NO_PROXY: 'localhost,127.0.0.1,::1', no_proxy: 'localhost,127.0.0.1,::1',

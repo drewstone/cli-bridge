@@ -115,7 +115,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   // An embedded host may redact after job cleanup, so its redactors live until close: one per run, unbounded by design.
   const issuedRedactors = new Set<ReturnType<typeof privateCopyRedactor>>()
   const nativeRedactionEpoch = randomUUID()
-  const hostServices = createHostServiceBindings(Boolean(config.bearer), quiet)
+  const hostServices = createHostServiceBindings(Boolean(config.bearer), quiet, config.jailBackend ?? 'bwrap')
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -407,7 +407,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
   const cwd = resolve(options.cwd ?? process.cwd())
   assertListenerConfig(config, true)
   const jailFloor = config.jailMode
-  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends) && !(await selectJailBackend(process.platform, config.jailBackend).isAvailable())) {
+  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends) && !(await selectJailBackend(process.platform, config.jailBackend ?? 'bwrap').isAvailable())) {
     if (config.jailFallback === 'warn') {
       console.warn(`[cli-bridge] WARNING: jail floor '${jailFloor}' is unavailable; requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).`)
     } else {

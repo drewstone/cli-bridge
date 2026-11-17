@@ -2,8 +2,8 @@
 
 import { configuredJailBackend, hostEnforcesJailEgress } from '../config.js'
 import { homedir } from 'node:os'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
-import { canonicalizeJailPath, resolveJailRoot } from './types.js'
+import { isAbsolute, resolve, sep } from 'node:path'
+import { canonicalizeJailPath, isWithin, resolveJailRoot } from './types.js'
 import type { JailSpec } from './types.js'
 import { JAIL_NETWORK_RANK, type JailNetwork } from './egress.js'
 
@@ -157,10 +157,4 @@ function normalizeMode(value: string | undefined): JailMode {
   if (v === 'write-jail') return 'write-jail'
   if (v === 'fs-jail') return 'fs-jail'
   return 'off'
-}
-
-/** Whether `p` is `base` itself or a descendant of it (lexical). */
-function isWithin(base: string, p: string): boolean {
-  const rel = relative(resolve(base), resolve(p))
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }

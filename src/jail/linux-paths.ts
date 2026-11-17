@@ -10,8 +10,8 @@ export interface LinuxPathRule { source: string; destination: string; writable: 
 // Nix executables refer to loaders and libraries in sibling immutable store entries.
 const SYSTEM_RO_PATHS = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/lib32', '/libx32', '/etc', '/opt']
 
-export async function prepareLinuxPaths(bin: string, spec: JailSpec) {
-  const config = await gitConfigSources(spec.projectDir, spec.extraWritablePaths)
+export async function prepareLinuxPaths(bin: string, spec: JailSpec, samePaths = false) {
+  const config = await gitConfigSources(spec.projectDir, spec.extraWritablePaths, samePaths)
   let copiedWritableAuth: string[] = []
   const cleanup = async () => { try { await removeAuthCopies(copiedWritableAuth) } finally { await config.cleanup() } }
   try {
@@ -45,7 +45,7 @@ export async function prepareLinuxPaths(bin: string, spec: JailSpec) {
     await seedAuthIntoJail(root, seededAuthSources)
     const resolvedAuthSources = availableAuthSources.map((source) => ({
       source,
-      destination: resolveJailRoot(source.jailRel, root),
+      destination: samePaths && config.sources.includes(source) ? source.source : resolveJailRoot(source.jailRel, root),
     }))
 
 
@@ -66,13 +66,14 @@ export async function prepareLinuxPaths(bin: string, spec: JailSpec) {
     add(root, true)
     if (resolver && resolver !== '/etc/resolv.conf') add(resolver)
     const env = jailEnv(root)
+    if (config.global) env.GIT_CONFIG_GLOBAL = config.global
     for (const { source, destination } of resolvedAuthSources) {
       if (source.mode === 'read-only') add(source.source, false, destination)
       if (source.envVar) env[source.envVar] = destination
     }
     for (const { source, destination } of config.binds) add(source, false, destination)
     const nativeHome = resolvedAuthSources.find(({ source }) => source.envVar === 'CODEX_HOME')
-    return { root, paths, links: hooks?.links ?? new Map<string, string>(), env, cleanup,
+    return { root, paths, directory: config.directory, links: hooks?.links ?? new Map<string, string>(), env, cleanup,
       effectiveNativeStore: nativeHome ? { harness: 'codex' as const, root: nativeHome.destination, basis: 'host-jail' as const } : undefined }
   } catch (error) { await cleanup(); throw error }
 }

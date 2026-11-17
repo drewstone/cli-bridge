@@ -31,7 +31,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http'
-import { connect, isIP, type Server, type Socket } from 'node:net'
+import { connect, isIP, type Server, type Socket, type AddressInfo } from 'node:net'
 import { readRequestBody, RequestTooLargeError } from '../backends/pi-inference-transport.js'
 
 /** Bytes buffered while waiting for the CONNECT head or the ClientHello. */
@@ -183,7 +183,7 @@ export async function claimTcpHostService(
   const service = services.get(claim.registration)!
   let relay: EgressRelay | undefined
   try {
-    relay = await startEgressRelay({ allow: [], tcp: true, deferAdoption: true, trustedHostServices: [claim.registration] })
+    relay = await startEgressRelay({ allow: [], tcp: true, trustedHostServices: [claim.registration] })
     const port = relay.port
     if (service.revoked || service.owner.revoked) throw new Error('trusted service was released during listener allocation')
     if (!port) throw new Error('trusted TCP service did not obtain a loopback port')
@@ -245,10 +245,8 @@ function revokeService(service: HostService): void {
 
 export interface EgressRelayOptions {
   socketPath?: string
-  /** Host loopback listener for one protected claim; no in-jail shim. */
   tcp?: boolean
-  /** URL allocation precedes the owning launcher’s adoption. */
-  deferAdoption?: boolean
+  proxyAuthorization?: string
   /** Reachable targets as `host` (port 443) or `host:port`. */
   allow: readonly string[]
   /** Hosts whose tunnels go to iron-proxy's CONNECT listener instead of the origin. */
@@ -267,7 +265,7 @@ export interface EgressRelay {
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
   const admitted = availableServices(options.trustedHostServices)
-  if (!options.deferAdoption) {
+  if (!options.tcp) {
     if (admitted.some((service) => service.tcp)) throw new Error('TCP service registration requires the TCP transport')
     for (const service of admitted) service.claimed = true
   }
@@ -292,6 +290,12 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     return allow.has(port === HTTPS_PORT ? host : `${host}:${port}`)
   }
 
+  const authorized = (req: IncomingMessage) => {
+    if (!options.proxyAuthorization) return true
+    const value = Buffer.from(req.headers['proxy-authorization'] ?? '')
+    const expected = Buffer.from(options.proxyAuthorization)
+    return value.length === expected.length && timingSafeEqual(value, expected)
+  }
   const open = new Set<Socket>()
   const used = new WeakSet<Socket>()
   const server = createServer(
@@ -303,6 +307,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     (req, res) => {
       // A connection authorizes one parsed request, never a raw HTTP tunnel.
       res.setHeader('connection', 'close')
+      if (!authorized(req)) { res.writeHead(407); res.end(); return }
       if (used.has(req.socket)) return void req.socket.destroy()
       used.add(req.socket)
       void serveHostService(req, res, routes, expectedHost).catch(() => {
@@ -330,6 +335,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   })
   server.on('connect', (req, socket, rest) => {
     const client = socket as Socket
+    if (!authorized(req)) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n'); return }
     if (used.has(client)) return void client.destroy()
     used.add(client)
     client.pause()
@@ -375,7 +381,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   try {
     if (options.tcp) {
       await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
-      expectedHost = `127.0.0.1:${(server.address() as { port: number }).port}`
+      expectedHost = `127.0.0.1:${(server.address() as AddressInfo).port}`
     } else {
       if (!options.socketPath) throw new Error('egress relay needs its Unix socket path')
       await listen(server, options.socketPath)
@@ -386,10 +392,10 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   }
   // Close ends live tunnels too, so a held connection cannot delay the proxy kill and revoke.
   return {
-    ...(options.tcp ? { port: (server.address() as { port: number }).port } : {}),
+    port: options.tcp ? (server.address() as AddressInfo).port : undefined,
     close: () =>
       new Promise((resolve) => {
-        if (!options.deferAdoption) for (const service of admitted) revokeService(service)
+        if (!options.tcp) for (const service of admitted) revokeService(service)
         server.close(() => resolve())
         for (const socket of open) socket.destroy()
       }),
