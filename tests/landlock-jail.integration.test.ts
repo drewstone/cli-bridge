@@ -276,7 +276,7 @@ finally:
       process.env[lower ? 'no_proxy' : 'NO_PROXY'] = noProxy
       if (proxy && declared) process.env.BRIDGE_JAIL_OUTER_PROXY_ENFORCED = '1'
       phase = 'verification'
-      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['example.com', 'localhost', 'localhost.', 'service.localhost', 'service.localhost.', '127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', `127.0.0.1:${originPort}`] }))
+      const wrapped = await jail.wrap(process.execPath, ['-e', payload(host, port)], spec({ network: 'relay', passThroughHosts: ['example.com', 'localhost', 'localhost.', 'service.localhost', 'service.localhost.', '127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '172.16.5.4', '0.0.0.0', '::1', '::', 'fe80::1', 'fd00::1', 'fc00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', `127.0.0.1:${originPort}`] }))
       phase = 'request'
       // Relay configuration must remain captured, even if the bridge environment changes afterwards.
       process.env.HTTPS_PROXY = 'http://127.0.0.1:1'; process.env.NO_PROXY = '*'
@@ -298,7 +298,8 @@ finally:
         result = await request(host, 443, url)
         expect(result.code, `local name ${host} must be refused before CONNECT`).not.toBe(0)
       }
-      for (const host of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1']) {
+      // Loopback, private, link-local and unspecified literals, v4 and v6, and v4-mapped v6.
+      for (const host of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '172.16.5.4', '0.0.0.0', '::1', '::', 'fe80::1', 'fd00::1', 'fc00::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1']) {
         result = await request(host, 443, url)
         expect(result.code, `private literal ${host} must be refused before CONNECT`).not.toBe(0)
       }
