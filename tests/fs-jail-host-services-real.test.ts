@@ -206,3 +206,67 @@ it.skipIf(!enabled)(
   },
   45_000,
 )
+
+it.skipIf(!enabled)(
+  'keeps a bubblewrap host-service relay off an undeclared host outer proxy',
+  async () => {
+    const base = await realpath(await mkdtemp(join(tmpdir(), 'fs-jail-proxy-')))
+    const peer = createServer((_req, res) => res.end('direct'))
+    peer.listen(0, '127.0.0.1')
+    await once(peer, 'listening')
+    const address = peer.address()
+    if (!address || typeof address === 'string') throw new Error('HTTP peer did not bind')
+    const service = registerTrustedHostService({ url: `http://127.0.0.1:${address.port}/direct`, paths: { '': ['GET'] } })
+    const claim = claimTrustedHostService(service.owner)
+    const keys = ['HTTPS_PROXY', 'BRIDGE_JAIL_OUTER_PROXY_ENFORCED'] as const
+    const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+    const restore = () => {
+      for (const key of keys) {
+        if (prior[key] === undefined) delete process.env[key]
+        else process.env[key] = prior[key]
+      }
+    }
+    try {
+      // A bridge proxy without the Landlock declaration must not change the namespace relay.
+      process.env.HTTPS_PROXY = 'http://127.0.0.1:9'
+      delete process.env.BRIDGE_JAIL_OUTER_PROXY_ENFORCED
+      const spec: JailSpec = {
+        root: join(base, '.agent-home'),
+        projectDir: base,
+        readConfine: true,
+        network: 'none',
+        trustedHostServices: [claim.registration],
+      }
+      const source = `fetch(${JSON.stringify(claim.nativeUrl)}).then(async (r) => console.log(r.status, await r.text()))`
+      const wrapped = await jail.wrap(process.execPath, ['-e', source], spec)
+      restore()
+      try {
+        const child = spawn(wrapped.bin, wrapped.args, {
+          cwd: base,
+          env: { ...process.env, ...wrapped.env },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+        let stdout = '',
+          stderr = ''
+        child.stdout.setEncoding('utf8').on('data', (data) => {
+          stdout += data
+        })
+        child.stderr.setEncoding('utf8').on('data', (data) => {
+          stderr += data
+        })
+        const [code] = await once(child, 'close')
+        expect(code, stderr).toBe(0)
+        expect(stdout.trim()).toBe('200 direct')
+      } finally {
+        await wrapped.cleanup?.()
+      }
+    } finally {
+      restore()
+      service.revoke()
+      peer.closeAllConnections()
+      await new Promise<void>((resolve) => peer.close(() => resolve()))
+      await rm(base, { recursive: true, force: true })
+    }
+  },
+  30_000,
+)

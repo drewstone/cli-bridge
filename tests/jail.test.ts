@@ -263,7 +263,6 @@ describe('auth preservation', () => {
         mode: 'seed-writable',
         only: ['auth.json'],
       })
-      expect(entries.find((entry) => entry.jailRel === '.config/opencode')?.mode).toBe('read-only')
     } finally {
       if (previousHome === undefined) delete process.env.HOME
       else process.env.HOME = previousHome

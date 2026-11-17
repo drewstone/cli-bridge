@@ -15,7 +15,7 @@ import { join, resolve } from 'node:path'
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localHarnesses, type Config } from './config.js'
+import { JAIL_BACKEND_ENV, JAIL_HOST_EGRESS_ENV, JAIL_OUTER_PROXY_ENV, anyBackendSpawnsOnHost, assertListenerConfig, loadConfig, localBackends, type Config } from './config.js'
 import { SessionStore } from './sessions/store.js'
 import { nativeRedactionHistorySchema } from './sessions/legacy-metadata.js'
 import { BackendRegistry } from './backends/registry.js'
@@ -115,7 +115,8 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   // An embedded host may redact after job cleanup, so its redactors live until close: one per run, unbounded by design.
   const issuedRedactors = new Set<ReturnType<typeof privateCopyRedactor>>()
   const nativeRedactionEpoch = randomUUID()
-  const hostServices = createHostServiceBindings(Boolean(config.bearer), quiet)
+  const jailBackend = config.jailBackend ?? 'bwrap'
+  const hostServices = createHostServiceBindings(Boolean(config.bearer), quiet, jailBackend)
   try {
   const registry = new BackendRegistry()
   const runs = new RunRegistry({
@@ -143,6 +144,9 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
 
   const jailEnv = {
     BRIDGE_JAIL_MODE: config.jailMode,
+    [JAIL_BACKEND_ENV]: jailBackend,
+    [JAIL_HOST_EGRESS_ENV]: config.jailHostEgressEnforced ? '1' : '0',
+    [JAIL_OUTER_PROXY_ENV]: config.jailOuterProxyEnforced ? '1' : '0',
     BRIDGE_JAIL_ROOT: config.jailRoot ?? undefined,
     BRIDGE_JAIL_RO_PATHS: config.jailReadablePaths.join(','),
     BRIDGE_JAIL_RW_PATHS: config.jailWritablePaths.join(','),
@@ -152,12 +156,23 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     ...(config.proxySecretCommand ? { BRIDGE_PROXY_SECRET_COMMAND: config.proxySecretCommand } : {}),
     ...(config.jailRelayAllow?.length ? { BRIDGE_JAIL_RELAY_ALLOW: config.jailRelayAllow.join(',') } : {}),
   }
-  // Register enabled native harnesses before remote execution.
-  for (const [name, harness] of localHarnesses) {
+  // The public routing metadata and actual registration share one owner.
+  for (const { name, kind } of localBackends) {
     if (!config.backends.has(name)) continue
-    const bin = config[`${name}Bin`]
-    registry.register(createLocalBackend(config, name, {
-      stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}) }))
+    if (kind === 'native') {
+      registry.register(createLocalBackend(config, name, {
+        stateDir: join(config.dataDir, name), ...(name === 'pi' ? { jailEnv } : {}) }))
+    } else if (kind === 'acp') {
+      registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
+    } else if (kind === 'prime') {
+      registry.register(new PrimeBackend({
+        bin: config.primeBin,
+        timeoutMs: config.primeTimeoutMs,
+        stateDir: join(config.dataDir, name),
+        ...(config.primeModelsJson ? { modelsJsonPath: config.primeModelsJson } : {}),
+        ...(config.primePersistentAgentDir ? { persistentAgentDir: config.primePersistentAgentDir } : {}),
+      }))
+    }
   }
   if (config.backends.has('claudish')) {
     if (!config.claudishUrl) {
@@ -167,22 +182,6 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       bin: config.claudeBin,
       timeoutMs: config.claudeTimeoutMs,
       claudishUrl: config.claudishUrl,
-    }))
-  }
-  // ACP-protocol agents (driven via `<bin> acp`): hermes, openclaw. Registered when
-  // BRIDGE_BACKENDS lists them; health reports `unavailable` if the binary is absent.
-  for (const name of ['hermes', 'openclaw'] as const) {
-    if (config.backends.has(name)) registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
-  }
-  // prime-agent (the pi fork) — host-spawned `--mode rpc` with a bridge-owned
-  // isolated HOME per run; see PrimeBackend for the daemon-avoidance contract.
-  if (config.backends.has('prime')) {
-    registry.register(new PrimeBackend({
-      bin: config.primeBin,
-      timeoutMs: config.primeTimeoutMs,
-      stateDir: join(config.dataDir, 'prime'),
-      ...(config.primeModelsJson ? { modelsJsonPath: config.primeModelsJson } : {}),
-      ...(config.primePersistentAgentDir ? { persistentAgentDir: config.primePersistentAgentDir } : {}),
     }))
   }
   if (config.backends.has('sandbox')) {
@@ -389,7 +388,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
 }
 
 export type { BridgeServer, StartServerOptions } from './server-options.js'
-export { loadConfig }
+export { loadConfig, localBackends }
 export { detectLocalSeats } from './local-seats.js'
 export { listLocalModels } from './local-models.js'
 
@@ -407,10 +406,13 @@ async function disposeApp(built: Pick<Awaited<ReturnType<typeof buildApp>>, 'ses
 
 export async function startServer(options: StartServerOptions = {}): Promise<BridgeServer> {
   const config = structuredClone(options.config ?? loadConfig())
+  const jailBackend = config.jailBackend ?? 'bwrap'
+  config.jailBackend = jailBackend
+  const selectedJail = selectJailBackend(process.platform, jailBackend)
   const cwd = resolve(options.cwd ?? process.cwd())
   assertListenerConfig(config, true)
   const jailFloor = config.jailMode
-  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends) && !(await selectJailBackend().isAvailable())) {
+  if (jailFloor !== 'off' && anyBackendSpawnsOnHost(config.backends) && !(await selectedJail.isAvailable())) {
     if (config.jailFallback === 'warn') {
       console.warn(`[cli-bridge] WARNING: jail floor '${jailFloor}' is unavailable; requests run UNCONFINED (BRIDGE_JAIL_FALLBACK=warn).`)
     } else {
@@ -523,7 +525,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
     if (scope.max < config.admission.maxActive) console.warn(`[cli-bridge] admission maxActive=${config.admission.maxActive} exceeds scoped-executor concurrency=${scope.max}; lower BRIDGE_HOST_CHAT_MAX_ACTIVE or raise CLI_BRIDGE_SCOPE_MAX_CONCURRENCY.`)
     if (config.admission.reservedActive > 0 && scope.reserved === 0) console.warn('[cli-bridge] admission reserves a lane but the executor does not; set CLI_BRIDGE_SCOPE_RESERVED_CONCURRENCY.')
     console.log(config.trace.enabled ? `[cli-bridge] traces: ${config.trace.file} (max ${config.trace.maxBytes} bytes × ${config.trace.maxFiles} files)` : '[cli-bridge] traces: off (BRIDGE_TRACE=off)')
-    console.log(`[cli-bridge] jail default: ${jailFloor}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
+    console.log(`[cli-bridge] jail default: ${jailFloor} backend=${selectedJail.name}${jailFloor !== 'off' ? ` root=${config.jailRoot ?? '<cwd>/.agent-home'}` : ''}`)
   }
   const { registerCoordinationEndpoint, registerPrivateMcpEndpoint } = built.hostServices
   return { url, close, registerCoordinationEndpoint, registerPrivateMcpEndpoint }

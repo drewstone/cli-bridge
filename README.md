@@ -89,6 +89,15 @@ For native model discovery without starting an HTTP listener or creating executi
 entries and authentication facts as `/v1/models`. It reads local metadata only and rejects on cancellation;
 it does not validate an execution jail or start a model turn.
 
+`localBackends` from the package root is the server-owned list of local driver
+registrations, with `name` (the `BRIDGE_BACKENDS` key), canonical `harness`, and
+driver `kind`. `loadConfig` accepts either the key or the canonical harness name.
+Use this metadata to route an explicit harness even when it publishes no model
+catalog. It does not establish that a binary, login, model, or requested profile
+feature is available; backend health, capability negotiation and native admission
+remain authoritative. `BRIDGE_SUBSCRIPTIONS_ONLY=1` continues to refuse routes
+without verified subscription admission.
+
 ## Local checks
 
 Local Beelink gate (set `TOUCHED_INTEGRATION_TEST` to the affected integration test file; the gate installs from the frozen pnpm lockfile): `beelink-gate auto https://github.com/drewstone/cli-bridge.git "$(git rev-parse HEAD)" -- sh -c 'pnpm typecheck && pnpm exec vitest run "$1"' _ "${TOUCHED_INTEGRATION_TEST:?set touched integration test path}"`. Live inference still runs locally through `pnpm test:local-inference` with its explicit model and filesystem-jail prerequisites.
@@ -857,7 +866,7 @@ The Codex backend serializes selected account preparation and refresh on one bri
 Unconfined ChatGPT turns hold that account lease until their native turn ends because the CLI may refresh during inference.
 Host turns link `auth.json` to that home, so Codex writes a refreshed token to the persistent account file.
 ChatGPT subscription turns in an enforced `fs-jail` receive only their selected account's access credential.
-This subscription isolation requires Linux bubblewrap read confinement; the bridge rejects macOS jailed subscription turns.
+This subscription isolation requires Linux read confinement using bubblewrap or explicitly selected Landlock with its host prerequisites; the bridge rejects macOS jailed subscription turns.
 The bridge refuses a ChatGPT subscription turn in `write-jail` because that mode can read the host refresh token.
 An unavailable jail cannot fall back to an unconfined subscription turn, even with `BRIDGE_JAIL_FALLBACK=warn`.
 Recognized non-ChatGPT file auth modes retain their existing credential behavior; unrecognized files fail closed.
@@ -990,6 +999,67 @@ Host execution is the supported local executor. `<NAME>_EXECUTOR=host` and
 `BRIDGE_DEFAULT_EXECUTOR=host` remain accepted. Docker executor and net-jail
 settings are refused at startup; requests containing `execution.netJail` are
 rejected. Use the maintained container platform for network confinement.
+
+## Filesystem jail on Linux
+
+`BRIDGE_JAIL_MODE=fs-jail` uses bubblewrap by default. A failed bubblewrap probe
+never substitutes another backend. An operator may explicitly select
+`BRIDGE_JAIL_BACKEND=landlock`; it needs an unprivileged user with no held Linux
+capabilities, `python3`, and an architecture and ABI accepted by
+`src/jail/landlock-exec.py`. Missing support preserves the startup refusal.
+Before a host switches to Landlock, one real claude turn and one real codex turn
+must pass under it on that host. A provider quota refusal proves the network path,
+not a completed model turn; strict-box receipts are recorded on PR #375.
+Use the host's own subscription logins for those turns; never add an API key.
+The selected backend is captured with each request's operator policy, including
+when an embedded server loads configuration from a custom environment. No compiled
+helper or install step is required. macOS continues to use sandbox-exec unless an
+unsupported backend is explicitly selected.
+
+Both Linux backends derive their filesystem grants from one path policy. Under
+Landlock, readable grants protect file contents; writable grants cover the workspace,
+jail home and explicit writable paths. A read-only path beneath a writable grant is
+refused because additive grants cannot protect that subtree. Grant identities are
+checked again by the launcher before enforcement. The Nix store is exposed only
+when a selected toolchain or the Landlock interpreter needs it.
+HOME, configuration/cache directories and TMPDIR point into the jail home. The
+Landlock payload receives no host session-bus, runtime-directory or socket-discovery
+environment variables, even when an outer scope wrapper needs them. The policy then supplies its jail-local runtime directory. Restrictions
+survive exec and are inherited by descendants. A failed rule or launcher exits
+without executing the command.
+
+| Boundary | Bubblewrap | Landlock | Residual risk / refusal |
+| --- | --- | --- | --- |
+| Path mappings | Bind source at destination | Same-path grants only | Any remapped bind is refused, including remapped read-only auth. Global Git snapshots use their own read-only paths and `GIT_CONFIG_GLOBAL`. A host with such mappings may start but refuse requests. |
+| Temporary files | Private `/tmp` mount | Private TMPDIR under jail home; shared `/tmp` has no grant | Hardcoded `/tmp` access fails unless the spec explicitly exposes that exact path. |
+| Egress state | Masks siblings with tmpfs | No broad grant covering the egress parent; only own CA files granted; launcher policies remain beneath that hidden parent | Pathname Unix-socket connections are unmediated by these Landlock ABIs; the launcher refuses AF_UNIX socket creation. |
+| `/proc`, devices and metadata | Private proc/device mounts and read-only binds | Read-only own numeric `/proc/<pid>/{maps,stat,statm,cgroup}` files for runtime stack bounds and metrics; only null, zero, random and urandom device grants | Metadata remains visible. Mode, ownership, timestamps and extended attributes are outside this allowlist, including on ungranted files the user owns. Other process directories and host proc files have no read grant. Exec preserves the numeric PID grant; forked children inherit it, not a new grant for their PID. A Bun child with a different PID can abort at startup because it cannot read its own maps. |
+| Process and IPC | Separate PID/IPC/UTS namespaces | Host namespaces; direct launcher dies when its parent exits; signal and abstract-socket scopes where supported | No PID namespace or whole-tree parent-death guarantee. Without kernel signal scopes, same-user signalling remains possible. |
+| Network | Separate network namespace with relay shim | Seccomp allows only ordinary TCP Internet sockets; AF_UNIX socket creation is refused and stream socketpair remains available for local IPC; TCP connects limited by port grants, with no TCP bind grants | Ports do not restrict addresses. A relay with allowed hosts captures the bridge's `HTTPS_PROXY`/`https_proxy` and `NO_PROXY`/`no_proxy` at startup; bubblewrap relays and relays without allowed hosts dial directly. Allowed non-intercepted targets use HTTP CONNECT without local target DNS only when `BRIDGE_JAIL_OUTER_PROXY_ENFORCED=1` declares that the operator proxy refuses all private destinations, including names resolving to private addresses. Before opening a relay, the bridge verifies HTTP 403 refusals for `127.0.0.1:443` and `localhost:443`; missing declarations, successful tunnels, authentication failures and transport errors refuse relay startup without fallback. Private and loopback IP literals (including IPv4-mapped IPv6) and localhost names are independently refused before CONNECT. URL credentials become Basic proxy authentication. Verification samples the declared policy; operators must maintain that policy for every destination. Direct and NO_PROXY dials retain private-address checks. Intercepted `proxySecrets` traffic retains iron-proxy's own routing and deny list; strict-box outer-proxy support for that path remains unresolved. `listen()` on an unbound AF_INET socket can autobind without the bind hook. UDP, MPTCP, other Internet protocols, netlink, MSG_FASTOPEN sends and io_uring creation are refused by seccomp. Pathname Unix-socket connections, including systemd user-manager and session-bus access, are refused by denying AF_UNIX socket creation; stream socketpair stays available for local IPC. Only measured stream socketpairs are retained; datagram pairs can reconnect to pathname peers. The TCP relay creates no pathname socket and requires a per-spawn proxy credential; other host processes can still reach its listener. |
+| Write jail | Host-wide read-only mount with hidden egress state | Refused; use fs-jail | A configured write-jail floor can pass the availability probe but each Landlock request is refused. |
+
+Every Landlock request, including `network: none`, is refused with HTTP 501 unless
+`BRIDGE_JAIL_HOST_EGRESS_ENFORCED=1` (default off). This is an operator assertion
+that the box's external egress policy is strict. The launcher also enforces a
+seccomp socket filter under NO_NEW_PRIVS, independent of the assertion. Only
+AF_INET/AF_INET6 SOCK_STREAM with protocol zero or IPPROTO_TCP may be created;
+AF_UNIX socket creation, non-stream socketpairs and io_uring_setup are refused; stream socketpair remains available for local IPC. Landlock then admits only
+the spawn's TCP ports. A user-only firewall cannot distinguish the bridge and
+payload, which share a user and network namespace. Host policy must still protect
+other host services and pathname Unix sockets; Landlock supplies no mount or
+network namespace. If the box's egress policy stops being strict, the operator
+must restart the bridge with the assertion cleared, or clear the assertion and
+restart before admitting further work. It is captured at startup. This assertion
+and the backend choice are never request fields and add no served capability or
+policy keys. Trusted private host-service aliases and Pi's isolated transport still
+require bubblewrap; they do not use the Landlock transport.
+
+The integration proof is `tests/landlock-jail.integration.test.ts`. Run it with
+`CLI_BRIDGE_REQUIRE_LANDLOCK=1` to make an unavailable kernel a failure rather than
+a skip. Each confinement case also runs against an unconfined launcher and must
+fail its boundary assertion. Kernel and ABI are printed with the result. See the
+[kernel UAPI documentation](https://docs.kernel.org/userspace-api/landlock.html)
+for the rights and limits of each ABI.
 
 ## Traces
 
