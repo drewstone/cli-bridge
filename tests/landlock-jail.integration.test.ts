@@ -1,7 +1,9 @@
 /** Real kernel confinement, including deliberately unconfined negative controls. */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { link, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
-import { createServer, type AddressInfo } from 'node:net'
+import { connect, createServer, type AddressInfo } from 'node:net'
+import { createServer as createHttpServer } from 'node:http'
+import { watch } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -625,6 +627,108 @@ print('socket filter enforced')`
       else { const result = await run(code, spec()); expect(result.code, result.stderr).toBe(0); console.log('ABI 4/5 residuals measured: signal 0 allowed; AF_UNIX creation refused by seccomp; kernel scopes unavailable') }
     } finally { await new Promise<void>((resolve) => listener.close(() => resolve())) }
   })
+
+  it('routes protected host-service claims only to their owning jailed run, refuses them once revoked and closes them after the run', async () => {
+    const secret = 'host-service-proof-canary-7b9e'
+    const calls: string[] = []
+    const endpoint = createHttpServer(async (request, response) => {
+      for await (const _ of request) { /* consume the actual MCP request */ }
+      calls.push(request.headers.authorization ?? '')
+      response.end('host-service-ok')
+    })
+    await new Promise<void>((resolve) => endpoint.listen(0, '127.0.0.1', resolve))
+    const serviceBin = join(workspace, 'host-service.cjs')
+    await writeFile(serviceBin, `#!${process.execPath}
+const fs=require('node:fs'),path=require('node:path');
+if(process.argv.includes('--version')){console.log('fixture 1.0.0');process.exit(0)}
+(async()=>{
+ const config=fs.readFileSync(path.join(process.env.CODEX_HOME,'config.toml'),'utf8');
+ if(config.includes(${JSON.stringify(secret)}))throw new Error('protected header entered the jail');
+ const match=/\\[mcp_servers\\.tool\\]\\nurl = ("(?:[^"\\\\]|\\\\.)*")/.exec(config);
+ if(!match)throw new Error('private MCP URL missing');
+ const url=JSON.parse(match[1]);
+ const result=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:'{"jsonrpc":"2.0","id":1,"method":"tools/list"}'});
+ const text=await result.text();
+ const tag=process.argv.at(-1).includes('second-service')?'second-':'';
+ if(tag){
+  const other=fs.readFileSync('host-service-url','utf8');
+  const denied=await new Promise((resolve,reject)=>require('node:http').get(other,r=>{r.resume();reject(new Error('borrowed first claim'))}).on('error',e=>resolve(e.code)));
+  require('node:assert/strict').equal(denied,'EACCES');fs.writeFileSync('second-denied',denied);
+ }
+ fs.writeFileSync(tag+'host-service-url',url);fs.writeFileSync(tag+'host-service-ready',String(result.status));
+ if(process.argv.at(-1).includes('hold-service'))while(!fs.existsSync(tag+'host-service-release'))await new Promise(r=>setTimeout(r,20));
+ const id=require('node:crypto').randomUUID();
+ for(const event of [{type:'thread.started',thread_id:id},{type:'item.completed',item:{type:'agent_message',text:result.status+' '+text}},{type:'turn.completed',usage:{input_tokens:0,output_tokens:0}}])console.log(JSON.stringify(event));
+})().catch(e=>{console.error(e);process.exitCode=1});
+`, { mode: 0o700 })
+    const lifetime = new AbortController()
+    const settings = { ...config(true), bearer: 'host-service-proof-bearer', codexBin: serviceBin, dataDir: join(base, 'state-host-service') }
+    const server = await startServer({ config: settings, cwd: workspace, quiet: true, handleSignals: false,
+      mcpSecrets: { async get(key) { return key === 'host-service-key' ? secret : undefined } } })
+    const ready = join(workspace, 'host-service-ready'), release = join(workspace, 'host-service-release')
+    const dispatch = (content: string) => fetch(`${server.url}/v1/chat/completions`, { method: 'POST',
+      headers: { authorization: `Bearer ${settings.bearer}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ stream: false, model: 'codex/confinement-proof', cwd: workspace, messages: [{ role: 'user', content }],
+        runtime_attachments: { mcp: { tool: { transport: 'http', url: `http://127.0.0.1:${(endpoint.address() as AddressInfo).port}/mcp`,
+          headers: { Authorization: { kind: 'secret-ref', key: 'host-service-key', format: 'bearer' } } } } } }) })
+      .then(async (response) => ({ status: response.status, text: await response.text() }))
+    let held: ReturnType<typeof dispatch> | undefined, secondHeld: ReturnType<typeof dispatch> | undefined
+    // Spawn cleanup runs after the response, so poll with bare connects; no request reaches a live claim.
+    const closed = async (target: string) => {
+      for (let i = 0; i < 100; i++) {
+        const code = await new Promise<string | undefined>((resolve) => { const s = connect(Number(new URL(target).port), '127.0.0.1')
+          s.once('connect', () => { s.destroy(); resolve('open') }); s.once('error', (e: NodeJS.ErrnoException) => resolve(e.code)) })
+        if (code === 'ECONNREFUSED') return true
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return false
+    }
+    try {
+      server.registerPrivateMcpEndpoint({ runId: 'landlock-service-proof', url: `http://127.0.0.1:${(endpoint.address() as AddressInfo).port}/mcp`, paths: { '': ['POST'] }, signal: lifetime.signal })
+      const first = await dispatch('call-service')
+      expect(first.status, first.text).toBe(200); expect(first.text).toContain('200 host-service-ok'); expect(first.text).not.toContain(secret)
+      expect(calls).toEqual([`Bearer ${secret}`])
+      expect(await closed(await readFile(join(workspace, 'host-service-url'), 'utf8')), 'a completed run closes its claim listener').toBe(true)
+      await rm(ready); held = dispatch('hold-service')
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { watcher.close(); reject(new Error('jailed host-service call did not finish')) }, 10_000)
+        const check = () => { void readFile(ready).then(() => { clearTimeout(timer); watcher.close(); resolve() }, () => {}) }
+        const watcher = watch(workspace, check); check()
+      })
+      const url = await readFile(join(workspace, 'host-service-url'), 'utf8')
+      expect(await readFile(ready, 'utf8')).toBe('200')
+      const forged = new URL(url); forged.pathname = '/'+ 'x'.repeat(forged.pathname.length - 1)
+      expect((await fetch(forged, { method: 'POST', body: '{}' })).status).toBe(403)
+      // A second live run must first use its own claim, then fail to connect to the first port.
+      secondHeld = dispatch('hold-service second-service')
+      const secondReady = join(workspace, 'second-host-service-ready')
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { watcher.close(); reject(new Error('second jailed claim did not become ready')) }, 10_000)
+        const check = () => { void readFile(secondReady).then(() => { clearTimeout(timer); watcher.close(); resolve() }, () => {}) }
+        const watcher = watch(workspace, check); check()
+      })
+      expect(await readFile(secondReady, 'utf8')).toBe('200')
+      expect(await readFile(join(workspace, 'second-denied'), 'utf8')).toBe('EACCES')
+      const secondUrl = await readFile(join(workspace, 'second-host-service-url'), 'utf8')
+      expect(new URL(secondUrl).port).not.toBe(new URL(url).port)
+      expect(calls).toEqual([`Bearer ${secret}`, `Bearer ${secret}`, `Bearer ${secret}`])
+      // The unconfined control can still reach the first listener with its URL credential.
+      expect((await fetch(url, { method: 'POST', body: '{}' })).status).toBe(200)
+      console.log('two live claimed runs: own claims 200; second to first port EACCES; unconfined control 200')
+      lifetime.abort()
+      // The held run keeps its port grant, so its revoked claim keeps the port bound and refuses.
+      const revoked = await fetch(url, { method: 'POST', body: '{}' }).then((r) => r.status, (e: Error & { cause?: { code?: string } }) => e.cause?.code ?? e.message)
+      expect(revoked, 'a revoked claim refuses while its run is alive').toBe(403)
+      await writeFile(release, 'go')
+      const completed = await held
+      expect(completed.status, completed.text).toBe(200); expect(completed.text).toContain('host-service-ok')
+      expect(await closed(url), 'the held run closes its revoked claim listener on exit').toBe(true)
+    } finally {
+      lifetime.abort(); await writeFile(release, 'go'); await writeFile(join(workspace, 'second-host-service-release'), 'go')
+      await Promise.all([held?.catch(() => undefined), secondHeld?.catch(() => undefined)])
+      await server.close(); endpoint.closeAllConnections(); await new Promise<void>((resolve) => endpoint.close(() => resolve()))
+    }
+  }, 60_000)
 
   it('does not let child PATH replace the trusted interpreter', async () => {
     const tools = join(base, 'hostile-path'); await mkdir(tools)
