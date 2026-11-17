@@ -17,7 +17,7 @@
   },
   "permissions": {
     "Read": "allow",
-    "Write": "deny",
+    "Write": "allow",
     "Edit": "deny",
     "Bash": "deny",
     "WebFetch": "deny"
