@@ -21,7 +21,7 @@
     "test:seats": "node --test tests/local-seats.integration.mjs",
     "test": "node --check tests/runtime-consumer/live-opencode.mjs && vitest run && pnpm run test:native-store && pnpm run test:runtime-consumer",
     "test:native-store": "node --test tests/native-store.integration.mjs",
-    "test:affected": "node tools/affected-tests.mjs --run",
+    "test:affected": "if [ -d /dev/shm ]; then export TMPDIR=$(mktemp -d /dev/shm/cli-bridge-tests.XXXXXX); trap 'rm -rf \"$TMPDIR\"' EXIT; fi; node tools/affected-tests.mjs --run",
     "test:runtime-consumer": "pnpm --filter cli-bridge-runtime-consumer-regression test",
     "test:local-inference": "node tests/runtime-consumer/live-opencode.mjs",
     "test:scoped-host-real": "CLI_BRIDGE_REAL_CGROUP_TESTS=1 vitest run tests/scoped-host.test.ts",
