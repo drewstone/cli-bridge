@@ -44,7 +44,7 @@ export class BoundedDiagnosticBuffer {
   }
 
   get totalBytes(): number {
-    return this.observedBytes
+    return this.observedBytes + 1
   }
 
   get retainedBytes(): number {
