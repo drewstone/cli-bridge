@@ -8,6 +8,8 @@
 // new URL() is reached too, until nothing new is: a test that runs a fixture by path (uncapped-host) reaches what the
 // fixture imports, and src/jail/landlock-exec.py reaches its tests through src/jail/linux-landlock.ts. Every named
 // module and node --test *.integration.mjs joins the walk, so the graph also holds what they import.
+// A test file that names a changed file's directory, as 'src/backends' or join(..., 'src', 'backends'), reaches it:
+// lineage-env.test.ts reads every src/backends/*.ts through readdirSync.
 // A changed file outside the docs (*.md, docs/) that reaches no test file selects every test file: a file read through
 // a joined path (profiles/*.json, tests/fixtures/durable-run-server.ts), index.mjs, types/*.d.ts, a lockfile, a
 // tsconfig, this file, a deleted file. vitest itself answers every test file for a package.json or vitest.config.ts.
@@ -33,7 +35,8 @@ const vitest = await createVitest('test', { watch: false, fsModuleCache: false,
 const reaching = new Set()
 let all = false
 for (const path of git('diff', '--name-only', '--no-renames', `${process.env.GATE_BASE || 'origin/main'}...HEAD`)) {
-  const reached = new Set([path])
+  const dir = RegExp(`['"/]${dirname(path).split('/').join(`(?:/|['"], *['"])`)}['"]`, 'u')
+  const reached = new Set([path, ...tests.filter((test) => path.includes('/') && dir.test(readFileSync(test, 'utf8')))])
   for (let size; size !== reached.size;) {
     size = reached.size
     vitest.config.related = [...reached].map((file) => resolve(file))
