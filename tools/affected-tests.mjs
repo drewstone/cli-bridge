@@ -44,8 +44,11 @@ const vitest = await createVitest('test', {
 })
 const reached = new Set((await vitest.getRelevantTestSpecifications()).map((spec) => relative(root, spec.moduleId)))
 await vitest.close()
-const selected = [...[...reached].filter((file) => /\.(test|spec)\.[cm]?[jt]sx?$/u.test(file)),
+const reaching = [...[...reached].filter((file) => /\.(test|spec)\.[cm]?[jt]sx?$/u.test(file)),
   ...nodeTests.filter((file) => related.has(file) || entries(file).some((entry) => reached.has(entry)))].sort()
+// A test that says `deploy-check: full run only` (deploy-check's own marker) needs a host that a Beelink gate is not.
+const deferred = reaching.filter((file) => readFileSync(join(root, file), 'utf8').includes('deploy-check: full run only'))
+const selected = reaching.filter((file) => !deferred.includes(file))
 
 // Largest first, each file to the shard holding the fewest bytes, as disco's tools/affected-tests.mjs splits its set.
 const load = Array(count).fill(0)
@@ -55,7 +58,7 @@ const tests = selected.map((file) => [file, statSync(join(root, file)).size]).so
 if (!process.argv.includes('--run')) process.stdout.write(tests.map((test) => `${test}\n`).join(''))
 else {
   console.error(`affected-tests: ${base}..HEAD changes ${changed.length} files${all ? ', selecting every test file' : ''}; ` +
-    `selected ${selected.length}: ${selected.join(' ')}`)
+    `selected ${selected.length}: ${selected.join(' ')}${deferred.length ? `; deferred to a full run: ${deferred.join(' ')}` : ''}`)
   console.error(`affected-tests: shard ${index}/${count} runs ${tests.length}: ${tests.join(' ')}`)
   const steps = [], unit = tests.filter((test) => !NODE_TEST.test(test)), integration = tests.filter((test) => NODE_TEST.test(test))
   if (index === 1 && (all || changed.some((path) => path.endsWith('.ts')))) steps.push([join(root, 'node_modules/.bin/tsc'), ['--noEmit']])
