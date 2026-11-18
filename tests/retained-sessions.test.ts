@@ -1,10 +1,10 @@
 import { once } from 'node:events'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import Database from 'better-sqlite3'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { tmpdir as hostTmpdir } from 'node:os'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Backend, BackendHealth, ChatDelta, ChatRequest, NativeSession, NativeSessionBackend } from '../src/backends/types.js'
 import type { SessionRecord, SessionStore } from '../src/sessions/store.js'
@@ -47,6 +47,11 @@ import {
   RETAINED_MAX_TURN_MESSAGE_LENGTH,
 } from '../src/sessions/retained/schema.js'
 import { parseSafePublicRecord } from '../src/sessions/retained/contract.js'
+
+// Every store commits with synchronous = FULL. On a Beelink whose disk other gates load, each fsync took hundreds of
+// milliseconds and a test that opens a store and commits a few dozen times passed its 5 s timeout (2026-11-17). A
+// tmpfs store is the same SQLite code and files, only without the disk wait.
+const tmpdir = (): string => existsSync('/dev/shm') ? '/dev/shm' : hostTmpdir()
 
 const capabilities: AgentEnvironmentCapabilities = {
   profile: {
