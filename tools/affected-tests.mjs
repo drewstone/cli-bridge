@@ -3,73 +3,61 @@
 // tangle-tools deploy/deploy-check runs `GATE_BASE=<proven base> pnpm run test:affected` in three Beelink gate shards
 // before a cli-bridge deploy rolls; a pass with nothing selected rolls.
 //
-// Vitest's own module graph (the one `vitest related` walks) picks each *.test.ts that imports a changed file, directly
-// or through other modules. A node --test *.integration.mjs runs when it, or a module it imports or loads by tsImport(),
-// reaches a change in that graph. A module that names a changed file in a relative new URL(), import or tsImport()
-// counts as changed, so a file no module imports (src/jail/landlock-exec.py, docker/Dockerfile) reaches its tests.
-// A change to a package.json, pnpm-lock.yaml, pnpm-workspace.yaml, vitest.config.ts, a tsconfig or this file selects
-// every test file.
+// Each changed file reaches the test files that vitest's own module graph (the walk `vitest related` does) finds
+// importing it, directly or through other modules. A module that names a reached file in a relative tsImport() or
+// new URL() is reached too, until nothing new is: a test that runs a fixture by path (uncapped-host) reaches what the
+// fixture imports, and src/jail/landlock-exec.py reaches its tests through src/jail/linux-landlock.ts. Every named
+// module and node --test *.integration.mjs joins the walk, so the graph also holds what they import.
+// A changed file outside the docs (*.md, docs/) that reaches no test file selects every test file: a file read through
+// a joined path (profiles/*.json, tests/fixtures/durable-run-server.ts), index.mjs, types/*.d.ts, a lockfile, a
+// tsconfig, this file, a deleted file. vitest itself answers every test file for a package.json or vitest.config.ts.
+// The walk runs without vitest's fsModuleCache, whose entries can carry an import graph from another tree.
+// A test that says `deploy-check: full run only` (deploy-check's own marker) needs a host that a Beelink gate is not.
 //
-// Usage: GATE_BASE=<ref> [BEELINK_GATE_SHARD=<i>/<n>] node tools/affected-tests.mjs [--run]
-//   prints this shard's test files, one per line; --run prints the selection and this shard's share, typechecks in
-//   shard 1 when a .ts changed, then runs the share's vitest files and node --test files.
+// Usage: GATE_BASE=<ref> [BEELINK_GATE_SHARD=<i>/<n>] node tools/affected-tests.mjs [--run], from the repository root
+//   prints this shard's test files, largest first to each shard in turn; `pnpm run test:affected` (--run) then
+//   typechecks in shard 1 when the range selects any and runs the share's vitest files and node --test files. A killed step keeps its signal's
+//   exit code, which deploy-check holds on; any other failure exits 1.
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync, statSync } from 'node:fs'
 import { constants } from 'node:os'
-import { basename, dirname, join, normalize, relative } from 'node:path'
-import { defaultInclude } from 'vitest/config'
+import { dirname, join, relative, resolve } from 'node:path'
 import { createVitest } from 'vitest/node'
 
-const root = join(import.meta.dirname, '..'), base = process.env.GATE_BASE || 'origin/main'
-const [index, count] = (process.env.BEELINK_GATE_SHARD || '1/1').split('/').map(Number)
-if (!(index >= 1 && index <= count)) throw new Error(`BEELINK_GATE_SHARD=${process.env.BEELINK_GATE_SHARD} is not <i>/<n>`)
-const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 64 << 20 }).split('\n').filter(Boolean)
-const NODE_TEST = /\.integration\.mjs$/u
-const SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\btsImport\(\s*|\bnew URL\(\s*)['"](\.{1,2}\/[^'"]+)['"]/gu
-
-const changed = git('diff', '--name-only', '--no-renames', `${base}...HEAD`)
-const EVERYTHING = /(^|\/)package\.json$|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|vitest\.config\.ts|tsconfig.*\.json|tools\/affected-tests\.mjs)$/u
-const all = changed.some((path) => EVERYTHING.test(path))
-// Each tracked module's relative specifiers, as repository paths; a module naming a changed file counts as changed.
-const names = new Map(git('ls-files', '--', '*.ts', '*.mjs', '*.js').map((file) =>
-  [file, [...readFileSync(join(root, file), 'utf8').matchAll(SPECIFIER)].map((match) => normalize(join(dirname(file), match[1])))]))
-const related = new Set([...changed, ...[...names.keys()].filter((file) => names.get(file).some((path) => changed.includes(path)))])
-const nodeTests = [...names.keys()].filter((file) => NODE_TEST.test(file))
-const entries = (file) => [file, ...names.get(file).filter((path) => names.has(path))]
-
-// The node tests and the modules they load join vitest's test files, so one walk of vitest's graph answers for both.
-const vitest = await createVitest('test', {
-  root, watch: false, related: all ? undefined : [...related].map((path) => join(root, path)),
-  include: [...defaultInclude, ...new Set(nodeTests.flatMap(entries))],
-})
-const reached = new Set((await vitest.getRelevantTestSpecifications()).map((spec) => relative(root, spec.moduleId)))
+const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).split('\n').filter(Boolean)
+const names = new Map(git('ls-files', '--', '*.ts', '*.mjs', '*.js').map((file) => [file, [...readFileSync(file, 'utf8')
+  .matchAll(/(?:tsImport|new URL)\(['"](\.\.?\/[^'"]+)/gu)].map((match) => join(dirname(file), match[1]))]))
+const tests = [...names.keys()].filter((file) => /\.test\.ts$|\.integration\.mjs$/u.test(file))
+const vitest = await createVitest('test', { watch: false, fsModuleCache: false,
+  include: [...tests, ...[...names.values()].flat().filter((path) => names.has(path))] })
+const reaching = new Set()
+let all = false
+for (const path of git('diff', '--name-only', '--no-renames', `${process.env.GATE_BASE || 'origin/main'}...HEAD`)) {
+  const reached = new Set([path])
+  for (let size; size !== reached.size;) {
+    size = reached.size
+    vitest.config.related = [...reached].map((file) => resolve(file))
+    for (const spec of await vitest.getRelevantTestSpecifications()) reached.add(relative('.', spec.moduleId))
+    for (const [file, paths] of names) if (paths.some((named) => reached.has(named))) reached.add(file)
+  }
+  const found = tests.filter((test) => reached.has(test))
+  found.forEach((test) => reaching.add(test))
+  if ((all = !found.length && !/\.md$|^docs\//u.test(path))) break
+}
 await vitest.close()
-const reaching = [...[...reached].filter((file) => /\.(test|spec)\.[cm]?[jt]sx?$/u.test(file)),
-  ...nodeTests.filter((file) => related.has(file) || entries(file).some((entry) => reached.has(entry)))].sort()
-// A test that says `deploy-check: full run only` (deploy-check's own marker) needs a host that a Beelink gate is not.
-const deferred = reaching.filter((file) => readFileSync(join(root, file), 'utf8').includes('deploy-check: full run only'))
-const selected = reaching.filter((file) => !deferred.includes(file))
-
-// Largest first, each file to the shard holding the fewest bytes, as disco's tools/affected-tests.mjs splits its set.
-const load = Array(count).fill(0)
-const tests = selected.map((file) => [file, statSync(join(root, file)).size]).sort(([a, x], [b, y]) => y - x || a.localeCompare(b))
-  .filter(([, size]) => { const to = load.indexOf(Math.min(...load)); load[to] += size; return to === index - 1 })
-  .map(([file]) => file).sort()
-if (!process.argv.includes('--run')) process.stdout.write(tests.map((test) => `${test}\n`).join(''))
-else {
-  console.error(`affected-tests: ${base}..HEAD changes ${changed.length} files${all ? ', selecting every test file' : ''}; ` +
-    `selected ${selected.length}: ${selected.join(' ')}${deferred.length ? `; deferred to a full run: ${deferred.join(' ')}` : ''}`)
-  console.error(`affected-tests: shard ${index}/${count} runs ${tests.length}: ${tests.join(' ')}`)
-  const steps = [], unit = tests.filter((test) => !NODE_TEST.test(test)), integration = tests.filter((test) => NODE_TEST.test(test))
-  if (index === 1 && (all || changed.some((path) => path.endsWith('.ts')))) steps.push([join(root, 'node_modules/.bin/tsc'), ['--noEmit']])
-  if (unit.length) steps.push([join(root, 'node_modules/.bin/vitest'), ['run', ...unit]])
-  if (integration.length) steps.push([process.execPath, ['--test', ...integration]])
+const selected = (all ? tests : [...reaching].sort()).filter((file) => !readFileSync(file, 'utf8').includes('deploy-check: full run only'))
+const [index, count] = (process.env.BEELINK_GATE_SHARD || '1/1').split('/').map(Number)
+const share = selected.map((file) => [statSync(file).size, file]).sort(([a], [b]) => b - a)
+  .filter((_, at) => at % count === index - 1).map(([, file]) => file).sort()
+console.error(`affected-tests: selected ${all ? 'every test file' : selected.length}; shard ${index}/${count} runs:`)
+console.log(share.join('\n'))
+if (process.argv.includes('--run')) {
+  const node = share.filter((test) => test.endsWith('.mjs')), unit = share.filter((test) => !node.includes(test))
   let exit = 0
-  for (const [command, args] of steps) {
-    console.error(`affected-tests: ${basename(command)} ${args.join(' ')}`)
-    const { status, signal } = spawnSync(command, args, { cwd: root, stdio: 'inherit' })
-    // A killed step keeps its signal's code, which deploy-check holds on; any other failure is a red.
-    if (status !== 0 && exit === 0) exit = signal ? 128 + constants.signals[signal] : 1
+  for (const [command, ...args] of [index === 1 && selected.length && ['tsc', '--noEmit'], unit.length && ['vitest', 'run', ...unit],
+    node.length && ['node', '--test', ...node]].filter(Boolean)) {
+    const { status, signal } = spawnSync(command, args, { stdio: 'inherit' })
+    if (status !== 0) exit ||= signal ? 128 + constants.signals[signal] : 1
   }
   process.exit(exit)
 }
