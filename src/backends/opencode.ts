@@ -22,6 +22,7 @@ import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { overlayOpencodeTextOnlyToolSurface } from './opencode-text-only.js'
 import {
   admitNativeSubscription,
   profileExecutionIdentity,
@@ -69,6 +70,9 @@ export class OpencodeBackend implements Backend {
   // The signal plugin reports a call at its start; it is installed in the turn's private config
   // directory, which every turn with an AgentProfile has (agent-runtime always sends one).
   readonly toolCallSpans = true
+  // Verified against the real runner (1.18.30, local recording provider): an explicit
+  // `tool_choice: "none"` turn carries zero ambient action tools in its model requests.
+  readonly textOnlyToolChoice = true
   private readonly spawner: Spawner
   constructor(private readonly opts: OpencodeBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
@@ -174,6 +178,7 @@ export class OpencodeBackend implements Backend {
         profileForControls?.permissions,
         profileForControls?.tools,
         req.session_id,
+        req.toolChoice === 'none',
       )
     } catch (error) {
       provisioned.cleanup?.()
@@ -182,6 +187,18 @@ export class OpencodeBackend implements Backend {
     // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
     // expose its dir read-only so the confined opencode can still read it.
     if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
+
+    // An explicit text-only turn (`tool_choice: "none"`) must put ZERO tools in
+    // the model request — standard semantics, no model tool calls at all — even
+    // when a profile, the operator's ambient OPENCODE_CONFIG_CONTENT, an
+    // agent-layer tools map, the operator's global config, or the project layer
+    // would reintroduce one: that env var is opencode's FINAL config layer and
+    // beats everything the bridge wrote above, so the zero-tool surface is laid
+    // over it (inherited MCP servers disabled by name, project layer disabled,
+    // unenumerable global config refused before spawn).
+    if (req.toolChoice === 'none') {
+      overlayOpencodeTextOnlyToolSurface(provisioned.env)
+    }
 
     // opencode installs itself under $HOME, and an fs-jail deliberately hides /home. The generic
     // derivation in `toolchainReadPaths` reaches the install root only when the on-PATH entry

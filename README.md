@@ -218,6 +218,21 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 - `run_id`: caller-owned durable job id (also accepted as `X-Run-Id`)
 - `execution`: execution location plus an optional caller-owned `timeoutMs` process deadline
 - `interactions` and `interaction_policy`: parsed with the shared interaction contract; one-shot chat rejects a non-empty posture or policy with `501 capability_denied` before durable admission because response-bound interactions require a retained native session
+- `tool_choice`: the standard OpenAI field, accepted as `'none'` or `'auto'`. `'none'` is the
+  explicit text-inference request with standard semantics — the model makes no tool calls at
+  all: the turn's model requests carry zero tools, ambient action tools and caller-bound MCP
+  servers alike (analysis/trace callbacks belong outside the nested model call, on their own
+  authority, and stay usable there). OpenCode today; every other backend is refused with
+  `400 invalid_request_error` naming the gap rather than accepting and ignoring the field,
+  until it declares a verified zero-tool control. The surface is per turn and closes inherited
+  channels: profile, operator, agent-layer, and project-config permission/tool entries cannot
+  reintroduce a tool, an unenumerable operator global config refuses the turn before dispatch,
+  and sandbox delegation is refused because its task boundary drops the field. `'auto'` and an
+  absent field are the native default everywhere — ordinary turns keep their native coding
+  tools and MCP passthrough, and an absent or empty `tools` list is never read as a request.
+  This is a provider tool-list restriction, not hosted-safe isolation. Measured against
+  OpenCode 1.18.30 with a local recording endpoint
+  (`tests/opencode-text-only-tool-choice-real.test.ts`).
 
 Behavior:
 

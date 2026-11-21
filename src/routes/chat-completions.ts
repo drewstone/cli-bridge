@@ -18,7 +18,6 @@ import { legacyRequestMetadata } from '../sessions/legacy-metadata.js'
  */
 
 import type { Context, Hono } from 'hono'
-import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import {
   canonicalAgentProfileDigest,
@@ -46,6 +45,7 @@ import { resolveHostAcquireDeadlineMs } from '../executors/host.js'
 import { BackendError } from '../backends/types.js'
 import { BackendReportedFailureError, describeRunFailure } from '../runs/error-shape.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
+import { canonicalProtectedModelBaseUrl, durableRunRequestDigest, protectedCredentialDigest } from './run-identity.js'
 import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
 import { hostRequestJail } from '../jail/host-request.js'
@@ -173,6 +173,15 @@ const chatRequestSchema = z.object({
   stream: z.boolean().optional(),
   temperature: z.number().optional(),
   max_tokens: z.number().optional(),
+  // Standard OpenAI tool-choice field. Only the explicit text-inference
+  // request `'none'` (and the everywhere-default `'auto'`) are accepted:
+  // `'none'` is honored solely by backends that declare a verified native
+  // zero-ambient-tool control (see the guard below), and every other
+  // spelling is refused at parse rather than accepted and ignored — this
+  // route never claims a tool control it does not enforce. An absent field
+  // is NOT a request: ordinary turns keep their native coding tools, and an
+  // absent/empty `tools` list never implies it.
+  tool_choice: z.union([z.literal('none'), z.literal('auto')]).optional(),
   // Mirrors the canonical ReasoningEffort ladder in @tangle-network/agent-interface.
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
   interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
@@ -468,6 +477,7 @@ export function mountChatCompletions(
     // here to match the ChatRequest type.
     const {
       response_format,
+      tool_choice,
       agent_profile,
       cwd,
       execution,
@@ -642,6 +652,28 @@ export function mountChatCompletions(
         },
       }, 404)
     }
+    // Honesty guard for the text-inference contract: a backend without a
+    // verified native control that removes its ambient action tools from the
+    // model request would run the turn with tools the caller explicitly
+    // refused. Sandbox delegation has the same gap one hop further out: the
+    // sandbox task transport does not carry the field, so the in-container
+    // turn would run with ambient tools even when the delegating harness
+    // declares the control. Refused here, before any session identity claim,
+    // naming the gap and the lift — never accepted and silently ignored.
+    if (tool_choice === 'none' && (backend.textOnlyToolChoice !== true || execution?.kind === 'sandbox')) {
+      return c.json({
+        error: {
+          message: backend.textOnlyToolChoice === true && execution?.kind === 'sandbox'
+            ? `backend "${backend.name}" cannot enforce tool_choice "none" through sandbox execution: the sandbox task boundary does not carry the field, and the in-container turn would run with ambient action tools; `
+              + 'this route refuses the field rather than ignoring it. Run the turn on the host executor, '
+              + 'or extend the sandbox task contract with the tool-surface field first.'
+            : `backend "${backend.name}" cannot enforce tool_choice "none": no verified native control removes its ambient action tools from the model request; `
+              + 'this route refuses the field rather than ignoring it. Send the request without tool_choice to keep native tools, '
+              + 'or route it through a backend that declares the control.',
+          type: 'invalid_request_error',
+        },
+      }, 400)
+    }
     const oneShotInteractionError = oneShotInteractionCapabilityError(
       backend.name,
       parsed.data.interactions,
@@ -697,6 +729,10 @@ export function mountChatCompletions(
       } : {}),
       mode,
       ...(response_format ? { responseFormat: normalizeResponseFormat(response_format) } : {}),
+      // `'auto'` is the native default on every harness; translating it to
+      // no field keeps an ordinary request byte-identical to one that never
+      // sent `tool_choice`. Only the explicit `'none'` reaches a backend.
+      ...(tool_choice === 'none' ? { toolChoice: 'none' as const } : {}),
       ...(effectiveProfile !== undefined ? { agent_profile: effectiveProfile as ChatRequest['agent_profile'] } : {}),
       ...(effectiveMcp ? { mcp: effectiveMcp } : {}),
       // Attachments are process-ephemeral: applied to this request only,
@@ -1451,60 +1487,7 @@ function resolveExactRunCoordinates(input: {
   }
 }
 
-/** Bind a run id to execution semantics, not response representation. `stream` and runtime-owned
- * materialization fields do not change the backend job and are deliberately excluded. */
-function durableRunRequestDigest(req: ChatRequest, backend: string): string {
-  const {
-    stream: _stream,
-    jailSpec: _jailSpec,
-    profile_materialization_receipt: _materialization,
-    // Runtime attachments are process-ephemeral platform endpoints. A
-    // dispatcher that restarts re-issues the same job from a new port, and
-    // that reconnect must re-attach to the in-flight run, not conflict.
-    runtime_attachments: _runtimeAttachments,
-    protectedModelCredential, runtimeCoordinationBearer: _runtimeCoordinationBearer,
-    ...executionRequest
-  } = req
-  // The request originated as JSON, but object spreads can reintroduce
-  // optional `undefined` properties. A JSON round trip restores exact wire
-  // semantics before RFC 8785 canonicalization (undefined object fields are
-  // absent; array values retain their JSON form).
-  const normalized = JSON.parse(JSON.stringify({
-    schema: 'cli-bridge.durable-run-request.v1',
-    backend,
-    request: { ...executionRequest },
-    ...(protectedModelCredential
-      ? {
-          protectedModelCredentialDigest: protectedModelCredential.digest,
-          protectedModelBaseUrlDigest: protectedModelCredential.baseUrlDigest,
-        }
-      : {}),
-  })) as Parameters<typeof canonicalCandidateDigest>[0]
-  return canonicalCandidateDigest(normalized)
-}
-
-function protectedCredentialDigest(token: string): `sha256:${string}` {
-  return `sha256:${createHash('sha256').update(token).digest('hex')}`
-}
-
-function canonicalProtectedModelBaseUrl(value: string): string | undefined {
-  let target: URL
-  try {
-    target = new URL(value)
-  } catch {
-    return undefined
-  }
-  if (
-    target.protocol !== 'https:'
-    || target.username
-    || target.password
-    || target.search
-    || target.hash
-  ) {
-    return undefined
-  }
-  return target.toString().replace(/\/$/u, '')
-}
+/** Bind a run id to execution semantics, not response representation — see run-identity.ts. */
 
 
 /**
