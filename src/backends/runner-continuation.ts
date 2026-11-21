@@ -9,7 +9,7 @@ import type { SpawnResult } from '../executors/types.js'
 import type { BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { contentToText } from './content.js'
-import type { ChatDelta, ChatRequest } from './types.js'
+import { terminalOutcome, type ChatDelta, type ChatRequest } from './types.js'
 
 /** What one runner process showed before it ended, for deciding a continuation. */
 export interface RunnerWatch {
@@ -21,13 +21,6 @@ export interface RunnerWatch {
   exit?: string
   /** Its scope was killed and found empty. */
   drained: boolean
-  /**
-   * Billed output tokens observed from this turn's step receipts so far, across
-   * every runner spawn of the turn. A backend enforcing a cumulative output cap
-   * reads and writes this, so one turn's runner-death continuation cannot reset
-   * the budget its dead runner already spent.
-   */
-  billedOutputTokens?: number
 }
 
 export interface RunnerInterruption {
@@ -36,8 +29,8 @@ export interface RunnerInterruption {
   exit?: string
   nativeSessionId: string
   openTools: ReadonlyMap<string, string>
-  /** What the dead runner already billed, so the continuation keeps the turn's budget. */
-  billedOutputTokens?: number
+  /** On bridge restart this comes from the durable runner record, before request reconstruction. */
+  recordedMaxTokens?: number | null
 }
 
 /** A backend that runs one native runner process per call and resumes `session.internalId` natively. */
@@ -58,7 +51,8 @@ export function runnerDelta(
   backend: string, pid: number, spawned: Pick<SpawnResult, 'scope'>, mode: BridgeMode, cwd: string | undefined, req: ChatRequest,
 ): ChatDelta {
   const system = (req.messages ?? []).filter((m) => m.role === 'system').map((m) => contentToText(m.content).match(/[\s\S]{1,16000}/gu) ?? [])
-  return { runner: { backend, pid, ...(spawned.scope ? { scope: spawned.scope } : {}), mode, ...(cwd ? { cwd } : {}), ...(system.length ? { system } : {}) } }
+  const budget = backend === 'opencode' ? { max_tokens: req.max_tokens ?? null } : {}
+  return { runner: { backend, pid, ...budget, ...(spawned.scope ? { scope: spawned.scope } : {}), mode, ...(cwd ? { cwd } : {}), ...(system.length ? { system } : {}) } }
 }
 
 /**
@@ -74,8 +68,7 @@ export async function* chatContinuing(
   } catch (error) {
     if (signal.aborted || !watch.exit || !watch.drained || !watch.nativeSessionId || watch.pid === undefined) throw error
     yield* continueTurn(backend, req, session,
-      { reason: 'runner_exit', pid: watch.pid, exit: watch.exit, nativeSessionId: watch.nativeSessionId, openTools: watch.openTools,
-        ...(watch.billedOutputTokens !== undefined ? { billedOutputTokens: watch.billedOutputTokens } : {}) }, signal)
+      { reason: 'runner_exit', pid: watch.pid, exit: watch.exit, nativeSessionId: watch.nativeSessionId, openTools: watch.openTools }, signal)
   }
 }
 
@@ -91,6 +84,14 @@ export async function* chatContinuing(
 export async function* continueTurn(
   backend: NativeResumeBackend, req: ChatRequest, session: SessionRecord | null, interruption: RunnerInterruption, signal: AbortSignal,
 ): AsyncIterable<ChatDelta> {
+  // A drained process cannot tell us which grants its provider already consumed.
+  // A legacy OpenCode record also lacks proof that its request was uncapped.
+  const originalCap = interruption.reason === 'bridge_restart' ? interruption.recordedMaxTokens : req.max_tokens ?? null
+  if (backend.name === 'opencode' && originalCap !== null) {
+    const failure = { type: 'upstream' as const, message: 'OpenCode was interrupted and its remaining output token budget is unknown. Automatic continuation was refused.' }
+    yield { ...terminalOutcome('opencode', failure, false), internal_session_id: interruption.nativeSessionId }
+    return
+  }
   const tools = [...interruption.openTools].map(([id, name]) => ({ id, name }))
   yield { continuation: {
     reason: interruption.reason,
@@ -116,9 +117,7 @@ export async function* continueTurn(
         cwd: req.cwd ?? null, turns: 1, createdAt: Date.now(), lastUsedAt: Date.now(), metadata: {} }
   // Codex numbers its items per process, so the resumed runner reuses ids the dead one announced.
   const own = (id: string): string => `${id}.resumed`
-  const resumedWatch = newRunnerWatch()
-  resumedWatch.billedOutputTokens = interruption.billedOutputTokens
-  for await (const delta of backend.runRunner(resumed, resumedSession, signal, resumedWatch)) {
+  for await (const delta of backend.runRunner(resumed, resumedSession, signal, newRunnerWatch())) {
     yield { ...delta,
       ...(delta.tool_calls ? { tool_calls: delta.tool_calls.map((call) => ({ ...call, id: own(call.id) })) } : {}),
       ...(delta.tool_results ? { tool_results: delta.tool_results.map((result) => ({ ...result, id: own(result.id) })) } : {}) }

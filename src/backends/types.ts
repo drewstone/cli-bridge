@@ -624,6 +624,8 @@ export interface ChatDelta {
    */
   runner?: {
     backend: string; pid: number; scope?: string; mode: BridgeMode; cwd?: string
+    /** OpenCode records null for uncapped requests. Older records do not establish the original budget. */
+    max_tokens?: number | null
     /** The turn's role:system texts, each split into chunks under the retained-string bound. */
     system?: string[][]
   }

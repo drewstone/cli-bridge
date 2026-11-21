@@ -21,7 +21,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import { outputCapPluginSource } from '../src/backends/opencode.js'
 
 interface Hooks {
-  'chat.params': (input: { sessionID?: string }, params: { maxOutputTokens?: number }) => Promise<void>
+  'chat.params': (input: { sessionID?: string; message?: { sessionID?: string; id?: string; role: 'user' } }, params: { maxOutputTokens?: number }) => Promise<void>
   event: (wrapper: { event: unknown }) => Promise<void>
 }
 
@@ -39,27 +39,41 @@ async function makePlugin(cap: number): Promise<Hooks> {
   return await mod.CliBridgeOutputCap()
 }
 
-/** One ask on a session; resolves to the maxOutputTokens the plugin granted. */
-async function ask(hooks: Hooks, sessionID = 'ses_run', base = 1_000_000): Promise<number> {
-  const params: { maxOutputTokens?: number } = { maxOutputTokens: base }
-  await hooks['chat.params']({ sessionID }, params)
-  return params.maxOutputTokens ?? 0
+const activeAssistant = new WeakMap<Hooks, Map<string, string>>()
+let sequence = 0
+async function partEvent(hooks: Hooks, part: Record<string, unknown>): Promise<void> {
+  await hooks.event({ event: { type: 'message.part.updated', properties: { part } } })
 }
 
-/** One step-finish notification, shaped like opencode's message.part.updated. */
-async function receipt(
-  hooks: Hooks,
-  part: { id?: string; sessionID?: string; output?: number; reasoning?: number },
-): Promise<void> {
-  await hooks.event({ event: {
-    type: 'message.part.updated',
-    properties: { part: {
-      type: 'step-finish',
-      ...(part.id !== undefined ? { id: part.id } : {}),
-      sessionID: part.sessionID ?? 'ses_run',
-      tokens: { output: part.output ?? 0, reasoning: part.reasoning ?? 0 },
-    } },
-  } })
+/** Replay the native writer's assistant → chat.params(user) → step-start ordering. */
+async function ask(hooks: Hooks, sessionID = 'ses_run', base = 1_000_000): Promise<number> {
+  const user = { sessionID, id: 'user1', role: 'user' as const }
+  const info = { id: `assistant${++sequence}`, sessionID, parentID: user.id, role: 'assistant' }
+  const notify = (value: object) => hooks.event({ event: { type: 'message.updated', properties: { info: value } } })
+  await notify(info)
+  const params = { maxOutputTokens: base }
+  try {
+    await hooks['chat.params']({ sessionID, message: user }, params)
+  } catch (error) {
+    await notify({ ...info, error: { name: 'UnknownError' } })
+    throw error
+  }
+  const active = activeAssistant.get(hooks) ?? new Map<string, string>()
+  active.set(sessionID, info.id)
+  activeAssistant.set(hooks, active)
+  await partEvent(hooks, { type: 'step-start', id: `start-${info.id}`, sessionID, messageID: info.id })
+  return params.maxOutputTokens
+}
+
+async function receipt(hooks: Hooks, part: {
+  id?: string; sessionID?: string; messageID?: string; output?: number; reasoning?: number; override?: Record<string, unknown>
+}): Promise<void> {
+  const sessionID = part.sessionID ?? 'ses_run'
+  await partEvent(hooks, {
+    type: 'step-finish', id: part.id, sessionID,
+    messageID: part.messageID ?? activeAssistant.get(hooks)?.get(sessionID) ?? 'foreign',
+    tokens: { output: part.output ?? 0, reasoning: part.reasoning ?? 0 }, ...part.override,
+  })
 }
 
 describe('the generated output-budget plugin', () => {
@@ -123,6 +137,55 @@ describe('the generated output-budget plugin', () => {
     expect(await ask(hooks, 'ses_run')).toBe(60)
     await receipt(hooks, { id: 'p1', sessionID: 'ses_other', output: 0 })
     await expect(ask(hooks, 'ses_run')).rejects.toThrow(/overlapping model call/)
+  })
+
+  it('withholds the full grant when a native counter is absent, invalid or normalized to zero', async () => {
+    for (const tokens of [undefined, {}, { output: 4 }, { reasoning: 2 }, { output: 0, reasoning: 0 },
+      { output: -1, reasoning: 5 }, { output: 4, reasoning: -1 }, { output: 1.5, reasoning: 0 },
+      { output: Infinity, reasoning: 0 }, { output: 4, reasoning: NaN }, { output: '4', reasoning: 0 },
+      { output: Number.MAX_SAFE_INTEGER, reasoning: 1 }]) {
+      const hooks = await makePlugin(30)
+      expect(await ask(hooks, 'ses_run', 20)).toBe(20)
+      await receipt(hooks, { id: 'finish', override: { tokens } })
+      // The other ten tokens were never granted to the uncertain call.
+      expect(await ask(hooks)).toBe(10)
+    }
+  })
+
+  it('requires an identified finish from the assistant whose model step started', async () => {
+    for (const override of [{ id: undefined }, { id: '' }, { sessionID: undefined }, { messageID: undefined },
+      { messageID: 'different-assistant-in-same-session' }]) {
+      const hooks = await makePlugin(30)
+      await ask(hooks)
+      await receipt(hooks, { id: 'finish', output: 2, override })
+      await expect(ask(hooks)).rejects.toThrow(/overlapping model call/)
+    }
+    const hooks = await makePlugin(30)
+    await ask(hooks)
+    const first = activeAssistant.get(hooks)!.get('ses_run')!
+    await receipt(hooks, { id: 'first', output: 5 })
+    expect(await ask(hooks)).toBe(25)
+    await receipt(hooks, { id: 'first', messageID: first, output: 5 })
+    await receipt(hooks, { id: 'late', messageID: first, output: 2 })
+    await expect(ask(hooks)).rejects.toThrow(/overlapping model call/)
+    await receipt(hooks, { id: 'second', output: 5 })
+    expect(await ask(hooks)).toBe(18)
+  })
+
+  it('withholds the lease when the grant or native start cannot identify an attempt', async () => {
+    for (const mode of ['absent-user', 'ambiguous-assistant', 'absent-start', 'ambiguous-start']) {
+      const hooks = await makePlugin(30)
+      const sessionID = 'ses_run'
+      for (const id of mode === 'ambiguous-assistant' ? ['a', 'b'] : ['a']) {
+        await hooks.event({ event: { type: 'message.updated', properties: { info: { id, sessionID, parentID: 'user1', role: 'assistant' } } } })
+      }
+      const message = { id: mode === 'absent-user' ? undefined : 'user1', role: 'user' as const, sessionID }
+      await hooks['chat.params']({ sessionID, message }, {})
+      if (mode !== 'absent-start') await partEvent(hooks, { id: 'start', type: 'step-start', sessionID, messageID: 'a' })
+      if (mode === 'ambiguous-start') await partEvent(hooks, { id: 'other', type: 'step-start', sessionID, messageID: 'a' })
+      await receipt(hooks, { id: 'finish', messageID: 'a', output: 3 })
+      await expect(ask(hooks)).rejects.toThrow(/overlapping model call/)
+    }
   })
 
   it('refuses once the budget is spent, and keeps refusing', async () => {

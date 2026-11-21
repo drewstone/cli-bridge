@@ -15,7 +15,7 @@
  * The per-turn output-budget plugin holds a HARD lease over the cap inside the
  * runner process: every granted ask is reserved synchronously before dispatch,
  * one lease is outstanding at a time, capacity returns only against a receipt
- * attributed to that exact attempt (same session, settled once per part id),
+ * attributed to that exact assistant step (settled once per identified part),
  * and unattributed receipts are charged, never refunded. So these cases must
  * observe, on the wire and in usage:
  *
@@ -43,7 +43,11 @@ import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { OpencodeBackend } from '../src/backends/opencode.js'
 import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
-import type { SessionRecord } from '../src/sessions/store.js'
+import { SessionStore, type SessionRecord } from '../src/sessions/store.js'
+import { BackendRegistry } from '../src/backends/registry.js'
+import { newRunnerWatch } from '../src/backends/runner-continuation.js'
+import { RunRegistry } from '../src/runs/registry.js'
+import { continueInterruptedRuns } from '../src/runs/continue-interrupted.js'
 import { hostSpawner } from '../src/executors/host.js'
 
 const BIN = process.env.OPENCODE_BIN ?? join(homedir(), '.opencode/bin/opencode')
@@ -275,6 +279,96 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
     expect(billed(deltas)).toBeLessThanOrEqual(60)
     expect(modelCalls(deltas).map((usage) => usage.output_tokens)).toEqual([48, 10])
   }, 120_000)
+
+  it('keeps a grant when OpenCode writes zeros for missing usage after a real tool call', async () => {
+    const key = providerConfig('probe-unknown')
+    recorded.length = 0
+    script = ({ text }) => text.includes('"role":"tool"')
+      ? { chunks: [chunk({ role: 'assistant', content: 'Unbudgeted follow-up.' }), chunk({}, 'stop')] }
+      : { chunks: [chunk({ role: 'assistant', content: 'Checking.' }), toolCallChunk('call_pwd', 'pwd'), chunk({}, 'tool_calls')] }
+    const { deltas } = await turn({
+      model: 'opencode/probe-unknown/m', session_id: 'cap-unknown',
+      messages: [{ role: 'user', content: 'Run pwd and answer.' }], max_tokens: 30,
+    })
+    expect(forKey(key).map(entry => entry.max_tokens)).toEqual([30])
+    expect(deltas.some(delta => delta.tool_results?.some(result => result.status === 'completed'))).toBe(true)
+    expect(modelCalls(deltas)).toHaveLength(1)
+    expect(modelCalls(deltas)[0]?.output_tokens).toBeUndefined()
+    expect(modelCalls(deltas)[0]?.cost_known).toBe(false)
+    expect(finish(deltas)).toBe('error')
+    expect(deltas.at(-1)?.error?.message).toContain('native usage is unknown')
+
+    recorded.length = 0
+    script = () => ({ chunks: [chunk({ role: 'assistant', content: 'Complete answer.' }), chunk({}, 'stop')] })
+    const final = await turn({
+      model: 'opencode/probe-unknown/m', session_id: 'cap-final-unknown',
+      messages: [{ role: 'user', content: 'Answer.' }], max_tokens: 30,
+    })
+    expect(forKey(key).map(entry => entry.max_tokens)).toEqual([30])
+    expect(finish(final.deltas)).toBe('stop')
+    expect(final.deltas.some(delta => delta.content === 'Complete answer.')).toBe(true)
+    expect(modelCalls(final.deltas)[0]?.output_tokens).toBeUndefined()
+  }, 120_000)
+
+  it.skipIf(process.env.CLI_BRIDGE_REAL_CGROUP_TESTS !== '1').each(['capped', 'legacy', 'uncapped'])(
+    'recovers an interrupted %s OpenCode request through its durable runner record', async mode => {
+      const key = providerConfig('probe-restart')
+      const model = 'opencode/probe-restart/m'
+      const runId = `restart-${mode}`
+      const cwd = mkdtempSync(join(scratch, 'restart-'))
+      const dir = mkdtempSync(join(scratch, 'store-'))
+      let store = new SessionStore(dir)
+      const runs = new RunRegistry()
+      const backend = new OpencodeBackend({ bin: BIN, timeoutMs: 60_000 })
+      const registry = new BackendRegistry().register(backend)
+      const req: ChatRequest = { model, cwd, mode: 'byob', messages: [{ role: 'user', content: 'Use the tool.' }],
+        ...(mode !== 'uncapped' ? { max_tokens: 30 } : {}) }
+      const original = backend.runRunner(req, null, new AbortController().signal, newRunnerWatch())
+      recorded.length = 0
+      script = ({ tools }) => ({ chunks: tools
+        ? [toolCallChunk('pause', 'sleep 30'), chunk({}, 'tool_calls', { prompt_tokens: 8, completion_tokens: 3 })]
+        : [chunk({ role: 'assistant', content: 'Title' }), chunk({}, 'stop', { prompt_tokens: 5, completion_tokens: 1 })] })
+      try {
+        store.claimRetainedRun({ runId, owner: 'one-shot', sessionId: runId, executionId: runId,
+          requestDigest: `sha256:${'a'.repeat(64)}`, provider: 'opencode', environmentId: 'local', snapshot: { model, terminal: false } })
+        let sequence = 0
+        while (true) {
+          const next = await original.next()
+          expect(next.done).toBe(false)
+          if (next.done) throw new Error('original runner ended before its native session was retained')
+          const delta = next.value
+          if (delta.runner) {
+            expect(delta.runner.scope).toBeTruthy()
+            if (mode === 'legacy') delete delta.runner.max_tokens
+          }
+          store.appendRetainedDelta(runId, { runId, sequence: ++sequence, delta })
+          if (delta.internal_session_id) break
+        }
+        expect(forKey(key).some(entry => entry.tools > 0)).toBe(true)
+        store.close()
+        store = new SessionStore(dir)
+        recorded.length = 0
+        script = () => ({ chunks: [chunk({ role: 'assistant', content: 'Recovered.' }), chunk({}, 'stop', { prompt_tokens: 8, completion_tokens: 3 })] })
+        // Startup drains the recorded live native scope and reopens the database.
+        await continueInterruptedRuns({ store, registry, runs, durableWriter: null, jailEnv: {} })
+        const recovered = runs.get(runId)
+        expect(recovered, 'the live native scope must have drained').toBeDefined()
+        const end = await recovered!.whenTerminal()
+        const requests = forKey(key).filter(entry => entry.tools > 0)
+        if (mode === 'uncapped') {
+          expect(requests).toHaveLength(1)
+          expect(end.continuations).toHaveLength(1)
+        } else {
+          expect(requests).toHaveLength(0)
+          expect(end.continuations ?? []).toHaveLength(0)
+          expect(JSON.stringify(store.retainedEventsAfterRun(runId, runId).at(-1)?.envelope.event)).toContain('remaining output token budget is unknown')
+        }
+      } finally {
+        await original.return(undefined)
+        await runs.shutdown()
+        store.close()
+      }
+    }, 120_000)
 
   it('cuts a continuation whose first receipt already spent the whole budget', async () => {
     const key = providerConfig('probe-cut')

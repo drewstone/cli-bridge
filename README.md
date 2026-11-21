@@ -234,14 +234,16 @@ Behavior:
   The bridge does not expose or copy the host database and logs.
 - OpenCode turns accept an explicit `max_tokens`. The request value becomes the runner's
   experimental output-token maximum (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`) for that one
-  turn — fresh or resumed — and a per-turn output-budget plugin holds a hard lease over the
-  cap inside the runner process: every granted ask is reserved synchronously before dispatch,
-  exactly one lease is outstanding at a time, capacity returns only against a step-finish
-  receipt attributed to that exact attempt (same session, settled once per part id, refunding
-  only the unspent difference), and a receipt no lease can claim (another session's spend) is
-  charged, never refunded. So the turn's billed output cannot pass the cap: an overlapping or
-  uncertain call — opencode's own retry after a refused attempt or a lost stream, a concurrent
-  generation — is refused before the wire and the turn fails honestly instead of re-spending.
+  turn, fresh or resumed. Its budget plugin reserves each model request before sending it.
+  OpenCode names the new assistant and its user parent before the request. Only a step that
+  starts and finishes on that assistant in the same session can return unused tokens, once,
+  with complete positive output accounting (visible plus reasoning). A provider can omit
+  usage even after producing text or a tool call. OpenCode then writes zeros, and the bridge
+  keeps the full grant reserved. A final answer still completes. Another call needs
+  unreserved tokens. An overlapping call or an uncertain retry is refused before dispatch.
+  If the runner or bridge dies, an explicitly capped turn cannot automatically resume because
+  its outstanding reservation went with the process. New uncapped turns retain automatic
+  recovery. Older OpenCode runner records lack the original cap and close with that uncertainty.
   The turn names its own session title (`--title`), because title generation is a model call
   whose billing prints no receipt. A provider that stops a completion at the bound ends the
   turn `finish_reason: "length"`, as does a step receipt that spends the budget while more
