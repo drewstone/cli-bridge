@@ -22,6 +22,7 @@ import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { overlayOpencodeTextOnlyToolSurface } from './opencode-text-only.js'
 import {
   admitNativeSubscription,
   profileExecutionIdentity,
@@ -69,6 +70,9 @@ export class OpencodeBackend implements Backend {
   // The signal plugin reports a call at its start; it is installed in the turn's private config
   // directory, which every turn with an AgentProfile has (agent-runtime always sends one).
   readonly toolCallSpans = true
+  // Verified against the real runner (1.18.30, local recording provider): an explicit
+  // `tool_choice: "none"` turn carries zero ambient action tools in its model requests.
+  readonly textOnlyToolChoice = true
   private readonly spawner: Spawner
   constructor(private readonly opts: OpencodeBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
@@ -183,6 +187,18 @@ export class OpencodeBackend implements Backend {
     // expose its dir read-only so the confined opencode can still read it.
     if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
 
+    // An explicit text-only turn (`tool_choice: "none"`) runs under its own
+    // fresh agent whose permission is the native wildcard deny: the resolver
+    // appends it after every global and agent default and checks every tool
+    // id, ambient action tools and MCP servers alike, so the model request
+    // carries zero tools. The project layer and the operator's global config
+    // stay live — a project-configured provider keeps working — and unrelated
+    // config keys survive the overlay.
+    let textOnlyAgent: string | undefined
+    if (req.toolChoice === 'none') {
+      textOnlyAgent = overlayOpencodeTextOnlyToolSurface(provisioned.env)
+    }
+
     // opencode installs itself under $HOME, and an fs-jail deliberately hides /home. The generic
     // derivation in `toolchainReadPaths` reaches the install root only when the on-PATH entry
     // realpaths INTO it; an operator whose `opencode` is a wrapper script elsewhere realpaths to
@@ -211,6 +227,7 @@ export class OpencodeBackend implements Backend {
     if (model) args.push('-m', model)
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
+    if (textOnlyAgent) args.push('--agent', textOnlyAgent)
     // A capped turn names its own title so opencode generates none. Title
     // generation is an extra model call in the same process: it carries the
     // cap on the wire, but `run` prints no step receipt for it, so its billed
