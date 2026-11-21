@@ -52,7 +52,10 @@ export function runnerDelta(
 ): ChatDelta {
   const system = (req.messages ?? []).filter((m) => m.role === 'system').map((m) => contentToText(m.content).match(/[\s\S]{1,16000}/gu) ?? [])
   const budget = backend === 'opencode' ? { max_tokens: req.max_tokens ?? null } : {}
-  return { runner: { backend, pid, ...budget, ...(spawned.scope ? { scope: spawned.scope } : {}), mode, ...(cwd ? { cwd } : {}), ...(system.length ? { system } : {}) } }
+  return { runner: {
+    backend, pid, mode, ...budget, ...(spawned.scope ? { scope: spawned.scope } : {}),
+    ...(cwd ? { cwd } : {}), ...(system.length ? { system } : {}),
+  } }
 }
 
 /**
@@ -88,8 +91,8 @@ export async function* continueTurn(
   // A legacy OpenCode record also lacks proof that its request was uncapped.
   const originalCap = interruption.reason === 'bridge_restart' ? interruption.recordedMaxTokens : req.max_tokens ?? null
   if (backend.name === 'opencode' && originalCap !== null) {
-    const failure = { type: 'upstream' as const, message: 'OpenCode was interrupted and its remaining output token budget is unknown. Automatic continuation was refused.' }
-    yield { ...terminalOutcome('opencode', failure, false), internal_session_id: interruption.nativeSessionId }
+    const message = 'The runner was interrupted and its remaining output token budget is unknown. Automatic continuation was refused.'
+    yield { ...terminalOutcome('opencode', message, false), internal_session_id: interruption.nativeSessionId }
     return
   }
   const tools = [...interruption.openTools].map(([id, name]) => ({ id, name }))

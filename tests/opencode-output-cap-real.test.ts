@@ -323,7 +323,7 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
       const registry = new BackendRegistry().register(backend)
       const req: ChatRequest = { model, cwd, mode: 'byob', messages: [{ role: 'user', content: 'Use the tool.' }],
         ...(mode !== 'uncapped' ? { max_tokens: 30 } : {}) }
-      const original = backend.runRunner(req, null, new AbortController().signal, newRunnerWatch())
+      const original = backend.runRunner(req, null, new AbortController().signal, newRunnerWatch())[Symbol.asyncIterator]()
       recorded.length = 0
       script = ({ tools }) => ({ chunks: tools
         ? [toolCallChunk('pause', 'sleep 30'), chunk({}, 'tool_calls', { prompt_tokens: 8, completion_tokens: 3 })]
@@ -364,7 +364,7 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
           expect(JSON.stringify(store.retainedEventsAfterRun(runId, runId).at(-1)?.envelope.event)).toContain('remaining output token budget is unknown')
         }
       } finally {
-        await original.return(undefined)
+        await original.return?.()
         await runs.shutdown()
         store.close()
       }
