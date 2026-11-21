@@ -21,6 +21,13 @@ export interface RunnerWatch {
   exit?: string
   /** Its scope was killed and found empty. */
   drained: boolean
+  /**
+   * Billed output tokens observed from this turn's step receipts so far, across
+   * every runner spawn of the turn. A backend enforcing a cumulative output cap
+   * reads and writes this, so one turn's runner-death continuation cannot reset
+   * the budget its dead runner already spent.
+   */
+  billedOutputTokens?: number
 }
 
 export interface RunnerInterruption {
@@ -29,6 +36,8 @@ export interface RunnerInterruption {
   exit?: string
   nativeSessionId: string
   openTools: ReadonlyMap<string, string>
+  /** What the dead runner already billed, so the continuation keeps the turn's budget. */
+  billedOutputTokens?: number
 }
 
 /** A backend that runs one native runner process per call and resumes `session.internalId` natively. */
@@ -65,7 +74,8 @@ export async function* chatContinuing(
   } catch (error) {
     if (signal.aborted || !watch.exit || !watch.drained || !watch.nativeSessionId || watch.pid === undefined) throw error
     yield* continueTurn(backend, req, session,
-      { reason: 'runner_exit', pid: watch.pid, exit: watch.exit, nativeSessionId: watch.nativeSessionId, openTools: watch.openTools }, signal)
+      { reason: 'runner_exit', pid: watch.pid, exit: watch.exit, nativeSessionId: watch.nativeSessionId, openTools: watch.openTools,
+        ...(watch.billedOutputTokens !== undefined ? { billedOutputTokens: watch.billedOutputTokens } : {}) }, signal)
   }
 }
 
@@ -106,7 +116,9 @@ export async function* continueTurn(
         cwd: req.cwd ?? null, turns: 1, createdAt: Date.now(), lastUsedAt: Date.now(), metadata: {} }
   // Codex numbers its items per process, so the resumed runner reuses ids the dead one announced.
   const own = (id: string): string => `${id}.resumed`
-  for await (const delta of backend.runRunner(resumed, resumedSession, signal, newRunnerWatch())) {
+  const resumedWatch = newRunnerWatch()
+  resumedWatch.billedOutputTokens = interruption.billedOutputTokens
+  for await (const delta of backend.runRunner(resumed, resumedSession, signal, resumedWatch)) {
     yield { ...delta,
       ...(delta.tool_calls ? { tool_calls: delta.tool_calls.map((call) => ({ ...call, id: own(call.id) })) } : {}),
       ...(delta.tool_results ? { tool_results: delta.tool_results.map((result) => ({ ...result, id: own(result.id) })) } : {}) }

@@ -230,6 +230,24 @@ Behavior:
   Codex CLI 0.147.0 supplied the accepted values through direct probes.
 - A jailed OpenCode run seeds only `auth.json` into its writable private data directory.
   The bridge does not expose or copy the host database and logs.
+- OpenCode turns accept an explicit `max_tokens`. The request value becomes the runner's
+  experimental output-token maximum (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`) for that one
+  turn — fresh or resumed — and a per-turn output-budget plugin asks every model call the
+  runner makes (answer steps, tool continuations, subagents, its own retries) for only the
+  unspent remainder, so the turn's billed output cannot pass the cap: an attempt that ends
+  with no receipt reserves its full ask, a refused pre-flight attempt (429 before any
+  completion) reserves nothing, and an exhausted budget refuses further calls before the
+  wire. The turn names its own session title (`--title`), because title generation is a
+  model call whose billing prints no receipt. A provider that stops a completion at the
+  bound ends the turn `finish_reason: "length"`, as does a step receipt that spends the
+  budget while more calls would follow. A lower operator flag
+  (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` in the bridge environment) or
+  `agent_profile.model.maxTotalOutputTokens` is preserved via `min`, and the runner's own
+  `min` with the model catalog's output limit applies on the wire. Measured against
+  OpenCode 1.18.30 with a local recording endpoint (`tests/opencode-output-cap-real.test.ts`):
+  wire `max_tokens` per request, remaining-allowance on continuations, retried attempts,
+  reasoning tokens counted, concurrent-turn isolation, and uncapped turns unchanged
+  (title call included, 32000 default bound).
 - the dollar channel has two lanes and they never merge. `cost` travels only with `cost_known: true` and `cost_provenance: provider-receipt` or `billing-receipt`; a consumer may debit a dollar budget with it. Every other case reports `cost_known: false`, plus an optional `estimated_cost` tagged `catalog-estimate` that is never billed spend. A backend that reports no dollars sends no dollar amount, because a zero would read as a measured free turn
 - Claude Code computes `total_cost_usd` locally from token prices. It is an estimate, including when the amount is zero, and is not subscription billing or an invoice. Bridge retains it as `estimated_cost`, with `catalog-estimate` provenance and `cost_scope: total`; actual billed cost remains unknown. An absent amount stays absent. See [Claude Code's cost documentation](https://code.claude.com/docs/en/costs#using-the-usage-command).
 - Pi requires `pi/<provider>/<model>`. The provider and model must have an explicit `baseUrl` and API mode in Pi's `models.json`; the bridge refuses missing or ambiguous selections before Pi starts
