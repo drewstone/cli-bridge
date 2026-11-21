@@ -94,11 +94,17 @@ describe('chat-completions route — tool_choice field', () => {
     expect(plain.calls).toBe(0)
   })
 
-  it('refuses none across sandbox delegation even from a capable backend: the task boundary drops the field', async () => {
+  it.each(['request', 'saved session'])('refuses none when the %s selects sandbox execution', async source => {
+    const session = 'saved-sandbox'
+    const execution = { kind: 'sandbox' }
+    if (source === 'saved session') {
+      sessions.upsert({ externalId: session, backend: 'capable', internalId: 'native',
+        metadata: { model: 'capable/m', execution } })
+    }
     const response = await post({
       ...base('capable/m'),
       tool_choice: 'none',
-      execution: { kind: 'sandbox' },
+      ...(source === 'saved session' ? { session_id: session } : { execution }),
     })
     expect(response.status).toBe(400)
     const error = ((await response.json()) as { error: { message: string } }).error

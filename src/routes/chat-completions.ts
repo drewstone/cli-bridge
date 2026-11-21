@@ -656,8 +656,8 @@ export function mountChatCompletions(
     // boundary drops the field — would run the turn with tools the caller
     // explicitly refused. Refused before any session identity claim, naming
     // the gap and the lift; never accepted and silently ignored.
-    if (tool_choice === 'none' && (backend.textOnlyToolChoice !== true || execution?.kind === 'sandbox')) {
-      const sandboxGap = backend.textOnlyToolChoice === true && execution?.kind === 'sandbox'
+    if (tool_choice === 'none' && (backend.textOnlyToolChoice !== true || effectiveExecution?.kind === 'sandbox')) {
+      const sandboxGap = backend.textOnlyToolChoice === true && effectiveExecution?.kind === 'sandbox'
       return c.json({
         error: {
           message: sandboxGap
