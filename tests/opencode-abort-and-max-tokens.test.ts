@@ -170,8 +170,8 @@ describe('opencode caps a native run through the runner flag', () => {
     const cwd = workspace()
     const script = [
       JSON.stringify({ type: 'session.started', sessionID: 'ses_cap_1' }),
-      JSON.stringify({ type: 'message.updated', sessionID: 'ses_cap_1', part: { type: 'step_finish', reason: 'tool-calls', tokens: { input: 10, output: 200 } } }),
-      JSON.stringify({ type: 'message.updated', sessionID: 'ses_cap_1', part: { type: 'step_finish', reason: 'tool-calls', tokens: { input: 12, output: 150 } } }),
+      JSON.stringify({ type: 'message.updated', sessionID: 'ses_cap_1', part: { type: 'step_finish', reason: 'tool-calls', tokens: { input: 10, output: 200, reasoning: 0 } } }),
+      JSON.stringify({ type: 'message.updated', sessionID: 'ses_cap_1', part: { type: 'step_finish', reason: 'tool-calls', tokens: { input: 12, output: 150, reasoning: 0 } } }),
     ]
     const recorder = recordingSpawner(script)
     const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5_000, spawner: recorder.spawner })

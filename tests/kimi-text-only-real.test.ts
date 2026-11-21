@@ -27,7 +27,7 @@ it.skipIf(!bin)('enforces the local Kimi tool choice at the provider and preserv
   writeFileSync(sentinel, marker)
   writeFileSync(join(cwd, 'AGENTS.md'), 'Native workspace instruction fixture.')
   writeFileSync(join(home, 'SYSTEM.md'), 'Native operator instruction fixture.\n${agents_md}')
-  const calls: { names: string[]; read: boolean; cwd: boolean; system: boolean; prompt: boolean; model: string }[] = []
+  const calls: { names: string[]; read: boolean; cwd: boolean; system: boolean; profile: boolean; prompt: boolean; model: string }[] = []
   let askRead = false
   let firstCall = 0
   const model = 'kimi-code/local-wire'
@@ -47,6 +47,7 @@ it.skipIf(!bin)('enforces the local Kimi tool choice at the provider and preserv
       read: body.messages.filter(message => message.role === 'tool').some(message => JSON.stringify(message.content).includes(marker)),
       cwd: messages.includes('Native workspace instruction fixture.'),
       system: messages.includes('Native operator instruction fixture.'),
+      profile: messages.includes('Authored profile instructions fixture.'),
       prompt: messages.includes(needle), model: body.model,
     })
     res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -106,6 +107,13 @@ it.skipIf(!bin)('enforces the local Kimi tool choice at the provider and preserv
       expect(none.hops).toHaveLength(1)
       expect(none.hops[0]).toMatchObject({ names: [], read: false, prompt: true, cwd: true, system: true, model })
       expect(existsSync(mcpStarted)).toBe(false)
+      const profileCwd = join(scratch, long ? 'profile-acp' : 'profile-print')
+      mkdirSync(profileCwd)
+      const profiled = await turn(long, 'none', { cwd: profileCwd, agent_profile: {
+        model: { default: model }, prompt: { instructions: ['Authored profile instructions fixture.'] },
+      } })
+      expect(profiled.result.error).toBeUndefined()
+      expect(profiled.hops[0]).toMatchObject({ names: [], prompt: true, profile: true, system: true, model })
       askRead = true
       const denied = await turn(long, 'none')
       expect(denied.hops.length).toBeGreaterThan(0)
