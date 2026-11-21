@@ -573,9 +573,12 @@ export interface OpencodeOutputTokenCap {
  * The request's `max_tokens` becomes the runner's experimental output-token
  * maximum for this one turn: every provider request the turn makes is bounded
  * on the wire (the flag's own `min` with the model catalog's output limit keeps
- * any lower model constraint), the per-turn output-budget plugin asks each call
- * for only the unspent remainder so continuing runs (tool continuations,
- * subagents, retries) cannot bill past the cap, `--title` removes the one model
+ * any lower model constraint), the per-turn output-budget plugin holds a hard
+ * lease over the cap — each granted ask is reserved synchronously before
+ * dispatch, one lease is outstanding at a time, and only a receipt attributed
+ * to that exact attempt returns the unspent difference — so continuing runs
+ * (tool continuations, subagents, retries) cannot bill past the cap and an
+ * uncertain retry is refused before the wire, `--title` removes the one model
  * call whose billing prints no receipt, and the stream loop ends the turn
  * truncated at a receipt that spends the budget while more calls would follow —
  * never a `stop` success above the caller's budget. An explicitly lower
@@ -883,69 +886,79 @@ function installSignals(configDir: string | undefined): void {
 /**
  * Write the output-budget plugin for one capped turn. Verified against opencode
  * 1.18.30: the plugin hook `chat.params` mutates the request parameters in
- * place before every model call, and the event bus delivers each step-finish
- * part with its token receipt (`message.part.updated`, `part.tokens`).
+ * place before every model call (its input carries the sessionID), and the
+ * event bus delivers each step-finish part with its token receipt
+ * (`message.part.updated`, `part.tokens`, `part.sessionID`, `part.id`).
  *
  * The env flag alone bounds each request at the full cap, so a multi-step run
  * (tool continuations, subagents, retried attempts) could bill up to that cap
- * on every call. This plugin asks each call for only the REMAINING allowance,
- * so the process's total billed output cannot pass the cap while any call
- * succeeds:
+ * on every call. This plugin keeps a HARD lease over the turn's budget inside
+ * the runner process:
  *
- * - a completed step releases its reservation at the RECEIPT's own count
- *   (output + reasoning), which is what the provider actually billed;
- * - an attempt that ends with no receipt — a mid-stream failure retried by
- *   opencode — reserves its FULL ask when it had emitted any assistant output
- *   (unknown spend), and nothing when it streamed none (a pre-flight refusal
- *   such as 429 bills no output);
- * - an exhausted budget refuses the next call before the wire (a throwing
- *   hook fails that call; measured: no provider request is sent).
+ * - every granted ask is reserved SYNCHRONOUSLY, before the request is
+ *   dispatched, so the sum of what any request can ever bill is the cap;
+ * - exactly ONE lease is outstanding at a time: an overlapping or uncertain
+ *   call — a hidden retry after a lost stream, a concurrent generation — is
+ *   refused before the wire (measured: a throwing hook sends no request);
+ * - capacity is returned ONLY by a step-finish receipt attributed to the
+ *   outstanding lease (same session), and only the unspent difference; a
+ *   receipt with no attributable lease (another session's spend, an attempt
+ *   this plugin did not grant) is charged, never refunded;
+ * - receipts are settled once per part id, so a replayed notification can
+ *   neither double-refund nor double-charge.
  *
- * Receipts are counted once per part id. The bridge's own stream-side cut
- * remains as the backstop for a runner where this plugin did not load.
+ * A failed attempt that never delivers a receipt therefore keeps its
+ * reservation, and its automatic retry is refused: the turn ends in a typed
+ * error rather than a possible second spend against the same budget. The
+ * bridge's own stream-side cut remains as the backstop for a runner where this
+ * plugin did not load.
  */
 function installOutputCapPlugin(configDir: string, cap: number): void {
   const pluginDir = join(configDir, 'plugin')
   mkdirSync(pluginDir, { recursive: true, mode: 0o755 })
-  writeFileSync(join(pluginDir, 'cli-bridge-output-cap.js'), OUTPUT_CAP_PLUGIN(cap), { mode: 0o644 })
+  writeFileSync(join(pluginDir, 'cli-bridge-output-cap.js'), outputCapPluginSource(cap), { mode: 0o644 })
 }
 
 /** The per-turn output-budget plugin with this turn's cap baked in. Never mentions caller data. */
-function OUTPUT_CAP_PLUGIN(cap: number): string {
-  return `// Written by cli-bridge for this one capped turn. Keeps the process's billed
-// output within ${String(cap)} tokens by asking each model call for only the
-// remaining allowance. See src/backends/opencode.ts for the measured contract.
+export function outputCapPluginSource(cap: number): string {
+  return `// Written by cli-bridge for this one capped turn. Keeps the sum of what any
+// model request in this runner process can bill within ${String(cap)} output
+// tokens, through a synchronous lease that only a receipt can refund. See
+// src/backends/opencode.ts for the measured contract.
 export const CliBridgeOutputCap = async () => {
   const CAP = ${String(cap)}
-  let spent = 0
-  let pending = 0
-  let receipt = true
-  let streamed = false
-  const counted = new Set()
+  let available = CAP
+  let lease = null
+  const settled = new Set()
   return {
-    'chat.params': async (_input, params) => {
-      if (pending > 0 && !receipt) spent += streamed ? pending : 0
-      pending = 0
-      streamed = false
-      receipt = false
-      const remaining = CAP - spent
-      if (remaining <= 0) throw new Error(\`cli-bridge: the \${CAP}-token output budget is already spent\`)
+    'chat.params': async (input, params) => {
+      if (lease !== null) {
+        throw new Error('cli-bridge: refusing an overlapping model call: the previous call holds the output budget and has not settled on a receipt')
+      }
+      if (available <= 0) {
+        throw new Error('cli-bridge: the ' + CAP + '-token output budget is spent')
+      }
       const base = typeof params.maxOutputTokens === 'number' && params.maxOutputTokens > 0 ? params.maxOutputTokens : CAP
-      pending = Math.min(remaining, base)
-      params.maxOutputTokens = pending
+      const ask = Math.min(available, base)
+      available -= ask
+      lease = { ask, sessionID: input?.sessionID }
+      params.maxOutputTokens = ask
     },
     event: async ({ event }) => {
       const part = event?.properties?.part
       if (event?.type !== 'message.part.updated' || part === undefined) return
-      if (part.type === 'step-finish' || part.type === 'step_finish') {
-        if (part.id !== undefined && counted.has(part.id)) return
-        if (part.id !== undefined) counted.add(part.id)
-        const tokens = part.tokens ?? {}
-        spent += Number(tokens.output ?? tokens.output_tokens ?? 0) + Number(tokens.reasoning ?? 0)
-        receipt = true
-        pending = 0
-      } else if (part.type === 'text' || part.type === 'reasoning') {
-        streamed = true
+      if (part.type !== 'step-finish' && part.type !== 'step_finish') return
+      if (part.id !== undefined) {
+        if (settled.has(part.id)) return
+        settled.add(part.id)
+      }
+      const tokens = part.tokens ?? {}
+      const billed = Number(tokens.output ?? tokens.output_tokens ?? 0) + Number(tokens.reasoning ?? 0)
+      if (lease !== null && part.sessionID === lease.sessionID) {
+        available += Math.max(0, lease.ask - billed)
+        lease = null
+      } else {
+        available -= billed
       }
     },
   }

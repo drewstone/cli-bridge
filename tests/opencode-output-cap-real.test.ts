@@ -12,15 +12,19 @@
  * removes the title model call, and a provider that stops a completion at the
  * bound ends its step with reason `length`.
  *
- * The per-turn output-budget plugin asks each call for only the REMAINING
- * allowance, so these cases must observe, on the wire and in usage:
+ * The per-turn output-budget plugin holds a HARD lease over the cap inside the
+ * runner process: every granted ask is reserved synchronously before dispatch,
+ * one lease is outstanding at a time, capacity returns only against a receipt
+ * attributed to that exact attempt (same session, settled once per part id),
+ * and unattributed receipts are charged, never refunded. So these cases must
+ * observe, on the wire and in usage:
  *
  * - every request's `max_tokens` ≤ the turn's cap, and each later request
- *   carries exactly the unspent remainder;
+ *   carries exactly the receipt-refunded remainder;
  * - a step receipt at the cap that would continue (tool-calls) ends the turn
  *   `length` with the runner terminated — the failing control;
- * - retries after a pre-flight 429 re-ask the same allowance and still finish
- *   under the cap;
+ * - a hidden retry — after a refused attempt or a lost stream — is refused
+ *   BEFORE the wire, and the turn fails honestly instead of re-spending;
  * - reasoning tokens count inside the budget;
  * - fresh, resumed, profiled, and concurrent turns all hold the property;
  * - uncapped turns keep today's launch exactly: no flag, no pinned title,
@@ -442,20 +446,15 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
     expect(bRequests[0]!.max_tokens).toBe(48)
   }, 120_000)
 
-  it('keeps the bound on every attempt of a retried call, without double-charging the budget', async () => {
+  it('refuses the hidden retry after a refused attempt, before the wire, and fails honestly', async () => {
     const key = providerConfig('probe-retry')
     recorded.length = 0
-    let answerAttempts = 0
     script = ({ tools }) => {
       if (tools === 0) {
         return { chunks: [chunk({ role: 'assistant', content: 'title' }), chunk({}, 'stop', { prompt_tokens: 5, completion_tokens: 2 })] }
       }
-      answerAttempts += 1
-      if (answerAttempts === 1) {
-        // A pre-flight quota refusal: no completion streams, opencode retries.
-        return { refuse: { status: 429, retryAfterSeconds: 1, message: 'Rate limit reached for requests' } }
-      }
-      return { chunks: [chunk({ role: 'assistant', content: 'Answered after retry.' }), chunk({}, 'stop', { prompt_tokens: 30, completion_tokens: 40 })] }
+      // A pre-flight quota refusal: opencode would retry the call itself.
+      return { refuse: { status: 429, retryAfterSeconds: 1, message: 'Rate limit reached for requests' } }
     }
 
     const { deltas } = await turn({
@@ -466,13 +465,66 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
     })
 
     const own = forKey(key)
-    // Both attempts carry the full unspent allowance: the refused attempt streamed nothing.
-    expect(own.length).toBe(2)
-    for (const entry of own) expect(entry.max_tokens).toBe(60)
-    expect(finish(deltas)).toBe('stop')
-    // Only the successful attempt billed.
-    expect(billed(deltas)).toBe(40)
-    expect(billed(deltas)).toBeLessThanOrEqual(60)
+    // Exactly one request reached the wire: the refused attempt holds the
+    // budget lease (its spend is unknown to the plugin), so opencode's
+    // automatic retry is refused before it can dispatch a second request.
+    expect(own).toHaveLength(1)
+    expect(own[0]!.max_tokens).toBe(60)
+    // The turn fails honestly rather than completing above the budget.
+    expect(finish(deltas)).toBe('error')
+    expect(billed(deltas)).toBe(0)
+  }, 120_000)
+
+  it('refuses the automatic retry after a lost stream, before the wire', async () => {
+    const key = 'key-probe-lost'
+    recorded.length = 0
+    let destroyed = false
+
+    // A dedicated response path: stream part of a completion, then destroy the
+    // socket with no finish chunk and no usage — the runner must retry, and
+    // the budget lease must refuse that retry before the wire.
+    const installed = createServer((req, res) => {
+      let body = ''
+      req.on('data', (data: Buffer) => { body += data.toString('utf8') })
+      req.on('end', () => {
+        const request = JSON.parse(body) as { max_tokens?: number; tools?: unknown[] }
+        recorded.push({
+          auth: String(req.headers.authorization ?? ''),
+          max_tokens: request.max_tokens,
+          tools: request.tools?.length ?? 0,
+          roles: [],
+        })
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(sse([chunk({ role: 'assistant', content: 'partial answer before the stream ' })]).replace('data: [DONE]\n\n', ''))
+        destroyed = true
+        res.socket?.destroy()
+      })
+    })
+    await new Promise<void>((resolve) => installed.listen(0, '127.0.0.1', resolve))
+    const installedPort = (installed.address() as AddressInfo).port
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+      provider: { 'probe-lost': { npm: '@ai-sdk/openai-compatible', name: 'probe-lost', options: { baseURL: `http://127.0.0.1:${installedPort}/v1`, apiKey: 'key-probe-lost' }, models: { m: { name: 'm', tool_call: true } } } },
+    })
+
+    try {
+      const { deltas } = await turn({
+        model: 'opencode/probe-lost/m',
+        session_id: 'cap-lost',
+        messages: [{ role: 'user', content: 'Answer briefly.' }],
+        max_tokens: 60,
+      })
+
+      // Exactly one request reached the wire; the destroyed stream never
+      // delivered a receipt, so the retry never dispatched.
+      const own = forKey('key-probe-lost')
+      expect(own).toHaveLength(1)
+      expect(own[0]!.max_tokens).toBe(60)
+      expect(destroyed).toBe(true)
+      expect(finish(deltas)).toBe('error')
+      expect(billed(deltas)).toBe(0)
+    } finally {
+      await new Promise<void>((resolve) => installed.close(() => resolve()))
+    }
   }, 120_000)
 
   it('counts reasoning tokens inside the budget', async () => {
