@@ -651,16 +651,10 @@ export function mountChatCompletions(
         },
       }, 404)
     }
-    // Honesty guard for the text-inference contract: a backend without a
-    // verified native zero-tool control — or sandbox delegation, whose task
-    // boundary drops the field — would run the turn with tools the caller
-    // explicitly refused. Refused before any session identity claim, naming
-    // the gap and the lift; never accepted and silently ignored.
-    if (tool_choice === 'none' && (backend.textOnlyToolChoice !== true || effectiveExecution?.kind === 'sandbox')) {
-      const sandboxGap = backend.textOnlyToolChoice === true && effectiveExecution?.kind === 'sandbox'
-      return c.json({
-        error: {
-          message: sandboxGap
+    // Refuse unsupported native or delegated controls before claiming a session identity.
+    if (tool_choice === 'none' && (!backend.textOnlyToolChoice || effectiveExecution?.kind === 'sandbox')) {
+      const sandboxGap = Boolean(backend.textOnlyToolChoice) && effectiveExecution?.kind === 'sandbox'
+      const message = sandboxGap
             ? `backend "${backend.name}" cannot enforce tool_choice "none" through sandbox execution: `
               + 'the sandbox task boundary does not carry the field, and the in-container turn would run '
               + 'with ambient action tools; this route refuses the field rather than ignoring it. '
@@ -669,10 +663,8 @@ export function mountChatCompletions(
             : `backend "${backend.name}" cannot enforce tool_choice "none": no verified native control `
               + 'removes its ambient action tools from the model request; this route refuses the field '
               + 'rather than ignoring it. Send the request without tool_choice to keep native tools, '
-              + 'or route it through a backend that declares the control.',
-          type: 'invalid_request_error',
-        },
-      }, 400)
+              + 'or route it through a backend that declares the control.'
+      return invalidRequest(c, message)
     }
     const oneShotInteractionError = oneShotInteractionCapabilityError(
       backend.name,
@@ -792,6 +784,13 @@ export function mountChatCompletions(
       }
     }
 
+    if (req.toolChoice === 'none' && typeof backend.textOnlyToolChoice === 'function') {
+      try {
+        backend.textOnlyToolChoice(req, persistedSession)
+      } catch (error) {
+        return errorResponse(c, error)
+      }
+    }
     if (req.session_id) {
       try {
         deps.sessions.assertSessionIdentityAvailable(req.session_id, 'legacy')

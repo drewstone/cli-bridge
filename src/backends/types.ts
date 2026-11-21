@@ -696,9 +696,10 @@ export interface Backend {
    * config content, agent defaults, the project layer). Without this flag the
    * chat route REFUSES a `tool_choice: "none"` request instead of letting the
    * backend ignore the field — a route cannot claim a control a harness does
-   * not enforce.
+   * not enforce. A function further checks that the request's executor and
+   * session can honor the control before the route claims a durable identity.
    */
-  readonly textOnlyToolChoice?: boolean
+  readonly textOnlyToolChoice?: boolean | ((request: ChatRequest, session: SessionRecord | null) => void)
 
   /** Does this backend want to handle requests for `model`? */
   matches(model: string): boolean

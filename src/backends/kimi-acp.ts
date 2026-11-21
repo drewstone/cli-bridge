@@ -90,6 +90,7 @@ import type { ChatDelta, ChatRequest } from './types.js'
 import { BackendError } from './types.js'
 import { BackendReportedFailureError } from '../runs/error-shape.js'
 import { bindKimiAcpTurn, kimiNativeHome } from './kimi-turn-failure.js'
+import { startKimiTextOnlySession } from './kimi-text-only.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { Spawner } from '../executors/types.js'
 import { terminateSpawned, waitForExitOrTimeout } from '../executors/process-tree.js'
@@ -208,7 +209,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
   // MCP rides session/new|resume's native mcpServers mount (kimi converts
   // stdio/http/sse entries itself) instead of the argv path's project-local
   // .kimi-code/mcp.json, which the ACP server does not read.
-  const mcpServers = buildAcpMcpServers(
+  const mcpServers = req.toolChoice === 'none' ? [] : buildAcpMcpServers(
     resolveMcpServers(req, session, { backend: opts.backend, privateMcpConfig: false }),
   )
 
@@ -223,8 +224,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
     executor: opts.spawner.executionEnvironment,
   })
 
-  const spawned = await opts.spawner(opts.bin, args, {
-    stdio: ['pipe', 'pipe', 'pipe'],
+  const spawnOpts = {
     cwd: opts.cwd,
     env: childEnv,
     ...(req.session_id ? { sessionId: req.session_id } : {}),
@@ -232,7 +232,11 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
     ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
     ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
     ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
-  })
+  }
+  const nativeId = req.toolChoice === 'none'
+    ? await startKimiTextOnlySession(opts.bin, opts.spawner, spawnOpts, model, signal)
+    : session?.internalId
+  const spawned = await opts.spawner(opts.bin, args, { ...spawnOpts, signal, stdio: ['pipe', 'pipe', 'pipe'] })
   const child = spawned.child
   const releaseSpawner = spawned.release
 
@@ -362,12 +366,12 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
       // calls). Always pass the execution-origin cwd and the mcpServers list,
       // including the empty one.
       const sessionCwd = opts.cwd ?? process.cwd()
-      if (session?.internalId) {
+      if (nativeId) {
         // resume, not load: restores the same on-disk native session and
         // skips the history replay session/load would push first. The cwd is
         // the same execution-origin cwd the argv path's --session turn used.
-        await request('session/resume', { sessionId: session.internalId, cwd: sessionCwd, mcpServers })
-        liveSessionId = session.internalId
+        await request('session/resume', { sessionId: nativeId, cwd: sessionCwd, mcpServers })
+        liveSessionId = nativeId
       } else {
         const created = (await request('session/new', { cwd: sessionCwd, mcpServers })) as { sessionId?: string }
         if (!created?.sessionId) throw new BackendError('kimi acp session/new returned no sessionId', 'upstream')

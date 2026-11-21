@@ -34,6 +34,7 @@
  */
 
 import { kimiNativeHome, observeKimiPrintSession } from './kimi-turn-failure.js'
+import { kimiTextOnlyProfile, kimiToolChoiceError } from './kimi-text-only.js'
 import { type AgentProfile, nativeReasoningControl } from '@tangle-network/agent-interface'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
@@ -92,7 +93,34 @@ export class KimiBackend implements Backend {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
+  textOnlyToolChoice(req: ChatRequest, session: SessionRecord | null): void {
+    if (req.session_id || session?.internalId) {
+      throw kimiToolChoiceError('Kimi fixes the main agent at session creation. Use a one-shot request to keep a coding session resumable with its own tools.')
+    }
+    if (this.spawner.executionEnvironment !== 'host') {
+      throw kimiToolChoiceError('The native agent file is available on the local host executor.')
+    }
+  }
+
   async *chat(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    const turn = this.nativeTurn(req, session, signal)
+    if (req.toolChoice !== 'none') {
+      yield* turn
+      return
+    }
+    for await (const delta of turn) {
+      if (delta.tool_calls?.length) {
+        throw new BackendError('The Kimi provider returned a tool call during a text-only request.', 'upstream')
+      }
+      yield delta
+    }
+  }
+
+  private async *nativeTurn(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
@@ -108,6 +136,14 @@ export class KimiBackend implements Backend {
     // and session semantics (kimi-acp.ts).
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
+    const textOnly = req.toolChoice === 'none'
+    if (textOnly) {
+      this.textOnlyToolChoice(req, session)
+      const health = await this.health(signal)
+      if (health.state !== 'ready' || health.version !== '2.7.2') {
+        throw kimiToolChoiceError('The native empty-tool profile requires a qualified Kimi Code binary (2.7.2).')
+      }
+    }
 
     // Reject unsupported profile plans before creating either temporary
     // Kimi config. Both files can contain provider or MCP credentials.
@@ -149,7 +185,7 @@ export class KimiBackend implements Backend {
     }
     if (thinkingFlag) args.push(thinkingFlag)
     args.push(...provisioned.flags)
-
+    let policy: ReturnType<typeof kimiTextOnlyProfile> | undefined
     let mcpMaterialized: ReturnType<typeof materializeMcpServersForKimi> = null
     let spawned: Awaited<ReturnType<Spawner>>
     let nativeSession: ReturnType<typeof observeKimiPrintSession>
@@ -157,7 +193,15 @@ export class KimiBackend implements Backend {
       // Kimi Code discovers request-scoped MCP from the project-local
       // `<cwd>/.kimi-code/mcp.json`; the mount restores the original file
       // after this process exits and serializes overlapping runs.
-      mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false }), cwd)
+      if (textOnly) {
+        if (provisioned.flags.some(flag => flag === '--agent' || flag === '--agent-file')) {
+          throw kimiToolChoiceError('The selected profile already binds a main agent. Kimi accepts one agent file per launch.')
+        }
+        policy = kimiTextOnlyProfile(req.jailSpec)
+        args.push('--agent-file', policy.file)
+      } else {
+        mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false }), cwd)
+      }
 
       const childEnv = { ...process.env, ...provisioned.env }
       await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
@@ -178,6 +222,7 @@ export class KimiBackend implements Backend {
       }
     } catch (error) {
       mcpMaterialized?.cleanup()
+      policy?.root.cleanup()
       throw error
     }
     const child = spawned.child
@@ -364,6 +409,7 @@ export class KimiBackend implements Backend {
       // before releasing the slot. Idempotent; waits for actual exit.
       await terminateSpawned(spawned)
       mcpMaterialized?.cleanup()
+      policy?.root.cleanup()
       releaseSpawner()
     }
   }
