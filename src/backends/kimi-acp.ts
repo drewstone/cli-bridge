@@ -431,11 +431,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
         throw new BackendError('kimi acp refused the turn', 'upstream')
       }
       if (!emittedContent && !emittedToolCall) {
-        const detail = stderr.render(300)
-        throw new BackendError(
-          `kimi acp produced no stream output${detail ? `: ${detail}` : ''}`,
-          'upstream',
-        )
+        throw new BackendError('kimi acp produced no stream output', 'upstream')
       }
       const finish = baseStopReason(result?.stopReason)
       if (finish !== 'length' && emittedToolCall) {

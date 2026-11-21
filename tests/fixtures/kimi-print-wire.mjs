@@ -45,6 +45,7 @@ if (args[0] === 'acp') {
       reply({})
     } else if (method === 'session/set_mode') reply({})
     else if (method === 'session/prompt') {
+      if (['stale', 'replaced', 'ambiguous'].includes(mode)) console.error('private native diagnostic')
       if (mode === 'replaced') { renameSync(wire, wire + '.earlier'); writeFileSync(wire, '') }
       if (mode !== 'stale') failedTurn(params.prompt, mode, 1)
       if (mode === 'ambiguous') failedTurn(params.prompt, mode, 2)

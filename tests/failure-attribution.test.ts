@@ -188,6 +188,7 @@ it('recovers an ACP failure after partial output and rejects stale, replaced and
     for (const response of [stale, replaced, ambiguous]) {
       expect(response).toMatchObject({ status: 502, json: { error: { type: 'upstream' } } })
       expect(response.json.error).not.toHaveProperty('retryable')
+      expect(response.json.error.message).not.toContain('private native diagnostic')
     }
   } finally { vi.unstubAllEnvs() }
 })
