@@ -121,9 +121,13 @@ it.skipIf(!bin)('enforces the local Kimi tool choice at the provider and preserv
     expect(incompatible.status).toBe(501)
     expect(incompatible.result.error).toMatchObject({ type: 'capability_denied', provider_dispatch: 'not_started' })
     expect(incompatible.hops).toHaveLength(0)
-    const sameId = await turn(false, undefined, { session_id: 'coding-session' })
+    const sameId = await turn(true, undefined, { session_id: 'coding-session' })
     expect(sameId.hops[0]!.names).toContain('Read')
+    const nativeId = sessions.get('coding-session', 'kimi-code')?.internalId
+    expect(nativeId).toMatch(/^session_/)
     expect((await turn(true, 'none', { resume_id: 'coding-session' })).hops).toHaveLength(0)
+    expect((await turn(true, undefined, { resume_id: 'coding-session' })).hops[0]!.names).toContain('Read')
+    expect(sessions.get('coding-session', 'kimi-code')?.internalId).toBe(nativeId)
     expect(readdirSync(cwd).sort()).toEqual(['.git', 'AGENTS.md', 'fixture.txt'])
     expect(readFileSync(sentinel, 'utf8')).toBe(marker)
   } finally {

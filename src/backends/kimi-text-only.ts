@@ -81,7 +81,9 @@ async function kapReady(spawned: SpawnResult): Promise<{ origin: string; token: 
 export async function startKimiTextOnlySession(
   bin: string, spawner: Spawner, spawnOpts: SpawnOpts, model: string | null, signal: AbortSignal,
 ): Promise<string> {
-  const profile = kimiTextOnlyProfile(spawnOpts.jail)
+  // The bootstrap's temporary mount is gone before the separate ACP process starts.
+  const jail = spawnOpts.jail ? { ...spawnOpts.jail } : undefined
+  const profile = kimiTextOnlyProfile(jail)
   let child: SpawnResult | undefined
   const onAbort = (): void => { if (child) void terminateSpawned(child) }
   signal.addEventListener('abort', onAbort, { once: true })
@@ -89,9 +91,9 @@ export async function startKimiTextOnlySession(
     signal.throwIfAborted()
     const env = spawnOpts.env ?? process.env
     bootstrapHome(profile, env)
-    registerJailWritable(spawnOpts.jail, profile.root.path)
+    registerJailWritable(jail, profile.root.path)
     child = await spawner(bin, ['web', '--json', '--host', '127.0.0.1', '--port', '0'], {
-      ...spawnOpts, signal, stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, KIMI_CODE_HOME: profile.root.path },
+      ...spawnOpts, jail, signal, stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, KIMI_CODE_HOME: profile.root.path },
     })
     signal.throwIfAborted()
     const { origin, token } = await kapReady(child)
@@ -104,7 +106,8 @@ export async function startKimiTextOnlySession(
       const reply = await response.json() as { code?: number; data?: unknown }
       if (!response.ok || reply.code !== 0) {
         const code = typeof reply.code === 'number' ? String(reply.code) : 'unknown'
-        throw kimiToolChoiceError(`The native session service refused ${body ? 'session creation' : 'tool verification'} (HTTP ${response.status}, native code ${code}).`)
+        const operation = body ? 'session creation' : 'tool verification'
+        throw kimiToolChoiceError(`The native session service refused ${operation} (HTTP ${response.status}, native code ${code}).`)
       }
       return reply.data
     }
