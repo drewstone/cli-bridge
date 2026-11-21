@@ -1,3 +1,4 @@
+import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import type { DurableRunWriter } from '../sessions/durable-writer.js'
 import { legacyRequestMetadata } from '../sessions/legacy-metadata.js'
 /**
@@ -43,7 +44,7 @@ import type { Backend, ChatDelta, ChatRequest, ProtectedModelCredential } from '
 import { ExecutorConfigurationError, ExecutorSaturatedError } from '../executors/types.js'
 import { resolveHostAcquireDeadlineMs } from '../executors/host.js'
 import { BackendError } from '../backends/types.js'
-import { describeRunFailure } from '../runs/error-shape.js'
+import { BackendReportedFailureError, describeRunFailure } from '../runs/error-shape.js'
 import { parseMode, ModeNotSupportedError } from '../modes.js'
 import { collectNonStreaming } from '../streaming/sse.js'
 import { estimateMessagesChars, tokensFromChars } from '../backends/content.js'
@@ -55,7 +56,6 @@ import {
   RunReplayCursorError,
   type RunRegistry,
 } from '../runs/registry.js'
-import { BackendReportedFailureError } from '../runs/error-shape.js'
 import { chatCompletionDeltaOptions } from '../runs/delta-stream.js'
 import type { RequestSpanRecorder, TraceEmitter } from '../trace/emitter.js'
 import { resolveCallerTrace } from '../trace/ids.js'
@@ -1706,11 +1706,11 @@ function errorResponse(c: Context, err: unknown): Response {
   if (err instanceof ExecutorConfigurationError) {
     return c.json({ error: { message: err.message, type: err.code } }, 501)
   }
-  // Yielded native failures are upstream faults: 504 on timeout, otherwise 502.
+  // Preserve a verified native provider status. Other upstream faults use the bridge fallback.
   if (err instanceof BackendReportedFailureError) {
     return c.json(
-      { error: { message: err.message, type: err.code, ...providerDispatchMetadata(err) } },
-      err.code === 'timeout' ? 504 : 502,
+      { error: describeRunFailure(err) },
+      (err.nativeProvider?.status ?? (err.code === 'timeout' ? 504 : 502)) as ContentfulStatusCode,
     )
   }
   if (err instanceof BackendError) {

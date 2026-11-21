@@ -207,6 +207,8 @@ Model id routes via harness prefix.
 The OpenAI-compatible default is non-streaming; pass `stream: true` for SSE.
 Session resume uses the `session_id` body field or `X-Session-Id` header.
 
+When the bridge can verify a Kimi provider failure in the submitted turn's native record, `error.type` carries the native provider code. The optional `error.status` and `error.retryable` fields carry the provider’s reported HTTP status and retry decision. A response that already delivered content keeps that content with its terminal error.
+
 Extra fields this bridge accepts beyond vanilla OpenAI:
 
 - `cwd`: persist a working directory for the session and run future resumed turns there

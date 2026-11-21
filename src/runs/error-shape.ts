@@ -13,6 +13,8 @@ export interface RunFailureDescription extends Partial<SubscriptionFailureMetada
   provider_dispatch?: 'not_started'
   /** Status the same failure would carry as an HTTP response. */
   status?: number
+  /** Retryability the native provider explicitly reported. */
+  retryable?: boolean
   /** Capacity refusal: the bridge never started the model. */
   capacity?: true
   /** Executor semaphore counts behind a capacity refusal. */
@@ -43,6 +45,7 @@ export function describeRunFailure(error: unknown): RunFailureDescription {
   return {
     message,
     type: failureType(error),
+    ...(error instanceof BackendReportedFailureError ? error.nativeProvider : {}),
     ...(providerDispatch === undefined ? {} : { provider_dispatch: providerDispatch }),
     ...capacityFromError(error),
   }
@@ -51,15 +54,17 @@ export function describeRunFailure(error: unknown): RunFailureDescription {
 /** A yielded provider failure becomes a recorded run failure for HTTP/replay status selection. */
 export class BackendReportedFailureError extends Error {
   readonly providerDispatch?: 'not_started'
+  readonly nativeProvider?: Pick<RunFailureDescription, 'status' | 'retryable'>
 
   constructor(
     message: string,
     readonly code: string,
-    options?: { providerDispatch?: 'not_started' },
+    options?: { providerDispatch?: 'not_started'; nativeProvider?: Pick<RunFailureDescription, 'status' | 'retryable'> },
   ) {
     super(message)
     this.name = 'BackendReportedFailureError'
     this.providerDispatch = options?.providerDispatch
+    this.nativeProvider = options?.nativeProvider
   }
 }
 

@@ -541,6 +541,8 @@ export interface ChatDelta {
      * the non-streaming response say the same thing.
      */
     status?: number
+    /** Retryability the native provider explicitly reported. */
+    retryable?: boolean
     /** Capacity refusal: the bridge never started the model. */
     capacity?: true
     /** Which executor semaphore refused, with the counts behind the refusal. */

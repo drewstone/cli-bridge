@@ -33,6 +33,7 @@
  * common ones (`content`, `text`, `message.content`, `delta.text`).
  */
 
+import { kimiNativeHome, observeKimiPrintSession } from './kimi-turn-failure.js'
 import { type AgentProfile, nativeReasoningControl } from '@tangle-network/agent-interface'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
@@ -151,6 +152,7 @@ export class KimiBackend implements Backend {
 
     let mcpMaterialized: ReturnType<typeof materializeMcpServersForKimi> = null
     let spawned: Awaited<ReturnType<Spawner>>
+    let nativeSession: ReturnType<typeof observeKimiPrintSession>
     try {
       // Kimi Code discovers request-scoped MCP from the project-local
       // `<cwd>/.kimi-code/mcp.json`; the mount restores the original file
@@ -160,6 +162,7 @@ export class KimiBackend implements Backend {
       const childEnv = { ...process.env, ...provisioned.env }
       await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
+      const startedAt = Date.now()
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
@@ -170,6 +173,9 @@ export class KimiBackend implements Backend {
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
+      if (this.spawner.executionEnvironment === 'host' && !req.jailSpec) {
+        nativeSession = observeKimiPrintSession(kimiNativeHome(childEnv), cwd ?? process.cwd(), spawned, startedAt)
+      }
     } catch (error) {
       mcpMaterialized?.cleanup()
       throw error
@@ -338,6 +344,13 @@ export class KimiBackend implements Backend {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
+      if (child.exitCode === 1 && !child.signalCode) {
+        const failure = await nativeSession?.failure(prompt)
+        if (failure) throw failure
+        if (/error: failed to run prompt:/i.test(stderr.render())) {
+          throw new BackendError('Kimi: Prompt turn ended with reason: failed', 'upstream')
+        }
+      }
       await assertSuccessfulHarnessExit(spawned, 'kimi', () => stderr.render())
       if (sawError) throw new BackendError(`kimi: ${sawError}`, 'upstream')
       if (!emittedContent && !emittedToolCall) {
@@ -345,6 +358,7 @@ export class KimiBackend implements Backend {
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
+      nativeSession?.close()
       signal.removeEventListener('abort', onAbort)
       // Always tear down the whole subtree (kimi + any MCP/tool forks)
       // before releasing the slot. Idempotent; waits for actual exit.

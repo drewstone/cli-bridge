@@ -88,9 +88,11 @@
 
 import type { ChatDelta, ChatRequest } from './types.js'
 import { BackendError } from './types.js'
+import { BackendReportedFailureError } from '../runs/error-shape.js'
+import { bindKimiAcpTurn, kimiNativeHome } from './kimi-turn-failure.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { Spawner } from '../executors/types.js'
-import { terminateSpawned } from '../executors/process-tree.js'
+import { terminateSpawned, waitForExitOrTimeout } from '../executors/process-tree.js'
 import { buildAcpMcpServers, resolveMcpServers } from './profile-mcp.js'
 import { admitNativeSubscription } from './profile-support.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
@@ -259,6 +261,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
     const queue: ChatDelta[] = []
     let wake: (() => void) | null = null
     let streamEnded = false
+    let closingNativeTurn = false
     let driverError: Error | null = null
     const push = (d: ChatDelta): void => { queue.push(d); wake?.() }
 
@@ -403,21 +406,26 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
         await request('session/set_mode', { sessionId: liveSessionId, modeId: 'auto' })
       }
 
-      // Exactly one dispatch; no retry after execution begins.
-      const result = (await request('session/prompt', {
-        sessionId: liveSessionId,
-        prompt: kimiAcpPromptBlocks(prompt),
-      })) as { stopReason?: unknown }
-
-      // Terminal truth. kimi's turnEndReasonToStopReason maps a FAILED engine
-      // turn to end_turn (only provider.filtered becomes refusal), so an
-      // engine error is indistinguishable from success at the stopReason
-      // level — the substantive-output guard below is what exposes it. A
-      // native cancelled or refusal outcome is reported as the failure it is,
-      // never as a silent zero-byte success, including when some text already
-      // streamed.
+      const nativeTurn = opts.spawner.executionEnvironment === 'host' && !req.jailSpec
+        ? await bindKimiAcpTurn(kimiNativeHome(childEnv), opts.cwd ?? process.cwd(), liveSessionId, !session?.internalId)
+        : undefined
+      // One dispatch. Only a settled ACP response binds this submission to a
+      // finished turn; a launch refusal can belong to a busy shared session.
+      const result = await request('session/prompt', {
+        sessionId: liveSessionId, prompt: kimiAcpPromptBlocks(prompt),
+      }) as { stopReason?: unknown }
       if (result?.stopReason === 'cancelled') {
         throw new BackendError('kimi acp turn was cancelled by the agent before completing', 'upstream')
+      }
+      if (!signal.aborted) {
+        // EOF closes the first-party ACP client and flushes its native append log.
+        // A hard teardown can leave just turn.prompt even after the RPC settles.
+        closingNativeTurn = true
+        child.stdin?.end()
+        await waitForExitOrTimeout(child)
+        // ACP reports end_turn for many failed turns, even after partial output.
+        const failure = await nativeTurn?.(prompt)
+        if (failure) throw failure
       }
       if (result?.stopReason === 'refusal') {
         throw new BackendError('kimi acp refused the turn', 'upstream')
@@ -438,7 +446,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
     })()
     driver.catch((error: Error) => {
       if (!driverError) {
-        driverError = error instanceof BackendError
+        driverError = error instanceof BackendError || error instanceof BackendReportedFailureError
           ? error
           : new BackendError(`kimi acp: ${error.message}${stderr.render(300) ? `: ${stderr.render(300)}` : ''}`, 'upstream')
       }
@@ -466,7 +474,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
         continue
       }
       if (driverError) throw driverError
-      if (streamEnded || rpc.writeFailure()) {
+      if (!closingNativeTurn && (streamEnded || rpc.writeFailure())) {
         const detail = stderr.render(300)
         throw new BackendError(
           `kimi acp stream ended before session/prompt completed${detail ? `: ${detail}` : ''}`,
