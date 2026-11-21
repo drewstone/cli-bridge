@@ -1,6 +1,4 @@
-import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { BackendError } from './types.js'
 import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES } from '../executors/host.js'
 
@@ -8,113 +6,65 @@ import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES } from '../executors/host
 export const OPENCODE_PROCESS_CONFIG_ENV = 'OPENCODE_CONFIG_CONTENT'
 
 /**
- * The `permission` spelling of an explicit text-only turn: every verb `deny`.
+ * Lay the text-only tool surface into opencode's FINAL config layer and name
+ * the agent that carries it.
  *
- * Measured against opencode 1.18.30 with a local recording provider: a request
- * whose config denies every permission verb carries ZERO ambient action tools,
- * an `allow` verb overrides a `tools: false` entry (the harness resolves a tool
- * as enabled when its permission allows it — the reason #218 needed the deny),
- * and this spelling in a request-scoped `OPENCODE_CONFIG` file beats the same
- * keys set to `allow` in the operator's global config.
+ * The native boundary, measured against the real runner (opencode 1.18.30,
+ * local recording provider): a turn run with `--agent <name>` whose agent is
+ * declared `agent[name] = { mode: "primary", permission: { "*": "deny" } }`
+ * carries ZERO tools on the wire — the resolver appends this agent-specific
+ * wildcard after the global and agent defaults and checks every tool id,
+ * ambient action tools and MCP servers alike. Verified with a provider
+ * configured by the project layer, MCP servers in the project config and the
+ * operator's global JSONC config, and hostile `"*": "allow"` entries in both
+ * the global permission map and `agent.build.permission`: 12 tools on the
+ * ordinary control, 0 on the isolated turn, tools restored afterwards, all
+ * runs completing through their own provider.
+ *
+ * The agent name is fresh per turn, so no inherited same-name agent object
+ * can override the wildcard per-tool. Unrelated config keys (provider,
+ * instructions, other agents, MCP declarations) are preserved untouched: the
+ * project layer and the operator's global config stay live, which is what
+ * keeps a project-configured provider working on a text-only turn. The env
+ * content itself is strict JSON — a comment there is a hard config error
+ * before this overlay runs — so a strict parse merges it correctly.
+ *
+ * `tool_choice: "none"` is the standard no-model-tool-calls request: the
+ * model is offered no tools at all, and analysis/trace callbacks stay outside
+ * the nested model call on their own authority.
  */
-export const OPENCODE_TEXT_ONLY_PERMISSION: Readonly<Record<string, 'deny'>> = Object.freeze({
-  external_directory: 'deny',
-  bash: 'deny',
-  edit: 'deny',
-  glob: 'deny',
-  grep: 'deny',
-  list: 'deny',
-  read: 'deny',
-  write: 'deny',
-  skill: 'deny',
-  task: 'deny',
-  todowrite: 'deny',
-  webfetch: 'deny',
-  lsp: 'deny',
-  plan_enter: 'deny',
-  plan_exit: 'deny',
-  question: 'deny',
-  doom_loop: 'deny',
-})
-
-/**
- * The belt-and-suspenders `tools` spelling: every ambient tool the harness
- * ships is disabled outright. Unknown names in this map are ignored by the
- * harness, so it also covers a tool that has no permission verb.
- */
-export const OPENCODE_TEXT_ONLY_TOOLS: Readonly<Record<string, false>> = Object.freeze({
-  bash: false,
-  edit: false,
-  glob: false,
-  grep: false,
-  list: false,
-  read: false,
-  write: false,
-  skill: false,
-  task: false,
-  todowrite: false,
-  webfetch: false,
-})
-
-/** A plain object record, or an empty record for every other shape. */
-function objectRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
-}
-
-/**
- * Put the zero-tool surface into opencode's FINAL config layer.
- *
- * `OPENCODE_CONFIG_CONTENT` is merged last, above both the operator's global
- * config and the request-scoped `OPENCODE_CONFIG` file. Every channel that can
- * put a tool back on the wire was measured against the real runner
- * (opencode 1.18.30, local recording provider) and is closed here:
- *
- *  - a permission `allow` verb overrides `tools: false` (#218), and a global
- *    `agent.build.tools: true` map reintroduces every ambient tool even under a
- *    top-level deny — the final layer replaces `permission` and `tools`
- *    wholesale AND pins `agent.build.permission` to deny-everything, which beats
- *    the agent tools map;
- *  - `default_agent` is pinned to `build` so a configured custom primary agent
- *    (with its own tool set) cannot be selected;
- *  - an MCP server named by the ambient content or the operator's global config
- *    survives `mcp: {}` (the mcp key deep-merges per server), so every
- *    enumerable server name is written `enabled: false` — the one spelling that
- *    removed it from the wire;
- *  - the project layer (`<cwd>/opencode.json`, which can declare its own
- *    servers) is disabled outright with `OPENCODE_DISABLE_PROJECT_CONFIG=1`.
- *
- * A `tool_choice: "none"` request is the standard no-model-tool-calls request:
- * caller-bound MCP servers are suppressed for the turn too (analysis/trace
- * callbacks belong outside the nested model call, on their own authority), and
- * the bridge does not mount any server it was asked to carry. Restriction wins
- * by construction; unrelated config keys (provider, instructions, ...) are
- * preserved. When an upstream configuration cannot be enumerated — an
- * operator's global config that is not valid JSON — the turn is refused before
- * dispatch rather than run with an unknown MCP surface.
- */
-export function overlayOpencodeTextOnlyToolSurface(env: Record<string, string>): void {
+export function overlayOpencodeTextOnlyToolSurface(env: Record<string, string>): string {
   const current = env[OPENCODE_PROCESS_CONFIG_ENV] ?? process.env[OPENCODE_PROCESS_CONFIG_ENV]
   let base: Record<string, unknown> = {}
   if (current !== undefined && current.length > 0) {
-    base = parseProcessConfig(current)
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(current)
+    } catch {
+      throw new BackendError(
+        `the ${OPENCODE_PROCESS_CONFIG_ENV} already present is not valid JSON, so the text-only tool surface `
+          + 'cannot be laid over it; correct or unset it before requesting tool_choice "none" on backend opencode',
+        'parse_error',
+      )
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new BackendError(
+        `the ${OPENCODE_PROCESS_CONFIG_ENV} already present is not a JSON object, so the text-only tool surface `
+          + 'cannot be laid over it',
+        'parse_error',
+      )
+    }
+    base = parsed as Record<string, unknown>
   }
-  const disabledServers = disabledMcpServerNames(base, env)
-  const baseAgent = objectRecord(base.agent)
-  const baseMcp = objectRecord(base.mcp)
+  const agentName = `cli-bridge-text-only-${randomBytes(8).toString('hex')}`
+  const agents = base.agent && typeof base.agent === 'object' && !Array.isArray(base.agent)
+    ? { ...(base.agent as Record<string, unknown>) }
+    : {}
   const merged: Record<string, unknown> = {
     ...base,
-    permission: OPENCODE_TEXT_ONLY_PERMISSION,
-    tools: OPENCODE_TEXT_ONLY_TOOLS,
     agent: {
-      ...baseAgent,
-      build: { ...objectRecord(baseAgent.build), permission: OPENCODE_TEXT_ONLY_PERMISSION },
-    },
-    default_agent: 'build',
-    mcp: {
-      ...baseMcp,
-      ...Object.fromEntries([...disabledServers].map((name) => [name, { enabled: false }])),
+      ...agents,
+      [agentName]: { mode: 'primary', permission: { '*': 'deny' } },
     },
   }
   const value = JSON.stringify(merged)
@@ -126,87 +76,5 @@ export function overlayOpencodeTextOnlyToolSurface(env: Record<string, string>):
     )
   }
   env[OPENCODE_PROCESS_CONFIG_ENV] = value
-  // The project layer can mount its own MCP servers from the run's cwd; a
-  // text-only turn has no project layer. Profiled turns already carry this.
-  env.OPENCODE_DISABLE_PROJECT_CONFIG ??= '1'
-}
-
-/** Parse the existing final-layer config, refusing values the overlay cannot build on. */
-function parseProcessConfig(current: string): Record<string, unknown> {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(current)
-  } catch {
-    throw new BackendError(
-      `the ${OPENCODE_PROCESS_CONFIG_ENV} already present is not valid JSON, so the text-only tool surface `
-        + 'cannot be laid over it; correct or unset it before requesting tool_choice "none" on backend opencode',
-      'parse_error',
-    )
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new BackendError(
-      `the ${OPENCODE_PROCESS_CONFIG_ENV} already present is not a JSON object, so the text-only tool surface `
-        + 'cannot be laid over it',
-      'parse_error',
-    )
-  }
-  return parsed as Record<string, unknown>
-}
-
-/**
- * Every MCP server name a text-only turn must disable: those named by the
- * ambient/final config base, and those declared by the operator's global
- * opencode config (resolved against the environment the child will see).
- *
- * The global config is the one input the bridge does not author. When the file
- * exists but cannot be parsed as an object, its server set is unknowable, so
- * the turn is refused before dispatch — never run with an unenumerated surface.
- */
-function disabledMcpServerNames(base: Record<string, unknown>, env: Record<string, string>): Set<string> {
-  const names = new Set(Object.keys(objectRecord(base.mcp)))
-  const configHome = env.XDG_CONFIG_HOME || process.env.XDG_CONFIG_HOME
-    || join(env.HOME || process.env.HOME || homedir(), '.config')
-  const globalPath = join(configHome, 'opencode', 'opencode.json')
-  let raw: string
-  try {
-    raw = readFileSync(globalPath, 'utf8')
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') return names
-    throw new BackendError(
-      'backend opencode cannot enforce tool_choice "none": the operator\'s global config '
-        + `${globalPath} exists but cannot be read (${code ?? 'unknown error'}), so its MCP server set is `
-        + 'unknowable; correct or remove it before requesting a text-only turn',
-      'not_configured',
-      undefined,
-      { providerDispatch: 'not_started' },
-    )
-  }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch (error) {
-    throw new BackendError(
-      'backend opencode cannot enforce tool_choice "none": the operator\'s global config '
-        + `${globalPath} is not valid JSON (${error instanceof Error ? error.message : String(error)}), `
-        + 'so its MCP server set is unknowable; correct or remove it before requesting a text-only turn',
-      'not_configured',
-      undefined,
-      { providerDispatch: 'not_started' },
-    )
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new BackendError(
-      'backend opencode cannot enforce tool_choice "none": the operator\'s global config '
-        + `${globalPath} is not a JSON object, so its MCP server set is unknowable; correct or remove it `
-        + 'before requesting a text-only turn',
-      'not_configured',
-      undefined,
-      { providerDispatch: 'not_started' },
-    )
-  }
-  for (const name of Object.keys(objectRecord((parsed as Record<string, unknown>).mcp))) {
-    names.add(name)
-  }
-  return names
+  return agentName
 }

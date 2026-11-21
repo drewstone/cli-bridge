@@ -25,14 +25,7 @@ import type { ChatRequest, McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { RUNTIME_COORDINATION_ENV_NAME } from '../sessions/retained/contract.js'
-import {
-  OPENCODE_TEXT_ONLY_PERMISSION,
-  OPENCODE_TEXT_ONLY_TOOLS,
-} from './opencode-text-only.js'
-import {
-  resolveAgentProfile,
-  requireMaterializationCwd,
-} from './profile-support.js'
+import { resolveAgentProfile, requireMaterializationCwd } from './profile-support.js'
 import { privateMcpCredentials, resolvePrivateMcpValue } from '../private-mcp.js'
 import { privateHostServiceMcp } from '../host-services.js'
 
@@ -813,19 +806,12 @@ export function materializeMcpServersForOpencode(
   callerPermissions?: Record<string, unknown> | null,
   profileTools?: Record<string, boolean> | null,
   sessionId?: string,
-  textOnly = false,
 ): MaterializedMcpConfig {
   const opencodeMcp: Record<string,
     | { type: 'local'; command: string[]; environment?: Record<string, string>; enabled?: boolean; timeout?: number }
     | { type: 'remote'; url: string; headers?: Record<string, string>; enabled?: boolean }
   > = {}
-  // A text-only turn (`tool_choice: "none"`) is the standard no-model-tool-calls
-  // request: every server the caller, profile, or runtime attachment names is
-  // suppressed for the turn and none is mounted. Analysis/trace callbacks run
-  // outside the nested model call on their own authority; they are not model
-  // tools here. Inherited servers (operator global config, ambient content)
-  // are disabled by name in the final config layer (see profile-support).
-  for (const [name, spec] of Object.entries(buildCanonicalMcpServers(textOnly ? {} : (specs ?? {})))) {
+  for (const [name, spec] of Object.entries(buildCanonicalMcpServers(specs ?? {}))) {
     if (spec.command) {
       opencodeMcp[name] = {
         type: 'local',
@@ -868,7 +854,7 @@ export function materializeMcpServersForOpencode(
   // sets webfetch:'deny' to remove native web). Without this, the hardcoded
   // `allow` above silently kept webfetch on and the "offline" arm still
   // fetched. Only known permission verbs are honored, per-key.
-  if (!textOnly && callerPermissions && typeof callerPermissions === 'object') {
+  if (callerPermissions && typeof callerPermissions === 'object') {
     for (const [key, value] of Object.entries(callerPermissions)) {
       if (value === 'allow' || value === 'ask' || value === 'deny') {
         headlessPermission[key] = value
@@ -879,7 +865,7 @@ export function materializeMcpServersForOpencode(
   // opencode resolves a tool as enabled when `permission` allows it,
   // regardless of the `tools` map, so a profile that disables a tool needs
   // the matching `deny` here or its disable is never enforced (#218).
-  if (!textOnly && profileTools && typeof profileTools === 'object') {
+  if (profileTools && typeof profileTools === 'object') {
     for (const [key, enabled] of Object.entries(profileTools)) {
       if (enabled === false && key in headlessPermission) {
         headlessPermission[key] = 'deny'
@@ -891,16 +877,6 @@ export function materializeMcpServersForOpencode(
     configPath = writePrivateJson(dir, 'opencode.json', {
       $schema: 'https://opencode.ai/config.json',
       permission: headlessPermission,
-      // A text-only turn replaces the whole permission map with deny-everything
-      // and disables every ambient tool outright; profile/`allow` entries are
-      // NOT merged under it because an allow verb overrides a disabled tool
-      // (#218). Restriction wins: the explicit tool_choice:"none" request is
-      // the narrowest surface this turn can have. Caller-bound MCP servers
-      // below are unaffected — they are the caller's own, not ambient.
-      ...(textOnly ? {
-        permission: { ...OPENCODE_TEXT_ONLY_PERMISSION },
-        tools: { ...OPENCODE_TEXT_ONLY_TOOLS },
-      } : {}),
       mcp: opencodeMcp,
     })
   } catch (error) {

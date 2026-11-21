@@ -3,31 +3,21 @@
  * opencode: a request that carries `tool_choice: "none"` must reach the
  * provider with ZERO tools (standard semantics — no model tool calls at all,
  * ambient action tools and caller-bound MCP servers alike), an ordinary
- * request keeps its native coding tools and its bound MCP callback, and every
- * inherited channel that could reintroduce a tool is closed.
+ * request keeps its native coding tools and its bound MCP callback, and the
+ * native agent-wildcard boundary holds against inherited configuration.
  *
- * Native facts this battery is bound to (measured against opencode 1.18.30
- * with a local OpenAI-compatible recording server, see
- * src/backends/profile-support.ts):
- *
- *  - a turn's ambient tool set on the wire is bash, edit, glob, grep, read,
- *    skill, task, todowrite, webfetch, write (tool_choice "auto");
- *  - a `permission` allow verb overrides `tools: false` (#218), so the
- *    text-only spelling denies every verb AND disables every tool;
- *  - a global `agent.build.tools: true` map reintroduces every ambient tool
- *    under a top-level deny; a final-layer `agent.build.permission` deny beats
- *    it, and pinning `default_agent: "build"` keeps a custom primary agent
- *    from being selected;
- *  - `OPENCODE_CONFIG_CONTENT` is the FINAL config layer: a profile or an
- *    ambient operator `allow` there beats the request-scoped file, so the
- *    zero-tool surface is laid over that layer too;
- *  - MCP servers are not ambient tools: an `mcp: {}` final layer does NOT
- *    remove a server named by the operator's global config (the key
- *    deep-merges per server); writing that server `enabled: false` by name is
- *    the one spelling that removed it from the wire, and
- *    `OPENCODE_DISABLE_PROJECT_CONFIG=1` removes a `<cwd>/opencode.json`
- *    server. The bridge refuses a text-only turn whose operator global config
- *    cannot be parsed, because its server set is then unknowable.
+ * Native fact this battery is bound to (measured against opencode 1.18.30
+ * with a local OpenAI-compatible recording server): a turn run with
+ * `--agent <fresh name>` whose agent is declared
+ * `agent[name] = { mode: "primary", permission: { "*": "deny" } }` in the
+ * final `OPENCODE_CONFIG_CONTENT` layer carries zero tools on the wire — the
+ * resolver appends the agent-specific wildcard after the global and agent
+ * defaults and checks every tool id, ambient and MCP alike. Verified with a
+ * provider configured by the PROJECT layer, MCP servers in the project
+ * config and the operator's global JSONC config, and hostile `"*": "allow"`
+ * entries in the global permission map and `agent.build.permission`: tools
+ * visible on ordinary turns, zero on the isolated turn, tools restored, all
+ * runs completing through their own provider.
  *
  * Every case drives the installed `opencode` through OpencodeBackend against
  * a disposable local recording server with redirected XDG homes: no paid
@@ -117,6 +107,10 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     rmSync(scratch, { recursive: true, force: true })
   })
 
+  afterEach(() => {
+    rmSync(join(scratch, 'config', 'opencode'), { recursive: true, force: true })
+  })
+
   function providerConfig(id: string, extra: Record<string, unknown> = {}): string {
     process.env.XDG_CONFIG_HOME = join(scratch, 'config')
     process.env.XDG_DATA_HOME = join(scratch, 'data')
@@ -137,11 +131,21 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     return apiKey
   }
 
-  /** The operator's global opencode config, as the child resolves it. */
-  function operatorGlobalConfig(value: unknown): void {
+  /** No final-layer content at all: the provider must come from the project layer. */
+  function projectProviderOnly(): string {
+    process.env.XDG_CONFIG_HOME = join(scratch, 'config')
+    process.env.XDG_DATA_HOME = join(scratch, 'data')
+    process.env.XDG_CACHE_HOME = join(scratch, 'cache')
+    process.env.XDG_STATE_HOME = join(scratch, 'state')
+    delete process.env.OPENCODE_CONFIG_CONTENT
+    return 'key-project-provider'
+  }
+
+  /** The operator's global opencode config — JSONC is legal here. */
+  function operatorGlobalConfig(value: string): void {
     const dir = join(process.env.XDG_CONFIG_HOME!, 'opencode')
     mkdirSync(dir, { recursive: true })
-    writeFileSync(join(dir, 'opencode.json'), typeof value === 'string' ? value : JSON.stringify(value))
+    writeFileSync(join(dir, 'opencode.jsonc'), value)
   }
 
   /** Recursive listing of a directory tree: names, sizes, contents of small files. */
@@ -163,8 +167,7 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
   /**
    * The cwd is unchanged by the turn: no new files, AGENTS.md byte-identical,
    * and opencode.json equal as JSON — modulo the `$schema` key opencode itself
-   * stamps onto a project config it reads on ordinary turns (a text-only turn
-   * disables the project layer and never touches it).
+   * stamps onto a project config it reads.
    */
   function assertCwdUnchanged(cwd: string, projectConfig: string): void {
     const listing = tree(cwd)
@@ -178,41 +181,58 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     expect(stripSchema(listing.get('opencode.json')!)).toEqual(stripSchema(projectConfig))
   }
 
-  async function turn(request: ChatRequest, session: SessionRecord | null = null): Promise<ChatDelta[]> {
+  interface TurnOptions {
+    request: ChatRequest
+    projectConfig: unknown
+    session?: SessionRecord | null
+  }
+
+  async function turn({ request, projectConfig, session = null }: TurnOptions): Promise<ChatDelta[]> {
     const backend = new OpencodeBackend({ bin: BIN, timeoutMs: 90_000, spawner: hostSpawner })
     const cwd = mkdtempSync(join(scratch, 'cwd-'))
     // The bait the observer incident named: an unrelated AGENTS.md the model
-    // tried to edit with its ambient tool, plus a project-layer config that
-    // mounts its own MCP server — both must stay inert on a text-only turn.
+    // tried to edit with its ambient tool, plus a project-layer config —
+    // which may carry the PROVIDER itself and its own MCP server, and must
+    // keep working on a text-only turn.
     writeFileSync(join(cwd, 'AGENTS.md'), '# unrelated bystander\nnothing to do here\n')
-    const projectConfig = JSON.stringify({
-      mcp: { projectcb: { type: 'local', command: ['node', mcpServerPath], enabled: true } },
-    })
-    writeFileSync(join(cwd, 'opencode.json'), projectConfig)
+    const projectJson = JSON.stringify(projectConfig)
+    writeFileSync(join(cwd, 'opencode.json'), projectJson)
     const deltas: ChatDelta[] = []
     for await (const delta of backend.chat({ cwd, mode: 'byob', ...request }, session, new AbortController().signal)) {
       deltas.push(delta)
     }
-    assertCwdUnchanged(cwd, projectConfig)
+    assertCwdUnchanged(cwd, projectJson)
     return deltas
   }
 
   const finish = (deltas: ChatDelta[]): string | undefined => deltas.at(-1)?.finish_reason
   const forKey = (apiKey: string): Recorded[] => recorded.filter((entry) => entry.auth.includes(apiKey))
   const ambientOn = (entry: Recorded): string[] => entry.tools.filter((name) => AMBIENT_TOOLS.includes(name))
-
-  afterEach(() => {
-    rmSync(join(scratch, 'config', 'opencode'), { recursive: true, force: true })
+  const projectMcp = (): Record<string, unknown> => ({
+    mcp: { projectcb: { type: 'local', command: ['node', mcpServerPath], enabled: true } },
+  })
+  const projectProvider = (apiKey: string): Record<string, unknown> => ({
+    provider: {
+      project: {
+        npm: '@ai-sdk/openai-compatible',
+        name: 'project',
+        options: { baseURL, apiKey },
+        models: { m: { name: 'm', tool_call: true } },
+      },
+    },
   })
 
-  it('keeps an ordinary request on its native coding tools, completing normally', async () => {
+  it('keeps an ordinary request on its native coding tools and project MCP, completing normally', async () => {
     const key = providerConfig('probe-ordinary')
     recorded.length = 0
 
     const deltas = await turn({
-      model: 'opencode/probe-ordinary/m',
-      session_id: 'text-ordinary',
-      messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-ordinary/m',
+        session_id: 'text-ordinary',
+        messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
+      },
     })
 
     const own = forKey(key)
@@ -221,20 +241,24 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     for (const tool of ['bash', 'edit', 'read', 'write', 'grep', 'glob']) {
       expect(answers[0]!.tools).toContain(tool)
     }
+    expect(answers[0]!.tools).toContain('projectcb_trace_callback')
     expect(finish(deltas)).toBe('stop')
     expect(deltas.some((delta) => delta.content === 'A textual plan, no host action.')).toBe(true)
     expect(deltas.some((delta) => delta.tool_calls)).toBe(false)
   }, 120_000)
 
-  it('sends the model a request with zero tools when explicitly requested, closing the project layer', async () => {
+  it('sends the model a request with zero tools when explicitly requested', async () => {
     const key = providerConfig('probe-textonly')
     recorded.length = 0
 
     const deltas = await turn({
-      model: 'opencode/probe-textonly/m',
-      session_id: 'text-only',
-      toolChoice: 'none',
-      messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-textonly/m',
+        session_id: 'text-only',
+        toolChoice: 'none',
+        messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
+      },
     })
 
     const own = forKey(key)
@@ -247,16 +271,103 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     expect(deltas.some((delta) => delta.tool_calls)).toBe(false)
   }, 120_000)
 
+  it('keeps a project-configured provider working on a text-only turn with no final-layer content', async () => {
+    const key = projectProviderOnly()
+    recorded.length = 0
+
+    const deltas = await turn({
+      projectConfig: { ...projectProvider(key), ...projectMcp() },
+      request: {
+        model: 'opencode/project/m',
+        session_id: 'text-project-provider',
+        toolChoice: 'none',
+        messages: [{ role: 'user', content: 'Write a textual plan.' }],
+      },
+    })
+
+    const own = forKey(key)
+    expect(own.length).toBeGreaterThanOrEqual(1)
+    for (const entry of own) {
+      expect(entry.tools, `request carried ${entry.tools.join(', ') || '(none)'}`).toHaveLength(0)
+    }
+    expect(finish(deltas)).toBe('stop')
+    expect(deltas.some((delta) => delta.content === 'A textual plan, no host action.')).toBe(true)
+  }, 120_000)
+
+  it('holds zero tools against a legal global JSONC config, its MCP server, and hostile wildcard allows', async () => {
+    const key = providerConfig('probe-wildcard')
+    operatorGlobalConfig([
+      '// operator global config, legal JSONC',
+      '{',
+      `  "mcp": { "globalcb": { "type": "local", "command": ["node", "${mcpServerPath}"], "enabled": true } },`,
+      '  "permission": { "*": "allow" },',
+      '  "agent": { "build": { "permission": { "*": "allow" } } }',
+      '}',
+    ].join('\n'))
+    recorded.length = 0
+
+    // Ordinary control: the global MCP server and every ambient tool are visible.
+    await turn({
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-wildcard/m',
+        session_id: 'text-wildcard-ordinary',
+        messages: [{ role: 'user', content: 'Write a textual plan.' }],
+      },
+    })
+    const ordinary = forKey(key).filter((entry) => entry.tools.length > 0)
+    expect(ordinary.length).toBeGreaterThanOrEqual(1)
+    expect(ordinary[0]!.tools).toContain('globalcb_trace_callback')
+    expect(ordinary[0]!.tools).toContain('projectcb_trace_callback')
+    expect(ambientOn(ordinary[0]!).length).toBe(AMBIENT_TOOLS.length)
+
+    // Isolated turn: zero tools despite the project MCP, the global JSONC MCP,
+    // and the "*" allows in both the global permission map and agent.build.
+    recorded.length = 0
+    const deltas = await turn({
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-wildcard/m',
+        session_id: 'text-wildcard-none',
+        toolChoice: 'none',
+        messages: [{ role: 'user', content: 'Write a textual plan.' }],
+      },
+    })
+    const own = forKey(key)
+    expect(own.length).toBeGreaterThanOrEqual(1)
+    for (const entry of own) {
+      expect(entry.tools, `request carried ${entry.tools.join(', ') || '(none)'}`).toHaveLength(0)
+    }
+    expect(finish(deltas)).toBe('stop')
+
+    // Restored: the next ordinary turn sees its tools again.
+    recorded.length = 0
+    await turn({
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-wildcard/m',
+        session_id: 'text-wildcard-restored',
+        messages: [{ role: 'user', content: 'Write a textual plan.' }],
+      },
+    })
+    const restored = forKey(key).filter((entry) => entry.tools.length > 0)
+    expect(restored.length).toBeGreaterThanOrEqual(1)
+    expect(ambientOn(restored[0]!).length).toBe(AMBIENT_TOOLS.length)
+  }, 240_000)
+
   it('suppresses a deliberately attached MCP tool under none: zero visible tools', async () => {
     const key = providerConfig('probe-mcp-none')
     recorded.length = 0
 
     const deltas = await turn({
-      model: 'opencode/probe-mcp-none/m',
-      session_id: 'text-mcp-none',
-      toolChoice: 'none',
-      messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
-      mcp: { mcpServers: { tracecb: { type: 'stdio', command: 'node', args: [mcpServerPath] } } },
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-mcp-none/m',
+        session_id: 'text-mcp-none',
+        toolChoice: 'none',
+        messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
+        mcp: { mcpServers: { tracecb: { type: 'stdio', command: 'node', args: [mcpServerPath] } } },
+      },
     })
 
     const own = forKey(key)
@@ -273,10 +384,13 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     recorded.length = 0
 
     const deltas = await turn({
-      model: 'opencode/probe-mcp-auto/m',
-      session_id: 'text-mcp-auto',
-      messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
-      mcp: { mcpServers: { tracecb: { type: 'stdio', command: 'node', args: [mcpServerPath] } } },
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-mcp-auto/m',
+        session_id: 'text-mcp-auto',
+        messages: [{ role: 'user', content: 'Write a textual plan and the Python for the analysis callback.' }],
+        mcp: { mcpServers: { tracecb: { type: 'stdio', command: 'node', args: [mcpServerPath] } } },
+      },
     })
 
     const own = forKey(key)
@@ -287,63 +401,26 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     expect(finish(deltas)).toBe('stop')
   }, 120_000)
 
-  it('disables an operator global-config MCP server by name on a text-only turn', async () => {
-    const key = providerConfig('probe-global-mcp')
-    recorded.length = 0
-    operatorGlobalConfig({
-      mcp: { globalcb: { type: 'local', command: ['node', mcpServerPath], enabled: true } },
-    })
-
-    const deltas = await turn({
-      model: 'opencode/probe-global-mcp/m',
-      session_id: 'text-global-mcp',
-      toolChoice: 'none',
-      messages: [{ role: 'user', content: 'Write a textual plan.' }],
-    })
-
-    const own = forKey(key)
-    expect(own.length).toBeGreaterThanOrEqual(1)
-    for (const entry of own) {
-      expect(entry.tools, `request carried ${entry.tools.join(', ') || '(none)'}`).toHaveLength(0)
-    }
-    expect(finish(deltas)).toBe('stop')
-  }, 120_000)
-
-  it('keeps the operator global-config MCP server available on an ordinary turn', async () => {
-    const key = providerConfig('probe-global-mcp-auto')
-    recorded.length = 0
-    operatorGlobalConfig({
-      mcp: { globalcb: { type: 'local', command: ['node', mcpServerPath], enabled: true } },
-    })
-
-    await turn({
-      model: 'opencode/probe-global-mcp-auto/m',
-      session_id: 'text-global-mcp-auto',
-      messages: [{ role: 'user', content: 'Write a textual plan.' }],
-    })
-
-    const withTools = forKey(key).filter((entry) => entry.tools.length > 0)
-    expect(withTools.length).toBeGreaterThanOrEqual(1)
-    expect(withTools[0]!.tools).toContain('globalcb_trace_callback')
-  }, 120_000)
-
-  it('wins over a profile that allows tools: the zero surface replaces the final config layer', async () => {
+  it('wins over a profile that allows tools', async () => {
     const key = providerConfig('probe-profiled')
     recorded.length = 0
 
     const deltas = await turn({
-      model: 'opencode/probe-profiled/m',
-      session_id: 'text-profiled',
-      toolChoice: 'none',
-      messages: [{ role: 'user', content: 'Write a textual plan.' }],
-      agent_profile: {
-        name: 'allowed-worker',
-        harness: 'opencode',
-        prompt: { instructions: ['Answer briefly.'] },
-        permissions: { bash: 'allow', edit: 'allow', read: 'allow', write: 'allow' },
-        tools: { bash: true, edit: true, read: true, write: true },
-      },
-    } as ChatRequest)
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-profiled/m',
+        session_id: 'text-profiled',
+        toolChoice: 'none',
+        messages: [{ role: 'user', content: 'Write a textual plan.' }],
+        agent_profile: {
+          name: 'allowed-worker',
+          harness: 'opencode',
+          prompt: { instructions: ['Answer briefly.'] },
+          permissions: { bash: 'allow', edit: 'allow', read: 'allow', write: 'allow' },
+          tools: { bash: true, edit: true, read: true, write: true },
+        },
+      } as ChatRequest,
+    })
 
     const own = forKey(key)
     expect(own.length).toBeGreaterThanOrEqual(1)
@@ -358,15 +435,18 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     recorded.length = 0
 
     const deltas = await turn({
-      model: 'opencode/probe-profiled-ordinary/m',
-      session_id: 'text-profiled-ordinary',
-      messages: [{ role: 'user', content: 'Write a textual plan.' }],
-      agent_profile: {
-        name: 'allowed-worker',
-        harness: 'opencode',
-        prompt: { instructions: ['Answer briefly.'] },
-      },
-    } as ChatRequest)
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-profiled-ordinary/m',
+        session_id: 'text-profiled-ordinary',
+        messages: [{ role: 'user', content: 'Write a textual plan.' }],
+        agent_profile: {
+          name: 'allowed-worker',
+          harness: 'opencode',
+          prompt: { instructions: ['Answer briefly.'] },
+        },
+      } as ChatRequest,
+    })
 
     const own = forKey(key)
     const withTools = own.filter((entry) => entry.tools.length > 0)
@@ -388,10 +468,13 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     recorded.length = 0
 
     const deltas = await turn({
-      model: 'opencode/probe-ambient/m',
-      session_id: 'text-ambient',
-      toolChoice: 'none',
-      messages: [{ role: 'user', content: 'Write a textual plan.' }],
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-ambient/m',
+        session_id: 'text-ambient',
+        toolChoice: 'none',
+        messages: [{ role: 'user', content: 'Write a textual plan.' }],
+      },
     })
 
     const own = forKey(key)
@@ -402,29 +485,18 @@ describe.skipIf(!ENABLED)('a real opencode text-only tool-surface turn', () => {
     expect(finish(deltas)).toBe('stop')
   }, 120_000)
 
-  it('refuses a text-only turn before dispatch when the operator global config cannot be parsed', async () => {
-    providerConfig('probe-bad-global')
-    operatorGlobalConfig('{ not valid json')
-    recorded.length = 0
-
-    await expect(turn({
-      model: 'opencode/probe-bad-global/m',
-      session_id: 'text-bad-global',
-      toolChoice: 'none',
-      messages: [{ role: 'user', content: 'Write a textual plan.' }],
-    })).rejects.toThrow(/global config .*is not valid JSON/)
-    expect(forKey('key-probe-bad-global')).toHaveLength(0)
-  }, 120_000)
-
   it('applies per turn on a saved session: callback bound, then none, without rebinding the session', async () => {
     const key = providerConfig('probe-resume')
     recorded.length = 0
 
     const first = await turn({
-      model: 'opencode/probe-resume/m',
-      session_id: 'text-resume',
-      messages: [{ role: 'user', content: 'Remember the word ANCHOR. Answer briefly.' }],
-      mcp: { mcpServers: { tracecb: { type: 'stdio', command: 'node', args: [mcpServerPath] } } },
+      projectConfig: projectMcp(),
+      request: {
+        model: 'opencode/probe-resume/m',
+        session_id: 'text-resume',
+        messages: [{ role: 'user', content: 'Remember the word ANCHOR. Answer briefly.' }],
+        mcp: { mcpServers: { tracecb: { type: 'stdio', command: 'node', args: [mcpServerPath] } } },
+      },
     })
     const internalId = first.find((delta) => delta.internal_session_id !== undefined)?.internal_session_id
     expect(internalId).toBeTruthy()

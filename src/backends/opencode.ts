@@ -178,7 +178,6 @@ export class OpencodeBackend implements Backend {
         profileForControls?.permissions,
         profileForControls?.tools,
         req.session_id,
-        req.toolChoice === 'none',
       )
     } catch (error) {
       provisioned.cleanup?.()
@@ -188,16 +187,16 @@ export class OpencodeBackend implements Backend {
     // expose its dir read-only so the confined opencode can still read it.
     if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
 
-    // An explicit text-only turn (`tool_choice: "none"`) must put ZERO tools in
-    // the model request — standard semantics, no model tool calls at all — even
-    // when a profile, the operator's ambient OPENCODE_CONFIG_CONTENT, an
-    // agent-layer tools map, the operator's global config, or the project layer
-    // would reintroduce one: that env var is opencode's FINAL config layer and
-    // beats everything the bridge wrote above, so the zero-tool surface is laid
-    // over it (inherited MCP servers disabled by name, project layer disabled,
-    // unenumerable global config refused before spawn).
+    // An explicit text-only turn (`tool_choice: "none"`) runs under its own
+    // fresh agent whose permission is the native wildcard deny: the resolver
+    // appends it after every global and agent default and checks every tool
+    // id, ambient action tools and MCP servers alike, so the model request
+    // carries zero tools. The project layer and the operator's global config
+    // stay live — a project-configured provider keeps working — and unrelated
+    // config keys survive the overlay.
+    let textOnlyAgent: string | undefined
     if (req.toolChoice === 'none') {
-      overlayOpencodeTextOnlyToolSurface(provisioned.env)
+      textOnlyAgent = overlayOpencodeTextOnlyToolSurface(provisioned.env)
     }
 
     // opencode installs itself under $HOME, and an fs-jail deliberately hides /home. The generic
@@ -228,6 +227,7 @@ export class OpencodeBackend implements Backend {
     if (model) args.push('-m', model)
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
+    if (textOnlyAgent) args.push('--agent', textOnlyAgent)
     // A capped turn names its own title so opencode generates none. Title
     // generation is an extra model call in the same process: it carries the
     // cap on the wire, but `run` prints no step receipt for it, so its billed

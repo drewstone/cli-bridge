@@ -692,8 +692,8 @@ export interface Backend {
    * This backend enforces `tool_choice: "none"` with standard semantics: ZERO
    * tools in its model requests for that turn — ambient action tools and
    * caller-bound MCP servers alike — through a verified native control that
-   * also closes inherited channels (operator global config, ambient config
-   * content, agent-layer tool maps, the project layer). Without this flag the
+   * also wins over inherited configuration (operator global config, ambient
+   * config content, agent defaults, the project layer). Without this flag the
    * chat route REFUSES a `tool_choice: "none"` request instead of letting the
    * backend ignore the field — a route cannot claim a control a harness does
    * not enforce.

@@ -224,12 +224,14 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
   servers alike (analysis/trace callbacks belong outside the nested model call, on their own
   authority, and stay usable there). OpenCode today; every other backend is refused with
   `400 invalid_request_error` naming the gap rather than accepting and ignoring the field,
-  until it declares a verified zero-tool control. The surface is per turn and closes inherited
-  channels: profile, operator, agent-layer, and project-config permission/tool entries cannot
-  reintroduce a tool, an unenumerable operator global config refuses the turn before dispatch,
-  and sandbox delegation is refused because its task boundary drops the field. `'auto'` and an
-  absent field are the native default everywhere — ordinary turns keep their native coding
-  tools and MCP passthrough, and an absent or empty `tools` list is never read as a request.
+  until it declares a verified zero-tool control. On OpenCode the turn runs under a fresh
+  bridge-named agent whose permission is the native wildcard deny — appended after every
+  global and agent default, checking every tool id — so inherited configuration (operator
+  global config including JSONC, ambient config content, agent defaults, the project layer)
+  cannot reintroduce a tool, and a project-configured provider keeps working. Sandbox
+  delegation is refused because its task boundary drops the field. `'auto'` and an absent
+  field are the native default everywhere — ordinary turns keep their native coding tools
+  and MCP passthrough, and an absent or empty `tools` list is never read as a request.
   This is a provider tool-list restriction, not hosted-safe isolation. Measured against
   OpenCode 1.18.30 with a local recording endpoint
   (`tests/opencode-text-only-tool-choice-real.test.ts`).

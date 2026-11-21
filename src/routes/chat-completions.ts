@@ -173,14 +173,13 @@ const chatRequestSchema = z.object({
   stream: z.boolean().optional(),
   temperature: z.number().optional(),
   max_tokens: z.number().optional(),
-  // Standard OpenAI tool-choice field. Only the explicit text-inference
-  // request `'none'` (and the everywhere-default `'auto'`) are accepted:
-  // `'none'` is honored solely by backends that declare a verified native
-  // zero-ambient-tool control (see the guard below), and every other
-  // spelling is refused at parse rather than accepted and ignored — this
-  // route never claims a tool control it does not enforce. An absent field
-  // is NOT a request: ordinary turns keep their native coding tools, and an
-  // absent/empty `tools` list never implies it.
+  // Standard OpenAI tool-choice field. Only the explicit text-inference request
+  // `'none'` (and the everywhere-default `'auto'`) are accepted: `'none'` is
+  // honored solely by backends that declare a verified native zero-ambient-tool
+  // control (see the guard below); every other spelling is refused at parse
+  // rather than accepted and ignored — this route never claims a tool control
+  // it does not enforce. An absent field is NOT a request: ordinary turns keep
+  // their native coding tools, and an absent/empty `tools` list never implies it.
   tool_choice: z.union([z.literal('none'), z.literal('auto')]).optional(),
   // Mirrors the canonical ReasoningEffort ladder in @tangle-network/agent-interface.
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
@@ -653,22 +652,23 @@ export function mountChatCompletions(
       }, 404)
     }
     // Honesty guard for the text-inference contract: a backend without a
-    // verified native control that removes its ambient action tools from the
-    // model request would run the turn with tools the caller explicitly
-    // refused. Sandbox delegation has the same gap one hop further out: the
-    // sandbox task transport does not carry the field, so the in-container
-    // turn would run with ambient tools even when the delegating harness
-    // declares the control. Refused here, before any session identity claim,
-    // naming the gap and the lift — never accepted and silently ignored.
+    // verified native zero-tool control — or sandbox delegation, whose task
+    // boundary drops the field — would run the turn with tools the caller
+    // explicitly refused. Refused before any session identity claim, naming
+    // the gap and the lift; never accepted and silently ignored.
     if (tool_choice === 'none' && (backend.textOnlyToolChoice !== true || execution?.kind === 'sandbox')) {
+      const sandboxGap = backend.textOnlyToolChoice === true && execution?.kind === 'sandbox'
       return c.json({
         error: {
-          message: backend.textOnlyToolChoice === true && execution?.kind === 'sandbox'
-            ? `backend "${backend.name}" cannot enforce tool_choice "none" through sandbox execution: the sandbox task boundary does not carry the field, and the in-container turn would run with ambient action tools; `
-              + 'this route refuses the field rather than ignoring it. Run the turn on the host executor, '
-              + 'or extend the sandbox task contract with the tool-surface field first.'
-            : `backend "${backend.name}" cannot enforce tool_choice "none": no verified native control removes its ambient action tools from the model request; `
-              + 'this route refuses the field rather than ignoring it. Send the request without tool_choice to keep native tools, '
+          message: sandboxGap
+            ? `backend "${backend.name}" cannot enforce tool_choice "none" through sandbox execution: `
+              + 'the sandbox task boundary does not carry the field, and the in-container turn would run '
+              + 'with ambient action tools; this route refuses the field rather than ignoring it. '
+              + 'Run the turn on the host executor, or extend the sandbox task contract with the '
+              + 'tool-surface field first.'
+            : `backend "${backend.name}" cannot enforce tool_choice "none": no verified native control `
+              + 'removes its ambient action tools from the model request; this route refuses the field '
+              + 'rather than ignoring it. Send the request without tool_choice to keep native tools, '
               + 'or route it through a backend that declares the control.',
           type: 'invalid_request_error',
         },
