@@ -163,7 +163,8 @@ export class AcpBackend implements Backend {
       const request = (method: string, params: unknown): Promise<unknown> =>
         rpc.request(method, params).catch((error: unknown) => {
           if (error instanceof RpcCallError) {
-            throw new BackendError(`${this.name} acp error: ${JSON.stringify({ code: error.code, message: error.message, data: error.data }).slice(0, 160)}`, 'upstream')
+            const wire = JSON.stringify({ code: error.code, message: error.message, data: error.data })
+            throw new BackendError(`${this.name} acp error: ${wire.slice(0, 160)}`, 'upstream')
           }
           throw error
         })

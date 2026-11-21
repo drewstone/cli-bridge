@@ -150,7 +150,7 @@ function mapRpcError(method: string, error: RpcCallError): BackendError {
   }
   if (error.code === -32601) {
     return new BackendError(
-      `kimi acp does not implement ${method}; this kimi build lacks the ACP surface the large-prompt transport requires (verified on kimi 2.7.2, upstream 56145f8)`,
+      `kimi acp does not implement ${method}; this kimi build lacks the ACP surface the large-prompt transport requires (2.7.2 verified, upstream 56145f8)`,
       'capability_denied',
       error,
     )
@@ -191,7 +191,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
 
   if (provisioned.flags.length > 0) {
     throw new BackendError(
-      `backend kimi-code cannot apply AgentProfile launch flags (${provisioned.flags.join(' ')}) on the ACP large-prompt transport; kimi acp exposes no per-invocation argv flags`,
+      `backend kimi-code cannot apply AgentProfile launch flags (${provisioned.flags.join(' ')}) on the ACP transport; kimi acp has no per-invocation argv flags`,
       'capability_denied',
     )
   }
