@@ -180,13 +180,17 @@ export class AcpBackend implements Backend {
       })()
       driver.catch((e: Error) => { driverError = e instanceof BackendError ? e : new BackendError(`${this.name} acp: ${e.message}`, 'upstream') })
 
-      // Yield deltas as they arrive; finish_reason ends the turn.
+      // Yield deltas as they arrive; finish_reason ends the turn. The
+      // driverError check repeats before every yield so a permission refusal
+      // landing while the pump sits at a yield still fails the turn even if
+      // the finish frame is already queued behind it.
       while (true) {
         if (driverError) throw driverError
-        while (queue.length) {
-          const d = queue.shift()!
+        const d = queue.shift()
+        if (d) {
           yield d
           if (d.finish_reason) return
+          continue
         }
         if (driverError) throw driverError
         if (streamEnded) {

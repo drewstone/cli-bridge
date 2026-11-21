@@ -71,6 +71,13 @@
  *     backend: an unenforced hint, separate from any measured native bound.
  *   - reasoning chunks (agent_thought_chunk) stay off the wire, like the
  *     argv path's 'think' blocks.
+ *   - terminal truth: a turn with no substantive assistant text or tool call
+ *     is never published as an empty success — the same contract the argv
+ *     path enforces — and this matters double here because kimi's
+ *     turnEndReasonToStopReason maps a FAILED engine turn to end_turn.
+ *     Native cancelled and refusal outcomes are surfaced as errors even when
+ *     some text already streamed, while max_tokens keeps legitimate partial
+ *     output and a tool-only turn completes with finish_reason tool_calls.
  *
  * Old-native compatibility: this transport requires a kimi build whose `acp`
  * subcommand implements the surface above (verified on 2.7.2; the subcommand
@@ -120,14 +127,14 @@ export function kimiAcpPromptBlocks(prompt: string): Array<{ type: 'text'; text:
   return [{ type: 'text', text: prompt }]
 }
 
-/** ACP stopReason → OpenAI finish_reason, with tool-call awareness applied by the caller. */
+/**
+ * ACP stopReason → OpenAI finish_reason. 'cancelled' and 'refusal' are
+ * handled before this mapping and reported as failures; a mapped length only
+ * publishes with legitimate partial output (the substantive-output guard).
+ */
 function baseStopReason(reason: unknown): ChatDelta['finish_reason'] {
-  switch (reason) {
-    case 'max_tokens': return 'length'
-    case 'cancelled': return 'stop'
-    case 'refusal': return 'stop'
-    default: return 'stop' // end_turn, max_turn_requests, unknown
-  }
+  if (reason === 'max_tokens') return 'length'
+  return 'stop' // end_turn, max_turn_requests, unknown
 }
 
 /** Map one failed JSON-RPC call onto the backend's typed error taxonomy. */
@@ -257,6 +264,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
 
     const emittedTools = new Set<string>()
     let emittedToolCall = false
+    let emittedContent = false
 
     const rpc = attachNdjsonRpc({
       child,
@@ -280,6 +288,7 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
             case 'agent_message_chunk': {
               const text = update.content?.text
               if (typeof text === 'string' && text) {
+                emittedContent = true
                 push({ content: text })
               }
               return
@@ -399,6 +408,27 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
         sessionId: liveSessionId,
         prompt: kimiAcpPromptBlocks(prompt),
       })) as { stopReason?: unknown }
+
+      // Terminal truth. kimi's turnEndReasonToStopReason maps a FAILED engine
+      // turn to end_turn (only provider.filtered becomes refusal), so an
+      // engine error is indistinguishable from success at the stopReason
+      // level — the substantive-output guard below is what exposes it. A
+      // native cancelled or refusal outcome is reported as the failure it is,
+      // never as a silent zero-byte success, including when some text already
+      // streamed.
+      if (result?.stopReason === 'cancelled') {
+        throw new BackendError('kimi acp turn was cancelled by the agent before completing', 'upstream')
+      }
+      if (result?.stopReason === 'refusal') {
+        throw new BackendError('kimi acp refused the turn', 'upstream')
+      }
+      if (!emittedContent && !emittedToolCall) {
+        const detail = stderr.render(300)
+        throw new BackendError(
+          `kimi acp produced no stream output${detail ? `: ${detail}` : ''}`,
+          'upstream',
+        )
+      }
       const finish = baseStopReason(result?.stopReason)
       if (finish !== 'length' && emittedToolCall) {
         push({ finish_reason: 'tool_calls' })
@@ -424,11 +454,16 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
         yield { finish_reason: 'error', internal_session_id: liveSessionId }
         return
       }
+      // driverError is re-checked before EVERY yield: a permission refusal
+      // can land while the pump sits suspended at a yield with the finish
+      // frame already queued behind it, and the turn must still fail closed
+      // rather than stream the refused turn's tail as a success.
       if (driverError) throw driverError
-      while (queue.length > 0) {
-        const d = queue.shift()!
+      const d = queue.shift()
+      if (d) {
         yield d
         if (d.finish_reason) return
+        continue
       }
       if (driverError) throw driverError
       if (streamEnded || rpc.writeFailure()) {

@@ -30,7 +30,11 @@ import type { SessionRecord } from '../src/sessions/store.js'
  *   busy        — session/prompt answers turn.agent_busy
  *   failInit    — initialize answers -32601 (old native)
  *   failAuth    — session/new answers -32000 (authRequired)
- *   slash       — records prompt blocks, streams no message, end_turn
+ *   slash       — records prompt blocks, streams no output, end_turn
+ *   nativeCancel— result stopReason cancelled after a partial message chunk
+ *   refusal     — result stopReason refusal, no output
+ *   maxTokens   — a partial message chunk, then stopReason max_tokens
+ *   toolOnly    — a tool_call update with no message chunks
  * Every received frame is appended to $KIMI_ACP_RECORD as JSONL before it is
  * answered, so a kill cannot erase the record.
  */
@@ -69,6 +73,19 @@ rl.on('line', (raw) => {
   if (m.method === 'session/cancel') return
   if (m.method === 'session/prompt') {
     if (mode === 'busy') return line({ jsonrpc: '2.0', id: m.id, error: { code: -32600, message: 'another turn is already in progress', data: { code: 'turn.agent_busy' } } })
+    if (mode === 'refusal') return line({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'refusal' } })
+    if (mode === 'nativeCancel') {
+      line({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-ks-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial ' } } } })
+      return line({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'cancelled' } })
+    }
+    if (mode === 'maxTokens') {
+      line({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-ks-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial answer' } } } })
+      return line({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'max_tokens' } })
+    }
+    if (mode === 'toolOnly') {
+      line({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-ks-1', update: { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Read', kind: 'read', status: 'in_progress', rawInput: { file_path: '/tmp/x' } } } })
+      return line({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'end_turn' } })
+    }
     const run = () => {
       line({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'native-ks-1', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'SECRET REASONING' } } } })
       if (mode === 'permission') line({ jsonrpc: '2.0', id: 901, method: 'session/request_permission', params: { sessionId: 'native-ks-1', options: [{ optionId: 'allow-once' }, { optionId: 'deny' }] } })
@@ -98,6 +115,11 @@ function realChildBackend(mode: string, behavior: { terminateGraceMs?: number } 
   const recordPath = join(dir, 'record.jsonl')
   const spawnCalls: Array<{ bin: string; args: string[] }> = []
   const children: ChildProcess[] = []
+  const waitClose = (child: ChildProcess): Promise<void> =>
+    new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve()
+      child.once('close', () => resolve())
+    })
   const spawner = vi.fn(async (bin: string, args: string[]) => {
     spawnCalls.push({ bin, args })
     const child = spawn(process.execPath, ['-e', AGENT_SOURCE, mode], {
@@ -109,11 +131,12 @@ function realChildBackend(mode: string, behavior: { terminateGraceMs?: number } 
       child,
       release: () => {},
       terminate: async () => {
-        if (child.exitCode !== null || child.signalCode !== null) return
-        // Small grace so a just-sent notification reaches the child's record.
-        await new Promise((resolve) => setTimeout(resolve, behavior.terminateGraceMs ?? 0))
-        child.kill('SIGKILL')
-        await new Promise((resolve) => child.once('close', resolve))
+        if (child.exitCode === null && child.signalCode === null) {
+          // Small grace so a just-sent notification reaches the child's record.
+          await new Promise((resolve) => setTimeout(resolve, behavior.terminateGraceMs ?? 0))
+          child.kill('SIGKILL')
+        }
+        await waitClose(child)
       },
       spawnError: () => null,
     }
@@ -326,7 +349,10 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
           release: () => {},
           terminate: async () => {
             if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-            await new Promise((resolve) => child.once('close', resolve))
+            await new Promise<void>((resolve) => {
+              if (child.exitCode !== null || child.signalCode !== null) return resolve()
+              child.once('close', () => resolve())
+            })
           },
           spawnError: () => null,
         }
@@ -343,7 +369,7 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
   })
 
   it('fails closed on session/request_permission without fabricating approval', async () => {
-    const h = realChildBackend('permission')
+    const h = realChildBackend('permission', { terminateGraceMs: 150 })
     try {
       const { text } = largePrompt()
       await expect(drain(h.be, baseReq(text))).rejects.toMatchObject({ code: 'capability_denied' })
@@ -413,13 +439,18 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
     }
   })
 
-  it('delivers a slash-shaped prompt as split blocks that join to the exact source text', async () => {
+  it('delivers a slash-shaped prompt as split blocks joining to the exact source text', async () => {
     const h = realChildBackend('slash')
     try {
       const source = `/status ${'x'.repeat(140 * 1024)}`.slice(0, 140 * 1024)
       if (Buffer.byteLength(source, 'utf8') <= KIMI_ARGV_PROMPT_MAX_BYTES) throw new Error('test prompt too small')
-      const r = await drain(h.be, baseReq(source))
-      expect(r.finish).toBe('stop')
+      // 'slash' streams no output and ends end_turn — itself the empty-outcome
+      // contract: an end_turn turn with no text and no tool call never
+      // publishes as a zero-byte success.
+      await expect(drain(h.be, baseReq(source))).rejects.toMatchObject({
+        code: 'upstream',
+        message: expect.stringContaining('kimi acp produced no stream output'),
+      })
       const promptMsg = frame(h.record(), 'session/prompt') as { params?: { prompt?: Array<{ type: string; text: string }> } }
       const blocks = promptMsg.params?.prompt ?? []
       expect(blocks).toHaveLength(2)
@@ -431,14 +462,66 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
       await h.cleanup()
     }
   })
+
+  it('reports a native cancellation as an error, even after partial text', async () => {
+    const h = realChildBackend('nativeCancel')
+    try {
+      const { text } = largePrompt()
+      await expect(drain(h.be, baseReq(text))).rejects.toMatchObject({
+        code: 'upstream',
+        message: expect.stringContaining('cancelled by the agent'),
+      })
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  it('reports a refusal as an error with no zero-byte success', async () => {
+    const h = realChildBackend('refusal')
+    try {
+      const { text } = largePrompt()
+      await expect(drain(h.be, baseReq(text))).rejects.toMatchObject({
+        code: 'upstream',
+        message: expect.stringContaining('refused the turn'),
+      })
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  it('keeps max_tokens partial output as a legitimate length finish', async () => {
+    const h = realChildBackend('maxTokens')
+    try {
+      const { text } = largePrompt()
+      const r = await drain(h.be, baseReq(text))
+      expect(r.text).toBe('partial answer')
+      expect(r.finish).toBe('length')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  it('completes a tool-only turn with finish_reason tool_calls', async () => {
+    const h = realChildBackend('toolOnly')
+    try {
+      const { text } = largePrompt()
+      const r = await drain(h.be, baseReq(text))
+      expect(r.text).toBe('')
+      expect(r.toolCalls).toEqual([{ id: 't1', name: 'Read', arguments: '{"file_path":"/tmp/x"}' }])
+      expect(r.finish).toBe('tool_calls')
+    } finally {
+      await h.cleanup()
+    }
+  })
 })
 
 describe('kimi slash-command guard', () => {
   it('detects the prompts ACP would intercept as commands', () => {
     expect(parsesAsKimiSlashCommand('/status now')).toBe(true)
-    expect(parsesAsKimiSlashCommand('/etc/hosts is a file')).toBe(true) // unknown commands end the turn with no model call
+    expect(parsesAsKimiSlashCommand('/share this file')).toBe(true) // unknown commands end the turn with no model call
     expect(parsesAsKimiSlashCommand('/')).toBe(false) // bare slash: no token
     expect(parsesAsKimiSlashCommand('//raw')).toBe(false) // token contains '/'
+    expect(parsesAsKimiSlashCommand('/etc/hosts is a file')).toBe(false) // first token 'etc/hosts' has a slash
     expect(parsesAsKimiSlashCommand('/path/only')).toBe(false)
     expect(parsesAsKimiSlashCommand('normal /status text')).toBe(false)
     expect(parsesAsKimiSlashCommand('plain text')).toBe(false)
