@@ -49,6 +49,7 @@ import { newRunnerWatch } from '../src/backends/runner-continuation.js'
 import { RunRegistry } from '../src/runs/registry.js'
 import { continueInterruptedRuns } from '../src/runs/continue-interrupted.js'
 import { hostSpawner } from '../src/executors/host.js'
+import { drainOrphanScope } from '../src/executors/scoped-host.js'
 
 const BIN = process.env.OPENCODE_BIN ?? join(homedir(), '.opencode/bin/opencode')
 const ENABLED = existsSync(BIN) && process.env.CLI_BRIDGE_SKIP_REAL_OPENCODE !== '1'
@@ -317,7 +318,7 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
     expect(modelCalls(final.deltas)[0]?.output_tokens).toBeUndefined()
   }, 120_000)
 
-  it.skipIf(process.env.CLI_BRIDGE_REAL_CGROUP_TESTS !== '1').each(['capped', 'legacy', 'uncapped'])(
+  it.skipIf(process.env.CLI_BRIDGE_REAL_CGROUP_TESTS !== '1').each(['capped', 'legacy', 'uncapped', 'runner-exit'])(
     'recovers an interrupted %s OpenCode request through its durable runner record', async mode => {
       const key = providerConfig('probe-restart')
       const model = 'opencode/probe-restart/m'
@@ -330,7 +331,10 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
       const registry = new BackendRegistry().register(backend)
       const req: ChatRequest = { model, cwd, mode: 'byob', messages: [{ role: 'user', content: 'Use the tool.' }],
         ...(mode !== 'uncapped' ? { max_tokens: 30 } : {}) }
-      const original = backend.runRunner(req, null, new AbortController().signal, newRunnerWatch())[Symbol.asyncIterator]()
+      const signal = new AbortController().signal
+      const stream = mode === 'runner-exit' ? backend.chat(req, null, signal) : backend.runRunner(req, null, signal, newRunnerWatch())
+      const original = stream[Symbol.asyncIterator]()
+      let scope: string | undefined
       recorded.length = 0
       script = ({ tools }) => ({ chunks: tools
         ? [toolCallChunk('pause', 'sleep 30'), chunk({}, 'tool_calls', { prompt_tokens: 8, completion_tokens: 3 })]
@@ -345,17 +349,27 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
           if (next.done) throw new Error('original runner ended before its native session was retained')
           const delta = next.value
           if (delta.runner) {
-            expect(delta.runner.scope).toBeTruthy()
+            scope = delta.runner.scope
+            expect(scope).toBeTruthy()
             if (mode === 'legacy') delete delta.runner.max_tokens
           }
           store.appendRetainedDelta(runId, { runId, sequence: ++sequence, delta })
           if (delta.internal_session_id) break
         }
         expect(forKey(key).some(entry => entry.tools > 0)).toBe(true)
-        store.close()
-        store = new SessionStore(dir)
         recorded.length = 0
         script = () => ({ chunks: [chunk({ role: 'assistant', content: 'Recovered.' }), chunk({}, 'stop', { prompt_tokens: 8, completion_tokens: 3 })] })
+        if (mode === 'runner-exit') {
+          expect(await drainOrphanScope(scope!)).toBe(true)
+          const remaining: ChatDelta[] = []
+          for (let next = await original.next(); !next.done; next = await original.next()) remaining.push(next.value)
+          expect(remaining.at(-1)?.error?.message).toContain('remaining output token budget is unknown')
+          expect(remaining.some(delta => delta.continuation)).toBe(false)
+          expect(forKey(key)).toHaveLength(0)
+          return
+        }
+        store.close()
+        store = new SessionStore(dir)
         // Startup drains the recorded live native scope and reopens the database.
         await continueInterruptedRuns({ store, registry, runs, durableWriter: null, jailEnv: {} })
         const recovered = runs.get(runId)
