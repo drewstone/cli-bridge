@@ -259,6 +259,8 @@ export async function* runKimiAcpTurn(opts: KimiAcpTurnOptions): AsyncIterable<C
     let emittedToolCall = false
 
     const rpc = attachNdjsonRpc({
+      child,
+      label: 'kimi acp',
       stdin: child.stdin,
       stdout: child.stdout,
       onMessage: (m: JsonRpcMessage) => {

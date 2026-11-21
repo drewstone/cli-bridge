@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { KimiBackend } from '../src/backends/kimi.js'
 import { KIMI_ARGV_PROMPT_MAX_BYTES, kimiAcpPromptBlocks, parsesAsKimiSlashCommand } from '../src/backends/kimi-acp.js'
-import type { ChatRequest } from '../src/backends/types.js'
+import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import type { SessionRecord } from '../src/sessions/store.js'
 
 /**
@@ -295,9 +295,9 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
       const session = { externalId: 'ext-1', backend: 'kimi-code', internalId: 'native-ks-existing', cwd: '/tmp', turns: 1, createdAt: 0, lastUsedAt: 0, metadata: {} } as SessionRecord
       const controller = new AbortController()
       const seen: string[] = []
-      const iter = h.be.chat(baseReq(text), session, controller.signal)
+      const iter = h.be.chat(baseReq(text), session, controller.signal) as AsyncGenerator<ChatDelta>
       const first = await iter.next()
-      if (first.value.internal_session_id) seen.push(first.value.internal_session_id)
+      if (first.value?.internal_session_id) seen.push(first.value.internal_session_id)
       setTimeout(() => controller.abort(), 20)
       let finish: string | undefined
       for await (const d of iter) {
@@ -423,8 +423,9 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
       const promptMsg = frame(h.record(), 'session/prompt') as { params?: { prompt?: Array<{ type: string; text: string }> } }
       const blocks = promptMsg.params?.prompt ?? []
       expect(blocks).toHaveLength(2)
-      expect(blocks[0]).toEqual({ type: 'text', text: '/' })
-      expect(blocks.map((b) => b.text).join('')).toBe(source)
+      const [lead, rest] = blocks as [{ text: string }, { text: string }]
+      expect(lead.text).toBe('/')
+      expect(lead.text + rest.text).toBe(source)
     } finally {
       await h.cleanup()
     }
