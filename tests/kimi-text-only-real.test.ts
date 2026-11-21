@@ -70,8 +70,13 @@ it.skipIf(!bin)('enforces the local Kimi tool choice at the provider and preserv
   try {
     const address = receiver.address() as AddressInfo
     const offline = 'http://127.0.0.1:1'
-    const localEnv = { KIMI_CODE_HOME: home, KIMI_MODEL_NAME: model, KIMI_MODEL_PROVIDER_TYPE: 'kimi',
-      KIMI_MODEL_API_KEY: 'loopback-fixture', KIMI_MODEL_BASE_URL: 'http://127.0.0.1:' + address.port + '/v1',
+    const base = 'http://127.0.0.1:' + address.port + '/v1'
+    writeFileSync(join(home, 'config.toml'), [
+      'default_model = "' + model + '"', 'telemetry = false', '[providers.loopback]', 'type = "kimi"',
+      'base_url = "' + base + '"', 'api_key = "loopback-fixture"', '[models."' + model + '"]',
+      'provider = "loopback"', 'model = "' + model + '"', 'max_context_size = 262144', 'capabilities = ["tool_use"]',
+    ].join('\n'))
+    const localEnv = { KIMI_CODE_HOME: home, KIMI_MODEL_NAME: '', KIMI_MODEL_BASE_URL: base,
       KIMI_CODE_OAUTH_HOST: offline, KIMI_CODE_BASE_URL: offline, KIMI_CODE_PLUGIN_MARKETPLACE_URL: offline,
       KIMI_DISABLE_TELEMETRY: '1', KIMI_CODE_NO_AUTO_UPDATE: '1', HTTP_PROXY: offline,
       HTTPS_PROXY: offline, ALL_PROXY: offline, NO_PROXY: '127.0.0.1,localhost' }

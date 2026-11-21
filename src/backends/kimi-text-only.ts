@@ -102,7 +102,10 @@ export async function startKimiTextOnlySession(
         ...(body ? { body: JSON.stringify(body) } : {}),
       })
       const reply = await response.json() as { code?: number; data?: unknown }
-      if (!response.ok || reply.code !== 0) throw kimiToolChoiceError('The native session service refused the requested binding.')
+      if (!response.ok || reply.code !== 0) {
+        const code = typeof reply.code === 'number' ? String(reply.code) : 'unknown'
+        throw kimiToolChoiceError(`The native session service refused ${body ? 'session creation' : 'tool verification'} (HTTP ${response.status}, native code ${code}).`)
+      }
       return reply.data
     }
     const cwd = spawnOpts.cwd ?? process.cwd()
