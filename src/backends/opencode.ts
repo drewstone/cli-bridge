@@ -50,6 +50,8 @@ import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
 import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
+import { installOutputCapPlugin, verifiedStepOutput } from './opencode-output-budget.js'
+export { outputCapPluginSource } from './opencode-output-budget.js'
 import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
@@ -313,6 +315,7 @@ export class OpencodeBackend implements Backend {
       const startedTools = new Set<string>()
       let toolSession: string | null = null
       // Steps yield their own usage as they finish; a non-step usage event is the fallback only for a stream with no step receipt.
+      let billedOutputTokens = 0
       let sawStepUsage = false
       let sawTerminal = false
       let fallbackUsage: UsageReceipt | undefined
@@ -378,26 +381,20 @@ export class OpencodeBackend implements Backend {
           // The provider stopped the completion at the request's output cap.
           if (stepReason === 'length') sawNativeLength = true
         }
-        const eventUsage = extractUsage(ev)
+        const eventUsage = extractUsage(ev, outputCap !== null && isStepReceipt(ev))
         if (eventUsage && !isStepReceipt(ev)) fallbackUsage = eventUsage
         else if (eventUsage) {
           sawStepUsage = true
-          // One turn's billed output is the sum of its steps (the trace contract's
-          // sum_of_children). Count it on the turn-owned watch so a runner-death
-          // continuation inherits what the dead runner already spent.
-          if (eventUsage.output_tokens !== undefined) {
-            watch.billedOutputTokens = (watch.billedOutputTokens ?? 0) + eventUsage.output_tokens
-          }
+          if (eventUsage.output_tokens !== undefined) billedOutputTokens += eventUsage.output_tokens
           yield { usage: { ...eventUsage, model_call: true } }
           if (outputCap) {
-            const billed = watch.billedOutputTokens ?? 0
             // The output-budget plugin asks each call for only the remaining
             // allowance, so receipts normally land at or below the cap. This cut
             // is the backstop for spend the plugin cannot see, and the stop for
             // a continuation whose budget is already gone: the run ends
             // truncated here — never a `stop` success above the cap (#138).
             // The `finally` below terminates the process tree.
-            if (billed > outputCap.cap || (billed === outputCap.cap && stepReason === 'tool-calls')) {
+            if (billedOutputTokens > outputCap.cap || (billedOutputTokens === outputCap.cap && stepReason === 'tool-calls')) {
               yield { finish_reason: 'length', internal_session_id: internalSessionId }
               return
             }
@@ -471,9 +468,6 @@ export class OpencodeBackend implements Backend {
       if (!sawTerminal && killed) watch.exit = killed
       // Each step's usage already went out as its own model call; a run that printed no step receipts reports its total.
       if (!sawStepUsage && fallbackUsage) {
-        if (fallbackUsage.output_tokens !== undefined) {
-          watch.billedOutputTokens = (watch.billedOutputTokens ?? 0) + fallbackUsage.output_tokens
-        }
         yield { usage: fallbackUsage }
       }
 
@@ -694,7 +688,7 @@ function extractToolResult(
   return toolResult(id, name, status === 'error', status === 'error' ? state?.error : state?.output)
 }
 
-function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
+function extractUsage(ev: Record<string, unknown>, cappedStep: boolean): UsageReceipt | null {
   const direct = ev.usage as Record<string, unknown> | undefined
   if (direct) {
     return usageFromValues({
@@ -711,6 +705,10 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
   const part = ev.part as Record<string, unknown> | undefined
   const tokens = part?.tokens as Record<string, unknown> | undefined
   const cache = tokens?.cache as Record<string, unknown> | undefined
+  const output = cappedStep ? verifiedStepOutput(tokens, part?.reason) : sumKnown([
+    tokens?.output_tokens ?? tokens?.output,
+    tokens?.reasoning,
+  ])
 
   return usageFromValues({
     // OpenCode reports input/output *excluding* cache and reasoning.
@@ -723,11 +721,9 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
     fresh_input_tokens: tokens?.input_tokens ?? tokens?.input,
     cache_read_input_tokens: cache?.read,
     cache_write_input_tokens: cache?.write,
-    output_tokens: sumKnown([
-      tokens?.output_tokens ?? tokens?.output,
-      tokens?.reasoning,
-    ]),
-    reasoning_output_tokens: tokens?.reasoning,
+    output_tokens: output,
+    reasoning_output_tokens: cappedStep && output === undefined && tokens?.reasoning === 0
+      ? undefined : tokens?.reasoning,
     cost: part?.cost ?? ev.cost,
   })
 }
@@ -881,89 +877,6 @@ function installSignals(configDir: string | undefined): void {
   const pluginDir = join(configDir, 'plugin')
   mkdirSync(pluginDir, { recursive: true, mode: 0o755 })
   writeFileSync(join(pluginDir, 'cli-bridge-signals.js'), SIGNAL_PLUGIN, { mode: 0o644 })
-}
-
-/**
- * Write the output-budget plugin for one capped turn. Verified against opencode
- * 1.18.30: the plugin hook `chat.params` mutates the request parameters in
- * place before every model call (its input carries the sessionID), and the
- * event bus delivers each step-finish part with its token receipt
- * (`message.part.updated`, `part.tokens`, `part.sessionID`, `part.id`).
- *
- * The env flag alone bounds each request at the full cap, so a multi-step run
- * (tool continuations, subagents, retried attempts) could bill up to that cap
- * on every call. This plugin keeps a HARD lease over the turn's budget inside
- * the runner process:
- *
- * - every granted ask is reserved SYNCHRONOUSLY, before the request is
- *   dispatched, so the sum of what any request can ever bill is the cap;
- * - exactly ONE lease is outstanding at a time: an overlapping or uncertain
- *   call — a hidden retry after a lost stream, a concurrent generation — is
- *   refused before the wire (measured: a throwing hook sends no request);
- * - capacity is returned ONLY by a step-finish receipt attributed to the
- *   outstanding lease (same session), and only the unspent difference; a
- *   receipt with no attributable lease (another session's spend, an attempt
- *   this plugin did not grant) is charged, never refunded;
- * - receipts are settled once per part id, so a replayed notification can
- *   neither double-refund nor double-charge.
- *
- * A failed attempt that never delivers a receipt therefore keeps its
- * reservation, and its automatic retry is refused: the turn ends in a typed
- * error rather than a possible second spend against the same budget. The
- * bridge's own stream-side cut remains as the backstop for a runner where this
- * plugin did not load.
- */
-function installOutputCapPlugin(configDir: string, cap: number): void {
-  const pluginDir = join(configDir, 'plugin')
-  mkdirSync(pluginDir, { recursive: true, mode: 0o755 })
-  writeFileSync(join(pluginDir, 'cli-bridge-output-cap.js'), outputCapPluginSource(cap), { mode: 0o644 })
-}
-
-/** The per-turn output-budget plugin with this turn's cap baked in. Never mentions caller data. */
-export function outputCapPluginSource(cap: number): string {
-  return `// Written by cli-bridge for this one capped turn. Keeps the sum of what any
-// model request in this runner process can bill within ${String(cap)} output
-// tokens, through a synchronous lease that only a receipt can refund. See
-// src/backends/opencode.ts for the measured contract.
-export const CliBridgeOutputCap = async () => {
-  const CAP = ${String(cap)}
-  let available = CAP
-  let lease = null
-  const settled = new Set()
-  return {
-    'chat.params': async (input, params) => {
-      if (lease !== null) {
-        throw new Error('cli-bridge: refusing an overlapping model call: the previous call holds the output budget and has not settled on a receipt')
-      }
-      if (available <= 0) {
-        throw new Error('cli-bridge: the ' + CAP + '-token output budget is spent')
-      }
-      const base = typeof params.maxOutputTokens === 'number' && params.maxOutputTokens > 0 ? params.maxOutputTokens : CAP
-      const ask = Math.min(available, base)
-      available -= ask
-      lease = { ask, sessionID: input?.sessionID }
-      params.maxOutputTokens = ask
-    },
-    event: async ({ event }) => {
-      const part = event?.properties?.part
-      if (event?.type !== 'message.part.updated' || part === undefined) return
-      if (part.type !== 'step-finish' && part.type !== 'step_finish') return
-      if (part.id !== undefined) {
-        if (settled.has(part.id)) return
-        settled.add(part.id)
-      }
-      const tokens = part.tokens ?? {}
-      const billed = Number(tokens.output ?? tokens.output_tokens ?? 0) + Number(tokens.reasoning ?? 0)
-      if (lease !== null && part.sessionID === lease.sessionID) {
-        available += Math.max(0, lease.ask - billed)
-        lease = null
-      } else {
-        available -= billed
-      }
-    },
-  }
-}
-`
 }
 
 /**
