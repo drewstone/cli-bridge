@@ -334,7 +334,7 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
       const be = new KimiBackend({ bin: 'kimi', timeoutMs: 15_000, spawner })
       const r = await drain(be, baseReq('say hi'))
       expect(spawnCalls).toHaveLength(1)
-      expect(spawnCalls[0].args).toEqual(expect.arrayContaining(['--prompt', 'say hi', '--output-format', 'stream-json']))
+      expect(spawnCalls[0]?.args).toEqual(expect.arrayContaining(['--prompt', 'say hi', '--output-format', 'stream-json']))
       expect(r.text).toBe('hi')
       expect(r.finish).toBe('stop')
     } finally {
@@ -423,9 +423,10 @@ describe('KimiBackend ACP large-prompt transport (real subprocess, real pipes)',
       const promptMsg = frame(h.record(), 'session/prompt') as { params?: { prompt?: Array<{ type: string; text: string }> } }
       const blocks = promptMsg.params?.prompt ?? []
       expect(blocks).toHaveLength(2)
-      const [lead, rest] = blocks as [{ text: string }, { text: string }]
-      expect(lead.text).toBe('/')
-      expect(lead.text + rest.text).toBe(source)
+      const lead = blocks[0]?.text
+      const rest = blocks[1]?.text
+      expect(lead).toBe('/')
+      expect(`${lead ?? ''}${rest ?? ''}`).toBe(source)
     } finally {
       await h.cleanup()
     }
