@@ -222,7 +222,11 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
   explicit text-inference request with standard semantics — the model makes no tool calls at
   all: the turn's model requests carry zero tools, ambient action tools and caller-bound MCP
   servers alike (analysis/trace callbacks belong outside the nested model call, on their own
-  authority, and stay usable there). OpenCode today; every other backend is refused with
+  authority, and stay usable there). OpenCode and local Kimi Code implement this control.
+  Kimi uses a native empty-tool profile on single requests. Short prompts use the CLI's
+  agent file. Long prompts bind the same policy to a new native session and send the
+  original prompt through ACP. Kimi binds the agent for the life of a session, so
+  requests with a session id return `501 capability_denied` before execution. Other backends are refused with
   `400 invalid_request_error` naming the gap rather than accepting and ignoring the field,
   until it declares a verified zero-tool control. On OpenCode the turn runs under a fresh
   bridge-named agent whose permission is the native wildcard deny — appended after every
