@@ -280,12 +280,14 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
     expect(modelCalls(deltas).map((usage) => usage.output_tokens)).toEqual([48, 10])
   }, 120_000)
 
-  it('keeps a grant when OpenCode writes zeros for missing usage after a real tool call', async () => {
+  it.each(['omitted', 'reasoning-subtotal'])('keeps the grant after a real tool call with %s usage', async coverage => {
     const key = providerConfig('probe-unknown')
     recorded.length = 0
+    const finishChunk = chunk({}, 'tool_calls') as Record<string, unknown>
+    if (coverage === 'reasoning-subtotal') finishChunk.usage = { completion_tokens_details: { reasoning_tokens: 5 } }
     script = ({ text }) => text.includes('"role":"tool"')
       ? { chunks: [chunk({ role: 'assistant', content: 'Unbudgeted follow-up.' }), chunk({}, 'stop')] }
-      : { chunks: [chunk({ role: 'assistant', content: 'Checking.' }), toolCallChunk('call_pwd', 'pwd'), chunk({}, 'tool_calls')] }
+      : { chunks: [chunk({ role: 'assistant', content: 'Checking.' }), toolCallChunk('call_pwd', 'pwd'), finishChunk] }
     const { deltas } = await turn({
       model: 'opencode/probe-unknown/m', session_id: 'cap-unknown',
       messages: [{ role: 'user', content: 'Run pwd and answer.' }], max_tokens: 30,
@@ -295,9 +297,14 @@ describe.skipIf(!ENABLED)('a real capped opencode turn', () => {
     expect(modelCalls(deltas)).toHaveLength(1)
     expect(modelCalls(deltas)[0]?.output_tokens).toBeUndefined()
     expect(modelCalls(deltas)[0]?.cost_known).toBe(false)
+    expect(modelCalls(deltas)[0]?.reasoning_output_tokens).toBe(coverage === 'reasoning-subtotal' ? 5 : undefined)
     expect(finish(deltas)).toBe('error')
     expect(deltas.at(-1)?.error?.message).toContain('native usage is unknown')
 
+  }, 120_000)
+
+  it('delivers a completed answer even when its provider withholds usage', async () => {
+    const key = providerConfig('probe-unknown')
     recorded.length = 0
     script = () => ({ chunks: [chunk({ role: 'assistant', content: 'Complete answer.' }), chunk({}, 'stop')] })
     const final = await turn({

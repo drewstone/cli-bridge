@@ -141,7 +141,7 @@ describe('the generated output-budget plugin', () => {
 
   it('withholds the full grant when a native counter is absent, invalid or normalized to zero', async () => {
     for (const tokens of [undefined, {}, { output: 4 }, { reasoning: 2 }, { output: 0, reasoning: 0 },
-      { output: -1, reasoning: 5 }, { output: 4, reasoning: -1 }, { output: 1.5, reasoning: 0 },
+      { output: 0, reasoning: 5 }, { output: -1, reasoning: 5 }, { output: 4, reasoning: -1 }, { output: 1.5, reasoning: 0 },
       { output: Infinity, reasoning: 0 }, { output: 4, reasoning: NaN }, { output: '4', reasoning: 0 },
       { output: Number.MAX_SAFE_INTEGER, reasoning: 1 }]) {
       const hooks = await makePlugin(30)
@@ -149,6 +149,17 @@ describe('the generated output-budget plugin', () => {
       await receipt(hooks, { id: 'finish', override: { tokens } })
       // The other ten tokens were never granted to the uncertain call.
       expect(await ask(hooks)).toBe(10)
+    }
+  })
+
+  it('reconciles a pure reasoning receipt before returning capacity', async () => {
+    const tokens = { output: 0, reasoning: 7, input: 10, cache: { read: 2, write: 1 }, total: 20 }
+    for (const [reason, total, remaining] of [['stop', 20, 13], ['stop', 19, 0], ['tool-calls', 20, 0]] as const) {
+      const hooks = await makePlugin(20)
+      await ask(hooks)
+      await receipt(hooks, { id: 'r', override: { reason, tokens: { ...tokens, total } } })
+      if (remaining > 0) expect(await ask(hooks)).toBe(remaining)
+      else await expect(ask(hooks)).rejects.toThrow(/usage is unknown/)
     }
   })
 

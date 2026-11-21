@@ -238,8 +238,9 @@ Behavior:
   OpenCode names the new assistant and its user parent before the request. Only a step that
   starts and finishes on that assistant in the same session can return unused tokens, once,
   with complete positive output accounting (visible plus reasoning). A provider can omit
-  usage even after producing text or a tool call. OpenCode then writes zeros, and the bridge
-  keeps the full grant reserved. A final answer still completes. Another call needs
+  all usage or report only its reasoning subtotal after producing text or a tool call.
+  OpenCode writes zero for each missing counter, and the bridge keeps the full grant reserved.
+  A pure reasoning step can establish complete usage when the total reconciles with its input. A final answer still completes. Another call needs
   unreserved tokens. An overlapping call or an uncertain retry is refused before dispatch.
   If the runner or bridge dies, an explicitly capped turn cannot automatically resume because
   its outstanding reservation went with the process. New uncapped turns retain automatic
