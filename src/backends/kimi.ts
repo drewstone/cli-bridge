@@ -6,6 +6,10 @@
  * and `--output-format stream-json` for JSONL. We parse those events
  * into OpenAI chat deltas.
  *
+ * A prompt too large for one argv string (Linux MAX_ARG_STRLEN: 131,071
+ * payload bytes) switches to `kimi acp`, the CLI's documented JSON-RPC
+ * stdin transport, in kimi-acp.ts — never a truncated prompt.
+ *
  * Model id scheme: `<harness>/<model>` where `<harness>` defaults to
  * `kimi-code` (the product name Moonshot ships the CLI under) and
  * `<model>` is what Kimi CLI accepts (e.g., `kimi-for-coding`,
@@ -54,6 +58,7 @@ import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { needsAcpPromptTransport, runKimiAcpTurn } from './kimi-acp.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -95,9 +100,11 @@ export class KimiBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
-    // Kimi Code 0.36.1 exposes prompt mode through argv. It does not
-    // implement Claude's structured stdin mode, so keep the prompt in
-    // the one supported `--prompt` argument.
+    // Kimi Code exposes prompt mode through a single `--prompt` argv string.
+    // Linux bounds one argv string at 131,071 payload bytes (MAX_ARG_STRLEN),
+    // so an assembled prompt larger than that rides the documented `kimi acp`
+    // stdin transport instead — same prompt bytes, model, reasoning, admission
+    // and session semantics (kimi-acp.ts).
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
 
@@ -114,6 +121,23 @@ export class KimiBackend implements Backend {
       cwd,
       profileExecutionIdentity(req, session, 'kimi-code', thinkingFlag),
     )
+
+    if (needsAcpPromptTransport(prompt)) {
+      yield* runKimiAcpTurn({
+        backend: this.name,
+        bin: this.opts.bin,
+        spawner: this.spawner,
+        req,
+        session,
+        signal,
+        cwd,
+        prompt,
+        model,
+        thinkingFlag,
+        provisioned,
+      })
+      return
+    }
 
     const args = ['--prompt', prompt, '--output-format', 'stream-json']
     if (session?.internalId) {

@@ -27,6 +27,7 @@ import { buildAcpMcpServers, resolveMcpServers } from './profile-mcp.js'
 import { resolvePromptMessages } from './profile-prompt.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { versionHealth } from './health.js'
+import { attachNdjsonRpc, type JsonRpcMessage, type NdjsonRpc, RpcCallError } from './ndjson-rpc.js'
 
 export interface AcpBackendOptions {
   /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
@@ -39,15 +40,6 @@ export interface AcpBackendOptions {
   timeoutMs: number
   /** Subprocess spawner; defaults to the scoped host spawner. */
   spawner?: Spawner
-}
-
-interface JsonRpcMessage {
-  jsonrpc?: string
-  id?: number | string
-  method?: string
-  params?: unknown
-  result?: unknown
-  error?: { code?: number; message?: string }
 }
 
 /** ACP stopReason → OpenAI finish_reason. */
@@ -126,34 +118,21 @@ export class AcpBackend implements Backend {
       const stdin = child.stdin
       const stdout = child.stdout
 
-      // ── ndjson JSON-RPC client over the child's stdio ──
-      let nextId = 1
-      const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
+      // ── ndjson JSON-RPC client over the child's stdio (shared framing in
+      // ndjson-rpc.ts; this backend keeps only its own protocol decisions) ──
       const queue: ChatDelta[] = []
       let wake: (() => void) | null = null
       let streamEnded = false
       let driverError: Error | null = null
       const push = (d: ChatDelta): void => { queue.push(d); wake?.() }
-      const send = (msg: JsonRpcMessage): void => { stdin.write(JSON.stringify(msg) + '\n') }
-      const request = (method: string, params: unknown): Promise<unknown> =>
-        new Promise((resolve, reject) => { const id = nextId++; pending.set(id, { resolve, reject }); send({ jsonrpc: '2.0', id, method, params }) })
 
-      let buf = ''
-      stdout.on('data', (chunk: Buffer) => {
-        buf += chunk.toString()
-        let nl: number
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, nl).trim()
-          buf = buf.slice(nl + 1)
-          if (!line) continue
-          let m: JsonRpcMessage
-          try { m = JSON.parse(line) } catch { continue } // hermes also logs to stderr; ignore non-JSON
-          if (m.id !== undefined && pending.has(m.id as number)) {
-            const p = pending.get(m.id as number)!
-            pending.delete(m.id as number)
-            if (m.error) p.reject(new BackendError(`${this.name} acp error: ${JSON.stringify(m.error).slice(0, 160)}`, 'upstream'))
-            else p.resolve(m.result)
-          } else if (m.method === 'session/update') {
+      const rpc = attachNdjsonRpc({
+        child,
+        label: `${this.name} acp`,
+        stdin,
+        stdout,
+        onMessage: (m: JsonRpcMessage) => {
+          if (m.method === 'session/update') {
             const update = (m.params as { update?: { sessionUpdate?: string; content?: { type?: string; text?: string } } })?.update
             const kind = update?.sessionUpdate
             const c = update?.content
@@ -171,16 +150,23 @@ export class AcpBackend implements Backend {
             const message = `${this.name} ACP permission requests require a retained native session; cli-bridge cannot answer this request safely`
             if (!driverError) {
               driverError = new BackendError(message, 'capability_denied')
-              send({ jsonrpc: '2.0', id: m.id, error: { code: -32001, message } })
+              rpc.respondError(m.id, -32001, message)
               void terminateSpawned(spawned)
             }
           } else if (m.method && m.id !== undefined) {
             // any other agent→client request (fs reads we declined in capabilities, etc.): refuse cleanly.
-            send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not supported by cli-bridge ACP client' } })
+            rpc.respondError(m.id, -32601, 'method not supported by cli-bridge ACP client')
           }
-        }
+        },
+        onEnd: () => { streamEnded = true; wake?.() },
       })
-      stdout.on('end', () => { streamEnded = true; wake?.() })
+      const request = (method: string, params: unknown): Promise<unknown> =>
+        rpc.request(method, params).catch((error: unknown) => {
+          if (error instanceof RpcCallError) {
+            throw new BackendError(`${this.name} acp error: ${JSON.stringify({ code: error.code, message: error.message, data: error.data }).slice(0, 160)}`, 'upstream')
+          }
+          throw error
+        })
 
       // Drive the protocol; deltas flow through `queue` as session/update arrives.
       const driver = (async () => {
