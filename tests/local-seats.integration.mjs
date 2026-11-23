@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { tsImport } from 'tsx/esm/api'
@@ -96,4 +97,85 @@ test('Gemini native files respect explicit auth mode and keep credentials out of
   assert.ok(!JSON.stringify(oauth).includes(key))
   await settings('vertex-ai')
   assert.deepEqual(await geminiLoginState(home, { GEMINI_API_KEY: key }), { status: 'unknown', authMode: 'unknown' })
+})
+
+// The real native CLIs, named the way the Bridge itself reads them. A Beelink gate has neither on PATH; its gate command
+// fetches the pinned packages (README, the seats section) and passes OPENCODE_BIN and KIMI_BIN.
+const realCli = async (variable, fallback) => {
+  const bin = process.env[variable] || fallback
+  return execute(bin, ['--version'], { timeout: 30_000 }).then(() => bin, () => null)
+}
+const [realOpencode, realKimi] = await Promise.all([realCli('OPENCODE_BIN', 'opencode'), realCli('KIMI_BIN', 'kimi')])
+
+test('plan-keyed and Kimi subscription seats reach graph admission through the real CLIs', {
+  skip: realOpencode && realKimi ? false : 'needs the real OpenCode and Kimi Code CLIs (OPENCODE_BIN, KIMI_BIN)', timeout: 180_000,
+}, async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'bridge-plan-seats-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const home = join(root, 'home'), workspace = join(root, 'workspace'), kimiHome = join(home, '.kimi-code')
+  const opencodeStore = join(home, '.local/share/opencode')
+  await Promise.all([mkdir(opencodeStore, { recursive: true }), mkdir(join(kimiHome, 'credentials'), { recursive: true, mode: 0o700 }), mkdir(workspace)])
+  // Fixture keys only: an inventory read sends no turn, and no key leaves this directory.
+  await writeFile(join(opencodeStore, 'auth.json'), JSON.stringify({
+    'zai-coding-plan': { type: 'api', key: 'fixture-plan-key' },
+    deepseek: { type: 'api', key: 'fixture-api-key' },
+    'minimax-coding-plan': { type: 'api', key: 'fixture-unlisted-key' },
+  }), { mode: 0o600 })
+  await writeFile(join(kimiHome, 'config.toml'), [
+    'default_model = "kimi-code/kimi-for-coding"',
+    '[providers."managed:kimi-code"]', 'type = "kimi"', 'base_url = "https://api.kimi.com/coding/v1"', 'api_key = ""',
+    'oauth = { storage = "file", key = "oauth/kimi-code" }',
+    '[providers.fixture-api]', 'type = "kimi"', 'base_url = "https://api.moonshot.ai/v1"', 'api_key = "fixture-kimi-api-key"',
+    '[models."kimi-code/kimi-for-coding"]', 'provider = "managed:kimi-code"', 'model = "kimi-for-coding"', 'max_context_size = 262144',
+    '[models."kimi-code/fixture-api-model"]', 'provider = "fixture-api"', 'model = "kimi-k2"', 'max_context_size = 262144', '',
+  ].join('\n'), { mode: 0o600 })
+  const login = join(kimiHome, 'credentials', 'kimi-code.json')
+  await writeFile(login, JSON.stringify({ access_token: 'fixture-kimi-access', refresh_token: 'fixture-kimi-refresh',
+    expires_at: Math.floor(Date.now() / 1000) + 3600, scope: '', token_type: 'Bearer', expires_in: 3600 }), { mode: 0o600 })
+  const missing = Object.fromEntries(['CLAUDE', 'CODEX', 'GEMINI', 'CURSOR', 'PI'].map((name) => [`${name}_BIN`, join(root, `missing-${name.toLowerCase()}`)]))
+  const env = { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'),
+    XDG_CACHE_HOME: join(home, '.cache'), XDG_STATE_HOME: join(home, '.local/state'), BRIDGE_DATA_DIR: join(root, 'bridge'),
+    // OpenCode answers from its bundled catalog, so the result does not depend on models.dev.
+    OPENCODE_DISABLE_MODELS_FETCH: '1', OPENCODE_BIN: realOpencode, KIMI_BIN: realKimi, ...missing }
+  const facts = ({ provider, status, authMode, credential, source }) => ({ provider, status, authMode, credential, source })
+  const inventory = async () => {
+    const { stdout } = await execute(process.execPath, [resolve('bin/cli-bridge.mjs'), '--seats', '--json'], { cwd: workspace, env, timeout: 60_000 })
+    assert.ok(!stdout.includes('fixture-'), 'seat inventory carries no credential')
+    return JSON.parse(stdout)
+  }
+
+  const seats = await inventory()
+  assert.deepEqual(seats.filter((seat) => seat.harness === 'opencode').map(facts), [
+    { provider: 'deepseek', status: 'configured', authMode: 'api_key', credential: undefined, source: 'native_store' },
+    // A plan-like name outside the plan-keyed table stays a per-token API key: nothing is inferred from a name.
+    { provider: 'minimax-coding-plan', status: 'configured', authMode: 'api_key', credential: undefined, source: 'native_store' },
+    { provider: 'zai-coding-plan', status: 'authenticated', authMode: 'subscription', credential: 'plan_key', source: 'native_catalog' },
+  ])
+  assert.deepEqual(seats.filter((seat) => seat.harness === 'kimi-code').map(facts),
+    [{ provider: 'moonshot', status: 'authenticated', authMode: 'subscription', credential: undefined, source: 'native_status' }])
+
+  // The graph runner's own admission input: listLocalModels under the default subscription-only policy.
+  const entry = pathToFileURL(resolve('index.mjs')).href
+  const { stdout } = await execute(process.execPath, ['--input-type=module', '-e', `
+    const { listLocalModels, loadConfig } = await import(${JSON.stringify(entry)})
+    const config = loadConfig({ ...process.env, BRIDGE_BACKENDS: 'opencode,kimi', BRIDGE_SUBSCRIPTIONS_ONLY: '1' })
+    console.log(JSON.stringify(await listLocalModels({ cwd: process.cwd(), config })))`], { cwd: workspace, env, timeout: 120_000 })
+  assert.ok(!stdout.includes('fixture-'), 'model catalog carries no credential')
+  const models = new Map(JSON.parse(stdout).map((row) => [row.id, row]))
+  const admitted = (id) => {
+    const row = models.get(id)
+    assert.ok(row, `the catalog lists ${id}`)
+    return row.authentication.status === 'authenticated' && row.authentication.authMode === 'subscription' ? row.provider : false
+  }
+  assert.equal(admitted('opencode/zai-coding-plan/glm-5.3'), 'zai-coding-plan')
+  assert.equal(models.get('opencode/zai-coding-plan/glm-5.3').authentication.credential, 'plan_key')
+  assert.equal(admitted('kimi-code/kimi-for-coding'), 'moonshot')
+  assert.equal(admitted('opencode/deepseek/deepseek-v4-pro'), false)
+  // An alias that Kimi's own config does not route through its managed subscription is not admitted.
+  assert.equal(admitted('kimi-code/kimi-k2.6'), false)
+
+  // Kimi's own status, not a stored file, decides the login: without a token it is signed out.
+  await rm(login)
+  assert.deepEqual((await inventory()).filter((seat) => seat.harness === 'kimi-code').map(facts),
+    [{ provider: null, status: 'signed_out', authMode: 'unknown', credential: undefined, source: 'native_status' }])
 })
