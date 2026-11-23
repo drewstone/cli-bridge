@@ -129,9 +129,11 @@ test('plan-keyed and Kimi subscription seats reach graph admission through the r
     '[models."kimi-code/kimi-for-coding"]', 'provider = "managed:kimi-code"', 'model = "kimi-for-coding"', 'max_context_size = 262144',
     '[models."kimi-code/fixture-api-model"]', 'provider = "fixture-api"', 'model = "kimi-k2"', 'max_context_size = 262144', '',
   ].join('\n'), { mode: 0o600 })
+  // Inside Kimi's refresh window (300 s): a server that refreshed its catalog on start would rewrite this login.
   const login = join(kimiHome, 'credentials', 'kimi-code.json')
-  await writeFile(login, JSON.stringify({ access_token: 'fixture-kimi-access', refresh_token: 'fixture-kimi-refresh',
-    expires_at: Math.floor(Date.now() / 1000) + 3600, scope: '', token_type: 'Bearer', expires_in: 3600 }), { mode: 0o600 })
+  const loginState = JSON.stringify({ access_token: 'fixture-kimi-access', refresh_token: 'fixture-kimi-refresh',
+    expires_at: Math.floor(Date.now() / 1000) + 60, scope: '', token_type: 'Bearer', expires_in: 3600 })
+  await writeFile(login, loginState, { mode: 0o600 })
   const missing = Object.fromEntries(['CLAUDE', 'CODEX', 'GEMINI', 'CURSOR', 'PI'].map((name) => [`${name}_BIN`, join(root, `missing-${name.toLowerCase()}`)]))
   const env = { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'),
     XDG_CACHE_HOME: join(home, '.cache'), XDG_STATE_HOME: join(home, '.local/state'), BRIDGE_DATA_DIR: join(root, 'bridge'),
@@ -173,6 +175,7 @@ test('plan-keyed and Kimi subscription seats reach graph admission through the r
   assert.equal(admitted('opencode/deepseek/deepseek-v4-pro'), false)
   // An alias that Kimi's own config does not route through its managed subscription is not admitted.
   assert.equal(admitted('kimi-code/kimi-k2.6'), false)
+  assert.equal(await readFile(login, 'utf8'), loginState, 'reading the Kimi seat refreshes no token')
 
   // Kimi's own status, not a stored file, decides the login: without a token it is signed out.
   await rm(login)
