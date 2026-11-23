@@ -45,6 +45,7 @@ import {
   admitNativeSubscription,
   profileExecutionIdentity,
   provisionProfileWorkspace,
+  resolveAgentProfile,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import {
@@ -94,6 +95,10 @@ export class KimiBackend implements Backend {
   }
 
   textOnlyToolChoice(req: ChatRequest, session: SessionRecord | null): void {
+    const prompt = (resolveAgentProfile(req, session) as { prompt?: { systemPrompt?: string; appendSystemPrompt?: string } } | null)?.prompt
+    if (prompt?.systemPrompt?.trim() || prompt?.appendSystemPrompt !== undefined) {
+      throw kimiToolChoiceError('The selected profile carries its prompt on Kimi\'s main agent, and a text-only turn replaces that agent with its own.')
+    }
     if (req.session_id || session?.internalId) {
       throw kimiToolChoiceError('Kimi fixes the main agent at session creation. Use a one-shot request to keep a coding session resumable with its own tools.')
     }

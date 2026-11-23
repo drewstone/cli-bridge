@@ -1231,16 +1231,15 @@ describe('KimiBackend JSON mode (buildPrompt)', () => {
     expect(prompt).toContain('summarize this repo')
   })
 
-  it('refuses a system-prompt replacement instead of flattening it into the prompt', () => {
-    // kimi has no system-prompt control of either kind, and this prompt string
-    // becomes the USER turn. Accepting the field here would ship the caller's
-    // replacement as ordinary user text while kimi's own prompt kept running.
-    expect(() =>
-      b.buildPrompt(
-        { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
-        null,
-      ),
-    ).toThrow(/cannot replace its harness's system prompt/)
+  it('keeps a system-prompt replacement out of the user turn', () => {
+    // The replacement rides Kimi's project agent file; this prompt string
+    // becomes the USER turn, so the replacement text must never appear in it.
+    const prompt = b.buildPrompt(
+      { ...baseReq, agent_profile: { name: 'x', prompt: { systemPrompt: 'Be precise.' } } as any },
+      null,
+    )
+    expect(prompt).not.toContain('Be precise.')
+    expect(prompt).toContain('summarize this repo')
   })
 })
 
