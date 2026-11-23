@@ -5,7 +5,7 @@
  * per turn), the Bridge denying a prompt the turn did not admit, and an interactive caller.
  */
 import { existsSync } from 'node:fs'
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -26,6 +26,7 @@ let pending = null, n = 0
 emit({ type: 'system', subtype: 'init', session_id: session, model: 'claude-sonnet' })
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const message = JSON.parse(line)
+  fs.appendFileSync(path.join(process.cwd(), 'claude-stdin.log'), [message.type, message.response && message.response.subtype, message.response && message.response.request_id].join(' ') + '\n')
   if (message.type === 'user') {
     n += 1
     const file = String(message.message.content[0].text).match(/write (\S+)/)[1]
@@ -77,7 +78,7 @@ describe('retained Claude session: who answers a permission prompt', () => {
    * itself stays open for later readers); `onEvent` may answer an interaction. Then wait for the
    * durable snapshot to report the terminal state.
    */
-  const settle = async (runId: string, onEvent?: (event: Record<string, any>) => Promise<void>) => {
+  const settle = async (runId: string, cwd: string, onEvent?: (event: Record<string, any>) => Promise<void>) => {
     const events: Array<Record<string, any>> = []
     const controller = new AbortController()
     const deadline = setTimeout(() => controller.abort(), 45_000)
@@ -117,7 +118,8 @@ describe('retained Claude session: who answers a permission prompt', () => {
       if (snapshot.terminal) return { events, status: snapshot.status }
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
-    throw new Error(`run ${runId} reported no terminal snapshot; events: ${JSON.stringify(events.map((event) => (event.event ?? event).type))}`)
+    const stdin = await readFile(join(cwd, 'claude-stdin.log'), 'utf8').catch(() => '(none)')
+    throw new Error(`run ${runId} reported no terminal snapshot; events: ${JSON.stringify(events.map((event) => (event.event ?? event).type))}; claude stdin: ${JSON.stringify(stdin)}`)
   }
 
   const session = async (policy?: string) => {
@@ -147,7 +149,7 @@ describe('retained Claude session: who answers a permission prompt', () => {
 
   it('answers every prompt with allow under a session unattended-allow policy', async () => {
     const { id, cwd } = await session('unattended-allow')
-    const { events, status } = await settle(await turn(id, 'session-policy.txt'))
+    const { events, status } = await settle(await turn(id, 'session-policy.txt'), cwd)
     expect(status).toBe('done')
     expect(existsSync(join(cwd, 'session-policy.txt'))).toBe(true)
     expect(kinds(events).some((event) => event.type === 'interaction')).toBe(false)
@@ -156,14 +158,14 @@ describe('retained Claude session: who answers a permission prompt', () => {
 
   it('lets one turn name unattended-allow on an interactive session', async () => {
     const { id, cwd } = await session()
-    const { status } = await settle(await turn(id, 'turn-policy.txt', { interaction_policy: 'unattended-allow' }))
+    const { status } = await settle(await turn(id, 'turn-policy.txt', { interaction_policy: 'unattended-allow' }), cwd)
     expect(status).toBe('done')
     expect(existsSync(join(cwd, 'turn-policy.txt'))).toBe(true)
   }, 60_000)
 
   it('denies a prompt the turn did not admit and writes nothing', async () => {
     const { id, cwd } = await session()
-    const { events } = await settle(await turn(id, 'denied.txt', { interactions: { permission: false } }))
+    const { events } = await settle(await turn(id, 'denied.txt', { interactions: { permission: false } }), cwd)
     expect(existsSync(join(cwd, 'denied.txt'))).toBe(false)
     expect(kinds(events)).toContainEqual(expect.objectContaining({ type: 'warning', code: 'interaction_not_requested' }))
   }, 60_000)
@@ -172,7 +174,7 @@ describe('retained Claude session: who answers a permission prompt', () => {
     const { id, cwd } = await session()
     const runId = await turn(id, 'interactive.txt', { interactions: { permission: true } })
     let answered = false
-    const { status } = await settle(runId, async (event) => {
+    const { status } = await settle(runId, cwd, async (event) => {
       const inner = event.event ?? event
       if (inner.type !== 'interaction' || answered) return
       answered = true
