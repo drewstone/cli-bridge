@@ -72,32 +72,52 @@ describe('retained Claude session: who answers a permission prompt', () => {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
 
-  /** Read a run's canonical events as they arrive until the stream ends at the run's terminal; `onEvent` may answer one. */
+  /**
+   * Read a run's canonical events as they arrive, until its terminal `status` event (the stream
+   * itself stays open for later readers); `onEvent` may answer an interaction. Then wait for the
+   * durable snapshot to report the terminal state.
+   */
   const settle = async (runId: string, onEvent?: (event: Record<string, any>) => Promise<void>) => {
     const events: Array<Record<string, any>> = []
-    const response = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(runId)}/events`, {
-      headers: { authorization: `Bearer ${BEARER}` }, signal: AbortSignal.timeout(45_000),
-    })
-    const reader = response.body!.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let newline: number
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline)
-        buffer = buffer.slice(newline + 1)
-        if (!line.startsWith('data:')) continue
-        let event: Record<string, any>
-        try { event = JSON.parse(line.slice(5)) } catch { continue }
-        events.push(event)
-        await onEvent?.(event)
+    const controller = new AbortController()
+    const deadline = setTimeout(() => controller.abort(), 45_000)
+    try {
+      const response = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(runId)}/events`, {
+        headers: { authorization: `Bearer ${BEARER}` }, signal: controller.signal,
+      })
+      const reader = response.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      reading: for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let newline: number
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline)
+          buffer = buffer.slice(newline + 1)
+          if (!line.startsWith('data:')) continue
+          let event: Record<string, any>
+          try { event = JSON.parse(line.slice(5)) } catch { continue }
+          events.push(event)
+          await onEvent?.(event)
+          const inner = event.event ?? event
+          if (inner.type === 'status' && ['completed', 'failed', 'cancelled'].includes(inner.status)) break reading
+        }
       }
+    } catch (error) {
+      // The deadline ends the read; the snapshot check below reports what arrived.
+      if (!controller.signal.aborted) throw error
+    } finally {
+      clearTimeout(deadline)
+      controller.abort()
     }
-    const snapshot = await (await call(`/v1/runs/${encodeURIComponent(runId)}`)).json() as { status?: string }
-    return { events, status: snapshot.status }
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const snapshot = await (await call(`/v1/runs/${encodeURIComponent(runId)}`)).json() as { terminal?: boolean; status?: string }
+      if (snapshot.terminal) return { events, status: snapshot.status }
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    throw new Error(`run ${runId} reported no terminal snapshot; events: ${JSON.stringify(events.map((event) => (event.event ?? event).type))}`)
   }
 
   const session = async (policy?: string) => {
