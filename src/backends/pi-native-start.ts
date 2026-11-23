@@ -1,3 +1,4 @@
+import { configuredJailBackend } from '../config.js'
 import { writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -100,7 +101,7 @@ export async function startPiNativeSession(
         env: options.jailEnv ?? process.env,
       })
     }
-    const jailBackend = selectJailBackend()
+    const jailBackend = selectJailBackend(process.platform, req.jailSpec?.backend ?? configuredJailBackend(options.jailEnv))
     if (!req.jailSpec?.readConfine || jailBackend.name !== 'bwrap' || !(await jailBackend.isAvailable())) {
       throw new BackendError(
         'backend pi requires an enforced Linux fs-jail so Bash and descendants cannot read host credentials '

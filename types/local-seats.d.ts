@@ -5,8 +5,11 @@ export interface LocalSeat {
     /** Native configured default, never a served model identity. */
     defaultModel?: string;
     status: 'authenticated' | 'configured' | 'signed_out' | 'missing' | 'unknown';
-    authMode: 'subscription' | 'api_key' | 'unknown';
-    source: 'native_status' | 'native_store';
+    /** `free`: the harness's own catalog prices this exact model at zero and it needs no credential. */
+    authMode: 'subscription' | 'free' | 'api_key' | 'unknown';
+    /** `plan_key`: the stored key belongs to a flat-rate plan in the Bridge's plan-keyed provider table; `authMode` is `subscription`. */
+    credential?: 'plan_key';
+    source: 'native_status' | 'native_store' | 'native_catalog';
     fix?: string;
 }
 export interface LocalSeatOptions {

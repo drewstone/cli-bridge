@@ -1,3 +1,4 @@
+import { configuredJailBackend } from '../src/config.js'
 /** Real request → OS filesystem confinement proof. No harness or model request. */
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
@@ -12,7 +13,7 @@ import { selectJailBackend } from '../src/jail/index.js'
 import { applyJail } from '../src/executors/jail-support.js'
 import type { Backend, ChatRequest, NativeSessionBackend } from '../src/backends/types.js'
 
-assert.ok(await selectJailBackend().isAvailable(), 'A real OS jail is required; this proof cannot skip')
+assert.ok(await selectJailBackend(process.platform, configuredJailBackend()).isAvailable(), 'A real OS jail is required; this proof cannot skip')
 const directory = await mkdtemp(join(tmpdir(), 'bridge-jail-snapshot-'))
 const workspace = join(directory, 'workspace')
 const secret = join(directory, 'outside', 'canary')
@@ -91,7 +92,7 @@ try {
   assert.equal(observed?.readConfine, true)
   assert.equal(observed?.root, result.root)
   assert.equal(loadConfig({ WORKER_FS_JAIL: '1' }).jailMode, 'fs-jail')
-  await assert.rejects(applyJail('/bin/true', [], { jail: observed! }, selectJailBackend('win32')), /refusing to run unconfined/)
+  await assert.rejects(applyJail('/bin/true', [], { jail: observed! }, selectJailBackend('win32', 'bwrap')), /refusing to run unconfined/)
   console.log('PASS real HTTP snapshot mode/root/read paths/write paths/fallback and outside-read denial')
 } finally {
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))

@@ -99,7 +99,7 @@ async function continueRun(
   })
   // The continuation owns the session lane like any turn, so a new turn on it waits.
   const lease = session ? await deps.store.acquireExecution(admission.sessionId, backend.name) : null
-  const interruption = { reason: 'bridge_restart' as const, pid: runner.pid, nativeSessionId, openTools }
+  const interruption = { reason: 'bridge_restart' as const, pid: runner.pid, nativeSessionId, openTools, recordedMaxTokens: runner.max_tokens }
   void run.pump(continueTurn(backend as NativeResumeBackend, req, session, interruption, run.signal), chatCompletionDeltaOptions(req))
     .finally(() => lease?.release())
 }

@@ -13,7 +13,8 @@ try {
   } else if (values.seats) {
     const seats = await detectLocalSeats()
     console.log(values.json ? JSON.stringify(seats) : seats.map((seat) =>
-      `${seat.harness}: ${seat.status} (${seat.authMode})${seat.fix ? `; run: ${seat.fix}` : ''}`).join('\n'))
+      `${seat.harness}${seat.provider ? `/${seat.provider}` : ''}: ${seat.status} ` +
+      `(${seat.authMode}${seat.credential === 'plan_key' ? ', plan key' : ''})${seat.fix ? `; run: ${seat.fix}` : ''}`).join('\n'))
   } else if (values.json) throw new Error('--json requires --seats or --retire-pools')
   else await startServer()
 } catch (error) {
