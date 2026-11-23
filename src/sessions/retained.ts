@@ -158,8 +158,10 @@ export class RetainedSessionService {
       healthProbeTimeoutMs: this.healthProbeTimeoutMs,
       signal,
     })
+    // agent-interface 5.10.28+ declares modelReroutes as a boolean; this document carries it only when asked (#360).
+    const { modelReroutes: _unrequested, ...document } = capabilities
     return {
-      ...capabilities,
+      ...document,
       ...(backend.toolCallSpans ? { toolCallSpans: true } : {}),
       ...(include.modelReroutes && backend.modelReroutes ? { modelReroutes: true } : {}),
     }
