@@ -36,8 +36,6 @@ import { materializeProfile } from '@tangle-network/agent-profile-materialize'
 import { AcpBackend } from '../src/backends/acp.js'
 import { ClaudeBackend } from '../src/backends/claude.js'
 import { CodexBackend } from '../src/backends/codex.js'
-import { KimiBackend } from '../src/backends/kimi.js'
-import { OpencodeBackend } from '../src/backends/opencode.js'
 import { PiBackend } from '../src/backends/pi.js'
 import {
   assertProfilePromptIntentsSupported,
@@ -587,20 +585,11 @@ describe('the shared refusal seam fires on the real request path', () => {
             await drain(backend.chat(request(profile, 'hermes', cwd), null, signal()))
           },
         },
-        {
-          label: `kimi-code · ${intent}`,
-          intent,
-          refusal,
-          run: async (profile, cwd, spawner) => {
-            const backend = new KimiBackend({ bin: 'kimi', timeoutMs: 5_000, spawner })
-            await drain(backend.chat(request(profile, 'kimi-code', cwd), null, signal()))
-          },
-        },
       ]
     }),
-    // codex and opencode DO materialize, and their materializer refuses the same cells — but a
-    // second layer down, after the request path has already accepted the intent. Asserting THIS
-    // seam's wording proves the refusal happens here first, before any workspace is touched.
+    // codex DOES materialize, and its materializer refuses the same cell — but a second layer
+    // down, after the request path has already accepted the intent. Asserting THIS seam's wording
+    // proves the refusal happens here first, before any workspace is touched.
     {
       label: 'codex · append (no additive control)',
       intent: 'append',
@@ -608,15 +597,6 @@ describe('the shared refusal seam fires on the real request path', () => {
       run: async (profile, cwd, spawner) => {
         const backend = new CodexBackend({ bin: 'codex', timeoutMs: 5_000, spawner })
         await drain(backend.chat(request(profile, 'codex', cwd), null, signal()))
-      },
-    },
-    {
-      label: 'opencode · replace (its replacement binds to a launch-time agent)',
-      intent: 'replace',
-      refusal: REPLACE_REFUSAL,
-      run: async (profile, cwd, spawner) => {
-        const backend = new OpencodeBackend({ bin: 'opencode', timeoutMs: 5_000, spawner })
-        await drain(backend.chat(request(profile, 'opencode', cwd), null, signal()))
       },
     },
   ]
@@ -650,6 +630,11 @@ describe('the shared refusal seam fires on the real request path', () => {
     expect(() =>
       resolvePromptMessages(request(addition, 'opencode', workspace()), null, 'opencode'),
     ).not.toThrow()
+    // opencode's replacement and both Kimi intents ride each harness's own agent definition.
+    for (const [profile, backend] of [[replacement, 'opencode'], [replacement, 'kimi-code'], [addition, 'kimi-code']] as const) {
+      const carried = resolvePromptMessages(request(profile, backend, workspace()), null, backend)
+      expect(JSON.stringify(carried)).not.toContain(profile === replacement ? REPLACEMENT : ADDITION)
+    }
     // And the intent text never leaks into the flattened prompt on the way through.
     const messages = resolvePromptMessages(
       request(replacement, 'codex', workspace()),
