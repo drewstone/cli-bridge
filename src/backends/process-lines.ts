@@ -119,9 +119,11 @@ export async function waitForProcessClose(child: ChildProcess): Promise<ProcessE
   })
 }
 
-const signalNames = new Map(
-  Object.entries(osConstants.signals).map(([name, number]) => [number, name as NodeJS.Signals]),
-)
+// The first name per number: SIGABRT before its alias SIGIOT, SIGIO before SIGPOLL.
+const signalNames = new Map<number, NodeJS.Signals>()
+for (const [name, number] of Object.entries(osConstants.signals)) {
+  if (!signalNames.has(number)) signalNames.set(number, name as NodeJS.Signals)
+}
 
 /**
  * The harness's own exit. A PID-namespace jail reaps the harness and exits
