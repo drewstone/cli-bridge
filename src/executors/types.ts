@@ -162,6 +162,8 @@ export interface SpawnResult {
    * Process groups do not bound a harness: Claude Code starts each Bash tool with setsid.
    */
   readonly scope?: string
+  /** The child is a PID-namespace jail that reports the command's fatal signal N as exit 128+N. */
+  readonly exitStatusCarriesSignal?: boolean
 }
 
 /** Describe a failed native child, preserving signal and diagnostic information. */

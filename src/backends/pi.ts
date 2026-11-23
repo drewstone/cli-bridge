@@ -39,7 +39,7 @@ import {
   resolveJailRoot,
   selectJailBackend,
 } from '../jail/index.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { readProcessLines, waitForHarnessExit } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { addUsage, type CollectedUsage } from '../usage.js'
@@ -841,7 +841,7 @@ export class PiBackend implements NativeSessionBackend {
       const trailingReasoning = takeReasoning()
       if (trailingReasoning) yield trailingReasoning
 
-      const { code: exitCode, signal: exitSignal } = await waitForProcessClose(child)
+      const { code: exitCode, signal: exitSignal } = await waitForHarnessExit(spawned)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
       // Pi's hang-up reaches the proxy through the jail's forwarder sockets a few ms after its exit.

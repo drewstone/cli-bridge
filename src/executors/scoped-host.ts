@@ -603,6 +603,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
     release,
     spawnError: () => spawnError,
     scope: unitName,
+    ...(jailed.exitStatusCarriesSignal ? { exitStatusCarriesSignal: true } : {}),
   }
   return result
 }

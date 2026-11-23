@@ -45,7 +45,7 @@ import { contentToText, toolResult } from './content.js'
 import { registerJailReadable } from '../jail/index.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForHarnessExit } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -531,7 +531,7 @@ export class ClaudeBackend implements Backend {
         }
       }
 
-      const closed = await waitForProcessClose(child)
+      const closed = await waitForHarnessExit(spawned)
       if (usage) yield { usage }
 
       if (signal.aborted) {

@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process'
+import { constants as osConstants } from 'node:os'
 import { createInterface } from 'node:readline'
 import { finished } from 'node:stream/promises'
 import { describeCliExit, type SpawnResult } from '../executors/types.js'
@@ -118,13 +119,32 @@ export async function waitForProcessClose(child: ChildProcess): Promise<ProcessE
   })
 }
 
+// The first name per number: SIGABRT before its alias SIGIOT, SIGIO before SIGPOLL.
+const signalNames = new Map<number, NodeJS.Signals>()
+for (const [name, number] of Object.entries(osConstants.signals)) {
+  if (!signalNames.has(number)) signalNames.set(number, name as NodeJS.Signals)
+}
+
+/**
+ * The harness's own exit. A PID-namespace jail reaps the harness and exits
+ * 128+N when it dies of signal N (measured: a Claude Code SIGABRT under bwrap
+ * reached the Bridge as `exitCode 134, signal null`), so read that status as
+ * the signal it carries.
+ */
+export async function waitForHarnessExit(spawned: Pick<SpawnResult, 'child' | 'exitStatusCarriesSignal'>): Promise<ProcessExit> {
+  const exit = await waitForProcessClose(spawned.child)
+  if (!spawned.exitStatusCarriesSignal || exit.signal !== null || exit.code === null || exit.code <= 128) return exit
+  const signal = signalNames.get(exit.code - 128)
+  return signal === undefined ? exit : { code: null, signal }
+}
+
 /** Called only after the native protocol reader reaches EOF; never drain over unread frames. */
 export async function assertSuccessfulHarnessExit(
   spawned: SpawnResult,
   label: string,
   diagnostics: () => string,
 ): Promise<void> {
-  const exit = await waitForProcessClose(spawned.child)
+  const exit = await waitForHarnessExit(spawned)
   const failure = classifyHarnessFailure(exit, diagnostics())
   if (failure) {
     const message = await describeCliExit(spawned, label, exit.code, failure.message, exit.signal)
