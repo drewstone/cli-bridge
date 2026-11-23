@@ -10,6 +10,7 @@
 
 import {
   InteractionResponseCommandSchema,
+  PERMISSION_GRANT_FIELD,
   canonicalCandidateDigest,
   interactionResponseCommandDigest,
   validateInteractionResponse,
@@ -47,25 +48,28 @@ export class RetainedInteractions {
   ) {}
 
   /**
-   * Deny a provider dialog that this turn did not explicitly request.
+   * Answer a provider dialog for the Bridge: deny one the turn did not request, or answer a
+   * permission prompt as the turn's unattended policy says (allow grants it once).
    *
    * The request is registered in memory only, then sent through `respond`.
    * That keeps the durable operation ledger and the serialized native-control
    * lane identical to an explicit user response without advertising the
-   * denied dialog as an interactive event.
+   * answered dialog as an interactive event.
    */
-  async denyUnrequestedInteraction(input: {
+  async answerInteraction(input: {
     run: Run
     request: InteractionRequest
     nativeId: string
-  }): Promise<void> {
+  }, decision: 'allow' | 'deny'): Promise<void> {
     const binding = {
       ...input.request.binding,
       requestDigest: input.request.requestDigest,
     }
-    const response = { id: input.request.id, outcome: 'cancelled' as const }
+    const response = decision === 'allow'
+      ? { id: input.request.id, outcome: 'accepted' as const, data: { [PERMISSION_GRANT_FIELD]: 'allow_once' } }
+      : { id: input.request.id, outcome: 'cancelled' as const }
     const command = {
-      operationId: canonicalCandidateDigest({ kind: 'retained-auto-deny', binding }),
+      operationId: canonicalCandidateDigest({ kind: decision === 'allow' ? 'retained-auto-allow' : 'retained-auto-deny', binding }),
       binding,
       response,
       commandDigest: interactionResponseCommandDigest({ binding, response }),
@@ -78,7 +82,7 @@ export class RetainedInteractions {
       { allowUnpublished: true },
     )
     if (result.acknowledgement.status === 'transport_failure') {
-      throw new Error(result.acknowledgement.message ?? 'automatic interaction denial effect is unknown')
+      throw new Error(result.acknowledgement.message ?? 'automatic interaction answer effect is unknown')
     }
   }
 

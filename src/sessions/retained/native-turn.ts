@@ -46,12 +46,17 @@ export interface NativeTurnInput {
   providerName: string
   environmentId: string
   interactions: RequestedInteractions
-  /** Deny provider UI that was not explicitly admitted by this turn. */
-  onUnrequestedInteraction: (input: {
+  /**
+   * Who answers permission prompts. `unattended-allow` and `unattended-deny` make the Bridge
+   * answer each one itself, so an unattended run gets what a one-shot turn already has.
+   */
+  interactionPolicy: 'interactive' | 'unattended-deny' | 'unattended-allow'
+  /** Answer provider UI for the Bridge: what the turn did not admit is denied. */
+  answerInteraction: (input: {
     run: Run
     request: InteractionRequest
     nativeId: string
-  }) => Promise<void>
+  }, decision: 'allow' | 'deny') => Promise<void>
   /** The provider disclosed its own session id; record it before continuing. */
   onProviderSessionId: (providerSessionId: string) => void
 }
@@ -245,31 +250,39 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
 }
 
 /**
- * Publish a provider dialog this turn requested, or deny one it did not.
- * The denial waits one tick so the provider has resumed from the yielded
- * request (Pi installs its response waiter on that resume).
+ * Publish a provider dialog this turn requested, deny one it did not, or answer a permission
+ * prompt as the turn's unattended policy says. The Bridge's answer waits one tick so the
+ * provider has resumed from the yielded request (Pi installs its response waiter on that resume).
  */
 function admitInteraction(
   input: NativeTurnInput,
   interaction: { request: InteractionRequest; nativeId: string },
   deferredDenials: Promise<void>[],
 ): StreamEvent {
-  if ((input.interactions as Readonly<Record<string, boolean | undefined>>)[interaction.request.kind] !== true) {
-    const denial = new Promise<void>((resolve, reject) => {
+  const byPolicy = interaction.request.kind === 'permission' && input.interactionPolicy !== 'interactive'
+  const requested = (input.interactions as Readonly<Record<string, boolean | undefined>>)[interaction.request.kind] === true
+  if (byPolicy || !requested) {
+    const decision = byPolicy && input.interactionPolicy === 'unattended-allow' ? 'allow' : 'deny'
+    deferredDenials.push(new Promise<void>((resolve, reject) => {
       setImmediate(() => {
-        void input.onUnrequestedInteraction({
+        void input.answerInteraction({
           run: input.run,
           request: interaction.request,
           nativeId: interaction.nativeId,
-        }).then(resolve, reject)
+        }, decision).then(resolve, reject)
       })
-    })
-    deferredDenials.push(denial)
-    return {
-      type: 'warning',
-      code: 'interaction_not_requested',
-      message: `${interaction.request.kind} interaction was denied because this turn did not request it`,
-    }
+    }))
+    return byPolicy
+      ? {
+          type: 'warning',
+          code: 'interaction_answered_by_policy',
+          message: `permission interaction was answered ${decision} by interaction_policy ${input.interactionPolicy}`,
+        }
+      : {
+          type: 'warning',
+          code: 'interaction_not_requested',
+          message: `${interaction.request.kind} interaction was denied because this turn did not request it`,
+        }
   }
   input.run.registerInteraction({ request: interaction.request, nativeId: interaction.nativeId })
   return { type: 'interaction', request: interaction.request }
