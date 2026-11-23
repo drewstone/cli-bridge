@@ -47,11 +47,16 @@ const ROUTER_HOSTS: readonly string[] = ['router.tangle.tools']
  * Router and its proxySecrets hosts under `relay`.
  */
 const ANTHROPIC_HOSTS = ['api.anthropic.com', 'platform.claude.com', 'console.anthropic.com']
+const KIMI_HOSTS = ['auth.kimi.com', 'code.kimi.com']
 const VENDOR_HOSTS: Record<string, readonly string[]> = {
   'claude-code': ANTHROPIC_HOSTS,
   claude: ANTHROPIC_HOSTS,
   codex: ['chatgpt.com', 'auth.openai.com', 'api.openai.com'],
-  opencode: ['opencode.ai', 'models.opencode.ai'],
+  // api.z.ai serves the GLM Coding Plan (zai-coding-plan); measured 2026-11-23 as the host a GLM turn was refused.
+  opencode: ['opencode.ai', 'models.opencode.ai', 'api.z.ai'],
+  // Kimi Code signs in through auth.kimi.com and calls code.kimi.com; its telemetry host stays refused.
+  'kimi-code': KIMI_HOSTS,
+  kimi: KIMI_HOSTS,
 }
 
 export function vendorHostsFor(backendName: string): string[] {
