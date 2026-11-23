@@ -7,9 +7,7 @@ import {
 import type { NativeSession } from './types.js'
 import { BackendError } from './types.js'
 import type { Spawner } from '../executors/types.js'
-import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
-import { redactCredentials } from '../runtime/redact-credentials.js'
-import { retryCleanupUntilSuccessful, terminateSpawned } from '../executors/process-tree.js'
+import { NativeChild } from './native-child.js'
 import { piPermissionMarker, piPermissionTokenFromTitle, piSelectedValue } from './pi-interaction.js'
 
 export interface PiNativeSessionOptions {
@@ -46,35 +44,13 @@ interface PiMarkerWaiter {
   timer?: ReturnType<typeof setTimeout>
 }
 
-const STDERR_DRAIN_GRACE_MS = 500
-const STDERR_TAIL_CHARS = 1_000
-
-/**
- * Returns the last printable stderr characters with common credential shapes
- * removed. Pi's stderr is untrusted child output that reaches API callers.
- */
-export function redactedStderrTail(stderr: string, maxChars = STDERR_TAIL_CHARS): string {
-  const sanitized = redactCredentials(
-    stderr
-      // eslint-disable-next-line no-control-regex
-      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
-      // eslint-disable-next-line no-control-regex
-      .replace(/[\x00-\x1f\x7f-\x9f]+/gu, ' '),
-  )
-    .replace(/\s+/gu, ' ')
-    .trim()
-  return sanitized.length <= maxChars ? sanitized : `...${sanitized.slice(-maxChars)}`
-}
+export { redactedStderrTail } from './native-child.js'
 
 /** A single Pi RPC child; the retained-session service owns the public events. */
 export class PiNativeSession implements NativeSession {
   readonly capabilities: AgentEnvironmentCapabilities
-  private readonly child: Awaited<ReturnType<Spawner>>['child']
-  private readonly release: () => void
-  private readonly terminate: () => Promise<void>
-  private readonly cleanup: () => void | Promise<void>
+  private readonly life: NativeChild
   private readonly requestTimeoutMs: number
-  private readonly stderr = new BoundedDiagnosticBuffer()
   private readonly pending = new Map<string | number, PiRpcWaiter>()
   private readonly queue: Record<string, unknown>[] = []
   private readonly waiters: Array<{
@@ -83,47 +59,34 @@ export class PiNativeSession implements NativeSession {
   }> = []
   private readonly markerWaiters = new Set<PiMarkerWaiter>()
   private readonly interactionMarkers = new Map<string, string>()
-  private readonly closeListeners = new Set<(reason: Error) => void>()
   private buffer = ''
   private eventSequence = 0
-  private closed = false
-  private closing: Promise<void> | null = null
   private providerSession: string | null
   private turnActive = false
-  private childError: Error | null = null
   private abortInFlight: Promise<void> | null = null
-  private terminationInFlight: Promise<void> | null = null
-  private readonly retryStartCleanup = (): Promise<void> => this.startCleanup()
 
   constructor(spawned: Awaited<ReturnType<Spawner>>, options: PiNativeSessionOptions) {
     this.capabilities = options.capabilities
     this.requestTimeoutMs = options.requestTimeoutMs
     this.providerSession = options.providerSessionId ?? null
-    this.child = spawned.child
-    this.release = spawned.release
-    this.terminate = async () => {
-      if (this.terminationInFlight) return this.terminationInFlight
-      this.terminationInFlight = spawned.terminate
-        ? spawned.terminate()
-        : terminateSpawned(spawned).then((outcome) => {
-            if (outcome !== 'stopped') throw new Error(`pi native session termination ${outcome}`)
-          })
-      try {
-        await this.terminationInFlight
-      } finally {
-        this.terminationInFlight = null
-      }
-    }
-    this.cleanup = options.cleanup
-    this.child.stdout?.on('data', (chunk) => this.consume(chunk.toString()))
-    this.child.stderr?.on('data', (chunk) => this.stderr.append(chunk))
-    this.child.stdin?.on('error', (error) => this.end(error))
-    this.child.stdout?.on('end', () => this.endAfterStderrDrains('pi RPC stdout ended'))
-    this.child.on('error', (error) => {
-      this.childError = error
-      this.end(error)
+    this.life = new NativeChild(spawned, {
+      names: { process: 'pi RPC', session: 'pi native session' },
+      onStdout: (chunk) => this.consume(chunk),
+      onEnd: (error) => this.settleWaiters(error),
+      cleanup: options.cleanup,
     })
-    this.child.on('close', () => this.end(this.childError ?? this.exitError('pi RPC process closed')))
+  }
+
+  private get closed(): boolean {
+    return this.life.closed
+  }
+
+  private get childError(): Error | null {
+    return this.life.error
+  }
+
+  private get child(): NativeChild['child'] {
+    return this.life.child
   }
 
   providerSessionId(): string | null {
@@ -135,28 +98,11 @@ export class PiNativeSession implements NativeSession {
   }
 
   onClose(listener: (reason: Error) => void): () => void {
-    if (this.closed) {
-      queueMicrotask(() => {
-        try {
-          listener(this.childError ?? new Error('pi RPC process closed'))
-        } catch {
-          // A late owner cannot break child cleanup.
-        }
-      })
-      return () => {}
-    }
-    this.closeListeners.add(listener)
-    return () => this.closeListeners.delete(listener)
+    return this.life.onClose(listener)
   }
 
   whenClosed(): Promise<void> {
-    if (this.closed) return this.startCleanup()
-    return new Promise<void>((resolve, reject) => {
-      const unsubscribe = this.onClose(() => {
-        unsubscribe()
-        this.startCleanup().then(resolve, reject)
-      })
-    })
+    return this.life.whenClosed()
   }
 
   async *turn(prompt: string, signal: AbortSignal): AsyncIterable<unknown> {
@@ -208,12 +154,12 @@ export class PiNativeSession implements NativeSession {
   }
 
   async abort(): Promise<void> {
-    if (this.closed) return this.startCleanup()
+    if (this.closed) return this.life.startCleanup()
     if (this.abortInFlight) return this.abortInFlight
     this.abortInFlight = (async () => {
       // Keep the hard-stop running while the courtesy RPC uses its bounded
       // window. A failed first stop is retried by startCleanup below.
-      const termination = this.terminate().catch(() => {})
+      const termination = this.life.terminate().catch(() => {})
       try {
         await this.request(
           { id: `abort-${randomUUID()}`, type: 'abort' },
@@ -226,9 +172,9 @@ export class PiNativeSession implements NativeSession {
         // Pi closes the RPC pipe before acknowledging the command.
       } finally {
         await termination
-        this.end(new Error('pi native session aborted'))
+        this.life.end(new Error('pi native session aborted'))
         try {
-          await this.startCleanup()
+          await this.life.startCleanup()
         } finally {
           this.abortInFlight = null
         }
@@ -291,8 +237,8 @@ export class PiNativeSession implements NativeSession {
   }
 
   async close(): Promise<void> {
-    this.end(new Error('pi native session closed'))
-    await this.closing
+    this.life.end(new Error('pi native session closed'))
+    await this.life.closing
   }
 
   private request(command: Record<string, unknown>, options: PiRpcRequestOptions = {}): Promise<PiRpcResponse> {
@@ -358,7 +304,7 @@ export class PiNativeSession implements NativeSession {
         this.write(wireCommand)
       } catch (error) {
         settle(() => reject(error instanceof Error ? error : new Error(String(error))))
-        this.end(error instanceof Error ? error : new Error(String(error)))
+        this.life.end(error instanceof Error ? error : new Error(String(error)))
       }
     })
   }
@@ -466,99 +412,18 @@ export class PiNativeSession implements NativeSession {
     })
   }
 
-  /**
-   * Pi reports fatal startup failures (for example EROFS on its session file) on
-   * stderr just before its stdout closes. The two pipes end in no fixed order,
-   * so wait briefly for stderr to drain before building the terminal error.
-   */
-  private endAfterStderrDrains(reason: string): void {
-    const stderr = this.child.stderr
-    if (this.closed || !stderr || stderr.readableEnded || stderr.destroyed) {
-      this.end(this.exitError(reason))
-      return
-    }
-    let settled = false
-    const finish = () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      stderr.off('end', finish)
-      stderr.off('close', finish)
-      this.end(this.exitError(reason))
-    }
-    const timer = setTimeout(finish, STDERR_DRAIN_GRACE_MS)
-    timer.unref?.()
-    stderr.once('end', finish)
-    stderr.once('close', finish)
-  }
-
-  private exitError(reason: string): Error {
-    const tail = redactedStderrTail(this.stderr.render())
-    return new Error(tail ? `${reason}: ${tail}` : reason)
-  }
-
-  private end(error: Error): void {
-    const firstClose = !this.closed
-    if (firstClose) this.closed = true
-    this.childError ??= error
-    for (const waiter of this.waiters.splice(0)) waiter.reject(this.childError)
+  private settleWaiters(error: Error): void {
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error)
     for (const [id, waiter] of this.pending) {
       this.pending.delete(id)
-      waiter.reject(this.childError)
+      waiter.reject(error)
     }
     for (const waiter of this.markerWaiters) {
       this.markerWaiters.delete(waiter)
       if (waiter.timer) clearTimeout(waiter.timer)
-      waiter.reject(this.childError)
+      waiter.reject(error)
     }
     this.interactionMarkers.clear()
-    const cleanup = this.startCleanup()
-    if (firstClose) {
-      for (const listener of [...this.closeListeners]) {
-        try {
-          listener(this.childError)
-        } catch {
-          // A session owner cannot break child cleanup.
-        }
-      }
-      this.closeListeners.clear()
-    }
-    void cleanup.catch((cleanupError) => {
-      this.childError ??= cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError))
-    })
-  }
-
-  private startCleanup(): Promise<void> {
-    if (this.closing) return this.closing
-    const attempt = (async () => {
-      try {
-        await this.terminate()
-      } catch (error) {
-        // Keep the lease and private files until the owned workload stops.
-        // A later attempt can prove the stop and finish cleanup.
-        retryCleanupUntilSuccessful(this.retryStartCleanup)
-        throw error
-      }
-      const failures: unknown[] = []
-      try {
-        await this.cleanup()
-      } catch (error) {
-        failures.push(error)
-        retryCleanupUntilSuccessful(this.cleanup)
-      }
-      try {
-        this.release()
-      } catch (error) {
-        failures.push(error)
-      }
-      if (failures.length === 1) throw failures[0]
-      if (failures.length > 1) throw new AggregateError(failures, 'pi native session cleanup failed')
-    })()
-    this.closing = attempt
-    void attempt.catch(() => {
-      if (this.closing === attempt) this.closing = null
-    })
-    return attempt
   }
 }
 
