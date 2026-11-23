@@ -150,7 +150,7 @@ describe('retained Claude session: who answers a permission prompt', () => {
   it('answers every prompt with allow under a session unattended-allow policy', async () => {
     const { id, cwd } = await session('unattended-allow')
     const { events, status } = await settle(await turn(id, 'session-policy.txt'), cwd)
-    expect(status).toBe('done')
+    expect(status, JSON.stringify(kinds(events).filter((event) => event.type === 'status' || event.type === 'warning'))).toBe('done')
     expect(existsSync(join(cwd, 'session-policy.txt'))).toBe(true)
     expect(kinds(events).some((event) => event.type === 'interaction')).toBe(false)
     expect(kinds(events)).toContainEqual(expect.objectContaining({ type: 'warning', code: 'interaction_answered_by_policy' }))
@@ -158,8 +158,8 @@ describe('retained Claude session: who answers a permission prompt', () => {
 
   it('lets one turn name unattended-allow on an interactive session', async () => {
     const { id, cwd } = await session()
-    const { status } = await settle(await turn(id, 'turn-policy.txt', { interaction_policy: 'unattended-allow' }), cwd)
-    expect(status).toBe('done')
+    const { events, status } = await settle(await turn(id, 'turn-policy.txt', { interaction_policy: 'unattended-allow' }), cwd)
+    expect(status, JSON.stringify(kinds(events).filter((event) => event.type === 'status' || event.type === 'warning'))).toBe('done')
     expect(existsSync(join(cwd, 'turn-policy.txt'))).toBe(true)
   }, 60_000)
 
@@ -174,7 +174,7 @@ describe('retained Claude session: who answers a permission prompt', () => {
     const { id, cwd } = await session()
     const runId = await turn(id, 'interactive.txt', { interactions: { permission: true } })
     let answered = false
-    const { status } = await settle(runId, cwd, async (event) => {
+    const { events, status } = await settle(runId, cwd, async (event) => {
       const inner = event.event ?? event
       if (inner.type !== 'interaction' || answered) return
       answered = true
@@ -190,7 +190,7 @@ describe('retained Claude session: who answers a permission prompt', () => {
       expect(reply.status, await reply.clone().text()).toBeLessThan(300)
     })
     expect(answered).toBe(true)
-    expect(status).toBe('done')
+    expect(status, JSON.stringify(kinds(events).filter((event) => event.type === 'status' || event.type === 'warning'))).toBe('done')
     expect(existsSync(join(cwd, 'interactive.txt'))).toBe(true)
   }, 60_000)
 })
