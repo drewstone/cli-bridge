@@ -32,15 +32,32 @@ with the caller. Use a private data directory and a generated bearer in `env`.
 `cli-bridge --seats --json` or `await detectLocalSeats({ config })` reports native
 login facts for Claude Code, Codex, OpenCode, Kimi Code, Gemini, Cursor, and Pi. No model
 turn is sent; no credential or account identity appears in the result. Each fact
-has `harness`, `provider` (or null), `status`, `authMode`, `source`, and an optional `fix` command.
+has `harness`, `provider` (or null), `status`, `authMode`, `source`, an optional `credential`, and an optional `fix` command.
+OpenCode reports one fact per provider credential in its own store, the same fact `/v1/models` gives that provider's routes.
 Model selection, ranking, and seat syntax belong to the consuming seat resolver.
 
 `authenticated` means the native status command recognizes a login, not that an
-inference was verified. Where inventory reads Kimi/Gemini's own OAuth stores,
+inference was verified. Kimi Code's login comes from Kimi's own local server
+(`kimi web --json`, then `GET /api/v1/auth` and `/api/v1/config`); it covers only models
+that Kimi routes through its managed `kimi-code` subscription, whose provider is `moonshot`.
+Where inventory reads Gemini's own OAuth store or OpenCode's credential store,
 the result is `configured` rather than a verified live login. Missing or malformed
 state stays `signed_out` or `unknown`; OAuth and API-key state stay distinct.
 Pi checks use `--no-refresh`. `CLAUDE_BIN`, `CODEX_BIN`, `OPENCODE_BIN`, `KIMI_BIN`,
 `GEMINI_BIN`, `CURSOR_BIN`, and `PI_BIN` select the same binaries for inventory and execution.
+
+Flat-rate coding plans that a subscription pays for and a plan key authenticates are named in one table,
+`PLAN_KEYED_PROVIDERS` in [src/local-seats.ts](src/local-seats.ts): `zai-coding-plan` (Z.ai GLM Coding Plan) and
+`kimi-for-coding` (Kimi Code through OpenCode). A stored key for one of them reports `authMode: subscription` with
+`credential: plan_key`, and `authenticated` once OpenCode's own `opencode models <provider> --pure` lists the model.
+A key for any other provider stays `api_key`, whatever its name; nothing is inferred from a key or a host.
+Subscription-only admission (`BRIDGE_SUBSCRIPTIONS_ONLY=1`, the `tangle graph run` default) still requires an
+`authenticated` subscription fact, so a plan key passes it and a per-token key does not.
+
+The real-CLI seat proof in `tests/local-seats.integration.mjs` needs the OpenCode and Kimi Code CLIs. A Beelink gate has
+neither, so its command fetches the pinned packages into a temporary prefix:
+`beelink-gate auto https://github.com/drewstone/cli-bridge.git "$(git rev-parse HEAD)" -- sh -c 'n=$(mktemp -d) && trap "rm -rf $n" EXIT && npm install --prefix "$n" --no-save --ignore-scripts --no-audit --no-fund opencode-linux-x64@1.19.6 @moonshot-ai/kimi-code@2.7.2 >/dev/null && pnpm typecheck && OPENCODE_BIN="$n/node_modules/opencode-linux-x64/bin/opencode" KIMI_BIN="$n/node_modules/.bin/kimi" node --test tests/local-seats.integration.mjs'`.
+Without them the test is skipped with that reason.
 
 ---
 
