@@ -18,6 +18,7 @@
     "start": "tsx src/server.ts",
     "build": "tsc --project tsconfig.package.json && node scripts/package-types.mjs",
     "test:package": "node --test tests/package.integration.mjs",
+    "conformance:matrix": "tsx tests/conformance/harness-matrix.ts",
     "test:seats": "node --test tests/local-seats.integration.mjs",
     "test": "node --check tests/runtime-consumer/live-opencode.mjs && vitest run && pnpm run test:native-store && pnpm run test:runtime-consumer",
     "test:native-store": "node --test tests/native-store.integration.mjs",
