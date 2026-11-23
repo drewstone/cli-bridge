@@ -8,7 +8,7 @@ import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { canonicalCandidateDigest, interactionResponseCommandDigest } from '@tangle-network/agent-interface'
 import { loadConfig, startServer, type BridgeServer } from '../src/server.js'
 
@@ -122,8 +122,15 @@ describe('retained Claude session: who answers a permission prompt', () => {
     throw new Error(`run ${runId} reported no terminal snapshot; events: ${JSON.stringify(events.map((event) => (event.event ?? event).type))}; claude stdin: ${JSON.stringify(stdin)}`)
   }
 
+  // A retained session holds its executor slot for its whole life; close each one with its test.
+  const open: string[] = []
+  afterEach(async () => {
+    for (const id of open.splice(0)) await call(`/v1/sessions/${id}/close`, {})
+  })
+
   const session = async (policy?: string) => {
     const id = `permission-policy-${++counter}`
+    open.push(id)
     const cwd = await mkdtemp(join(root, 'work-'))
     const created = await call('/v1/sessions', { id, model: MODEL, cwd, ...(policy ? { interaction_policy: policy } : {}) })
     expect(created.status, await created.clone().text()).toBeLessThan(300)
