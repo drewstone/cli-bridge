@@ -81,8 +81,8 @@ export class RetainedInteractions {
       undefined,
       { allowUnpublished: true },
     )
-    if (result.acknowledgement.status === 'transport_failure') {
-      throw new Error(result.acknowledgement.message ?? 'automatic interaction answer effect is unknown')
+    if (result.acknowledgement.status !== 'accepted') {
+      throw new Error(`${result.acknowledgement.status}: ${result.acknowledgement.message ?? 'automatic interaction answer was not delivered'}`)
     }
   }
 

@@ -240,7 +240,11 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
       yield { event: { type: 'raw', backend: backendName, event: raw } }
     }
     await Promise.all(deferredDenials)
-  } catch (error) {
+  } catch (thrown) {
+    // An answer the Bridge could not deliver aborts the native turn; report that cause, not the abort.
+    const answerFailure = (await Promise.allSettled(deferredDenials))
+      .find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected')?.reason
+    const error = answerFailure ?? thrown
     if (!run.signal.aborted)
       yield {
         event: { type: 'status', status: 'failed', detail: error instanceof Error ? error.message : String(error) },
@@ -271,6 +275,10 @@ function admitInteraction(
           nativeId: interaction.nativeId,
         }, decision).then(resolve, reject)
       })
+    }).catch(async (error: unknown) => {
+      // The harness waits on this answer forever; end the turn instead of leaving it waiting.
+      await input.native.abort().catch(() => {})
+      throw new Error(`the Bridge could not ${decision} the ${interaction.request.kind} interaction: ${error instanceof Error ? error.message : String(error)}`)
     }))
     return byPolicy
       ? {
