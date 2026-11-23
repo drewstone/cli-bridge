@@ -90,6 +90,16 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
     try { cells[verb] = await run() } catch (error) { cells[verb] = red(error instanceof Error ? error.message : String(error)) }
   }
 
+  // A refused route is a seat or configuration fact for the whole row, not six failures.
+  const probe = await chat(bridge, model, cwd, 'Reply with OK only.', { session_id: marker(`${harness}-probe`) })
+  const refusal = probe.error as { type?: string; message?: string } | undefined
+  if (probe.status === 403 && refusal?.type === 'subscription_required') {
+    return Object.fromEntries(VERBS.map((verb) => [verb, { state: 'blocked', detail: `no subscription seat: ${refusal.message ?? ''}`.slice(0, 240) }])) as Record<Verb, Cell>
+  }
+  if (probe.status === 501 && /requires an explicit/u.test(refusal?.message ?? '')) {
+    return Object.fromEntries(VERBS.map((verb) => [verb, { state: 'blocked', detail: `set CONFORMANCE_MODEL_${harness.toUpperCase().replace(/-/gu, '_')}: ${refusal?.message ?? ''}`.slice(0, 240) }])) as Record<Verb, Cell>
+  }
+
   let toolTurn: Turn | undefined
   await guard('tool', async () => {
     const value = marker('tool'), file = `${value}.txt`
@@ -105,7 +115,8 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
   const native = created.status === 200 || created.status === 201
   const nativeRefusal = native ? '' : `POST /v1/sessions ${created.status}: ${(await created.text()).slice(0, 160)}`
   const nativeTurn = async (n: number, message: string) => {
-    const response = await call(bridge, `/v1/sessions/${sessionId}/turns`, { message, turn_id: `${sessionId}-turn-${n}` })
+    const id = `${sessionId}-turn-${n}`
+    const response = await call(bridge, `/v1/sessions/${sessionId}/turns`, { message, turn_id: id, run_id: `${id}-run`, execution_id: `${id}-execution` })
     const body = await response.json() as Record<string, any>
     if (response.status >= 300) throw new Error(`turn ${n} HTTP ${response.status}: ${JSON.stringify(body.error ?? body)}`)
     return await runText(bridge, String(body.run?.id))
@@ -132,7 +143,7 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
     const word = marker('steered')
     const turn = await call(bridge, `/v1/sessions/${sessionId}/turns`, {
       message: 'Count slowly from 1 to 200, one number per line, using your shell tool to sleep 1 second between numbers.',
-      turn_id: `${sessionId}-steer`,
+      turn_id: `${sessionId}-steer`, run_id: `${sessionId}-steer-run`, execution_id: `${sessionId}-steer-execution`,
     })
     const body = await turn.json() as Record<string, any>
     if (turn.status >= 300) return red(`turn HTTP ${turn.status}`)
