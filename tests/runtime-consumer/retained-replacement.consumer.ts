@@ -71,7 +71,7 @@ emit({ type: 'result', subtype: 'success', session_id: ${JSON.stringify(NATIVE_S
   const provider = createCliBridgeProvider({
     baseUrl: bridge.url,
     bearerToken: 'test-only',
-    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+    fetch: async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       if (String(input).endsWith('/v1/chat/completions') && typeof init?.body === 'string') sent.push(JSON.parse(init.body))
       return await fetch(input, init)
     },
@@ -115,7 +115,7 @@ emit({ type: 'result', subtype: 'success', session_id: ${JSON.stringify(NATIVE_S
   // The same replacement with only what the Bridge issued and the attachment in its own field runs,
   // resumes the aborted native session and mounts the coordination tools.
   const accepted = await drain(environment.stream({ prompt: 'The previous attempt failed; continue.', ...turn(8) }))
-  assert.equal(accepted.error, undefined, accepted.error?.message)
+  assert.equal(accepted.error?.message, undefined)
   assert.ok(JSON.stringify(accepted.events).includes(MARKER))
   const acceptedBody = sent.at(-1)!
   assert.deepEqual(acceptedBody.metadata, { retainedIdempotencyKey: idempotencyKey })
