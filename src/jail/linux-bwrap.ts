@@ -29,7 +29,10 @@ export class LinuxBwrapJail implements JailBackend {
       for (const [key, value] of Object.entries({ ...egress.env, ...policy.env })) argv.push('--setenv', key, value)
       argv.push('--chdir', spec.projectDir, '--die-with-parent', ...egress.prefix, bin, ...args)
       const activeEgress = egress
+      // --unshare-pid makes bwrap the reaper of the command, which runs as PID 2 and
+      // reaches the Bridge only as bwrap's exit status: 134 for a SIGABRT death.
       return { bin: BWRAP_BIN, args: argv, effectiveHome: policy.root, effectiveNativeStore: policy.effectiveNativeStore,
+        exitStatusCarriesSignal: true,
         cleanup: async () => { try { await activeEgress.cleanup() } finally { await policy.cleanup() } } }
     } catch (error) { try { await egress?.cleanup() } finally { await policy.cleanup() }; throw error }
   }

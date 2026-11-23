@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import {
-  containsCredentialBearingKey, containsSecretShapedValue,
+  credentialBearingKeyPath, containsSecretShapedValue,
   parseSafeRetainedMcp, parseSafeRetainedEnv, retainedPublicRecordSchema, snapshotRetainedAgentProfile,
 } from './retained/contract.js'
 import type { ChatRequest } from '../backends/types.js'
@@ -65,7 +65,7 @@ export function sanitizeLegacySessionMetadata(value: unknown): Record<string, un
       value
       && typeof value === 'object'
       && !Array.isArray(value)
-      && !containsCredentialBearingKey(value)
+      && credentialBearingKeyPath(value) === undefined
       && !containsSecretShapedValue(value)
     ) {
       metadata[key] = value
@@ -92,7 +92,7 @@ export function sanitizeLegacySessionMetadata(value: unknown): Record<string, un
     const parsed = retainedPublicRecordSchema.safeParse(candidate)
     if (
       parsed.success
-      && !containsCredentialBearingKey(parsed.data)
+      && credentialBearingKeyPath(parsed.data) === undefined
       && !containsSecretShapedValue(parsed.data)
     ) metadata[key] = parsed.data
   }

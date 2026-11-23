@@ -30,6 +30,7 @@ export interface JailedCommand {
   effectiveHome?: string
   /** Tear-down for backend-owned jail temp state; run once in release(). */
   cleanup?: () => Promise<void> | void
+  exitStatusCarriesSignal?: boolean
 }
 
 const ENABLE_HINT =
@@ -82,7 +83,11 @@ export async function applyJail(
   // still flows through sanitizeHostEnv at the spawn site, so the host
   // env allowlist continues to apply.
   const env = wrap.env ? { ...(opts.env ?? {}), ...wrap.env } : opts.env
-  return { bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup, effectiveNativeStore: wrap.effectiveNativeStore, effectiveHome: wrap.effectiveHome }
+  return {
+    bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup,
+    effectiveNativeStore: wrap.effectiveNativeStore, effectiveHome: wrap.effectiveHome,
+    ...(wrap.exitStatusCarriesSignal ? { exitStatusCarriesSignal: true } : {}),
+  }
 }
 
 /** Called after host sanitization; jail mappings take precedence over launcher environment. */

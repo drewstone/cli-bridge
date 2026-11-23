@@ -45,7 +45,7 @@ import { homedir, tmpdir } from 'node:os'
 import { contentToText, toolResult } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForHarnessExit } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
@@ -485,7 +485,7 @@ export class OpencodeBackend implements Backend {
 
       }
 
-      const closed = await waitForProcessClose(child)
+      const closed = await waitForHarnessExit(spawned)
       // A signal the bridge did not send, before the turn's last step finished: the runner was killed.
       // A wrapper that does not exec opencode (opencode-isolated runs it under `timeout`) reports that as exit 128+n.
       const killed = closed.signal ?? (closed.code !== null && closed.code > 128 ? `exit ${closed.code}` : null)

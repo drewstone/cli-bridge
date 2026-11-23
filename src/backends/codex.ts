@@ -34,7 +34,7 @@ import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { sanitizeHostEnv } from '../executors/host.js'
 import type { CodexCatalogReader, NativeModelFacts } from '../native-catalog.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
+import { assertSuccessfulHarnessExit, readProcessLines, waitForHarnessExit } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
@@ -450,7 +450,7 @@ export class CodexBackend implements Backend {
         }
       }
 
-      const closed = await waitForProcessClose(child)
+      const closed = await waitForHarnessExit(spawned)
       // A signal the bridge did not send, before the turn's terminal event: the runner was killed.
       if (!sawTerminal && closed.signal !== null) watch.exit = closed.signal
       if (usage) yield { usage }

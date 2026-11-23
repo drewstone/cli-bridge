@@ -146,7 +146,8 @@ export function containsSecretShapedValue(value: unknown): boolean {
 export function parseSafePublicRecord(value: unknown, label: string): Record<string, unknown> {
   const parsed = retainedPublicRecordSchema.safeParse(value ?? {})
   if (!parsed.success) throw new Error(`${label} exceeds retained request bounds`)
-  if (containsCredentialBearingKey(parsed.data)) throw new Error(`${label} contains a credential-bearing key`)
+  const credentialKey = credentialBearingKeyPath(parsed.data)
+  if (credentialKey !== undefined) throw new Error(`${label} contains a credential-bearing key at ${credentialKey}`)
   if (containsSecretShapedValue(parsed.data)) throw new Error(`${label} contains a secret-shaped value`)
   return parsed.data
 }
@@ -173,8 +174,9 @@ export function parseSafeRetainedMcp(value: unknown, label = 'retained MCP confi
     }
     const server = value as Record<string, unknown>
     if (server.metadata !== undefined) {
-      if (containsCredentialBearingKey(server.metadata)) {
-        throw new Error(`${label} server ${JSON.stringify(name)} metadata contains a credential-bearing key`)
+      const credentialKey = credentialBearingKeyPath(server.metadata)
+      if (credentialKey !== undefined) {
+        throw new Error(`${label} server ${JSON.stringify(name)} metadata contains a credential-bearing key at ${credentialKey}`)
       }
       if (containsSecretShapedValue(server.metadata)) {
         throw new Error(`${label} server ${JSON.stringify(name)} metadata contains a secret-shaped value`)
@@ -220,8 +222,9 @@ export function parseSafeRetainedMetadata(value: unknown): Record<string, unknow
 /** Caller metadata cannot shadow the canonical request channels or credential slots. */
 export function parseSafeCallerMetadata(value: unknown): Record<string, unknown> {
   const parsed = parseSafePublicRecord(value, 'retained metadata')
-  if (containsUnsafeMetadataKey(parsed)) {
-    throw new Error('retained metadata contains an unsupported behavioral or credential key')
+  const unsafeKey = unsafeMetadataKeyPath(parsed)
+  if (unsafeKey !== undefined) {
+    throw new Error(`retained metadata contains an unsupported behavioral or credential key at ${unsafeKey}`)
   }
   return parsed
 }
@@ -243,8 +246,14 @@ export function parseSafeRetainedEnv(value: unknown): Record<string, string> {
 
 export function snapshotRetainedAgentProfile(value: unknown): AgentProfile {
   const profile = snapshotAgentProfile(value)
-  if (containsCredentialBearingProfileOpenKey(profile)) {
-    throw new Error('agent_profile open metadata contains a credential-bearing key')
+  for (const [path, record] of profileOpenRecords(profile)) {
+    const credentialKey = credentialBearingKeyPath(record, path)
+    if (credentialKey !== undefined) {
+      throw new Error(`agent_profile open metadata contains a credential-bearing key at ${credentialKey}`)
+    }
+    if (containsSecretShapedValue(record)) {
+      throw new Error(`agent_profile open metadata contains a secret-shaped value at ${keyPathText(path)}`)
+    }
   }
   return profile
 }
@@ -287,27 +296,64 @@ export function isBoundedJsonValue(value: unknown): boolean {
   }
 }
 
-export function containsCredentialBearingKey(value: unknown, ancestors = new Set<object>()): boolean {
-  if (value === null || typeof value !== 'object' || ancestors.has(value)) return false
-  const nextAncestors = new Set(ancestors).add(value)
-  if (Array.isArray(value)) return value.some((entry) => containsCredentialBearingKey(entry, nextAncestors))
-  return Object.entries(value).some(([key, child]) => {
-    if (isCredentialBearingProfileConfigName(key)) return true
-    return containsCredentialBearingKey(child, nextAncestors)
-  })
+type KeyPath = ReadonlyArray<string | number>
+
+/**
+ * The first key under `value` that names credential material, rendered as a
+ * quoted path such as `"backend.headers.Authorization"`, so a refused caller can
+ * find the field it sent. Only key names enter the path; a key that itself looks
+ * like credential material is shown as `<redacted>`.
+ */
+export function credentialBearingKeyPath(value: unknown, prefix: KeyPath = []): string | undefined {
+  const found = findKeyPath(value, prefix, isCredentialBearingProfileConfigName)
+  return found === undefined ? undefined : keyPathText(found)
 }
 
-function containsCredentialBearingProfileOpenKey(profile: AgentProfile): boolean {
-  const openRecords: unknown[] = [
-    profile.metadata,
-    profile.model?.metadata,
-    profile.extensions,
-    ...Object.values(profile.subagents ?? {}).map(subagent => subagent.metadata),
-    ...Object.values(profile.modes ?? {}).map(mode => mode.metadata),
-    ...Object.values(profile.mcp ?? {}).map(server => server.metadata),
+function findKeyPath(
+  value: unknown,
+  path: KeyPath,
+  refused: (key: string) => boolean,
+  ancestors = new Set<object>(),
+): KeyPath | undefined {
+  if (value === null || typeof value !== 'object' || ancestors.has(value)) return undefined
+  const nextAncestors = new Set(ancestors).add(value)
+  if (Array.isArray(value)) {
+    for (const [index, entry] of value.entries()) {
+      const found = findKeyPath(entry, [...path, index], refused, nextAncestors)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (refused(key)) return [...path, key]
+    const found = findKeyPath(child, [...path, key], refused, nextAncestors)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+function keyPathText(path: KeyPath): string {
+  const text = path.map((segment, index) => {
+    if (typeof segment === 'number') return `[${segment}]`
+    const name = agentProfilePublicConfigValueSchema.safeParse({ kind: 'public', value: segment }).success
+      ? segment
+      : '<redacted>'
+    return index === 0 ? name : `.${name}`
+  }).join('')
+  return JSON.stringify(text)
+}
+
+function profileOpenRecords(profile: AgentProfile): Array<[KeyPath, unknown]> {
+  const named = (field: string, records: Record<string, { metadata?: unknown }> | undefined): Array<[KeyPath, unknown]> =>
+    Object.entries(records ?? {}).map(([name, entry]) => [[field, name, 'metadata'], entry.metadata])
+  return [
+    [['metadata'], profile.metadata],
+    [['model', 'metadata'], profile.model?.metadata],
+    [['extensions'], profile.extensions],
+    ...named('subagents', profile.subagents),
+    ...named('modes', profile.modes),
+    ...named('mcp', profile.mcp),
   ]
-  return openRecords.some(record =>
-    containsCredentialBearingKey(record) || containsSecretShapedValue(record))
 }
 
 function canonicalMcpServerForValidation(server: Record<string, unknown>): Record<string, unknown> {
@@ -347,19 +393,14 @@ function isRetainedProcessControlEnvironmentName(name: string): boolean {
     || retainedPiProcessControlEnvironmentNames.has(normalized)
 }
 
-function containsUnsafeMetadataKey(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(containsUnsafeMetadataKey)
-  if (!value || typeof value !== 'object') return false
-  return Object.entries(value).some(([key, child]) => {
+function unsafeMetadataKeyPath(value: unknown): string | undefined {
+  const found = findKeyPath(value, [], (key) => {
     const normalized = key
       .replace(/([a-z0-9])([A-Z])/gu, '$1_$2')
       .replace(/[^A-Za-z0-9]+/gu, '_')
       .replace(/^_+|_+$/gu, '')
       .toLowerCase()
-    if (
-      isCredentialBearingProfileConfigName(key)
-      || retainedMetadataBehavioralKeys.has(normalized)
-    ) return true
-    return containsUnsafeMetadataKey(child)
+    return isCredentialBearingProfileConfigName(key) || retainedMetadataBehavioralKeys.has(normalized)
   })
+  return found === undefined ? undefined : keyPathText(found)
 }
