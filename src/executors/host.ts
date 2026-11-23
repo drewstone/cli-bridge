@@ -273,6 +273,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
       terminate,
       release,
       spawnError: () => spawnError,
+      ...(jailed.exitStatusCarriesSignal ? { exitStatusCarriesSignal: true } : {}),
     }
     return result
   } catch (err) {

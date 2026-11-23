@@ -114,7 +114,7 @@ import {
 import { contentToText, extractImageAttachments } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
-import { readProcessLines, waitForProcessClose } from './process-lines.js'
+import { readProcessLines, waitForHarnessExit } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { registerJailReadable, registerJailWritable } from '../jail/index.js'
@@ -728,7 +728,7 @@ export class PrimeBackend implements Backend {
         // additions — drop silently; the stream may gain event types.
       }
 
-      const { code: exitCode, signal: exitSignal } = await waitForProcessClose(child)
+      const { code: exitCode, signal: exitSignal } = await waitForHarnessExit(spawned)
       signal.removeEventListener('abort', onAbort)
       releaseSpawner()
 

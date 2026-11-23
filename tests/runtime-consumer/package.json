@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsx --test bridge-cache-accounting.consumer.ts capability-discovery.consumer.ts sse-reencoder.consumer.ts"
+    "test": "tsx --test bridge-cache-accounting.consumer.ts capability-discovery.consumer.ts retained-replacement.consumer.ts sse-reencoder.consumer.ts"
   },
   "devDependencies": {
     "@tangle-network/agent-core": "1.0.4",

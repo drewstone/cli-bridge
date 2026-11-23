@@ -100,6 +100,11 @@ export interface JailWrap {
   effectiveHome?: string
   /** Tear down any backend-owned temp state (e.g. an SBPL profile file). */
   cleanup?: () => Promise<void> | void
+  /**
+   * The wrapper is the command's PID-namespace parent and exits 128+N when the
+   * command dies of signal N, so the spawned process never shows the signal itself.
+   */
+  exitStatusCarriesSignal?: boolean
 }
 
 export interface JailBackend {
