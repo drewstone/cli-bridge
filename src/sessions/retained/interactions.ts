@@ -66,7 +66,7 @@ export class RetainedInteractions {
       requestDigest: input.request.requestDigest,
     }
     const response = decision === 'allow'
-      ? { id: input.request.id, outcome: 'accepted' as const, data: { [PERMISSION_GRANT_FIELD]: 'allow_once' } }
+      ? { id: input.request.id, outcome: 'accepted' as const, data: { [PERMISSION_GRANT_FIELD]: ['allow_once'] } }
       : { id: input.request.id, outcome: 'cancelled' as const }
     const command = {
       operationId: canonicalCandidateDigest({ kind: decision === 'allow' ? 'retained-auto-allow' : 'retained-auto-deny', binding }),

@@ -180,7 +180,7 @@ describe('retained Claude session: who answers a permission prompt', () => {
       answered = true
       const request = inner.request
       const binding = { ...request.binding, requestDigest: request.requestDigest }
-      const response = { id: String(request.id), outcome: 'accepted' as const, data: { grant: 'allow_once' } }
+      const response = { id: String(request.id), outcome: 'accepted' as const, data: { grant: ['allow_once'] } }
       const reply = await call(`/v1/runs/${encodeURIComponent(runId)}/interactions/${encodeURIComponent(request.id)}/respond`, {
         operationId: canonicalCandidateDigest({ kind: 'test-allow', binding }),
         binding,
