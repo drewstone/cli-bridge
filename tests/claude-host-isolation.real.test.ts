@@ -6,7 +6,10 @@
  * CLAUDE.md, auto-memory, skills, commands, subagents, MCP servers or hooks.
  * On 2026-10-14 a profile run on beelink2 loaded the host CLAUDE.md and called
  * the host's `operate` skill, because the CLI ran with the operator's full user
- * layer.
+ * layer. Leaving that layer out also leaves out its hooks, so a guard a profile
+ * run needs travels in the profile: `AgentProfile.hooks` reaches the CLI only
+ * through the generated `--settings` file, and its PreToolUse hook must still
+ * refuse a Bash call.
  *
  * Opt-in with CLI_BRIDGE_REAL_CLAUDE_TESTS=1 because it runs the installed
  * `claude` binary (or CLAUDE_BIN). It needs no login and spends nothing: the CLI
@@ -22,7 +25,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { ClaudeBackend } from '../src/backends/claude.js'
-import type { ChatRequest } from '../src/backends/types.js'
+import type { ChatDelta, ChatRequest } from '../src/backends/types.js'
 import { hostSpawner } from '../src/executors/host.js'
 import type { Spawner } from '../src/executors/types.js'
 
@@ -30,8 +33,12 @@ const describeReal = process.env.CLI_BRIDGE_REAL_CLAUDE_TESTS === '1' ? describe
 
 interface Recorded { path: string; authorization: string | undefined; body: string }
 
-/** Answers every Messages call with one streamed "ok" and keeps the request. */
-function startApiStandIn(recorded: Recorded[]): Promise<Server> {
+/**
+ * Answers the turn's first Messages call that offers Bash with one Bash call
+ * running `bashCommand`, every other call with one streamed "ok", and keeps
+ * each request.
+ */
+function startApiStandIn(recorded: Recorded[], bashCommand: string): Promise<Server> {
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (chunk: Buffer) => chunks.push(chunk))
@@ -42,13 +49,24 @@ function startApiStandIn(recorded: Recorded[]): Promise<Server> {
         res.writeHead(200, { 'content-type': 'application/json' }).end('{"input_tokens":1}')
         return
       }
-      const model = (JSON.parse(body) as { model?: string }).model ?? 'model'
+      const request = JSON.parse(body) as { model?: string; tools?: Array<{ name?: string }>; messages?: Array<{ content?: unknown }> }
+      const model = request.model ?? 'model'
+      const answered = (request.messages ?? []).some((message) => Array.isArray(message.content) && message.content.some((part: { type?: string }) => part.type === 'tool_result'))
+      const callsBash = request.tools?.some((tool) => tool.name === 'Bash') === true && !answered
+      const block: Array<[string, unknown]> = callsBash
+        ? [
+            ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_guard_canary', name: 'Bash', input: {} } }],
+            ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify({ command: bashCommand, description: 'guard canary' }) } }],
+          ]
+        : [
+            ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+            ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } }],
+          ]
       const events: Array<[string, unknown]> = [
         ['message_start', { type: 'message_start', message: { id: 'msg_canary', type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } }],
-        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
-        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } }],
+        ...block,
         ['content_block_stop', { type: 'content_block_stop', index: 0 }],
-        ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } }],
+        ['message_delta', { type: 'message_delta', delta: { stop_reason: callsBash ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } }],
         ['message_stop', { type: 'message_stop' }],
       ]
       res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -92,15 +110,22 @@ describeReal('Claude host isolation against the real CLI', () => {
   let root: string
   let init: Record<string, unknown> = {}
   let content = ''
+  const toolResults: NonNullable<ChatDelta['tool_results']> = []
 
   beforeAll(async () => {
-    server = await startApiStandIn(recorded)
     root = mkdtempSync(join(tmpdir(), 'claude-host-isolation-'))
+    server = await startApiStandIn(recorded, `touch ${join(root, 'guarded-command-ran')}`)
     const home = join(root, 'home')
     const workspace = join(root, 'workspace')
     const hookMarker = join(root, 'host-hook-fired')
     mkdirSync(workspace, { recursive: true })
     plantHostUserLayer(home, workspace, hookMarker)
+    // The profile's guard: it keeps the PreToolUse input and refuses the call
+    // with the same decision shape an operator's own guard hook returns.
+    const guard = join(root, 'profile-guard.sh')
+    const refusal = { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'PROFILE_GUARD_CANARY refused this command' } }
+    writeFileSync(guard, `#!/bin/sh\ncat > ${JSON.stringify(join(root, 'profile-guard-input.json'))}\nprintf '%s\\n' '${JSON.stringify(refusal)}'\n`)
+    chmodSync(guard, 0o755)
     // A workspace file the run must still see: the project layer stays loaded.
     mkdirSync(join(workspace, '.claude/skills/project-skill'), { recursive: true })
     writeFileSync(join(workspace, '.claude/skills/project-skill/SKILL.md'), '---\nname: project-skill\ndescription: PROJECT_SKILL_CANARY workspace skill\n---\nworkspace skill\n')
@@ -139,8 +164,9 @@ describeReal('Claude host isolation against the real CLI', () => {
       messages: [{ role: 'user', content: 'say ok' }],
       agent_profile: {
         name: 'host-isolation-canary',
-        // Reaches the CLI only through the profile's generated --settings file.
+        // Both reach the CLI only through the profile's generated --settings file.
         tools: { WebFetch: false },
+        hooks: { PreToolUse: [{ matcher: 'Bash', command: guard }] },
         resources: {
           instructions: 'PROFILE_INSTRUCTIONS_CANARY: profile instructions.',
           skills: [{ kind: 'inline', name: 'profile-skill', content: '---\nname: profile-skill\ndescription: PROFILE_SKILL_CANARY profile skill\n---\nprofile skill\n' }],
@@ -148,7 +174,10 @@ describeReal('Claude host isolation against the real CLI', () => {
         },
       },
     }
-    for await (const delta of backend.chat(req, null, new AbortController().signal)) content += delta.content ?? ''
+    for await (const delta of backend.chat(req, null, new AbortController().signal)) {
+      content += delta.content ?? ''
+      toolResults.push(...(delta.tool_results ?? []))
+    }
     for (const line of readFileSync(streamCopy, 'utf8').split('\n')) {
       if (!line.trim()) continue
       const event = JSON.parse(line) as Record<string, unknown>
@@ -201,5 +230,12 @@ describeReal('Claude host isolation against the real CLI', () => {
     expect(init.agents).not.toContain('user-agent')
     expect(init.mcp_servers).toEqual([])
     expect(existsSync(join(root, 'host-hook-fired'))).toBe(false)
+  })
+
+  it("refuses a Bash call through the profile's own PreToolUse hook", () => {
+    const input = JSON.parse(readFileSync(join(root, 'profile-guard-input.json'), 'utf8')) as { hook_event_name?: string; tool_name?: string; tool_input?: { command?: string } }
+    expect(input).toMatchObject({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: `touch ${join(root, 'guarded-command-ran')}` } })
+    expect(existsSync(join(root, 'guarded-command-ran'))).toBe(false)
+    expect(toolResults).toEqual([expect.objectContaining({ id: 'toolu_guard_canary', name: 'Bash', status: 'error', error: expect.stringContaining('PROFILE_GUARD_CANARY') })])
   })
 })

@@ -1,7 +1,8 @@
 /** Trusted host scopes grant routes; authored profiles and HTTP requests cannot register one. */
+import { configuredJailBackend, JAIL_HOST_EGRESS_ENV, type LinuxJailBackend } from './config.js'
 import type { AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import { BackendError, type ChatRequest, type McpServerSpec } from './backends/types.js'
-import { claimTrustedHostService, registerTrustedHostService, type TrustedHostServiceOwner } from './jail/egress-relay.js'
+import { claimTcpHostService, claimTrustedHostService, registerTrustedHostService, type TrustedHostServiceOwner } from './jail/egress-relay.js'
 import { selectJailBackend } from './jail/index.js'
 import { privateMcpCredentials, protectExecutionValues, resolvePrivateMcpValue } from './private-mcp.js'
 import { isSafeWireIdentifier } from './runs/identifiers.js'
@@ -18,28 +19,33 @@ function refused(message: string): never {
 }
 
 /** The same selected backend later consumes JailSpec; native URLs never assume a shim on other transports. */
-async function relaySpec(request: ChatRequest, backend: string): Promise<JailSpec | undefined> {
+async function relaySpec(request: ChatRequest, backend: string, backendChoice: LinuxJailBackend): Promise<JailSpec | undefined> {
   const spec = request.jailSpec
   if (!spec) return undefined
-  const jail = selectJailBackend()
+  const jail = selectJailBackend(process.platform, request.jailSpec?.backend ?? backendChoice)
   if (jail.name === 'seatbelt') return undefined // Preserve the current Mac native URLs; no shim listener is installed there.
   if (!['claude', 'claude-code', 'codex', 'opencode'].includes(backend) || request.execution?.kind === 'sandbox') {
     return refused('This backend cannot consume trusted private host-service routing')
   }
-  if (jail.name !== 'bwrap' || !await jail.isAvailable()) return refused('Trusted host-service routing requires the available Linux bwrap transport')
+  if (!jail.networkCapability || !await jail.isAvailable()) return refused('Trusted host-service routing requires an available Linux jail transport')
+  if (jail.networkCapability === 'tcp-port' && !spec.hostEgressEnforced)
+    return refused(`Trusted TCP host-service routing requires ${JAIL_HOST_EGRESS_ENV}=1`)
+  spec.backend ??= backendChoice
   spec.requireEnforcement = true
   return spec
 }
 
 // Callers bind only declared runtime attachments, so the request already carries its attachment identity.
-function bindClaim(
+async function bindClaim(
   request: ChatRequest, spec: JailSpec, alias: string, binding: Omit<Binding, 'nativeUrl'>,
   owner: TrustedHostServiceOwner, headers?: Readonly<Record<string, string>>,
-): () => void {
+): Promise<() => void> {
   const identity = request.runtime_attachments!
+  if (privateBindings.get(identity)?.has(alias)) return refused('A private MCP alias already has a trusted host-service binding')
+  const claim = selectJailBackend(process.platform, spec.backend ?? 'bwrap').networkCapability === 'tcp-port'
+    ? await claimTcpHostService(owner, headers) : claimTrustedHostService(owner, headers)
   const bindings = privateBindings.get(identity) ?? new Map<string, Binding>()
-  if (bindings.has(alias)) return refused('A private MCP alias already has a trusted host-service binding')
-  const claim = claimTrustedHostService(owner, headers)
+  if (bindings.has(alias)) { claim.revoke(); return refused('A private MCP alias already has a trusted host-service binding') }
   let releaseProtected = () => {}
   const release = () => {
     try { claim.revoke() } finally {
@@ -60,9 +66,9 @@ function bindClaim(
 }
 
 /** Bind every entry or none: a refusal releases the bindings made before it. */
-function bindEach<T>(entries: readonly T[], bind: (entry: T) => () => void): () => void {
+async function bindEach<T>(entries: readonly T[], bind: (entry: T) => (() => void) | Promise<() => void>): Promise<() => void> {
   const releases: Array<() => void> = []
-  try { for (const entry of entries) releases.push(bind(entry)) }
+  try { for (const entry of entries) releases.push(await bind(entry)) }
   catch (error) { for (const release of releases) release(); throw error }
   return () => { for (const release of releases.splice(0)) release() }
 }
@@ -85,7 +91,7 @@ export function privateHostServiceMcp(request: ChatRequest, servers: Record<stri
   return rewritten
 }
 
-export function createHostServiceBindings(bearerRequired: boolean, quiet = false) {
+export function createHostServiceBindings(bearerRequired: boolean, quiet = false, backendChoice = configuredJailBackend()) {
   // Operator audit context, silenced with startServer's startup lines. Run ids here are never authority.
   const audit = (event: 'register' | 'claim', runIds: readonly string[], url: string) => {
     if (!quiet) process.stderr.write(`[host-services] private-mcp ${event} run=${runIds.join(',')} endpoint=${new URL(url).host}\n`)
@@ -151,7 +157,7 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
     async prepareCoordination(request: ChatRequest, backend: string): Promise<() => void> {
       const attachments = Object.entries(request.runtime_attachments?.mcp ?? {}).filter(([, server]) =>
         Object.values(server.headers ?? {}).some((value) => value.kind === 'secret-ref' && value.key === RUNTIME_COORDINATION_ENV_NAME))
-      const spec = attachments.length ? await relaySpec(request, backend) : undefined
+      const spec = attachments.length ? await relaySpec(request, backend, backendChoice) : undefined
       if (!spec) return () => {}
       return bindEach(attachments, ([alias, server]) => {
         const authorization = Object.entries(server.headers ?? {}).filter(([name]) => name.toLowerCase() === 'authorization')
@@ -171,17 +177,17 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
       // A sandbox request carries no jailSpec unless the sandbox backend runs it, whose loopback is its own.
       const authored = Object.entries(request.agent_profile?.mcp ?? {}).find(([, server]) => URL.canParse(server.url ?? '')
         && ['localhost', '127.0.0.1', '[::1]'].includes(new URL(server.url!).hostname))?.[0]
-      const jail = authored && request.jailSpec && backend !== 'sandbox' ? selectJailBackend() : undefined
-      if (jail?.name === 'bwrap' && await jail.isAvailable())
+      const jail = authored && request.jailSpec && backend !== 'sandbox' ? selectJailBackend(process.platform, request.jailSpec?.backend ?? backendChoice) : undefined
+      if (jail?.networkCapability && await jail.isAvailable())
         return refused(`MCP server ${JSON.stringify(authored)} is on host loopback; a jailed seat reaches it only as a runtime attachment to a live host-registered private endpoint`)
       const bound = request.runtime_attachments && privateBindings.get(request.runtime_attachments)
       const attachments = Object.entries(request.runtime_attachments?.mcp ?? {})
         .filter(([alias, server]) => /^http:/iu.test(server.url ?? '') && !bound?.has(alias))
-      const spec = attachments.length ? await relaySpec(request, backend) : undefined
+      const spec = attachments.length ? await relaySpec(request, backend, backendChoice) : undefined
       if (!spec) return () => {}
       if (!bearerRequired) return refused('Private MCP routing requires a bearer-authenticated Bridge')
       const destination = { backend, privateMcpConfig: true, secrets: privateMcpCredentials(request) }
-      return bindEach(attachments, ([alias, server]) => {
+      return bindEach(attachments, async ([alias, server]) => {
         const endpoint = privateEndpoints.get(server.url!)
         if (!endpoint) return refused(`Plain-HTTP MCP attachment ${JSON.stringify(alias)} in the jail requires a live host-registered private endpoint`)
         const headers: Record<string, string> = {}
@@ -191,23 +197,23 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
           headers[name] = resolvePrivateMcpValue(value, destination) ?? refused('A private MCP attachment secret was not resolved by its host')
         }
         const strip = Object.keys(headers).map((name) => name.toLowerCase())
-        const release = bindClaim(request, spec, alias, { canonicalUrl: server.url!, field: 'url', strip }, endpoint.owner, headers)
+        const release = await bindClaim(request, spec, alias, { canonicalUrl: server.url!, field: 'url', strip }, endpoint.owner, headers)
         audit('claim', [...endpoint.runIds.values()], server.url!)
         return release
       })
     },
     async prepareHub(request: ChatRequest, backend: string, servers: Record<string, AgentProfileMcpServer>, tokens: readonly string[]): Promise<() => void> {
-      const spec = await relaySpec(request, backend)
+      const spec = await relaySpec(request, backend, backendChoice)
       if (!spec) return () => {}
       if (closed || !listener) return refused('Hub host-service routing requires this Bridge actual loopback listener')
-      return bindEach(Object.entries(servers), ([alias, server]) => {
+      return bindEach(Object.entries(servers), async ([alias, server]) => {
         const env = server.env?.TANGLE_HUB_MCP_ENDPOINT
         const raw = server.url ?? (env?.kind === 'public' ? env.value : undefined)
         const expected = tokens.map((token) => `${listener}/hub/mcp/grants/${token}`).find((url) => url === raw)
         if (!expected) return refused('The Hub MCP configuration does not name a grant on this owned listener')
         const service = registerTrustedHostService({ url: expected, paths: { '/tools': ['GET'], '/call': ['POST'] } })
         let release: () => void
-        try { release = bindClaim(request, spec, alias, { canonicalUrl: expected, field: server.url ? 'url' : 'hub-env', strip: [] }, service.owner) }
+        try { release = await bindClaim(request, spec, alias, { canonicalUrl: expected, field: server.url ? 'url' : 'hub-env', strip: [] }, service.owner) }
         catch (error) { service.revoke(); throw error }
         const cleanup = () => { if (hubReleases.delete(cleanup)) { try { release() } finally { service.revoke() } } }
         hubReleases.add(cleanup)

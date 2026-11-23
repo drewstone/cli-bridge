@@ -1,7 +1,8 @@
+import { isWithin } from '../jail/types.js'
 import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { join, resolve } from 'node:path'
 import { PassThrough, Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { zstdDecompress } from 'node:zlib'
@@ -1717,11 +1718,6 @@ function provisionSessionDirectory(
   mkdirSync(sessionDir, { recursive: true, mode: 0o700 })
   chmodSync(sessionDir, 0o700)
   return sessionDir
-}
-
-function isWithin(base: string, candidate: string): boolean {
-  const rel = relative(base, candidate)
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
 function isHopByHopHeader(name: string): boolean {

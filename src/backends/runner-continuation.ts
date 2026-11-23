@@ -9,7 +9,7 @@ import type { SpawnResult } from '../executors/types.js'
 import type { BridgeMode } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { contentToText } from './content.js'
-import type { ChatDelta, ChatRequest } from './types.js'
+import { terminalOutcome, type ChatDelta, type ChatRequest } from './types.js'
 
 /** What one runner process showed before it ended, for deciding a continuation. */
 export interface RunnerWatch {
@@ -29,6 +29,8 @@ export interface RunnerInterruption {
   exit?: string
   nativeSessionId: string
   openTools: ReadonlyMap<string, string>
+  /** On bridge restart this comes from the durable runner record, before request reconstruction. */
+  recordedMaxTokens?: number | null
 }
 
 /** A backend that runs one native runner process per call and resumes `session.internalId` natively. */
@@ -49,7 +51,11 @@ export function runnerDelta(
   backend: string, pid: number, spawned: Pick<SpawnResult, 'scope'>, mode: BridgeMode, cwd: string | undefined, req: ChatRequest,
 ): ChatDelta {
   const system = (req.messages ?? []).filter((m) => m.role === 'system').map((m) => contentToText(m.content).match(/[\s\S]{1,16000}/gu) ?? [])
-  return { runner: { backend, pid, ...(spawned.scope ? { scope: spawned.scope } : {}), mode, ...(cwd ? { cwd } : {}), ...(system.length ? { system } : {}) } }
+  const budget = backend === 'opencode' ? { max_tokens: req.max_tokens ?? null } : {}
+  return { runner: {
+    backend, pid, mode, ...budget, ...(spawned.scope ? { scope: spawned.scope } : {}),
+    ...(cwd ? { cwd } : {}), ...(system.length ? { system } : {}),
+  } }
 }
 
 /**
@@ -81,6 +87,14 @@ export async function* chatContinuing(
 export async function* continueTurn(
   backend: NativeResumeBackend, req: ChatRequest, session: SessionRecord | null, interruption: RunnerInterruption, signal: AbortSignal,
 ): AsyncIterable<ChatDelta> {
+  // A drained process cannot tell us which grants its provider already consumed.
+  // A legacy OpenCode record also lacks proof that its request was uncapped.
+  const originalCap = interruption.reason === 'bridge_restart' ? interruption.recordedMaxTokens : req.max_tokens ?? null
+  if (backend.name === 'opencode' && originalCap !== null) {
+    const message = 'The runner was interrupted and its remaining output token budget is unknown. Automatic continuation was refused.'
+    yield { ...terminalOutcome('opencode', message, false), internal_session_id: interruption.nativeSessionId }
+    return
+  }
   const tools = [...interruption.openTools].map(([id, name]) => ({ id, name }))
   yield { continuation: {
     reason: interruption.reason,

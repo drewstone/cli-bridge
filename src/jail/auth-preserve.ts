@@ -72,6 +72,14 @@ const CLAUDE_SEED_ENTRIES = ['.credentials.json', 'credentials.json', 'settings.
 /** OpenCode stores credentials beside a writable database and log directory. */
 const OPENCODE_SEED_ENTRIES = ['auth.json'] as const
 
+/**
+ * OpenCode 1.19 writes `.gitignore` (and plugin install files) into its global config directory at
+ * startup, so a read-only bind exits every jailed turn with `FileSystem.writeFile` before any model
+ * call. Seed the user's config surface; OpenCode recreates its own install files in the jail.
+ */
+const OPENCODE_CONFIG_SEED_ENTRIES = ['opencode.json', 'opencode.jsonc', 'config.json', 'AGENTS.md',
+  'agent', 'agents', 'command', 'commands', 'mode', 'modes', 'plugin', 'plugins', 'tool', 'tools', 'themes'] as const
+
 /** The HOME the spawned CLIs actually read, honoring a cli-bridge-set HOME
  * override (matches how the backends resolve config/auth at runtime). */
 export function backendHome(): string {
@@ -129,9 +137,9 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
     // OpenCode writes its database and logs below XDG_DATA_HOME before a turn.
     // Seed only auth.json so the jailed data directory stays small and writable.
     for (const entry of out) {
-      if (entry.jailRel !== '.local/share/opencode') continue
+      if (entry.jailRel !== '.local/share/opencode' && entry.jailRel !== '.config/opencode') continue
       entry.mode = 'seed-writable'
-      entry.only = [...OPENCODE_SEED_ENTRIES]
+      entry.only = [...(entry.jailRel === '.config/opencode' ? OPENCODE_CONFIG_SEED_ENTRIES : OPENCODE_SEED_ENTRIES)]
     }
   }
   if (backendName === 'kimi-code' || backendName === 'kimi') {
@@ -171,22 +179,27 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
 /** Snapshot each global config source at its original path, preserving dynamic includes while
  * translating paths whose meaning would change when HOME/XDG are redirected. Git parses every
  * source and verifies the serialized entries; values never pass through a shell or argv. */
-export async function gitConfigSources(cwd = process.cwd(), writablePaths: readonly string[] = []) {
+export async function gitConfigSources(cwd = process.cwd(), writablePaths: readonly string[] = [], samePaths = false) {
   const home = backendHome(), xdg = process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config')
   const roots: Array<[string, string]> = process.env.GIT_CONFIG_GLOBAL ? [[resolve(cwd, process.env.GIT_CONFIG_GLOBAL), '.gitconfig']] :
     [[join(home, '.gitconfig'), '.gitconfig'], [join(xdg, 'git/config'), '.config/git/config']]
   const repo = spawnSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
   const root = repo.status === 0 ? repo.stdout.trim() : cwd
-  const prepared = new Map<string, string>(), hooks = new Set<string>()
+  type Entry = { key: string; value: string | undefined }
+  const prepared = new Map<string, Entry[]>(), hooks = new Set<string>()
   const query = (file: string, ...args: string[]) => {
     const result = spawnSync('git', ['config', '--file', file, '--no-includes', '--null', ...args], { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'ignore'] })
     if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error('Could not prepare global Git configuration for confinement')
     return result.stdout
   }
   const quote = (value: string) => `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(/\u0008/g, '\\b')}"`
+  const serialize = (entries: Entry[]) => entries.map(({ key, value }) => {
+    const first = key.indexOf('.'), last = key.lastIndexOf('.')
+    return `[${key.slice(0, first)}${last === first ? '' : ` ${quote(key.slice(first + 1, last))}`}]\n${key.slice(last + 1)}${value === undefined ? '' : ` = ${quote(value)}`}\n`
+  }).join('')
   const visit = (file: string) => {
     if (prepared.has(file) || !existsSync(file)) return
-    prepared.set(file, '')
+    prepared.set(file, [])
     const typed = new Map<string, string[]>()
     const entries = query(file, '--list').split('\0').filter(Boolean).map((entry) => {
       const at = entry.indexOf('\n')
@@ -205,14 +218,11 @@ export async function gitConfigSources(cwd = process.cwd(), writablePaths: reado
       return { key, value }
     // A jail has no SSH route under any network policy, so a rewrite to SSH can only break a push.
     }).filter(({ key }) => !/^url\.(?:ssh:\/\/|[^.@/]+@).*\.(?:push)?insteadof$/iu.test(key))
-    const text = entries.map(({ key, value }) => {
-      const first = key.indexOf('.'), last = key.lastIndexOf('.')
-      return `[${key.slice(0, first)}${last === first ? '' : ` ${quote(key.slice(first + 1, last))}`}]\n${key.slice(last + 1)}${value === undefined ? '' : ` = ${quote(value)}`}\n`
-    }).join('')
+    const text = serialize(entries)
     const check = spawnSync('git', ['config', '--file', '-', '--no-includes', '--null', '--list'], { input: text, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] })
     const expected = entries.map(({ key, value }) => `${key}${value === undefined ? '' : `\n${value}`}\0`).join('')
     if (check.error || check.status !== 0 || check.stdout !== expected) throw new Error('Global Git configuration could not be preserved exactly')
-    prepared.set(file, text)
+    prepared.set(file, entries)
   }
   for (const [file] of roots) visit(file)
   const writable = [cwd, ...writablePaths].map(canonicalizeJailPath)
@@ -224,16 +234,26 @@ export async function gitConfigSources(cwd = process.cwd(), writablePaths: reado
   await mkdir(parent, { recursive: true })
   const directory = await mkdtemp(join(parent, 'cli-bridge-git-'))
   const cleanup = () => rm(directory, { recursive: true, force: true })
+  const snapshots = new Map([...prepared.keys()].map((path, i) => [path, join(directory, String(i))]))
+  const global = samePaths && prepared.size > 0 ? join(directory, 'global') : undefined
+  const relocate = (entries: Entry[]) => entries.map(({ key, value }) => ({ key,
+    value: samePaths && /^include(?:if\..*)?\.path$/i.test(key) && value ? snapshots.get(value) ?? value : value }))
   const binds: Array<{ source: string; destination: string }> = [], sources: JailAuthSource[] = []
   try {
-    for (const [destination, text] of prepared) {
-      const source = join(directory, String(binds.length))
-      await writeFile(source, text, { mode: 0o600 }); binds.push({ source, destination })
-      for (const [file, jailRel] of roots) if (file === destination) sources.push({ source, jailRel, mode: 'read-only' })
+    for (const [destination, entries] of prepared) {
+      const source = snapshots.get(destination)!
+      const text = serialize(relocate(entries))
+      await writeFile(source, text, { mode: 0o600 }); binds.push({ source, destination: samePaths ? source : destination })
+      if (!samePaths) for (const [file, jailRel] of roots) if (file === destination) sources.push({ source, jailRel, mode: 'read-only' })
+    }
+    if (global) {
+      // Git reads XDG before ~/.gitconfig; explicit GIT_CONFIG_GLOBAL has just one root.
+      const text = roots.slice().reverse().flatMap(([path]) => prepared.get(path) ?? [])
+      await writeFile(global, serialize(relocate(text)), { mode: 0o600 }); binds.push({ source: global, destination: global })
     }
     const privacy = process.env.GIT_PRIVACY_DENYLIST || join(home, '.config/privacy/denylist')
     if (existsSync(privacy)) sources.push({ source: privacy, jailRel: '.config/privacy/denylist', mode: 'read-only', envVar: 'GIT_PRIVACY_DENYLIST' })
-    return { sources, binds, hooks: [...hooks], cleanup }
+    return { sources, binds, global, directory, hooks: [...hooks], cleanup }
   } catch (error) { await cleanup(); throw error }
 }
 

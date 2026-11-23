@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { ProxySecretBinding } from '@tangle-network/agent-interface'
 import type { JailNetwork } from './egress.js'
+import type { LinuxJailBackend } from '../config.js'
 import type { TrustedHostServiceRegistration } from './egress-relay.js'
 
 export interface JailSpec {
@@ -44,6 +45,12 @@ export interface JailSpec {
   ironProxyBin?: string
   /** Refuse the operator's unconfined warn fallback for this request. */
   requireEnforcement?: boolean
+  /** Trusted operator assertion: external host policy enforces egress for a port-only jail. */
+  hostEgressEnforced?: boolean
+  /** Trusted operator assertion: the host `HTTPS_PROXY` refuses private destinations. */
+  outerProxyEnforced?: boolean
+  /** Operator backend captured with this spec; request JSON cannot choose it. */
+  backend?: LinuxJailBackend
   /** Captured operator fallback; absent means refuse unconfined execution. */
   fallback?: 'deny' | 'warn'
   /** Host auth paths exposed inside the jail. Populated per backend. */
@@ -97,6 +104,7 @@ export interface JailWrap {
 
 export interface JailBackend {
   readonly name: string
+  readonly networkCapability?: 'namespace' | 'tcp-port'
   /** Whether this backend can run on the current host (right OS + tools). */
   isAvailable(): boolean | Promise<boolean>
   wrap(bin: string, args: string[], spec: JailSpec): JailWrap | Promise<JailWrap>
@@ -150,6 +158,8 @@ export function jailEnv(root: string): Record<string, string> {
   return {
     HOME: root,
     TMPDIR: join(root, '.tmp'),
+    // Claude Code ignores TMPDIR and writes /tmp/claude-<uid>, which seatbelt denies (EPERM).
+    CLAUDE_CODE_TMPDIR: join(root, '.tmp'),
     XDG_CONFIG_HOME: join(root, '.config'),
     XDG_CACHE_HOME: join(root, '.cache'),
     XDG_DATA_HOME: join(root, '.local', 'share'),
@@ -220,4 +230,10 @@ export async function prepareJailHome(root: string): Promise<void> {
   for (const rel of relDirs) {
     await mkdir(join(root, rel), { recursive: true })
   }
+}
+
+/** Whether a path is a directory itself or beneath it, after resolving existing aliases. */
+export function isWithin(base: string, path: string): boolean {
+  const rel = relative(canonicalizeJailPath(resolve(base)), canonicalizeJailPath(resolve(path)))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }

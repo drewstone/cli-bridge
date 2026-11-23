@@ -12,6 +12,7 @@
  * Both the host and scoped-host spawners call this so the wrap logic lives
  * in exactly one place.
  */
+import { configuredJailBackend } from '../config.js'
 
 import { selectJailBackend } from '../jail/index.js'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
@@ -41,7 +42,7 @@ export async function applyJail(
   bin: string,
   args: string[],
   opts: SpawnOpts,
-  backend: JailBackend = selectJailBackend(),
+  backend: JailBackend = selectJailBackend(process.platform, opts.jail?.backend ?? configuredJailBackend()),
 ): Promise<JailedCommand> {
   if (!opts.jail) return { bin, args, env: opts.env }
 

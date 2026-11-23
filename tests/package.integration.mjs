@@ -36,7 +36,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
   assert.ok(manifest.dependencies.tsx, 'the existing loader must be installed in production')
   assert.equal(manifest.devDependencies?.tsx, undefined)
   await writeFile(join(root, 'consumer.mts'), `
-    import { loadConfig, startServer, detectLocalSeats, listLocalModels, type LocalModelOptions, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
+    import { loadConfig, localBackends, startServer, detectLocalSeats, listLocalModels, type LocalModelOptions, type LocalSeat, type ModelEntry, type BridgeServer } from 'cli-bridge';
     import { HubClient } from '@tangle-network/hub-sdk';
     const config = { ...loadConfig({ BRIDGE_DATA_DIR: './state', BRIDGE_BACKENDS: '' }), port: 0 };
     const run = async (): Promise<BridgeServer> => startServer({ config, cwd: process.cwd(), handleSignals: false, quiet: true,
@@ -51,6 +51,8 @@ test('packed production install embeds isolated HTTP services and runs the exist
     void catalog;
     const model: ModelEntry = { id: 'codex/native', object: 'model', backend: 'codex', provider: 'openai', authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status' } };
     void model;
+    const localDrivers: readonly { name: string; harness: string; kind: 'native' | 'acp' | 'prime' }[] = localBackends;
+    void localDrivers;
   `)
   await command(join(repo, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--skipLibCheck', 'false',
     '--module', 'nodenext', '--moduleResolution', 'nodenext', '--target', 'es2022',

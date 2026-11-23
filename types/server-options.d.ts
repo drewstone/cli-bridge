@@ -29,7 +29,12 @@ export interface StartServerOptions {
 export interface BridgeServer {
     url: string;
     /** Host-only listener authority from Runtime's actual bound publicUrl resolver; never an HTTP route. */
-    registerCoordinationEndpoint(input: { runId: string; actorId: string; url: string; signal: AbortSignal }): () => void;
+    registerCoordinationEndpoint(input: {
+        runId: string;
+        actorId: string;
+        url: string;
+        signal: AbortSignal;
+    }): () => void;
     /** In-process embedder authority only: no HTTP route, request field or environment variable registers one. Only a
      * bearer-authenticated request's `runtime_attachments.mcp` entry naming this exact loopback URL claims it, with that
      * request's own resolved secret-refs. Identical registrations share the route until the last revoke; different paths
