@@ -17,8 +17,9 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader, 
   const context = (cwd: string, signal?: AbortSignal, sourceEnv: NodeJS.ProcessEnv = process.env, flags?: readonly string[]) => {
     const cache = new Map<string, Promise<NativeModelFacts>>()
     return (row: CatalogRow): Promise<NativeModelFacts> => {
-      // OpenCode facts depend on the model too: a credential-free provider serves only its zero-cost models.
-      const key = `${row.backend}:${row.provider ?? ''}:${row.backend === 'codex' || row.backend === 'pi' || row.backend === 'opencode' ? row.id : ''}`
+      // OpenCode and Kimi facts depend on the model too: a credential-free provider serves only its zero-cost models,
+      // a plan key only the models its plan lists, and Kimi's subscription only the models its managed provider serves.
+      const key = `${row.backend}:${row.provider ?? ''}:${['codex', 'pi', 'opencode', 'kimi-code'].includes(row.backend) ? row.id : ''}`
       const pending = cache.get(key)
       if (pending) return pending
       const descriptor = localHarnesses.find(([, harness]) => harness === row.backend)
@@ -77,7 +78,8 @@ export function createNativeCatalog(config: Config, codex?: CodexCatalogReader, 
       for (const row of rows) {
         const facts = await read(row)
         signal?.throwIfAborted()
-        const authentication = { status: facts.status, authMode: facts.authMode, source: facts.source, ...(facts.fix ? { fix: facts.fix } : {}) }
+        const authentication = { status: facts.status, authMode: facts.authMode, ...(facts.credential ? { credential: facts.credential } : {}),
+          source: facts.source, ...(facts.fix ? { fix: facts.fix } : {}) }
         const id = `${row.backend}/${facts.defaultModel}`
         output.push({ ...row, provider: facts.provider, authentication, ...(facts.defaultModel && row.id === id ? { default: true } : {}),
           ...(row.backend === 'claude-code' && row.id === 'claude-code/opus' && !facts.defaultModel ? { recommended: true } : {}) })

@@ -8,7 +8,7 @@
  */
 export declare const maxCodexSubscriptionTurnMs: number;
 /** Native harness identities only; model selection and seat syntax belong to agent-interface. */
-export declare const localHarnesses: readonly [readonly ['claude', 'claude-code', 'claude auth login', readonly ['auth', 'status', '--json'], 'anthropic'], readonly ['codex', 'codex', 'codex login', readonly ['login', 'status'], 'openai'], readonly ['opencode', 'opencode', 'opencode auth login', readonly ['auth', 'list', '--pure'], null], readonly ['kimi', 'kimi-code', 'kimi login', readonly ['--version'], null], readonly ['gemini', 'gemini', 'gemini', readonly ['--version'], 'google'], readonly ['cursor', 'cursor', 'cursor-agent login', readonly ['status', '--format', 'json'], 'cursor'], readonly ['pi', 'pi', 'pi', readonly ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null]];
+export declare const localHarnesses: readonly [readonly ['claude', 'claude-code', 'claude auth login', readonly ['auth', 'status', '--json'], 'anthropic'], readonly ['codex', 'codex', 'codex login', readonly ['login', 'status'], 'openai'], readonly ['opencode', 'opencode', 'opencode auth login', readonly ['auth', 'list', '--pure'], null], readonly ['kimi', 'kimi-code', 'kimi login', readonly ['--version'], 'moonshot'], readonly ['gemini', 'gemini', 'gemini', readonly ['--version'], 'google'], readonly ['cursor', 'cursor', 'cursor-agent login', readonly ['status', '--format', 'json'], 'cursor'], readonly ['pi', 'pi', 'pi', readonly ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null]];
 /**
  * Local drivers registered by the server. This is routing metadata, not proof
  * of installation, authentication, model availability or profile capabilities.

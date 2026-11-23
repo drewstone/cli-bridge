@@ -1,9 +1,12 @@
+import { spawn } from 'node:child_process'
 import { cursorEnvironment } from './lib/cursor-auth.js'
 import { join, resolve } from 'node:path'
 import { findGitDir } from './jail/types.js'
 import { loadConfig, localHarnesses, type Config } from './config.js'
 import { backendHome } from './jail/auth-preserve.js'
-import { probeNativeStatus } from './lib/native-status.js'
+import { probeNativeStatus, type NativeStatus } from './lib/native-status.js'
+import { kapReady } from './backends/kimi-text-only.js'
+import { killTree, killTreeSync } from './executors/process-tree.js'
 import { nativeObject as object, nativeJson as decode, nativeIdentifier, readNativeState as state } from './lib/native-state.js'
 
 export interface LocalSeat {
@@ -14,9 +17,17 @@ export interface LocalSeat {
   status: 'authenticated' | 'configured' | 'signed_out' | 'missing' | 'unknown'
   /** `free`: the harness's own catalog prices this exact model at zero and it needs no credential. */
   authMode: 'subscription' | 'free' | 'api_key' | 'unknown'
+  /** `plan_key`: the stored key belongs to a flat-rate plan in the Bridge's plan-keyed provider table; `authMode` is `subscription`. */
+  credential?: 'plan_key'
   source: 'native_status' | 'native_store' | 'native_catalog'
   fix?: string
 }
+
+/**
+ * Native provider ids of flat-rate coding plans that a subscription pays for and a plan key authenticates.
+ * Their per-token API siblings (`zai`, `moonshotai`) are other providers. Named here, never inferred from a key.
+ */
+const PLAN_KEYED_PROVIDERS: ReadonlySet<string> = new Set(['zai-coding-plan', 'kimi-for-coding'])
 
 export interface LocalSeatOptions {
   cwd?: string
@@ -39,12 +50,13 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
   const timeout = options.timeoutMs ?? 10_000
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 30_000) throw new Error('seat inventory timeoutMs must be between 1 and 30000')
   const probe = (bin: string, args: readonly string[], nativeEnv = env) => probeNativeStatus(bin, args, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd, env: nativeEnv })
-  const results = await Promise.allSettled(localHarnesses.filter(([, harness]) => !options.harnesses || options.harnesses.includes(harness)).map(async ([key, harness, fix, args, provider]): Promise<LocalSeat> => {
+  const selected = localHarnesses.filter(([, harness]) => !options.harnesses || options.harnesses.includes(harness))
+  const results = await Promise.allSettled(selected.map(async ([key, harness, fix, args, provider]): Promise<LocalSeat | LocalSeat[]> => {
     const bin = config[`${key}Bin`]
     const nativeArgs = key === 'pi' && options.provider
       ? ['auth', 'check', '--provider', options.provider, ...(options.model ? ['--model', options.model] : []), '--json', '--no-refresh'] : args
     const fact: LocalSeat = { harness, provider: null, status: 'unknown', authMode: 'unknown',
-      source: key === 'kimi' || key === 'gemini' ? 'native_store' : 'native_status', fix }
+      source: key === 'gemini' ? 'native_store' : 'native_status', fix }
     const native = await (key === 'claude' ? readClaudeNativeContext({ cwd: options.cwd ?? process.cwd(), env, flags: options.flags ?? [] }) : Promise.resolve().then(async () => ({ env: key === 'cursor' ? await cursorEnvironment(env) : env, flags: [], settings: [] as Record<string, unknown>[] }))).catch(() => null)
     if (!native) return fact
     if (key === 'claude') {
@@ -61,6 +73,11 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
     }
     const result = await probe(bin, [...native.flags, ...nativeArgs], native.env)
     if (result.code === 'ENOENT') { delete fact.fix; return { ...fact, status: 'missing' } }
+    // Inventory omits fixes for configured rows; a provider-scoped read keeps the next command.
+    const settle = (seat: LocalSeat): LocalSeat => {
+      if (seat.status === 'authenticated' || seat.status === 'configured' && !options.provider) delete seat.fix
+      return seat
+    }
     try {
       if (key === 'cursor') {
         const auth = decode(result.stdout)
@@ -85,22 +102,12 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
         } else if (result.code === 0 && /Logged in using an API key\b/u.test(output)) {
           fact.status = 'authenticated'; fact.authMode = 'api_key'
         } else if (result.code === 1 && /Not logged in\b/u.test(output)) fact.status = 'signed_out'
-      } else if (key === 'opencode' && options.provider && result.code === 0) {
-        const auth = object((await state(join(env.XDG_DATA_HOME || join(env.HOME?.trim() || backendHome(), '.local/share'), 'opencode/auth.json')))[options.provider])
-        const mode = auth.type === 'oauth' && typeof auth.refresh === 'string' && !!auth.refresh.trim() ? 'subscription'
-          : auth.type === 'api' && typeof auth.key === 'string' && !!auth.key.trim() ? 'api_key' : 'unknown'
-        Object.assign(fact, { provider: mode === 'unknown' ? null : options.provider, status: mode === 'unknown' ? 'unknown' : 'configured',
-          authMode: mode, source: 'native_store', fix: 'opencode auth list --pure' })
-        // With no stored credential, OpenCode can still serve a model its own catalog prices at zero
-        // (`opencode/*-free` needs no login). That route spends nothing, so it is ready as a free route.
-        if (mode === 'unknown' && options.model) {
-          // `--pure`: the turn's config loads Bridge plugins, whose cold start outlasts the probe timeout.
-          const listed = await probe(bin, ['models', options.provider, '--verbose', '--pure'], native.env)
-          if (listed.code === 0 && opencodeFreeModel(listed.stdout, options.provider, options.model))
-            Object.assign(fact, { provider: options.provider, status: 'authenticated', authMode: 'free', source: 'native_catalog',
-              fix: `opencode models ${options.provider} --verbose --pure` })
-        }
       } else if (key === 'opencode' && result.code === 0) {
+        const store = await state(join(env.XDG_DATA_HOME || join(env.HOME?.trim() || backendHome(), '.local/share'), 'opencode/auth.json'))
+        // Inventory reports each stored provider credential on its own row, as model admission reads it.
+        const providers = options.provider ? [options.provider] : Object.keys(store).filter((id) => nativeIdentifier(id) === id).sort()
+        if (providers.length) return await Promise.all(providers.map(async (id) => settle(
+          { ...fact, ...await opencodeProviderSeat(id, object(store[id]), options.model, (args) => probe(bin, args, native.env)) })))
         const output = (result.stdout + result.stderr).replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
         fact.authMode = /\boauth\b/iu.test(output) ? 'subscription' : /\bapi\b/iu.test(output) ? 'api_key' : 'unknown'
         fact.status = fact.authMode !== 'unknown' ? 'authenticated' : /\b0 credentials?\b/iu.test(output) ? 'signed_out' : 'unknown'
@@ -115,19 +122,88 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
         fact.status = ready.length ? 'authenticated' : auth.length === checks.length && auth.every((item) =>
           (item.exit === 0 || item.exit === 1) && item.status === 'not_ready') ? 'signed_out' : 'unknown'
       } else if (result.code === 0 && key === 'kimi') {
-        const root = env.KIMI_CODE_HOME?.trim() || join(env.HOME?.trim() || backendHome(), '.kimi-code')
-        const auth = await Promise.all(['kimi-code.json', 'managed:kimi-code.json'].map((file) => state(join(root, 'credentials', file))))
-        const stored = auth.some((item) => typeof item.refresh_token === 'string' && !!item.refresh_token)
-        fact.status = stored ? 'configured' : 'signed_out'; fact.authMode = stored ? 'subscription' : 'unknown'
+        Object.assign(fact, await kimiLoginState(bin, native.env, options.model, provider, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd }))
       } else if (result.code === 0 && key === 'gemini') {
         Object.assign(fact, await geminiLoginState(env.HOME?.trim() || backendHome(), env))
       }
     } catch { /* Unrecognized or unsupported native output remains unknown. */ }
-    if (fact.status === 'authenticated' || fact.status === 'configured' && !options.provider) delete fact.fix
-    return fact
+    return settle(fact)
   }))
   options.signal?.throwIfAborted()
-  return results.map((result) => { if (result.status === 'rejected') throw result.reason; return result.value })
+  return results.flatMap((result) => { if (result.status === 'rejected') throw result.reason; return result.value })
+}
+
+/**
+ * One OpenCode provider's stored credential. A plan key is a subscription; it is authenticated once OpenCode's own
+ * catalog lists the requested model (any model when none is named) for that provider. No model turn is sent.
+ */
+async function opencodeProviderSeat(provider: string, auth: Record<string, unknown>, model: string | undefined,
+  probe: (args: readonly string[]) => Promise<NativeStatus>): Promise<Omit<LocalSeat, 'harness'>> {
+  const mode = auth.type === 'oauth' && typeof auth.refresh === 'string' && !!auth.refresh.trim() ? 'subscription'
+    : auth.type === 'api' && typeof auth.key === 'string' && !!auth.key.trim() ? 'api_key' : 'unknown'
+  const seat: Omit<LocalSeat, 'harness'> = { provider: mode === 'unknown' ? null : provider, status: mode === 'unknown' ? 'unknown' : 'configured',
+    authMode: mode, source: 'native_store', fix: 'opencode auth list --pure' }
+  if (mode === 'api_key' && PLAN_KEYED_PROVIDERS.has(provider)) {
+    Object.assign(seat, { authMode: 'subscription', credential: 'plan_key' })
+    // `--pure`: the turn's config loads Bridge plugins, whose cold start outlasts the probe timeout.
+    const listed = await probe(['models', provider, '--pure'])
+    const ids = listed.stdout.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '').split('\n').map((line) => line.trim())
+    if (listed.code === 0 && ids.some((id) => model ? id === `${provider}/${model}` : id.startsWith(`${provider}/`)))
+      Object.assign(seat, { status: 'authenticated', source: 'native_catalog', fix: `opencode models ${provider} --pure` })
+  }
+  // With no stored credential, OpenCode can still serve a model its own catalog prices at zero
+  // (`opencode/*-free` needs no login). That route spends nothing, so it is ready as a free route.
+  if (mode === 'unknown' && model) {
+    const listed = await probe(['models', provider, '--verbose', '--pure'])
+    if (listed.code === 0 && opencodeFreeModel(listed.stdout, provider, model))
+      Object.assign(seat, { provider, status: 'authenticated', authMode: 'free', source: 'native_catalog',
+        fix: `opencode models ${provider} --verbose --pure` })
+  }
+  return seat
+}
+
+/**
+ * Kimi Code's own local server answers whether its managed subscription login holds a token (`GET /api/v1/auth`)
+ * and which configured provider serves a model (`GET /api/v1/config`). Both read local state: no model turn,
+ * token refresh or credential leaves the server. A model served by any other Kimi provider is not this subscription.
+ */
+async function kimiLoginState(bin: string, env: NodeJS.ProcessEnv, model: string | undefined, provider: string | null,
+  options: { timeoutMs: number; signal?: AbortSignal; cwd?: string }): Promise<Pick<LocalSeat, 'provider' | 'status' | 'authMode' | 'fix'>> {
+  const stop = AbortSignal.any([AbortSignal.timeout(options.timeoutMs), ...(options.signal ? [options.signal] : [])])
+  stop.throwIfAborted()
+  // The server otherwise refreshes its model catalog on start, which can refresh the OAuth token and calls Kimi's API.
+  const child = spawn(bin, ['web', '--json', '--host', '127.0.0.1', '--port', '0'], { cwd: options.cwd,
+    env: { ...env, KIMI_CODE_MODEL_CATALOG_REFRESH_ON_START: '0', KIMI_CODE_MODEL_CATALOG_REFRESH_INTERVAL_MS: '0' },
+    detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  // A timeout or caller abort stops the server at once; otherwise it gets the default grace to save its own state.
+  const kill = () => killTreeSync(child, 'SIGKILL')
+  stop.addEventListener('abort', kill, { once: true })
+  child.once('error', kill)
+  try {
+    const ready = await kapReady(child)
+    if (!ready) return { provider: null, status: 'unknown', authMode: 'unknown' }
+    const read = async (path: string): Promise<Record<string, unknown>> => {
+      const response = await fetch(`${ready.origin}/api/v1/${path}`, { headers: { authorization: `Bearer ${ready.token}` }, redirect: 'error', signal: stop })
+      const reply = object(await response.json())
+      if (!response.ok || reply.code !== 0) throw new Error(`kimi ${path} answered HTTP ${response.status}`)
+      return object(reply.data)
+    }
+    const [auth, config] = await Promise.all([read('auth'), read('config')])
+    const managed = object(auth.managed_provider)
+    if (auth.managed_provider === null || ['unauthenticated', 'expired', 'revoked'].includes(managed.status as string))
+      return { provider: null, status: 'signed_out', authMode: 'unknown' }
+    if (managed.status !== 'authenticated') return { provider: null, status: 'unknown', authMode: 'unknown' }
+    // Kimi keys a model as `kimi-code/<model>`, the id the Bridge passes as `--model`; no model means Kimi's default.
+    const route = model ? `kimi-code/${model}` : nativeIdentifier(config.default_model)
+    const served = route === undefined ? managed.name : object(object(config.models)[route]).provider
+    if (served === managed.name) return { provider, status: 'authenticated', authMode: 'subscription' }
+    const other = typeof served === 'string' ? object(object(config.providers)[served]) : {}
+    return { provider: null, status: served === undefined ? 'unknown' : 'configured',
+      authMode: other.has_api_key === true ? 'api_key' : 'unknown', fix: 'kimi provider list' }
+  } finally {
+    stop.removeEventListener('abort', kill)
+    await killTree(child)
+  }
 }
 
 /**

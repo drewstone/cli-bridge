@@ -6,7 +6,7 @@ export interface ModelEntry {
   object: 'model'
   backend: string
   provider: string | null
-  authentication: Pick<LocalSeat, 'status' | 'authMode' | 'source' | 'fix'>
+  authentication: Pick<LocalSeat, 'status' | 'authMode' | 'credential' | 'source' | 'fix'>
   note?: string
   default?: true
   recommended?: true

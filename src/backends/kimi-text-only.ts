@@ -1,3 +1,4 @@
+import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -53,24 +54,24 @@ function bootstrapHome(profile: ReturnType<typeof kimiTextOnlyProfile>, env: Nod
   }
 }
 
-async function kapReady(spawned: SpawnResult): Promise<{ origin: string; token: string }> {
-  const { child } = spawned
-  if (!child.stdout || spawned.spawnError?.()) throw kimiToolChoiceError('The local session service could not start.')
+/** The private loopback origin and bearer that `kimi web --json` prints once ready; null when it names none. */
+export async function kapReady(child: ChildProcess): Promise<{ origin: string; token: string } | null> {
+  if (!child.stdout) return null
   child.stderr?.resume()
   const lines = createInterface({ input: child.stdout })
   try {
     for await (const line of lines) {
       if (!line.startsWith('{')) continue
       const ready = JSON.parse(line) as { origin?: unknown; token?: unknown }
-      if (typeof ready.origin !== 'string' || typeof ready.token !== 'string' || !ready.token) break
+      if (typeof ready.origin !== 'string' || typeof ready.token !== 'string' || !ready.token) return null
       const url = new URL(ready.origin)
-      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.origin !== ready.origin) break
+      if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.origin !== ready.origin) return null
       return { origin: url.origin, token: ready.token }
     }
   } finally {
     lines.close()
   }
-  throw kimiToolChoiceError('The local session service did not confirm a private loopback endpoint.')
+  return null
 }
 
 /**
@@ -96,7 +97,10 @@ export async function startKimiTextOnlySession(
       ...spawnOpts, jail, signal, stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, KIMI_CODE_HOME: profile.root.path },
     })
     signal.throwIfAborted()
-    const { origin, token } = await kapReady(child)
+    if (!child.child.stdout || child.spawnError?.()) throw kimiToolChoiceError('The local session service could not start.')
+    const ready = await kapReady(child.child)
+    if (!ready) throw kimiToolChoiceError('The local session service did not confirm a private loopback endpoint.')
+    const { origin, token } = ready
     const call = async (path: string, body?: object): Promise<unknown> => {
       const response = await fetch(origin + '/api/v1/' + path, {
         method: body ? 'POST' : 'GET', signal, redirect: 'error',

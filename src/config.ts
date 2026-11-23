@@ -19,7 +19,7 @@ export const localHarnesses = [
   ['claude', 'claude-code', 'claude auth login', ['auth', 'status', '--json'], 'anthropic'],
   ['codex', 'codex', 'codex login', ['login', 'status'], 'openai'],
   ['opencode', 'opencode', 'opencode auth login', ['auth', 'list', '--pure'], null],
-  ['kimi', 'kimi-code', 'kimi login', ['--version'], null],
+  ['kimi', 'kimi-code', 'kimi login', ['--version'], 'moonshot'],
   ['gemini', 'gemini', 'gemini', ['--version'], 'google'],
   ['cursor', 'cursor', 'cursor-agent login', ['status', '--format', 'json'], 'cursor'],
   ['pi', 'pi', 'pi', ['auth', 'check', '--provider', 'openai-codex', '--json', '--no-refresh'], null],
