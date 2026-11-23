@@ -110,6 +110,13 @@ export class OpencodeBackend implements Backend {
       model?: AgentProfileModelHints
     } | null
     const outputCap = resolveOpencodeOutputTokenCap(req, profileForControls)
+    // A text-only turn selects its own zero-tool agent with --agent, which would
+    // replace the profile primary agent that carries prompt.systemPrompt.
+    if (req.toolChoice === 'none' && (profileForControls as { prompt?: { systemPrompt?: string } } | null)?.prompt?.systemPrompt?.trim()) {
+      throw new BackendError(
+        'opencode cannot run a text-only turn for a profile that replaces its system prompt: the text-only turn selects its own zero-tool agent, and the profile prompt rides on the profile primary agent. Send the turn with tools, or drop prompt.systemPrompt.',
+        'capability_denied', undefined, { providerDispatch: 'not_started' })
+    }
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'opencode'))
     const model = this.extractModel(req.model)
