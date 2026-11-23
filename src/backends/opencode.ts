@@ -22,6 +22,7 @@ import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
+import { overlayOpencodeTextOnlyToolSurface } from './opencode-text-only.js'
 import {
   admitNativeSubscription,
   profileExecutionIdentity,
@@ -36,10 +37,11 @@ import {
 import {
   resolvePromptMessages,
 } from './profile-prompt.js'
-import { registerJailReadable } from '../jail/index.js'
+import { registerJailReadable, registerJailWritable } from '../jail/index.js'
+import { createPrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import { dirname, join } from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { contentToText, toolResult } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
@@ -48,6 +50,9 @@ import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { writeStdinPayload } from './stdin-payload.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { nativeReasoningControl } from '@tangle-network/agent-interface'
+import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
+import { installOutputCapPlugin, verifiedStepOutput } from './opencode-output-budget.js'
+export { outputCapPluginSource } from './opencode-output-budget.js'
 import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
@@ -65,6 +70,9 @@ export class OpencodeBackend implements Backend {
   // The signal plugin reports a call at its start; it is installed in the turn's private config
   // directory, which every turn with an AgentProfile has (agent-runtime always sends one).
   readonly toolCallSpans = true
+  // Verified against the real runner (1.18.30, local recording provider): an explicit
+  // `tool_choice: "none"` turn carries zero ambient action tools in its model requests.
+  readonly textOnlyToolChoice = true
   private readonly spawner: Spawner
   constructor(private readonly opts: OpencodeBackendOptions) {
     this.defaultExecutionTimeoutMs = opts.timeoutMs
@@ -96,18 +104,18 @@ export class OpencodeBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'opencode hosted-safe requires a verified per-provider tool-disable flag path')
 
-    // opencode has no verified native output cap, and an accepted-but-unenforced
-    // max_tokens makes the request look bounded to cost accounting while the
-    // run can spend above the bound (#138). Refuse before anything spawns.
-    if (req.max_tokens !== undefined) {
+    const profileForControls = resolveAgentProfile(req, session) as {
+      permissions?: Record<string, unknown>
+      tools?: Record<string, boolean>
+      model?: AgentProfileModelHints
+    } | null
+    const outputCap = resolveOpencodeOutputTokenCap(req, profileForControls)
+    // A text-only turn selects its own zero-tool agent with --agent, which would
+    // replace the profile primary agent that carries prompt.systemPrompt.
+    if (req.toolChoice === 'none' && (profileForControls as { prompt?: { systemPrompt?: string } } | null)?.prompt?.systemPrompt?.trim()) {
       throw new BackendError(
-        `backend opencode cannot enforce request max_tokens ${String(req.max_tokens)}: opencode exposes no verified native output cap, `
-        + 'so the bound would be accepted but not applied to billed output tokens. '
-        + 'Omit max_tokens, or route through a backend that enforces it.',
-        'not_configured',
-        undefined,
-        { providerDispatch: 'not_started' },
-      )
+        'opencode cannot run a text-only turn for a profile that replaces its system prompt: the text-only turn selects its own zero-tool agent, and the profile prompt rides on the profile primary agent. Send the turn with tools, or drop prompt.systemPrompt.',
+        'capability_denied', undefined, { providerDispatch: 'not_started' })
     }
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'opencode'))
@@ -133,6 +141,30 @@ export class OpencodeBackend implements Backend {
       throw error
     }
 
+    // A capped turn loads the output-budget plugin. Profiled turns already own
+    // a private config directory; a plain turn gets one that holds only this
+    // file, so the operator's own global config still loads unchanged.
+    let capConfigCleanup: (() => void) | undefined
+    let plainCapConfigDir: string | undefined
+    if (outputCap) {
+      const dir = provisioned.env.OPENCODE_CONFIG_DIR
+      try {
+        if (dir !== undefined) {
+          installOutputCapPlugin(dir, outputCap.cap)
+        } else {
+          const root = createPrivateTemporaryRoot(tmpdir(), '.cli-bridge-opencode-cap-')
+          registerJailWritable(req.jailSpec, root.path)
+          plainCapConfigDir = join(root.path, 'opencode')
+          capConfigCleanup = root.cleanup
+          installOutputCapPlugin(plainCapConfigDir, outputCap.cap)
+        }
+      } catch (error) {
+        capConfigCleanup?.()
+        provisioned.cleanup?.()
+        throw error
+      }
+    }
+
     // Materialize the one selected MCP source into a temporary OpenCode config.
     // opencode-cli has no per-invocation `--mcp-config-file` flag —
     // config layering is the only inline injection point. We set
@@ -148,10 +180,6 @@ export class OpencodeBackend implements Backend {
     // opencode config directory, so both releases are paired at every exit.
     let mcpMaterialized: ReturnType<typeof materializeMcpServersForOpencode>
     try {
-      const profileForControls = resolveAgentProfile(req, session) as {
-        permissions?: Record<string, unknown>
-        tools?: Record<string, boolean>
-      } | null
       mcpMaterialized = materializeMcpServersForOpencode(
         resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }),
         profileForControls?.permissions,
@@ -165,6 +193,18 @@ export class OpencodeBackend implements Backend {
     // Under an fs-jail the fresh tmpfs over /tmp hides this host-/tmp config;
     // expose its dir read-only so the confined opencode can still read it.
     if (mcpMaterialized) registerJailReadable(req.jailSpec, dirname(mcpMaterialized.configPath))
+
+    // An explicit text-only turn (`tool_choice: "none"`) runs under its own
+    // fresh agent whose permission is the native wildcard deny: the resolver
+    // appends it after every global and agent default and checks every tool
+    // id, ambient action tools and MCP servers alike, so the model request
+    // carries zero tools. The project layer and the operator's global config
+    // stay live — a project-configured provider keeps working — and unrelated
+    // config keys survive the overlay.
+    let textOnlyAgent: string | undefined
+    if (req.toolChoice === 'none') {
+      textOnlyAgent = overlayOpencodeTextOnlyToolSurface(provisioned.env)
+    }
 
     // opencode installs itself under $HOME, and an fs-jail deliberately hides /home. The generic
     // derivation in `toolchainReadPaths` reaches the install root only when the on-PATH entry
@@ -194,6 +234,12 @@ export class OpencodeBackend implements Backend {
     if (model) args.push('-m', model)
     if (variant) args.push('--variant', variant)
     if (session?.internalId) args.push('-s', session.internalId)
+    if (textOnlyAgent) args.push('--agent', textOnlyAgent)
+    // A capped turn names its own title so opencode generates none. Title
+    // generation is an extra model call in the same process: it carries the
+    // cap on the wire, but `run` prints no step receipt for it, so its billed
+    // output would sit outside every usage record the bridge can observe.
+    if (outputCap) args.push('--title', CAPPED_TURN_TITLE)
 
     args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
@@ -206,6 +252,8 @@ export class OpencodeBackend implements Backend {
         ...(req.session_id ? { OPENCODE_RUNTIME_ID: req.session_id.replace(/[^A-Za-z0-9_.-]/g, '-') } : {}),
         ...provisioned.env,
         ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
+        ...(outputCap ? { [OUTPUT_TOKEN_FLAG_ENV]: String(outputCap.cap) } : {}),
+        ...(plainCapConfigDir !== undefined ? { OPENCODE_CONFIG_DIR: plainCapConfigDir } : {}),
       }
       await admitNativeSubscription(req, { env: childEnv, args, envPassthroughKeys, flags: provisioned.flags,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
@@ -223,6 +271,7 @@ export class OpencodeBackend implements Backend {
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
     } catch (error) {
+      capConfigCleanup?.()
       mcpMaterialized?.cleanup()
       provisioned.cleanup?.()
       throw error
@@ -284,10 +333,13 @@ export class OpencodeBackend implements Backend {
       let sawError: BackendFailureReason | null = null
       let emittedContent = false
       let emittedToolCall = false
+      // The turn ended because the provider stopped a completion at the output cap.
+      let sawNativeLength = false
       // Calls already reported at their start, so their finished part carries only the outcome.
       const startedTools = new Set<string>()
       let toolSession: string | null = null
       // Steps yield their own usage as they finish; a non-step usage event is the fallback only for a stream with no step receipt.
+      let billedOutputTokens = 0
       let sawStepUsage = false
       let sawTerminal = false
       let fallbackUsage: UsageReceipt | undefined
@@ -346,10 +398,32 @@ export class OpencodeBackend implements Backend {
           continue
         }
         // Every step ends on a receipt; the turn's last one gives a reason other than `tool-calls`.
-        if (isStepReceipt(ev) && (ev.part as { reason?: unknown } | undefined)?.reason !== 'tool-calls') sawTerminal = true
-        const eventUsage = extractUsage(ev)
+        let stepReason: unknown
+        if (isStepReceipt(ev)) {
+          stepReason = (ev.part as { reason?: unknown } | undefined)?.reason
+          if (stepReason !== 'tool-calls') sawTerminal = true
+          // The provider stopped the completion at the request's output cap.
+          if (stepReason === 'length') sawNativeLength = true
+        }
+        const eventUsage = extractUsage(ev, outputCap !== null && isStepReceipt(ev))
         if (eventUsage && !isStepReceipt(ev)) fallbackUsage = eventUsage
-        else if (eventUsage) { sawStepUsage = true; yield { usage: { ...eventUsage, model_call: true } } }
+        else if (eventUsage) {
+          sawStepUsage = true
+          if (eventUsage.output_tokens !== undefined) billedOutputTokens += eventUsage.output_tokens
+          yield { usage: { ...eventUsage, model_call: true } }
+          if (outputCap) {
+            // The output-budget plugin asks each call for only the remaining
+            // allowance, so receipts normally land at or below the cap. This cut
+            // is the backstop for spend the plugin cannot see, and the stop for
+            // a continuation whose budget is already gone: the run ends
+            // truncated here — never a `stop` success above the cap (#138).
+            // The `finally` below terminates the process tree.
+            if (billedOutputTokens > outputCap.cap || (billedOutputTokens === outputCap.cap && stepReason === 'tool-calls')) {
+              yield { finish_reason: 'length', internal_session_id: internalSessionId }
+              return
+            }
+          }
+        }
         if (type === 'error' || ev.error) {
           // When the event carries no message field, surface the raw event instead of the
           // constant string 'opencode error'. That constant reached run ledgers verbatim:
@@ -417,7 +491,9 @@ export class OpencodeBackend implements Backend {
       const killed = closed.signal ?? (closed.code !== null && closed.code > 128 ? `exit ${closed.code}` : null)
       if (!sawTerminal && killed) watch.exit = killed
       // Each step's usage already went out as its own model call; a run that printed no step receipts reports its total.
-      if (!sawStepUsage && fallbackUsage) yield { usage: fallbackUsage }
+      if (!sawStepUsage && fallbackUsage) {
+        yield { usage: fallbackUsage }
+      }
 
       if (signal.aborted) {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
@@ -433,7 +509,9 @@ export class OpencodeBackend implements Backend {
         throw new BackendError(`opencode produced no stream output: ${stderr.render(300)}`, 'upstream')
       }
       yield {
-        finish_reason: emittedToolCall ? 'tool_calls' : 'stop',
+        // A provider that stopped the completion at the cap ends the turn truncated,
+        // whatever tool calls completed earlier in it.
+        finish_reason: sawNativeLength ? 'length' : emittedToolCall ? 'tool_calls' : 'stop',
         internal_session_id: internalSessionId,
       }
     } finally {
@@ -445,6 +523,7 @@ export class OpencodeBackend implements Backend {
       watch.drained = (await terminateSpawned(spawned)) === 'stopped' && spawned.scope !== undefined
       releaseSpawner()
       mcpMaterialized?.cleanup()
+      capConfigCleanup?.()
       // Only after the process is gone: opencode rereads its config directory
       // on every model request, so removing it earlier would strip a running
       // turn's instructions.
@@ -466,6 +545,125 @@ export class OpencodeBackend implements Backend {
     }
     return null
   }
+}
+
+/**
+ * The runner flag opencode reads as its experimental output-token maximum. Every
+ * model request the process makes — title, answer steps, tool continuations,
+ * subagent calls, opencode's own retries — carries
+ * `max_tokens = min(model.limit.output, flag)`, or the flag alone when the model
+ * catalog states no output limit. Measured on opencode 1.18.30 against a local
+ * OpenAI-compatible endpoint: `Math.min(model.limit.output, flag) || flag`,
+ * default 32000 when the flag is unset, and every invalid spelling (0, negative,
+ * non-integer, non-numeric) silently ignored — which is why this bridge never
+ * forwards an unvalidated request value. The flag has been in the binary at
+ * least since 1.1.4. It caps ONE completion per call; it is not a run total.
+ */
+const OUTPUT_TOKEN_FLAG_ENV = 'OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX'
+
+/** Session title this bridge names for capped turns so opencode generates none. */
+const CAPPED_TURN_TITLE = 'cli-bridge'
+
+/** A positive safe integer, the only spelling the runner flag honors. */
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+
+/** The operator's own flag value from the bridge environment, when valid. An invalid ambient value is ignored, exactly as the runner ignores it. */
+function operatorOutputTokenFlag(): number | undefined {
+  const raw = process.env[OUTPUT_TOKEN_FLAG_ENV]
+  if (raw === undefined || !/^(0|[1-9][0-9]*)$/u.test(raw)) return undefined
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+/** One explicitly capped opencode turn, resolved before anything spawns. */
+export interface OpencodeOutputTokenCap {
+  /** The cap every provider request this turn carries; never above the request's `max_tokens`. */
+  cap: number
+  /** Authorities that lowered the request value, so a refusal or receipt can name them. */
+  loweredBy: Array<'operator' | 'agent_profile'>
+}
+
+/**
+ * Resolve one caller-requested output cap for a native opencode turn.
+ *
+ * The request's `max_tokens` becomes the runner's experimental output-token
+ * maximum for this one turn: every provider request the turn makes is bounded
+ * on the wire (the flag's own `min` with the model catalog's output limit keeps
+ * any lower model constraint), the per-turn output-budget plugin holds a hard
+ * lease over the cap — each granted ask is reserved synchronously before
+ * dispatch, one lease is outstanding at a time, and only a receipt attributed
+ * to that exact attempt returns the unspent difference — so continuing runs
+ * (tool continuations, subagents, retries) cannot bill past the cap and an
+ * uncertain retry is refused before the wire, `--title` removes the one model
+ * call whose billing prints no receipt, and the stream loop ends the turn
+ * truncated at a receipt that spends the budget while more calls would follow —
+ * never a `stop` success above the caller's budget. An explicitly lower
+ * operator (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` in the bridge environment)
+ * or `agent_profile.model.maxTotalOutputTokens` ceiling is preserved by `min`.
+ *
+ * Refused before spawn, because each is a cap the runner cannot honor:
+ * - a `max_tokens` that is not a positive safe integer (the runner would
+ *   silently ignore it and run at its 32000 default);
+ * - a profile carrying `maxVisibleOutputTokens` or `maxReasoningTokens`
+ *   beside the request cap: the runner exposes one total per-call ceiling and
+ *   cannot preserve independent visible/reasoning budgets.
+ *
+ * `undefined` request `max_tokens` returns `null`: uncapped turns keep today's
+ * behavior byte for byte, including any operator flag already in the
+ * environment.
+ */
+export function resolveOpencodeOutputTokenCap(
+  req: Pick<ChatRequest, 'max_tokens'>,
+  profile: { model?: AgentProfileModelHints } | null,
+): OpencodeOutputTokenCap | null {
+  const requested = req.max_tokens
+  if (requested === undefined) return null
+  if (!positiveSafeInteger(requested)) {
+    throw new BackendError(
+      `backend opencode cannot apply request max_tokens ${String(requested)}: the native output cap `
+        + `(${OUTPUT_TOKEN_FLAG_ENV}) accepts a positive integer only, and any other spelling is silently ignored by the runner`,
+      'parse_error',
+      undefined,
+      { providerDispatch: 'not_started' },
+    )
+  }
+  const unsupported: string[] = []
+  if (profile?.model?.maxVisibleOutputTokens !== undefined) unsupported.push('maxVisibleOutputTokens')
+  if (profile?.model?.maxReasoningTokens !== undefined) unsupported.push('maxReasoningTokens')
+  if (unsupported.length > 0) {
+    throw new BackendError(
+      `backend opencode cannot enforce agent_profile.model field(s): ${unsupported.sort().join(', ')}; `
+        + 'the runner exposes one total per-call output cap, so request max_tokens cannot preserve independent visible/reasoning ceilings',
+      'not_configured',
+      undefined,
+      { providerDispatch: 'not_started' },
+    )
+  }
+  let cap = requested
+  const loweredBy: Array<'operator' | 'agent_profile'> = []
+  const profileCap = profile?.model?.maxTotalOutputTokens
+  if (profileCap !== undefined) {
+    if (!positiveSafeInteger(profileCap)) {
+      throw new BackendError(
+        `backend opencode cannot apply agent_profile.model.maxTotalOutputTokens ${String(profileCap)}: it must be a positive safe integer`,
+        'parse_error',
+        undefined,
+        { providerDispatch: 'not_started' },
+      )
+    }
+    if (profileCap < cap) {
+      cap = profileCap
+      loweredBy.push('agent_profile')
+    }
+  }
+  const operator = operatorOutputTokenFlag()
+  if (operator !== undefined && operator < cap) {
+    cap = operator
+    loweredBy.push('operator')
+  }
+  return { cap, loweredBy }
 }
 
 function pickSessionId(ev: Record<string, unknown>): string | null {
@@ -514,7 +712,7 @@ function extractToolResult(
   return toolResult(id, name, status === 'error', status === 'error' ? state?.error : state?.output)
 }
 
-function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
+function extractUsage(ev: Record<string, unknown>, cappedStep: boolean): UsageReceipt | null {
   const direct = ev.usage as Record<string, unknown> | undefined
   if (direct) {
     return usageFromValues({
@@ -531,6 +729,10 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
   const part = ev.part as Record<string, unknown> | undefined
   const tokens = part?.tokens as Record<string, unknown> | undefined
   const cache = tokens?.cache as Record<string, unknown> | undefined
+  const output = cappedStep ? verifiedStepOutput(tokens, part?.reason) : sumKnown([
+    tokens?.output_tokens ?? tokens?.output,
+    tokens?.reasoning,
+  ])
 
   return usageFromValues({
     // OpenCode reports input/output *excluding* cache and reasoning.
@@ -543,11 +745,9 @@ function extractUsage(ev: Record<string, unknown>): UsageReceipt | null {
     fresh_input_tokens: tokens?.input_tokens ?? tokens?.input,
     cache_read_input_tokens: cache?.read,
     cache_write_input_tokens: cache?.write,
-    output_tokens: sumKnown([
-      tokens?.output_tokens ?? tokens?.output,
-      tokens?.reasoning,
-    ]),
-    reasoning_output_tokens: tokens?.reasoning,
+    output_tokens: output,
+    reasoning_output_tokens: cappedStep && output === undefined && tokens?.reasoning === 0
+      ? undefined : tokens?.reasoning,
     cost: part?.cost ?? ev.cost,
   })
 }

@@ -5,9 +5,11 @@ import { join } from 'node:path'
 import { PassThrough, Readable } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
 import { Hono } from 'hono'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { loadConfig } from '../src/config.js'
-import { resolveSpawnerCwd } from '../src/executors/types.js'
+import { resolveSpawnerCwd, type Spawner } from '../src/executors/types.js'
+import { hostSpawner } from '../src/executors/host.js'
+import { KimiBackend } from '../src/backends/kimi.js'
 import { mountHealth } from '../src/routes/health.js'
 import { mountChatCompletions } from '../src/routes/chat-completions.js'
 import { BackendRegistry } from '../src/backends/registry.js'
@@ -136,6 +138,60 @@ async function streamChat(app: Hono, body: unknown): Promise<string> {
   })
   return await res.text()
 }
+
+function kimiFailureApp() {
+  const home = tempDir('kimi-print-owner-')
+  const cwd = tempDir('kimi-workspace-')
+  mkdirSync(join(home, 'locks', 'sessions'), { recursive: true })
+  const fixture = new URL('./fixtures/kimi-print-wire.mjs', import.meta.url).pathname
+  const spawner: Spawner = (bin, args, opts) => hostSpawner(bin, [fixture, ...args], opts)
+  spawner.executionEnvironment = 'host'
+  return { home, cwd, app: chatApp(new KimiBackend({ bin: process.execPath, timeoutMs: 10_000, spawner })) }
+}
+
+it('returns the native Kimi cause only for this process and submitted turn, through HTTP and SSE', async () => {
+  const { home, cwd, app } = kimiFailureApp()
+  const request = (model: string) => ({ model: 'kimi-code/' + model, cwd, messages: [{ role: 'user', content: 'same question' }] })
+  vi.stubEnv('KIMI_CODE_HOME', home)
+  try {
+    // Concurrent peers use the same prompt and workspace; each process owns its own native cause.
+    const [quota, rate, foreign, mismatch, success, stream] = await Promise.all([
+      postChat(app, request('quota')), postChat(app, request('rate')), postChat(app, request('foreign')),
+      postChat(app, request('wrong-prompt')), postChat(app, request('success')), streamChat(app, request('quota')),
+    ])
+    expect(quota).toEqual({ status: 429, json: { error: {
+      message: 'Kimi: The provider subscription quota is exhausted.', type: 'provider.api_error', status: 429, retryable: false,
+    } } })
+    expect(rate).toMatchObject({ status: 429, json: { error: { type: 'provider.rate_limit', retryable: true } } })
+    for (const response of [foreign, mismatch]) {
+      expect(response).toEqual({ status: 502, json: { error: { message: 'Kimi: Prompt turn ended with reason: failed', type: 'upstream' } } })
+    }
+    expect(success.json.choices[0]).toMatchObject({ message: { content: 'native success' }, finish_reason: 'stop' })
+    expect(stream).toContain('"retryable":false')
+    expect(stream).toContain('"status":429')
+    expect(stream).not.toContain('private')
+  } finally { vi.unstubAllEnvs() }
+})
+
+it('recovers an ACP failure after partial output and rejects stale, replaced and ambiguous wires', async () => {
+  const { home, cwd, app } = kimiFailureApp()
+  const request = (model: string) => ({ model: 'kimi-code/' + model, cwd, messages: [{ role: 'user', content: 'L'.repeat(140_000) }] })
+  vi.stubEnv('KIMI_CODE_HOME', home)
+  try {
+    const send = (mode: string) => postChat(app, request(mode))
+    const [quota, partial, stale, replaced, ambiguous] = await Promise.all([
+      send('quota'), send('partial'), send('stale'), send('replaced'), send('ambiguous'),
+    ])
+    expect(quota).toMatchObject({ status: 429, json: { error: { type: 'provider.api_error', status: 429, retryable: false } } })
+    expect(partial).toMatchObject({ status: 200, json: { error: { type: 'provider.api_error', retryable: false },
+      choices: [{ finish_reason: 'error', message: { content: 'incomplete' } }] } })
+    for (const response of [stale, replaced, ambiguous]) {
+      expect(response).toMatchObject({ status: 502, json: { error: { type: 'upstream' } } })
+      expect(response.json.error).not.toHaveProperty('retryable')
+      expect(response.json.error.message).not.toContain('private native diagnostic')
+    }
+  } finally { vi.unstubAllEnvs() }
+})
 
 describe('a post-output failure answers with its reason, not an empty 200', () => {
   it('returns the backend status and message when the run produced no content', async () => {

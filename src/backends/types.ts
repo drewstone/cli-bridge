@@ -247,6 +247,24 @@ export interface ChatRequest {
    * route boundary to this prompt-side `json_object` directive.
    */
   responseFormat?: { type: 'text' | 'json_object' }
+  /**
+   * The wire field is `tool_choice`; the route translates the explicit
+   * text-inference request `tool_choice: "none"` to this field. Only a
+   * backend that declares {@link Backend.textOnlyToolChoice} may receive
+   * it — such a backend MUST put zero tools in its model requests for the
+   * turn: standard semantics, no model tool calls at all, so ambient action
+   * tools AND caller-bound MCP servers are removed (analysis/trace callbacks
+   * belong outside the nested model call, on their own authority). The route
+   * refuses the request for every other backend rather than silently
+   * ignoring the field. `tool_choice: "auto"` is the native default
+   * everywhere and is translated to no field at all, so an ordinary request
+   * never carries this.
+   *
+   * This is a provider tool-list restriction for one turn, not hosted-safe
+   * isolation: it constrains what the harness offers the model, and makes
+   * no claim about where the harness itself runs.
+   */
+  toolChoice?: 'none'
   /** Optional canonical AgentProfile materialized through the selected harness's native controls. */
   agent_profile?: AgentProfile
   /**
@@ -541,6 +559,8 @@ export interface ChatDelta {
      * the non-streaming response say the same thing.
      */
     status?: number
+    /** Retryability the native provider explicitly reported. */
+    retryable?: boolean
     /** Capacity refusal: the bridge never started the model. */
     capacity?: true
     /** Which executor semaphore refused, with the counts behind the refusal. */
@@ -622,6 +642,8 @@ export interface ChatDelta {
    */
   runner?: {
     backend: string; pid: number; scope?: string; mode: BridgeMode; cwd?: string
+    /** OpenCode records null for uncapped requests. Older records do not establish the original budget. */
+    max_tokens?: number | null
     /** The turn's role:system texts, each split into chunks under the retained-string bound. */
     system?: string[][]
   }
@@ -666,6 +688,18 @@ export interface Backend {
    * published consumers parse the default document with agent-interface's strict schema, which rejects the key.
    */
   readonly modelReroutes?: boolean
+  /**
+   * This backend enforces `tool_choice: "none"` with standard semantics: ZERO
+   * tools in its model requests for that turn — ambient action tools and
+   * caller-bound MCP servers alike — through a verified native control that
+   * also wins over inherited configuration (operator global config, ambient
+   * config content, agent defaults, the project layer). Without this flag the
+   * chat route REFUSES a `tool_choice: "none"` request instead of letting the
+   * backend ignore the field — a route cannot claim a control a harness does
+   * not enforce. A function further checks that the request's executor and
+   * session can honor the control before the route claims a durable identity.
+   */
+  readonly textOnlyToolChoice?: boolean | ((request: ChatRequest, session: SessionRecord | null) => void)
 
   /** Does this backend want to handle requests for `model`? */
   matches(model: string): boolean

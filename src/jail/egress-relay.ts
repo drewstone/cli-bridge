@@ -18,10 +18,12 @@
  * Only port 443 is reachable unless an allow entry names `host:port`. Resolved
  * addresses in private, loopback, link-local and metadata ranges are refused;
  * an allow entry that is itself a literal address is an operator naming the
- * target directly and is exempt.
+ * target directly and is exempt on direct dials. Proxy dials always refuse private
+ * literals and localhost names before CONNECT.
  */
 
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { JAIL_OUTER_PROXY_ENV } from '../config.js'
 import { lookup } from 'node:dns/promises'
 import {
   createServer,
@@ -31,7 +33,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http'
-import { connect, isIP, type Server, type Socket } from 'node:net'
+import { connect, isIP, type Server, type Socket, type AddressInfo } from 'node:net'
 import { readRequestBody, RequestTooLargeError } from '../backends/pi-inference-transport.js'
 
 /** Bytes buffered while waiting for the CONNECT head or the ClientHello. */
@@ -76,6 +78,7 @@ interface HostService {
   claimed: boolean
   revoked: boolean
   active: Set<() => void>
+  tcp?: { port: number; close(): Promise<void> }
 }
 const services = new WeakMap<TrustedHostServiceRegistration, HostService>()
 const owners = new WeakMap<TrustedHostServiceOwner, HostServiceOwner>()
@@ -173,6 +176,48 @@ export function claimTrustedHostService(
   }
 }
 
+/** Allocate the URL before native config materialization; adoption still belongs to one spawn. */
+export async function claimTcpHostService(
+  owner: TrustedHostServiceOwner,
+  headers: Readonly<Record<string, string>> = {},
+): Promise<ReturnType<typeof claimTrustedHostService>> {
+  const claim = claimTrustedHostService(owner, headers)
+  const service = services.get(claim.registration)!
+  let relay: EgressRelay | undefined
+  try {
+    relay = await startRelay({ allow: [], tcp: true, trustedHostServices: [claim.registration] })
+    const port = relay.port
+    if (service.revoked || service.owner.revoked) throw new Error('trusted service was released during listener allocation')
+    if (!port) throw new Error('trusted TCP service did not obtain a loopback port')
+    service.tcp = { port, close: relay.close }
+    return { ...claim, nativeUrl: `http://127.0.0.1:${port}/${service.cap}` }
+  } catch (error) { claim.revoke(); await relay?.close(); throw error }
+}
+
+function availableServices(registrations: readonly TrustedHostServiceRegistration[] = []): HostService[] {
+  const admitted = registrations.map((registration) => {
+    const service = services.get(registration)
+    if (!service || service.revoked || service.owner.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
+    return service
+  })
+  if (new Set(admitted).size !== admitted.length) throw new Error('duplicate trusted host service registration')
+  return admitted
+}
+
+/** One launcher adopts these ports; a second cannot borrow the registration or its listener. */
+export function adoptTcpHostServices(registrations: readonly TrustedHostServiceRegistration[] = []) {
+  const admitted = availableServices(registrations)
+  if (admitted.some((service) => !service.tcp)) throw new Error('trusted service needs the TCP claim transport')
+  for (const service of admitted) service.claimed = true
+  return {
+    ports: admitted.map((service) => service.tcp!.port),
+    cleanup: async () => {
+      for (const service of admitted) revokeService(service)
+      await Promise.all(admitted.map((service) => service.tcp!.close()))
+    },
+  }
+}
+
 function serviceHeaders(
   input: Readonly<Record<string, string>>,
   fixed: Readonly<Record<string, string>> = {},
@@ -197,10 +242,14 @@ function revokeService(service: HostService): void {
   service.owner.claims.delete(service)
   for (const drop of service.active) drop()
   service.active.clear()
+  // An adopted port stays bound, answering 403, until its spawn's cleanup closes it.
+  if (service.tcp && !service.claimed) void service.tcp.close()
 }
 
 export interface EgressRelayOptions {
-  socketPath: string
+  socketPath?: string
+  tcp?: boolean
+  proxyAuthorization?: string
   /** Reachable targets as `host` (port 443) or `host:port`. */
   allow: readonly string[]
   /** Hosts whose tunnels go to iron-proxy's CONNECT listener instead of the origin. */
@@ -209,21 +258,37 @@ export interface EgressRelayOptions {
     tunnel: { host: string; port: number }
   }
   trustedHostServices?: readonly TrustedHostServiceRegistration[]
+  /** Captured `BRIDGE_JAIL_OUTER_PROXY_ENFORCED`; the relay never reads it from the environment. */
+  outerProxyEnforced?: boolean
   log?: (line: string) => void
 }
 
 export interface EgressRelay {
+  port?: number
   close(): Promise<void>
 }
 
 export async function startEgressRelay(options: EgressRelayOptions): Promise<EgressRelay> {
-  const admitted = (options.trustedHostServices ?? []).map((registration) => {
-    const service = services.get(registration)
-    if (!service || service.revoked || service.claimed) throw new Error('unavailable trusted host service registration')
-    return service
-  })
-  if (new Set(admitted).size !== admitted.length) throw new Error('duplicate trusted host service registration')
-  for (const service of admitted) service.claimed = true
+  if (options.tcp && !options.proxyAuthorization) throw new Error('TCP egress relay requires proxy authorization')
+  return startRelay(options)
+}
+
+// Claim listeners authenticate their random URL in serveHostService; they are not CONNECT proxies.
+async function startRelay(options: EgressRelayOptions): Promise<EgressRelay> {
+  // Namespace relays and relays with no allowed host dial directly.
+  const outerProxy = options.tcp && options.allow.length ? captureOuterProxy(options.outerProxyEnforced) : undefined
+  // A declaration alone is insufficient: require live policy refusals, not
+  // authentication failures, DNS errors or an unreachable proxy. Never fall back.
+  if (outerProxy) for (const host of ['127.0.0.1', 'localhost']) {
+    const probe = await openTunnel(outerProxy, host, HTTPS_PORT, 403)
+    probe.destroy()
+  }
+  const admitted = availableServices(options.trustedHostServices)
+  if (!options.tcp) {
+    if (admitted.some((service) => service.tcp)) throw new Error('TCP service registration requires the TCP transport')
+    for (const service of admitted) service.claimed = true
+  }
+  let expectedHost = `127.0.0.1:${SHIM_PORT}`
   const routes = new Map<string, ServiceRoute>()
   for (const service of admitted) {
     for (const [suffix, methods] of service.owner.paths) {
@@ -239,11 +304,19 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   const log = (line: string) =>
     sink(protectedValues.reduce((value, secret) => value.split(secret).join('[redacted]'), line))
 
+  if (outerProxy) log('outer-proxy verified private-destination refusals')
+
   const permitted = (host: string, port: number): boolean => {
     if (intercepted.has(host)) return port === HTTPS_PORT
     return allow.has(port === HTTPS_PORT ? host : `${host}:${port}`)
   }
 
+  const authorized = (req: IncomingMessage) => {
+    if (!options.proxyAuthorization) return true
+    const value = Buffer.from(req.headers['proxy-authorization'] ?? '')
+    const expected = Buffer.from(options.proxyAuthorization)
+    return value.length === expected.length && timingSafeEqual(value, expected)
+  }
   const open = new Set<Socket>()
   const used = new WeakSet<Socket>()
   const server = createServer(
@@ -255,9 +328,10 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
     (req, res) => {
       // A connection authorizes one parsed request, never a raw HTTP tunnel.
       res.setHeader('connection', 'close')
+      if (!authorized(req)) { res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="cli-bridge"' }); res.end(); return }
       if (used.has(req.socket)) return void req.socket.destroy()
       used.add(req.socket)
-      void serveHostService(req, res, routes).catch(() => {
+      void serveHostService(req, res, routes, expectedHost).catch(() => {
         if (!res.headersSent) res.writeHead(502)
         res.end()
       })
@@ -282,6 +356,7 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
   })
   server.on('connect', (req, socket, rest) => {
     const client = socket as Socket
+    if (!authorized(req)) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="cli-bridge"\r\nConnection: close\r\n\r\n'); return }
     if (used.has(client)) return void client.destroy()
     used.add(client)
     client.pause()
@@ -304,10 +379,10 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
         }
         const upstream = intercepted.has(host)
           ? await openTunnel(options.intercept!.tunnel, host, port)
-          : await dial(host, port, allow)
+          : await dial(host, port, allow, outerProxy)
         clearTimeout(timer)
         if (client.destroyed) return void upstream.destroy()
-        log(`allow host=${host}:${port}${intercepted.has(host) ? ' via=iron-proxy' : ''}`)
+        log(`allow host=${host}:${port}${intercepted.has(host) ? ' via=iron-proxy' : outerProxy && !bypassesProxy(host, port, outerProxy.bypass) ? ' via=outer-proxy' : ''}`)
         upstream.write(Buffer.concat([hello.head, hello.rest]))
         const drop = () => {
           upstream.destroy()
@@ -325,16 +400,23 @@ export async function startEgressRelay(options: EgressRelayOptions): Promise<Egr
       })
   })
   try {
-    await listen(server, options.socketPath)
+    if (options.tcp) {
+      await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
+      expectedHost = `127.0.0.1:${(server.address() as AddressInfo).port}`
+    } else {
+      if (!options.socketPath) throw new Error('egress relay needs its Unix socket path')
+      await listen(server, options.socketPath)
+    }
   } catch (error) {
     for (const service of admitted) revokeService(service)
     throw error
   }
   // Close ends live tunnels too, so a held connection cannot delay the proxy kill and revoke.
   return {
+    port: options.tcp ? (server.address() as AddressInfo).port : undefined,
     close: () =>
       new Promise((resolve) => {
-        for (const service of admitted) revokeService(service)
+        if (!options.tcp) for (const service of admitted) revokeService(service)
         server.close(() => resolve())
         for (const socket of open) socket.destroy()
       }),
@@ -345,9 +427,18 @@ async function serveHostService(
   req: IncomingMessage,
   res: ServerResponse,
   routes: ReadonlyMap<string, ServiceRoute>,
+  expectedHost: string,
 ): Promise<void> {
-  const route = routes.get(req.url ?? '')
-  if (!route || req.headers.host !== `127.0.0.1:${SHIM_PORT}` || route.service.revoked || route.service.owner.revoked) {
+  const path = req.url ?? ''
+  const token = Buffer.from(path.split('/')[1] ?? '', 'utf8')
+  let route: ServiceRoute | undefined
+  // Do not use a secret-bearing URL as a hash-table key for authentication.
+  for (const [registeredPath, candidate] of routes) {
+    const secret = Buffer.from(candidate.service.cap, 'utf8')
+    const matches = token.length === secret.length && timingSafeEqual(token, secret)
+    if (matches && path.slice(token.length + 1) === registeredPath.slice(secret.length + 1)) route = candidate
+  }
+  if (!route || req.headers.host !== expectedHost || !route.service.claimed || route.service.revoked || route.service.owner.revoked) {
     res.writeHead(403)
     res.end()
     return
@@ -468,7 +559,9 @@ function readUntil(
     if (check()) return
     socket.on('data', onData)
     socket.once('end', onEnd)
-    socket.once('error', onEnd)
+    socket.once('error', reject)
+    // A destroy without an error emits only close.
+    socket.once('close', onEnd)
     socket.resume()
   })
 }
@@ -518,7 +611,41 @@ function readSni(buf: Buffer): string | undefined {
   return name
 }
 
-async function dial(host: string, port: number, allow: ReadonlySet<string>): Promise<Socket> {
+/** The bridge owns this configuration; never consult a jailed child's proxy URL. */
+function captureOuterProxy(declared = false) {
+  const value = process.env.HTTPS_PROXY || process.env.https_proxy
+  if (!value) return undefined
+  if (!declared) {
+    throw new Error(`host HTTPS_PROXY requires ${JAIL_OUTER_PROXY_ENV}=1 and verified private-destination refusals`)
+  }
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' || !url.hostname) throw new Error()
+    const authorization = url.username || url.password
+      ? 'Basic ' + Buffer.from(`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`).toString('base64') : undefined
+    return { host: url.hostname.replace(/^\[|\]$/gu, ''), port: Number(url.port || 80), authorization,
+      bypass: (process.env.NO_PROXY || process.env.no_proxy || '').toLowerCase().split(/[,\s]+/u).filter(Boolean) }
+  } catch { throw new Error('host HTTPS_PROXY requires a valid HTTP proxy URL') }
+}
+
+function bypassesProxy(host: string, port: number, entries: readonly string[]): boolean {
+  return entries.some((entry) => {
+    if (entry === '*') return true
+    const match = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/u.exec(entry)
+    if (!match || (match[2] && Number(match[2]) !== port)) return false
+    const raw = match[1]!.replace(/^\[|\]$/gu, '')
+    const suffixOnly = raw.startsWith('.') || raw.startsWith('*.')
+    const name = raw.replace(/^\*?\./u, '')
+    return (!suffixOnly && host === name) || host.endsWith('.' + name)
+  })
+}
+
+async function dial(host: string, port: number, allow: ReadonlySet<string>, proxy: ReturnType<typeof captureOuterProxy>): Promise<Socket> {
+  // The configured proxy is operator-named. CONNECT leaves target DNS to it.
+  if (proxy && !bypassesProxy(host, port, proxy.bypass)) {
+    if ((isIP(host) && isBlockedAddress(host)) || /(^|\.)localhost\.?$/u.test(host)) throw new Error(`blocked-address host=${host}`)
+    return openTunnel(proxy, host, port)
+  }
   const literal = isIP(host) !== 0
   const addresses = literal ? [host] : (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address)
   const operatorNamed = literal && (allow.has(host) || allow.has(`${host}:${port}`))
@@ -527,27 +654,34 @@ async function dial(host: string, port: number, allow: ReadonlySet<string>): Pro
   return await connectTo(address, port)
 }
 
-/** CONNECT through iron-proxy's tunnel listener; resolves once it answers 200. */
-async function openTunnel(tunnel: { host: string; port: number }, host: string, port: number): Promise<Socket> {
+/** CONNECT through an operator-owned proxy; verification requires a policy refusal. */
+async function openTunnel(tunnel: { host: string; port: number; authorization?: string }, host: string, port: number, expectedStatus = 200): Promise<Socket> {
   const socket = await connectTo(tunnel.host, tunnel.port)
-  socket.on('error', () => socket.destroy())
-  socket.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`)
-  const { head, rest } = await readUntil(socket, (buf) => buf.indexOf('\r\n\r\n') >= 0 ? buf.indexOf('\r\n\r\n') + 4 : null)
-  if (!/^HTTP\/1\.[01] 200 /u.test(head.toString('latin1'))) {
-    socket.destroy()
-    throw new Error(`iron-proxy-refused host=${host}`)
-  }
-  if (rest.length) socket.unshift(rest)
-  socket.resume()
-  return socket
+  socket.setTimeout(NAME_DEADLINE_MS, () => socket.destroy(new Error('proxy-connect-timeout')))
+  try {
+    const target = `${isIP(host) === 6 ? `[${host}]` : host}:${port}`
+    socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n${tunnel.authorization ? `Proxy-Authorization: ${tunnel.authorization}\r\n` : ''}\r\n`)
+    const { head, rest } = await readUntil(socket, (buf) => buf.indexOf('\r\n\r\n') >= 0 ? buf.indexOf('\r\n\r\n') + 4 : null)
+    const status = /^HTTP\/1\.[01] (\d{3}) /u.exec(head.toString('latin1'))?.[1]
+    if (Number(status) !== expectedStatus) throw new Error(expectedStatus === 403
+      ? 'outer-proxy private-destination refusal not verified' : `proxy-refused host=${host}`)
+    socket.setTimeout(0)
+    if (rest.length) socket.unshift(rest)
+    socket.resume()
+    return socket
+  } catch (error) { socket.destroy(); throw error }
 }
 
 function connectTo(host: string, port: number): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const socket = connect({ host, port, timeout: NAME_DEADLINE_MS }, () => { socket.off('error', reject); socket.setTimeout(0); resolve(socket) })
+    const onTimeout = () => { socket.destroy(); reject(new Error(`connect-timeout ${host}:${port}`)) }
+    // The connect deadline ends at connect; a caller's own timeout must not find this listener.
+    const socket = connect({ host, port, timeout: NAME_DEADLINE_MS }, () => {
+      socket.off('error', reject); socket.off('timeout', onTimeout); socket.setTimeout(0); resolve(socket)
+    })
     socket.setNoDelay(true)
     socket.once('error', reject)
-    socket.once('timeout', () => { socket.destroy(); reject(new Error(`connect-timeout ${host}:${port}`)) })
+    socket.once('timeout', onTimeout)
   })
 }
 
@@ -561,9 +695,13 @@ function listen(server: Server, socketPath: string): Promise<void> {
 /** Private, loopback, link-local, CGNAT, benchmark, multicast, reserved, NAT64/6to4 and metadata ranges. */
 function isBlockedAddress(ip: string): boolean {
   if (isIP(ip) === 6) {
-    const v6 = ip.toLowerCase()
-    if (v6.startsWith('::ffff:')) return isBlockedAddress(v6.slice(7))
-    return v6 === '::1' || v6 === '::' || v6.startsWith('fe80:') || v6.startsWith('fc') || v6.startsWith('fd')
+    const v6 = new URL(`http://[${ip}]/`).hostname.slice(1, -1)
+    const mapped = /^::ffff:([0-9a-f]+):([0-9a-f]+)$/u.exec(v6)
+    if (mapped) {
+      const high = parseInt(mapped[1]!, 16), low = parseInt(mapped[2]!, 16)
+      return isBlockedAddress(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`)
+    }
+    return v6 === '::1' || v6 === '::' || /^fe[89ab]/u.test(v6) || v6.startsWith('fc') || v6.startsWith('fd')
       || v6.startsWith('64:ff9b:') || v6.startsWith('2002:') || v6.startsWith('ff')
   }
   const [a, b] = ip.split('.').map(Number)

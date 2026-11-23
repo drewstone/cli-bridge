@@ -193,6 +193,23 @@ export function sanitizeUpstreamErrorDetail(detail: string | undefined): string 
  */
 export const CLAUDE_SETTING_SOURCE_FLAGS = ['--setting-sources', 'project,local'] as const
 
+/**
+ * The calling Claude Code session's identity. A bridge launched from inside a
+ * Claude Code session (`tangle graph run` in a terminal agent) inherits these,
+ * and a nested claude that sees them attaches to the parent's messaging socket.
+ * Auth and config variables are not in this list and still pass.
+ */
+const PARENT_SESSION_ENV_KEYS = [
+  'CLAUDECODE',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_SESSION_ATTENDED',
+  'CLAUDE_CODE_MESSAGING_SOCKET',
+  'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_PID',
+] as const
+
 export interface ClaudeBackendOptions {
   bin: string
   timeoutMs: number
@@ -336,6 +353,7 @@ export class ClaudeBackend implements Backend {
     })
 
     const childEnv: NodeJS.ProcessEnv = { ...process.env }
+    for (const key of PARENT_SESSION_ENV_KEYS) delete childEnv[key]
     if (this.anthropicBaseUrl) {
       childEnv.ANTHROPIC_BASE_URL = this.anthropicBaseUrl
     }

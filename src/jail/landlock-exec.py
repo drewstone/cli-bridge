@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Fail-closed argv launcher; JSON policy is supplied outside the writable jail.
+
+UAPI: https://docs.kernel.org/userspace-api/landlock.html
+Only known syscall tables and ABIs are accepted. All filesystem rights of the
+selected ABI are handled, including REFER, TRUNCATE and device IOCTL.
+"""
+import ctypes
+import json
+import os
+import platform
+import signal
+import stat
+import sys
+
+
+class PathRule(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [('access', ctypes.c_uint64), ('fd', ctypes.c_int32)]
+
+
+class NetRule(ctypes.Structure):
+    _fields_ = [('access', ctypes.c_uint64), ('port', ctypes.c_uint64)]
+
+
+def check(result):
+    if result < 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+    return result
+
+
+class CapabilityHeader(ctypes.Structure):
+    _fields_ = [('version', ctypes.c_uint32), ('pid', ctypes.c_int)]
+
+
+class CapabilityData(ctypes.Structure):
+    _fields_ = [('effective', ctypes.c_uint32), ('permitted', ctypes.c_uint32),
+                ('inheritable', ctypes.c_uint32)]
+
+
+class OpenHow(ctypes.Structure):
+    _fields_ = [('flags', ctypes.c_uint64), ('mode', ctypes.c_uint64), ('resolve', ctypes.c_uint64)]
+
+
+def open_path(libc, path):
+    # openat2 is syscall 437 on every admitted architecture; reject all symlink components atomically.
+    how = OpenHow(os.O_PATH | os.O_CLOEXEC, 0, 0x04)  # RESOLVE_NO_SYMLINKS
+    return check(libc.syscall(437, -100, path.encode(), ctypes.byref(how), ctypes.sizeof(how)))
+
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [('code', ctypes.c_ushort), ('jt', ctypes.c_ubyte),
+                ('jf', ctypes.c_ubyte), ('k', ctypes.c_uint32)]
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [('len', ctypes.c_ushort), ('filter', ctypes.POINTER(SockFilter))]
+
+
+def restrict_sockets(libc):
+    # seccomp_data: nr at 0, audit arch at 4, socket domain/type/protocol at 16/24/32.
+    arch, socket_nr, pair_nr, sendto_nr, sendmsg_nr, sendmmsg_nr = {
+        'x86_64': (0xc000003e, 41, 53, 44, 46, 307),
+        'aarch64': (0xc00000b7, 198, 199, 206, 211, 269),
+        'riscv64': (0xc00000f3, 198, 199, 206, 211, 269),
+    }[platform.machine()]
+    instructions = [
+        (0x20, 0, 0, 4),                 # 0: load arch
+        (0x15, 1, 0, arch),              # 1: native ABI only
+        (0x06, 0, 0, 0x80000000),        # 2: KILL_PROCESS
+        (0x20, 0, 0, 0),                 # 3: load syscall
+        (0x35, 0, 1, 0x40000000),        # 4: reject x32 ABI too
+        (0x06, 0, 0, 0x80000000),        # 5: KILL_PROCESS
+        (0x15, 14, 0, 425),              # 6: io_uring_setup -> ENOSYS (21)
+        (0x15, 1, 0, socket_nr),         # 7: socket -> domain (9)
+        (0x15, 0, 11, pair_nr),          # 8: socketpair -> domain, others ALLOW (20)
+        (0x20, 0, 0, 16),                # 9: load domain
+        (0x15, 9, 0, 1),                 # 10: AF_UNIX socketpair -> ALLOW (20)
+        (0x15, 1, 0, 2),                 # 11: AF_INET -> type (13)
+        (0x15, 0, 6, 10),                # 12: AF_INET6, otherwise EACCES (19)
+        (0x20, 0, 0, 24),                # 13: load type
+        (0x54, 0, 0, 0xfff7f7ff),        # 14: strip SOCK_CLOEXEC | SOCK_NONBLOCK
+        (0x15, 0, 3, 1),                 # 15: SOCK_STREAM only, else EACCES (19)
+        (0x20, 0, 0, 32),                # 16: load protocol
+        (0x15, 2, 0, 0),                 # 17: protocol 0 -> ALLOW (20)
+        (0x15, 1, 0, 6),                 # 18: IPPROTO_TCP -> ALLOW, else EACCES (19)
+        (0x06, 0, 0, 0x0005000d),        # 19: ERRNO EACCES
+        (0x06, 0, 0, 0x7fff0000),        # 20: ALLOW
+        (0x06, 0, 0, 0x00050026),        # 21: ERRNO ENOSYS; runtimes can fall back
+    ]
+    # TFO sends can connect without security_socket_connect. seccomp_data.args
+    # starts at 16 with 8-byte slots; these little-endian ABIs put the low word first.
+    fastopen = []
+    for nr, offset in ((sendto_nr, 40), (sendmsg_nr, 32), (sendmmsg_nr, 40)):
+        fastopen.extend([
+            (0x15, 0, 3, nr),             # non-matching syscall -> reload nr
+            (0x20, 0, 0, offset),         # low 32 bits of flags
+            (0x45, 0, 1, 0x20000000),     # JSET MSG_FASTOPEN -> EACCES
+            (0x06, 0, 0, 0x0005000d),
+            (0x20, 0, 0, 0),              # restore syscall before next dispatch
+        ])
+    # Pathname Unix connects bypass Landlock. Only connected stream pairs are local-only.
+    # Datagram pairs can be retargeted to pathname peers with connect/sendto.
+    instructions[6:6] = fastopen + [
+        (0x15, 0, 3, socket_nr),
+        (0x20, 0, 0, 16),
+        (0x15, 0, 1, 1),                 # socket(AF_UNIX) -> EACCES
+        (0x06, 0, 0, 0x0005000d),
+        (0x20, 0, 0, 0),
+        (0x15, 0, 4, pair_nr),
+        (0x20, 0, 0, 24),
+        (0x54, 0, 0, 0xfff7f7ff),        # strip CLOEXEC | NONBLOCK
+        (0x15, 1, 0, 1),                 # stream socketpair only
+        (0x06, 0, 0, 0x0005000d),
+        (0x20, 0, 0, 0),
+    ]
+    filters = (SockFilter * len(instructions))(*(SockFilter(*i) for i in instructions))
+    program = SockFprog(len(filters), filters)
+    check(libc.prctl(22, 2, ctypes.byref(program), 0, 0))  # PR_SET_SECCOMP, FILTER
+
+
+def restrict(policy):
+    if platform.machine() not in ('x86_64', 'aarch64', 'riscv64'):
+        raise RuntimeError('unknown architecture syscall table')
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    # ABIs accepted here have no capability mediation. Refuse privileged launchers.
+    header = CapabilityHeader(0x20080522, 0)  # Linux capability ABI v3 (two u32 words).
+    capabilities = (CapabilityData * 2)()
+    check(libc.capget(ctypes.byref(header), ctypes.byref(capabilities)))
+    if os.geteuid() == 0 or any(c.effective or c.permitted or c.inheritable for c in capabilities):
+        raise RuntimeError('Landlock requires a non-root user with no Linux capabilities')
+    os.close(open_path(libc, '/'))  # Availability includes the path-resolution primitive.
+    abi = check(libc.syscall(444, 0, 0, 1))
+    # Refuse future ABIs rather than silently omitting new filesystem rights.
+    if not 4 <= abi <= 8:
+        raise RuntimeError('unsupported Landlock ABI: ' + str(abi))
+    # UAPI masks and ABI compatibility switch:
+    # https://docs.kernel.org/userspace-api/landlock.html#defining-and-enforcing-a-security-policy
+    # ABI 4: FS bits 0..14; ABI 5 adds IOCTL_DEV (bit 15). ABIs 6..8 add no FS rights.
+    # https://docs.kernel.org/userspace-api/landlock.html#filesystem-flags
+    fs = (1 << (15 if abi == 4 else 16)) - 1
+    net = 3  # BIND_TCP (bit 0) | CONNECT_TCP (bit 1), present since ABI 4.
+    # ABI 6 scopes: ABSTRACT_UNIX_SOCKET (bit 0) | SIGNAL (bit 1).
+    # https://docs.kernel.org/userspace-api/landlock.html#scope-flags
+    attrs = (ctypes.c_uint64 * 3)(fs, net, 3 if abi >= 6 else 0)
+    ruleset = check(libc.syscall(444, ctypes.byref(attrs), (24 if abi >= 6 else 16), 0))
+    for entry in policy.get('paths', []):
+        try:
+            fd = open_path(libc, entry['path'])
+        except FileNotFoundError:
+            if entry.get('optional', False):
+                continue
+            raise
+        try:
+            identity = os.fstat(fd)
+            if (stat.S_ISLNK(identity.st_mode) or str(identity.st_dev) != entry['dev']
+                    or str(identity.st_ino) != entry['ino']):
+                raise RuntimeError('path identity changed before enforcement')
+            access = fs if entry['writable'] else 13  # EXECUTE | READ_FILE | READ_DIR
+            if not stat.S_ISDIR(identity.st_mode):
+                access &= 1 | 2 | 4 | (1 << 14) | (1 << 15)
+            rule = PathRule(access, fd)
+            check(libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0))
+        finally:
+            os.close(fd)
+    # Bun/JSC reads maps for stack bounds and stat/statm/cgroup for runtime metrics.
+    # Open the launcher's numeric PID without following /proc/self. Exec preserves it.
+    for name in ('maps', 'stat', 'statm', 'cgroup'):
+        fd = open_path(libc, '/proc/' + str(os.getpid()) + '/' + name)
+        try:
+            rule = PathRule(4, fd)  # READ_FILE only; no net/* or child PID grants
+            check(libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0))
+        finally:
+            os.close(fd)
+    for port in policy.get('connect', []):
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise RuntimeError('invalid TCP port')
+        rule = NetRule(2, port)  # CONNECT_TCP; no BIND_TCP or UDP grants
+        check(libc.syscall(445, ruleset, 2, ctypes.byref(rule), 0))
+    check(libc.prctl(38, 1, 0, 0, 0))  # PR_SET_NO_NEW_PRIVS
+    restrict_sockets(libc)
+    check(libc.syscall(446, ruleset, 0))
+    os.close(ruleset)
+    return abi
+
+
+try:
+    if sys.argv[1:] == ['--probe']:
+        print(restrict({}))  # Probe enforcement, not just kernel support.
+    else:
+        with open(sys.argv[1], encoding='utf-8') as stream:
+            policy = json.load(stream)
+        libc = ctypes.CDLL(None, use_errno=True)
+        parent = os.getppid()
+        check(libc.prctl(1, signal.SIGKILL, 0, 0, 0))  # PR_SET_PDEATHSIG
+        if os.getppid() != parent:
+            raise RuntimeError('launcher parent exited')
+        os.kill(policy['parent'], 0)  # The Bridge must still exist, including under a scope wrapper.
+        restrict(policy)
+        # The outer scope may need its bus transport; the confined payload must not inherit it.
+        socket_env = {'XDG_RUNTIME_DIR', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'GPG_AGENT_INFO',
+                      'GNOME_KEYRING_CONTROL', 'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY',
+                      'ICEAUTHORITY', 'SESSION_MANAGER', 'PULSE_SERVER', 'PIPEWIRE_REMOTE',
+                      'SWAYSOCK', 'I3SOCK', 'TMUX', 'STY', 'DOCKER_HOST', 'CONTAINER_HOST'}
+        for key in list(os.environ):
+            if key.startswith('DBUS_') or key.endswith(('_SOCK', '_SOCKET')) or key in socket_env:
+                os.environ.pop(key, None)
+        os.environ.update(policy['env'])
+        os.chdir(policy['cwd'])
+        for name in ('SIGPIPE', 'SIGXFSZ'):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), signal.SIG_DFL)
+        os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+except Exception as error:
+    print('landlock-exec: refused: ' + str(error), file=sys.stderr)
+    sys.exit(126)

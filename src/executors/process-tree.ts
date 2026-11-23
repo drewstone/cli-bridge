@@ -186,7 +186,7 @@ function trySignal(target: number, sig: NodeJS.Signals): boolean {
   }
 }
 
-function waitForExitOrTimeout(child: ChildProcess, ms: number): Promise<void> {
+export function waitForExitOrTimeout(child: ChildProcess, ms = DEFAULT_GRACEFUL_TERMINATION_MS): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
   return new Promise((resolve) => {
     let done = false

@@ -32,15 +32,33 @@ with the caller. Use a private data directory and a generated bearer in `env`.
 `cli-bridge --seats --json` or `await detectLocalSeats({ config })` reports native
 login facts for Claude Code, Codex, OpenCode, Kimi Code, Gemini, Cursor, and Pi. No model
 turn is sent; no credential or account identity appears in the result. Each fact
-has `harness`, `provider` (or null), `status`, `authMode`, `source`, and an optional `fix` command.
+has `harness`, `provider` (or null), `status`, `authMode`, `source`, an optional `credential`, and an optional `fix` command.
+OpenCode reports one fact per provider credential in its own store, the same fact `/v1/models` gives that provider's routes.
 Model selection, ranking, and seat syntax belong to the consuming seat resolver.
 
 `authenticated` means the native status command recognizes a login, not that an
-inference was verified. Where inventory reads Kimi/Gemini's own OAuth stores,
+inference was verified. Kimi Code's login comes from Kimi's own local server
+(`kimi web --json`, then `GET /api/v1/auth` and `/api/v1/config`), started with its model-catalog
+refresh off so the read calls no Kimi API and refreshes no token. It covers only models
+that Kimi routes through its managed `kimi-code` subscription, whose provider is `moonshot`.
+Where inventory reads Gemini's own OAuth store or OpenCode's credential store,
 the result is `configured` rather than a verified live login. Missing or malformed
 state stays `signed_out` or `unknown`; OAuth and API-key state stay distinct.
 Pi checks use `--no-refresh`. `CLAUDE_BIN`, `CODEX_BIN`, `OPENCODE_BIN`, `KIMI_BIN`,
 `GEMINI_BIN`, `CURSOR_BIN`, and `PI_BIN` select the same binaries for inventory and execution.
+
+Flat-rate coding plans that a subscription pays for and a plan key authenticates are named in one table,
+`PLAN_KEYED_PROVIDERS` in [src/local-seats.ts](src/local-seats.ts): `zai-coding-plan` (Z.ai GLM Coding Plan) and
+`kimi-for-coding` (Kimi Code through OpenCode). A stored key for one of them reports `authMode: subscription` with
+`credential: plan_key`, and `authenticated` once OpenCode's own `opencode models <provider> --pure` lists the model.
+A key for any other provider stays `api_key`, whatever its name; nothing is inferred from a key or a host.
+Subscription-only admission (`BRIDGE_SUBSCRIPTIONS_ONLY=1`, the `tangle graph run` default) still requires an
+`authenticated` subscription fact, so a plan key passes it and a per-token key does not.
+
+The real-CLI seat proof in `tests/local-seats.integration.mjs` needs the OpenCode and Kimi Code CLIs. A Beelink gate has
+neither, so its command fetches the pinned packages into a temporary prefix:
+`beelink-gate auto https://github.com/drewstone/cli-bridge.git "$(git rev-parse HEAD)" -- sh -c 'n=$(mktemp -d) && trap "rm -rf $n" EXIT && npm install --prefix "$n" --no-save --ignore-scripts --no-audit --no-fund opencode-linux-x64@1.19.6 @moonshot-ai/kimi-code@2.7.2 >/dev/null && pnpm typecheck && OPENCODE_BIN="$n/node_modules/opencode-linux-x64/bin/opencode" KIMI_BIN="$n/node_modules/.bin/kimi" node --test tests/local-seats.integration.mjs'`.
+Without them the test is skipped with that reason.
 
 ---
 
@@ -88,6 +106,15 @@ For native model discovery without starting an HTTP listener or creating executi
 `listLocalModels({ config, cwd, signal })` from the package root. Its options are optional. It returns the same ordered native model
 entries and authentication facts as `/v1/models`. It reads local metadata only and rejects on cancellation;
 it does not validate an execution jail or start a model turn.
+
+`localBackends` from the package root is the server-owned list of local driver
+registrations, with `name` (the `BRIDGE_BACKENDS` key), canonical `harness`, and
+driver `kind`. `loadConfig` accepts either the key or the canonical harness name.
+Use this metadata to route an explicit harness even when it publishes no model
+catalog. It does not establish that a binary, login, model, or requested profile
+feature is available; backend health, capability negotiation and native admission
+remain authoritative. `BRIDGE_SUBSCRIPTIONS_ONLY=1` continues to refuse routes
+without verified subscription admission.
 
 ## Local checks
 
@@ -198,6 +225,8 @@ Model id routes via harness prefix.
 The OpenAI-compatible default is non-streaming; pass `stream: true` for SSE.
 Session resume uses the `session_id` body field or `X-Session-Id` header.
 
+When the bridge can verify a Kimi provider failure in the submitted turn's native record, `error.type` carries the native provider code. The optional `error.status` and `error.retryable` fields carry the provider’s reported HTTP status and retry decision. A response that already delivered content keeps that content with its terminal error.
+
 Extra fields this bridge accepts beyond vanilla OpenAI:
 
 - `cwd`: persist a working directory for the session and run future resumed turns there
@@ -207,6 +236,27 @@ Extra fields this bridge accepts beyond vanilla OpenAI:
 - `run_id`: caller-owned durable job id (also accepted as `X-Run-Id`)
 - `execution`: execution location plus an optional caller-owned `timeoutMs` process deadline
 - `interactions` and `interaction_policy`: parsed with the shared interaction contract; one-shot chat rejects a non-empty posture or policy with `501 capability_denied` before durable admission because response-bound interactions require a retained native session
+- `tool_choice`: the standard OpenAI field, accepted as `'none'` or `'auto'`. `'none'` is the
+  explicit text-inference request with standard semantics — the model makes no tool calls at
+  all: the turn's model requests carry zero tools, ambient action tools and caller-bound MCP
+  servers alike (analysis/trace callbacks belong outside the nested model call, on their own
+  authority, and stay usable there). OpenCode and local Kimi Code implement this control.
+  Kimi uses a native empty-tool profile on single requests. Short prompts use the CLI's
+  agent file. Long prompts bind the same policy to a new native session and send the
+  original prompt through ACP. Kimi binds the agent for the life of a session, so
+  requests with a session id return `501 capability_denied` before execution. Other backends are refused with
+  `400 invalid_request_error` naming the gap rather than accepting and ignoring the field,
+  until it declares a verified zero-tool control. On OpenCode the turn runs under a fresh
+  bridge-named agent whose permission is the native wildcard deny — appended after every
+  global and agent default, checking every tool id — so inherited configuration (operator
+  global config including JSONC, ambient config content, agent defaults, the project layer)
+  cannot reintroduce a tool, and a project-configured provider keeps working. Sandbox
+  delegation is refused because its task boundary drops the field. `'auto'` and an absent
+  field are the native default everywhere — ordinary turns keep their native coding tools
+  and MCP passthrough, and an absent or empty `tools` list is never read as a request.
+  This is a provider tool-list restriction, not hosted-safe isolation. Measured against
+  OpenCode 1.18.30 with a local recording endpoint
+  (`tests/opencode-text-only-tool-choice-real.test.ts`).
 
 Behavior:
 
@@ -221,6 +271,31 @@ Behavior:
   Codex CLI 0.147.0 supplied the accepted values through direct probes.
 - A jailed OpenCode run seeds only `auth.json` into its writable private data directory.
   The bridge does not expose or copy the host database and logs.
+- OpenCode turns accept an explicit `max_tokens`. The request value becomes the runner's
+  experimental output-token maximum (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`) for that one
+  turn, fresh or resumed. Its budget plugin reserves each model request before sending it.
+  OpenCode names the new assistant and its user parent before the request. Only a step that
+  starts and finishes on that assistant in the same session can return unused tokens, once,
+  with complete positive output accounting (visible plus reasoning). A provider can omit
+  all usage or report only its reasoning subtotal after producing text or a tool call.
+  OpenCode writes zero for each missing counter, and the bridge keeps the full grant reserved.
+  A pure reasoning step can establish complete usage when the total reconciles with its input. A final answer still completes. Another call needs
+  unreserved tokens. An overlapping call or an uncertain retry is refused before dispatch.
+  If the runner or bridge dies, an explicitly capped turn cannot automatically resume because
+  its outstanding reservation went with the process. New uncapped turns retain automatic
+  recovery. Older OpenCode runner records lack the original cap and close with that uncertainty.
+  The turn names its own session title (`--title`), because title generation is a model call
+  whose billing prints no receipt. A provider that stops a completion at the bound ends the
+  turn `finish_reason: "length"`, as does a step receipt that spends the budget while more
+  calls would follow. A lower operator flag (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` in the
+  bridge environment) or `agent_profile.model.maxTotalOutputTokens` is preserved via `min`,
+  and the runner's own `min` with the model catalog's output limit applies on the wire.
+  Measured against OpenCode 1.18.30 with a local recording endpoint
+  (`tests/opencode-output-cap-real.test.ts`, `tests/opencode-output-cap-plugin.test.ts`):
+  wire `max_tokens` per request, receipt-refunded remainders on continuations, hidden retries
+  after refused attempts and lost streams refused before the wire, reasoning tokens counted,
+  duplicate and cross-session notifications replayed, concurrent-turn isolation, and uncapped
+  turns unchanged (title call included, 32000 default bound).
 - the dollar channel has two lanes and they never merge. `cost` travels only with `cost_known: true` and `cost_provenance: provider-receipt` or `billing-receipt`; a consumer may debit a dollar budget with it. Every other case reports `cost_known: false`, plus an optional `estimated_cost` tagged `catalog-estimate` that is never billed spend. A backend that reports no dollars sends no dollar amount, because a zero would read as a measured free turn
 - Claude Code computes `total_cost_usd` locally from token prices. It is an estimate, including when the amount is zero, and is not subscription billing or an invoice. Bridge retains it as `estimated_cost`, with `catalog-estimate` provenance and `cost_scope: total`; actual billed cost remains unknown. An absent amount stays absent. See [Claude Code's cost documentation](https://code.claude.com/docs/en/costs#using-the-usage-command).
 - Pi requires `pi/<provider>/<model>`. The provider and model must have an explicit `baseUrl` and API mode in Pi's `models.json`; the bridge refuses missing or ambiguous selections before Pi starts
@@ -857,7 +932,7 @@ The Codex backend serializes selected account preparation and refresh on one bri
 Unconfined ChatGPT turns hold that account lease until their native turn ends because the CLI may refresh during inference.
 Host turns link `auth.json` to that home, so Codex writes a refreshed token to the persistent account file.
 ChatGPT subscription turns in an enforced `fs-jail` receive only their selected account's access credential.
-This subscription isolation requires Linux bubblewrap read confinement; the bridge rejects macOS jailed subscription turns.
+This subscription isolation requires Linux read confinement using bubblewrap or explicitly selected Landlock with its host prerequisites; the bridge rejects macOS jailed subscription turns.
 The bridge refuses a ChatGPT subscription turn in `write-jail` because that mode can read the host refresh token.
 An unavailable jail cannot fall back to an unconfined subscription turn, even with `BRIDGE_JAIL_FALLBACK=warn`.
 Recognized non-ChatGPT file auth modes retain their existing credential behavior; unrecognized files fail closed.
@@ -990,6 +1065,70 @@ Host execution is the supported local executor. `<NAME>_EXECUTOR=host` and
 `BRIDGE_DEFAULT_EXECUTOR=host` remain accepted. Docker executor and net-jail
 settings are refused at startup; requests containing `execution.netJail` are
 rejected. Use the maintained container platform for network confinement.
+
+## Filesystem jail on Linux
+
+`BRIDGE_JAIL_MODE=fs-jail` uses bubblewrap by default. A failed bubblewrap probe
+never substitutes another backend. An operator may explicitly select
+`BRIDGE_JAIL_BACKEND=landlock`; it needs an unprivileged user with no held Linux
+capabilities, `python3`, and an architecture and ABI accepted by
+`src/jail/landlock-exec.py`. Missing support preserves the startup refusal.
+Before a host switches to Landlock, one real claude turn and one real codex turn
+must pass under it on that host. A provider quota refusal proves the network path,
+not a completed model turn; strict-box receipts are recorded on PR #375.
+Use the host's own subscription logins for those turns; never add an API key.
+The selected backend is captured with each request's operator policy, including
+when an embedded server loads configuration from a custom environment. No compiled
+helper or install step is required. macOS continues to use sandbox-exec unless an
+unsupported backend is explicitly selected.
+
+Both Linux backends derive their filesystem grants from one path policy. Under
+Landlock, readable grants protect file contents; writable grants cover the workspace,
+jail home and explicit writable paths. A read-only path beneath a writable grant is
+refused because additive grants cannot protect that subtree. Grant identities are
+checked again by the launcher before enforcement. The Nix store is exposed only
+when a selected toolchain or the Landlock interpreter needs it.
+HOME, configuration/cache directories and TMPDIR point into the jail home. The
+Landlock payload receives no host session-bus, runtime-directory or socket-discovery
+environment variables, even when an outer scope wrapper needs them. The policy then supplies its jail-local runtime directory. Restrictions
+survive exec and are inherited by descendants. A failed rule or launcher exits
+without executing the command.
+
+| Boundary | Bubblewrap | Landlock | Residual risk / refusal |
+| --- | --- | --- | --- |
+| Path mappings | Bind source at destination | Same-path grants only | Any remapped bind is refused, including remapped read-only auth. Global Git snapshots use their own read-only paths and `GIT_CONFIG_GLOBAL`. A host with such mappings may start but refuse requests. |
+| Temporary files | Private `/tmp` mount | Private TMPDIR under jail home; shared `/tmp` has no grant | Hardcoded `/tmp` access fails unless the spec explicitly exposes that exact path. |
+| Egress state | Masks siblings with tmpfs | No broad grant covering the egress parent; only own CA files granted; launcher policies remain beneath that hidden parent | Pathname Unix-socket connections are unmediated by these Landlock ABIs; the launcher refuses AF_UNIX socket creation. |
+| `/proc`, devices and metadata | Private proc/device mounts and read-only binds | Read-only own numeric `/proc/<pid>/{maps,stat,statm,cgroup}` files for runtime stack bounds and metrics; only null, zero, random and urandom device grants | Metadata remains visible. Mode, ownership, timestamps and extended attributes are outside this allowlist, including on ungranted files the user owns. Other process directories and host proc files have no read grant. Exec preserves the numeric PID grant; forked children inherit it, not a new grant for their PID. A Bun child with a different PID can abort at startup because it cannot read its own maps. |
+| Process and IPC | Separate PID/IPC/UTS namespaces | Host namespaces; direct launcher dies when its parent exits; signal and abstract-socket scopes where supported | No PID namespace or whole-tree parent-death guarantee. Without kernel signal scopes, same-user signalling remains possible. A descendant that leaves the process group outlives the spawn's cleanup with its Landlock grants (see Network). |
+| Network | Separate network namespace with relay shim | Seccomp allows only ordinary TCP Internet sockets; AF_UNIX socket creation is refused and stream socketpair remains available for local IPC; TCP connects limited by port grants, with no TCP bind grants | Ports do not restrict addresses. A relay with allowed hosts captures the bridge's `HTTPS_PROXY`/`https_proxy` and `NO_PROXY`/`no_proxy` at startup; bubblewrap relays and relays without allowed hosts dial directly. Allowed non-intercepted targets use HTTP CONNECT without local target DNS only when `BRIDGE_JAIL_OUTER_PROXY_ENFORCED=1` declares that the operator proxy refuses all private destinations, including names resolving to private addresses. Before opening a relay, the bridge verifies HTTP 403 refusals for `127.0.0.1:443` and `localhost:443`; missing declarations, successful tunnels, authentication failures and transport errors refuse relay startup without fallback. Private and loopback IP literals (including IPv4-mapped IPv6) and localhost names are independently refused before CONNECT. URL credentials become Basic proxy authentication. Verification samples the declared policy; operators must maintain that policy for every destination. Direct and NO_PROXY dials retain private-address checks. Intercepted `proxySecrets` traffic retains iron-proxy's own routing and deny list; strict-box outer-proxy support for that path remains unresolved. `listen()` on an unbound AF_INET socket can autobind without the bind hook. UDP, MPTCP, other Internet protocols, netlink, MSG_FASTOPEN sends and io_uring creation are refused by seccomp. Pathname Unix-socket connections, including systemd user-manager and session-bus access, are refused by denying AF_UNIX socket creation; stream socketpair stays available for local IPC. Only measured stream socketpairs are retained; datagram pairs can reconnect to pathname peers. The TCP relay creates no pathname socket and requires a per-spawn proxy credential; other host processes can still reach its listener. Host-service claims have a separate random URL credential, compared in constant time. A revoked claim answers 403 while its spawn runs, and that spawn's cleanup closes the listener; a claim no spawn adopted closes on revoke. Accepted residual: a descendant that outlives cleanup keeps its connect grant to the closed claim port, which another host process could later bind. |
+| Write jail | Host-wide read-only mount with hidden egress state | Refused; use fs-jail | A configured write-jail floor can pass the availability probe but each Landlock request is refused. |
+
+Every Landlock request, including `network: none`, is refused with HTTP 501 unless
+`BRIDGE_JAIL_HOST_EGRESS_ENFORCED=1` (default off). This is an operator assertion
+that the box's external egress policy is strict. The launcher also enforces a
+seccomp socket filter under NO_NEW_PRIVS, independent of the assertion. Only
+AF_INET/AF_INET6 SOCK_STREAM with protocol zero or IPPROTO_TCP may be created;
+AF_UNIX socket creation, non-stream socketpairs and io_uring_setup are refused; stream socketpair remains available for local IPC. Landlock then admits only
+the spawn's TCP ports. A user-only firewall cannot distinguish the bridge and
+payload, which share a user and network namespace. Host policy must still protect
+other host services and pathname Unix sockets; Landlock supplies no mount or
+network namespace. If the box's egress policy stops being strict, the operator
+must restart the bridge with the assertion cleared, or clear the assertion and
+restart before admitting further work. It is captured at startup. This assertion
+and the backend choice are never request fields and add no served capability or
+policy keys. Trusted private host-service aliases use one ephemeral loopback listener
+per claim when that assertion is enabled. Protected headers remain in the host relay,
+and claims cannot be adopted by a second spawn. The URL is allocated before native
+configuration, so it cannot share the later per-spawn proxy listener. Pi's isolated
+transport continues to require bubblewrap.
+
+The integration proof is `tests/landlock-jail.integration.test.ts`. Run it with
+`CLI_BRIDGE_REQUIRE_LANDLOCK=1` to make an unavailable kernel a failure rather than
+a skip. Each confinement case also runs against an unconfined launcher and must
+fail its boundary assertion. Kernel and ABI are printed with the result. See the
+[kernel UAPI documentation](https://docs.kernel.org/userspace-api/landlock.html)
+for the rights and limits of each ABI.
 
 ## Traces
 

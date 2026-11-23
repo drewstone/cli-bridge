@@ -25,6 +25,14 @@ import { resolveAgentProfile } from './profile-support.js'
  *  - gemini 0.26.0: `.gemini/system.md` with `GEMINI_SYSTEM_MD=1` replaces the
  *    base prompt. Its only additive path is GEMINI.md memory, which is the
  *    `instructions` surface.
+ *  - opencode 1.19.6: the materializer's profile primary agent replaces the
+ *    built-in prompt, selected by `default_agent` in the config this bridge
+ *    passes as `OPENCODE_CONFIG_CONTENT` (`opencode debug agent` shows its prompt
+ *    verbatim); `instructions[]` files join the system message as an addition.
+ *  - kimi-code 2.7.2: the project agent `.kimi-code/agents/agent.md`
+ *    (`override: true`) replaces the built-in default agent; Kimi records the
+ *    rendered prompt in the session's `profile.bind` before any turn. Its body
+ *    keeps Kimi's own prompt through `${base_prompt}` for an addition.
  *
  * Everything else is `null` on both intents, INCLUDING the backends whose
  * prompt path is a `role: 'system'` message. That message is flattened into
@@ -41,11 +49,8 @@ const HARNESS_PROMPT_CONTROLS: Record<string, { replace: string | null; append: 
   prime: { replace: '--system-prompt', append: '--append-system-prompt' },
   codex: { replace: '-c model_instructions_file=<file>', append: null },
   gemini: { replace: '.gemini/system.md', append: null },
-  // opencode composes its `instructions[]` files into the same system message
-  // as its built-in prompt, which stays in place — a real additive channel. Its
-  // replacement control (`agent.<name>.prompt`) binds to one agent chosen at
-  // launch, which a workspace plan cannot guarantee, so replacement is refused.
-  opencode: { replace: null, append: 'opencode.json instructions[]' },
+  opencode: { replace: 'profile primary agent selected by default_agent', append: 'opencode.json instructions[]' },
+  'kimi-code': { replace: '.kimi-code/agents/agent.md', append: '.kimi-code/agents/agent.md ${base_prompt}' },
 }
 
 const NO_PROMPT_CONTROLS = { replace: null, append: null } as const

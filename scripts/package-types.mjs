@@ -5,7 +5,7 @@ const signature = server.match(/^export declare function startServer\([^;]+;/m)?
 if (!signature) throw new Error('The emitted Bridge server declaration has no startServer signature')
 await writeFile(new URL('../types/package.d.ts', import.meta.url), [
   "import type { BridgeServer, StartServerOptions } from './server-options.js';",
-  "export { loadConfig } from './config.js';",
+  "export { loadConfig, localBackends } from './config.js';",
   "export type { BridgeServer, StartServerOptions } from './server-options.js';",
   "export { detectLocalSeats, type LocalSeat, type LocalSeatOptions } from './local-seats.js';",
   "export { listLocalModels, type LocalModelOptions } from './local-models.js';",

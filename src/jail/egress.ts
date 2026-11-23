@@ -1,8 +1,8 @@
 /**
- * Per-spawn egress for the Linux jail. Every jailed spawn runs in a fresh
- * network namespace; its policy decides what, if anything, leaves it:
+ * Per-spawn egress for the Linux jail. Namespace backends isolate routes;
+ * the opt-in port-only backend requires external host enforcement for every policy:
  *
- *   none    no route at all. Replays and evals: a candidate cannot fetch the
+ *   none    no admitted route (host enforcement is required for port-only jails). Replays and evals: a candidate cannot fetch the
  *           published fix.
  *   router  model calls only: the egress relay admits just the declared
  *           router hosts.
@@ -30,10 +30,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProxySecretBinding } from '@tangle-network/agent-interface'
-import { SHIM_PORT, startEgressRelay, type EgressRelay } from './egress-relay.js'
+import { SHIM_PORT, adoptTcpHostServices, startEgressRelay, type EgressRelay } from './egress-relay.js'
 import type { JailSpec } from './types.js'
 
-export type JailNetwork = 'none' | 'router' | 'relay'
+import type { JailNetwork } from '../config.js'
+export type { JailNetwork } from '../config.js'
 /** Openness order; an operator floor caps a request at its own rank. */
 export const JAIL_NETWORK_RANK: Record<JailNetwork, number> = { none: 0, router: 1, relay: 2 }
 /** The Tangle Router: the only origin a `router` spawn reaches. */
@@ -73,6 +74,11 @@ export interface PreparedEgress {
   env: Record<string, string>
   /** argv placed before the CLI: the in-jail shim, when any egress is allowed. */
   prefix: string[]
+  /** Host TCP ports admitted by the Landlock transport; empty denies plain TCP. */
+  tcpConnectPorts?: number[]
+  /** No broad filesystem grant may reveal another spawn’s egress state. */
+  hiddenParent?: string
+  readablePaths?: string[]
   cleanup(): Promise<void>
 }
 
@@ -87,7 +93,7 @@ function proxySecretPlaceholder(envName: string): string {
   return `proxy-${envName.toLowerCase().replace(/[^a-z0-9]+/gu, '-')}.${randomBytes(12).toString('base64url')}`
 }
 
-type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin' | 'trustedHostServices' | 'hostLoopbackPorts'>
+type EgressSpec = Pick<JailSpec, 'network' | 'vendorHosts' | 'passThroughHosts' | 'proxySecrets' | 'proxySecretCommand' | 'ironProxyBin' | 'trustedHostServices' | 'hostLoopbackPorts' | 'outerProxyEnforced'>
 
 /** Hosts the relay may splice. Router mode stays the Router only; pass-through is relay-only. */
 export function relayAllowHosts(spec: EgressSpec): readonly string[] {
@@ -120,26 +126,31 @@ async function egressParent(): Promise<string> {
   return EGRESS_PARENT
 }
 
-export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
+export async function prepareEgress(spec: EgressSpec, transport: 'namespace' | 'tcp-port' = 'namespace'): Promise<PreparedEgress> {
   const network = spec.network ?? 'none'
   const bindings = spec.proxySecrets ?? []
   if (bindings.length && network !== 'relay') throw new Error('proxySecrets require execution.jail.network relay')
   // Created on every path: a write-jail cannot create the mask's mountpoint on the read-only host root.
   const mask = ['--tmpfs', await egressParent()]
-  if (network === 'none' && !spec.trustedHostServices?.length && !spec.hostLoopbackPorts?.length) return { bwrapArgs: mask, env: {}, prefix: [], cleanup: async () => {} }
+  if (network === 'none' && !spec.hostLoopbackPorts?.length && (transport === 'tcp-port' || !spec.trustedHostServices?.length)) {
+    const claims = transport === 'tcp-port' ? adoptTcpHostServices(spec.trustedHostServices) : undefined
+    return { bwrapArgs: mask, env: {}, prefix: [], hiddenParent: EGRESS_PARENT, tcpConnectPorts: claims?.ports ?? [], cleanup: claims?.cleanup ?? (async () => {}) }
+  }
 
   const shared = await mkdtemp(join(EGRESS_PARENT, 's-'))
   const socketPath = join(shared, 's')
-  if (`${socketPath}65535`.length > MAX_SOCKET_PATH) {
+  if (transport !== 'tcp-port' && `${socketPath}65535`.length > MAX_SOCKET_PATH) {
     await rm(shared, { recursive: true, force: true })
     throw new Error(`egress socket path exceeds ${MAX_SOCKET_PATH} bytes; set TMPDIR to a shorter directory`)
   }
   let proxy: Awaited<ReturnType<typeof startIronProxy>> | undefined
   let relay: EgressRelay | undefined
+  let tcpServices: ReturnType<typeof adoptTcpHostServices> | undefined
   const bridges: Array<() => Promise<void>> = []
   const intercepts: JailEgressIntercept[] = []
   const cleanup = async () => {
     await relay?.close()
+    await tcpServices?.cleanup()
     await Promise.all(bridges.map((close) => close()))
     if (proxy) { proxy.child.kill('SIGTERM'); await rm(proxy.dir, { recursive: true, force: true }) }
     await rm(shared, { recursive: true, force: true })
@@ -148,6 +159,7 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
       runSecretCommand(spec.proxySecretCommand!, 'revoke', { key: binding.secretRef.key, secret })))
   }
   try {
+    if (transport === 'tcp-port') tcpServices = adoptTcpHostServices(spec.trustedHostServices)
     const env: Record<string, string> = network === 'none' ? {} : proxyEnv()
     let tunnel: { host: string; port: number } | undefined
     if (bindings.length) {
@@ -158,12 +170,21 @@ export async function prepareEgress(spec: EgressSpec): Promise<PreparedEgress> {
       tunnel = proxy.tunnel
       Object.assign(env, await trustEnv(shared, proxy.caCert), credentialEnv(intercepts))
     }
+    const proxyAuthorization = transport === 'tcp-port' ? `Basic ${Buffer.from(`spawn:${randomBytes(32).toString('base64url')}`).toString('base64')}` : undefined
     relay = await startEgressRelay({
-      socketPath,
+      ...(transport === 'tcp-port' ? { tcp: true, proxyAuthorization } : { socketPath }),
       allow: relayAllowHosts(spec),
-      trustedHostServices: spec.trustedHostServices,
+      trustedHostServices: transport === 'namespace' ? spec.trustedHostServices : undefined,
+      outerProxyEnforced: spec.outerProxyEnforced,
       ...(tunnel ? { intercept: { hosts: intercepts.flatMap((i) => i.binding.hosts), tunnel } } : {}),
     })
+    if (transport === 'tcp-port') {
+      const port = relay.port!
+      Object.assign(env, network === 'none' ? {} : proxyEnv(port, proxyAuthorization))
+      return { bwrapArgs: [], env, prefix: [], hiddenParent: EGRESS_PARENT,
+        tcpConnectPorts: [port, ...(tcpServices?.ports ?? []), ...(spec.hostLoopbackPorts ?? [])],
+        readablePaths: proxy ? [join(shared, 'ca.crt'), join(shared, 'ca-bundle.crt')] : [], cleanup }
+    }
     // Each host loopback port gets its own socket; the relay still refuses every other destination.
     const pairs = [socketPath, SHIM_PORT]
     for (const port of spec.hostLoopbackPorts ?? []) {
@@ -232,8 +253,9 @@ function runSecretCommand(command: string, verb: 'mint' | 'revoke', input: objec
   })
 }
 
-function proxyEnv(): Record<string, string> {
-  const url = `http://127.0.0.1:${SHIM_PORT}`
+function proxyEnv(port: number | string = SHIM_PORT, authorization?: string): Record<string, string> {
+  const credential = authorization ? `${Buffer.from(authorization.slice(6), 'base64').toString()}@` : ''
+  const url = `http://${credential}127.0.0.1:${port}`
   return {
     HTTPS_PROXY: url, https_proxy: url, HTTP_PROXY: url, http_proxy: url, ALL_PROXY: url, all_proxy: url,
     NO_PROXY: 'localhost,127.0.0.1,::1', no_proxy: 'localhost,127.0.0.1,::1',

@@ -6,6 +6,10 @@
  * and `--output-format stream-json` for JSONL. We parse those events
  * into OpenAI chat deltas.
  *
+ * A prompt too large for one argv string (Linux MAX_ARG_STRLEN: 131,071
+ * payload bytes) switches to `kimi acp`, the CLI's documented JSON-RPC
+ * stdin transport, in kimi-acp.ts — never a truncated prompt.
+ *
  * Model id scheme: `<harness>/<model>` where `<harness>` defaults to
  * `kimi-code` (the product name Moonshot ships the CLI under) and
  * `<model>` is what Kimi CLI accepts (e.g., `kimi-for-coding`,
@@ -29,6 +33,8 @@
  * common ones (`content`, `text`, `message.content`, `delta.text`).
  */
 
+import { kimiNativeHome, observeKimiPrintSession } from './kimi-turn-failure.js'
+import { kimiTextOnlyProfile, kimiToolChoiceError } from './kimi-text-only.js'
 import { type AgentProfile, nativeReasoningControl } from '@tangle-network/agent-interface'
 import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
 import { versionHealth } from './health.js'
@@ -39,6 +45,7 @@ import {
   admitNativeSubscription,
   profileExecutionIdentity,
   provisionProfileWorkspace,
+  resolveAgentProfile,
   resolveRequestedReasoningEffort,
 } from './profile-support.js'
 import {
@@ -54,6 +61,7 @@ import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } from './process-lines.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
+import { needsAcpPromptTransport, runKimiAcpTurn } from './kimi-acp.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -86,7 +94,38 @@ export class KimiBackend implements Backend {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
+  textOnlyToolChoice(req: ChatRequest, session: SessionRecord | null): void {
+    const prompt = (resolveAgentProfile(req, session) as { prompt?: { systemPrompt?: string; appendSystemPrompt?: string } } | null)?.prompt
+    if (prompt?.systemPrompt?.trim() || prompt?.appendSystemPrompt !== undefined) {
+      throw kimiToolChoiceError('The selected profile carries its prompt on Kimi\'s main agent, and a text-only turn replaces that agent with its own.')
+    }
+    if (req.session_id || session?.internalId) {
+      throw kimiToolChoiceError('Kimi fixes the main agent at session creation. Use a one-shot request to keep a coding session resumable with its own tools.')
+    }
+    if (this.spawner.executionEnvironment !== 'host') {
+      throw kimiToolChoiceError('The native agent file is available on the local host executor.')
+    }
+  }
+
   async *chat(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    const turn = this.nativeTurn(req, session, signal)
+    if (req.toolChoice !== 'none') {
+      yield* turn
+      return
+    }
+    for await (const delta of turn) {
+      if (delta.tool_calls?.length) {
+        throw new BackendError('The Kimi provider returned a tool call during a text-only request.', 'upstream')
+      }
+      yield delta
+    }
+  }
+
+  private async *nativeTurn(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
@@ -95,11 +134,21 @@ export class KimiBackend implements Backend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'kimi hosted-safe requires a verified tool-disable flag path on kimi-cli')
 
-    // Kimi Code 0.36.1 exposes prompt mode through argv. It does not
-    // implement Claude's structured stdin mode, so keep the prompt in
-    // the one supported `--prompt` argument.
+    // Kimi Code exposes prompt mode through a single `--prompt` argv string.
+    // Linux bounds one argv string at 131,071 payload bytes (MAX_ARG_STRLEN),
+    // so an assembled prompt larger than that rides the documented `kimi acp`
+    // stdin transport instead — same prompt bytes, model, reasoning, admission
+    // and session semantics (kimi-acp.ts).
     const prompt = this.buildPrompt(req, session)
     const model = this.resolveCliModel(req.model)
+    const textOnly = req.toolChoice === 'none'
+    if (textOnly) {
+      this.textOnlyToolChoice(req, session)
+      const health = await this.health(signal)
+      if (health.state !== 'ready' || health.version !== '2.7.2') {
+        throw kimiToolChoiceError('The native empty-tool profile requires a qualified Kimi Code binary (2.7.2).')
+      }
+    }
 
     // Reject unsupported profile plans before creating either temporary
     // Kimi config. Both files can contain provider or MCP credentials.
@@ -115,6 +164,23 @@ export class KimiBackend implements Backend {
       profileExecutionIdentity(req, session, 'kimi-code', thinkingFlag),
     )
 
+    if (needsAcpPromptTransport(prompt)) {
+      yield* runKimiAcpTurn({
+        backend: this.name,
+        bin: this.opts.bin,
+        spawner: this.spawner,
+        req,
+        session,
+        signal,
+        cwd,
+        prompt,
+        model,
+        thinkingFlag,
+        provisioned,
+      })
+      return
+    }
+
     const args = ['--prompt', prompt, '--output-format', 'stream-json']
     if (session?.internalId) {
       args.push('--session', session.internalId)
@@ -124,18 +190,28 @@ export class KimiBackend implements Backend {
     }
     if (thinkingFlag) args.push(thinkingFlag)
     args.push(...provisioned.flags)
-
+    let policy: ReturnType<typeof kimiTextOnlyProfile> | undefined
     let mcpMaterialized: ReturnType<typeof materializeMcpServersForKimi> = null
     let spawned: Awaited<ReturnType<Spawner>>
+    let nativeSession: ReturnType<typeof observeKimiPrintSession>
     try {
       // Kimi Code discovers request-scoped MCP from the project-local
       // `<cwd>/.kimi-code/mcp.json`; the mount restores the original file
       // after this process exits and serializes overlapping runs.
-      mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false }), cwd)
+      if (textOnly) {
+        if (provisioned.flags.some(flag => flag === '--agent' || flag === '--agent-file')) {
+          throw kimiToolChoiceError('The selected profile already binds a main agent. Kimi accepts one agent file per launch.')
+        }
+        policy = kimiTextOnlyProfile(req.jailSpec)
+        args.push('--agent-file', policy.file)
+      } else {
+        mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false }), cwd)
+      }
 
       const childEnv = { ...process.env, ...provisioned.env }
       await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
+      const startedAt = Date.now()
       spawned = await this.spawner(this.opts.bin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd,
@@ -146,8 +222,12 @@ export class KimiBackend implements Backend {
         ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
         ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
       })
+      if (this.spawner.executionEnvironment === 'host' && !req.jailSpec) {
+        nativeSession = observeKimiPrintSession(kimiNativeHome(childEnv), cwd ?? process.cwd(), spawned, startedAt)
+      }
     } catch (error) {
       mcpMaterialized?.cleanup()
+      policy?.root.cleanup()
       throw error
     }
     const child = spawned.child
@@ -314,6 +394,13 @@ export class KimiBackend implements Backend {
         yield { finish_reason: 'error', internal_session_id: internalSessionId }
         return
       }
+      if (child.exitCode === 1 && !child.signalCode) {
+        const failure = await nativeSession?.failure(prompt)
+        if (failure) throw failure
+        if (/error: failed to run prompt:/i.test(stderr.render())) {
+          throw new BackendError('Kimi: Prompt turn ended with reason: failed', 'upstream')
+        }
+      }
       await assertSuccessfulHarnessExit(spawned, 'kimi', () => stderr.render())
       if (sawError) throw new BackendError(`kimi: ${sawError}`, 'upstream')
       if (!emittedContent && !emittedToolCall) {
@@ -321,11 +408,13 @@ export class KimiBackend implements Backend {
       }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
+      nativeSession?.close()
       signal.removeEventListener('abort', onAbort)
       // Always tear down the whole subtree (kimi + any MCP/tool forks)
       // before releasing the slot. Idempotent; waits for actual exit.
       await terminateSpawned(spawned)
       mcpMaterialized?.cleanup()
+      policy?.root.cleanup()
       releaseSpawner()
     }
   }
