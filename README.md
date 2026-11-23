@@ -38,7 +38,8 @@ Model selection, ranking, and seat syntax belong to the consuming seat resolver.
 
 `authenticated` means the native status command recognizes a login, not that an
 inference was verified. Kimi Code's login comes from Kimi's own local server
-(`kimi web --json`, then `GET /api/v1/auth` and `/api/v1/config`); it covers only models
+(`kimi web --json`, then `GET /api/v1/auth` and `/api/v1/config`), started with its model-catalog
+refresh off so the read calls no Kimi API and refreshes no token. It covers only models
 that Kimi routes through its managed `kimi-code` subscription, whose provider is `moonshot`.
 Where inventory reads Gemini's own OAuth store or OpenCode's credential store,
 the result is `configured` rather than a verified live login. Missing or malformed

@@ -50,7 +50,8 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
   const timeout = options.timeoutMs ?? 10_000
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > 30_000) throw new Error('seat inventory timeoutMs must be between 1 and 30000')
   const probe = (bin: string, args: readonly string[], nativeEnv = env) => probeNativeStatus(bin, args, { timeoutMs: timeout, signal: options.signal, cwd: options.cwd, env: nativeEnv })
-  const results = await Promise.allSettled(localHarnesses.filter(([, harness]) => !options.harnesses || options.harnesses.includes(harness)).map(async ([key, harness, fix, args, provider]): Promise<LocalSeat | LocalSeat[]> => {
+  const selected = localHarnesses.filter(([, harness]) => !options.harnesses || options.harnesses.includes(harness))
+  const results = await Promise.allSettled(selected.map(async ([key, harness, fix, args, provider]): Promise<LocalSeat | LocalSeat[]> => {
     const bin = config[`${key}Bin`]
     const nativeArgs = key === 'pi' && options.provider
       ? ['auth', 'check', '--provider', options.provider, ...(options.model ? ['--model', options.model] : []), '--json', '--no-refresh'] : args
@@ -170,7 +171,9 @@ async function kimiLoginState(bin: string, env: NodeJS.ProcessEnv, model: string
   options: { timeoutMs: number; signal?: AbortSignal; cwd?: string }): Promise<Pick<LocalSeat, 'provider' | 'status' | 'authMode' | 'fix'>> {
   const stop = AbortSignal.any([AbortSignal.timeout(options.timeoutMs), ...(options.signal ? [options.signal] : [])])
   stop.throwIfAborted()
-  const child = spawn(bin, ['web', '--json', '--host', '127.0.0.1', '--port', '0'], { cwd: options.cwd, env,
+  // The server otherwise refreshes its model catalog on start, which can refresh the OAuth token and calls Kimi's API.
+  const child = spawn(bin, ['web', '--json', '--host', '127.0.0.1', '--port', '0'], { cwd: options.cwd,
+    env: { ...env, KIMI_CODE_MODEL_CATALOG_REFRESH_ON_START: '0', KIMI_CODE_MODEL_CATALOG_REFRESH_INTERVAL_MS: '0' },
     detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   // A timeout or caller abort stops the server at once; otherwise it gets the default grace to save its own state.
   const kill = () => killTreeSync(child, 'SIGKILL')
