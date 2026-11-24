@@ -36,6 +36,8 @@ import { piPermissionPublicTitle, piPermissionTokenFromTitle } from '../../backe
 import { normalizeClaudeUsage, sanitizeUpstreamErrorDetail, type ClaudeNativeUsage } from '../../backends/claude.js'
 import { CLAUDE_TURN_SETTLED, ClaudeNativeSession } from '../../backends/claude-native-session.js'
 import { KIMI_TURN_SETTLED, KimiNativeSession } from '../../backends/kimi-native-session.js'
+import { OPENCODE_TURN_SETTLED, OpencodeNativeSession } from '../../backends/opencode-native-session.js'
+import { opencodeStepUsage } from '../../backends/opencode.js'
 import { numberValue, recordValue, stringValue } from './json-values.js'
 
 export interface NativeTurnInput {
@@ -64,7 +66,7 @@ export interface NativeTurnInput {
 
 /**
  * The one turn driver: it owns the loop, the raw fallback, deferred denials
- * and the failing catch. Pi's step is inline below; Claude's is `claudeStep`, Kimi's `kimiStep`.
+ * and the failing catch. Pi's step is inline below; Claude's is `claudeStep`, opencode's `opencodeStep`, Kimi's `kimiStep`.
  */
 export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ event: StreamEvent }> {
   const { native, run, sessionId, prompt, backendName } = input
@@ -77,6 +79,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   let responseIdentity: PiResponseIdentity | undefined
   const deferredDenials: Promise<void>[] = []
   const claude = native instanceof ClaudeNativeSession ? claudeStep(input, native, deferredDenials)
+    : native instanceof OpencodeNativeSession ? opencodeStep(input, native, deferredDenials)
     : native instanceof KimiNativeSession ? kimiStep(input, native, deferredDenials) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
@@ -509,6 +512,125 @@ function kimiStep(
     }
     // Session, agent, context and task bookkeeping carry nothing a turn's consumer reads.
     if (['session', 'agent', 'context', 'task', 'task.list', 'todo', 'goal', 'turns'].includes(type)) return []
+    return null
+  }
+}
+
+/**
+ * opencode's step: one `/event` record to canonical events, or null to keep it as `raw`. Text and
+ * reasoning arrive as part snapshots plus `message.part.delta` appends, one content index per part;
+ * a user message's parts (the prompt and steers) are not output. Each `step-finish` part is one
+ * model call's usage. The first failure sticks, as in one-shot; an abort is the run's own.
+ */
+function opencodeStep(
+  input: NativeTurnInput,
+  native: OpencodeNativeSession,
+  deferredDenials: Promise<void>[],
+): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId, backendName } = input
+  const userMessages = new Set<string>()
+  const parts = new Map<string, { index: number; kind: 'text' | 'reasoning'; text: string }>()
+  const tools = new Map<string, string>()
+  const steps = new Set<string>()
+  const models = new Set<string>()
+  let model: string | undefined
+  let nextContentIndex = 0
+  let processing = false
+  let failure: string | null = null
+  const raw = (event: unknown): StreamEvent => ({ type: 'raw', backend: backendName, event })
+  const fail = (error: Record<string, unknown> | null): void => {
+    if (!error || error.name === 'MessageAbortedError') return
+    failure ??= sanitizeUpstreamErrorDetail(stringValue(recordValue(error.data)?.message) ?? stringValue(error.name) ?? undefined)
+  }
+  // Publish only what extends the part's text; a stale or rewritten snapshot adds nothing the deltas did not.
+  const content = (partId: string, kind: 'text' | 'reasoning', delta: string | null, snapshot = ''): StreamEvent[] => {
+    let entry = parts.get(partId)
+    if (!entry) parts.set(partId, entry = { index: nextContentIndex++, kind, text: '' })
+    const appended = delta ?? (snapshot.startsWith(entry.text) ? snapshot.slice(entry.text.length) : '')
+    if (!appended) return []
+    entry.text += appended
+    return [(entry.kind === 'reasoning' ? reasoningEvent : textEvent)(sessionId, run.id, entry.index, entry.text, appended)]
+  }
+  return (event) => {
+    const type = String(event.type ?? '')
+    const props = recordValue(event.properties) ?? {}
+    if (type === OPENCODE_TURN_SETTLED) return [settledStatus(failure)]
+    if (type === 'message.updated') {
+      const info = recordValue(props.info)
+      const id = stringValue(info?.id)
+      if (info?.role === 'user') {
+        if (id) userMessages.add(id)
+        return []
+      }
+      fail(recordValue(info?.error))
+      model = stringValue(info?.modelID) ?? model
+      // Served model identity, reported as one-shot and Claude report it.
+      if (!id || !model || models.has(`${id}:${model}`)) return []
+      models.add(`${id}:${model}`)
+      return [raw({ type: 'raw', data: { model, provider_models: [model] } })]
+    }
+    if (type === 'message.part.delta') {
+      const partId = stringValue(props.partID)
+      const messageId = stringValue(props.messageID)
+      const delta = props.delta
+      if (!partId || !messageId || props.field !== 'text' || typeof delta !== 'string') return null
+      if (userMessages.has(messageId)) return []
+      return content(partId, parts.get(partId)?.kind ?? 'text', delta)
+    }
+    if (type === 'message.part.updated') {
+      const part = recordValue(props.part)
+      const partId = stringValue(part?.id)
+      const messageId = stringValue(part?.messageID)
+      if (!part || !partId || !messageId) return null
+      if (userMessages.has(messageId) || part.synthetic === true) return []
+      const kind = part.type
+      if (kind === 'text' || kind === 'reasoning') return content(partId, kind, null, typeof part.text === 'string' ? part.text : '')
+      if (kind === 'tool') {
+        const id = stringValue(part.callID) ?? partId
+        const state = recordValue(part.state) ?? {}
+        const status = state.status
+        if ((status !== 'pending' && status !== 'running' && status !== 'completed' && status !== 'error') || tools.get(id) === status) return []
+        tools.set(id, status)
+        const outcome = status === 'completed' ? { output: state.output } : status === 'error' ? { error: state.error } : undefined
+        return [{ type: 'message.part.updated',
+          part: toolPart(sessionId, run.id, id, stringValue(part.tool) ?? 'tool', recordValue(state.input) ?? {}, status, outcome) }]
+      }
+      if (kind === 'step-start') {
+        if (processing) return []
+        processing = true
+        return [{ type: 'status', status: 'processing' }]
+      }
+      if (kind === 'step-finish') {
+        if (steps.has(partId)) return []
+        steps.add(partId)
+        const usage = opencodeStepUsage(part)
+        return usage ? [raw(usageEnvironmentEvent({
+          input: usage.input_tokens, freshInput: usage.fresh_input_tokens, cacheRead: usage.cache_read_input_tokens,
+          cacheWrite: usage.cache_write_input_tokens, output: usage.output_tokens, reasoning: usage.reasoning_output_tokens,
+          estimatedCost: usage.estimated_cost,
+        }, model ? { model } : undefined))] : []
+      }
+      return null
+    }
+    if (type === 'session.error') {
+      fail(recordValue(props.error))
+      return []
+    }
+    if (type === 'permission.asked') {
+      const nativeId = stringValue(props.id)
+      if (!nativeId) return null
+      const permission = (stringValue(props.permission) ?? 'tool').replace(/[^\p{L}\p{N} .,_:\/-]/gu, ' ').trim().slice(0, 120) || 'tool'
+      const body = JSON.stringify({ patterns: props.patterns, metadata: props.metadata }).slice(0, 4_000)
+      const interaction = permissionInteraction(run, nativeId, `Permission: ${permission}`, body, sessionId,
+        input.providerName, input.environmentId)
+      if (interaction) return [admitInteraction(input, interaction, deferredDenials)]
+      // opencode waits on every permission request; one the bridge cannot publish is refused.
+      deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
+      return [{ type: 'warning', code: 'unsupported_interaction', message: 'opencode emitted a permission request cli-bridge cannot publish' }]
+    }
+    // A retry status stays raw: it names the provider's wait.
+    if (type === 'session.status') return recordValue(props.status)?.type === 'retry' ? null : []
+    if (type === 'session.updated' || type === 'session.diff' || type === 'permission.replied') return []
     return null
   }
 }

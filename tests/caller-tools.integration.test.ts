@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it } from 'vitest'
@@ -76,6 +76,47 @@ it('a harness turn calls the caller\'s tool: the Bridge answers tool_calls, then
     const stale = await post({ model: 'claude-code/test', tools: [{ type: 'function', function: { name: 'record_answer' } }], tool_choice: 'none', messages: [user] })
     expect(stale.status).toBe(400)
   } finally {
+    await server.close()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 60_000)
+
+it('a caller that stops answering mid-turn has its turn cancelled, ending the harness that held its slot', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'caller-tools-idle-'))
+  const binary = join(root, 'claude')
+  // The same harness, recording its pid so the test can watch it end.
+  const pidFile = join(root, 'peer.pid')
+  await writeFile(binary, harness.replace('async function main() {', `async function main() {\n  fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid))`))
+  await chmod(binary, 0o755)
+  const previous = process.env.BRIDGE_CALLER_TOOLS_IDLE_MS
+  process.env.BRIDGE_CALLER_TOOLS_IDLE_MS = '1000'
+  const server = await startServer({ cwd: root, quiet: true, handleSignals: false,
+    config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'claude', BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary }), port: 0 } })
+  try {
+    const post = (body: unknown) => fetch(`${server.url}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
+    const user = { role: 'user', content: 'Record the answer with the tool.' }
+    const first = await post({ model: 'claude-code/test', messages: [user], tools })
+    const asked = await first.json() as { choices: Array<{ finish_reason: string; message: { content: string | null; tool_calls: Array<{ id: string; type: string; function: { name: string; arguments: string } }> } }> }
+    expect(asked.choices[0]!.finish_reason).toBe('tool_calls')
+    const pid = Number(await readFile(pidFile, 'utf8'))
+    expect(alive(pid)).toBe(true)
+
+    // The caller never sends the tool result. Past the idle limit the turn is cancelled and its harness ends.
+    let ended = false
+    for (let attempt = 0; attempt < 60 && !ended; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      ended = !alive(pid)
+    }
+    expect(ended).toBe(true)
+    const call = asked.choices[0]!.message.tool_calls[0]!
+    const late = await post({ model: 'claude-code/test', tools, messages: [user,
+      { role: 'assistant', content: asked.choices[0]!.message.content, tool_calls: [call] }, { role: 'tool', tool_call_id: call.id, content: 'stored 42' }] })
+    // The late answer matches no parked call: a new turn, not the cancelled one resumed.
+    expect(late.status).toBe(200)
+  } finally {
+    if (previous === undefined) delete process.env.BRIDGE_CALLER_TOOLS_IDLE_MS
+    else process.env.BRIDGE_CALLER_TOOLS_IDLE_MS = previous
     await server.close()
     await rm(root, { recursive: true, force: true })
   }

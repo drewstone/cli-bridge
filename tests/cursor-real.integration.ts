@@ -49,7 +49,8 @@ try {
   const capabilities = await api('/v1/capabilities?model=cursor/grok-4.7-medium')
   assert.equal(capabilities.sessions.continue, true)
   assert.equal(capabilities.branching.fork, false)
-  assert.equal(capabilities.profile.mcp, false)
+  assert.equal(capabilities.profile.mcp, true)
+  assert.equal(capabilities.profile.instructions, true)
   assert.deepEqual(capabilities.profile.systemPrompt, { replace: false, append: false })
   receipt.capabilities = capabilities
   const seats = await detectLocalSeats({ config, harnesses: ['cursor'] })

@@ -43,6 +43,14 @@ export const callerToolsRequestSchema = z.array(z.object({
 
 /** How long a parked call waits for the caller's next request before the harness sees a tool error. */
 export const CALLER_TOOL_TIMEOUT_MS = 10 * 60_000
+/**
+ * How long the Bridge waits for the caller's next request after answering with tool calls. A caller that stops mid-turn
+ * (a benchmark runner at its step limit) never sends one, and the harness, handed a tool error, would park again and hold
+ * its executor slot indefinitely; past this the caller has gone and the turn is cancelled. `BRIDGE_CALLER_TOOLS_IDLE_MS`
+ * overrides it.
+ */
+export const CALLER_IDLE_TIMEOUT_MS = 5 * 60_000
+const callerIdleMs = () => Number(process.env.BRIDGE_CALLER_TOOLS_IDLE_MS) || CALLER_IDLE_TIMEOUT_MS
 /** The MCP server name the harness sees; Claude Code shows the tools as `mcp__caller__<name>`. */
 export const CALLER_TOOLS_SERVER = 'caller'
 
@@ -55,8 +63,16 @@ export class CallerToolsTurn {
   private readonly unanswered = new Map<string, ParkedCall>()
   private reported: ParkedCall[] = []
   private parkWaiters: Array<() => void> = []
+  private idle: ReturnType<typeof setTimeout> | undefined
 
   constructor(readonly tools: readonly CallerTool[]) {}
+
+  /** The caller now holds tool calls: if its next request does not come in time, `gone` runs. */
+  awaitCaller(gone: () => void): void {
+    clearTimeout(this.idle)
+    this.idle = setTimeout(gone, callerIdleMs())
+    this.idle.unref?.()
+  }
 
   /** The harness called a caller tool: hold it until the caller answers. */
   park(name: string, args: unknown): Promise<{ content: string; isError: boolean }> {
@@ -86,6 +102,7 @@ export class CallerToolsTurn {
   answer(toolCallId: string, content: string): boolean {
     const call = this.unanswered.get(toolCallId)
     if (!call) return false
+    clearTimeout(this.idle)
     this.unanswered.delete(toolCallId)
     call.resolve({ content, isError: false })
     return true
@@ -94,6 +111,7 @@ export class CallerToolsTurn {
   /** The harness turn ended or the caller went away: release every call still parked. */
   settle(reason: string): void {
     this.settled = true
+    clearTimeout(this.idle)
     for (const call of this.unanswered.values()) call.resolve({ content: reason, isError: true })
     this.unanswered.clear()
     this.reported = []
@@ -220,6 +238,7 @@ export async function respondCallerTurn(c: Context, run: Run, turn: CallerToolsT
       }
       const calls = turn.takeReported()
       turn.resumeSeq = lastSeq
+      turn.awaitCaller(() => { turn.settle('the caller did not answer its tool calls'); run.cancel() })
       void iterator.return?.(undefined as never)
       return answer(c, req, text, calls, 'tool_calls')
     }

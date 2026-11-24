@@ -17,7 +17,7 @@
  * right headers so Moonshot's backend accepts the call.
  */
 
-import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { BackendFailureReason, ChatDelta, ChatRequest, BackendHealth, NativeSessionBackend } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -54,6 +54,7 @@ import type { AgentProfileModelHints } from '@tangle-network/agent-interface'
 import { installOutputCapPlugin, verifiedStepOutput } from './opencode-output-budget.js'
 export { outputCapPluginSource } from './opencode-output-budget.js'
 import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
+import { opencodeNativeCapabilities, startOpencodeNativeSession } from './opencode-native-start.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
 
@@ -62,10 +63,32 @@ export interface OpencodeBackendOptions {
   timeoutMs: number
   /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
   spawner?: Spawner
+  /** The operator's jail settings, which a retained session resolves its jail from. */
+  jailEnv?: NodeJS.ProcessEnv
 }
 
-export class OpencodeBackend implements Backend {
+/** The operator's proxy and trust roots, kept through the host sanitizer; these names are not request-controlled. */
+export const OPENCODE_ENV_PASSTHROUGH_KEYS: readonly string[] = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']
+
+/** opencode's install root under $HOME, which an fs-jail hides (see `runRunner`). */
+export function opencodeInstallDir(): string {
+  return process.env.OPENCODE_INSTALL_DIR || join(homedir(), '.opencode')
+}
+
+/** opencode's own `provider/model` spec from `opencode/<provider>/<model>`; null for the bare route. */
+export function opencodeModelSpec(fullModel: string): string | null {
+  const lower = fullModel.toLowerCase()
+  if (lower === 'opencode') return null
+  if (lower.startsWith('opencode/')) {
+    const rest = fullModel.slice('opencode/'.length)
+    return rest.length > 0 ? rest : null
+  }
+  return null
+}
+
+export class OpencodeBackend implements NativeSessionBackend {
   readonly name = 'opencode'
+  readonly nativeModes = ['byob'] as const
   readonly defaultExecutionTimeoutMs: number
   // The signal plugin reports a call at its start; it is installed in the turn's private config
   // directory, which every turn with an AgentProfile has (agent-runtime always sends one).
@@ -86,6 +109,15 @@ export class OpencodeBackend implements Backend {
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
+  }
+
+  nativeCapabilities() {
+    return opencodeNativeCapabilities()
+  }
+
+  /** One retained `opencode serve` (opencode-native-session.ts); a steer is opencode's own mid-turn input. */
+  startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal) {
+    return startOpencodeNativeSession({ bin: this.opts.bin, spawner: this.spawner, jailEnv: this.opts.jailEnv }, req, session, signal)
   }
 
   /** One turn; it continues once in the same native session when its runner dies (see `chatContinuing`). */
@@ -119,7 +151,7 @@ export class OpencodeBackend implements Backend {
     }
 
     const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'opencode'))
-    const model = this.extractModel(req.model)
+    const model = opencodeModelSpec(req.model)
 
     // Reject unsupported profile plans before writing a request-scoped
     // opencode.json that may contain MCP credentials.
@@ -214,7 +246,7 @@ export class OpencodeBackend implements Backend {
     //   timeout: failed to run command '/home/<user>/.opencode/bin/opencode': No such file or directory
     // The install root is a fixed property of this harness, so this backend declares it rather
     // than leaving every operator to discover BRIDGE_JAIL_RO_PATHS from a 127.
-    registerJailReadable(req.jailSpec, process.env.OPENCODE_INSTALL_DIR || join(homedir(), '.opencode'))
+    registerJailReadable(req.jailSpec, opencodeInstallDir())
 
     // Pipe the prompt via stdin instead of stuffing it into argv. Linux
     // enforces MAX_ARG_STRLEN = PAGE_SIZE × 32 = 128 KiB per argv arg
@@ -245,7 +277,7 @@ export class OpencodeBackend implements Backend {
     args.push(...provisioned.flags)
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      const envPassthroughKeys = ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']
+      const envPassthroughKeys = OPENCODE_ENV_PASSTHROUGH_KEYS
       const childEnv = {
         ...process.env,
         OPENCODE_RUN_TIMEOUT_SECONDS: String(Math.ceil((req.execution?.timeoutMs ?? this.defaultExecutionTimeoutMs) / 1000)),
@@ -537,15 +569,6 @@ export class OpencodeBackend implements Backend {
     return messages.map((m) => `[${m.role}] ${contentToText(m.content)}`).join('\n\n')
   }
 
-  private extractModel(fullModel: string): string | null {
-    const lower = fullModel.toLowerCase()
-    if (lower === 'opencode') return null
-    if (lower.startsWith('opencode/')) {
-      const rest = fullModel.slice('opencode/'.length)
-      return rest.length > 0 ? rest : null
-    }
-    return null
-  }
 }
 
 /**
@@ -711,6 +734,11 @@ function extractToolResult(
   const name = String(part.name ?? part.tool ?? '')
   if (!id || !name) return null
   return toolResult(id, name, status === 'error', status === 'error' ? state?.error : state?.output)
+}
+
+/** One `step-finish` part's model-call usage, as the one-shot stream reports it. */
+export function opencodeStepUsage(part: Record<string, unknown>): UsageReceipt | null {
+  return extractUsage({ part }, false)
 }
 
 function extractUsage(ev: Record<string, unknown>, cappedStep: boolean): UsageReceipt | null {
