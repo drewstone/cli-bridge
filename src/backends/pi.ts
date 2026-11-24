@@ -414,7 +414,10 @@ export class PiBackend implements NativeSessionBackend {
     const requestedInternalSessionId = req.session_id && !session?.internalId
       ? randomUUID()
       : undefined
+    // Each attempt grants its own transport directory, which its cleanup removes; a retry starts from the request's jail.
+    const requestJail = req.jailSpec
     for (let attempt = 1; ; attempt += 1) {
+      if (requestJail) req.jailSpec = { ...requestJail }
       let emitted = 0
       // A turn that never started is not a transient turn failure: a rejected spawn is a local
       // condition (a missing binary, an executor refusing the request) that repeats identically,
