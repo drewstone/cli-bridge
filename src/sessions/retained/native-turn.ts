@@ -35,6 +35,7 @@ import type { Run } from '../../runs/registry.js'
 import { piPermissionPublicTitle, piPermissionTokenFromTitle } from '../../backends/pi-interaction.js'
 import { normalizeClaudeUsage, sanitizeUpstreamErrorDetail, type ClaudeNativeUsage } from '../../backends/claude.js'
 import { CLAUDE_TURN_SETTLED, ClaudeNativeSession } from '../../backends/claude-native-session.js'
+import { ACP_PERMISSION, ACP_TURN_SETTLED, AcpNativeSession } from '../../backends/acp-native-session.js'
 import { CODEX_TURN_SETTLED, CodexNativeSession, isCodexToolApproval } from '../../backends/codex-native-session.js'
 import { KIMI_TURN_SETTLED, KimiNativeSession } from '../../backends/kimi-native-session.js'
 import { OPENCODE_TURN_SETTLED, OpencodeNativeSession } from '../../backends/opencode-native-session.js'
@@ -83,7 +84,8 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   const claude = native instanceof ClaudeNativeSession ? claudeStep(input, native, deferredDenials)
     : native instanceof OpencodeNativeSession ? opencodeStep(input, native, deferredDenials)
     : native instanceof KimiNativeSession ? kimiStep(input, native, deferredDenials)
-    : native instanceof CodexNativeSession ? codexStep(input, native, deferredDenials) : null
+    : native instanceof CodexNativeSession ? codexStep(input, native, deferredDenials)
+    : native instanceof AcpNativeSession ? acpStep(input, native, deferredDenials) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
       const event = recordValue(raw)
@@ -516,6 +518,82 @@ function kimiStep(
     // Session, agent, context and task bookkeeping carry nothing a turn's consumer reads.
     if (['session', 'agent', 'context', 'task', 'task.list', 'todo', 'goal', 'turns'].includes(type)) return []
     return null
+  }
+}
+
+/**
+ * An ACP agent's step: one `session/update` to canonical events, or null to keep it as `raw`. Each
+ * assistant message (by `messageId`) or thought is one content part fed by its chunks; a tool call is
+ * one tool part. The `session/prompt` result settles the turn with the usage it reports. A steer's
+ * receipt stays raw.
+ */
+function acpStep(
+  input: NativeTurnInput,
+  native: AcpNativeSession,
+  deferredDenials: Promise<void>[],
+): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId, backendName } = input
+  const parts = new Map<string, { index: number; text: string }>()
+  const tools = new Map<string, { name: string; args: Record<string, unknown> }>()
+  let nextContentIndex = 0
+  const raw = (event: unknown): StreamEvent => ({ type: 'raw', backend: backendName, event })
+  const content = (key: string, kind: 'text' | 'reasoning', delta: string): StreamEvent[] => {
+    let entry = parts.get(key)
+    if (!entry) parts.set(key, entry = { index: nextContentIndex++, text: '' })
+    entry.text += delta
+    return [(kind === 'reasoning' ? reasoningEvent : textEvent)(sessionId, run.id, entry.index, entry.text, delta)]
+  }
+  return (event) => {
+    const type = String(event.type ?? '')
+    if (type === ACP_TURN_SETTLED) {
+      const failure = typeof event.error === 'string' ? sanitizeUpstreamErrorDetail(event.error)
+        : event.stopReason === 'refusal' ? 'the agent refused the prompt' : null
+      const usage = recordValue(event.usage)
+      const read = (key: string) => numberValue(usage?.[key]) ?? undefined
+      const counted = usage && [read('inputTokens'), read('outputTokens')].some((count) => count !== undefined && count > 0)
+      return [
+        ...(counted ? [raw(usageEnvironmentEvent({ input: read('inputTokens'), output: read('outputTokens'), reasoning: read('thoughtTokens'),
+          cacheRead: read('cachedReadTokens'), cacheWrite: read('cachedWriteTokens') }, undefined))] : []),
+        settledStatus(failure),
+      ]
+    }
+    if (type === ACP_PERMISSION) {
+      const nativeId = stringValue(event.id)
+      if (!nativeId) return []
+      const call = recordValue(event.toolCall) ?? {}
+      const title = (stringValue(call.title) ?? 'tool').replace(/[^\p{L}\p{N} .,_:\/-]/gu, ' ').trim().slice(0, 120) || 'tool'
+      const body = call.rawInput === undefined ? null : JSON.stringify(call.rawInput).slice(0, 4_000)
+      const interaction = permissionInteraction(run, nativeId, `Permission: ${title}`, body, sessionId, input.providerName, input.environmentId)
+      if (interaction) return [admitInteraction(input, interaction, deferredDenials)]
+      deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
+      return [{ type: 'warning', code: 'unsupported_interaction', message: 'the agent asked a permission cli-bridge cannot publish; it was refused' }]
+    }
+    if (type !== 'session/update') return null
+    const update = recordValue(event.update) ?? {}
+    const kind = String(update.sessionUpdate ?? '')
+    const chunk = recordValue(update.content)
+    if ((kind === 'agent_message_chunk' || kind === 'agent_thought_chunk') && chunk?.type === 'text' && typeof chunk.text === 'string') {
+      const key = `${kind}:${stringValue(update.messageId) ?? ''}`
+      return chunk.text ? content(key, kind === 'agent_thought_chunk' ? 'reasoning' : 'text', chunk.text) : []
+    }
+    if (kind === 'tool_call' || kind === 'tool_call_update') {
+      const id = stringValue(update.toolCallId)
+      if (!id) return null
+      const known = tools.get(id) ?? { name: 'tool', args: {} }
+      const name = stringValue(update.title) ?? known.name
+      const args = recordValue(update.rawInput) ?? known.args
+      tools.set(id, { name, args })
+      const output = Array.isArray(update.content)
+        ? update.content.map((item) => stringValue(recordValue(recordValue(item)?.content)?.text) ?? '').filter(Boolean).join('\n')
+        : undefined
+      const status = update.status === 'completed' ? 'completed' : update.status === 'failed' ? 'error'
+        : update.status === 'in_progress' ? 'running' : kind === 'tool_call' ? 'pending' : null
+      if (!status) return []
+      return [{ type: 'message.part.updated', part: toolPart(sessionId, run.id, id, name, args, status,
+        status === 'completed' ? { output: output ?? null } : status === 'error' ? { error: output || 'tool failed' } : undefined) }]
+    }
+    // Plans, usage gauges, session info, commands and config are not a turn's output.
+    return []
   }
 }
 
