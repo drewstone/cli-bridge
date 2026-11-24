@@ -58,8 +58,9 @@ const VENDOR_HOSTS: Record<string, readonly string[]> = {
   // during a turn (measured 2026-11-24 on Kimi Code 2.7.2); its telemetry host stays refused.
   'kimi-code': KIMI_HOSTS,
   kimi: KIMI_HOSTS,
-  // Cursor Agent calls api2.cursor.sh for every turn (measured 2026-11-24, cursor-agent 2026.11.22).
-  cursor: ['api2.cursor.sh'],
+  // Cursor Agent calls api2.cursor.sh, then its agent endpoint agentn.global.api5.cursor.sh, for every
+  // turn (measured 2026-11-24, cursor-agent 2026.11.22).
+  cursor: ['api2.cursor.sh', 'agentn.global.api5.cursor.sh'],
 }
 
 export function vendorHostsFor(backendName: string): string[] {
