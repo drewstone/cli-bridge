@@ -50,7 +50,7 @@ process.stdin.on('data', (chunk) => { prompt += chunk }).on('end', async () => {
 `
 
 // Answers its one tool with the token from its env and records the HOME it runs under.
-const tokenServer = (record: string) => `const fs=require('node:fs'),rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{const r=JSON.parse(line);if(r.id===undefined)return;fs.writeFileSync(${JSON.stringify(record)},process.env.HOME||'');const result=r.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}}:r.method==='tools/list'?{tools:[{name:'conformance_token',inputSchema:{type:'object',properties:{}}}]}:{content:[{type:'text',text:process.env.CONFORMANCE_TOKEN}]};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
+const tokenServer = (record: string) => `const fs=require('node:fs'),rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{const r=JSON.parse(line);if(r.id===undefined)return;fs.writeFileSync(${JSON.stringify(record)},process.env.HOME||'');const result=r.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}}:r.method==='tools/list'?{tools:[{name:'conformance_token',inputSchema:{type:'object',properties:{}}}]}:{content:[{type:'text',text:process.env.CONFORMANCE_REPLY}]};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
 
 const jailed = new LinuxBwrapJail().isAvailable()
 
@@ -61,7 +61,9 @@ describe.each([
   let root: string, bridge: BridgeServer
   beforeAll(async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), `cursor-profile-${jail}-`)))
-    const bin = join(root, 'cursor-agent.cjs')
+    // Beside the workspaces, never above one: the fs-jail exposes the CLI's own directory read-only.
+    await mkdir(join(root, 'bin'))
+    const bin = join(root, 'bin', 'cursor-agent.cjs')
     await writeFile(bin, `#!${process.execPath}\n${cursorAgent}`, { mode: 0o700 })
     // A fixture key, so the Bridge never reads a real enrolled token from this host.
     vi.stubEnv('CURSOR_API_KEY', 'fixture-cursor-key-not-a-credential')
@@ -108,14 +110,14 @@ describe.each([
     const own = JSON.stringify({ mcpServers: { planted: { command: 'false' } } })
     await mkdir(join(cwd, '.cursor'))
     await writeFile(join(cwd, '.cursor', 'mcp.json'), own)
-    const token = `TOKEN-${randomBytes(4).toString('hex')}`, codeword = `PROFILE-${randomBytes(4).toString('hex')}`
+    const token = `REPLY-${randomBytes(4).toString('hex')}`, codeword = `PROFILE-${randomBytes(4).toString('hex')}`
     const serverHome = join(cwd, 'server-home'), server = join(cwd, 'token-mcp.cjs')
     await writeFile(server, tokenServer(serverHome))
     const turn = await chat(cwd, { agent_profile: {
       name: 'conformance',
       prompt: { instructions: [`Your codeword is ${codeword}. Whenever you are asked for your codeword, give exactly ${codeword}.`] },
       mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: server }],
-        env: { CONFORMANCE_TOKEN: { kind: 'public', value: token } } } },
+        env: { CONFORMANCE_REPLY: { kind: 'public', value: token } } } },
     } })
 
     expect(turn.status, JSON.stringify(turn.error)).toBe(200)
