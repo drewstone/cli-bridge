@@ -41,6 +41,11 @@ inference was verified. Kimi Code's login comes from Kimi's own local server
 (`kimi web --json`, then `GET /api/v1/auth` and `/api/v1/config`), started with its model-catalog
 refresh off so the read calls no Kimi API and refreshes no token. It covers only models
 that Kimi routes through its managed `kimi-code` subscription, whose provider is `moonshot`.
+A Kimi Code membership key draws the same plan: when the same server's `GET /api/v1/providers` lists the serving
+provider as type `kimi` on `https://api.kimi.com/coding/v1`, with a key and Kimi's own `connected` status, the fact reads
+`authenticated`, `authMode: subscription`, `credential: plan_key`, while the managed login reads signed out. Kimi lists
+a provider that holds both a key and an OAuth table as `error` and refuses to run it. A key on a Moonshot platform
+endpoint bills per token and is not admitted.
 Where inventory reads Gemini's own OAuth store or OpenCode's credential store,
 the result is `configured` rather than a verified live login. Missing or malformed
 state stays `signed_out` or `unknown`; OAuth and API-key state stay distinct.
@@ -704,6 +709,12 @@ The chat completion above with the cataloged AgentProfile `:id` (a `<id>.json` i
 A caller that sets only a base URL, such as a publisher's benchmark runner, reaches a profile with base URL `<bridge>/profiles/<id>/v1`.
 An id the catalog lacks rereads the directory once; a changed profile needs a new id. A body `agent_profile` is refused with 400.
 The caller's system-role messages, which `/v1/chat/completions` refuses beside a profile, join the profile as `prompt.appendSystemPrompt`.
+
+### `POST /v1/responses` · `POST /profiles/:id/v1/responses`
+
+The text subset of the OpenAI Responses API, for callers that only call `responses.create` (PRBench's runner).
+The request runs as one non-streaming chat completion through `/v1/chat/completions`, or `/profiles/:id/v1/chat/completions` with that profile, and the reply comes back as a Responses object whose `output_text` is the answer.
+Carried: `model`, `input` (a string or role/content messages with text parts), `instructions`, `max_output_tokens`, `reasoning.effort`; `tools`, `background`, `stream`, `previous_response_id`, `conversation` and structured `text` formats are refused with 400.
 
 ### `POST /cad/render`
 
