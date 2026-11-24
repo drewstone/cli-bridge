@@ -1,6 +1,6 @@
 # Retained sessions and native interactions
 
-Status: implemented for the Pi and Claude Code native backends, with the generic one-shot durable contract exposed for ready non-native routes.
+Status: implemented for the Pi, Claude Code and Kimi Code native backends, with the generic one-shot durable contract exposed for ready non-native routes.
 
 This surface keeps one native CLI process behind a durable bridge session.
 
@@ -288,6 +288,16 @@ Pi rejects `maxVisibleOutputTokens` and `maxReasoningTokens` because its selecte
 One `claude --print --input-format stream-json --replay-user-messages --permission-prompt-tool stdio` process serves every turn of a session with stdin held open; like Pi, every tool asks the caller, and a turn that does not admit `permission` has each prompt denied.
 
 A steer is `accepted` once Claude reports `command_lifecycle` `queued`; when Claude applies it the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }`. A turn settles at the first `result` before which all its messages had started.
+
+## Kimi Code native implementation
+
+One `kimi web --json` (Kimi's local server, the Kimi Agent Protocol) serves every turn of a session.
+A jailed process has its own network namespace, so `src/backends/kimi-kap-stdio.mjs` runs inside the jail beside the server, holds its bearer token, and carries its HTTP calls and WebSocket frames over stdio.
+The session is created with `POST /api/v1/sessions` (or continued with `POST /api/v1/sessions/{id}/profile`; an unknown id is refused) in Kimi's `manual` permission mode, so every approval reaches the Bridge and is answered by the turn's interaction policy; a Kimi question is dismissed.
+The profile prompt is Kimi's project agent and the profile's MCP servers are the workspace's `.kimi-code/mcp.json`, trusted exactly when the Bridge mounted it, as on the one-shot path.
+
+A steer is `POST /api/v1/sessions/{id}/steer`; Kimi holds it until the next safe injection point, after the running tool call, and the steer is `accepted` when Kimi takes it. Kimi may end its current turn there and open a continuation turn whose opener is the steer; the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }` when its `user_message` item appears. A Bridge turn settles at the first Kimi `turn.ended` after which no Kimi turn runs and no submitted prompt or steer is still unstarted.
+`kimi acp` cannot steer: a second `session/prompt` during a turn answers `turn.agent_busy` (Kimi Code 2.7.3).
 
 ## MCP and ACP boundary
 
