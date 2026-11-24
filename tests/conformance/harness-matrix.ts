@@ -37,7 +37,12 @@ const SCRIPTED = process.env.CONFORMANCE_SCRIPTED === '1'
 const AXIS = SCRIPTED ? 'scripted' : 'seat'
 const AXIS_TEXT = SCRIPTED ? 'scripted model (tangle/canary-echo through the Router)' : "the harness's own model on a seat"
 // Cursor Agent talks only to Cursor's own backend, so no scripted model is on its route.
-const NO_SCRIPTED_ROUTE: Record<string, string> = { cursor: 'Cursor Agent reaches only Cursor\'s own backend; the seat axis measures it' }
+// Harnesses no scripted model can reach. Cursor Agent talks only to Cursor's backend (the CLI cannot);
+// Gemini CLI speaks only the Gemini API, which the Router does not serve (no route, not a CLI limit).
+const NO_SCRIPTED_ROUTE: Record<string, Cell> = {
+  cursor: { state: 'unsupported', detail: 'Cursor Agent reaches only Cursor\'s own backend; the seat axis measures it' },
+  gemini: { state: 'blocked', detail: 'no scripted route: Gemini CLI speaks only the Gemini API, which the Router does not serve; the seat axis needs a Google login on the Bridge host' },
+}
 const VERBS = ['tool', 'retained', 'steer', 'abort', 'profile+mcp', 'usage+outcome'] as const
 type Verb = typeof VERBS[number]
 const BEARER = `conformance-${randomBytes(12).toString('hex')}`
@@ -61,7 +66,7 @@ function harnessModel(harness: string): string {
  */
 function seat(name: string, harness: string, bin: string): Cell | null {
   if (spawnSync('sh', ['-c', `command -v "$1"`, '_', bin]).status !== 0) return { state: 'blocked', detail: `no ${bin} on PATH` }
-  if (SCRIPTED) return NO_SCRIPTED_ROUTE[harness] ? { state: 'unsupported', detail: NO_SCRIPTED_ROUTE[harness]! } : null
+  if (SCRIPTED) return NO_SCRIPTED_ROUTE[harness] ?? null
   const native = localHarnesses.find(([key]) => key === name)
   if (!native) return null
   const provider = harness === 'pi' ? /^pi\/([^/]+)\//u.exec(harnessModel(harness))?.[1] : undefined
