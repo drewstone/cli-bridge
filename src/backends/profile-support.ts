@@ -87,7 +87,8 @@ function requirePublicPlanEnv(
 export async function admitNativeSubscription(req: ChatRequest, invocation: NativeSubscriptionInvocation): Promise<void> {
   if (!req.subscriptionAdmission) return
   // Readiness probes run on the host itself, unconfined, so they reach the network the way the host does.
-  await req.subscriptionAdmission.check({ ...invocation, env: sanitizeHostEnv(invocation.env, invocation.cwd, spawnPassthroughKeys(invocation, {})) ?? invocation.env })
+  const env = sanitizeHostEnv(invocation.env, invocation.cwd, spawnPassthroughKeys(invocation, {})) ?? invocation.env
+  await req.subscriptionAdmission.check({ ...invocation, env })
   Object.freeze(invocation.env)
   if (invocation.args) Object.freeze(invocation.args)
 }
