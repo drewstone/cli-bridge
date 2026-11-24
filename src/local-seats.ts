@@ -177,7 +177,7 @@ const KIMI_CODE_PLAN_ENDPOINT = 'https://api.kimi.com/coding/v1'
  * unless that provider is a Kimi Code membership key (`kimiPlanKey`).
  */
 async function kimiLoginState(bin: string, env: NodeJS.ProcessEnv, model: string | undefined, provider: string | null,
-  options: { timeoutMs: number; signal?: AbortSignal; cwd?: string }): Promise<Pick<LocalSeat, 'provider' | 'status' | 'authMode' | 'fix' | 'credential' | 'source'>> {
+  options: { timeoutMs: number; signal?: AbortSignal; cwd?: string }): Promise<Pick<LocalSeat, 'provider' | 'status' | 'authMode' | 'fix' | 'credential'> & Partial<Pick<LocalSeat, 'source'>>> {
   const stop = AbortSignal.any([AbortSignal.timeout(options.timeoutMs), ...(options.signal ? [options.signal] : [])])
   stop.throwIfAborted()
   // The server otherwise refreshes its model catalog on start, which can refresh the OAuth token and calls Kimi's API.
