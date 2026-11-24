@@ -188,13 +188,22 @@ alone does not authorize execution through this backend.
 
 Each invocation passes `--trust --workspace <request cwd>` and runs in that cwd.
 Only use this BYOB backend with a workspace whose project instructions and tools
-you trust. The bridge does not pass `--force` or approve MCP servers globally.
+you trust. The bridge never passes `--force`; it passes `--approve-mcps` only on a turn
+whose MCP servers it mounted itself.
 The persisted native chat ID goes to `--resume` on the next external session turn.
 Cursor's native chat store must survive alongside the bridge data directory.
 
 This backend supports text, streamed reasoning and tool events, native chat
-continuation and durable run cancellation/replay. Exact AgentProfiles, public request env, request
-MCP, attachments, reasoning/sampling overrides and hosted modes are refused.
+continuation and durable run cancellation/replay. An AgentProfile reaches Cursor through its
+project files for that one turn, and the bridge restores the workspace afterwards:
+`prompt.instructions` becomes the always-applied rule `.cursor/rules/cli-bridge-agent-profile.mdc`,
+and the profile's or request's MCP servers replace `.cursor/mcp.json`. `--approve-mcps` loads
+those servers; their tool calls run through one `Mcp(<server>:*)` grant per server in
+`.cursor/cli.json`, whose lists keep every entry of the user's and the workspace's own config.
+One profiled run per workspace runs at a time. Cursor has no system-prompt control for a customer seat, so
+`prompt.systemPrompt` and `prompt.appendSystemPrompt` are refused, as are profile tools,
+permissions, subagents, hooks, modes, resources and model hints beyond the model. Public request
+env, attachments, reasoning/sampling overrides and hosted modes are refused.
 The existing capability response advertises those limits. Token counts use the
 CLI's terminal receipt when present; billed cost and served model stay unknown
 when Cursor does not report authoritative observations.

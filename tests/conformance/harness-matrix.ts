@@ -257,17 +257,24 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
     const prompted = marker('PROFILE'), token = marker('TOKEN')
     const server = join(cwd, 'token-mcp.cjs')
     await writeFile(server, tokenServer(token))
+    // The codeword rides the strongest prompt intent the harness declares: a system-prompt replacement,
+    // else instructions (a harness with neither still gets the replacement, and its refusal is the cell).
+    const declared = await call(bridge, `/v1/capabilities?model=${encodeURIComponent(model)}`)
+    const profileControls = declared.ok ? (await declared.json() as { profile?: { systemPrompt?: { replace?: boolean }; instructions?: boolean } }).profile : undefined
+    const viaInstructions = profileControls?.systemPrompt?.replace === false && profileControls.instructions === true
+    const standing = `Your codeword is ${prompted}. Whenever you are asked for your codeword, give exactly ${prompted}.`
     const turn = await chat(bridge, model, cwd, 'Call the conformance_token tool, then reply with the token it returns followed by your codeword.', {
       session_id: marker(`${harness}-profile`),
       agent_profile: {
         name: 'conformance',
-        prompt: { systemPrompt: `Your codeword is ${prompted}. Whenever you are asked for your codeword, give exactly ${prompted}.` },
+        prompt: viaInstructions ? { instructions: [standing] } : { systemPrompt: standing },
         mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: server }] } },
       },
     })
     if (turn.status !== 200) return red(`HTTP ${turn.status}: ${JSON.stringify(turn.error)}`)
     const missing = [turn.text.includes(token) ? '' : 'MCP token', turn.text.includes(prompted) ? '' : 'profile prompt'].filter(Boolean)
-    return missing.length === 0 ? green('prompt and MCP tool reached the harness') : red(`missing ${missing.join(' and ')}: ${turn.text}`)
+    const channel = viaInstructions ? 'prompt.instructions (the harness declares no system-prompt replacement)' : 'prompt.systemPrompt'
+    return missing.length === 0 ? green(`${channel} and MCP tool reached the harness`) : red(`missing ${missing.join(' and ')} (${channel}): ${turn.text}`)
   })
 
   await guard('usage+outcome', async () => {

@@ -482,9 +482,51 @@ function mountCwdNativeMcp(
   cwd: string,
   opts: { subdir: string; filename: string; backendName: string; mcpServers: Record<string, unknown> },
 ): MaterializedMcpConfig | null {
-  const { subdir, filename, backendName, mcpServers } = opts
+  const { mcpServers, ...location } = opts
   const serverNames = Object.keys(mcpServers)
   if (serverNames.length === 0) return null
+  const mounted = mountCwdNativeFile(cwd, {
+    ...location,
+    nouns: { config: 'MCP config', mount: 'MCP servers', run: 'MCP-mounted run' },
+    render: (originalBytes) => {
+      let merged: Record<string, unknown> = { mcpServers }
+      if (originalBytes !== null) {
+        try {
+          const original = JSON.parse(originalBytes) as Record<string, unknown>
+          const originalServers = (original.mcpServers ?? {}) as Record<string, unknown>
+          merged = { ...original, mcpServers: { ...originalServers, ...mcpServers } }
+        } catch {
+          // Unparseable existing file — overwrite for the run; cleanup
+          // restores the original bytes verbatim either way.
+        }
+      }
+      return JSON.stringify(merged, null, 2)
+    },
+  })
+  return { ...mounted, serverNames }
+}
+
+/**
+ * Mount one request-scoped file at `<cwd>/<subdir>/<filename>`, a path a CLI
+ * discovers by working directory, under the lock, restore and no-follow
+ * discipline {@link mountCwdNativeMcp} documents. `render` receives the
+ * file's pre-mount bytes (null when absent) and returns the bytes the run
+ * sees; `cleanup()` puts the pre-mount state back. `subdir` may nest
+ * (`.cursor/rules`): every component must be a real directory, and the ones
+ * this mount created are removed again when they are empty.
+ */
+export function mountCwdNativeFile(
+  cwd: string,
+  opts: {
+    subdir: string
+    filename: string
+    backendName: string
+    /** How refusals name the file, the mount and an overlapping run. */
+    nouns: { config: string; mount: string; run: string }
+    render: (originalBytes: string | null) => string
+  },
+): { configPath: string; cleanup(): void } {
+  const { subdir, filename, backendName, nouns } = opts
 
   const piDir = join(cwd, subdir)
   const configPath = join(piDir, filename)
@@ -492,21 +534,28 @@ function mountCwdNativeMcp(
 
   const fail = (detail: string): never => {
     throw new BackendError(
-      `backend ${backendName} failed to prepare MCP config at ${configPath}: ${detail}`,
+      `backend ${backendName} failed to prepare ${nouns.config} at ${configPath}: ${detail}`,
       'not_configured',
     )
   }
 
-  let createdDir = false
+  const createdDirs: string[] = []
   try {
-    createdDir = !existsSync(piDir)
-    mkdirSync(piDir, { recursive: true })
-    // `writeFileNoFollow` only guards the FINAL path component; a
-    // workspace that pre-created `.pi` as a symlink to a host directory
-    // would still redirect every write under it. lstat does not follow —
-    // require a real directory, not a link to one.
-    if (!lstatSync(piDir).isDirectory()) {
-      fail(`${piDir} exists but is not a real directory (symlink or file planted by the workspace)`)
+    let dir = cwd
+    for (const part of subdir.split('/').filter(Boolean)) {
+      dir = join(dir, part)
+      if (!existsSync(dir)) {
+        mkdirSync(dir)
+        createdDirs.push(dir)
+      }
+      // `writeFileNoFollow` only guards the FINAL path component; a
+      // workspace that pre-created `.pi` (or any parent of a nested subdir)
+      // as a symlink to a host directory would still redirect every write
+      // under it. lstat does not follow — require a real directory at every
+      // component, not a link to one.
+      if (!lstatSync(dir).isDirectory()) {
+        fail(`${dir} exists but is not a real directory (symlink or file planted by the workspace)`)
+      }
     }
   } catch (err) {
     if (err instanceof BackendError) throw err
@@ -586,7 +635,7 @@ function mountCwdNativeMcp(
       // live mount mid-run; a human (or a dead-pid check on a later
       // retry) resolves genuine corruption.
       throw new BackendError(
-        `backend ${backendName} cannot mount MCP servers at ${configPath}: lock file ${lockPath} exists but is `
+        `backend ${backendName} cannot mount ${nouns.mount} at ${configPath}: lock file ${lockPath} exists but is `
         + `unreadable; if no ${backendName} run is active in this cwd, remove it manually`,
         'not_configured',
       )
@@ -594,8 +643,8 @@ function mountCwdNativeMcp(
     const holderPid = stale?.pid ?? null
     if (holderPid === null || pidAlive(holderPid)) {
       throw new BackendError(
-        `backend ${backendName} cannot mount MCP servers at ${configPath}: another run${holderPid !== null ? ` (pid ${holderPid})` : ''} holds the `
-        + `mount for this cwd; ${backendName} supports one MCP-mounted run per workspace — use distinct cwds`,
+        `backend ${backendName} cannot mount ${nouns.mount} at ${configPath}: another run${holderPid !== null ? ` (pid ${holderPid})` : ''} holds the `
+        + `mount for this cwd; ${backendName} supports one ${nouns.run} per workspace — use distinct cwds`,
         'not_configured',
       )
     }
@@ -645,19 +694,8 @@ function mountCwdNativeMcp(
     releaseLock()
     fail(err instanceof Error ? err.message : String(err))
   }
-  let merged: Record<string, unknown> = { mcpServers }
-  if (originalBytes !== null) {
-    try {
-      const original = JSON.parse(originalBytes) as Record<string, unknown>
-      const originalServers = (original.mcpServers ?? {}) as Record<string, unknown>
-      merged = { ...original, mcpServers: { ...originalServers, ...mcpServers } }
-    } catch {
-      // Unparseable existing file — overwrite for the run; cleanup
-      // restores the original bytes verbatim either way.
-    }
-  }
   try {
-    writeFileNoFollow(configPath, JSON.stringify(merged, null, 2))
+    writeFileNoFollow(configPath, opts.render(originalBytes))
   } catch (err) {
     releaseLock()
     fail(err instanceof Error ? err.message : String(err))
@@ -666,7 +704,6 @@ function mountCwdNativeMcp(
   let cleaned = false
   return {
     configPath,
-    serverNames,
     cleanup: () => {
       if (cleaned) return
       cleaned = true
@@ -691,9 +728,10 @@ function mountCwdNativeMcp(
       }
       releaseLock()
       try {
-        // Only remove `<subdir>` when this run created it AND nothing
-        // else landed in it meanwhile (rmdirSync refuses non-empty dirs).
-        if (originalBytes === null && createdDir) rmdirSync(piDir)
+        // Only remove the `<subdir>` components this run created AND that
+        // nothing else landed in meanwhile (rmdirSync refuses non-empty
+        // dirs), deepest first.
+        if (originalBytes === null) for (const dir of [...createdDirs].reverse()) rmdirSync(dir)
       } catch {
         // best-effort cleanup
       }
@@ -721,6 +759,39 @@ export function materializeMcpServersForKimi(
     backendName: 'kimi-code',
     mcpServers: buildCanonicalMcpServers(specs),
   })
+}
+
+/**
+ * Materialize MCP servers for Cursor Agent's project config, `<cwd>/.cursor/mcp.json`.
+ *
+ * cursor-agent 2026.11.22 reads that file for each workspace root, beside the user's
+ * `~/.cursor/mcp.json`, and has no per-invocation MCP config option. A headless turn
+ * cannot answer an approval prompt, so the backend passes `--approve-mcps`, which admits
+ * every server the CLI loaded. The mount therefore REPLACES the project file for the run
+ * instead of merging into it: the run loads exactly the request's servers, never one the
+ * workspace planted, and cleanup restores the workspace's own bytes.
+ *
+ * Cursor's entry is `{command, args, env}` for stdio and `{url, headers}` for a remote
+ * server, whose transport Cursor negotiates; it has no per-server timeout.
+ */
+export function materializeMcpServersForCursor(
+  specs: Record<string, McpServerSpec> | null,
+  cwd: string | undefined,
+): MaterializedMcpConfig | null {
+  if (!specs) return null
+  const mcpServers = Object.fromEntries(Object.entries(buildCanonicalMcpServers(specs))
+    .map(([name, { type: _type, timeout: _timeout, ...server }]) => [name, server]))
+  const serverNames = Object.keys(mcpServers)
+  if (serverNames.length === 0) return null
+  const target = requireMaterializationCwd(cwd, 'cursor MCP passthrough')
+  const mounted = mountCwdNativeFile(target, {
+    subdir: '.cursor',
+    filename: 'mcp.json',
+    backendName: 'cursor',
+    nouns: { config: 'MCP config', mount: 'MCP servers', run: 'MCP-mounted run' },
+    render: () => JSON.stringify({ mcpServers }, null, 2),
+  })
+  return { ...mounted, serverNames }
 }
 
 /**
