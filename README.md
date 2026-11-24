@@ -192,8 +192,10 @@ This backend supports text, streamed reasoning and tool events, native chat
 continuation and durable run cancellation/replay. An AgentProfile reaches Cursor through its
 project files for that one turn, and the bridge restores the workspace afterwards:
 `prompt.instructions` becomes the always-applied rule `.cursor/rules/cli-bridge-agent-profile.mdc`,
-and the profile's or request's MCP servers replace `.cursor/mcp.json`. One profiled run per
-workspace runs at a time. Cursor has no system-prompt control for a customer seat, so
+and the profile's or request's MCP servers replace `.cursor/mcp.json`. `--approve-mcps` loads
+those servers; their tool calls run through one `Mcp(<server>:*)` grant per server in
+`.cursor/cli.json`, whose lists keep every entry of the user's and the workspace's own config.
+One profiled run per workspace runs at a time. Cursor has no system-prompt control for a customer seat, so
 `prompt.systemPrompt` and `prompt.appendSystemPrompt` are refused, as are profile tools,
 permissions, subagents, hooks, modes, resources and model hints beyond the model. Public request
 env, attachments, reasoning/sampling overrides and hosted modes are refused.

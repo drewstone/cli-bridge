@@ -1,10 +1,11 @@
 /**
  * A Cursor Agent turn carries its AgentProfile's instructions and MCP servers into the project files
  * Cursor reads, through a real Bridge listener, the host spawner and, where bwrap exists, the
- * fs-jail. The synthetic cursor-agent records its argv and the workspace it finds at launch; with
- * `--approve-mcps` it starts each server in `.cursor/mcp.json` the way Cursor does, as its own
- * child inside the jail, calls the server's tool, and answers with the tool's result and every
- * always-applied rule. No model is called.
+ * fs-jail. The synthetic cursor-agent records its argv and the workspace it finds at launch. As
+ * measured on cursor-agent 2026.11.22, it loads the servers in `.cursor/mcp.json` only with
+ * `--approve-mcps` and runs a server's tool only when `.cursor/cli.json` allows `Mcp(<server>:*)`;
+ * it starts each server as its own child inside the jail, calls the tool, and answers with the
+ * tool's result and every always-applied rule. No model is called.
  */
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
@@ -21,10 +22,11 @@ const cursorAgent = String.raw`
 const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process'), readline = require('node:readline')
 if (process.argv.includes('--version')) { console.log('2026.11.22-fixture'); process.exit(0) }
 const argv = process.argv.slice(2), workspace = argv[argv.indexOf('--workspace') + 1], approved = argv.includes('--approve-mcps')
-const rulesDir = path.join(workspace, '.cursor', 'rules'), mcpFile = path.join(workspace, '.cursor', 'mcp.json')
+const rulesDir = path.join(workspace, '.cursor', 'rules'), mcpFile = path.join(workspace, '.cursor', 'mcp.json'), cliFile = path.join(workspace, '.cursor', 'cli.json')
 const rules = fs.existsSync(rulesDir) ? fs.readdirSync(rulesDir).filter((name) => name.endsWith('.mdc')).map((name) => fs.readFileSync(path.join(rulesDir, name), 'utf8')) : []
 const always = rules.map((rule) => /^---\n([\s\S]*?)\n---\n([\s\S]*)$/.exec(rule)).filter((parts) => parts && /^alwaysApply: true$/m.test(parts[1])).map((parts) => parts[2].trim())
 const servers = fs.existsSync(mcpFile) ? JSON.parse(fs.readFileSync(mcpFile, 'utf8')).mcpServers ?? {} : {}
+const permissions = fs.existsSync(cliFile) ? JSON.parse(fs.readFileSync(cliFile, 'utf8')).permissions ?? null : null
 async function callTool(server) {
   const child = cp.spawn(server.command, server.args ?? [], { env: { ...process.env, ...server.env }, stdio: ['pipe', 'pipe', 'inherit'] })
   const pending = new Map(); let id = 0
@@ -38,8 +40,9 @@ async function callTool(server) {
 }
 let prompt = ''
 process.stdin.on('data', (chunk) => { prompt += chunk }).on('end', async () => {
-  const results = approved ? await Promise.all(Object.values(servers).map(callTool)) : []
-  fs.writeFileSync(path.join(workspace, 'launch.json'), JSON.stringify({ argv, approved, rules, servers: Object.keys(servers), prompt, home: process.env.HOME }))
+  const granted = Object.entries(servers).filter(([name]) => approved && (permissions?.allow ?? []).includes('Mcp(' + name + ':*)'))
+  const results = await Promise.all(granted.map(([, server]) => callTool(server)))
+  fs.writeFileSync(path.join(workspace, 'launch.json'), JSON.stringify({ argv, approved, rules, servers: Object.keys(servers), permissions, prompt, home: process.env.HOME }))
   const text = [...results, ...always].join(' ') || 'plain'
   for (const event of [{ type: 'system', subtype: 'init', session_id: '${SESSION}' },
     { type: 'assistant', session_id: '${SESSION}', message: { content: [{ type: 'text', text }] } },
@@ -65,8 +68,11 @@ describe.each([
     await mkdir(join(root, 'bin'))
     const bin = join(root, 'bin', 'cursor-agent.cjs')
     await writeFile(bin, `#!${process.execPath}\n${cursorAgent}`, { mode: 0o700 })
-    // A fixture key, so the Bridge never reads a real enrolled token from this host.
+    // A fixture key, so the Bridge never reads a real enrolled token from this host, and a user config with an operator's lists.
     vi.stubEnv('CURSOR_API_KEY', 'fixture-cursor-key-not-a-credential')
+    await mkdir(join(root, 'cursor-config'))
+    await writeFile(join(root, 'cursor-config', 'cli-config.json'), JSON.stringify({ permissions: { allow: ['Shell(ls)'], deny: ['Shell(curl)'] } }))
+    vi.stubEnv('CURSOR_CONFIG_DIR', join(root, 'cursor-config'))
     const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'cursor', CURSOR_BIN: bin,
       BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: jail, BRIDGE_JAIL_FALLBACK: 'deny', BRIDGE_JAIL_NETWORK: 'none' })
     bridge = await startServer({ config: { ...config, port: 0 }, cwd: root, quiet: true, handleSignals: false })
@@ -95,7 +101,7 @@ describe.each([
     return false
   }
   const launch = async (cwd: string) => JSON.parse(await readFile(join(cwd, 'launch.json'), 'utf8')) as {
-    argv: string[]; approved: boolean; rules: string[]; servers: string[]; prompt: string; home: string }
+    argv: string[]; approved: boolean; rules: string[]; servers: string[]; permissions: { allow: string[]; deny: string[] } | null; prompt: string; home: string }
 
   it('declares instructions and MCP, and no system-prompt control', async () => {
     const response = await fetch(`${bridge.url}/v1/capabilities?model=cursor`)
@@ -110,6 +116,9 @@ describe.each([
     const own = JSON.stringify({ mcpServers: { planted: { command: 'false' } } })
     await mkdir(join(cwd, '.cursor'))
     await writeFile(join(cwd, '.cursor', 'mcp.json'), own)
+    // And its own CLI config, whose deny must still apply beside the grant.
+    const ownCli = JSON.stringify({ permissions: { allow: [], deny: ['Shell(rm)'] }, vimMode: false })
+    await writeFile(join(cwd, '.cursor', 'cli.json'), ownCli)
     const token = `REPLY-${randomBytes(4).toString('hex')}`, codeword = `PROFILE-${randomBytes(4).toString('hex')}`
     const serverHome = join(cwd, 'server-home'), server = join(cwd, 'token-mcp.cjs')
     await writeFile(server, tokenServer(serverHome))
@@ -127,10 +136,12 @@ describe.each([
     expect(seen.approved).toBe(true)
     expect(seen.argv).toEqual(expect.arrayContaining(['--trust', '--workspace', cwd]))
     expect(seen.servers).toEqual(['conformance'])
+    // The one grant is the profile server's tools; the operator's and the workspace's lists stay whole.
+    expect(seen.permissions).toEqual({ allow: ['Shell(ls)', 'Mcp(conformance:*)'], deny: ['Shell(curl)', 'Shell(rm)'] })
     expect(seen.rules).toEqual([`---\nalwaysApply: true\n---\n\nYour codeword is ${codeword}. Whenever you are asked for your codeword, give exactly ${codeword}.\n`])
-    // The server's env reached the server, never the CLI's argv, and the prompt names the declared server.
+    // The server's env reached the server, never the CLI's argv; the instructions reached the rule, never the user turn.
     expect(seen.argv.join(' ')).not.toContain(token)
-    expect(seen.prompt).toContain('Caller-declared MCP servers for this session: conformance')
+    expect(seen.prompt).not.toContain(codeword)
     if (jail === 'fs-jail') {
       // Both the CLI and the server it started ran confined, under the jail's HOME in the workspace.
       expect(seen.home.startsWith(join(cwd, '.agent-home'))).toBe(true)
@@ -138,6 +149,8 @@ describe.each([
     }
     expect(await eventually(() => !existsSync(join(cwd, '.cursor', 'mcp.json.lock')))).toBe(true)
     expect(await readFile(join(cwd, '.cursor', 'mcp.json'), 'utf8')).toBe(own)
+    expect(await readFile(join(cwd, '.cursor', 'cli.json'), 'utf8')).toBe(ownCli)
+    expect(existsSync(join(cwd, '.cursor', 'cli.json.lock'))).toBe(false)
     expect(existsSync(join(cwd, '.cursor', 'rules'))).toBe(false)
   }, 60_000)
 
@@ -147,7 +160,7 @@ describe.each([
     expect(turn.status, JSON.stringify(turn.error)).toBe(200)
     expect(turn.text).toBe('plain')
     const seen = await launch(cwd)
-    expect(seen).toMatchObject({ approved: false, rules: [], servers: [] })
+    expect(seen).toMatchObject({ approved: false, rules: [], servers: [], permissions: null })
     expect(existsSync(join(cwd, '.cursor'))).toBe(false)
   }, 60_000)
 
