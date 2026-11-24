@@ -23,6 +23,7 @@ import { createLocalBackend } from './backends/local.js'
 import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
 import { AcpBackend } from './backends/acp.js'
+import { OpenclawBackend } from './backends/openclaw.js'
 import { PrimeBackend } from './backends/prime.js'
 import { SandboxBackend } from './backends/sandbox.js'
 import { createProfileCatalog, type ProfileCatalog } from './profiles/loader.js'
@@ -168,6 +169,8 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       // hermes steers a running turn with its `/steer` command (measured on 0.23.2).
       registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault, jailEnv,
         ...(name === 'hermes' ? { steerCommand: '/steer' } : {}) }))
+    } else if (kind === 'openclaw') {
+      registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault }))
     } else if (kind === 'prime') {
       registry.register(new PrimeBackend({
         bin: config.primeBin,
