@@ -274,6 +274,7 @@ async function main(): Promise<void> {
     BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: rows.map((row) => row.name).join(',') })
   const matrix: Record<string, Record<Verb, Cell>> = {}
   const bridge = await startServer({ config: { ...config, port: 0 }, cwd: root, quiet: true, handleSignals: false })
+  let shutdown: string | undefined
   try {
     for (const row of rows) {
       const bin = (config as unknown as Record<string, string>)[`${row.name}Bin`] ?? row.name
@@ -284,17 +285,25 @@ async function main(): Promise<void> {
       console.error(`[conformance] ${row.harness} (${AXIS}): ${VERBS.map((verb) => `${verb}=${matrix[row.harness]![verb].state}`).join(' ')}`)
     }
   } finally {
-    await bridge.close()
+    // A Bridge that cannot confirm its own resources closed is a finding of the run, not a reason to lose its cells.
+    await bridge.close().catch((error: unknown) => {
+      shutdown = error instanceof AggregateError ? `${error.message}: ${error.errors.map((inner) => String(inner?.message ?? inner)).join('; ')}`
+        : error instanceof Error ? error.message : String(error)
+    })
     await rm(root, { recursive: true, force: true })
   }
   const mark = { green: 'green', red: 'RED', unsupported: 'unsupported', blocked: 'blocked' } as const
   console.log(`axis: ${AXIS_TEXT}\n\n| harness | axis | ${VERBS.join(' | ')} |\n|---|---|${VERBS.map(() => '---').join('|')}|`)
   for (const [harness, cells] of Object.entries(matrix)) console.log(`| ${harness} | ${AXIS} | ${VERBS.map((verb) => mark[cells[verb].state]).join(' | ')} |`)
+  for (const [harness, cells] of Object.entries(matrix)) {
+    for (const verb of VERBS) if (cells[verb].state === 'red') console.log(`RED ${harness} ${verb}: ${cells[verb].detail}`)
+  }
+  if (shutdown) console.log(`RED bridge shutdown: ${shutdown}`)
   const json = flag('--json')
-  if (json) await writeFile(json, JSON.stringify({ at: new Date().toISOString(), axis: AXIS, models: Object.fromEntries(rows.map((row) => [row.harness, harnessModel(row.harness)])), matrix }, null, 2))
+  if (json) await writeFile(json, JSON.stringify({ at: new Date().toISOString(), axis: AXIS, models: Object.fromEntries(rows.map((row) => [row.harness, harnessModel(row.harness)])), matrix, ...(shutdown ? { shutdown } : {}) }, null, 2))
   const counts = Object.values(matrix).flatMap((cells) => Object.values(cells)).reduce((sum, cell) => ({ ...sum, [cell.state]: (sum[cell.state] ?? 0) + 1 }), {} as Record<string, number>)
   console.log(`\ncells: ${JSON.stringify(counts)}`)
-  process.exitCode = (counts.red ?? 0) > 0 ? 1 : 0
+  process.exitCode = (counts.red ?? 0) > 0 || shutdown ? 1 : 0
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 2 })
