@@ -1,5 +1,5 @@
 /**
- * Runs Kimi Code's local server (`kimi web --json`) and carries its API over stdio.
+ * Runs Kimi Code's local server (`kimi web`) and carries its API over stdio.
  *
  * A jailed process runs in its own network namespace (`bwrap --unshare-net`), so the loopback port the
  * server listens on is unreachable from the Bridge. This shim runs inside the jail beside the server:
@@ -9,7 +9,9 @@
  * Plain Node with no dependencies, and .mjs, because the jail runs it with the Bridge's own `node`
  * before Kimi starts, without the Bridge's TypeScript loader (as `jail/egress-shim.mjs`).
  *
- * argv:   <kimi> web --json [...args]
+ * argv:   <kimi> web [...args]. Kimi Code 2.7 announces the server as one JSON line under `--json`, with an
+ *         ephemeral token; 2.6 has no `--json` and prints a banner whose Local URL carries its token as `#token=`.
+ *         The CLI's own `web --help` says which it speaks, and the shim adds `--json` or `--no-open` to match.
  * stdin:  one request per line: `{"id":n,"method":"POST","path":"sessions","body":{...}}` for HTTP under
  *         `/api/v1/`, or `{"id":n,"send":{...}}` for a frame to send on the WebSocket.
  * stdout: `{"type":"ready","protocol":"<KAP version>"}` once the server and its WebSocket are open, then
@@ -17,17 +19,19 @@
  * End of stdin stops the server with SIGTERM, so it saves its own state, and the shim exits with it.
  */
 
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
 const [bin, ...args] = process.argv.slice(2)
 if (!bin) {
-  process.stderr.write('kimi-kap-stdio: usage: <kimi> web --json [...args]\n')
+  process.stderr.write('kimi-kap-stdio: usage: <kimi> web [...args]\n')
   process.exit(2)
 }
 
 const write = (value) => process.stdout.write(`${JSON.stringify(value)}\n`)
-const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'inherit'] })
+const help = spawnSync(bin, [args[0] ?? 'web', '--help'], { encoding: 'utf8', timeout: 30_000 })
+const json = /^\s+--json\b/mu.test(help.stdout ?? '')
+const child = spawn(bin, [...args, json ? '--json' : '--no-open'], { stdio: ['ignore', 'pipe', 'inherit'] })
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal))
 child.on('error', (error) => {
   process.stderr.write(`kimi-kap-stdio: ${error.message}\n`)
@@ -39,11 +43,17 @@ child.on('exit', (code, signal) => {
   else process.exit(code ?? 1)
 })
 
-/** The first JSON line `kimi web --json` prints names its private loopback origin, WebSocket and token. */
+/** 2.6's banner line `Local:    http://127.0.0.1:<port>/#token=<token>`, possibly coloured. */
+function bannerReady(line) {
+  const local = /\bLocal:\s+(http:\/\/[^\s/#]+)\/?#token=([A-Za-z0-9_-]+)/u.exec(line.replace(/\x1b\[[0-9;]*m/gu, ''))
+  return local ? { origin: local[1], token: local[2] } : undefined
+}
+
+/** The ready line names the server's private loopback origin, WebSocket and token: JSON under `--json`, else the banner. */
 async function serverReady() {
   for await (const line of createInterface({ input: child.stdout })) {
-    if (!line.startsWith('{')) continue
-    const ready = JSON.parse(line)
+    const ready = json ? (line.startsWith('{') ? JSON.parse(line) : undefined) : bannerReady(line)
+    if (!ready) continue
     const origin = new URL(ready.origin)
     if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || typeof ready.token !== 'string' || !ready.token)
       throw new Error('the local server did not confirm a private loopback endpoint')

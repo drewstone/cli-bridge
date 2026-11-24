@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
-import { constants, openSync, closeSync, readSync, fstatSync, readFileSync, realpathSync, watch } from 'node:fs'
+import { constants, openSync, closeSync, readSync, fstatSync, mkdirSync, readFileSync, realpathSync, watch } from 'node:fs'
 import { lstat, open } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import type { SpawnResult } from '../executors/types.js'
+import type { ChatDelta } from './types.js'
 import { BackendReportedFailureError } from '../runs/error-shape.js'
 
 // Kimi Code 2.7.2 writes turn.ended to the main agent's wire. Print mode
@@ -98,6 +99,12 @@ function providerFailure(error: unknown): BackendReportedFailureError | undefine
   )
 }
 
+function isPromptTurn(event: Record<string, unknown>, prompt: string): event is Record<string, unknown> & { turnId: number } {
+  return event.type === 'turn.prompt' && typeof event.turnId === 'number' && Array.isArray(event.input) && event.input.length > 0 &&
+    event.input.every(part => record(part) && part.type === 'text' && typeof part.text === 'string') &&
+    event.input.map(part => part.text).join('') === prompt
+}
+
 function matchTurn(wire: string, prompt: string, since: number, until: number): BackendReportedFailureError | undefined {
   let promptTurn: number | undefined
   let ending: BackendReportedFailureError | undefined
@@ -106,9 +113,7 @@ function matchTurn(wire: string, prompt: string, since: number, until: number): 
     const event: unknown = JSON.parse(line)
     if (!record(event) || event.agentId !== 'main' || typeof event.turnId !== 'number' ||
         typeof event.time !== 'number' || event.time < since || event.time > until) continue
-    if (event.type === 'turn.prompt' && Array.isArray(event.input) && event.input.length > 0 &&
-        event.input.every(part => record(part) && part.type === 'text' && typeof part.text === 'string') &&
-        event.input.map(part => part.text).join('') === prompt) {
+    if (isPromptTurn(event, prompt)) {
       if (promptTurn !== undefined) return
       promptTurn = event.turnId
     } else if (event.type === 'turn.ended' && promptTurn === event.turnId) {
@@ -119,13 +124,51 @@ function matchTurn(wire: string, prompt: string, since: number, until: number): 
   return ending
 }
 
-async function readBoundFailure(path: string, prompt: string, since: number, cursor?: WireCursor) {
+const tokenCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+
+/**
+ * The provider usage Kimi recorded for the bound turn: each `usage.record` its main agent wrote between that turn's
+ * `turn.prompt` and its `turn.ended`, one per model call. Print mode's stream carries no usage; the wire is Kimi's
+ * own receipt. A record Kimi could not split for cache reads leaves that split unknown.
+ */
+function turnUsage(wire: string, prompt: string, since: number, until: number): NonNullable<ChatDelta['usage']> | undefined {
+  let promptTurn: number | undefined
+  let calls = 0, fresh = 0, cacheRead = 0, cacheWrite = 0, output = 0, cacheReadKnown = true
+  for (const line of wire.split('\n')) {
+    if (!line.trim()) continue
+    const event: unknown = JSON.parse(line)
+    if (!record(event) || event.agentId !== 'main' || typeof event.time !== 'number' || event.time < since || event.time > until) continue
+    if (isPromptTurn(event, prompt)) {
+      if (promptTurn !== undefined) return
+      promptTurn = event.turnId
+    } else if (promptTurn !== undefined && event.type === 'usage.record') {
+      const usage = event.usage
+      if (!record(usage) || !tokenCount(usage.inputOther) || !tokenCount(usage.output) || !tokenCount(usage.inputCacheCreation)) return
+      calls += 1
+      fresh += usage.inputOther
+      output += usage.output
+      cacheWrite += usage.inputCacheCreation
+      if (tokenCount(usage.inputCacheRead)) cacheRead += usage.inputCacheRead
+      else cacheReadKnown = false
+    } else if (event.type === 'turn.ended' && event.turnId === promptTurn) {
+      return calls === 0 ? undefined : {
+        model_requests: calls, input_tokens: fresh + cacheRead + cacheWrite, fresh_input_tokens: fresh,
+        ...(cacheReadKnown ? { cache_read_input_tokens: cacheRead } : {}), cache_write_input_tokens: cacheWrite, output_tokens: output,
+      }
+    }
+  }
+}
+
+async function readBoundWire<T>(path: string, match: (wire: string, until: number) => T | undefined, cursor?: WireCursor) {
   const until = Date.now()
   try {
     if (realpathSync(path) !== path) return
-    return matchTurn(await readWireTail(path, cursor), prompt, since, until)
+    return match(await readWireTail(path, cursor), until)
   } catch { return }
 }
+
+const readBoundFailure = (path: string, prompt: string, since: number, cursor?: WireCursor) =>
+  readBoundWire(path, (wire, until) => matchTurn(wire, prompt, since, until), cursor)
 
 // ACP supplies its session ID on its own RPC connection. Take the byte boundary
 // just before session/prompt, so past failures and replayed turns cannot attest
@@ -150,6 +193,8 @@ export async function bindKimiAcpTurn(home: string, cwd: string, sessionId: stri
 
 export function observeKimiPrintSession(home: string, cwd: string, spawned: SpawnResult, since: number) {
   try {
+    // A fresh Kimi home has no lease directory until Kimi's first session; create it as Kimi does, so the watch can start.
+    mkdirSync(join(home, 'locks', 'sessions'), { recursive: true, mode: 0o700 })
     const root = realpathSync(home)
     const locks = join(root, 'locks', 'sessions')
     if (realpathSync(locks) !== locks) return
@@ -184,6 +229,11 @@ export function observeKimiPrintSession(home: string, cwd: string, spawned: Spaw
       async failure(prompt: string): Promise<BackendReportedFailureError | undefined> {
         if (!session || ambiguous) return
         try { return await readBoundFailure(wirePath(root, cwd, session), prompt, since) } catch { return }
+      },
+      /** The completed turn's provider usage from Kimi's wire, when the lease bound its session. */
+      async usage(prompt: string): Promise<NonNullable<ChatDelta['usage']> | undefined> {
+        if (!session || ambiguous) return
+        try { return await readBoundWire(wirePath(root, cwd, session), (wire, until) => turnUsage(wire, prompt, since, until)) } catch { return }
       },
     }
   } catch { return }

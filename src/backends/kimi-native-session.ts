@@ -117,7 +117,8 @@ export class KimiNativeSession implements NativeSession {
       await this.call('POST', `sessions/${encodeURIComponent(resumeSessionId)}/profile`, { agent_config: agentConfig }, 'session resume')
       this.sessionId = resumeSessionId
     } else {
-      const created = await this.call('POST', 'sessions', { cwd, agent_config: agentConfig }, 'session creation')
+      // `metadata.cwd` names the workspace on Kimi Code 2.6 and 2.7 alike; only 2.7 also reads a top-level `cwd`.
+      const created = await this.call('POST', 'sessions', { metadata: { cwd }, agent_config: agentConfig }, 'session creation')
       const id = typeof created.id === 'string' && /^[A-Za-z0-9_.:-]{1,256}$/u.test(created.id) ? created.id : null
       if (!id) throw new BackendError('Kimi created a session without an id', 'upstream')
       this.sessionId = id
