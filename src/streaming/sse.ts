@@ -159,6 +159,7 @@ export function deltaToBridgeOnlyFrame(seq: number, delta: ChatDelta, meta: Chun
     ...(keepalive ? {} : { model: delta.model ?? meta.model }),
     choices: [],
     ...(delta.continuation ? { continuation: delta.continuation } : {}),
+    ...(delta.activity ? { activity: delta.activity } : {}),
   })
   return `id: ${seq}\n: ${note}\ndata: ${data}\n\n`
 }

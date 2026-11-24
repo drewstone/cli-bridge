@@ -490,7 +490,18 @@ export function terminalOutcome(
   return { finish_reason: emittedToolCall ? 'tool_calls' : 'stop' }
 }
 
+export type RunActivity =
+  | { type: 'turn.started' }
+  | {
+    type: 'tool.started' | 'tool.completed' | 'tool.failed'
+    tool: 'command_execution' | 'web_search' | 'file_change' | 'mcp_tool_call'
+    /** Per-turn ordinal. Omitted if the native instrument supplied no correlation identity. */
+    call?: number
+  }
+
 export interface ChatDelta {
+  /** Native lifecycle evidence for public progress views. Contains no generated text. */
+  activity?: RunActivity
   /** Native final assistant candidate, distinct from progress/tool text. Never parsed by adapters. */
   final_text?: string
   /** Bridge-owned JSON value, published only after successful source drain and process close. */

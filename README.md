@@ -368,6 +368,9 @@ The bridge binds the id atomically to the normalized execution request before ad
 
 For `stream: true`, every output delta has a monotonically increasing SSE `id`.
 Every numbered frame carries a `data:` line, because SSE parsers and re-encoders never dispatch a frame without data; keepalive and bridge-metadata frames carry an empty `choices: []` chunk.
+
+Codex streams native lifecycle observations as top-level `activity` on numbered frames with `choices: []`. A turn emits `{"type":"turn.started"}` when the CLI reports it. A tool reports `tool.started`, `tool.completed` or `tool.failed` with a `tool` of `command_execution`, `web_search`, `file_change` or `mcp_tool_call`. The optional `call` ordinal pairs start and settlement within a turn. Some tools report only completion. For a public progress view, display the activity fields alone. Other frames can contain operator-only tool arguments, results and diagnostic text. Heartbeats describe the transport. `final_output` publishes the contracted answer after successful completion.
+
 Reconnect with the same request and `Last-Event-ID: N` to receive only events after `N`.
 An ahead cursor returns `409 invalid_replay_cursor`.
 A cursor older than the retained window returns `410 expired_replay_cursor`; the bridge never silently restarts at event zero.
