@@ -31,6 +31,7 @@ import { mountHealth } from './routes/health.js'
 import { mountModels } from './routes/models.js'
 import { createNativeCatalog } from './native-catalog.js'
 import { mountProfiles } from './routes/profiles.js'
+import { mountResponses } from './routes/responses.js'
 import { mountSessions } from './routes/sessions.js'
 import { mountRuns } from './routes/runs.js'
 import { continueInterruptedRuns } from './runs/continue-interrupted.js'
@@ -229,7 +230,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountSessions(app, { sessions, retained })
   mountRetainedSessions(app, retained, { includeSessionList: false })
   mountRuns(app, { runs, retainedRuns: retained, retainedStore: sessions })
-  mountProfiles(app, { catalog })
+  mountProfiles(app, { catalog }); mountResponses(app)
   mountChatCompletions(app, {
     registry, callerTools,
     onRunRedaction: (binding, values, request) => {

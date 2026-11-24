@@ -160,14 +160,17 @@ test('plan-keyed and Kimi subscription seats reach graph admission through the r
     deepseek: { type: 'api', key: 'fixture-api-key' },
     'minimax-coding-plan': { type: 'api', key: 'fixture-unlisted-key' },
   }), { mode: 0o600 })
-  await writeFile(join(kimiHome, 'config.toml'), [
-    'default_model = "kimi-code/kimi-for-coding"',
-    '[providers."managed:kimi-code"]', 'type = "kimi"', 'base_url = "https://api.kimi.com/coding/v1"', 'api_key = ""',
-    'oauth = { storage = "file", key = "oauth/kimi-code" }',
-    '[providers.fixture-api]', 'type = "kimi"', 'base_url = "https://api.moonshot.ai/v1"', 'api_key = "fixture-kimi-api-key"',
-    '[models."kimi-code/kimi-for-coding"]', 'provider = "managed:kimi-code"', 'model = "kimi-for-coding"', 'max_context_size = 262144',
-    '[models."kimi-code/fixture-api-model"]', 'provider = "fixture-api"', 'model = "kimi-k2"', 'max_context_size = 262144', '',
-  ].join('\n'), { mode: 0o600 })
+  // `managed` is the managed provider's credential lines: Kimi's own OAuth login by default, or a membership key.
+  // `routes` adds model lines, such as a catalog model served by the per-token fixture provider.
+  const kimiConfig = (managed = ['base_url = "https://api.kimi.com/coding/v1"', 'api_key = ""', 'oauth = { storage = "file", key = "oauth/kimi-code" }'], routes = []) =>
+    writeFile(join(kimiHome, 'config.toml'), [
+      'default_model = "kimi-code/kimi-for-coding"',
+      '[providers."managed:kimi-code"]', 'type = "kimi"', ...managed,
+      '[providers.fixture-api]', 'type = "kimi"', 'base_url = "https://api.moonshot.ai/v1"', 'api_key = "fixture-kimi-api-key"',
+      '[models."kimi-code/kimi-for-coding"]', 'provider = "managed:kimi-code"', 'model = "kimi-for-coding"', 'max_context_size = 262144',
+      '[models."kimi-code/fixture-api-model"]', 'provider = "fixture-api"', 'model = "kimi-k2"', 'max_context_size = 262144', ...routes, '',
+    ].join('\n'), { mode: 0o600 })
+  await kimiConfig()
   // Inside Kimi's refresh window (300 s): a server that refreshed its catalog on start would rewrite this login.
   const login = join(kimiHome, 'credentials', 'kimi-code.json')
   const loginState = JSON.stringify({ access_token: 'fixture-kimi-access', refresh_token: 'fixture-kimi-refresh',
@@ -197,12 +200,15 @@ test('plan-keyed and Kimi subscription seats reach graph admission through the r
 
   // The graph runner's own admission input: listLocalModels under the default subscription-only policy.
   const entry = pathToFileURL(resolve('index.mjs')).href
-  const { stdout } = await execute(process.execPath, ['--input-type=module', '-e', `
-    const { listLocalModels, loadConfig } = await import(${JSON.stringify(entry)})
-    const config = loadConfig({ ...process.env, BRIDGE_BACKENDS: 'opencode,kimi', BRIDGE_SUBSCRIPTIONS_ONLY: '1' })
-    console.log(JSON.stringify(await listLocalModels({ cwd: process.cwd(), config })))`], { cwd: workspace, env, timeout: 120_000 })
-  assert.ok(!stdout.includes('fixture-'), 'model catalog carries no credential')
-  const models = new Map(JSON.parse(stdout).map((row) => [row.id, row]))
+  const catalog = async (backends) => {
+    const { stdout } = await execute(process.execPath, ['--input-type=module', '-e', `
+      const { listLocalModels, loadConfig } = await import(${JSON.stringify(entry)})
+      const config = loadConfig({ ...process.env, BRIDGE_BACKENDS: ${JSON.stringify(backends)}, BRIDGE_SUBSCRIPTIONS_ONLY: '1' })
+      console.log(JSON.stringify(await listLocalModels({ cwd: process.cwd(), config })))`], { cwd: workspace, env, timeout: 120_000 })
+    assert.ok(!stdout.includes('fixture-'), 'model catalog carries no credential')
+    return new Map(JSON.parse(stdout).map((row) => [row.id, row]))
+  }
+  let models = await catalog('opencode,kimi')
   const admitted = (id) => {
     const row = models.get(id)
     assert.ok(row, `the catalog lists ${id}`)
@@ -218,6 +224,26 @@ test('plan-keyed and Kimi subscription seats reach graph admission through the r
 
   // Kimi's own status, not a stored file, decides the login: without a token it is signed out.
   await rm(login)
-  assert.deepEqual((await inventory()).filter((seat) => seat.harness === 'kimi-code').map(facts),
-    [{ provider: null, status: 'signed_out', authMode: 'unknown', credential: undefined, source: 'native_status' }])
+  const kimiSeat = async () => (await inventory()).filter((seat) => seat.harness === 'kimi-code').map(facts)
+  const signedOut = [{ provider: null, status: 'signed_out', authMode: 'unknown', credential: undefined, source: 'native_status' }]
+  assert.deepEqual(await kimiSeat(), signedOut)
+
+  // A Kimi Code membership key on the plan's own coding endpoint is the plan's credential. Kimi serves turns with it
+  // while its managed login still reads unauthenticated; its provider listing tells it apart from the OAuth provider's
+  // empty key, for which /api/v1/config also reports has_api_key.
+  await kimiConfig(['base_url = "https://api.kimi.com/coding/v1/"', 'api_key = "fixture-kimi-plan-key"'],
+    ['[models."kimi-code/kimi-k2.6"]', 'provider = "fixture-api"', 'model = "kimi-k2.6"', 'max_context_size = 262144'])
+  assert.deepEqual(await kimiSeat(),
+    [{ provider: 'moonshot', status: 'authenticated', authMode: 'subscription', credential: 'plan_key', source: 'native_status' }])
+  models = await catalog('kimi')
+  assert.equal(admitted('kimi-code/kimi-for-coding'), 'moonshot', JSON.stringify(models.get('kimi-code/kimi-for-coding')))
+  assert.equal(models.get('kimi-code/kimi-for-coding').authentication.credential, 'plan_key')
+  // A Moonshot platform key bills per token and stays refused beside an admitted plan key.
+  assert.equal(admitted('kimi-code/kimi-k2.6'), false)
+  // Kimi refuses a provider holding both a key and its OAuth table, so that pair is no seat.
+  await kimiConfig(['base_url = "https://api.kimi.com/coding/v1"', 'api_key = "fixture-kimi-plan-key"', 'oauth = { storage = "file", key = "oauth/kimi-code" }'])
+  assert.deepEqual(await kimiSeat(), signedOut)
+  // The same key on a Moonshot platform endpoint is per-token spend, not the membership.
+  await kimiConfig(['base_url = "https://api.moonshot.ai/v1"', 'api_key = "fixture-kimi-plan-key"'])
+  assert.deepEqual(await kimiSeat(), signedOut)
 })
