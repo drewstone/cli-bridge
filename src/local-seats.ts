@@ -171,13 +171,13 @@ async function opencodeProviderSeat(provider: string, auth: Record<string, unkno
 const KIMI_CODE_PLAN_ENDPOINT = 'https://api.kimi.com/coding/v1'
 
 /**
- * Kimi Code's own local server answers whether its managed subscription login holds a token (`GET /api/v1/auth`)
- * and which configured provider serves a model (`GET /api/v1/config`). Both read local state: no model turn,
- * token refresh or credential leaves the server. A model served by any other Kimi provider is not this subscription,
- * unless that provider is a Kimi Code membership key (`kimiPlanKey`).
+ * Kimi Code's own local server answers whether its managed subscription login holds a token (`GET /api/v1/auth`),
+ * which configured provider serves a model (`GET /api/v1/config`) and whether that provider holds a key
+ * (`GET /api/v1/providers`). All read local state: no model turn, token refresh or credential leaves the server.
+ * A model served by any other Kimi provider is not this subscription, unless it is a Kimi Code membership key.
  */
 async function kimiLoginState(bin: string, env: NodeJS.ProcessEnv, model: string | undefined, provider: string | null,
-  options: { timeoutMs: number; signal?: AbortSignal; cwd?: string }): Promise<Pick<LocalSeat, 'provider' | 'status' | 'authMode' | 'fix' | 'credential'> & Partial<Pick<LocalSeat, 'source'>>> {
+  options: { timeoutMs: number; signal?: AbortSignal; cwd?: string }): Promise<Pick<LocalSeat, 'provider' | 'status' | 'authMode' | 'fix' | 'credential'>> {
   const stop = AbortSignal.any([AbortSignal.timeout(options.timeoutMs), ...(options.signal ? [options.signal] : [])])
   stop.throwIfAborted()
   // The server otherwise refreshes its model catalog on start, which can refresh the OAuth token and calls Kimi's API.
@@ -197,15 +197,16 @@ async function kimiLoginState(bin: string, env: NodeJS.ProcessEnv, model: string
       if (!response.ok || reply.code !== 0) throw new Error(`kimi ${path} answered HTTP ${response.status}`)
       return object(reply.data)
     }
-    const [auth, config] = await Promise.all([read('auth'), read('config')])
+    // A build without the provider listing reads no plan key; its OAuth login reads as before.
+    const [auth, config, providers] = await Promise.all([read('auth'), read('config'), read('providers').catch(() => ({}))])
     const managed = object(auth.managed_provider)
     // Kimi keys a model as `kimi-code/<model>`, the id the Bridge passes as `--model`; no model means Kimi's default.
     const route = model ? `kimi-code/${model}` : nativeIdentifier(config.default_model)
     const served = route === undefined ? managed.name : object(object(config.models)[route]).provider
     // A key-only provider serves turns while the managed login reads `unauthenticated`, so the key is read first.
-    if (typeof served === 'string' && object(object(config.providers)[served]).has_api_key === true
-      && await kimiPlanKey(bin, env, served, { ...options, signal: stop }))
-      return { provider, status: 'authenticated', authMode: 'subscription', credential: 'plan_key', source: 'native_store' }
+    const items: unknown[] = Array.isArray(providers.items) ? providers.items : []
+    if (kimiPlanKey(object(items.find((item) => object(item).id === served))))
+      return { provider, status: 'authenticated', authMode: 'subscription', credential: 'plan_key' }
     if (auth.managed_provider === null || ['unauthenticated', 'expired', 'revoked'].includes(managed.status as string))
       return { provider: null, status: 'signed_out', authMode: 'unknown' }
     if (managed.status !== 'authenticated') return { provider: null, status: 'unknown', authMode: 'unknown' }
@@ -220,18 +221,14 @@ async function kimiLoginState(bin: string, env: NodeJS.ProcessEnv, model: string
 }
 
 /**
- * True when Kimi's own provider list shows `provider` as a Kimi Code membership key: the `kimi` type on the plan's
- * coding endpoint with a non-empty key and no OAuth table. The local server's `has_api_key` is also true for an
- * OAuth-only provider whose key is empty, and Kimi refuses a provider holding both ("mutually exclusive"), so only this
- * listing tells a usable key apart. The key is tested for presence and dropped; it never leaves this function.
+ * A Kimi Code membership key, as Kimi's own local server lists the provider (`GET /api/v1/providers`): the `kimi` type on
+ * the plan's coding endpoint, a non-empty key, and Kimi's own `connected` status. That listing reads local config only;
+ * it reports `error` for a provider holding both a key and an OAuth table, which Kimi refuses to run, and no key for the
+ * OAuth provider's empty one, though `/api/v1/config` reports `has_api_key` for it.
  */
-async function kimiPlanKey(bin: string, env: NodeJS.ProcessEnv, provider: string,
-  options: { timeoutMs: number; signal?: AbortSignal; cwd?: string }): Promise<boolean> {
-  const listed = await probeNativeStatus(bin, ['provider', 'list', '--json'], { ...options, env })
-  if (listed.code !== 0) return false
-  const entry = object(object(decode(listed.stdout).providers)[provider])
-  const endpoint = typeof entry.baseUrl === 'string' && URL.canParse(entry.baseUrl) ? new URL(entry.baseUrl) : undefined
-  return entry.type === 'kimi' && entry.oauth === undefined && typeof entry.apiKey === 'string' && !!entry.apiKey.trim()
+function kimiPlanKey(entry: Record<string, unknown>): boolean {
+  const endpoint = typeof entry.base_url === 'string' && URL.canParse(entry.base_url) ? new URL(entry.base_url) : undefined
+  return entry.type === 'kimi' && entry.has_api_key === true && entry.status === 'connected'
     && !!endpoint && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash
     && `${endpoint.origin}${endpoint.pathname.replace(/\/+$/u, '')}` === KIMI_CODE_PLAN_ENDPOINT
 }

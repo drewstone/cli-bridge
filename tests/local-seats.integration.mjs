@@ -229,14 +229,14 @@ test('plan-keyed and Kimi subscription seats reach graph admission through the r
   assert.deepEqual(await kimiSeat(), signedOut)
 
   // A Kimi Code membership key on the plan's own coding endpoint is the plan's credential. Kimi serves turns with it
-  // while its managed login still reads unauthenticated, and only Kimi's own provider list tells it apart from the
-  // OAuth provider's empty key, for which the local server also reports has_api_key.
+  // while its managed login still reads unauthenticated; its provider listing tells it apart from the OAuth provider's
+  // empty key, for which /api/v1/config also reports has_api_key.
   await kimiConfig(['base_url = "https://api.kimi.com/coding/v1/"', 'api_key = "fixture-kimi-plan-key"'],
     ['[models."kimi-code/kimi-k2.6"]', 'provider = "fixture-api"', 'model = "kimi-k2.6"', 'max_context_size = 262144'])
   assert.deepEqual(await kimiSeat(),
-    [{ provider: 'moonshot', status: 'authenticated', authMode: 'subscription', credential: 'plan_key', source: 'native_store' }])
+    [{ provider: 'moonshot', status: 'authenticated', authMode: 'subscription', credential: 'plan_key', source: 'native_status' }])
   models = await catalog('kimi')
-  assert.equal(admitted('kimi-code/kimi-for-coding'), 'moonshot')
+  assert.equal(admitted('kimi-code/kimi-for-coding'), 'moonshot', JSON.stringify(models.get('kimi-code/kimi-for-coding')))
   assert.equal(models.get('kimi-code/kimi-for-coding').authentication.credential, 'plan_key')
   // A Moonshot platform key bills per token and stays refused beside an admitted plan key.
   assert.equal(admitted('kimi-code/kimi-k2.6'), false)
