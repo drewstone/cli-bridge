@@ -35,6 +35,7 @@ import type { Run } from '../../runs/registry.js'
 import { piPermissionPublicTitle, piPermissionTokenFromTitle } from '../../backends/pi-interaction.js'
 import { normalizeClaudeUsage, sanitizeUpstreamErrorDetail, type ClaudeNativeUsage } from '../../backends/claude.js'
 import { CLAUDE_TURN_SETTLED, ClaudeNativeSession } from '../../backends/claude-native-session.js'
+import { KIMI_TURN_SETTLED, KimiNativeSession } from '../../backends/kimi-native-session.js'
 import { OPENCODE_TURN_SETTLED, OpencodeNativeSession } from '../../backends/opencode-native-session.js'
 import { opencodeStepUsage } from '../../backends/opencode.js'
 import { numberValue, recordValue, stringValue } from './json-values.js'
@@ -65,7 +66,7 @@ export interface NativeTurnInput {
 
 /**
  * The one turn driver: it owns the loop, the raw fallback, deferred denials
- * and the failing catch. Pi's step is inline below; Claude's is `claudeStep`, opencode's `opencodeStep`.
+ * and the failing catch. Pi's step is inline below; Claude's is `claudeStep`, opencode's `opencodeStep`, Kimi's `kimiStep`.
  */
 export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ event: StreamEvent }> {
   const { native, run, sessionId, prompt, backendName } = input
@@ -78,7 +79,8 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   let responseIdentity: PiResponseIdentity | undefined
   const deferredDenials: Promise<void>[] = []
   const claude = native instanceof ClaudeNativeSession ? claudeStep(input, native, deferredDenials)
-    : native instanceof OpencodeNativeSession ? opencodeStep(input, native, deferredDenials) : null
+    : native instanceof OpencodeNativeSession ? opencodeStep(input, native, deferredDenials)
+    : native instanceof KimiNativeSession ? kimiStep(input, native, deferredDenials) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
       const event = recordValue(raw)
@@ -406,6 +408,110 @@ function claudeStep(
       return [...(usage ? [raw(usage)] : []), raw(event)]
     }
     if (type === CLAUDE_TURN_SETTLED) return [settledStatus(failure)]
+    return null
+  }
+}
+
+/**
+ * Kimi's step: one frame of Kimi's local-server WebSocket to canonical events, or null to keep it as `raw`.
+ * An assistant message or reasoning item is one content part, fed by its snapshots and `item.delta` appends;
+ * a tool call item is one tool part. Each `turn.updated` step is one model call's usage. A `user_message`
+ * item (the prompt or a steer) stays raw: it is the consumption receipt. The first failure sticks, as in one-shot.
+ */
+function kimiStep(
+  input: NativeTurnInput,
+  native: KimiNativeSession,
+  deferredDenials: Promise<void>[],
+): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId, backendName } = input
+  const items = new Map<string, string>()
+  const parts = new Map<string, { index: number; text: string }>()
+  const tools = new Map<string, { name: string; args: Record<string, unknown>; status: 'pending' | 'running' | 'completed' | 'error' | null }>()
+  const steps = new Set<string>()
+  let nextContentIndex = 0
+  let failure: string | null = null
+  const raw = (event: unknown): StreamEvent => ({ type: 'raw', backend: backendName, event })
+  // Publish only what extends the item's text; a stale or rewritten snapshot adds nothing the deltas did not.
+  const content = (itemId: string, kind: 'text' | 'reasoning', delta: string | null, snapshot = ''): StreamEvent[] => {
+    let entry = parts.get(itemId)
+    if (!entry) parts.set(itemId, entry = { index: nextContentIndex++, text: '' })
+    const appended = delta ?? (snapshot.startsWith(entry.text) ? snapshot.slice(entry.text.length) : '')
+    if (!appended) return []
+    entry.text += appended
+    return [(kind === 'reasoning' ? reasoningEvent : textEvent)(sessionId, run.id, entry.index, entry.text, appended)]
+  }
+  const tool = (id: string, fields: Record<string, unknown>, ended: boolean): StreamEvent[] => {
+    const known = tools.get(id) ?? { name: 'tool', args: {}, status: null }
+    const name = stringValue(fields.name) ?? known.name
+    let args = recordValue(fields.input) ?? known.args
+    if (!recordValue(fields.input) && typeof fields.input_text === 'string') {
+      try { args = recordValue(JSON.parse(fields.input_text)) ?? args } catch { /* still streaming */ }
+    }
+    const error = stringValue(fields.error)
+    const status: 'pending' | 'running' | 'completed' | 'error' = ended ? (error || fields.outcome === 'failed' ? 'error' : 'completed')
+      : fields.stage === 'executing' ? 'running' : known.status ?? 'pending'
+    tools.set(id, { name, args, status })
+    if (status === known.status) return []
+    const outcome = status === 'completed' ? { output: fields.output ?? null }
+      : status === 'error' ? { error: error ?? 'tool failed', result: fields.output } : undefined
+    return [{ type: 'message.part.updated', part: toolPart(sessionId, run.id, id, name, args, status, outcome) }]
+  }
+  return (event) => {
+    const type = String(event.type ?? '')
+    if (type === KIMI_TURN_SETTLED) return [settledStatus(failure)]
+    if (type === 'turn.started') return [{ type: 'status', status: 'processing' }]
+    if (type === 'turn.ended') {
+      const turn = recordValue(event.turn)
+      if (turn?.outcome === 'failed')
+        failure ??= sanitizeUpstreamErrorDetail(stringValue(recordValue(turn.error)?.message) ?? `turn ended: ${String(turn.end_reason ?? 'failed')}`)
+      return null
+    }
+    if (type === 'turn.updated') {
+      const step = recordValue(event.step)
+      const usage = recordValue(step?.usage)
+      const key = `${String(event.turn_id)}:${String(step?.index)}`
+      // A retry frame carries no usage and stays raw: it names the provider's wait.
+      if (!usage) return null
+      if (steps.has(key)) return []
+      steps.add(key)
+      const fresh = numberValue(usage.input_other) ?? 0, cacheRead = numberValue(usage.input_cache_read) ?? 0
+      const cacheWrite = numberValue(usage.input_cache_creation) ?? 0
+      return [raw(usageEnvironmentEvent({ input: fresh + cacheRead + cacheWrite, freshInput: fresh, cacheRead, cacheWrite,
+        output: numberValue(usage.output) ?? undefined }, undefined))]
+    }
+    if (type === 'item.started' || type === 'item.ended' || type === 'item.updated' || type === 'item.delta') {
+      const item = recordValue(event.item)
+      const id = stringValue(item?.item_id) ?? stringValue(event.item_id)
+      if (!id) return null
+      const kind = stringValue(item?.type) ?? items.get(id)
+      if (kind) items.set(id, kind)
+      const fields = item ?? recordValue(event.set) ?? {}
+      if (kind === 'assistant_message' || kind === 'reasoning') {
+        const part = kind === 'reasoning' ? 'reasoning' : 'text'
+        if (type === 'item.delta') return event.field === 'text' && typeof event.delta === 'string' ? content(id, part, event.delta) : []
+        return content(id, part, null, typeof fields.text === 'string' ? fields.text : '')
+      }
+      if (kind === 'tool_call') return type === 'item.delta' ? [] : tool(id, fields, type === 'item.ended')
+      return null
+    }
+    if (type === 'interaction') {
+      const nativeId = stringValue(event.interaction_id)
+      if (!nativeId || event.status !== 'pending') return []
+      const request = recordValue(event.request)
+      if (event.kind === 'approval') {
+        const name = (stringValue(request?.tool_name) ?? 'tool').replace(/[^\p{L}\p{N} .,_:\/-]/gu, ' ').trim().slice(0, 120) || 'tool'
+        const body = [stringValue(request?.action), request?.tool_input_display === undefined ? null : JSON.stringify(request.tool_input_display)]
+          .filter((part): part is string => part !== null).join('\n').slice(0, 4_000)
+        const interaction = permissionInteraction(run, nativeId, `Permission: ${name}`, body || null, sessionId,
+          input.providerName, input.environmentId)
+        if (interaction) return [admitInteraction(input, interaction, deferredDenials)]
+      }
+      // Kimi waits on every interaction; a question, or an approval the bridge cannot publish, is dismissed.
+      deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
+      return [{ type: 'warning', code: 'unsupported_interaction', message: `Kimi asked a ${String(event.kind)} cli-bridge cannot publish; it was dismissed` }]
+    }
+    // Session, agent, context and task bookkeeping carry nothing a turn's consumer reads.
+    if (['session', 'agent', 'context', 'task', 'task.list', 'todo', 'goal', 'turns'].includes(type)) return []
     return null
   }
 }

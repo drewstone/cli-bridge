@@ -163,7 +163,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     if (!config.backends.has(name)) continue
     if (kind === 'native') {
       registry.register(createLocalBackend(config, name, {
-        stateDir: join(config.dataDir, name), ...(name === 'pi' || name === 'opencode' ? { jailEnv } : {}) }))
+        stateDir: join(config.dataDir, name), ...(name === 'pi' || name === 'opencode' || name === 'kimi' ? { jailEnv } : {}) }))
     } else if (kind === 'acp') {
       registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
     } else if (kind === 'prime') {

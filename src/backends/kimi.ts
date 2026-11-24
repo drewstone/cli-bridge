@@ -36,7 +36,8 @@
 import { kimiNativeHome, observeKimiPrintSession } from './kimi-turn-failure.js'
 import { kimiTextOnlyProfile, kimiToolChoiceError } from './kimi-text-only.js'
 import { type AgentProfile, nativeReasoningControl } from '@tangle-network/agent-interface'
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
+import type { ChatDelta, ChatRequest, BackendHealth, NativeSession, NativeSessionBackend } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -62,6 +63,7 @@ import { assertSuccessfulHarnessExit, readProcessLines, waitForProcessClose } fr
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { needsAcpPromptTransport, runKimiAcpTurn } from './kimi-acp.js'
+import { kimiNativeCapabilities, startKimiNativeSession } from './kimi-native-start.js'
 
 export interface KimiBackendOptions {
   bin: string
@@ -70,10 +72,13 @@ export interface KimiBackendOptions {
   harness?: string
   /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
   spawner?: Spawner
+  /** The Bridge's jail settings; a retained session resolves its jail from them, as the chat route does for a one-shot. */
+  jailEnv?: NodeJS.ProcessEnv
 }
 
-export class KimiBackend implements Backend {
+export class KimiBackend implements NativeSessionBackend {
   readonly name: string
+  readonly nativeModes = ['byob'] as const
   readonly defaultExecutionTimeoutMs: number
   private readonly prefix: string
   private readonly spawner: Spawner
@@ -92,6 +97,16 @@ export class KimiBackend implements Backend {
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
+  }
+
+  nativeCapabilities(): AgentEnvironmentCapabilities {
+    return kimiNativeCapabilities(this.name)
+  }
+
+  /** A retained session on Kimi's own local server, which takes input mid-turn (kimi-native-session.ts). */
+  startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
+    return startKimiNativeSession({ backend: this.name, bin: this.opts.bin, spawner: this.spawner, timeoutMs: this.opts.timeoutMs,
+      jailEnv: this.opts.jailEnv, cliModel: (model) => this.resolveCliModel(model) }, req, session, signal)
   }
 
   textOnlyToolChoice(req: ChatRequest, session: SessionRecord | null): void {
