@@ -172,11 +172,11 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
     const prompted = marker('PROFILE'), token = marker('TOKEN')
     const server = join(cwd, 'token-mcp.cjs')
     await writeFile(server, tokenServer(token))
-    const turn = await chat(bridge, model, cwd, 'Call the conformance_token tool and reply with the token it returns.', {
+    const turn = await chat(bridge, model, cwd, 'Call the conformance_token tool, then reply with the token it returns followed by your codeword.', {
       session_id: marker(`${harness}-profile`),
       agent_profile: {
         name: 'conformance',
-        prompt: { systemPrompt: `End every reply with the word ${prompted}.` },
+        prompt: { systemPrompt: `Your codeword is ${prompted}. Whenever you are asked for your codeword, give exactly ${prompted}.` },
         mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: server }] } },
       },
     })
