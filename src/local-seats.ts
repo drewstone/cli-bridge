@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { cursorEnvironment } from './lib/cursor-auth.js'
+import { cursorEnvironment, cursorPlanHasRoom } from './lib/cursor-auth.js'
 import { join, resolve } from 'node:path'
 import { findGitDir } from './jail/types.js'
 import { loadConfig, localHarnesses, type Config } from './config.js'
@@ -81,10 +81,15 @@ export async function detectLocalSeats(options: LocalSeatOptions = {}): Promise<
     try {
       if (key === 'cursor') {
         const auth = decode(result.stdout)
+        const signedIn = result.code === 0 && auth.isAuthenticated === true
+        // An enrolled token is the plan's own headless credential only while its plan reading shows room.
+        const plan = !!native.env.CURSOR_API_KEY && await cursorPlanHasRoom(env)
         fact.provider = 'cursor'
-        fact.status = native.env.CURSOR_API_KEY ? 'configured' : result.code === 0 && auth.isAuthenticated === true ? 'authenticated' : auth.isAuthenticated === false ? 'signed_out' : 'unknown'
+        fact.status = native.env.CURSOR_API_KEY ? plan && signedIn ? 'authenticated' : 'configured'
+          : signedIn ? 'authenticated' : auth.isAuthenticated === false ? 'signed_out' : 'unknown'
         if (native.env.CURSOR_API_KEY) fact.source = 'native_store'
-        fact.authMode = native.env.CURSOR_API_KEY ? 'api_key' : 'unknown'
+        fact.authMode = native.env.CURSOR_API_KEY ? plan ? 'subscription' : 'api_key' : 'unknown'
+        if (plan) fact.credential = 'plan_key'
       } else if (key === 'claude' && (result.code === 0 || result.code === 1)) {
         const auth = decode(result.stdout)
         fact.provider = auth.apiProvider === 'firstParty' ? provider : null

@@ -3,6 +3,7 @@ import { configuredJailBackend, JAIL_HOST_EGRESS_ENV, type LinuxJailBackend } fr
 import type { AgentProfileMcpServer } from '@tangle-network/agent-interface'
 import { BackendError, type ChatRequest, type McpServerSpec } from './backends/types.js'
 import { claimTcpHostService, claimTrustedHostService, registerTrustedHostService, type TrustedHostServiceOwner } from './jail/egress-relay.js'
+import { CALLER_TOOLS_SERVER } from './caller-tools.js'
 import { selectJailBackend } from './jail/index.js'
 import { privateMcpCredentials, protectExecutionValues, resolvePrivateMcpValue } from './private-mcp.js'
 import { isSafeWireIdentifier } from './runs/identifiers.js'
@@ -219,6 +220,25 @@ export function createHostServiceBindings(bearerRequired: boolean, quiet = false
         hubReleases.add(cleanup)
         return cleanup
       })
+    },
+    /** A caller-tools attachment (src/caller-tools.ts) reaches this Bridge's own listener through the jail, as a Hub grant does. */
+    async prepareCallerTools(request: ChatRequest, backend: string): Promise<() => void> {
+      const server = request.runtime_attachments?.mcp?.[CALLER_TOOLS_SERVER]
+      if (!server || typeof server.url !== 'string') return () => {}
+      const spec = await relaySpec(request, backend, backendChoice)
+      if (!spec) return () => {}
+      if (closed || !listener) return refused('Caller-executed tools require this Bridge actual loopback listener')
+      const prefix = `${listener}/caller-tools/`
+      if (!server.url.startsWith(prefix) || !/^[A-Za-z0-9_-]+$/.test(server.url.slice(prefix.length))) {
+        return refused('The caller-tools attachment does not name a turn on this owned listener')
+      }
+      const service = registerTrustedHostService({ url: server.url, paths: { '': ['POST', 'GET'] } })
+      let release: () => void
+      try { release = await bindClaim(request, spec, CALLER_TOOLS_SERVER, { canonicalUrl: server.url, field: 'url', strip: [] }, service.owner) }
+      catch (error) { service.revoke(); throw error }
+      const cleanup = () => { if (hubReleases.delete(cleanup)) { try { release() } finally { service.revoke() } } }
+      hubReleases.add(cleanup)
+      return cleanup
     },
     close() {
       closed = true
