@@ -20,6 +20,9 @@
  * - abort: the cancelled turn waits in `wait_seconds`; the replacement replies with its own word;
  * - usage: `Report usage <prompt> <completion>`, checked by equality.
  * The profile prompt is not observable on it; the profile's MCP server is.
+ * The scripted model makes one call per instruction, so it cannot search for a deferred tool first: the
+ * axis runs the Bridge with ENABLE_TOOL_SEARCH=false (unless set), which has Claude Code put every MCP
+ * tool in each request instead of behind its ToolSearch tool, as it does for an endpoint without search.
  */
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -302,6 +305,7 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
 }
 
 async function main(): Promise<void> {
+  if (SCRIPTED) process.env.ENABLE_TOOL_SEARCH ??= 'false'
   const root = await mkdtemp(join(tmpdir(), 'bridge-conformance-'))
   const config = loadConfig({ ...process.env, BRIDGE_HOST: '127.0.0.1', BRIDGE_BEARER: BEARER, BRIDGE_TRACE: 'off',
     BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: rows.map((row) => row.name).join(',') })

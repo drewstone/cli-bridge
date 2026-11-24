@@ -653,6 +653,7 @@ The run workspace's own CLAUDE.md and `.claude/` files still load, and so does t
 The bridge does not use `--bare`, because bare mode never reads OAuth credentials or the keychain and would sign subscription seats out.
 Login is unchanged: the Linux credentials file, the macOS keychain and `CLAUDE_CODE_OAUTH_TOKEN` all keep working.
 Host-wide policy belongs in Claude Code's managed settings, which still apply; auth, model, effort, output style, attribution or env defaults set in `~/.claude/settings.json` no longer reach bridged turns.
+The Bridge's own `ENABLE_TOOL_SEARCH` reaches every Claude it starts: Claude Code defers MCP tools behind its ToolSearch tool by default, and `ENABLE_TOOL_SEARCH=false` puts them in each model request, for a model endpoint that cannot search first.
 A turn without a model or effort therefore uses Claude Code's defaults, and commit and pull request attribution follows Claude Code's default unless the profile's instructions or managed settings say otherwise.
 Retention cleanup does not run in these turns: Claude Code skips it when the user settings layer is off, so the host's transcripts keep the host's retention.
 CLAUDE.md files in directories above the workspace are still read as project memory, so keep run workspaces outside directories that hold one.
