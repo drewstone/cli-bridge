@@ -1,6 +1,6 @@
 # Retained sessions and native interactions
 
-Status: implemented for the Pi native backend, with the generic one-shot durable contract exposed for ready non-native routes.
+Status: implemented for the Pi and Claude Code native backends, with the generic one-shot durable contract exposed for ready non-native routes.
 
 This surface keeps one native CLI process behind a durable bridge session.
 
@@ -282,6 +282,12 @@ Pi rejects `maxVisibleOutputTokens` and `maxReasoningTokens` because its selecte
 `reasoningEffort` remains a quality control and never acts as a numeric reasoning-token limit.
 
 `AgentProfile.model.metadata` is not a Pi token authority, and `metadata.maxTokens` is rejected.
+
+## Claude Code native implementation
+
+One `claude --print --input-format stream-json --replay-user-messages --permission-prompt-tool stdio` process serves every turn of a session with stdin held open; like Pi, every tool asks the caller, and a turn that does not admit `permission` has each prompt denied.
+
+A steer is `accepted` once Claude reports `command_lifecycle` `queued`; when Claude applies it the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }`. A turn settles at the first `result` before which all its messages had started.
 
 ## MCP and ACP boundary
 

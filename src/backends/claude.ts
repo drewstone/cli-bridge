@@ -88,7 +88,7 @@ type ClaudeStreamLine = ClaudeStreamInit | ClaudeStreamAssistant | ClaudeStreamR
  * Claude Code's native receipt is not OpenAI usage: `input_tokens` is fresh
  * input, while cache reads and writes live in their own fields.
  */
-interface ClaudeNativeUsage {
+export interface ClaudeNativeUsage {
   input_tokens?: number
   cache_creation_input_tokens?: number
   cache_read_input_tokens?: number
@@ -115,7 +115,7 @@ function claudeResultUsage(result: ClaudeStreamResult): NonNullable<ChatDelta['u
  * input. When Claude omits, invalidates, or overflows part of its cache split,
  * preserve the named classes but do not invent a total.
  */
-function normalizeClaudeUsage(usage: ClaudeNativeUsage | undefined): NonNullable<ChatDelta['usage']> | undefined {
+export function normalizeClaudeUsage(usage: ClaudeNativeUsage | undefined): NonNullable<ChatDelta['usage']> | undefined {
   if (!usage) return undefined
 
   const freshInput = tokenCount(usage.input_tokens)
@@ -154,7 +154,7 @@ function sumTokenCounts(...values: number[]): number | undefined {
   return Number.isSafeInteger(total) ? total : undefined
 }
 
-function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
+export function sanitizeUpstreamErrorDetail(detail: string | undefined): string {
   const fallback = 'provider returned an error result'
   if (!detail) return fallback
 
@@ -229,10 +229,10 @@ export interface ClaudeBackendOptions {
 export class ClaudeBackend implements Backend {
   readonly name: string
   readonly defaultExecutionTimeoutMs: number
-  private readonly bin: string
+  protected readonly bin: string
   private readonly anthropicBaseUrl: string | null
   private readonly prefix: string
-  private readonly spawner: Spawner
+  protected readonly spawner: Spawner
 
   constructor(opts: ClaudeBackendOptions) {
     this.name = opts.harness ?? 'claude'
@@ -595,6 +595,8 @@ export class ClaudeBackend implements Backend {
       userTextForArgv?: string
       /** Prompt intents the profile plan carries, each bound to its own flag below. */
       profilePrompt?: { systemPrompt?: string; appendSystemPrompt?: string }
+      /** One process for many stdin turns that asks the host before each tool. */
+      retained?: true
     },
   ): string[] {
     // Two transport modes — see chat() for the rationale:
@@ -606,6 +608,8 @@ export class ClaudeBackend implements Backend {
     const args = argvMode
       ? ['-p', opts!.userTextForArgv!, '--output-format', 'stream-json', '--verbose']
       : ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
+    // Echoes each consumed stdin message with its uuid: the receipt a retained turn reads.
+    if (opts?.retained) args.push('--replay-user-messages')
     const effort = nativeReasoningControl('claude-code', resolveRequestedReasoningEffort(req, session))
     if (effort) args.push('--effort', effort)
 
@@ -708,6 +712,8 @@ export class ClaudeBackend implements Backend {
         '--permission-mode', 'plan',
         '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch',
       )
+    } else if (opts?.retained) {
+      args.push('--permission-prompt-tool', 'stdio')
     } else if (mode === 'byob') {
       args.push('--dangerously-skip-permissions')
     }

@@ -86,6 +86,8 @@ const turnSchema = z.strictObject({
   environment_id: idSchema.optional(),
   context_transfer: contextTransferSchema.optional(),
   interactions: boundedJsonSchema.optional(),
+  /** Who answers this turn's permission prompts; absent means the session's policy. */
+  interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
   context: boundedJsonRecordSchema.optional(),
   provider_options: boundedJsonRecordSchema.optional(),
   metadata: boundedJsonRecordSchema.optional(),

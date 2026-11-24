@@ -69,13 +69,6 @@ export async function startPiNativeSession(
     ['byob'],
     'pi has native tools (read/bash/edit/write); hosted-safe requires a verified --no-tools enforcement path',
   )
-  if (req.interaction_policy === 'unattended-allow') {
-    throw new BackendError(
-      'native Pi sessions require interaction_policy=interactive; use one-shot for explicit unattended policy',
-      'capability_denied',
-    )
-  }
-
   if (options.spawner.executionEnvironment === undefined) {
     throw new BackendError(
       'backend pi requires an executor that declares host isolation; '

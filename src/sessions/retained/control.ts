@@ -257,7 +257,7 @@ export class RetainedControl {
       await control.run.withNativeControl(async (native) => {
         const current = this.exactSteerControl(input.id, input.runRef)
         if (!current || current.run !== control.run || current.session !== native) throw new SteerAdmissionLostError()
-        await native.steer!(input.prompt)
+        await native.steer!(input.prompt, input.operationId)
       })
       const acknowledgement: RetainedControlAcknowledgement = { ...pending, status: 'accepted' }
       this.store.updateRetainedControlOperation(input.operationId, input.requestDigest, acknowledgement)

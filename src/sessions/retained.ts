@@ -109,7 +109,7 @@ export class RetainedSessionService {
       state: this.state,
       lanes: new TurnLanes(maxDepth, timeoutMs),
       isClosing: (id) => this.closures.has(id),
-      denyUnrequestedInteraction: (input) => this.interactions.denyUnrequestedInteraction(input),
+      answerInteraction: (input, decision) => this.interactions.answerInteraction(input, decision),
       contextTransfers: this.contextTransfers,
       admitSubscription: options.admitSubscription,
     })
@@ -224,13 +224,6 @@ export class RetainedSessionService {
         'capability_denied',
       )
     }
-    if (input.interaction_policy && input.interaction_policy !== 'interactive') {
-      throw new RetainedSessionError(
-        'unattended policies are one-shot profile policies; retained sessions require interactive approval',
-        400,
-        'capability_denied',
-      )
-    }
 
     const id = input.id ?? input.session_id!
     let callerMetadata: Record<string, unknown>
@@ -253,6 +246,10 @@ export class RetainedSessionService {
       ...(context ? { context } : {}),
       ...(providerOptions ? { provider_options: providerOptions } : {}),
       ...(profile ? { agent_profile: profile } : {}),
+      // The session's default answerer for permission prompts; a turn may name its own.
+      ...(input.interaction_policy && input.interaction_policy !== 'interactive'
+        ? { interaction_policy: input.interaction_policy }
+        : {}),
     }
     // Attachment endpoints are process-ephemeral; a re-create from a
     // restarted dispatcher must match the original create identity.
@@ -267,7 +264,7 @@ export class RetainedSessionService {
           ...(profile ? { agent_profile: profile } : {}),
           ...(env ? { env } : {}),
           ...(mcp ? { mcp } : {}),
-          interaction_policy: 'interactive',
+          interaction_policy: input.interaction_policy ?? 'interactive',
         }),
         backend: backend.name,
         model: selectedModel,

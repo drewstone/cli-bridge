@@ -50,11 +50,12 @@ export interface RetainedTurnRunnerOptions {
   state: RetainedSessionState
   lanes: TurnLanes
   isClosing: (id: string) => boolean
-  denyUnrequestedInteraction: (input: {
+  /** Answer a provider dialog for the Bridge: denied when unrequested, or as the turn's policy says. */
+  answerInteraction: (input: {
     run: import('../../runs/registry.js').Run
     request: InteractionRequest
     nativeId: string
-  }) => Promise<void>
+  }, decision: 'allow' | 'deny') => Promise<void>
   contextTransfers: RetainedContextTransfers
 }
 
@@ -79,7 +80,7 @@ export class RetainedTurnRunner {
   private readonly state: RetainedSessionState
   private readonly lanes: TurnLanes
   private readonly isClosing: (id: string) => boolean
-  private readonly denyUnrequestedInteraction: RetainedTurnRunnerOptions['denyUnrequestedInteraction']
+  private readonly answerInteraction: RetainedTurnRunnerOptions['answerInteraction']
   private readonly contextTransfers: RetainedContextTransfers
   private readonly admitSubscription: RetainedTurnRunnerOptions['admitSubscription']
   /** In-flight durable commits, keyed by run id. */
@@ -92,7 +93,7 @@ export class RetainedTurnRunner {
     this.state = options.state
     this.lanes = options.lanes
     this.isClosing = options.isClosing
-    this.denyUnrequestedInteraction = options.denyUnrequestedInteraction
+    this.answerInteraction = options.answerInteraction
     this.contextTransfers = options.contextTransfers
     this.admitSubscription = options.admitSubscription
   }
@@ -205,6 +206,7 @@ export class RetainedTurnRunner {
     const runId = input.run_id!
     const executionId = input.execution_id ?? input.turn_id ?? runId
     const interactions = admittedTurnInteractions(retained.capabilities, input.interactions)
+    const interactionPolicy = input.interaction_policy ?? sessionInteractionPolicy(retained.metadata.interaction_policy)
     const providerName = input.provider ?? ENVIRONMENT_ID
     const environmentId = input.environment_id ?? ENVIRONMENT_ID
     const contextMessages = input.context_transfer === undefined
@@ -383,7 +385,7 @@ export class RetainedTurnRunner {
       this.store.updateRetainedRun(runId, requestDigest, run.snapshot())
       this.store.updateRetained(id, { status: 'running', runId })
       releaseNativeAttachment = run.reserveNativeControlAttachment()
-      const request = this.requestFor(retained, input, prompt, interactions, config, contextMessages,
+      const request = this.requestFor(retained, input, prompt, interactions, interactionPolicy, config, contextMessages,
         options.childLineage)
       await this.admitSubscription?.(request, backend.name, run.signal)
       try {
@@ -431,7 +433,8 @@ export class RetainedTurnRunner {
           providerName,
           environmentId,
           interactions,
-          onUnrequestedInteraction: (interaction) => this.denyUnrequestedInteraction(interaction),
+          interactionPolicy,
+          answerInteraction: (interaction, decision) => this.answerInteraction(interaction, decision),
           onProviderSessionId: (providerSessionId) => this.store.updateRetained(id, { internalId: providerSessionId }),
         }),
       )
@@ -544,6 +547,7 @@ export class RetainedTurnRunner {
     input: RetainedTurnInput,
     prompt: string,
     interactions: RequestedInteractions,
+    interactionPolicy: InteractionPolicy,
     config: RetainedRequestConfig,
     contextMessages: ChatRequest['messages'],
     childLineage?: Readonly<Record<string, string>> | null,
@@ -556,7 +560,7 @@ export class RetainedTurnRunner {
         content: input.parts ? normalizeInputParts({ message: input.message, parts: input.parts }) : prompt,
       }],
       session_id: record.id,
-      interaction_policy: 'interactive',
+      interaction_policy: interactionPolicy,
       interactions,
       ...(record.cwd ? { cwd: record.cwd } : {}),
       ...(typeof mode === 'string' ? { mode: mode as ChatRequest['mode'] } : {}),
@@ -672,6 +676,7 @@ export class RetainedTurnRunner {
         'agent_profile',
         'mcp',
         'runtime_attachments',
+        'interaction_policy',
         'metadata',
         'context',
         'provider_options',
@@ -768,4 +773,10 @@ async function admitNativeContinuation(request: ChatRequest, native: NativeSessi
   }
   if (!control) throw new RetainedSessionError('native session ownership disappeared before continuation', 409, 'invalid_state')
   if (!(await control.run.takeNativeControl(native))) throw new RetainedSessionError('native session ownership changed before continuation', 409, 'invalid_state')
+}
+
+type InteractionPolicy = NonNullable<RetainedTurnInput['interaction_policy']>
+
+function sessionInteractionPolicy(value: unknown): InteractionPolicy {
+  return value === 'unattended-allow' || value === 'unattended-deny' ? value : 'interactive'
 }
