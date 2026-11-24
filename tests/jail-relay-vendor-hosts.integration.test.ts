@@ -42,8 +42,9 @@ describe.skipIf(!new LinuxBwrapJail().isAvailable())('the jail relay admits each
   }, 60_000)
 
   it('lets a Cursor Agent turn reach api2.cursor.sh', async () => {
-    const seen = await statuses('cursor', ['api2.cursor.sh', 'registry.npmjs.org'])
+    const seen = await statuses('cursor', ['api2.cursor.sh', 'agentn.global.api5.cursor.sh', 'registry.npmjs.org'])
     expect(seen['api2.cursor.sh']).not.toBe(403)
+    expect(seen['agentn.global.api5.cursor.sh']).not.toBe(403)
     expect(seen['registry.npmjs.org']).toBe(403)
   }, 60_000)
 
