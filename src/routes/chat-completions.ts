@@ -62,6 +62,8 @@ import { resolveCallerTrace } from '../trace/ids.js'
 import { lineageChildEnv } from '../trace/lineage.js'
 import { withRawProcessCapture } from '../executors/raw-capture.js'
 import { privateExecutionRedaction, type PrivateRunRedactionObserver } from '../private-mcp.js'
+import { admitCallerTools, callerToolsRequestSchema, type CallerTools, type CallerToolsGrant } from '../caller-tools.js'
+import { mergeMcpInputs, parseMcpHeader } from './mcp-inputs.js'
 import type { NativeCaptureTarget } from '../executors/native-capture.js'
 import {
   assertPiOutputTokenRequest,
@@ -181,6 +183,7 @@ const chatRequestSchema = z.object({
   // it does not enforce. An absent field is NOT a request: ordinary turns keep
   // their native coding tools, and an absent/empty `tools` list never implies it.
   tool_choice: z.union([z.literal('none'), z.literal('auto')]).optional(),
+  tools: callerToolsRequestSchema.optional(), // caller-executed tools: src/caller-tools.ts
   // Mirrors the canonical ReasoningEffort ladder in @tangle-network/agent-interface.
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultracode']).optional(),
   interaction_policy: z.enum(['interactive', 'unattended-deny', 'unattended-allow']).optional(),
@@ -390,6 +393,7 @@ export function mountChatCompletions(
     onRunRedaction?: PrivateRunRedactionObserver
     captureNative?: NativeCaptureTarget
     admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void | (() => void)>
+    callerTools?: CallerTools
     /** Captured operator jail defaults; standalone mounts retain process defaults. */
     jailEnv?: NodeJS.ProcessEnv
     sessions: SessionStore
@@ -477,6 +481,7 @@ export function mountChatCompletions(
     const {
       response_format,
       tool_choice,
+      tools: callerToolDefs,
       agent_profile,
       cwd,
       execution,
@@ -784,13 +789,8 @@ export function mountChatCompletions(
       }
     }
 
-    if (req.toolChoice === 'none' && typeof backend.textOnlyToolChoice === 'function') {
-      try {
-        backend.textOnlyToolChoice(req, persistedSession)
-      } catch (error) {
-        return errorResponse(c, error)
-      }
-    }
+    const caller = await admitToolControls(c, req, backend, persistedSession, deps, callerToolDefs)
+    if (caller instanceof Response) return caller
     if (req.session_id) {
       try {
         deps.sessions.assertSessionIdentityAvailable(req.session_id, 'legacy')
@@ -1199,6 +1199,7 @@ export function mountChatCompletions(
       const terminal = deps.captureNative ? async (input: Parameters<import('../executors/raw-capture.js').TerminalNativeCapture>[0]) => run.setNativeCapture(await deps.captureNative!({ ...input,
         snapshot: run.snapshot(), backend: backend.name, cwd: req.cwd, profileDigest: sessionProfileBinding?.effectiveProfileDigest ?? null })) : undefined
       const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, redaction, terminal)), chatCompletionDeltaOptions(req))
+      caller?.bind(run, job)
       admissionSlot?.holdUntil(job)
       admissionSlot = null
       void job.then(endJobResources, endJobResources)
@@ -1208,6 +1209,7 @@ export function mountChatCompletions(
       // slot: had this line been skipped, the gate would reclaim it once
       // `run.failSetup` commits the run terminal.
       admissionSlot?.holdUntil(Promise.resolve())
+      caller?.release()
       run.failSetup(error)
       // A request rejected at admission or misconfigured before spawn never
       // reaches the wrapped stream, and it is exactly the request an operator
@@ -1217,7 +1219,7 @@ export function mountChatCompletions(
       return errorResponse(c, error)
     }
 
-    return respondFromRun(c, run, req, afterSeq)
+    return caller ? caller.respond(c, run) : respondFromRun(c, run, req, afterSeq)
   })
 }
 
@@ -1623,36 +1625,21 @@ function replayCursorError(c: Context, error: RunReplayCursorError): Response {
 }
 
 /**
- * Parse the `X-Mcp-Config` request header. Accepts the canonical
- * `{ mcpServers: { … } }` shape; invalid JSON is silently dropped
- * rather than 400-ing the whole request so callers can opportunistically
- * set the header without it becoming a brittle hard dep.
+ * The tool controls a request asks for, before any harness starts: the text-only `tool_choice: "none"` check a backend enforces,
+ * then caller-executed tools (a resumed turn's response, a refusal, or a grant for a new turn).
  */
-function parseMcpHeader(value: string | undefined): ChatRequest['mcp'] | undefined {
-  if (!value) return undefined
-  try {
-    const parsed = JSON.parse(value) as unknown
-    if (parsed && typeof parsed === 'object') return parsed as ChatRequest['mcp']
-  } catch {
-    // ignore — malformed header is best-effort
+async function admitToolControls(
+  c: Context, req: ChatRequest, backend: Pick<Backend, 'textOnlyToolChoice'>, persistedSession: SessionRecord | null,
+  deps: { callerTools?: CallerTools; runs: RunRegistry }, tools: Parameters<typeof admitCallerTools>[3],
+): Promise<Response | CallerToolsGrant | undefined> {
+  if (req.toolChoice === 'none' && typeof backend.textOnlyToolChoice === 'function') {
+    try {
+      backend.textOnlyToolChoice(req, persistedSession)
+    } catch (error) {
+      return errorResponse(c, error)
+    }
   }
-  return undefined
-}
-
-/**
- * Merge MCP inputs from the header and the body, with body winning on
- * per-server name collisions. Either side can be undefined.
- */
-function mergeMcpInputs(
-  fromHeader: ChatRequest['mcp'] | undefined,
-  fromBody: ChatRequest['mcp'] | undefined,
-): ChatRequest['mcp'] | undefined {
-  if (!fromHeader && !fromBody) return undefined
-  const headerServers = (fromHeader?.mcpServers ?? {}) as Record<string, unknown>
-  const bodyServers = (fromBody?.mcpServers ?? {}) as Record<string, unknown>
-  const merged = { ...headerServers, ...bodyServers }
-  if (Object.keys(merged).length === 0) return undefined
-  return { mcpServers: merged } as ChatRequest['mcp']
+  return admitCallerTools(c, deps.callerTools, req, tools, deps.runs)
 }
 
 function normalizeResponseFormat(format: { type: 'text' | 'json_object' | 'json_schema' }): ChatRequest['responseFormat'] {
