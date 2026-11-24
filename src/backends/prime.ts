@@ -60,9 +60,14 @@
  * sdk-provider-prime runs in-sandbox, so the two executors driving this fork
  * cannot disagree about what it can honor. It accepts prompt replace/append,
  * instructions, inline skills and subagents, and refuses every other dimension
- * loudly with the fork evidence. This file keeps only what is genuinely
- * transport-specific: the rpc argv/stream contract, host-process isolation
- * (HOME + XDG + per-run daemon socket), and operator credential handling.
+ * loudly with the fork evidence. MCP is the one exception lowered here: the
+ * shared reader still refuses it with the TypeScript fork's (0.7) evidence,
+ * while prime-agent 0.10 (the Rust build) mounts a settings.json `mcpServers`
+ * entry in its REPL as `mcp.call_tool(server, tool, args)` (measured on
+ * 0.10.3), so this backend writes the request's servers there. This file keeps
+ * only what is genuinely transport-specific: the rpc argv/stream contract,
+ * host-process isolation (HOME + XDG + per-run daemon socket), MCP settings,
+ * and operator credential handling.
  *
  * Known fork defect this backend defends against: a spontaneously crashed
  * IPython kernel is never re-provisioned headlessly. Every later `ipython`
