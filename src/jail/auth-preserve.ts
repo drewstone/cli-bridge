@@ -48,6 +48,27 @@ const AUTH_PATHS: Record<string, readonly string[]> = {
   pi: ['.pi/agent'],
 }
 
+/**
+ * Backends whose CLI finds the AUTH_PATHS below `.config` and `.local/share` through the XDG base
+ * directories. OpenCode resolves its config and data directories as `$XDG_CONFIG_HOME/opencode`
+ * and `$XDG_DATA_HOME/opencode`, so an operator's login can live outside `$HOME`. Claude Code,
+ * Codex, Gemini CLI, Kimi Code and Pi resolve their homes from HOME or their own variable, never
+ * XDG. The jail-relative target keeps the `$HOME`-relative layout: the jail sets its own XDG paths.
+ */
+const XDG_AUTH_BACKENDS = new Set(['opencode'])
+const XDG_BASES = [['XDG_CONFIG_HOME', '.config'], ['XDG_DATA_HOME', '.local/share']] as const
+
+/** Where the backend's CLI reads `rel` on this host. The XDG spec ignores relative values. */
+function hostAuthPath(backendName: string, rel: string, home: string): string {
+  if (XDG_AUTH_BACKENDS.has(backendName)) {
+    for (const [variable, fallback] of XDG_BASES) {
+      const base = process.env[variable]
+      if (rel.startsWith(`${fallback}/`) && base && isAbsolute(base)) return join(base, rel.slice(fallback.length + 1))
+    }
+  }
+  return join(home, rel)
+}
+
 /** Kimi Code needs these seed entries, then writes sessions and logs in-jail. */
 const KIMI_SEED_ENTRIES = ['config.toml', 'credentials', 'device_id'] as const
 
@@ -92,7 +113,7 @@ export function authSourcesFor(backendName: string): JailAuthSource[] {
   const home = backendHome()
   const out: JailAuthSource[] = []
   for (const rel of AUTH_PATHS[backendName] ?? []) {
-    const source = join(home, rel)
+    const source = hostAuthPath(backendName, rel, home)
     // rel is already a POSIX-style jail-relative target ('.claude', '.config/opencode').
     if (existsSync(source)) out.push({ source, jailRel: rel, mode: 'read-only' })
   }
