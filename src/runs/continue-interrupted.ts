@@ -65,7 +65,9 @@ async function continueRun(
   const model = typeof snapshot.model === 'string' ? snapshot.model : session?.metadata.model
   if (typeof model !== 'string') return
   const openTools = new Map<string, string>()
+  let lastActivityCall = 0
   for (const delta of deltas) {
+    if (delta.activity && 'call' in delta.activity) lastActivityCall = Math.max(lastActivityCall, delta.activity.call ?? 0)
     for (const call of delta.tool_calls ?? []) openTools.set(call.id, call.name)
     for (const result of delta.tool_results ?? []) openTools.delete(result.id)
   }
@@ -99,7 +101,7 @@ async function continueRun(
   })
   // The continuation owns the session lane like any turn, so a new turn on it waits.
   const lease = session ? await deps.store.acquireExecution(admission.sessionId, backend.name) : null
-  const interruption = { reason: 'bridge_restart' as const, pid: runner.pid, nativeSessionId, openTools, recordedMaxTokens: runner.max_tokens }
+  const interruption = { reason: 'bridge_restart' as const, pid: runner.pid, nativeSessionId, openTools, lastActivityCall, recordedMaxTokens: runner.max_tokens }
   void run.pump(continueTurn(backend as NativeResumeBackend, req, session, interruption, run.signal), chatCompletionDeltaOptions(req))
     .finally(() => lease?.release())
 }

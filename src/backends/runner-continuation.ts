@@ -17,6 +17,7 @@ export interface RunnerWatch {
   nativeSessionId?: string
   /** Tool calls announced without a result yet, by id, with their tool names. */
   openTools: Map<string, string>
+  lastActivityCall?: number
   /** The signal that killed the runner before its terminal event. */
   exit?: string
   /** Its scope was killed and found empty. */
@@ -29,6 +30,7 @@ export interface RunnerInterruption {
   exit?: string
   nativeSessionId: string
   openTools: ReadonlyMap<string, string>
+  lastActivityCall?: number
   /** On bridge restart this comes from the durable runner record, before request reconstruction. */
   recordedMaxTokens?: number | null
 }
@@ -71,7 +73,7 @@ export async function* chatContinuing(
   } catch (error) {
     if (signal.aborted || !watch.exit || !watch.drained || !watch.nativeSessionId || watch.pid === undefined) throw error
     yield* continueTurn(backend, req, session,
-      { reason: 'runner_exit', pid: watch.pid, exit: watch.exit, nativeSessionId: watch.nativeSessionId, openTools: watch.openTools }, signal)
+      { reason: 'runner_exit', pid: watch.pid, exit: watch.exit, nativeSessionId: watch.nativeSessionId, openTools: watch.openTools, lastActivityCall: watch.lastActivityCall }, signal)
   }
 }
 
@@ -120,7 +122,9 @@ export async function* continueTurn(
         cwd: req.cwd ?? null, turns: 1, createdAt: Date.now(), lastUsedAt: Date.now(), metadata: {} }
   // Codex numbers its items per process, so the resumed runner reuses ids the dead one announced.
   const own = (id: string): string => `${id}.resumed`
-  for await (const delta of backend.runRunner(resumed, resumedSession, signal, newRunnerWatch())) {
+  const watch = newRunnerWatch()
+  watch.lastActivityCall = interruption.lastActivityCall
+  for await (const delta of backend.runRunner(resumed, resumedSession, signal, watch)) {
     yield { ...delta,
       ...(delta.tool_calls ? { tool_calls: delta.tool_calls.map((call) => ({ ...call, id: own(call.id) })) } : {}),
       ...(delta.tool_results ? { tool_results: delta.tool_results.map((result) => ({ ...result, id: own(result.id) })) } : {}) }

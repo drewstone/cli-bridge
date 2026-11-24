@@ -393,7 +393,6 @@ export class CodexBackend implements Backend {
       let usage: ChatDelta['usage']
       const servedModels = new Set<string>()
       const publicCalls = new Map<string, number>()
-      let nextCall = 1
 
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
@@ -434,7 +433,7 @@ export class CodexBackend implements Backend {
         if ((type === 'item.started' || type === 'item.completed')
           && (tool === 'command_execution' || tool === 'web_search' || tool === 'file_change' || tool === 'mcp_tool_call')) {
           const id = typeof item?.id === 'string' && item.id ? item.id : undefined
-          const call = id ? publicCalls.get(id) ?? nextCall++ : undefined
+          const call = id ? publicCalls.get(id) ?? (watch.lastActivityCall = (watch.lastActivityCall ?? 0) + 1) : undefined
           if (id && call !== undefined) {
             if (type === 'item.started') publicCalls.set(id, call)
             else publicCalls.delete(id)
