@@ -25,8 +25,10 @@ import {
   resolveMcpServers,
 } from './profile-mcp.js'
 import {
+  PI_JAIL_REQUIREMENT,
   parsePiModelId,
   piDirectToolSelection,
+  piEnforcingJail,
   piExtensionArgs,
   piMcpAdapterAvailable,
   piToolProcessEnvironment,
@@ -42,7 +44,7 @@ import {
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { createPrivateTemporaryRoot, type PrivateTemporaryRoot } from '../runtime/private-temporary.js'
-import { registerJailReadable, registerJailWritable, selectJailBackend } from '../jail/index.js'
+import { registerJailReadable, registerJailWritable } from '../jail/index.js'
 import { resolveJailSpec } from '../jail/resolve-spec.js'
 import { traceContextToChildEnv } from '../trace/ids.js'
 
@@ -94,13 +96,8 @@ export async function startPiNativeSession(
         env: options.jailEnv ?? process.env,
       })
     }
-    const jailBackend = selectJailBackend(process.platform, req.jailSpec?.backend ?? configuredJailBackend(options.jailEnv))
-    if (!req.jailSpec?.readConfine || jailBackend.name !== 'bwrap' || !(await jailBackend.isAvailable())) {
-      throw new BackendError(
-        'backend pi requires an enforced Linux fs-jail so Bash and descendants cannot read host credentials '
-        + 'or sibling sessions; set BRIDGE_JAIL_MODE=fs-jail and enable bubblewrap',
-        'not_configured',
-      )
+    if (!req.jailSpec?.readConfine || !(await piEnforcingJail(req.jailSpec.backend ?? configuredJailBackend(options.jailEnv)))) {
+      throw new BackendError(PI_JAIL_REQUIREMENT, 'not_configured')
     }
     req.jailSpec.requireEnforcement = true
     req.jailSpec.authSources = []

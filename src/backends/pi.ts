@@ -3,7 +3,7 @@
  * MCP requires the installed pi-mcp-adapter and exact profile/request configuration, otherwise refuse.
  * Native text/thinking/tool/usage events retain their OpenAI and canonical event projections below.
  */
-import { configuredJailBackend } from '../config.js'
+import { configuredJailBackend, type LinuxJailBackend } from '../config.js'
 
 import { existsSync, readFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -85,6 +85,25 @@ export interface PiBackendOptions {
   /** Base backoff between turn attempts, multiplied by the attempt number. Defaults to
    *  {@link PI_TURN_RETRY_BACKOFF_MS}. */
   turnRetryBackoffMs?: number
+}
+
+/**
+ * The Linux fs-jails that keep Pi's Bash and descendants from host credentials and sibling sessions.
+ * Bubblewrap hides them behind namespaces. Landlock grants the run only its own paths and its own
+ * `/proc/<pid>` files, so the Bridge's environment and other runs' scoped tokens stay unreadable;
+ * its seccomp filter refuses Unix sockets and its TCP grants name only this run's inference port and
+ * relay. Landlock also refuses every spawn without the operator's host-egress assertion.
+ */
+const PI_ENFORCING_JAILS: ReadonlySet<string> = new Set(['bwrap', 'landlock'])
+
+export const PI_JAIL_REQUIREMENT = 'backend pi requires an enforced Linux fs-jail so Bash and descendants cannot read host '
+  + 'credentials or sibling sessions; set execution.jail.mode=fs-jail (or BRIDGE_JAIL_MODE=fs-jail) and enable '
+  + 'bubblewrap, or select BRIDGE_JAIL_BACKEND=landlock with its host prerequisites'
+
+/** The fs-jail backend that will wrap this Pi spawn, or null when none can enforce Pi's isolation. */
+export async function piEnforcingJail(choice: LinuxJailBackend): Promise<string | null> {
+  const backend = selectJailBackend(process.platform, choice)
+  return PI_ENFORCING_JAILS.has(backend.name) && await backend.isAvailable() ? backend.name : null
 }
 
 /** Parsed `pi/<provider>/<model>` selection. Incomplete ids are rejected before spawn. */
@@ -337,12 +356,13 @@ export class PiBackend implements NativeSessionBackend {
   async health(signal?: AbortSignal): Promise<BackendHealth> {
     // Retained Pi currently requires its Linux inference-isolation path.
     if (this.spawner.executionEnvironment === 'host') {
-      const jailBackend = selectJailBackend(process.platform, configuredJailBackend(this.opts.jailEnv))
-      if (jailBackend.name !== 'bwrap' || !(await jailBackend.isAvailable())) {
+      const choice = configuredJailBackend(this.opts.jailEnv)
+      if (!(await piEnforcingJail(choice))) {
         return {
           name: this.name,
           state: 'unavailable',
-          detail: `pi needs an enforced Linux fs-jail (bubblewrap) on a host executor; this host offers ${jailBackend.name}`,
+          detail: `pi needs an enforced Linux fs-jail (bubblewrap, or selected Landlock) on a host executor; `
+            + `this host offers ${selectJailBackend(process.platform, choice).name}, unavailable or not enforcing`,
         }
       }
     }
@@ -459,17 +479,8 @@ export class PiBackend implements NativeSessionBackend {
       )
     }
     if (this.spawner.executionEnvironment === 'host') {
-      const jailBackend = selectJailBackend(process.platform, req.jailSpec?.backend ?? configuredJailBackend(this.opts.jailEnv))
-      if (
-        !req.jailSpec?.readConfine
-        || jailBackend.name !== 'bwrap'
-        || !(await jailBackend.isAvailable())
-      ) {
-        throw new BackendError(
-          'backend pi requires an enforced Linux fs-jail so Bash and descendants cannot read host credentials '
-          + 'or sibling sessions; send execution.jail.mode=fs-jail and enable bubblewrap',
-          'not_configured',
-        )
+      if (!req.jailSpec?.readConfine || !(await piEnforcingJail(req.jailSpec.backend ?? configuredJailBackend(this.opts.jailEnv)))) {
+        throw new BackendError(PI_JAIL_REQUIREMENT, 'not_configured')
       }
       // Pi carries a scoped model token inside its private config. An operator's
       // global warn fallback must never downgrade this request to open host reads.
