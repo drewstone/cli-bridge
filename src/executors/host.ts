@@ -433,6 +433,9 @@ const PROXIED_ENV_KEYS = new Set([
   'BRIDGE_BEARER',
   'CLI_BRIDGE_BEARER',
   'CURSOR_API_KEY',
+  // Claude Code's tool search: `false` loads every MCP tool into each model request instead of deferring
+  // it behind ToolSearch, for a model endpoint that cannot search first.
+  'ENABLE_TOOL_SEARCH',
   'GEMINI_SYSTEM_MD',
   'GH_TOKEN',
   'GITHUB_TOKEN',

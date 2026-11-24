@@ -20,6 +20,9 @@
  * - abort: the cancelled turn waits in `wait_seconds`; the replacement replies with its own word;
  * - usage: `Report usage <prompt> <completion>`, checked by equality.
  * The profile prompt is not observable on it; the profile's MCP server is.
+ * The scripted model makes one call per instruction, so it cannot search for a deferred tool first: the
+ * axis runs the Bridge with ENABLE_TOOL_SEARCH=false (unless set), which has Claude Code put every MCP
+ * tool in each request instead of behind its ToolSearch tool, as it does for an endpoint without search.
  */
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -119,7 +122,7 @@ function retainedModeEvidence(bin: string): { offered: boolean; evidence: string
   const help = spawnSync(bin, ['--help'], { encoding: 'utf8', timeout: 30_000 })
   const text = `${help.stdout ?? ''}\n${help.stderr ?? ''}`
   // A subcommand line, with or without the program name in front: `  acp ...` or `  opencode serve ...`.
-  const modes = [/^\s+(?:[\w-]+\s)?(?:acp|serve|app-server|web)\b/mu, /--mode\b[^\n]*\brpc\b/u, /--input-format\b/u]
+  const modes = [/^\s+(?:[\w-]+\s)?(?:acp|serve|app-server|web)\b/mu, /--(?:experimental-)?acp\b/u, /--mode\b[^\n]*\brpc\b/u, /--input-format\b/u]
   const offered = modes.some((mode) => mode.test(text))
   const version = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 30_000 }).stdout?.trim().split('\n')[0] ?? ''
   return { offered, evidence: `\`${bin} --help\` (${version}) lists no server, ACP, RPC or streamed-input mode` }
@@ -134,7 +137,12 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   }
 
   // A refused route is a seat or configuration fact for the whole row, not six failures.
-  const probe = await chat(bridge, model, cwd, 'Reply with OK only.', { session_id: marker(`${harness}-probe`) })
+  // A probe that never answers is the row's finding, not the end of the run for every later harness.
+  const probe = await chat(bridge, model, cwd, SCRIPTED ? 'Reply with exactly OK' : 'Reply with OK only.', { session_id: marker(`${harness}-probe`) })
+    .catch((error: unknown): Turn => ({ status: 0, text: '', error: { message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) } }))
+  if (probe.status === 0) {
+    return Object.fromEntries(VERBS.map((verb) => [verb, red(`the first turn did not answer within ${TURN_MS} ms: ${(probe.error as { message?: string }).message ?? ''}`)])) as Record<Verb, Cell>
+  }
   const refusal = probe.error as { type?: string; message?: string } | undefined
   if (probe.status === 403 && refusal?.type === 'subscription_required') {
     return Object.fromEntries(VERBS.map((verb) => [verb, { state: 'blocked', detail: `no subscription seat: ${refusal.message ?? ''}`.slice(0, 240) }])) as Record<Verb, Cell>
@@ -302,6 +310,7 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
 }
 
 async function main(): Promise<void> {
+  if (SCRIPTED) process.env.ENABLE_TOOL_SEARCH ??= 'false'
   const root = await mkdtemp(join(tmpdir(), 'bridge-conformance-'))
   const config = loadConfig({ ...process.env, BRIDGE_HOST: '127.0.0.1', BRIDGE_BEARER: BEARER, BRIDGE_TRACE: 'off',
     BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: rows.map((row) => row.name).join(',') })
