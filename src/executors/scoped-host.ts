@@ -58,7 +58,7 @@ import { totalmem } from 'node:os'
 import { posix } from 'node:path'
 import { promisify } from 'node:util'
 import { withLineageEnv } from '../trace/lineage.js'
-import { executorSaturatedError, hostSpawner, sanitizeHostEnv } from './host.js'
+import { executorSaturatedError, hostSpawner, sanitizeHostEnv, spawnPassthroughKeys } from './host.js'
 import { applyJail, effectiveNativeStore } from './jail-support.js'
 import { killTree, retryCleanupUntilSuccessful } from './process-tree.js'
 import type { Spawner, SpawnResult } from './types.js'
@@ -552,7 +552,7 @@ export const scopedHostSpawner: Spawner = async (bin, args, opts) => {
   let nativeStore: SpawnResult['effectiveNativeStore']
   try {
     const env = resolveScopedSpawnEnv(
-      withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv),
+      withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, spawnPassthroughKeys(opts, jailed)), opts.lineageEnv),
       busTransportEnv,
     )
     nativeStore = effectiveNativeStore(opts, jailed, env)

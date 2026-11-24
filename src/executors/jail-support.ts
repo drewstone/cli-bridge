@@ -31,6 +31,8 @@ export interface JailedCommand {
   /** Tear-down for backend-owned jail temp state; run once in release(). */
   cleanup?: () => Promise<void> | void
   exitStatusCarriesSignal?: boolean
+  /** The command runs inside a jail, whose own egress settings replace the host's. */
+  confined?: true
 }
 
 const ENABLE_HINT =
@@ -84,7 +86,7 @@ export async function applyJail(
   // env allowlist continues to apply.
   const env = wrap.env ? { ...(opts.env ?? {}), ...wrap.env } : opts.env
   return {
-    bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup,
+    bin: wrap.bin, args: wrap.args, env, cleanup: wrap.cleanup, confined: true,
     effectiveNativeStore: wrap.effectiveNativeStore, effectiveHome: wrap.effectiveHome,
     ...(wrap.exitStatusCarriesSignal ? { exitStatusCarriesSignal: true } : {}),
   }
