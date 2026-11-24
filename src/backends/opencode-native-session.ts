@@ -91,6 +91,8 @@ export class OpencodeNativeSession implements NativeSession {
   /** This session and its subagent sessions; a subagent's permission prompt also waits on the Bridge. */
   private readonly family = new Set<string>()
   private readonly knownMessages = new Set<string>()
+  /** The newest message id seen; opencode's ids sort in creation order. */
+  private lastMessageId: string | null = null
   private readonly permissions = new Set<string>()
   private events: ClientRequest | null = null
   private connected: Waiter<void> | null = null
@@ -224,16 +226,16 @@ export class OpencodeNativeSession implements NativeSession {
     this.permissions.delete(id)
   }
 
-  /** The session's last message id, read only between turns. */
+  /**
+   * The session's newest message id, read only between turns. Every message a turn creates is
+   * reported before the loop goes idle, so the id is the one `GET /session/:id/message?limit=1`
+   * returns, without a request that would hold the turn's commit.
+   */
   async contextBoundary(input: {
     runId: string; provider: string; environmentId: string; sessionId: string; executionId: string; requestDigest: string
   }): Promise<NativeContextBoundaryProof | null> {
-    if (this.life.closed || this.turnState || !this.sessionID) return null
-    const response = await this.call('GET', `/session/${encodeURIComponent(this.sessionID)}/message?limit=1`)
-    const messages = parseJson(response.text)
-    const last = Array.isArray(messages) ? record(record(messages.at(-1))?.info)?.id : undefined
-    if (response.status !== 200 || typeof last !== 'string') return null
-    const revision = `opencode:${this.sessionID}:${last}`
+    if (this.life.closed || this.turnState || !this.sessionID || !this.lastMessageId) return null
+    const revision = `opencode:${this.sessionID}:${this.lastMessageId}`
     return {
       ...input,
       requestDigest: input.requestDigest as `sha256:${string}`,
@@ -299,6 +301,7 @@ export class OpencodeNativeSession implements NativeSession {
     if (event.type === 'message.updated' && info && typeof info.id === 'string') {
       const fresh = !this.knownMessages.has(info.id)
       this.knownMessages.add(info.id)
+      if (!this.lastMessageId || info.id > this.lastMessageId) this.lastMessageId = info.id
       if (turn && fresh && info.role === 'user') {
         const admission = turn.admissions.shift()
         if (admission?.kind === 'prompt') turn.started = true
