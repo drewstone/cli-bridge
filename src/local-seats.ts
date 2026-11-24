@@ -198,7 +198,7 @@ async function kimiLoginState(bin: string, env: NodeJS.ProcessEnv, model: string
       return object(reply.data)
     }
     // A build without the provider listing reads no plan key; its OAuth login reads as before.
-    const [auth, config, providers] = await Promise.all([read('auth'), read('config'), read('providers').catch(() => ({}))])
+    const [auth, config, providers] = await Promise.all([read('auth'), read('config'), read('providers').catch((): Record<string, unknown> => ({}))])
     const managed = object(auth.managed_provider)
     // Kimi keys a model as `kimi-code/<model>`, the id the Bridge passes as `--model`; no model means Kimi's default.
     const route = model ? `kimi-code/${model}` : nativeIdentifier(config.default_model)
