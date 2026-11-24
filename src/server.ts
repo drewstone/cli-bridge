@@ -173,6 +173,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
         stateDir: join(config.dataDir, name),
         ...(config.primeModelsJson ? { modelsJsonPath: config.primeModelsJson } : {}),
         ...(config.primePersistentAgentDir ? { persistentAgentDir: config.primePersistentAgentDir } : {}),
+        jailEnv,
       }))
     }
   }

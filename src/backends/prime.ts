@@ -60,9 +60,14 @@
  * sdk-provider-prime runs in-sandbox, so the two executors driving this fork
  * cannot disagree about what it can honor. It accepts prompt replace/append,
  * instructions, inline skills and subagents, and refuses every other dimension
- * loudly with the fork evidence. This file keeps only what is genuinely
- * transport-specific: the rpc argv/stream contract, host-process isolation
- * (HOME + XDG + per-run daemon socket), and operator credential handling.
+ * loudly with the fork evidence. MCP is the one exception lowered here: the
+ * shared reader still refuses it with the TypeScript fork's (0.7) evidence,
+ * while prime-agent 0.10 (the Rust build) mounts a settings.json `mcpServers`
+ * entry in its REPL as `mcp.call_tool(server, tool, args)` (measured on
+ * 0.10.3), so this backend writes the request's servers there. This file keeps
+ * only what is genuinely transport-specific: the rpc argv/stream contract,
+ * host-process isolation (HOME + XDG + per-run daemon socket), MCP settings,
+ * and operator credential handling.
  *
  * Known fork defect this backend defends against: a spontaneously crashed
  * IPython kernel is never re-provisioned headlessly. Every later `ipython`
@@ -75,7 +80,6 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentProfile } from '@tangle-network/agent-interface'
 import {
   assertPrimeModelAgreement,
   matchPrimeKernelDeadMarker,
@@ -83,7 +87,6 @@ import {
   parsePrimeModelsJson,
   PRIME_HARNESS_STATE_ENV_DENYLIST,
   PRIME_KERNEL_ENV_PASSTHROUGH,
-  PRIME_MCP_UNSUPPORTED_REASON,
   primeAgentDirEnv,
   primeProfileNeedsAgentDir,
   primeApiKeyEnvNames,
@@ -95,7 +98,10 @@ import {
   readPrimeProfileControls,
   writePrimeAgentFile,
 } from '@tangle-network/agent-profile-materialize'
-import type { Backend, BackendHealth, ChatDelta, ChatMessage, ChatRequest } from './types.js'
+import type { AgentEnvironmentCapabilities, AgentProfile } from '@tangle-network/agent-interface'
+import type {
+  BackendHealth, ChatDelta, ChatMessage, ChatRequest, McpServerSpec, NativeSession, NativeSessionBackend,
+} from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { versionHealth } from './health.js'
 import { assertModeSupported } from '../modes.js'
@@ -115,9 +121,11 @@ import { contentToText, extractImageAttachments } from './content.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { readProcessLines, waitForHarnessExit } from './process-lines.js'
+import { PiNativeSession } from './pi-native-session.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { registerJailReadable, registerJailWritable } from '../jail/index.js'
+import { hostRequestJail } from '../jail/host-request.js'
 import {
   piAssistantFailure,
   piFailureKind,
@@ -144,6 +152,8 @@ export interface PrimeBackendOptions {
   persistentAgentDir?: string
   /** Subprocess spawner. Defaults to the scoped host spawner. */
   spawner?: Spawner
+  /** The operator's jail settings; a retained session resolves its own jail from them, as the chat route does. */
+  jailEnv?: NodeJS.ProcessEnv
 }
 
 /** Parsed `prime/<provider>/<model>` selection. Incomplete ids are rejected before spawn. */
@@ -270,6 +280,106 @@ export function assertPrimeProviderApiKeyForwarded(
 }
 
 /**
+ * The request's MCP servers in the `mcpServers` schema of prime-agent 0.10's
+ * `<agentDir>/settings.json`, the file `prime-agent mcp add` writes and its
+ * Python runtime mounts as `mcp.call_tool(server, tool, args)` in the REPL
+ * (prime-agent-runtime rlm/mcp.py): stdio `{type, command, args, env}`, whose
+ * env values must be `{env: NAME}` references into the agent's own
+ * environment, and streamable HTTP `{type: 'http', url, headers}`. A stdio env
+ * value therefore rides the prime process env under the generated name its
+ * reference points at. Null when nothing is requested.
+ */
+export function primeMcpSettings(
+  specs: Record<string, McpServerSpec> | null,
+): { servers: Record<string, Record<string, unknown>>; env: Record<string, string> } | null {
+  if (!specs) return null
+  const servers: Record<string, Record<string, unknown>> = {}
+  const env: Record<string, string> = {}
+  const refuse = (name: string, reason: string): never => {
+    throw new BackendError(`backend prime cannot mount MCP server ${JSON.stringify(name)}: ${reason}`, 'not_configured')
+  }
+  for (const [name, spec] of Object.entries(specs)) {
+    if (spec.enabled === false) continue
+    if (spec.timeout !== undefined) refuse(name, 'prime-agent 0.10 reads no per-server tool-call timeout')
+    if (spec.type === 'sse') refuse(name, 'prime-agent 0.10 mounts stdio and streamable-HTTP MCP servers only')
+    if (spec.type === 'http' || (spec.type === undefined && !spec.command && spec.url)) {
+      if (!spec.url) refuse(name, 'an HTTP server needs a url')
+      servers[name] = {
+        type: 'http',
+        url: spec.url,
+        ...(spec.headers && Object.keys(spec.headers).length > 0 ? { headers: spec.headers } : {}),
+      }
+      continue
+    }
+    if (!spec.command) refuse(name, 'a stdio server needs a command')
+    const references: Record<string, { env: string }> = {}
+    for (const [key, value] of Object.entries(spec.env ?? {})) {
+      // prime resolves each reference from its own environment, which carries no empty value.
+      if (value === '') refuse(name, `env ${JSON.stringify(key)} is empty, and prime-agent 0.10 reads MCP env only by reference`)
+      const source = `CLI_BRIDGE_PRIME_MCP_ENV_${Object.keys(env).length}`
+      env[source] = value
+      references[key] = { env: source }
+    }
+    servers[name] = {
+      type: 'stdio',
+      command: spec.command,
+      ...(spec.args && spec.args.length > 0 ? { args: spec.args } : {}),
+      ...(Object.keys(references).length > 0 ? { env: references } : {}),
+    }
+  }
+  return Object.keys(servers).length > 0 ? { servers, env } : null
+}
+
+/**
+ * Put exactly `servers` (none when null) in the agent dir's settings.json,
+ * keeping every other setting prime itself wrote there. Atomic and owner-only,
+ * like models.json: prime reads the file at startup, and a header may carry a
+ * credential.
+ */
+export function writePrimeMcpSettings(agentDir: string, servers: Record<string, unknown> | null): void {
+  const path = join(agentDir, 'settings.json')
+  if (!existsSync(path) && !servers) return
+  const settings: unknown = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {}
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error(`${path} is not a JSON object`)
+  const { mcpServers: previous, ...rest } = settings as Record<string, unknown>
+  if (!servers && previous === undefined) return
+  writePrimeAgentFile(path, `${JSON.stringify(servers ? { ...rest, mcpServers: servers } : rest, null, 2)}\n`)
+}
+
+/**
+ * What a retained prime session proves. prime asks no permission and offers no
+ * other interaction (its tools run unconditionally), so it declares none, and
+ * a turn that requests one is refused at admission.
+ */
+export function primeNativeCapabilities(): AgentEnvironmentCapabilities {
+  return {
+    profile: {
+      namedProfiles: false,
+      systemPrompt: { replace: true, append: true },
+      instructions: true,
+      tools: false,
+      permissions: false,
+      mcp: true,
+      subagents: true,
+      resources: { files: false, instructions: true, tools: false, skills: true, agents: false, commands: false },
+      hooks: false,
+      modes: false,
+      runtimeUpdate: false,
+      validation: true,
+    },
+    streaming: { live: true, replay: true, detach: true, turnIdempotency: true },
+    retainedControl: { exactRunIdentity: true, resultIdentity: true, eventIdentity: true, cancellationIdempotency: true },
+    nativeContinuation: { atomicBoundary: true, requestIdempotency: true, admissionControl: true },
+    sessions: { continue: true, list: true, messages: true },
+    workspace: { read: true, write: true, exec: true, git: true, upload: false, download: false },
+    branching: { checkpoint: false, fork: false },
+    placement: true,
+    usage: true,
+    confidential: false,
+  }
+}
+
+/**
  * One authority per run. The harness pin and the model agreement are both
  * enforced by the shared lowering, so this backend only renders the refusal in
  * its own typed error contract — a profile can never be scored against a model
@@ -322,6 +432,18 @@ function translatePrimeProfileError<T>(run: () => T): T {
   }
 }
 
+/** One prime run, prepared and not yet started (see `PrimeBackend.prepareRun`). */
+interface PreparedPrimeRun {
+  args: string[]
+  env: NodeJS.ProcessEnv
+  envPassthroughKeys: string[]
+  runCwd: string | undefined
+  home: ProvisionedPrimeHome
+}
+
+/** Bound on one rpc command's answer (get_state, steer, abort), as for retained Pi. */
+const PRIME_RPC_REQUEST_TIMEOUT_CAP_MS = 30_000
+
 interface ProvisionedPrimeHome {
   home: string
   agentDir: string
@@ -336,9 +458,10 @@ interface ProvisionedPrimeHome {
   cleanup: () => void
 }
 
-export class PrimeBackend implements Backend {
+export class PrimeBackend implements NativeSessionBackend {
   readonly name = 'prime'
   readonly defaultExecutionTimeoutMs: number
+  readonly nativeModes = ['byob'] as const
   private readonly spawner: Spawner
 
   constructor(private readonly opts: PrimeBackendOptions) {
@@ -369,63 +492,52 @@ export class PrimeBackend implements Backend {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
+  nativeCapabilities(): AgentEnvironmentCapabilities {
+    return primeNativeCapabilities()
+  }
+
+  /**
+   * One retained `prime-agent --mode rpc` per session, launched exactly like a
+   * one-shot turn (same isolated HOME and agent dir, models.json, MCP settings,
+   * profile flags and env allowlist) but with stdin held open. prime's rpc mode
+   * is Pi's: `prompt`, `steer` (applied after the running tool call), `abort`
+   * and `get_state`, so the Pi session adapter drives it. prime 0.10 ends a
+   * prompt at `agent_end` and emits no `agent_settled`; the adapter settles a
+   * turn once `get_state` reports the session idle after that `agent_end`.
+   */
+  async startNativeSession(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal?: AbortSignal,
+  ): Promise<NativeSession> {
+    this.assertRunnable(req)
+    // The chat route resolves a one-shot's jail; a retained session starts here, so it resolves its own.
+    req.jailSpec ??= hostRequestJail(req, this.name, this.opts.jailEnv ?? process.env)
+    const prepared = this.prepareRun(req, session, resolvePromptMessages(req, session, this.name))
+    const spawned = await this.spawnRun(req, prepared, signal)
+    const spawnError = spawned.spawnError?.()
+    if (spawnError || !spawned.child.stdin || !spawned.child.stdout) {
+      await terminateSpawned(spawned)
+      spawned.release()
+      prepared.home.cleanup()
+      throw new BackendError('prime rpc failed to start with stdin and stdout pipes', 'upstream', spawnError)
+    }
+    return new PiNativeSession(spawned, {
+      capabilities: primeNativeCapabilities(),
+      requestTimeoutMs: this.defaultExecutionTimeoutMs > 0
+        ? Math.min(this.defaultExecutionTimeoutMs, PRIME_RPC_REQUEST_TIMEOUT_CAP_MS)
+        : PRIME_RPC_REQUEST_TIMEOUT_CAP_MS,
+      settleWhenIdleAfterAgentEnd: true,
+      cleanup: () => prepared.home.cleanup(),
+    })
+  }
+
   async *chat(
     req: ChatRequest,
     session: SessionRecord | null,
     signal: AbortSignal,
   ): AsyncIterable<ChatDelta> {
-    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
-      'prime-agent has native tools (ipython/bash/files); hosted-safe requires a verified tool-disable path')
-
-    if (this.spawner.executionEnvironment === 'test-double' && process.env.VITEST !== 'true') {
-      throw new BackendError(
-        'backend prime test-double executors are only accepted by the test runner',
-        'not_configured',
-      )
-    }
-
-    const spec = parsePrimeModelId(req.model)
-    if (!spec.provider || !spec.model) {
-      throw new BackendError(
-        'backend prime requires an explicit prime/<provider>/<model> so the run binds to a provider entry '
-        + 'in the materialized models.json',
-        'not_configured',
-      )
-    }
-
-    // FAIL-LOUD on MCP, whether it arrives request-scoped or as
-    // agent_profile.mcp (resolveMcpServers merges both; entries with
-    // enabled:false are OFF, not requested). The fork evidence is the shared
-    // refusal reason, so this backend and the in-sandbox adapter cite the same
-    // facts and a fork change moves one string.
-    const mcpSpecs = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false })
-    if (mcpSpecs && Object.keys(mcpSpecs).length > 0) {
-      throw new BackendError(
-        `backend prime cannot mount MCP servers (requested: ${Object.keys(mcpSpecs).join(', ')}): `
-        + PRIME_MCP_UNSUPPORTED_REASON,
-        'not_configured',
-      )
-    }
-
-    const profile = resolveAgentProfile(req, session)
-    let profileControls: PrimeProfileControls | null = null
-    if (profile) {
-      assertProfileRequestAuthority(req, session)
-      assertPrimeProfileBinding(profile, { provider: spec.provider, model: spec.model })
-      profileControls = translatePrimeProfileError(() => readPrimeProfileControls(profile))
-      // Prompts and skills are bound by flag, so they land in this run's own
-      // prompt dir and are safe against any agent dir. Instructions and the
-      // subagent roster are located BY the agent dir and have no flag, so they
-      // are refused when that dir is operator-owned.
-      if (primeProfileNeedsAgentDir(profileControls) && this.opts.persistentAgentDir) {
-        throw new BackendError(
-          'agent_profile instructions/subagents can only be written into the agent dir itself, and '
-          + 'PRIME_PERSISTENT_AGENT_DIR names an operator-owned dir this backend must not rewrite; '
-          + 'drop the persistent dir or strip those profile dimensions',
-          'not_configured',
-        )
-      }
-    }
+    this.assertRunnable(req)
     const promptMessages = resolvePromptMessages(req, session, this.name)
     const promptText = buildPromptText(promptMessages)
     if (!promptText) {
@@ -436,127 +548,9 @@ export class PrimeBackend implements Backend {
       data: image.data.toString('base64'),
       mimeType: image.mediaType,
     }))
-
-    const args: string[] = ['--mode', 'rpc', '--provider', spec.provider, '--model', spec.model]
-    const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
-    const thinking = translatePrimeProfileError(() =>
-      primeThinkingLevel(requestedReasoningEffort),
-    )
-    if (thinking) args.push('--thinking', thinking)
-
-    const home = this.provisionHome(req.session_id, spec.provider)
-    // The shared lowering writes the profile's prompt files and skills into
-    // this run's prompt dir, its instructions and subagent roster into the
-    // agent dir, and returns the flags that bind them. The prune runs even when
-    // the current profile carries nothing, so a session dir whose in-band
-    // profile shrank does not keep serving the previous turn's material.
-    if (profileControls) {
-      const materializeOptions = { flagFileRoot: home.promptDir }
-      try {
-        prunePrimeProfileMaterial(
-          this.opts.persistentAgentDir ? home.promptDir : home.agentDir,
-          materializeOptions,
-        )
-        args.push(
-          ...materializePrimeProfileControls(home.agentDir, profileControls, materializeOptions),
-        )
-      } catch (err) {
-        home.cleanup()
-        if (err instanceof PrimeHarnessStateError) {
-          throw new BackendError(err.message, 'upstream', err)
-        }
-        throw translatePrimeProfileError(() => {
-          throw err
-        })
-      }
-    }
-
-    // Every ADDITIVE system source the REQUEST carries folds into one more
-    // --append-system-prompt (the flag accumulates in order, fork
-    // cli/args.ts:141-143), after the profile's own addition and with the
-    // JSON-mode directive last so nothing restates the output contract after
-    // it. It is written as a FILE (resolved by the fork when the path exists,
-    // resource-loader.ts:41-56) outside the agent dir, so it carries no argv
-    // size ceiling and works unchanged against an operator-owned agent dir.
-    const requestAppendBlocks = [
-      ...promptMessages
-        .filter((message) => message.role === 'system')
-        .map((message) => contentToText(message.content))
-        .filter(Boolean),
-      wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
-    ].filter((value): value is string => Boolean(value))
-    if (requestAppendBlocks.length > 0) {
-      const appendPath = join(home.promptDir, 'request-append-system-prompt.md')
-      try {
-        writePrimeAgentFile(appendPath, requestAppendBlocks.join('\n\n'))
-      } catch (err) {
-        home.cleanup()
-        throw new BackendError(
-          `prime could not materialize the request system prompt: ${err instanceof Error ? err.message : String(err)}`,
-          'upstream',
-          err,
-        )
-      }
-      args.push('--append-system-prompt', appendPath)
-    }
-    if (req.session_id) {
-      args.push('--session-dir', home.sessionArtifactDir)
-      // The artifact dir is exclusive to this bridge session, so `--continue`
-      // deterministically resumes its single most-recent session. The fork
-      // dropped upstream Pi's `--session <id>` flag; resume-by-dir replaces it.
-      if (session?.internalId) args.push('--continue')
-    } else {
-      args.push('--no-session')
-    }
-    args.push('--daemon-socket', home.daemonSocketPath)
-
-    const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
-    // The socket dir lives under the HOST tmpdir, which every jail mode
-    // hides: write-jail binds the host root read-only and fs-jail replaces
-    // /tmp with an empty tmpfs. The fork's daemon supervisor takes a lockfile
-    // beside the socket before it listens, so an unexposed dir dies as
-    // "Prime Agent daemon exited during startup" with EACCES/ENOENT on
-    // `<socket>.lock` in the daemon log (reproduced against fork be9e2fa0).
-    // The prompt dir carries --append-system-prompt and profile files; an
-    // fs-jail that cannot see the path makes the fork take it as literal
-    // prompt text (resource-loader.ts resolves a path only when it exists).
-    //
-    // The request cwd is where the caller asked the agent to RUN; a jail
-    // confines it, it must not silently revoke it. An fs-jail without the
-    // cwd registered cannot even read the working directory — a
-    // file-delivered trajectory (traces' prime engine passes cwd with
-    // trajectory.otlp.jsonl inside) would vanish for the agent.
-    registerJailWritable(req.jailSpec, home.home, home.sessionArtifactDir, home.socketDir, runCwd ?? '')
-    registerJailReadable(req.jailSpec, home.promptDir)
-
-    let spawned: Awaited<ReturnType<Spawner>>
-    try {
-      spawned = await this.spawner(this.opts.bin, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: runCwd,
-        env: primeProcessEnvironment(process.env, {
-          HOME: home.home,
-          XDG_DATA_HOME: join(home.home, '.local', 'share'),
-          XDG_CONFIG_HOME: join(home.home, '.config'),
-          XDG_CACHE_HOME: join(home.home, '.cache'),
-          ...primeAgentDirEnv(home.agentDir),
-          PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: '1',
-          ...home.apiKeyEnv,
-        }),
-        // The host executors re-filter the child env through their own
-        // allowlist; the apiKey names a models.json picks are arbitrary
-        // (DEEPSEEK_API_KEY, TANGLE_ROUTER_KEY, ...), so they are declared
-        // by exact name or the fork resolves the bare name as the literal key.
-        envPassthroughKeys: Object.keys(home.apiKeyEnv),
-        ...(req.session_id ? { sessionId: req.session_id } : {}),
-        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
-        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
-      })
-    } catch (err) {
-      home.cleanup()
-      throw err
-    }
+    const prepared = this.prepareRun(req, session, promptMessages)
+    const home = prepared.home
+    const spawned = await this.spawnRun(req, prepared)
     const child = spawned.child
     const releaseSpawner = spawned.release
 
@@ -806,6 +800,224 @@ export class PrimeBackend implements Backend {
       await terminateSpawned(spawned)
       try { releaseSpawner() } catch { /* best effort */ }
       home.cleanup()
+    }
+  }
+
+  private assertRunnable(req: ChatRequest): void {
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
+      'prime-agent has native tools (ipython/bash/files); hosted-safe requires a verified tool-disable path')
+
+    if (this.spawner.executionEnvironment === 'test-double' && process.env.VITEST !== 'true') {
+      throw new BackendError(
+        'backend prime test-double executors are only accepted by the test runner',
+        'not_configured',
+      )
+    }
+  }
+
+  /**
+   * Everything a prime run needs before its process starts: the model binding,
+   * the profile and MCP lowering into the run's own agent dir, the argv and the
+   * child env. Shared by one-shot turns and retained sessions so the two cannot
+   * launch prime differently. The returned HOME is the caller's to clean up.
+   */
+  private prepareRun(req: ChatRequest, session: SessionRecord | null, promptMessages: ChatMessage[]): PreparedPrimeRun {
+    const spec = parsePrimeModelId(req.model)
+    if (!spec.provider || !spec.model) {
+      throw new BackendError(
+        'backend prime requires an explicit prime/<provider>/<model> so the run binds to a provider entry '
+        + 'in the materialized models.json',
+        'not_configured',
+      )
+    }
+
+    // MCP servers, request-scoped or agent_profile.mcp (resolveMcpServers
+    // merges both; entries with enabled:false are OFF), become the run's own
+    // `<agentDir>/settings.json` mcpServers: prime-agent 0.10 mounts them in
+    // its Python REPL as `mcp.call_tool(server, tool, args)`.
+    const mcpSpecs = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false })
+    const mcp = primeMcpSettings(mcpSpecs)
+    if (mcp && this.opts.persistentAgentDir) {
+      throw new BackendError(
+        `backend prime cannot mount MCP servers (requested: ${Object.keys(mcp.servers).join(', ')}) into `
+        + 'PRIME_PERSISTENT_AGENT_DIR: they live in the agent dir\'s settings.json, which is operator-owned; '
+        + 'drop the persistent dir or the MCP servers',
+        'not_configured',
+      )
+    }
+
+    const profile = resolveAgentProfile(req, session)
+    let profileControls: PrimeProfileControls | null = null
+    if (profile) {
+      assertProfileRequestAuthority(req, session)
+      assertPrimeProfileBinding(profile, { provider: spec.provider, model: spec.model })
+      // The Bridge lowers agent_profile.mcp itself (above); the shared reader
+      // still refuses it with the 0.7 fork's evidence, so it reads the rest.
+      const { mcp: _loweredByBridge, ...forkProfile } = profile
+      profileControls = translatePrimeProfileError(() => readPrimeProfileControls(forkProfile as AgentProfile))
+      // Prompts and skills are bound by flag, so they land in this run's own
+      // prompt dir and are safe against any agent dir. Instructions and the
+      // subagent roster are located BY the agent dir and have no flag, so they
+      // are refused when that dir is operator-owned.
+      if (primeProfileNeedsAgentDir(profileControls) && this.opts.persistentAgentDir) {
+        throw new BackendError(
+          'agent_profile instructions/subagents can only be written into the agent dir itself, and '
+          + 'PRIME_PERSISTENT_AGENT_DIR names an operator-owned dir this backend must not rewrite; '
+          + 'drop the persistent dir or strip those profile dimensions',
+          'not_configured',
+        )
+      }
+    }
+    const args: string[] = ['--mode', 'rpc', '--provider', spec.provider, '--model', spec.model]
+    const requestedReasoningEffort = resolveRequestedReasoningEffort(req, session)
+    const thinking = translatePrimeProfileError(() =>
+      primeThinkingLevel(requestedReasoningEffort),
+    )
+    if (thinking) args.push('--thinking', thinking)
+
+    const home = this.provisionHome(req.session_id, spec.provider)
+    try {
+      // A session's agent dir outlives its turns, so every run rewrites the
+      // MCP set, an empty one included: a server an earlier turn mounted must
+      // not stay mounted for a turn that no longer asks for it.
+      if (!this.opts.persistentAgentDir) writePrimeMcpSettings(home.agentDir, mcp?.servers ?? null)
+    } catch (err) {
+      home.cleanup()
+      throw new BackendError(
+        `prime could not write its MCP settings: ${err instanceof Error ? err.message : String(err)}`,
+        'upstream',
+        err,
+      )
+    }
+    // The shared lowering writes the profile's prompt files and skills into
+    // this run's prompt dir, its instructions and subagent roster into the
+    // agent dir, and returns the flags that bind them. The prune runs even when
+    // the current profile carries nothing, so a session dir whose in-band
+    // profile shrank does not keep serving the previous turn's material.
+    if (profileControls) {
+      const materializeOptions = { flagFileRoot: home.promptDir }
+      try {
+        prunePrimeProfileMaterial(
+          this.opts.persistentAgentDir ? home.promptDir : home.agentDir,
+          materializeOptions,
+        )
+        args.push(
+          ...materializePrimeProfileControls(home.agentDir, profileControls, materializeOptions),
+        )
+      } catch (err) {
+        home.cleanup()
+        if (err instanceof PrimeHarnessStateError) {
+          throw new BackendError(err.message, 'upstream', err)
+        }
+        throw translatePrimeProfileError(() => {
+          throw err
+        })
+      }
+    }
+
+    // Every ADDITIVE system source the REQUEST carries folds into one more
+    // --append-system-prompt (the flag accumulates in order, fork
+    // cli/args.ts:141-143), after the profile's own addition and with the
+    // JSON-mode directive last so nothing restates the output contract after
+    // it. It is written as a FILE (resolved by the fork when the path exists,
+    // resource-loader.ts:41-56) outside the agent dir, so it carries no argv
+    // size ceiling and works unchanged against an operator-owned agent dir.
+    const requestAppendBlocks = [
+      ...promptMessages
+        .filter((message) => message.role === 'system')
+        .map((message) => contentToText(message.content))
+        .filter(Boolean),
+      wantsJsonObject(req) ? JSON_MODE_DIRECTIVE : null,
+    ].filter((value): value is string => Boolean(value))
+    if (requestAppendBlocks.length > 0) {
+      const appendPath = join(home.promptDir, 'request-append-system-prompt.md')
+      try {
+        writePrimeAgentFile(appendPath, requestAppendBlocks.join('\n\n'))
+      } catch (err) {
+        home.cleanup()
+        throw new BackendError(
+          `prime could not materialize the request system prompt: ${err instanceof Error ? err.message : String(err)}`,
+          'upstream',
+          err,
+        )
+      }
+      args.push('--append-system-prompt', appendPath)
+    }
+    if (req.session_id) {
+      args.push('--session-dir', home.sessionArtifactDir)
+      // The artifact dir is exclusive to this bridge session, so `--continue`
+      // deterministically resumes its single most-recent session. The fork
+      // dropped upstream Pi's `--session <id>` flag; resume-by-dir replaces it.
+      if (session?.internalId) args.push('--continue')
+    } else {
+      args.push('--no-session')
+    }
+    args.push('--daemon-socket', home.daemonSocketPath)
+
+    const runCwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
+    // The socket dir lives under the HOST tmpdir, which every jail mode
+    // hides: write-jail binds the host root read-only and fs-jail replaces
+    // /tmp with an empty tmpfs. The fork's daemon supervisor takes a lockfile
+    // beside the socket before it listens, so an unexposed dir dies as
+    // "Prime Agent daemon exited during startup" with EACCES/ENOENT on
+    // `<socket>.lock` in the daemon log (reproduced against fork be9e2fa0).
+    // The prompt dir carries --append-system-prompt and profile files; an
+    // fs-jail that cannot see the path makes the fork take it as literal
+    // prompt text (resource-loader.ts resolves a path only when it exists).
+    //
+    // The request cwd is where the caller asked the agent to RUN; a jail
+    // confines it, it must not silently revoke it. An fs-jail without the
+    // cwd registered cannot even read the working directory — a
+    // file-delivered trajectory (traces' prime engine passes cwd with
+    // trajectory.otlp.jsonl inside) would vanish for the agent.
+    registerJailWritable(req.jailSpec, home.home, home.sessionArtifactDir, home.socketDir, runCwd ?? '')
+    registerJailReadable(req.jailSpec, home.promptDir)
+
+    const requestEnv = {
+      HOME: home.home,
+      XDG_DATA_HOME: join(home.home, '.local', 'share'),
+      XDG_CONFIG_HOME: join(home.home, '.config'),
+      XDG_CACHE_HOME: join(home.home, '.cache'),
+      ...primeAgentDirEnv(home.agentDir),
+      PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND: '1',
+      ...home.apiKeyEnv,
+      ...(mcp?.env ?? {}),
+    }
+    return {
+      args,
+      env: primeProcessEnvironment(process.env, requestEnv),
+      // The host executors re-filter the child env through their own
+      // allowlist; the apiKey names a models.json picks are arbitrary
+      // (DEEPSEEK_API_KEY, TANGLE_ROUTER_KEY, ...), so they are declared
+      // by exact name or the fork resolves the bare name as the literal key.
+      // The MCP env references are declared the same way.
+      envPassthroughKeys: [...Object.keys(home.apiKeyEnv), ...Object.keys(mcp?.env ?? {})],
+      runCwd,
+      home,
+    }
+  }
+
+  /** Start the run's prime process; a spawn that throws releases the run's HOME. */
+  private async spawnRun(
+    req: ChatRequest,
+    prepared: PreparedPrimeRun,
+    signal?: AbortSignal,
+  ): Promise<Awaited<ReturnType<Spawner>>> {
+    try {
+      return await this.spawner(this.opts.bin, prepared.args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: prepared.runCwd,
+        env: prepared.env,
+        envPassthroughKeys: prepared.envPassthroughKeys,
+        ...(signal ? { signal } : {}),
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
+        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
+      })
+    } catch (err) {
+      prepared.home.cleanup()
+      throw err
     }
   }
 
