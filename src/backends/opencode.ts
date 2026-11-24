@@ -126,6 +126,7 @@ export class OpencodeBackend implements Backend {
     const variant = nativeReasoningControl(
       'opencode',
       resolveRequestedReasoningEffort(req, session),
+      model ?? undefined,
     )
     const provisioned = provisionProfileWorkspace(
       req,
