@@ -8,12 +8,16 @@
  *   spawn `<bin> acp`  (cwd = req.cwd, so the agent discovers workspace skills/context)
  *   → initialize {protocolVersion, clientCapabilities}
  *   → session/new {cwd, mcpServers}            → { sessionId }
+ *     (a Bridge session's later turn: session/resume, else session/load, of that sessionId)
  *   → session/prompt {sessionId, prompt:[{type:'text',text}]}
  *   ← stream session/update {update:{content:{type:'text',text}}}  → ChatDelta.content
  *   ← session/request_permission               → fail closed (capability_denied)
- *   ← session/prompt result {stopReason}        → finish_reason
+ *   ← session/prompt result {stopReason, usage} → finish_reason, ChatDelta.usage
+ *   → session/cancel {sessionId}               when the turn is cancelled
  *
- * One bin per backend instance (hermes→`hermes acp`, openclaw→`openclaw acp`).
+ * The agent answers with the model its own configuration names: the model id is the bare backend
+ * name, and `<name>/<model>` is refused. One bin per backend instance (hermes→`hermes acp`,
+ * openclaw→`openclaw acp`).
  */
 
 import type { Backend, BackendHealth, ChatDelta, ChatMessage, ChatRequest } from './types.js'
@@ -42,6 +46,9 @@ export interface AcpBackendOptions {
   spawner?: Spawner
 }
 
+/** How long a cancelled turn's agent gets to answer `session/cancel` before its process is stopped. */
+const CANCEL_GRACE_MS = 2_000
+
 /** ACP stopReason → OpenAI finish_reason. */
 function mapStopReason(reason: unknown): ChatDelta['finish_reason'] {
   switch (reason) {
@@ -50,6 +57,28 @@ function mapStopReason(reason: unknown): ChatDelta['finish_reason'] {
     case 'refusal': return 'stop'
     default: return 'stop' // end_turn, max_turn_requests, unknown
   }
+}
+
+/**
+ * The token counts an agent reports on its `session/prompt` result (ACP's `usage`: inputTokens,
+ * outputTokens, thoughtTokens, cachedReadTokens, cachedWriteTokens), for every model call of the
+ * turn. A result without counts, or with all zero, leaves the turn's usage unreported.
+ */
+function acpTurnUsage(value: unknown): ChatDelta['usage'] | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const read = (key: string): number | undefined => {
+    const count = (value as Record<string, unknown>)[key]
+    return typeof count === 'number' && Number.isFinite(count) && count >= 0 ? count : undefined
+  }
+  const usage = {
+    input_tokens: read('inputTokens'),
+    output_tokens: read('outputTokens'),
+    reasoning_output_tokens: read('thoughtTokens'),
+    cache_read_input_tokens: read('cachedReadTokens'),
+    cache_write_input_tokens: read('cachedWriteTokens'),
+  }
+  if (!Object.values(usage).some((count) => count !== undefined && count > 0)) return undefined
+  return Object.fromEntries(Object.entries(usage).filter(([, count]) => count !== undefined)) as ChatDelta['usage']
 }
 
 /** Render the (profile-preamble-prefixed) conversation into a single prompt string. */
@@ -84,6 +113,15 @@ export class AcpBackend implements Backend {
   }
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
+    // The agent runs the model its own configuration names; ACP gives this client no portable way to pick
+    // another, so a named model is refused instead of being dropped while the configured one answers.
+    if (req.model !== this.name) {
+      throw new BackendError(
+        `backend ${this.name} runs the model ${this.bin}'s own configuration names; request model "${this.name}" `
+          + `instead of "${req.model}" and select the model in ${this.bin}'s configuration`,
+        'not_configured',
+      )
+    }
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
     const promptText = renderPrompt(resolvePromptMessages(req, session, this.name))
     // Profile MCP, or body/header MCP when no profile is present, is passed
@@ -109,7 +147,16 @@ export class AcpBackend implements Backend {
     let spawnErrorMessage = spawned.spawnError?.()?.message ?? ''
     child.on('error', (err) => { spawnErrorMessage = err.message })
 
-    const onAbort = (): void => { void terminateSpawned(spawned) }
+    // A cancelled turn asks the agent to stop it first (`session/cancel`), so an agent whose turn
+    // outlives this process (a daemon that owns the session) stops too; the process goes after a grace.
+    let acpSessionId: string | undefined
+    let cancel: (() => void) | undefined
+    let graceTimer: NodeJS.Timeout | undefined
+    const onAbort = (): void => {
+      cancel?.()
+      graceTimer = setTimeout(() => { void terminateSpawned(spawned) }, acpSessionId ? CANCEL_GRACE_MS : 0)
+      graceTimer.unref?.()
+    }
     signal.addEventListener('abort', onAbort, { once: true })
 
     try {
@@ -124,6 +171,7 @@ export class AcpBackend implements Backend {
       let wake: (() => void) | null = null
       let streamEnded = false
       let driverError: Error | null = null
+      let prompting = false
       const push = (d: ChatDelta): void => { queue.push(d); wake?.() }
 
       const rpc = attachNdjsonRpc({
@@ -132,6 +180,8 @@ export class AcpBackend implements Backend {
         stdin,
         stdout,
         onMessage: (m: JsonRpcMessage) => {
+          // Before the prompt is sent, updates are the agent replaying a resumed session's history.
+          if (m.method === 'session/update' && !prompting) return
           if (m.method === 'session/update') {
             const update = (m.params as { update?: { sessionUpdate?: string; content?: { type?: string; text?: string } } })?.update
             const kind = update?.sessionUpdate
@@ -171,14 +221,26 @@ export class AcpBackend implements Backend {
 
       // Drive the protocol; deltas flow through `queue` as session/update arrives.
       const driver = (async () => {
-        await request('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } })
-        const sess = (await request('session/new', { cwd, mcpServers })) as { sessionId?: string }
-        const sessionId = sess?.sessionId
-        if (sessionId) push({ internal_session_id: sessionId })
-        const result = (await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: promptText }] })) as { stopReason?: unknown }
-        push({ finish_reason: mapStopReason(result?.stopReason) })
+        const init = (await request('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } } })) as {
+          agentCapabilities?: { loadSession?: boolean; sessionCapabilities?: { resume?: unknown } }
+        }
+        const sessionId = await this.openSession(request, init?.agentCapabilities, session?.internalId || null, cwd, mcpServers)
+        acpSessionId = sessionId
+        cancel = () => rpc.notify('session/cancel', { sessionId })
+        if (signal.aborted) throw new BackendError(`${this.name} acp turn was cancelled`, 'aborted')
+        push({ internal_session_id: sessionId })
+        prompting = true
+        const result = (await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: promptText }] })) as { stopReason?: unknown; usage?: unknown }
+        const usage = acpTurnUsage(result?.usage)
+        if (usage) push({ usage })
+        push({ finish_reason: signal.aborted ? 'error' : mapStopReason(result?.stopReason) })
       })()
-      driver.catch((e: Error) => { driverError = e instanceof BackendError ? e : new BackendError(`${this.name} acp: ${e.message}`, 'upstream') })
+      // The agent stays up after a refused step (a server waits for its next request), so a
+      // failure must wake the pump itself; otherwise the turn waits for an exit that never comes.
+      driver.catch((e: Error) => {
+        driverError = e instanceof BackendError ? e : new BackendError(`${this.name} acp: ${e.message}`, 'upstream')
+        wake?.()
+      })
 
       // Yield deltas as they arrive; finish_reason ends the turn. The
       // driverError check repeats before every yield so a permission refusal
@@ -205,8 +267,36 @@ export class AcpBackend implements Backend {
       }
     } finally {
       signal.removeEventListener('abort', onAbort)
+      clearTimeout(graceTimer)
       await terminateSpawned(spawned)
       release()
     }
+  }
+
+  /**
+   * The ACP session this turn runs in. A Bridge session that already holds the agent's session id
+   * continues it: `session/resume` where the agent offers it, else `session/load`; the history either
+   * replays is not this turn's output. Without either the turn starts a new agent session.
+   */
+  private async openSession(
+    request: (method: string, params: unknown) => Promise<unknown>,
+    capabilities: { loadSession?: boolean; sessionCapabilities?: { resume?: unknown } } | undefined,
+    previous: string | null,
+    cwd: string,
+    mcpServers: unknown[],
+  ): Promise<string> {
+    if (previous && capabilities?.sessionCapabilities?.resume) {
+      await request('session/resume', { sessionId: previous, cwd, mcpServers })
+      return previous
+    }
+    if (previous && capabilities?.loadSession) {
+      await request('session/load', { sessionId: previous, cwd, mcpServers })
+      return previous
+    }
+    const created = (await request('session/new', { cwd, mcpServers })) as { sessionId?: unknown }
+    if (typeof created?.sessionId !== 'string' || !created.sessionId) {
+      throw new BackendError(`${this.name} acp session/new answered without a sessionId`, 'upstream')
+    }
+    return created.sessionId
   }
 }
