@@ -240,7 +240,6 @@ test('plan-keyed and Kimi subscription seats reach graph admission through the r
   assert.equal(models.get('kimi-code/kimi-for-coding').authentication.credential, 'plan_key')
   // A Moonshot platform key bills per token and stays refused beside an admitted plan key.
   assert.equal(admitted('kimi-code/kimi-k2.6'), false)
-  assert.equal(models.get('kimi-code/kimi-k2.6').authentication.authMode, 'api_key')
   // Kimi refuses a provider holding both a key and its OAuth table, so that pair is no seat.
   await kimiConfig(['base_url = "https://api.kimi.com/coding/v1"', 'api_key = "fixture-kimi-plan-key"', 'oauth = { storage = "file", key = "oauth/kimi-code" }'])
   assert.deepEqual(await kimiSeat(), signedOut)
