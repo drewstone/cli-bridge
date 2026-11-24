@@ -8,6 +8,8 @@ loaded at server start by `createProfileCatalog` and exposed via:
 - `GET /v1/profiles/:id` — single profile body
 - `POST /v1/chat/completions` with `model: "sandbox/<id>"` — route a
   chat through the `sandbox` backend using this profile
+- `POST /profiles/<id>/v1/chat/completions` — the same chat on the local
+  harness the request `model` names, with this profile applied
 
 The profile `id` is the filename without the `.json` extension — e.g.
 `vb-reviewer.json` becomes id `vb-reviewer`, addressable as
