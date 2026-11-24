@@ -689,6 +689,12 @@ The refusal body carries both bindings, so a caller can tell a drifted profile f
 `stored_binding: null` means the session predates exact binding; use a new session id.
 `provider_dispatch: "not_started"` is the bridge's proof that the refusal happened before any model call, so the turn cost nothing.
 
+### `POST /profiles/:id/v1/chat/completions`
+
+The chat completion above with the cataloged AgentProfile `:id` (a `<id>.json` in `SANDBOX_PROFILES_DIR`) applied, on the harness the request `model` names.
+A caller that sets only a base URL, such as a publisher's benchmark runner, reaches a profile with base URL `<bridge>/profiles/<id>/v1`.
+An id the catalog lacks rereads the directory once; a changed profile needs a new id. A body `agent_profile` is refused with 400.
+
 ### `POST /cad/render`
 
 Render OpenSCAD source to STL + PNG (+ optional GLB). Generic — any
