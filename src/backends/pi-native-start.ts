@@ -2,7 +2,7 @@ import { configuredJailBackend } from '../config.js'
 import { writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import {
   type AgentEnvironmentCapabilities,
@@ -202,10 +202,9 @@ export async function startPiNativeSession(
 
     advancePhase('mcp')
     mcpMounted = requestedMcpNames.length > 0 ? materializeMcpServersForPi(mcpSpecs, runCwd) : null
-    if (mcpMounted) {
-      args.push('--mcp-config', mcpMounted.configPath)
-      registerJailReadable(req.jailSpec, mcpMounted.configPath, dirname(mcpMounted.configPath))
-    }
+    // The config sits in the writable workspace, readable as the one-shot path reads it; a read-only grant
+    // over it would nest inside that writable grant, which Landlock cannot express.
+    if (mcpMounted) args.push('--mcp-config', mcpMounted.configPath)
     advancePhase('profile')
     provisioned = provisionPiProfile(
       req,
