@@ -45,7 +45,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   }
   if (message.method === 'session/prompt') {
     const text = params.prompt[0].text, past = JSON.parse(fs.readFileSync(transcript(params.sessionId), 'utf8'))
-    if (text === 'wait') { waiting = message.id; return }
+    if (text === 'wait' || text === 'hold') { waiting = message.id; return }
     // hermes's /steer: answered at once with a receipt that repeats the text, applied to the running prompt after it.
     if (text.startsWith('/steer ') && waiting !== null) {
       const steer = text.slice('/steer '.length), held = waiting
@@ -153,9 +153,9 @@ describe('an ACP turn through the Bridge', () => {
     }
     const created = await post('/v1/sessions', { id, model: 'hermes', cwd, interaction_policy: 'unattended-allow' })
     expect(created.status, JSON.stringify(created.body)).toBeLessThan(300)
-    expect(await runText(await turn(1, 'first'))).toBe('echo first')
+    expect(await runText(await turn(1, 'native first'))).toBe('echo native first')
 
-    const running = await turn(2, 'wait')
+    const running = await turn(2, 'hold')
     const status = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(running)}`)
     const header = (name: string) => status.headers.get(`x-run-${name}`)
     const steered = await post(`/v1/sessions/${id}/steer`, { operationId: `steer-${randomBytes(3).toString('hex')}`, message: 'turn left',
@@ -165,7 +165,7 @@ describe('an ACP turn through the Bridge', () => {
     // The receipt repeats the steer's text; only the agent's answer is the turn's text.
     expect(await runText(running)).toBe('steered: turn left')
     const prompts = (await calls()).filter((call) => call.method === 'session/prompt' && (call.params.prompt as Array<{ text: string }>)[0]?.text !== undefined)
-    const mine = prompts.filter((call) => ['first', 'wait', '/steer turn left'].includes((call.params.prompt as Array<{ text: string }>)[0]!.text))
+    const mine = prompts.filter((call) => ['native first', 'hold', '/steer turn left'].includes((call.params.prompt as Array<{ text: string }>)[0]!.text))
     expect(mine).toHaveLength(3)
     expect(new Set(mine.map((call) => call.params.sessionId)).size).toBe(1)
     await post(`/v1/sessions/${id}/close`, {})
