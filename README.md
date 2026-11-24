@@ -41,6 +41,10 @@ inference was verified. Kimi Code's login comes from Kimi's own local server
 (`kimi web --json`, then `GET /api/v1/auth` and `/api/v1/config`), started with its model-catalog
 refresh off so the read calls no Kimi API and refreshes no token. It covers only models
 that Kimi routes through its managed `kimi-code` subscription, whose provider is `moonshot`.
+A Kimi Code membership key draws the same plan: when `kimi provider list --json` shows the serving provider as type
+`kimi` on `https://api.kimi.com/coding/v1` with a non-empty key and no OAuth table, the fact reads `authenticated`,
+`authMode: subscription`, `credential: plan_key`, `source: native_store`, while the managed login reads signed out.
+A key on a Moonshot platform endpoint bills per token and stays `api_key`.
 Where inventory reads Gemini's own OAuth store or OpenCode's credential store,
 the result is `configured` rather than a verified live login. Missing or malformed
 state stays `signed_out` or `unknown`; OAuth and API-key state stay distinct.
