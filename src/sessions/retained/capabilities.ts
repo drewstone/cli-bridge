@@ -150,9 +150,10 @@ export function genericCliBridgeCapabilities(backendName?: string, nativeContext
       accountUsage: false,
     },
   }
+  // Cursor carries instructions as a project rule and MCP as its project config (backends/cursor-profile.ts).
   if (backendName === 'cursor') candidate.profile = {
-    namedProfiles: false, systemPrompt: { replace: false, append: false }, instructions: false,
-    tools: false, permissions: false, mcp: false, subagents: false,
+    namedProfiles: false, systemPrompt: { replace: false, append: false }, instructions: true,
+    tools: false, permissions: false, mcp: true, subagents: false,
     resources: { files: false, instructions: false, tools: false, skills: false, agents: false, commands: false },
     hooks: false, modes: false, runtimeUpdate: false, validation: true,
   }
