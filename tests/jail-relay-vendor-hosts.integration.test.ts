@@ -42,9 +42,8 @@ describe.skipIf(!new LinuxBwrapJail().isAvailable())('the jail relay admits each
   }, 60_000)
 
   it('lets Kimi Code sign in and call its API, and keeps its telemetry refused', async () => {
-    const seen = await statuses('kimi-code', ['auth.kimi.com', 'code.kimi.com', 'telemetry-logs.kimi.com'])
-    expect(seen['auth.kimi.com']).not.toBe(403)
-    expect(seen['code.kimi.com']).not.toBe(403)
+    const seen = await statuses('kimi-code', ['auth.kimi.com', 'code.kimi.com', 'api.kimi.com', 'cdn.kimi.com', 'telemetry-logs.kimi.com'])
+    for (const host of ['auth.kimi.com', 'code.kimi.com', 'api.kimi.com', 'cdn.kimi.com']) expect(seen[host], host).not.toBe(403)
     expect(seen['telemetry-logs.kimi.com']).toBe(403)
   }, 60_000)
 })
