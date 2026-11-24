@@ -102,7 +102,8 @@ describe('an OpenClaw turn through the Bridge', () => {
     return { status: response.status, text: body.choices?.[0]?.message.content ?? '', usage: body.usage, error: body.error }
   }
   const calls = async () => (await readFile(join(root, 'bin', 'state', 'calls.jsonl'), 'utf8')).trim().split('\n')
-    .map((line) => JSON.parse(line) as { argv: string[]; configPath: string; config: typeof operator & { mcp: { servers: Record<string, unknown> } }; workspace: string })
+    .map((line) => JSON.parse(line) as { argv: string[]; configPath: string; config: typeof operator & { mcp: { servers: Record<string, unknown> }; gateway?: Record<string, unknown> };
+      workspace: string; gatewayState: string | null; pid: number })
 
   it('runs the embedded agent in the request workspace, continues its session, and reports its usage', async () => {
     const cwd = await workspace('session'), session = `openclaw-${randomBytes(3).toString('hex')}`
@@ -177,7 +178,7 @@ describe('an OpenClaw turn through the Bridge', () => {
     expect(steered.status, JSON.stringify(steered.body)).toBeLessThan(300)
     expect(await runText(running)).toBe('heldsteered: turn left')
 
-    const mine = (await calls()).filter((call) => call.workspace === cwd) as Array<{ argv: string[]; config: Record<string, any>; gatewayState: string; pid: number }>
+    const mine = (await calls()).filter((call) => call.workspace === cwd)
     const gateway = mine.find((call) => call.argv[0] === 'gateway')!
     // The session's own loopback Gateway, with a token, on its own state; the operator's settings stay.
     expect(gateway.config.gateway).toMatchObject({ mode: 'local', bind: 'loopback', auth: { mode: 'token' } })
