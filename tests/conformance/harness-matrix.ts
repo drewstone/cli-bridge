@@ -8,6 +8,11 @@
  * Model per harness: CONFORMANCE_MODEL_<HARNESS> (claude-code -> CONFORMANCE_MODEL_CLAUDE_CODE),
  * else the harness's own default. A harness whose binary or login is missing reads `blocked`.
  * Cells: green | red (cause) | unsupported (the CLI has no such mode) | blocked (no binary or seat).
+ *
+ * CONFORMANCE_SCRIPTED=1 drives the Router's scripted test model instead of a real one: the tool verb
+ * asks `Call the tool *write_nonce with exactly {...}` of the matrix's own MCP server, usage asks
+ * `Report usage <prompt> <completion>` and is checked by equality, and retained reads the Bridge's
+ * own session record (an echo model cannot show memory). The profile prompt is not observable on it.
  */
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -80,6 +85,12 @@ async function runText(bridge: BridgeServer, runId: string): Promise<{ text: str
   return { text, ...(failed ? { failed } : {}) }
 }
 
+const SCRIPTED = process.env.CONFORMANCE_SCRIPTED === '1'
+const USAGE = { prompt: 1234, completion: 56 }
+
+// One MCP tool that writes `<dir>/<nonce>.nonce` and answers with the nonce, so a turn proves both effects.
+const nonceServer = (dir: string) => `const fs=require('node:fs'),path=require('node:path'),rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{let r;try{r=JSON.parse(line)}catch{return}if(r.id===undefined)return;let result={};if(r.method==='initialize')result={protocolVersion:(r.params&&r.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}};else if(r.method==='tools/list')result={tools:[{name:'write_nonce',description:'Writes the nonce file and returns the nonce.',inputSchema:{type:'object',properties:{nonce:{type:'string'}},required:['nonce']}}]};else if(r.method==='tools/call'){const nonce=String((r.params&&r.params.arguments&&r.params.arguments.nonce)||'');fs.writeFileSync(path.join(${JSON.stringify(dir)},nonce+'.nonce'),nonce);result={content:[{type:'text',text:'nonce '+nonce+' written'}]}}process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
+
 const tokenServer = (token: string) => `const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{let r;try{r=JSON.parse(line)}catch{return}if(r.id===undefined)return;const result=r.method==='initialize'?{protocolVersion:(r.params&&r.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}}:r.method==='tools/list'?{tools:[{name:'conformance_token',description:'Returns the conformance token.',inputSchema:{type:'object',properties:{}}}]}:r.method==='tools/call'?{content:[{type:'text',text:${JSON.stringify(token)}}]}:{};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
 
 async function harnessCells(bridge: BridgeServer, harness: string, root: string): Promise<Record<Verb, Cell>> {
@@ -101,7 +112,20 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
   }
 
   let toolTurn: Turn | undefined
+  const nonceProfile = async () => {
+    const server = join(cwd, 'nonce-mcp.cjs')
+    await writeFile(server, nonceServer(cwd))
+    return { name: 'conformance', mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: server }] } } }
+  }
   await guard('tool', async () => {
+    if (SCRIPTED) {
+      const nonce = marker('nonce')
+      toolTurn = await chat(bridge, model, cwd, `Call the tool *write_nonce with exactly ${JSON.stringify({ nonce })}`, { session_id: marker(`${harness}-tool`), agent_profile: await nonceProfile() })
+      if (toolTurn.status !== 200) return red(`HTTP ${toolTurn.status}: ${JSON.stringify(toolTurn.error)}`)
+      const written = await readFile(join(cwd, `${nonce}.nonce`), 'utf8').catch(() => '')
+      if (written !== nonce) return red(`the harness did not call write_nonce (no nonce file); reply: ${toolTurn.text}`)
+      return toolTurn.text.includes(nonce) ? green('called write_nonce and reported its result') : red(`tool ran; reply lacks its result: ${toolTurn.text}`)
+    }
     const value = marker('tool'), file = `${value}.txt`
     toolTurn = await chat(bridge, model, cwd, `Use your file tool to create the file ${file} in the current directory containing exactly ${value}. Then read it back with your file tool and reply with its exact contents only.`, { session_id: marker(`${harness}-tool`) })
     const written = await readFile(join(cwd, file), 'utf8').catch(() => '')
@@ -123,6 +147,18 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
   }
 
   await guard('retained', async () => {
+    if (SCRIPTED && !native) {
+      const session = marker(`${harness}-continue`)
+      for (const word of [marker('first'), marker('second')]) {
+        const turn = await chat(bridge, model, cwd, `Reply with exactly ${word}`, { session_id: session })
+        if (turn.status !== 200 || !turn.text.includes(word)) return red(`turn HTTP ${turn.status}: ${turn.text || JSON.stringify(turn.error)}`)
+      }
+      const listed = await (await call(bridge, `/v1/sessions?session_id=${encodeURIComponent(session)}&backend=${encodeURIComponent(harness)}`)).json() as { data?: Array<Record<string, any>> }
+      const record = listed.data?.[0]
+      return Number(record?.turns) >= 2 && record?.internalId
+        ? green(`one-shot continuation: ${record.turns} turns on one native session`)
+        : red(`the Bridge kept no native session across the two turns: ${JSON.stringify(listed).slice(0, 160)}`)
+    }
     const word = marker('codeword')
     const first = 'Remember this codeword for later: ' + word + '. Reply with OK only.'
     const second = 'What codeword did I give you earlier? Reply with the codeword only.'
@@ -169,6 +205,15 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
   })
 
   await guard('profile+mcp', async () => {
+    if (SCRIPTED) {
+      // The echo model ignores a system prompt, so only the profile's MCP server is observable here.
+      const nonce = marker('profile')
+      const turn = await chat(bridge, model, cwd, `Call the tool *write_nonce with exactly ${JSON.stringify({ nonce })}`, { session_id: marker(`${harness}-profile`), agent_profile: await nonceProfile() })
+      const written = await readFile(join(cwd, `${nonce}.nonce`), 'utf8').catch(() => '')
+      return turn.status === 200 && written === nonce
+        ? green('the profile\'s MCP server reached the harness (prompt text is not observable on the scripted model)')
+        : red(`HTTP ${turn.status}: ${turn.text || JSON.stringify(turn.error)}`)
+    }
     const prompted = marker('PROFILE'), token = marker('TOKEN')
     const server = join(cwd, 'token-mcp.cjs')
     await writeFile(server, tokenServer(token))
@@ -186,6 +231,18 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
   })
 
   await guard('usage+outcome', async () => {
+    if (SCRIPTED) {
+      const word = marker('usage')
+      const turn = await chat(bridge, model, cwd, `Reply with exactly ${word}\nReport usage ${USAGE.prompt} ${USAGE.completion}`, { session_id: marker(`${harness}-usage`) })
+      const usage = (turn.usage ?? {}) as Record<string, unknown>
+      if (turn.status !== 200) return red(`HTTP ${turn.status}: ${JSON.stringify(turn.error)}`)
+      if (usage.prompt_tokens !== USAGE.prompt || usage.completion_tokens !== USAGE.completion) {
+        return red(`usage ${JSON.stringify(usage).slice(0, 120)} is not the scripted ${USAGE.prompt}/${USAGE.completion}`)
+      }
+      const refused = await chat(bridge, `${harness}/conformance-no-such-model`, cwd, 'Reply OK.', { session_id: marker(`${harness}-refused`) })
+      const typed = refused.status >= 400 ? Boolean((refused.error as any)?.type ?? (refused.error as any)?.code) : refused.finish === 'error'
+      return typed ? green(`scripted usage ${USAGE.prompt}/${USAGE.completion} exact; unknown model refused typed`) : red(`unknown model not refused typed: HTTP ${refused.status}`)
+    }
     if (!toolTurn || toolTurn.status !== 200) return red('no completed tool turn to read usage from')
     const usage = toolTurn.usage ?? {}
     const counted = Object.values(usage).some((value) => typeof value === 'number' && value > 0)
