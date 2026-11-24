@@ -6,7 +6,8 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { registerJailReadable } from '../jail/index.js'
 import { ensurePrivateDataDirectory } from '../runtime/single-instance.js'
-import type { Backend, BackendFailureReason, ChatDelta, ChatRequest, BackendHealth, PreparedContextTransfer } from './types.js'
+import type { BackendFailureReason, ChatDelta, ChatRequest, BackendHealth, NativeSession, NativeSessionBackend,
+  NativeSubscriptionInvocation, PreparedContextTransfer } from './types.js'
 import { versionHealth } from './health.js'
 import { BackendError, BRIDGE_RESERVED_FAILURE_CODES, terminalOutcome } from './types.js'
 import { assertModeSupported } from '../modes.js'
@@ -38,10 +39,13 @@ import { assertSuccessfulHarnessExit, readProcessLines, waitForHarnessExit } fro
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { hasCodexEnvAuth, isCodexSubscriptionAuth, prepareCodexJailAuth } from './codex-auth.js'
-import { nativeReasoningControl, workspaceCwdPathForBase, type ContextTransferRequest } from '@tangle-network/agent-interface'
+import { nativeReasoningControl, workspaceCwdPathForBase, type AgentEnvironmentCapabilities, type ContextTransferRequest } from '@tangle-network/agent-interface'
 import { CODEX_NATIVE_IMPORT_VERSION, CodexContextTransfer, validateCodexContextTransfer } from './codex-context-transfer.js'
 import { CODEX_DISABLED_FEATURE_ARGS, assertWorkspacePlanSupported, materializeProfile } from '@tangle-network/agent-profile-materialize'
 import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
+import { CodexNativeSession } from './codex-native-session.js'
+import { hostRequestJail } from '../jail/host-request.js'
+import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
 
 export interface CodexBackendOptions {
   bin: string
@@ -50,10 +54,16 @@ export interface CodexBackendOptions {
   stateDir?: string
   /** Subprocess spawner; defaults to the host executor. */
   spawner?: Spawner
+  /** The Bridge's jail settings; a retained session resolves its jail from them, as the chat route does for a one-shot. */
+  jailEnv?: NodeJS.ProcessEnv
 }
 
-export class CodexBackend implements Backend {
+/** Bound on each app-server request of a retained session. */
+const NATIVE_REQUEST_TIMEOUT_CAP_MS = 30_000
+
+export class CodexBackend implements NativeSessionBackend {
   readonly name = 'codex'
+  readonly nativeModes = ['byob'] as const
   readonly defaultExecutionTimeoutMs: number
   // Codex names the served model only when it differs from the request (ModelReroute).
   readonly modelReroutes = true
@@ -164,6 +174,53 @@ export class CodexBackend implements Backend {
     }
   }
 
+  nativeCapabilities(): AgentEnvironmentCapabilities {
+    const generic = genericCliBridgeCapabilities(this.name)
+    return {
+      ...generic,
+      sessions: { continue: true, list: true, messages: true },
+      nativeContinuation: { atomicBoundary: true, requestIdempotency: true, admissionControl: true },
+      interactions: { kinds: ['permission'], answerFieldTypes: ['select'], responseScopes: ['interaction'],
+        secretAnswers: false, concurrentRequests: false, replay: true, responseIdempotency: true },
+      workspace: { ...generic.workspace, read: true, write: true, exec: true, git: true },
+    }
+  }
+
+  /**
+   * A retained thread on `codex app-server` (codex-native-session.ts), which takes input mid-turn. It starts as a
+   * one-shot turn does: the same jail, profile workspace, per-session CODEX_HOME with the turn's MCP servers, Router
+   * route and subscription admission.
+   */
+  async startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
+    // The chat route resolves a one-shot's jail; a retained session starts here, so it resolves its own.
+    req.jailSpec ??= hostRequestJail(req, this.name, this.opts.jailEnv ?? process.env)
+    const { cwd, spawned, releaseState, invocation } = await this.launch(req, session, signal ?? new AbortController().signal, {
+      head: ['app-server', '--listen', 'stdio://'], stdio: ['pipe', 'pipe', 'pipe'] })
+    const native = new CodexNativeSession(spawned, {
+      capabilities: this.nativeCapabilities(),
+      cwd: cwd ?? process.cwd(),
+      resumeThreadId: session?.internalId || null,
+      requestTimeoutMs: this.opts.timeoutMs > 0 ? Math.min(this.opts.timeoutMs, NATIVE_REQUEST_TIMEOUT_CAP_MS) : NATIVE_REQUEST_TIMEOUT_CAP_MS,
+      cleanup: releaseState,
+    })
+    try {
+      req.subscriptionAdmission?.require()
+      if (spawned.spawnError?.() || !spawned.child.stdin || !spawned.child.stdout)
+        throw new BackendError('codex app-server failed to start with stdin and stdout pipes', 'upstream', spawned.spawnError?.())
+      await native.start(signal)
+    } catch (error) {
+      await native.close().catch(() => {})
+      throw error
+    }
+    return Object.assign(native, {
+      // A later turn reuses this server, so it re-presents the launch that was admitted.
+      async admitSubscription(admission: NonNullable<ChatRequest['subscriptionAdmission']>): Promise<void> {
+        await admitNativeSubscription({ ...req, subscriptionAdmission: admission }, invocation)
+        admission.require()
+      },
+    })
+  }
+
   /** One turn; it continues once in the same native thread when its runner dies (see `chatContinuing`). */
   chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     return chatContinuing(this, req, session, signal)
@@ -176,182 +233,13 @@ export class CodexBackend implements Backend {
     signal: AbortSignal,
     watch: RunnerWatch,
   ): AsyncIterable<ChatDelta> {
-    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
-    // Codex has `--sandbox` flags but we haven't verified end-to-end that
-    // every FS/shell tool is gated under read-only. Reject hosted-safe
-    // until that audit lands — never fake safety.
-    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
-      'codex hosted-safe requires verified --sandbox read-only audit')
-
-    const prompt = this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))
-    // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
-    const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
-    const routerArgs = plainRouterArgs(this.extractModel(req.model))
-
-    // Build argv. `codex exec resume <id> <prompt>` if we have one,
-    // else `codex exec <prompt>`. --json emits JSONL events.
-    const args: string[] = [
-      'exec',
-      '--json',
-      '--skip-git-repo-check',
-      '--dangerously-bypass-approvals-and-sandbox',
-    ]
-    if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
-    if (modelArg) args.push('-c', `model="${modelArg}"`)
-    const reasoningEffort = nativeReasoningControl(
-      'codex',
-      resolveRequestedReasoningEffort(req, session),
-    )
-    if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`)
-
-    if (session?.internalId) {
-      args.splice(1, 0, 'resume', session.internalId)
-      // codex exec resume <id> [prompt]
-    }
-
-    // Session leases own native state; the account turn lease owns auth rotation.
-    // Keep native state across turns, but regenerate MCP config and auth links.
-    const mcpServers = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true })
-    const externalId = req.session_id ?? session?.externalId
-    const nativeHome = this.opts.stateDir && externalId
-      ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))
-      : undefined
-    const legacySession = nativeHome && session?.internalId && !existsSync(nativeHome)
-    if (legacySession && mcpServers) {
-      throw new BackendError(
-        'Codex session has no retained native home; cannot attach MCP without losing its thread. ' +
-        'Continue an existing no-MCP session without MCP, or start a new external session with retained context.',
-        'parse_error',
-      )
-    }
-    const authSourcePath = resolveCodexAuthPath()
-    // Reject unsupported profile plans before copying auth or writing MCP
-    // credentials into a synthetic CODEX_HOME.
-    const provisioned = provisionProfileWorkspace(
-      req,
-      session,
-      'codex',
-      cwd,
-      profileExecutionIdentity(req, session, 'codex', reasoningEffort),
-    )
-    const launchEnv = { ...process.env, ...provisioned.env }
-    if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
-    // codex -c is last-wins: the Router route follows the split and profile flags.
-    args.push(...provisioned.flags, ...routerArgs)
-    if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
-    const nativeConfigFlags = codexConfigFlags(args)
-    args.push('--', prompt)
-    let releaseHostAuth: (() => void) | undefined
-    let codexHome: ReturnType<typeof materializeMcpServersForCodex>
-    let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
-    const releaseState = (): void => {
-      try { codexHome?.cleanup() } finally {
-        try { jailHome?.cleanup() } finally {
-          try { releaseHostAuth?.() } finally { provisioned.cleanup?.() }
-        }
-      }
-    }
-    try {
-      // Only an unconfined file-backed ChatGPT turn can rotate the shared host
-      // credential during inference. Use the effective launch env after profile
-      // materialization; Codex exec prefers env API keys and access tokens.
-      if (!req.jailSpec && !hasCodexEnvAuth(launchEnv) && isCodexSubscriptionAuth(authSourcePath)) {
-        releaseHostAuth = await this.acquireAuthPreparation(signal)
-      }
-      codexHome = materializeMcpServersForCodex(
-        mcpServers,
-        authSourcePath,
-        nativeHome && !legacySession
-          ? ensurePrivateDataDirectory(nativeHome)
-          : undefined,
-      )
-      // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
-      await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
-        cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, executor: this.spawner.executionEnvironment })
-      if (req.jailSpec) {
-        // Only canonical auth preparation can rotate the account. Access-only
-        // jailed turns may run concurrently after their private seeds exist.
-        const releasePreparation = await this.acquireAuthPreparation(signal)
-        try {
-          jailHome = await prepareCodexJailAuth(
-            this.opts.bin,
-            hasCodexEnvAuth(launchEnv) ? undefined : authSourcePath,
-            codexHome ? join(codexHome.homePath, 'config.toml')
-              : authSourcePath ? join(dirname(authSourcePath), 'config.toml') : undefined,
-            req.execution?.timeoutMs ?? this.opts.timeoutMs,
-            signal,
-            req.jailSpec.readConfine === true,
-            Boolean(codexHome),
-          )
-        } finally {
-          releasePreparation()
-        }
-        if (req.jailSpec.readConfine) req.jailSpec.requireEnforcement = true
-        // The standalone install links ~/.local/bin/codex through ~/.codex/packages/standalone/current, a hop the
-        // PATH-derived binds miss (bwrap: execvp ~/.local/bin/codex ENOENT); declare the root as opencode does.
-        registerJailReadable(req.jailSpec, join(homedir(), '.codex', 'packages'))
-        // The jail seed has no refresh capability. File storage must win over
-        // an account config that would otherwise select an unrelated keyring.
-        args.splice(1, 0, '-c', 'cli_auth_credentials_store="file"')
-        nativeConfigFlags.unshift('-c', 'cli_auth_credentials_store="file"')
-      }
-    } catch (error) {
-      releaseState()
-      throw error
-    }
-
-    // Seed only an access-only credential into the writable jail home. The
-    // source account file is never mounted or promoted from agent-writable state.
-    if (req.jailSpec && jailHome) {
-      req.jailSpec.authSources = [
-        ...(req.jailSpec.authSources ?? []).filter((s) => s.envVar !== 'CODEX_HOME'),
-        {
-          source: jailHome.homePath,
-          jailRel: '.codex',
-          mode: 'seed-writable',
-          only: ['auth.json', 'config.toml'],
-          envVar: 'CODEX_HOME',
-        },
-      ]
-    }
-
-    let spawned: Awaited<ReturnType<Spawner>>
-    try {
-      signal.throwIfAborted()
-      const finalEnv = {
-          ...launchEnv,
-          ...(jailHome?.subscription ? {
-            OPENAI_API_KEY: undefined,
-            OPENAI_BASE_URL: undefined,
-            CODEX_ACCESS_TOKEN: undefined,
-            CODEX_API_KEY: undefined,
-          } : {}),
-          ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
-        }
-      await admitNativeSubscription(req, { env: finalEnv, cwd: cwd ?? process.cwd(), model: req.model, args, flags: nativeConfigFlags, executor: this.spawner.executionEnvironment })
-      spawned = await this.spawner(this.opts.bin, args, {
-        nativeStore: 'codex',
-        signal,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd,
-        env: finalEnv,
-        ...(externalId ? { sessionId: externalId } : {}),
-        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
-        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
-        ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
-      })
-      // A custom spawner may settle after cancellation even if it ignores the
-      // signal. Do not read a late child's output or report a normal stop.
-      if (signal.aborted) {
-        const outcome = await terminateSpawned(spawned)
-        spawned.release()
-        throw new BackendError(`Codex launch aborted during spawn; termination ${outcome}`, 'aborted')
-      }
-    } catch (error) {
-      releaseState()
-      throw error
-    }
+    const { cwd, spawned, releaseState } = await this.launch(req, session, signal, {
+      // `codex exec resume <id> <prompt>` if we have one, else `codex exec <prompt>`. --json emits JSONL events.
+      head: ['exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox'],
+      ...(session?.internalId ? { resume: session.internalId } : {}),
+      tail: () => ['--', this.flattenPrompt(resolvePromptMessages(req, session, 'codex'))],
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
     const child = spawned.child
     const releaseSpawner = spawned.release
     const nativeStore = spawned.effectiveNativeStore ? { effective_native_store: spawned.effectiveNativeStore } : {}
@@ -508,6 +396,193 @@ export class CodexBackend implements Backend {
         try { releaseSpawner() } finally { releaseState() }
       }
     }
+  }
+
+  /**
+   * Prepare and spawn one Codex process the way every Codex turn starts: the profile workspace, a per-session
+   * CODEX_HOME holding the turn's MCP servers, the Router route, the jail's access-only auth seed, and
+   * subscription admission on the final inputs. `head` names the subcommand (`exec ...` or `app-server ...`);
+   * `-c` selectors follow it in last-wins order, then `tail`.
+   */
+  private async launch(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+    command: { head: string[]; resume?: string; tail?: () => string[]; stdio: ['ignore' | 'pipe', 'pipe', 'pipe'] },
+  ): Promise<{ cwd: string | undefined; spawned: Awaited<ReturnType<Spawner>>; releaseState: () => void; invocation: NativeSubscriptionInvocation }> {
+    const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
+    // Codex has `--sandbox` flags but we haven't verified end-to-end that
+    // every FS/shell tool is gated under read-only. Reject hosted-safe
+    // until that audit lands — never fake safety.
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
+      'codex hosted-safe requires verified --sandbox read-only audit')
+
+    const tail = command.tail?.() ?? []
+    // Codex config separates provider from model. A repeated codex/ is the harness, never a provider.
+    const { provider: splitProvider, model: modelArg } = splitCodexModel(this.extractModel(req.model))
+    const routerArgs = plainRouterArgs(this.extractModel(req.model))
+
+    const args: string[] = [...command.head]
+    if (splitProvider && splitProvider !== this.name) args.push('-c', `model_provider="${splitProvider}"`)
+    if (modelArg) args.push('-c', `model="${modelArg}"`)
+    const reasoningEffort = nativeReasoningControl(
+      'codex',
+      resolveRequestedReasoningEffort(req, session),
+    )
+    if (reasoningEffort) args.push('-c', `model_reasoning_effort="${reasoningEffort}"`)
+
+    if (command.resume) {
+      args.splice(1, 0, 'resume', command.resume)
+      // codex exec resume <id> [prompt]
+    }
+
+    // Session leases own native state; the account turn lease owns auth rotation.
+    // Keep native state across turns, but regenerate MCP config and auth links.
+    const mcpServers = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true })
+    const externalId = req.session_id ?? session?.externalId
+    const nativeHome = this.opts.stateDir && externalId
+      ? join(this.opts.stateDir, createHash('sha256').update(externalId).digest('hex'))
+      : undefined
+    const legacySession = nativeHome && session?.internalId && !existsSync(nativeHome)
+    if (legacySession && mcpServers) {
+      throw new BackendError(
+        'Codex session has no retained native home; cannot attach MCP without losing its thread. ' +
+        'Continue an existing no-MCP session without MCP, or start a new external session with retained context.',
+        'parse_error',
+      )
+    }
+    const authSourcePath = resolveCodexAuthPath()
+    // Reject unsupported profile plans before copying auth or writing MCP
+    // credentials into a synthetic CODEX_HOME.
+    const provisioned = provisionProfileWorkspace(
+      req,
+      session,
+      'codex',
+      cwd,
+      profileExecutionIdentity(req, session, 'codex', reasoningEffort),
+    )
+    const launchEnv = { ...process.env, ...provisioned.env }
+    if (req.subscriptionAdmission) launchEnv.CODEX_HOME ??= launchEnv.HOME ? join(launchEnv.HOME, '.codex') : undefined
+    // codex -c is last-wins: the Router route follows the split and profile flags.
+    args.push(...provisioned.flags, ...routerArgs)
+    if (provisioned.receipt) args.push(...CODEX_DISABLED_FEATURE_ARGS)
+    const nativeConfigFlags = codexConfigFlags(args)
+    args.push(...tail)
+    let releaseHostAuth: (() => void) | undefined
+    let codexHome: ReturnType<typeof materializeMcpServersForCodex>
+    let jailHome: Awaited<ReturnType<typeof prepareCodexJailAuth>> | undefined
+    const releaseState = (): void => {
+      try { codexHome?.cleanup() } finally {
+        try { jailHome?.cleanup() } finally {
+          try { releaseHostAuth?.() } finally { provisioned.cleanup?.() }
+        }
+      }
+    }
+    try {
+      // Only an unconfined file-backed ChatGPT turn can rotate the shared host
+      // credential during inference. Use the effective launch env after profile
+      // materialization; Codex exec prefers env API keys and access tokens.
+      if (!req.jailSpec && !hasCodexEnvAuth(launchEnv) && isCodexSubscriptionAuth(authSourcePath)) {
+        releaseHostAuth = await this.acquireAuthPreparation(signal)
+      }
+      codexHome = materializeMcpServersForCodex(
+        mcpServers,
+        authSourcePath,
+        nativeHome && !legacySession
+          ? ensurePrivateDataDirectory(nativeHome)
+          : undefined,
+      )
+      // Refuse profile/API route overrides before canonical auth preparation may refresh an approved account.
+      await admitNativeSubscription(req, { env: { ...launchEnv, ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}) },
+        cwd: cwd ?? process.cwd(), model: req.model, flags: nativeConfigFlags, executor: this.spawner.executionEnvironment })
+      if (req.jailSpec) {
+        // Only canonical auth preparation can rotate the account. Access-only
+        // jailed turns may run concurrently after their private seeds exist.
+        const releasePreparation = await this.acquireAuthPreparation(signal)
+        try {
+          jailHome = await prepareCodexJailAuth(
+            this.opts.bin,
+            hasCodexEnvAuth(launchEnv) ? undefined : authSourcePath,
+            codexHome ? join(codexHome.homePath, 'config.toml')
+              : authSourcePath ? join(dirname(authSourcePath), 'config.toml') : undefined,
+            req.execution?.timeoutMs ?? this.opts.timeoutMs,
+            signal,
+            req.jailSpec.readConfine === true,
+            Boolean(codexHome),
+          )
+        } finally {
+          releasePreparation()
+        }
+        if (req.jailSpec.readConfine) req.jailSpec.requireEnforcement = true
+        // The standalone install links ~/.local/bin/codex through ~/.codex/packages/standalone/current, a hop the
+        // PATH-derived binds miss (bwrap: execvp ~/.local/bin/codex ENOENT); declare the root as opencode does.
+        registerJailReadable(req.jailSpec, join(homedir(), '.codex', 'packages'))
+        // The jail seed has no refresh capability. File storage must win over
+        // an account config that would otherwise select an unrelated keyring.
+        args.splice(1, 0, '-c', 'cli_auth_credentials_store="file"')
+        nativeConfigFlags.unshift('-c', 'cli_auth_credentials_store="file"')
+      }
+    } catch (error) {
+      releaseState()
+      throw error
+    }
+
+    // Seed only an access-only credential into the writable jail home. The
+    // source account file is never mounted or promoted from agent-writable state.
+    if (req.jailSpec && jailHome) {
+      req.jailSpec.authSources = [
+        ...(req.jailSpec.authSources ?? []).filter((s) => s.envVar !== 'CODEX_HOME'),
+        {
+          source: jailHome.homePath,
+          jailRel: '.codex',
+          mode: 'seed-writable',
+          only: ['auth.json', 'config.toml'],
+          envVar: 'CODEX_HOME',
+        },
+      ]
+    }
+
+    let spawned: Awaited<ReturnType<Spawner>>
+    let invocation: NativeSubscriptionInvocation
+    try {
+      signal.throwIfAborted()
+      const finalEnv = {
+          ...launchEnv,
+          ...(jailHome?.subscription ? {
+            OPENAI_API_KEY: undefined,
+            OPENAI_BASE_URL: undefined,
+            CODEX_ACCESS_TOKEN: undefined,
+            CODEX_API_KEY: undefined,
+          } : {}),
+          ...(codexHome ? { CODEX_HOME: codexHome.homePath } : {}),
+        }
+      invocation = { env: finalEnv, cwd: cwd ?? process.cwd(), model: req.model, args, flags: nativeConfigFlags,
+        executor: this.spawner.executionEnvironment }
+      await admitNativeSubscription(req, invocation)
+      spawned = await this.spawner(this.opts.bin, args, {
+        nativeStore: 'codex',
+        signal,
+        stdio: command.stdio,
+        cwd,
+        env: finalEnv,
+        ...(externalId ? { sessionId: externalId } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
+        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
+        ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
+      })
+      // A custom spawner may settle after cancellation even if it ignores the
+      // signal. Do not read a late child's output or report a normal stop.
+      if (signal.aborted) {
+        const outcome = await terminateSpawned(spawned)
+        spawned.release()
+        throw new BackendError(`Codex launch aborted during spawn; termination ${outcome}`, 'aborted')
+      }
+    } catch (error) {
+      releaseState()
+      throw error
+    }
+    return { cwd, spawned, releaseState, invocation }
   }
 
   private async acquireAuthPreparation(signal: AbortSignal): Promise<() => void> {
