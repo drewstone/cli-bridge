@@ -111,7 +111,21 @@ const nonceServer = (dir: string) => `const fs=require('node:fs'),path=require('
 
 const tokenServer = (token: string) => `const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{let r;try{r=JSON.parse(line)}catch{return}if(r.id===undefined)return;const result=r.method==='initialize'?{protocolVersion:(r.params&&r.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}}:r.method==='tools/list'?{tools:[{name:'conformance_token',description:'Returns the conformance token.',inputSchema:{type:'object',properties:{}}}]}:r.method==='tools/call'?{content:[{type:'text',text:${JSON.stringify(token)}}]}:{};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
 
-async function harnessCells(bridge: BridgeServer, harness: string, root: string): Promise<Record<Verb, Cell>> {
+/**
+ * Whether the CLI itself offers a mode that keeps a session open for input mid-turn, read from its own
+ * help: a server, ACP, an RPC mode or streamed input. Without one, steer is not supported by the CLI.
+ */
+function retainedModeEvidence(bin: string): { offered: boolean; evidence: string } {
+  const help = spawnSync(bin, ['--help'], { encoding: 'utf8', timeout: 30_000 })
+  const text = `${help.stdout ?? ''}\n${help.stderr ?? ''}`
+  // A subcommand line, with or without the program name in front: `  acp ...` or `  opencode serve ...`.
+  const modes = [/^\s+(?:[\w-]+\s)?(?:acp|serve|app-server|web)\b/mu, /--mode\b[^\n]*\brpc\b/u, /--input-format\b/u]
+  const offered = modes.some((mode) => mode.test(text))
+  const version = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 30_000 }).stdout?.trim().split('\n')[0] ?? ''
+  return { offered, evidence: `\`${bin} --help\` (${version}) lists no server, ACP, RPC or streamed-input mode` }
+}
+
+async function harnessCells(bridge: BridgeServer, harness: string, root: string, bin: string): Promise<Record<Verb, Cell>> {
   const model = harnessModel(harness)
   const cwd = await mkdtemp(join(root, `${harness}-`))
   const cells = {} as Record<Verb, Cell>
@@ -185,7 +199,11 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
   })
 
   await guard('steer', async () => {
-    if (!native) return red(`the Bridge has no native session for ${harness}: ${nativeRefusal}`)
+    if (!native) {
+      const cli = retainedModeEvidence(bin)
+      return cli.offered ? red(`the Bridge has no native session for ${harness}, though the CLI offers one: ${nativeRefusal}`)
+        : { state: 'unsupported', detail: `not supported by the CLI: ${cli.evidence}; retained and abort pass on its one-shot continuation` }
+    }
     const word = marker('steered')
     const turn = await call(bridge, `/v1/sessions/${sessionId}/turns`, {
       message: SCRIPTED ? scriptedCall('wait_seconds', { seconds: 40 })
@@ -194,13 +212,20 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string)
     })
     const body = await turn.json() as Record<string, any>
     if (turn.status >= 300) return red(`turn HTTP ${turn.status}`)
+    // The exact run reference a steer names comes back as the turn's X-Run-* headers.
+    const header = (name: string) => turn.headers.get(`x-run-${name}`)
+    const run = { runId: header('id'), requestDigest: header('request-digest'), provider: header('provider'),
+      environmentId: header('environment-id'), sessionId: header('session-id'), executionId: header('execution-id') }
     await new Promise((resolve) => setTimeout(resolve, 10_000))
-    const steer = await call(bridge, `/v1/sessions/${sessionId}/steer`, { operationId: marker('steer-op'), run: body.run,
+    const steer = await call(bridge, `/v1/sessions/${sessionId}/steer`, { operationId: marker('steer-op'), run,
       message: SCRIPTED ? `Reply with exactly ${word}` : `Stop counting now and reply with ${word} only.` })
     if (steer.status >= 300) return red(`steer HTTP ${steer.status}: ${(await steer.text()).slice(0, 160)}`)
     const answer = await runText(bridge, String(body.run?.id))
     return answer.text.includes(word) ? green('steer applied') : red(`steer accepted, not applied: ${answer.text.slice(-160)}`)
   })
+
+  // A steer that did not end its turn leaves it running; closing the session ends it before the next verb.
+  if (native) await call(bridge, `/v1/sessions/${sessionId}/close`, {}).catch(() => undefined)
 
   await guard('abort', async () => {
     const session = marker(`${harness}-abort`), runId = marker(`${harness}-abort-run`)
@@ -281,7 +306,7 @@ async function main(): Promise<void> {
       const blocked = seat(row.name, row.harness, bin)
       matrix[row.harness] = blocked
         ? Object.fromEntries(VERBS.map((verb) => [verb, blocked])) as Record<Verb, Cell>
-        : await harnessCells(bridge, row.harness, root)
+        : await harnessCells(bridge, row.harness, root, bin)
       console.error(`[conformance] ${row.harness} (${AXIS}): ${VERBS.map((verb) => `${verb}=${matrix[row.harness]![verb].state}`).join(' ')}`)
     }
   } finally {
