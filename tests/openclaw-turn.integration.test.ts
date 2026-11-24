@@ -23,7 +23,7 @@ const config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
 fs.appendFileSync(path.join(state, 'calls.jsonl'), JSON.stringify({ argv, configPath, config, workspace: process.env.OPENCLAW_WORKSPACE_DIR }) + '\n')
 const done = (document, code = 0) => { process.stdout.write(JSON.stringify(document, null, 2) + '\n'); process.exit(code) }
 function callMcp() {
-  const [name, server] = Object.entries(config.mcp.servers)[0]
+  const name = 'conformance', server = config.mcp.servers[name]
   const child = cp.spawn(server.command, server.args || [], { env: { ...process.env, ...server.env }, stdio: ['pipe', 'pipe', 'inherit'] })
   const pending = new Map(); let id = 0
   readline.createInterface({ input: child.stdout }).on('line', (line) => { const reply = JSON.parse(line); pending.get(reply.id)(reply.result) })
