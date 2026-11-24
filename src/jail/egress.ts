@@ -47,16 +47,20 @@ const ROUTER_HOSTS: readonly string[] = ['router.tangle.tools']
  * Router and its proxySecrets hosts under `relay`.
  */
 const ANTHROPIC_HOSTS = ['api.anthropic.com', 'platform.claude.com', 'console.anthropic.com']
-const KIMI_HOSTS = ['auth.kimi.com', 'code.kimi.com']
+const KIMI_HOSTS = ['auth.kimi.com', 'code.kimi.com', 'api.kimi.com', 'cdn.kimi.com']
 const VENDOR_HOSTS: Record<string, readonly string[]> = {
   'claude-code': ANTHROPIC_HOSTS,
   claude: ANTHROPIC_HOSTS,
   codex: ['chatgpt.com', 'auth.openai.com', 'api.openai.com'],
   // api.z.ai serves the GLM Coding Plan (zai-coding-plan); measured 2026-11-23 as the host a GLM turn was refused.
   opencode: ['opencode.ai', 'models.opencode.ai', 'api.z.ai'],
-  // Kimi Code signs in through auth.kimi.com and calls code.kimi.com; its telemetry host stays refused.
+  // Kimi Code signs in through auth.kimi.com and calls code.kimi.com, api.kimi.com and cdn.kimi.com
+  // during a turn (measured 2026-11-24 on Kimi Code 2.7.2); its telemetry host stays refused.
   'kimi-code': KIMI_HOSTS,
   kimi: KIMI_HOSTS,
+  // Cursor Agent calls api2.cursor.sh, then its agent endpoint agentn.global.api5.cursor.sh, for every
+  // turn (measured 2026-11-24, cursor-agent 2026.11.22).
+  cursor: ['api2.cursor.sh', 'agentn.global.api5.cursor.sh'],
 }
 
 export function vendorHostsFor(backendName: string): string[] {

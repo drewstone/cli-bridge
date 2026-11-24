@@ -41,10 +41,16 @@ describe.skipIf(!new LinuxBwrapJail().isAvailable())('the jail relay admits each
     expect(seen['registry.npmjs.org']).toBe(403)
   }, 60_000)
 
+  it('lets a Cursor Agent turn reach api2.cursor.sh', async () => {
+    const seen = await statuses('cursor', ['api2.cursor.sh', 'agentn.global.api5.cursor.sh', 'registry.npmjs.org'])
+    expect(seen['api2.cursor.sh']).not.toBe(403)
+    expect(seen['agentn.global.api5.cursor.sh']).not.toBe(403)
+    expect(seen['registry.npmjs.org']).toBe(403)
+  }, 60_000)
+
   it('lets Kimi Code sign in and call its API, and keeps its telemetry refused', async () => {
-    const seen = await statuses('kimi-code', ['auth.kimi.com', 'code.kimi.com', 'telemetry-logs.kimi.com'])
-    expect(seen['auth.kimi.com']).not.toBe(403)
-    expect(seen['code.kimi.com']).not.toBe(403)
+    const seen = await statuses('kimi-code', ['auth.kimi.com', 'code.kimi.com', 'api.kimi.com', 'cdn.kimi.com', 'telemetry-logs.kimi.com'])
+    for (const host of ['auth.kimi.com', 'code.kimi.com', 'api.kimi.com', 'cdn.kimi.com']) expect(seen[host], host).not.toBe(403)
     expect(seen['telemetry-logs.kimi.com']).toBe(403)
   }, 60_000)
 })

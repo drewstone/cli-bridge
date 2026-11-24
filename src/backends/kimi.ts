@@ -208,7 +208,10 @@ export class KimiBackend implements Backend {
         mcpMaterialized = materializeMcpServersForKimi(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false }), cwd)
       }
 
-      const childEnv = { ...process.env, ...provisioned.env }
+      // Kimi Code loads `<cwd>/.kimi-code/mcp.json` only in a trusted workspace; otherwise it skips the
+      // turn's servers ("this folder is not trusted; skipped ... project-level MCP"). Trust the
+      // workspace exactly when the Bridge mounted the turn's MCP file there.
+      const childEnv = { ...process.env, ...provisioned.env, ...(mcpMaterialized ? { KIMI_CODE_TRUST_WORKSPACE: '1' } : {}) }
       await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
         cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
       const startedAt = Date.now()

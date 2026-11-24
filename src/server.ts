@@ -54,6 +54,7 @@ import { reapStalePrivateTemporaryRoots } from './runtime/private-temporary.js'
 import { bindIncomingRequest } from './http/request-source.js'
 import type { BridgeServer, StartServerOptions } from './server-options.js'
 import { mountHubMcp } from './hub-mcp.js'
+import { mountCallerTools, type CallerTools } from './caller-tools.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -82,7 +83,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   runs: RunRegistry
   catalog: ProfileCatalog
   extras: BuildAppExtras
-  hostServices: ReturnType<typeof createHostServiceBindings>
+  hostServices: ReturnType<typeof createHostServiceBindings>; callerTools: CallerTools
 }> {
   // The host policy and its enforcement share an immutable startup snapshot.
   config = { ...config }
@@ -206,7 +207,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   await continueInterruptedRuns({ store: sessions, runs, registry, durableWriter, jailEnv })
 
   const app = new Hono()
-  const hub = hubOptions ? mountHubMcp(app, hubOptions, hostServices) : undefined
+  const hub = hubOptions ? mountHubMcp(app, hubOptions, hostServices) : undefined, callerTools = mountCallerTools(app)
   if (hub) extras.shutdownHooks.push(async () => hub.close())
 
   // Bearer guard — only active when BRIDGE_BEARER is set.
@@ -230,7 +231,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   mountRuns(app, { runs, retainedRuns: retained, retainedStore: sessions })
   mountProfiles(app, { catalog })
   mountChatCompletions(app, {
-    registry,
+    registry, callerTools,
     onRunRedaction: (binding, values, request) => {
       const backend = registry.resolve(request.model)?.name
       const local = backend !== undefined && anyBackendSpawnsOnHost([backend]) && request.execution?.kind !== 'sandbox'
@@ -307,16 +308,16 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     admitSubscription: async (request, backend, signal) => {
       await nativeCatalog.admit(request, backend, signal)
       const releaseHub = await hub?.prepare(request, signal, backend)
-      let releasePrivate: (() => void) | undefined, releaseServices: (() => void) | undefined
+      let releasePrivate: (() => void) | undefined, releaseServices: (() => void) | undefined, releaseCaller: (() => void) | undefined
       try {
-        releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
+        releaseCaller = await hostServices.prepareCallerTools(request, backend); releasePrivate = await preparePrivateMcp(request, mcpSecrets, backend, signal)
         releaseServices = await hostServices.prepareCoordination(request, backend)
         const releaseEndpoints = await hostServices.preparePrivateEndpoints(request, backend)
         return () => {
           try { releaseRunRedaction(request) } finally { try { releaseEndpoints() } finally {
-            try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } } } }
+            try { releaseServices?.() } finally { try { releasePrivate?.() } finally { try { releaseHub?.() } finally { releaseCaller?.() } } } } }
         }
-      } catch (error) { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { releaseHub?.() } }; throw error }
+      } catch (error) { try { releaseServices?.() } finally { try { releasePrivate?.() } finally { try { releaseHub?.() } finally { releaseCaller?.() } } }; throw error }
     },
     trace: new TraceEmitter({
       sink: config.trace.enabled ? new JsonlSpanSink(config.trace) : nullSpanSink,
@@ -378,7 +379,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     ],
   }))
 
-  return { app, sessions, registry, runs, catalog, extras, hostServices }
+  return { app, sessions, registry, runs, catalog, extras, hostServices, callerTools }
   } catch (error) {
     try { await disposeApp({ sessions, extras }) } catch (cleanup) {
       throw new UnconfirmedBridgeCleanup([error, cleanup], 'CLI Bridge startup failed and cleanup was not confirmed')
@@ -508,6 +509,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Bri
   const host = address.address.includes(':') ? `[${address.address}]` : address.address
   const url = `http://${host}:${address.port}`
   built.hostServices.bindListener(url)
+  built.callerTools.bindListener(url)
   if (options.handleSignals !== false) {
     process.once('exit', release)
     process.on('SIGTERM', shutdown)

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -73,6 +73,45 @@ setInterval(() => {}, 1000);
   else assert.equal(result.value.find((seat) => seat.harness === 'claude-code').status, 'unknown')
   const owned = await pids(pidFile)
   await until(() => owned.every((pid) => !exists(pid)), 'a readonly probe PID survived inventory settlement')
+})
+
+test('an enrolled Cursor token is a subscription seat only while its plan reading shows room', async (context) => {
+  const root = await mkdtemp(join(tmpdir(), 'bridge-seat-cursor-'))
+  context.after(() => rm(root, { recursive: true, force: true }))
+  const bin = join(root, 'cursor-agent')
+  // Cursor's own status for the token it is handed; it names no plan, so the plan reading decides.
+  await writeFile(bin, `#!${process.execPath}
+if (process.argv.includes('--version')) { console.log('2026.11.22-fixture'); process.exit(0) }
+console.log(JSON.stringify({ status: 'authenticated', isAuthenticated: !!process.env.CURSOR_API_KEY }))
+`, { mode: 0o755 })
+  const token = 'cursor-service-token-fixture'
+  const tokenFile = join(root, 'CURSOR_SERVICE_TOKEN')
+  await writeFile(tokenFile, `${token}\n`, { mode: 0o600 })
+  const readingFile = join(root, 'usage-cursor.json')
+  const reading = (used, extra = {}) => writeFile(readingFile, JSON.stringify({ ok: true, plan: 'Ultra', windows: [{ label: '7d auto', used }], ...extra }))
+  const seat = async (env = {}) => (await detectLocalSeats({
+    config: loadConfig({ BRIDGE_BACKENDS: 'cursor', CURSOR_BIN: bin }), harnesses: ['cursor'],
+    env: { PATH: process.env.PATH, HOME: root, CURSOR_API_KEY_FILE: tokenFile, ...env },
+  }))[0]
+  const planned = { CURSOR_PLAN_READING_FILE: readingFile }
+
+  const unread = await seat()
+  assert.equal(unread.status, 'configured', 'with no reading the token stays an API key')
+  assert.equal(unread.authMode, 'api_key')
+  await reading(0.44)
+  const room = await seat(planned)
+  assert.equal(room.status, 'authenticated')
+  assert.equal(room.authMode, 'subscription')
+  assert.equal(room.credential, 'plan_key')
+  assert.ok(!JSON.stringify(room).includes(token))
+  await reading(0.95)
+  assert.equal((await seat(planned)).authMode, 'api_key', 'a window past 90% may not cover the turn')
+  await reading(0.44, { ok: false })
+  assert.equal((await seat(planned)).authMode, 'api_key', 'a failed reading vouches for nothing')
+  await reading(0.44)
+  const stale = new Date(Date.now() - 2 * 60 * 60_000)
+  await utimes(readingFile, stale, stale)
+  assert.equal((await seat(planned)).authMode, 'api_key', 'a stale reading vouches for nothing')
 })
 
 test('Gemini native files respect explicit auth mode and keep credentials out of facts', async (context) => {
