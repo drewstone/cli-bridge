@@ -392,6 +392,8 @@ export class CodexBackend implements Backend {
       let sawTerminal = false
       let usage: ChatDelta['usage']
       const servedModels = new Set<string>()
+      const publicCalls = new Map<string, number>()
+      let nextCall = 1
 
       for await (const event of readProcessLines({ child, stdout: child.stdout })) {
         if (event.kind !== 'line') continue
@@ -409,6 +411,11 @@ export class CodexBackend implements Backend {
           continue
         }
 
+        if (type === 'turn.started') {
+          yield { activity: { type: 'turn.started' } }
+          continue
+        }
+
         if (type === 'error') {
           sawError = codexFailureReason(ev)
           continue
@@ -423,6 +430,19 @@ export class CodexBackend implements Backend {
         }
 
         const item = asRecord(ev.item)
+        const tool = item?.type
+        if ((type === 'item.started' || type === 'item.completed')
+          && (tool === 'command_execution' || tool === 'web_search' || tool === 'file_change' || tool === 'mcp_tool_call')) {
+          const id = typeof item?.id === 'string' && item.id ? item.id : undefined
+          const call = id ? publicCalls.get(id) ?? nextCall++ : undefined
+          if (id && call !== undefined) {
+            if (type === 'item.started') publicCalls.set(id, call)
+            else publicCalls.delete(id)
+          }
+          const failed = item?.status === 'failed' || (typeof item?.exit_code === 'number' && item.exit_code !== 0)
+          const activityType = type === 'item.started' ? 'tool.started' : failed ? 'tool.failed' : 'tool.completed'
+          yield { activity: { type: activityType, tool, ...(call === undefined ? {} : { call }) } }
+        }
         const toolCall = type === 'item.started' || type === 'item.completed' ? extractToolCall(item) : null
         if (toolCall) {
           // Announce a tool when it starts and answer it when it ends, so the
