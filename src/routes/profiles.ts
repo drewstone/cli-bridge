@@ -6,6 +6,7 @@
  * can set only a base URL, such as a publisher's benchmark runner, reaches a profile through `<bridge>/profiles/<id>/v1`.
  */
 
+import type { AgentProfile } from '@tangle-network/agent-interface'
 import { Hono } from 'hono'
 import type { ProfileCatalog } from '../profiles/loader.js'
 
@@ -41,7 +42,9 @@ export function mountProfiles(app: Hono, deps: { catalog: ProfileCatalog }): voi
   // The request runs exactly as /v1/chat/completions with `agent_profile` set to the catalog entry, on the harness its
   // `model` names, so admission, jail, caller tools and receipts are the chat route's own. An id the catalog lacks rereads
   // the directory once, so a profile written after start needs no restart; a changed profile needs a new id. A body that
-  // already carries a profile is refused rather than merged.
+  // already carries a profile is refused rather than merged. The chat route refuses system-role messages beside a profile,
+  // and a runner cannot stop sending its own, so they move into the profile as `prompt.appendSystemPrompt`: the same
+  // privileged position, after the profile's prompt.
   app.post('/profiles/:id/v1/chat/completions', async (c) => {
     const id = c.req.param('id')
     let profile = deps.catalog.get(id)
@@ -57,10 +60,25 @@ export function mountProfiles(app: Hono, deps: { catalog: ProfileCatalog }): voi
     if ('agent_profile' in body) {
       return c.json({ error: { message: `/profiles/${id}/v1 applies the cataloged profile ${id}; a body agent_profile goes to /v1/chat/completions`, type: 'invalid_request_error' } }, 400)
     }
+    const messages: unknown[] = Array.isArray((body as { messages?: unknown }).messages) ? (body as { messages: unknown[] }).messages : []
+    const isSystem = (message: unknown) => (message as { role?: unknown } | null)?.role === 'system'
+    const system = messages.filter(isSystem).map((message) => textOf((message as { content?: unknown }).content))
+    if (system.includes(null)) return c.json({ error: { message: 'a system message must be text to join the profile prompt', type: 'invalid_request_error' } }, 400)
+    const applied: AgentProfile = system.length === 0 ? profile : { ...profile, prompt: { ...profile.prompt,
+      appendSystemPrompt: [profile.prompt?.appendSystemPrompt, ...system].filter((part) => typeof part === 'string' && part.length > 0).join('\n\n') } }
     const url = new URL(c.req.url)
     url.pathname = '/v1/chat/completions'
     const headers = new Headers(c.req.raw.headers)
     headers.delete('content-length')
-    return app.fetch(new Request(url, { method: 'POST', headers, body: JSON.stringify({ ...body, agent_profile: profile }), signal: c.req.raw.signal }), c.env)
+    const forwarded = { ...body, ...(system.length ? { messages: messages.filter((message) => !isSystem(message)) } : {}), agent_profile: applied }
+    return app.fetch(new Request(url, { method: 'POST', headers, body: JSON.stringify(forwarded), signal: c.req.raw.signal }), c.env)
   })
+}
+
+/** A message's text: a string, or text parts only; null for anything else. */
+function textOf(content: unknown): string | null {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return null
+  const parts = content.map((part) => (part as { type?: unknown; text?: unknown } | null)?.type === 'text' ? (part as { text?: unknown }).text : null)
+  return parts.every((part): part is string => typeof part === 'string') ? parts.join('') : null
 }
