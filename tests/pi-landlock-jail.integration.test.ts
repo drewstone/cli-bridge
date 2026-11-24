@@ -5,8 +5,8 @@
  * each of them (the unconfined control); Pi's Bash reaches none, and the turn still completes through the run's
  * scoped loopback transport, which alone holds the upstream key.
  *
- * A second turn's first Pi process dies on a cut model connection before it answers; the Bridge's retry runs a
- * fresh Pi under the same jail with its own transport directory.
+ * The Bridge runs Pi through a pass-through wrapper that, in a workspace holding `.fail-first-pi`, exits once before
+ * Pi starts: the Bridge's retry then runs a fresh Pi under the same jail with its own transport directory.
  *
  * Needs Linux with Landlock and python3, and a real Pi: PI_BIN, else `pi` on PATH (a gate installs
  * @earendil-works/pi-coding-agent). CLI_BRIDGE_REQUIRE_LANDLOCK=1 makes a missing prerequisite a failure.
@@ -40,15 +40,11 @@ const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
 // read-only. A Nix or global install already lies under a granted toolchain path.
 const piInstall = piBin ? /^(.*?\/node_modules)\//u.exec(realpathSync(piBin))?.[1] : undefined
 
-/**
- * An OpenAI-compatible model: a call without a tool result asks Pi's bash tool to run `probe`, a call carrying one
- * replies `landlock-pi-ok`. `cut()` true drops that call's connection instead.
- */
-function syntheticModel(probe: () => string, cut: () => boolean, bodies: string[], authorizations: string[]): Server {
+/** An OpenAI-compatible model: a call without a tool result asks Pi's bash tool to run `probe`; one carrying it replies. */
+function syntheticModel(probe: () => string, bodies: string[], authorizations: string[]): Server {
   return createServer(async (req, res) => {
     let body = ''
     for await (const chunk of req) body += chunk
-    if (cut()) { req.socket.destroy(); return }
     bodies.push(body)
     authorizations.push(req.headers.authorization ?? '')
     res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -79,7 +75,7 @@ describe.skipIf(!enabled)(`Pi under the Landlock fs-jail (ABI ${landlock.stdout.
   const bodies: string[] = [], authorizations: string[] = []
   let base: string, model: Server, bridge: BridgeServer
   let targets: Record<string, string>
-  let probe = '', cuts = 0
+  let probe = ''
 
   beforeAll(async () => {
     base = await realpath(await mkdtemp(join(tmpdir(), 'pi-landlock-')))
@@ -97,8 +93,11 @@ describe.skipIf(!enabled)(`Pi under the Landlock fs-jail (ABI ${landlock.stdout.
     // An unusable bubblewrap: the backend in force is the Landlock one the operator selected.
     await writeFile(join(tools, 'bwrap'), '#!/bin/sh\nexit 1\n', { mode: 0o700 })
     process.env.PATH = `${tools}${delimiter}${saved.PATH}`
+    // Pi's turns run in the jail through this wrapper; the Bridge's own Pi calls (auth, version) pass straight through.
+    const wrapper = join(tools, 'pi')
+    await writeFile(wrapper, `#!/bin/sh\nif [ -e .fail-first-pi ]; then rm -f .fail-first-pi; echo injected-first-attempt-exit >&2; exit 1; fi\nexec ${quote(realpathSync(piBin!))} "$@"\n`, { mode: 0o700 })
 
-    model = syntheticModel(() => probe, () => cuts > 0 && cuts-- > 0, bodies, authorizations)
+    model = syntheticModel(() => probe, bodies, authorizations)
     model.listen(0, '127.0.0.1')
     await once(model, 'listening')
     const port = (model.address() as { port: number }).port
@@ -114,7 +113,7 @@ describe.skipIf(!enabled)(`Pi under the Landlock fs-jail (ABI ${landlock.stdout.
 
     bridge = await startServer({
       config: { ...loadConfig({ ...process.env, BRIDGE_HOST: '127.0.0.1', BRIDGE_BEARER: BEARER, BRIDGE_TRACE: 'off',
-        BRIDGE_DATA_DIR: join(base, 'state'), BRIDGE_BACKENDS: 'pi', PI_BIN: piBin!, BRIDGE_JAIL_MODE: 'fs-jail',
+        BRIDGE_DATA_DIR: join(base, 'state'), BRIDGE_BACKENDS: 'pi', PI_BIN: join(base, 'tools', 'pi'), BRIDGE_JAIL_MODE: 'fs-jail',
         BRIDGE_JAIL_BACKEND: 'landlock', BRIDGE_JAIL_HOST_EGRESS_ENFORCED: '1', ...(piInstall ? { BRIDGE_JAIL_RO_PATHS: piInstall } : {}) }), port: 0 },
       cwd: base, quiet: true, handleSignals: false,
     })
@@ -167,8 +166,8 @@ describe.skipIf(!enabled)(`Pi under the Landlock fs-jail (ABI ${landlock.stdout.
   it('retries a turn whose first Pi process died before answering, under the same jail', async () => {
     const before = bodies.length
     probe = 'echo retried-under-landlock'
-    cuts = 1
     const cwd = await mkdtemp(join(base, 'retry-'))
+    await writeFile(join(cwd, '.fail-first-pi'), '')
     const response = await fetch(`${bridge.url}/v1/chat/completions`, {
       method: 'POST', headers: { authorization: `Bearer ${BEARER}`, 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'pi/synthetic/probe-model', cwd, stream: false,
@@ -177,7 +176,8 @@ describe.skipIf(!enabled)(`Pi under the Landlock fs-jail (ABI ${landlock.stdout.
     })
     const body = await response.json() as Record<string, any>
     expect(response.status, JSON.stringify(body)).toBe(200)
-    expect(cuts).toBe(0)
+    // The first attempt ran in the jail and exited; the retry's grants name only its own transport directory.
+    await expect(readFile(join(cwd, '.fail-first-pi'))).rejects.toThrow(/ENOENT/u)
     expect(body.choices?.[0]?.message?.content).toContain('landlock-pi-ok')
     // The retried Pi answered both calls itself, its tool running in the jail.
     expect(bodies.slice(before)).toHaveLength(2)
