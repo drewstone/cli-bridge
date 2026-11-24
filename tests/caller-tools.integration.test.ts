@@ -62,8 +62,9 @@ it('a harness turn calls the caller\'s tool: the Bridge answers tool_calls, then
     expect(asked.choices[0]!.message.content).toContain('before the tool')
     expect(firstText).not.toContain('/caller-tools/')
 
+    // The assistant message as an SDK's model_dump(exclude_none=True) sends it (Harvey LAB's adapters): no `content` key.
     const second = await post({ model: 'claude-code/test', tools, messages: [user,
-      { role: 'assistant', content: asked.choices[0]!.message.content, tool_calls: [call] },
+      { role: 'assistant', tool_calls: [call] },
       { role: 'tool', tool_call_id: call.id, content: 'stored 42' }] })
     const secondText = await second.text()
     expect(second.status, secondText).toBe(200)

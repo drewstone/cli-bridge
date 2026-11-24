@@ -125,10 +125,9 @@ const chatRequestSchema = z.object({
   model: z.string().min(1),
   messages: z.array(z.object({
     role: z.enum(['system', 'user', 'assistant', 'tool']),
-    // Per OpenAI Chat Completions: `content` is nullable when
-    // `tool_calls` is present on an assistant message. Accepting null
-    // here is the difference between "agent loops work" and "every
-    // assistant tool-call round trips back as invalid chat request".
+    // Per OpenAI Chat Completions: `content` is nullable, or absent, when `tool_calls` is present on an assistant message
+    // (an SDK `model_dump(exclude_none=True)` drops it: Harvey LAB's adapters). Absent reads as null. Accepting both
+    // is the difference between "agent loops work" and "every assistant tool-call round trips back as invalid chat request".
     content: z.union([
       z.string(),
       z.null(),
@@ -156,7 +155,7 @@ const chatRequestSchema = z.object({
           path: z.string().optional(),
         }).passthrough(),
       ])),
-    ]),
+    ]).default(null),
     // Assistant messages from the model carry `tool_calls` so the
     // server-side history retains the decision the model made. Without
     // this field declared, Zod's default strip-mode silently drops it
