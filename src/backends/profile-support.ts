@@ -35,7 +35,7 @@ import {
   type WorkspacePlanConfigValue,
   type WorkspacePlanReceipt,
 } from '@tangle-network/agent-profile-materialize'
-import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES, sanitizeHostEnv } from '../executors/host.js'
+import { exceedsHostEnvValueLimit, MAX_ENV_VALUE_BYTES, sanitizeHostEnv, spawnPassthroughKeys } from '../executors/host.js'
 
 export interface ProfileExecutionIdentity {
   provider: string | null
@@ -86,7 +86,8 @@ function requirePublicPlanEnv(
 /** Enforce subscription policy on final native inputs, then seal the values passed to the existing spawner. */
 export async function admitNativeSubscription(req: ChatRequest, invocation: NativeSubscriptionInvocation): Promise<void> {
   if (!req.subscriptionAdmission) return
-  await req.subscriptionAdmission.check({ ...invocation, env: sanitizeHostEnv(invocation.env, invocation.cwd, invocation.envPassthroughKeys) ?? invocation.env })
+  // Readiness probes run on the host itself, unconfined, so they reach the network the way the host does.
+  await req.subscriptionAdmission.check({ ...invocation, env: sanitizeHostEnv(invocation.env, invocation.cwd, spawnPassthroughKeys(invocation, {})) ?? invocation.env })
   Object.freeze(invocation.env)
   if (invocation.args) Object.freeze(invocation.args)
 }

@@ -244,7 +244,7 @@ export const hostSpawner: Spawner = async (bin, args, opts) => {
     const jailed = await applyJail(bin, args, opts)
     jailCleanup = jailed.cleanup
     opts.signal?.throwIfAborted()
-    const env = withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, opts.envPassthroughKeys), opts.lineageEnv)
+    const env = withLineageEnv(sanitizeHostEnv(jailed.env, opts.cwd, spawnPassthroughKeys(opts, jailed)), opts.lineageEnv)
     const nativeStore = effectiveNativeStore(opts, jailed, env)
     // detached: true → child is the leader of a new process group whose
     // pgid equals its pid. kill(-pid, sig) reaches every descendant. We
@@ -297,6 +297,23 @@ export function hostExecutorSnapshot(): HostExecutorSnapshot {
  */
 export function resolveHostAcquireDeadlineMs(requestedDeadlineMs?: number): number {
   return hostSemaphore.resolveDeadline(requestedDeadlineMs)
+}
+
+/**
+ * How the operator's host reaches the network: its proxy and the certificate authorities it trusts.
+ * A host behind a TLS-inspecting egress (a Tangle sandbox, a corporate proxy) needs both, or every
+ * harness it starts fails its first provider call (`SELF_SIGNED_CERT_IN_CHAIN`). An unconfined child
+ * reaches the network the way its host does; a jailed child gets only its jail's egress settings.
+ * `NODE_TLS_REJECT_UNAUTHORIZED` is not here: turning verification off is never inherited.
+ */
+export const OPERATOR_TRANSPORT_ENV_KEYS = [
+  'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'all_proxy',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+] as const
+
+/** The exact names a spawn carries past the host allowlist: the backend's own, plus the host transport when unconfined. */
+export function spawnPassthroughKeys(opts: Pick<SpawnOpts, 'envPassthroughKeys'>, command: { confined?: true }): readonly string[] {
+  return command.confined ? opts.envPassthroughKeys ?? [] : [...(opts.envPassthroughKeys ?? []), ...OPERATOR_TRANSPORT_ENV_KEYS]
 }
 
 export function sanitizeHostEnv(
