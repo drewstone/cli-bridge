@@ -34,6 +34,11 @@ import { resolveAgentProfile } from './profile-support.js'
  *    rendered prompt in the session's `profile.bind` before any turn. Its body
  *    keeps Kimi's own prompt through `${base_prompt}` for an addition.
  *
+ * cursor-agent 2026.11.22 has none on either intent for a customer seat: its one
+ * replacement flag, the hidden `--system-prompt <file>`, is described by the CLI
+ * as "Anysphere/OpenAI team only", and its project rules are the instructions
+ * surface (backends/cursor-profile.ts), not the system prompt.
+ *
  * Everything else is `null` on both intents, INCLUDING the backends whose
  * prompt path is a `role: 'system'` message. That message is flattened into
  * the user turn before the CLI ever sees it, so it is not a system-prompt

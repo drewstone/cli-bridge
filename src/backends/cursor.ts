@@ -8,7 +8,8 @@ import { resolveSpawnerCwd, type Spawner } from '../executors/types.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { versionHealth } from './health.js'
 import { flattenMessages } from './content.js'
-import { resolveMcpServers } from './profile-mcp.js'
+import { planCursorProfile } from './cursor-profile.js'
+import { resolvePromptMessages } from './profile-prompt.js'
 import { admitNativeSubscription } from './profile-support.js'
 import { assertSuccessfulHarnessExit, readProcessLines } from './process-lines.js'
 import { writeStdinPayload } from './stdin-payload.js'
@@ -34,28 +35,37 @@ export class CursorBackend implements Backend {
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'])
-    if (req.agent_profile || session?.metadata.agent_profile || resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: false })
-      || req.env && Object.keys(req.env).length > 0 || req.effort || req.temperature !== undefined || req.max_tokens !== undefined || req.messages.some((message) => typeof message.content !== 'string' && message.content !== null)) {
-      throw new BackendError('Cursor CLI supports text turns and native resume; exact profiles, public env, MCP, reasoning overrides and attachments are not configured', 'capability_denied')
+    if (req.env && Object.keys(req.env).length > 0 || req.effort || req.temperature !== undefined || req.max_tokens !== undefined || req.messages.some((message) => typeof message.content !== 'string' && message.content !== null)) {
+      throw new BackendError('Cursor CLI supports text turns, native resume, AgentProfile instructions and MCP; public env, reasoning and sampling overrides and attachments are not configured', 'capability_denied')
     }
+    // The profile and its MCP are refused or planned before admission; nothing is written until the spawn.
+    const profile = planCursorProfile(req, session)
+    const prompt = flattenMessages(resolvePromptMessages(req, session, this.name))
     signal.throwIfAborted()
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
     // Both cwd and --workspace name this invocation's workspace. --trust is explicit and scoped to that workspace.
-    const args = ['-p', '--output-format', 'stream-json', '--trust', '--workspace', cwd]
+    const args = ['-p', '--output-format', 'stream-json', '--trust', '--workspace', cwd, ...profile.flags]
     const model = req.model.slice('cursor/'.length)
     if (req.model !== 'cursor' && model && model !== 'default') args.push('--model', model)
     if (session?.internalId) args.push('--resume', session.internalId)
     const env = await cursorEnvironment(process.env)
     if (!env.CURSOR_API_KEY) throw new BackendError('Cursor requires CURSOR_API_KEY or an owner-only CURSOR_API_KEY_FILE', 'not_configured')
     await admitNativeSubscription(req, { env, args, flags: [], cwd, model: req.model, executor: this.spawner.executionEnvironment })
-    const spawned = await this.spawner(this.opts.bin, args, {
-      cwd, env, signal, stdio: ['pipe', 'pipe', 'pipe'],
-      ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
-      ...(req.session_id ? { sessionId: req.session_id } : {}),
-      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-      ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
-      ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
-    })
+    const restoreWorkspace = profile.mount(cwd)
+    let spawned: Awaited<ReturnType<Spawner>>
+    try {
+      spawned = await this.spawner(this.opts.bin, args, {
+        cwd, env, signal, stdio: ['pipe', 'pipe', 'pipe'],
+        ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
+        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
+      })
+    } catch (error) {
+      restoreWorkspace()
+      throw error
+    }
     const onAbort = (): void => { void terminateSpawned(spawned) }
     signal.addEventListener('abort', onAbort, { once: true })
     if (signal.aborted) onAbort()
@@ -63,7 +73,6 @@ export class CursorBackend implements Backend {
     spawned.child.stderr?.on('data', (bytes) => stderr.append(bytes))
     try {
       if (!spawned.child.stdout || !spawned.child.stdin) throw new BackendError('Cursor CLI pipes unavailable', 'upstream')
-      const prompt = flattenMessages(req.messages)
       const written = await writeStdinPayload(spawned.child.stdin, [{ role: 'user', content: wantsJsonObject(req) ? `${JSON_MODE_DIRECTIVE}\n\n${prompt}` : prompt }], { format: 'raw' })
       if (!written.ok) throw new BackendError('Cursor stdin write failed', 'upstream')
       let terminal: Record<string, unknown> | undefined
@@ -115,6 +124,7 @@ export class CursorBackend implements Backend {
     } finally {
       signal.removeEventListener('abort', onAbort)
       await terminateSpawned(spawned)
+      restoreWorkspace()
       spawned.release()
     }
   }
