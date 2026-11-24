@@ -1,7 +1,8 @@
 /**
  * Retained Kimi Code sessions through the real Bridge listener and the real Kimi Code CLI (`kimi web`, carried over
- * stdio by kimi-kap-stdio.mjs). Only the model is synthetic: Kimi's own config points its key-only provider at a
- * local OpenAI-compatible endpoint that answers the instruction in the last user message:
+ * stdio by kimi-kap-stdio.mjs), and the provider usage of a one-shot `kimi --prompt` turn. Only the model is synthetic:
+ * Kimi's own config points its key-only provider at a local OpenAI-compatible endpoint that reports 100 prompt and
+ * 7 completion tokens per call and answers the instruction in the last user message:
  * - `Reply with exactly <word>`; `Repeat your previous answer.` (only the session's history can answer it);
  * - `RUN_SLEEP:<n>`: one Bash call running `sleep <n>`, which keeps the turn running for a steer or a cancel;
  * - `CALL_TOOL <name> <json>`: one call to that tool, then a reply carrying its result.
@@ -232,6 +233,18 @@ describe.skipIf(!kimi)(`retained Kimi Code sessions on Kimi's local server (${ki
     expect(seen?.system).toContain('Your codeword is PROFILE-5.')
     expect(seen?.tools).toContain('mcp__conformance__write_nonce')
   }, 180_000)
+
+  it('reports a one-shot turn\'s provider usage from Kimi\'s own session record', async () => {
+    const cwd = await mkdtemp(join(root, 'usage-'))
+    const response = await call('/v1/chat/completions', { model: MODEL, cwd, stream: false,
+      messages: [{ role: 'user', content: 'Reply with exactly USAGE-3' }] })
+    const body = await response.json() as Record<string, any>
+    expect(response.status, JSON.stringify(body)).toBe(200)
+    expect(body.choices?.[0]?.message?.content).toBe('USAGE-3')
+    // Kimi's print stream carries no usage; the one model call's receipt comes from its session wire, not an estimate.
+    expect(body.usage).toMatchObject({ prompt_tokens: 100, completion_tokens: 7 })
+    expect(body.usage.estimated).not.toBe(true)
+  }, 120_000)
 
   it('refuses a retained session whose Kimi provider is not a subscription before Kimi takes a turn', async () => {
     const before = requests.length
