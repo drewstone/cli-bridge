@@ -288,6 +288,7 @@ export class KimiBackend implements NativeSessionBackend {
       })
 
       let sawError: string | null = null
+      let streamedUsage = false
 
       const progressIntervalMs = Math.max(10, Number(process.env.KIMI_PROGRESS_MS ?? 30_000))
 
@@ -402,7 +403,7 @@ export class KimiBackend implements NativeSessionBackend {
         }
 
         const usage = ev.usage as ChatDelta['usage']
-        if (usage) yield { usage }
+        if (usage) { streamedUsage = true; yield { usage } }
 
       }
 
@@ -424,6 +425,9 @@ export class KimiBackend implements NativeSessionBackend {
       if (!emittedContent && !emittedToolCall) {
         throw new BackendError(`kimi produced no stream output: ${stderr.render(300)}`, 'upstream')
       }
+      // Print mode streams no usage; the turn's own wire records each model call's provider usage.
+      const recorded = streamedUsage ? undefined : await nativeSession?.usage(prompt)
+      if (recorded) yield { usage: recorded }
       yield { finish_reason: emittedToolCall ? 'tool_calls' : 'stop', internal_session_id: internalSessionId }
     } finally {
       nativeSession?.close()

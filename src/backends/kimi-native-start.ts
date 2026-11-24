@@ -62,7 +62,8 @@ export async function startKimiNativeSession(
     registerJailReadable(req.jailSpec, KAP_STDIO_SHIM, ...(req.jailSpec ? toolchainReadPaths(options.bin, req.jailSpec.projectDir) : []))
     // Kimi loads `<cwd>/.kimi-code/mcp.json` only in a trusted workspace; trust it exactly when the Bridge mounted it there.
     const env: NodeJS.ProcessEnv = { ...process.env, ...provisioned.env, ...(mcp ? { KIMI_CODE_TRUST_WORKSPACE: '1' } : {}) }
-    const args = [KAP_STDIO_SHIM, options.bin, 'web', '--json', '--host', '127.0.0.1', '--port', '0']
+    // The shim adds `--json` when this Kimi offers it (2.7) and reads 2.6's startup banner otherwise.
+    const args = [KAP_STDIO_SHIM, options.bin, 'web', '--host', '127.0.0.1', '--port', '0']
     const invocation = { env, args, flags: provisioned.flags, cwd: cwd ?? process.cwd(), model: req.model,
       executor: options.spawner.executionEnvironment }
     await admitNativeSubscription(req, invocation)

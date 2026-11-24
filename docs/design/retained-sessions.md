@@ -298,9 +298,10 @@ A steer is `accepted` once Claude reports `command_lifecycle` `queued`; when Cla
 
 ## Kimi Code native implementation
 
-One `kimi web --json` (Kimi's local server, the Kimi Agent Protocol) serves every turn of a session.
+One `kimi web` (Kimi's local server, the Kimi Agent Protocol) serves every turn of a session.
 A jailed process has its own network namespace, so `src/backends/kimi-kap-stdio.mjs` runs inside the jail beside the server, holds its bearer token, and carries its HTTP calls and WebSocket frames over stdio.
-The session is created with `POST /api/v1/sessions` (or continued with `POST /api/v1/sessions/{id}/profile`; an unknown id is refused) in Kimi's `manual` permission mode, so every approval reaches the Bridge and is answered by the turn's interaction policy; a Kimi question is dismissed.
+Kimi Code 2.7 announces the server as one JSON line under `--json`, with an ephemeral token; 2.6 has no `--json` and prints a banner whose Local URL carries its persistent token. The shim reads the CLI's `web --help` and speaks whichever it offers.
+The session is created with `POST /api/v1/sessions`, naming its workspace as `metadata.cwd`, which both versions read (or continued with `POST /api/v1/sessions/{id}/profile`; an unknown id is refused) in Kimi's `manual` permission mode, so every approval reaches the Bridge and is answered by the turn's interaction policy; a Kimi question is dismissed.
 The profile prompt is Kimi's project agent and the profile's MCP servers are the workspace's `.kimi-code/mcp.json`, trusted exactly when the Bridge mounted it, as on the one-shot path.
 
 A steer is `POST /api/v1/sessions/{id}/steer`; Kimi holds it until the next safe injection point, after the running tool call, and the steer is `accepted` when Kimi takes it. Kimi may end its current turn there and open a continuation turn whose opener is the steer; the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }` when its `user_message` item appears. A Bridge turn settles at the first Kimi `turn.ended` after which no Kimi turn runs and no submitted prompt or steer is still unstarted.
