@@ -123,7 +123,7 @@ describe.skipIf(!enabled)(`Pi under the Landlock fs-jail (ABI ${landlock.stdout.
     expect(await reaches(bridgePort)).toBe('connected')
 
     probe = [
-      ...Object.entries(targets).map(([label, path]) => `if cat ${quote(path)} >/dev/null 2>&1; then echo READABLE_${label}; cat ${quote(path)}; else echo READ_BLOCKED_${label}; fi`),
+      ...Object.entries(targets).map(([label, path]) => `if out=$(cat ${quote(path)} 2>&1); then echo READABLE_${label} "$out"; else echo READ_BLOCKED_${label} "$out"; fi`),
       'echo inside > own.txt && sed "s/^/OWN_/" own.txt',
       `node -e ${quote(`const s=require('net').connect(${bridgePort},'127.0.0.1');s.on('connect',()=>{console.log('CONNECTED_BRIDGE');s.destroy()});s.on('error',e=>console.log('CONNECT_BLOCKED_BRIDGE_'+e.code))`)}`,
       'env',
@@ -143,7 +143,8 @@ describe.skipIf(!enabled)(`Pi under the Landlock fs-jail (ABI ${landlock.stdout.
     // The second model call carries the probe's output as the tool result.
     expect(bodies).toHaveLength(2)
     const result = bodies[1]!
-    for (const label of Object.keys(targets)) expect(result).toContain(`READ_BLOCKED_${label}`)
+    // Each file exists where Pi looks (Landlock remaps nothing); the kernel refuses to open it.
+    for (const [label, path] of Object.entries(targets)) expect(result).toContain(`READ_BLOCKED_${label} cat: ${path}: Permission denied`)
     expect(result).toContain('OWN_inside')
     expect(result).toContain('CONNECT_BLOCKED_BRIDGE_EACCES')
     for (const secret of [HOST_SECRET, SIBLING_SECRET, UPSTREAM_KEY, BEARER]) expect(result).not.toContain(secret)
