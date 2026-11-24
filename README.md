@@ -696,6 +696,12 @@ A caller that sets only a base URL, such as a publisher's benchmark runner, reac
 An id the catalog lacks rereads the directory once; a changed profile needs a new id. A body `agent_profile` is refused with 400.
 The caller's system-role messages, which `/v1/chat/completions` refuses beside a profile, join the profile as `prompt.appendSystemPrompt`.
 
+### `POST /v1/responses` · `POST /profiles/:id/v1/responses`
+
+The text subset of the OpenAI Responses API, for callers that only call `responses.create` (PRBench's runner).
+The request runs as one non-streaming chat completion through `/v1/chat/completions`, or `/profiles/:id/v1/chat/completions` with that profile, and the reply comes back as a Responses object whose `output_text` is the answer.
+Carried: `model`, `input` (a string or role/content messages with text parts), `instructions`, `max_output_tokens`, `reasoning.effort`; `tools`, `background`, `stream`, `previous_response_id`, `conversation` and structured `text` formats are refused with 400.
+
 ### `POST /cad/render`
 
 Render OpenSCAD source to STL + PNG (+ optional GLB). Generic — any
