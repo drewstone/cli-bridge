@@ -31,3 +31,6 @@ entities/
 
 # Agent worktrees are separate checkouts of this repo; never commit them as embedded repos.
 .worktrees/
+
+# Process ids a test or a local run leaves behind
+*.pid
