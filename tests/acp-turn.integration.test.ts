@@ -2,8 +2,8 @@
  * ACP turns (hermes, openclaw) through a real Bridge listener and the host spawner, against a
  * synthetic `<bin> acp` agent that keeps its sessions on disk like hermes 0.23 does: it stays up
  * after refusing a request, replays a resumed session's history as `session/update` before
- * answering `session/resume`, reports token usage on the `session/prompt` result, and holds a
- * `wait` prompt until `session/cancel`. No model is called.
+ * answering `session/resume`, reports token usage on the `session/prompt` result, holds a `wait`
+ * prompt until `session/cancel`, and applies a concurrent `/steer <text>` to it. No model is called.
  */
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -19,7 +19,9 @@ const state = path.join(__dirname, 'state')
 fs.mkdirSync(state, { recursive: true })
 const transcript = (id) => path.join(state, id + '.json')
 const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n')
-const say = (sessionId, text) => send({ method: 'session/update', params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } })
+// Model text carries a messageId; the agent's own reply to a command does not (as hermes 0.23 sends them).
+const say = (sessionId, text, messageId = 'm-' + Math.random().toString(16).slice(2)) => send({ method: 'session/update', params: { sessionId,
+  update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, ...(messageId ? { messageId } : {}) } } })
 let waiting = null
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const message = JSON.parse(line)
@@ -43,7 +45,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   }
   if (message.method === 'session/prompt') {
     const text = params.prompt[0].text, past = JSON.parse(fs.readFileSync(transcript(params.sessionId), 'utf8'))
-    if (text === 'wait') { waiting = message.id; return }
+    if (text === 'wait' || text === 'hold') { waiting = message.id; return }
+    // hermes's /steer: answered at once with a receipt that repeats the text, applied to the running prompt after it.
+    if (text.startsWith('/steer ') && waiting !== null) {
+      const steer = text.slice('/steer '.length), held = waiting
+      waiting = null
+      say(params.sessionId, 'Steer queued for the active turn: ' + steer, null)
+      send({ id: message.id, result: { stopReason: 'end_turn' } })
+      return void setTimeout(() => { say(params.sessionId, 'steered: ' + steer); send({ id: held, result: { stopReason: 'end_turn' } }) }, 100)
+    }
     const answer = text === 'repeat' ? (past[past.length - 1] || 'nothing') : 'echo ' + text
     fs.writeFileSync(transcript(params.sessionId), JSON.stringify([...past, answer]))
     say(params.sessionId, answer)
@@ -117,6 +127,49 @@ describe('an ACP turn through the Bridge', () => {
     expect(body.error?.type).toBe('not_configured')
     expect((await calls()).length).toBe(before)
   })
+
+  it('retains one agent session across turns and steers its running turn with /steer', async () => {
+    const cwd = await workspace('native'), id = `native-${randomBytes(3).toString('hex')}`
+    const post = async (path: string, body: unknown) => {
+      const response = await fetch(`${bridge.url}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) })
+      return { status: response.status, body: await response.json() as Record<string, any> }
+    }
+    const runText = async (runId: string) => {
+      const response = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(runId)}/events`, { signal: AbortSignal.timeout(15_000) })
+      let text = ''
+      for (const line of (await response.text()).split('\n')) {
+        if (!line.startsWith('data:')) continue
+        const event = JSON.parse(line.slice(5)) as Record<string, any>
+        const inner = event.event ?? event
+        if (inner.type === 'message.part.updated' && inner.part?.type === 'text' && typeof inner.delta === 'string') text += inner.delta
+      }
+      return text
+    }
+    const turn = async (n: number, message: string) => {
+      const begun = await post(`/v1/sessions/${id}/turns`, { message, turn_id: `${id}-${n}`, run_id: `${id}-${n}-run`, execution_id: `${id}-${n}-execution` })
+      expect(begun.status, JSON.stringify(begun.body)).toBeLessThan(300)
+      return String(begun.body.run.id)
+    }
+    const created = await post('/v1/sessions', { id, model: 'hermes', cwd, interaction_policy: 'unattended-allow' })
+    expect(created.status, JSON.stringify(created.body)).toBeLessThan(300)
+    expect(await runText(await turn(1, 'native first'))).toBe('echo native first')
+
+    const running = await turn(2, 'hold')
+    const status = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(running)}`)
+    const header = (name: string) => status.headers.get(`x-run-${name}`)
+    const steered = await post(`/v1/sessions/${id}/steer`, { operationId: `steer-${randomBytes(3).toString('hex')}`, message: 'turn left',
+      run: { runId: header('id'), requestDigest: header('request-digest'), provider: header('provider'), environmentId: header('environment-id'),
+        sessionId: header('session-id'), executionId: header('execution-id') } })
+    expect(steered.status, JSON.stringify(steered.body)).toBeLessThan(300)
+    // The receipt repeats the steer's text; only the agent's answer is the turn's text.
+    expect(await runText(running)).toBe('steered: turn left')
+    const prompts = (await calls()).filter((call) => call.method === 'session/prompt' && (call.params.prompt as Array<{ text: string }>)[0]?.text !== undefined)
+    const mine = prompts.filter((call) => ['native first', 'hold', '/steer turn left'].includes((call.params.prompt as Array<{ text: string }>)[0]!.text))
+    expect(mine).toHaveLength(3)
+    expect(new Set(mine.map((call) => call.params.sessionId)).size).toBe(1)
+    await post(`/v1/sessions/${id}/close`, {})
+  }, 40_000)
 
   it('cancels a running turn through session/cancel', async () => {
     const cwd = await workspace('cancel'), runId = `cancel-run-${randomBytes(3).toString('hex')}`

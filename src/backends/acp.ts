@@ -20,8 +20,12 @@
  * openclaw→`openclaw acp`).
  */
 
-import type { Backend, BackendHealth, ChatDelta, ChatMessage, ChatRequest } from './types.js'
+import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
+import type { BackendHealth, ChatDelta, ChatMessage, ChatRequest, NativeSession, NativeSessionBackend } from './types.js'
 import { BackendError } from './types.js'
+import { AcpNativeSession } from './acp-native-session.js'
+import { hostRequestJail } from '../jail/host-request.js'
+import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
 import type { SessionRecord } from '../sessions/store.js'
 import type { Spawner } from '../executors/types.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -44,7 +48,17 @@ export interface AcpBackendOptions {
   timeoutMs: number
   /** Subprocess spawner; defaults to the scoped host spawner. */
   spawner?: Spawner
+  /**
+   * The agent's ACP command that steers its running turn, sent as a concurrent `session/prompt`
+   * (`/steer` for hermes). Without one a retained session refuses a steer.
+   */
+  steerCommand?: string
+  /** The operator's jail settings; a retained session resolves its own jail from them, as the chat route does. */
+  jailEnv?: NodeJS.ProcessEnv
 }
+
+/** Bound on every retained-session request except a prompt. */
+const REQUEST_TIMEOUT_CAP_MS = 60_000
 
 /** How long a cancelled turn's agent gets to answer `session/cancel` before its process is stopped. */
 const CANCEL_GRACE_MS = 2_000
@@ -89,12 +103,15 @@ function renderPrompt(messages: ChatMessage[]): string {
     .join('\n\n')
 }
 
-export class AcpBackend implements Backend {
+export class AcpBackend implements NativeSessionBackend {
   readonly name: string
   readonly defaultExecutionTimeoutMs: number
+  readonly nativeModes = ['byob'] as const
   private readonly bin: string
   private readonly acpArgs: string[]
   private readonly spawner: Spawner
+  private readonly steerCommand: string | null
+  private readonly jailEnv: NodeJS.ProcessEnv | undefined
 
   constructor(opts: AcpBackendOptions) {
     this.name = opts.name
@@ -102,6 +119,69 @@ export class AcpBackend implements Backend {
     this.bin = opts.bin
     this.acpArgs = opts.acpArgs ?? ['acp']
     this.spawner = opts.spawner ?? scopedHostSpawner
+    this.steerCommand = opts.steerCommand ?? null
+    this.jailEnv = opts.jailEnv
+  }
+
+  nativeCapabilities(): AgentEnvironmentCapabilities {
+    return acpNativeCapabilities(this.name)
+  }
+
+  /**
+   * One retained `<bin> acp` per Bridge session, launched like a one-shot turn: the same model rule,
+   * profile prompt check, MCP servers (inline in `session/new`), cwd, environment and jail. A session
+   * that already holds the agent's session id continues it.
+   */
+  async startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
+    this.assertConfiguredModel(req.model)
+    // Refuses a profile prompt intent ACP cannot carry, exactly as a one-shot turn does.
+    resolvePromptMessages(req, session, this.name)
+    const cwd = req.cwd ?? session?.cwd ?? process.cwd()
+    const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
+    // The chat route resolves a one-shot's jail; a retained session starts here, so it resolves its own.
+    req.jailSpec ??= hostRequestJail(req, this.name, this.jailEnv ?? process.env)
+    const spawned = await this.spawner(this.bin, this.acpArgs, {
+      signal, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: process.env,
+      ...(req.session_id ? { sessionId: req.session_id } : {}),
+      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
+      ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
+      ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
+    })
+    const spawnError = spawned.spawnError?.()
+    if (spawnError || !spawned.child.stdin || !spawned.child.stdout) {
+      await terminateSpawned(spawned).finally(() => spawned.release())
+      throw new BackendError(`${this.name} acp failed to start with stdin and stdout pipes`, 'upstream', spawnError)
+    }
+    const native = new AcpNativeSession(spawned, {
+      name: this.name,
+      capabilities: acpNativeCapabilities(this.name),
+      cwd,
+      mcpServers,
+      resumeSessionId: session?.internalId || null,
+      steerCommand: this.steerCommand,
+      requestTimeoutMs: this.defaultExecutionTimeoutMs > 0 ? Math.min(this.defaultExecutionTimeoutMs, REQUEST_TIMEOUT_CAP_MS) : REQUEST_TIMEOUT_CAP_MS,
+      cleanup: () => {},
+    })
+    try {
+      await native.start(signal)
+    } catch (error) {
+      await native.close().catch(() => {})
+      throw error
+    }
+    return native
+  }
+
+  private assertConfiguredModel(model: string): void {
+    // The agent runs the model its own configuration names; ACP gives this client no portable way to pick
+    // another, so a named model is refused instead of being dropped while the configured one answers.
+    if (model !== this.name) {
+      throw new BackendError(
+        `backend ${this.name} runs the model ${this.name}'s own configuration names; request model "${this.name}" `
+          + `instead of "${model}" and select the model in ${this.name}'s configuration`,
+        'not_configured',
+      )
+    }
   }
 
   matches(model: string): boolean {
@@ -113,15 +193,7 @@ export class AcpBackend implements Backend {
   }
 
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
-    // The agent runs the model its own configuration names; ACP gives this client no portable way to pick
-    // another, so a named model is refused instead of being dropped while the configured one answers.
-    if (req.model !== this.name) {
-      throw new BackendError(
-        `backend ${this.name} runs the model ${this.bin}'s own configuration names; request model "${this.name}" `
-          + `instead of "${req.model}" and select the model in ${this.bin}'s configuration`,
-        'not_configured',
-      )
-    }
+    this.assertConfiguredModel(req.model)
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
     const promptText = renderPrompt(resolvePromptMessages(req, session, this.name))
     // Profile MCP, or body/header MCP when no profile is present, is passed
@@ -298,5 +370,32 @@ export class AcpBackend implements Backend {
       throw new BackendError(`${this.name} acp session/new answered without a sessionId`, 'upstream')
     }
     return created.sessionId
+  }
+}
+
+/**
+ * What a retained ACP session proves: continuation in one agent process, permission requests answered
+ * by the turn's policy, and the profile surfaces ACP carries (MCP servers inline in `session/new`;
+ * no system prompt, instructions or tool controls).
+ */
+export function acpNativeCapabilities(backend: string): AgentEnvironmentCapabilities {
+  const generic = genericCliBridgeCapabilities(backend)
+  return {
+    ...generic,
+    profile: {
+      ...generic.profile,
+      systemPrompt: { replace: false, append: false },
+      instructions: false,
+      tools: false,
+      permissions: false,
+      subagents: false,
+      resources: { files: false, instructions: false, tools: false, skills: false, agents: false, commands: false },
+      modes: false,
+    },
+    sessions: { continue: true, list: true, messages: true },
+    nativeContinuation: { atomicBoundary: true, requestIdempotency: true, admissionControl: true },
+    interactions: { kinds: ['permission'], answerFieldTypes: ['select'], responseScopes: ['interaction'],
+      secretAnswers: false, concurrentRequests: false, replay: true, responseIdempotency: true },
+    workspace: { ...generic.workspace, read: true, write: true, exec: true, git: true },
   }
 }

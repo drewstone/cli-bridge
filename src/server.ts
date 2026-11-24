@@ -165,7 +165,9 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       registry.register(createLocalBackend(config, name, {
         stateDir: join(config.dataDir, name), ...(name === 'pi' || name === 'opencode' || name === 'kimi' || name === 'codex' ? { jailEnv } : {}) }))
     } else if (kind === 'acp') {
-      registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault }))
+      // hermes steers a running turn with its `/steer` command (measured on 0.23.2).
+      registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault, jailEnv,
+        ...(name === 'hermes' ? { steerCommand: '/steer' } : {}) }))
     } else if (kind === 'prime') {
       registry.register(new PrimeBackend({
         bin: config.primeBin,
