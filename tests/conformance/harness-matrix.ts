@@ -12,7 +12,7 @@
  * Two axes, named in every row: `seat` runs each harness's own model on a subscription seat;
  * CONFORMANCE_SCRIPTED=1 (`scripted`) drives the Router's scripted test model, tangle/canary-echo, which
  * needs no seat and cannot wobble. It answers the instruction in the last user message that carries one:
- * - tool: `Call the tool *write_nonce with exactly {...}` of the matrix's own MCP server;
+ * - tool: `Call the tool *write_nonce with exactly {...}` of the matrix's own MCP server (prime: through its REPL);
  * - retained: `Reply with exactly <word>`, then a second turn with no instruction, which can only be
  *   answered with <word> when the harness sent the first turn along;
  * - steer: the turn calls the matrix's `wait_seconds` tool and the steer says `Reply with exactly <word>`,
@@ -112,7 +112,12 @@ async function runText(bridge: BridgeServer, runId: string): Promise<{ text: str
 }
 
 const USAGE = { prompt: 1234, completion: 56 }
-const scriptedCall = (tool: string, args: Record<string, unknown>) => `Call the tool *${tool} with exactly ${JSON.stringify(args)}`
+// prime-agent 0.10 offers its model one tool, a Python REPL, and mounts an MCP server there as
+// `mcp.call_tool(server, tool, args)` (its system prompt's "Generic MCP Connections"), so prime's script
+// calls the REPL; every other harness offers the MCP tool itself.
+const scriptedMcpCall = (harness: string, tool: string, args: Record<string, unknown>) => harness === 'prime'
+  ? `Call the tool python_repl with exactly ${JSON.stringify({ code: `print(await mcp.call_tool('conformance', '${tool}', ${JSON.stringify(args)}))` })}`
+  : `Call the tool *${tool} with exactly ${JSON.stringify(args)}`
 
 // One MCP tool that writes `<dir>/<nonce>.nonce` and answers with the nonce, so a turn proves both effects.
 const nonceServer = (dir: string) => `const fs=require('node:fs'),path=require('node:path'),rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{let r;try{r=JSON.parse(line)}catch{return}if(r.id===undefined)return;let result={};if(r.method==='initialize')result={protocolVersion:(r.params&&r.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}};else if(r.method==='tools/list')result={tools:[{name:'write_nonce',description:'Writes the nonce file and returns the nonce.',inputSchema:{type:'object',properties:{nonce:{type:'string'}},required:['nonce']}},{name:'wait_seconds',description:'Waits the given number of seconds, then returns.',inputSchema:{type:'object',properties:{seconds:{type:'number'}},required:['seconds']}}]};else if(r.method==='tools/call'&&r.params&&r.params.name==='wait_seconds'){const seconds=Number(r.params.arguments&&r.params.arguments.seconds)||0;setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result:{content:[{type:'text',text:'waited '+seconds+' seconds'}]}})+'\\n'),seconds*1000);return}else if(r.method==='tools/call'){const nonce=String((r.params&&r.params.arguments&&r.params.arguments.nonce)||'');fs.writeFileSync(path.join(${JSON.stringify(dir)},nonce+'.nonce'),nonce);result={content:[{type:'text',text:'nonce '+nonce+' written'}]}}process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
@@ -137,6 +142,7 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   const model = harnessModel(harness)
   const cwd = await mkdtemp(join(root, `${harness}-`))
   const cells = {} as Record<Verb, Cell>
+  const scriptedCall = (tool: string, args: Record<string, unknown>) => scriptedMcpCall(harness, tool, args)
   const guard = async (verb: Verb, run: () => Promise<Cell>) => {
     try { cells[verb] = await run() } catch (error) { cells[verb] = red(error instanceof Error ? error.message : String(error)) }
   }

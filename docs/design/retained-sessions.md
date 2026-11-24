@@ -24,7 +24,7 @@ The bridge advertises retained sessions only when the backend proves all of thes
 - cancellation idempotency;
 - an atomic native context boundary;
 - request idempotency at that boundary;
-- replayable interactions and response idempotency.
+- replayable interactions and response idempotency, when the CLI asks for any.
 
 Native retained sessions remain limited to backends that prove the complete contract above.
 
@@ -282,6 +282,13 @@ Pi rejects `maxVisibleOutputTokens` and `maxReasoningTokens` because its selecte
 `reasoningEffort` remains a quality control and never acts as a numeric reasoning-token limit.
 
 `AgentProfile.model.metadata` is not a Pi token authority, and `metadata.maxTokens` is rejected.
+
+## Prime native implementation
+
+One `prime-agent --mode rpc` serves every turn of a session, launched as a one-shot prime turn is: the same per-session HOME and agent dir, materialized `models.json`, MCP `settings.json`, profile flags and env allowlist, with stdin held open.
+prime's rpc mode is Pi's, so the Pi session adapter drives it; a steer is the rpc `steer` command, which prime applies after the running tool call.
+prime 0.10 ends a prompt at `agent_end` and prints no `agent_settled`, so a turn settles at an `agent_end` after which `get_state` reports the session neither streaming nor compacting.
+prime asks no permission, so it declares no interactions and a turn that requests one is refused.
 
 ## Claude Code native implementation
 
