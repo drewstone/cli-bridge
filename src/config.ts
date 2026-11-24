@@ -33,7 +33,7 @@ export const localHarnesses = [
 export const localBackends = [
   ...localHarnesses.map(([name, harness]) => ({ name, harness, kind: 'native' as const })),
   { name: 'hermes', harness: 'hermes', kind: 'acp' },
-  { name: 'openclaw', harness: 'openclaw', kind: 'acp' },
+  { name: 'openclaw', harness: 'openclaw', kind: 'openclaw' },
   { name: 'prime', harness: 'prime', kind: 'prime' },
 ] as const
 
@@ -73,7 +73,7 @@ export interface Config extends NativeHarnessConfig {
   backends: Set<string>
   /** Dedicated subscription consumers refuse API and unverified native routes. */
   subscriptionsOnly: boolean
-  /** ACP-protocol agents driven via `<bin> acp` (AcpBackend). */
+  /** hermes, driven via `hermes acp` (AcpBackend); openclaw, via `openclaw agent --local` (OpenclawBackend). */
   hermesBin: string
   openclawBin: string
   primeBin: string
