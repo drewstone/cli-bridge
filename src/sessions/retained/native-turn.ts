@@ -38,6 +38,7 @@ import { CLAUDE_TURN_SETTLED, ClaudeNativeSession } from '../../backends/claude-
 import { ACP_PERMISSION, ACP_TURN_SETTLED, AcpNativeSession } from '../../backends/acp-native-session.js'
 import { CODEX_TURN_SETTLED, CodexNativeSession, isCodexToolApproval } from '../../backends/codex-native-session.js'
 import { KIMI_TURN_SETTLED, KimiNativeSession } from '../../backends/kimi-native-session.js'
+import { OPENCLAW_REPLY, OPENCLAW_TURN_SETTLED, OpenclawNativeSession } from '../../backends/openclaw-native-session.js'
 import { OPENCODE_TURN_SETTLED, OpencodeNativeSession } from '../../backends/opencode-native-session.js'
 import { opencodeStepUsage } from '../../backends/opencode.js'
 import { numberValue, recordValue, stringValue } from './json-values.js'
@@ -85,7 +86,8 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
     : native instanceof OpencodeNativeSession ? opencodeStep(input, native, deferredDenials)
     : native instanceof KimiNativeSession ? kimiStep(input, native, deferredDenials)
     : native instanceof CodexNativeSession ? codexStep(input, native, deferredDenials)
-    : native instanceof AcpNativeSession ? acpStep(input, native, deferredDenials) : null
+    : native instanceof AcpNativeSession ? acpStep(input, native, deferredDenials)
+    : native instanceof OpenclawNativeSession ? openclawStep(input) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
       const event = recordValue(raw)
@@ -594,6 +596,30 @@ function acpStep(
     }
     // Plans, usage gauges, session info, commands and config are not a turn's output.
     return []
+  }
+}
+
+/**
+ * OpenClaw's step: each answered `openclaw agent` call of the turn (the prompt, and any `/steer`) is
+ * one text part with that call's usage; the settle frame ends the turn with the first failure.
+ */
+function openclawStep(input: NativeTurnInput): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId, backendName } = input
+  let nextContentIndex = 0
+  return (event) => {
+    const type = String(event.type ?? '')
+    if (type === OPENCLAW_TURN_SETTLED) {
+      return [settledStatus(typeof event.error === 'string' ? sanitizeUpstreamErrorDetail(event.error) : null)]
+    }
+    if (type !== OPENCLAW_REPLY) return null
+    const text = typeof event.text === 'string' ? event.text : ''
+    const usage = recordValue(event.usage)
+    return [
+      ...(text ? [textEvent(sessionId, run.id, nextContentIndex++, text, text)] : []),
+      ...(usage ? [{ type: 'raw', backend: backendName, event: usageEnvironmentEvent({ input: numberValue(usage.input_tokens) ?? undefined,
+        freshInput: numberValue(usage.fresh_input_tokens) ?? undefined, cacheRead: numberValue(usage.cache_read_input_tokens) ?? undefined,
+        cacheWrite: numberValue(usage.cache_write_input_tokens) ?? undefined, output: numberValue(usage.output_tokens) ?? undefined }, undefined) } satisfies StreamEvent] : []),
+    ]
   }
 }
 

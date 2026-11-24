@@ -24,7 +24,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { Backend, BackendHealth, ChatDelta, ChatRequest, McpServerSpec } from './types.js'
+import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
+import type { BackendHealth, ChatDelta, ChatRequest, McpServerSpec, NativeSession, NativeSessionBackend } from './types.js'
+import { OpenclawNativeSession } from './openclaw-native-session.js'
+import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
+import { hostRequestJail } from '../jail/host-request.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
@@ -43,14 +47,20 @@ export interface OpenclawBackendOptions {
   /** Operator fallback when the caller omits `execution.timeoutMs`; zero means none. */
   timeoutMs: number
   spawner?: Spawner
+  /** The operator's jail settings; a retained session resolves its own jail from them, as the chat route does. */
+  jailEnv?: NodeJS.ProcessEnv
 }
+
+/** Bound on a retained session's Gateway start (measured near 16 s on 2026.11.5) and on its `/stop`. */
+const GATEWAY_START_CAP_MS = 120_000
 
 /** The session ids this backend passes to `--session-id`: the CLI files sessions under them. */
 const OPENCLAW_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u
 
-export class OpenclawBackend implements Backend {
+export class OpenclawBackend implements NativeSessionBackend {
   readonly name = 'openclaw'
   readonly defaultExecutionTimeoutMs: number
+  readonly nativeModes = ['byob'] as const
   private readonly spawner: Spawner
 
   constructor(private readonly opts: OpenclawBackendOptions) {
@@ -66,6 +76,46 @@ export class OpenclawBackend implements Backend {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
+  nativeCapabilities(): AgentEnvironmentCapabilities {
+    return openclawNativeCapabilities(this.name)
+  }
+
+  /**
+   * A retained session on a Gateway of its own (openclaw-native-session.ts): OpenClaw steers a
+   * running turn only through its Gateway. The session runs the config's default model; its MCP
+   * servers join its own copy of the operator's config.
+   */
+  async startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
+    if (req.model !== this.name) {
+      throw new BackendError(`a retained openclaw session runs the model its config names; request model "${this.name}"`, 'not_configured')
+    }
+    resolvePromptMessages(req, session, this.name)
+    const cwd = req.cwd ?? session?.cwd ?? process.cwd()
+    req.jailSpec ??= hostRequestJail(req, this.name, this.opts.jailEnv ?? process.env)
+    const native = new OpenclawNativeSession({
+      bin: this.opts.bin,
+      spawner: this.spawner,
+      capabilities: openclawNativeCapabilities(this.name),
+      cwd,
+      sessionKey: openclawSessionId(req.session_id, session?.internalId),
+      mcpServers: resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }),
+      spawn: {
+        ...(req.session_id ? { sessionId: req.session_id } : {}),
+        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
+        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
+      },
+      requestTimeoutMs: GATEWAY_START_CAP_MS,
+    })
+    try {
+      await native.start(signal)
+    } catch (error) {
+      await native.close().catch(() => {})
+      throw error
+    }
+    return native
+  }
+
   async *chat(req: ChatRequest, session: SessionRecord | null, signal: AbortSignal): AsyncIterable<ChatDelta> {
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
     // `openclaw agent` has no system-prompt control; a profile prompt intent is refused here, and the
@@ -78,7 +128,7 @@ export class OpenclawBackend implements Backend {
     const model = req.model === this.name ? null : req.model.slice(`${this.name}/`.length)
     const args = ['agent', '--local', '--json', '--session-id', sessionId, ...(model ? ['--model', model] : []), '--message-file', '-']
 
-    const overlay = mcpConfigOverlay(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
+    const overlay = openclawConfigOverlay(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
     if (overlay) registerJailReadable(req.jailSpec, overlay.dir)
     const env: NodeJS.ProcessEnv = {
       ...process.env,
@@ -124,7 +174,7 @@ export class OpenclawBackend implements Backend {
         yield { finish_reason: 'error' }
         return
       }
-      const result = parseResult(lines.join('\n'))
+      const result = parseOpenclawResult(lines.join('\n'))
       const failure = record(result?.error)
       if (failure || exit.code !== 0 || !result) {
         const detail = typeof failure?.message === 'string' ? failure.message : stderr.render(600) || `exit ${exit.code ?? exit.signal}`
@@ -133,7 +183,7 @@ export class OpenclawBackend implements Backend {
       const text = (Array.isArray(result.payloads) ? result.payloads : [])
         .map((payload) => record(payload)?.text).filter((part): part is string => typeof part === 'string' && part.length > 0).join('\n\n')
       if (text) yield { content: text }
-      const usage = turnUsage(record(record(record(result.meta)?.agentMeta)?.usage))
+      const usage = openclawTurnUsage(record(record(record(result.meta)?.agentMeta)?.usage))
       if (usage) yield { usage }
       yield { finish_reason: 'stop' }
     } finally {
@@ -149,7 +199,7 @@ export class OpenclawBackend implements Backend {
  * The `--session-id` for this turn: the one the Bridge session recorded, else one derived from the
  * Bridge session id (so its turns share one OpenClaw session), else a fresh one.
  */
-function openclawSessionId(requestSessionId: string | undefined, recorded: string | undefined): string {
+export function openclawSessionId(requestSessionId: string | undefined, recorded: string | undefined): string {
   if (recorded && OPENCLAW_SESSION_ID.test(recorded)) return recorded
   if (requestSessionId) return `cli-bridge-${createHash('sha256').update(requestSessionId).digest('hex').slice(0, 32)}`
   return `cli-bridge-${randomUUID()}`
@@ -157,10 +207,14 @@ function openclawSessionId(requestSessionId: string | undefined, recorded: strin
 
 /**
  * A per-run copy of the operator's config (OPENCLAW_CONFIG_PATH, else ~/.openclaw/openclaw.json)
- * with the request's MCP servers added to `mcp.servers`, or null when none are requested. The copy
- * lives in its own directory, so a config that names files by relative path is refused.
+ * with the request's MCP servers added to `mcp.servers` and `gateway` settings replaced, or null
+ * when there is nothing to add. The copy lives in its own directory, so a config that names files by
+ * relative path is refused.
  */
-function mcpConfigOverlay(specs: Record<string, McpServerSpec> | null): { dir: string; path: string; cleanup: () => void } | null {
+export function openclawConfigOverlay(
+  specs: Record<string, McpServerSpec> | null,
+  gateway?: Record<string, unknown>,
+): { dir: string; path: string; cleanup: () => void } | null {
   const servers: Record<string, Record<string, unknown>> = {}
   for (const [name, spec] of Object.entries(specs ?? {})) {
     if (spec.enabled === false) continue
@@ -172,7 +226,7 @@ function mcpConfigOverlay(specs: Record<string, McpServerSpec> | null): { dir: s
     } else throw new BackendError(`backend openclaw cannot mount MCP server ${JSON.stringify(name)}: it names neither a command nor a url`, 'not_configured')
     if (spec.timeout !== undefined) servers[name]!.requestTimeoutMs = spec.timeout
   }
-  if (Object.keys(servers).length === 0) return null
+  if (Object.keys(servers).length === 0 && !gateway) return null
   const source = process.env.OPENCLAW_CONFIG_PATH || join(process.env.HOME || homedir(), '.openclaw', 'openclaw.json')
   let config: Record<string, unknown> = {}
   if (existsSync(source)) {
@@ -188,18 +242,19 @@ function mcpConfigOverlay(specs: Record<string, McpServerSpec> | null): { dir: s
   const mcp = record(config.mcp) ?? {}
   const dir = mkdtempSync(join(tmpdir(), 'cli-bridge-openclaw-'))
   const path = join(dir, 'openclaw.json')
-  writeFileSync(path, `${JSON.stringify({ ...config, mcp: { ...mcp, servers: { ...(record(mcp.servers) ?? {}), ...servers } } }, null, 2)}\n`, { mode: 0o600 })
+  const merged = { ...config, mcp: { ...mcp, servers: { ...(record(mcp.servers) ?? {}), ...servers } }, ...(gateway ? { gateway } : {}) }
+  writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 })
   return { dir, path, cleanup: () => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* best effort */ } } }
 }
 
-function parseResult(stdout: string): Record<string, unknown> | null {
+export function parseOpenclawResult(stdout: string): Record<string, unknown> | null {
   const start = stdout.indexOf('{')
   if (start < 0) return null
   try { return record(JSON.parse(stdout.slice(start))) ?? null } catch { return null }
 }
 
 /** `meta.agentMeta.usage`, the turn's model calls together: `input` is the uncached prompt; cache reads and writes are counted apart. */
-function turnUsage(usage: Record<string, unknown> | undefined): ChatDelta['usage'] | undefined {
+export function openclawTurnUsage(usage: Record<string, unknown> | undefined): ChatDelta['usage'] | undefined {
   const count = (key: string): number => (typeof usage?.[key] === 'number' && Number.isFinite(usage[key]) ? usage[key] as number : 0)
   const fresh = count('input'), cacheRead = count('cacheRead'), cacheWrite = count('cacheWrite'), output = count('output')
   if (fresh + cacheRead + cacheWrite + output === 0) return undefined
@@ -209,4 +264,28 @@ function turnUsage(usage: Record<string, unknown> | undefined): ChatDelta['usage
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+/**
+ * What a retained OpenClaw session proves: continuation and steer on its own Gateway, MCP servers
+ * through its config, and no interactions (it publishes none to this client).
+ */
+export function openclawNativeCapabilities(backend: string): AgentEnvironmentCapabilities {
+  const generic = genericCliBridgeCapabilities(backend)
+  return {
+    ...generic,
+    profile: {
+      ...generic.profile,
+      systemPrompt: { replace: false, append: false },
+      instructions: false,
+      tools: false,
+      permissions: false,
+      subagents: false,
+      resources: { files: false, instructions: false, tools: false, skills: false, agents: false, commands: false },
+      modes: false,
+    },
+    sessions: { continue: true, list: true, messages: true },
+    nativeContinuation: { atomicBoundary: true, requestIdempotency: true, admissionControl: true },
+    workspace: { ...generic.workspace, read: true, write: true, exec: true, git: true },
+  }
 }
