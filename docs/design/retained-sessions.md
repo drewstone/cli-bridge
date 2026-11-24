@@ -1,6 +1,6 @@
 # Retained sessions and native interactions
 
-Status: implemented for the Pi, Claude Code and Kimi Code native backends, with the generic one-shot durable contract exposed for ready non-native routes.
+Status: implemented for the Pi, Claude Code, Kimi Code and Codex native backends, with the generic one-shot durable contract exposed for ready non-native routes.
 
 This surface keeps one native CLI process behind a durable bridge session.
 
@@ -299,6 +299,14 @@ The profile prompt is Kimi's project agent and the profile's MCP servers are the
 
 A steer is `POST /api/v1/sessions/{id}/steer`; Kimi holds it until the next safe injection point, after the running tool call, and the steer is `accepted` when Kimi takes it. Kimi may end its current turn there and open a continuation turn whose opener is the steer; the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }` when its `user_message` item appears. A Bridge turn settles at the first Kimi `turn.ended` after which no Kimi turn runs and no submitted prompt or steer is still unstarted.
 `kimi acp` cannot steer: a second `session/prompt` during a turn answers `turn.agent_busy` (Kimi Code 2.7.3).
+
+## Codex native implementation
+
+One `codex app-server --listen stdio://` (Codex's JSON-RPC server) serves every turn of a session, launched as a one-shot `codex exec` turn is: the same jail and access-only auth seed, profile workspace, per-session `CODEX_HOME` holding the profile's MCP servers, `CODEX_TANGLE_ROUTER_URL` route and subscription admission (`src/backends/codex.ts` `launch`).
+The thread is started with `thread/start` (or continued with `thread/resume`; an unknown id is refused) with sandbox `danger-full-access`, because the Bridge's jail is the boundary as it is for `--dangerously-bypass-approvals-and-sandbox`, and approval policy `untrusted`, so a command approval, a file-change approval and an MCP tool-call approval (Codex asks that one as an `mcpServer/elicitation/request`) each reach the Bridge and are answered by the turn's interaction policy; an MCP server's own elicitation form is declined.
+
+A steer is `turn/steer` with the running turn as `expectedTurnId`; Codex accepts it at once and applies it at its next model call, after the running tool call, as a `userMessage` item of the same turn whose `clientId` is the steer's `clientUserMessageId`, when the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }`. A Bridge turn settles at that turn's `turn/completed`. Measured on Codex 0.169.0.
+On a host whose Codex login is a file-backed subscription, an unconfined session holds the host's credential-rotation lease for its whole life, as a one-shot turn holds it for its own, so other unconfined Codex turns on that login wait until it closes; a jailed session's access-only seed is checked against the first turn's deadline only.
 
 ## MCP and ACP boundary
 

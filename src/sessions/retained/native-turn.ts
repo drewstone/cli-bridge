@@ -35,6 +35,7 @@ import type { Run } from '../../runs/registry.js'
 import { piPermissionPublicTitle, piPermissionTokenFromTitle } from '../../backends/pi-interaction.js'
 import { normalizeClaudeUsage, sanitizeUpstreamErrorDetail, type ClaudeNativeUsage } from '../../backends/claude.js'
 import { CLAUDE_TURN_SETTLED, ClaudeNativeSession } from '../../backends/claude-native-session.js'
+import { CODEX_TURN_SETTLED, CodexNativeSession, isCodexToolApproval } from '../../backends/codex-native-session.js'
 import { KIMI_TURN_SETTLED, KimiNativeSession } from '../../backends/kimi-native-session.js'
 import { OPENCODE_TURN_SETTLED, OpencodeNativeSession } from '../../backends/opencode-native-session.js'
 import { opencodeStepUsage } from '../../backends/opencode.js'
@@ -66,7 +67,8 @@ export interface NativeTurnInput {
 
 /**
  * The one turn driver: it owns the loop, the raw fallback, deferred denials
- * and the failing catch. Pi's step is inline below; Claude's is `claudeStep`, opencode's `opencodeStep`, Kimi's `kimiStep`.
+ * and the failing catch. Pi's step is inline below; Claude's is `claudeStep`, opencode's `opencodeStep`, Kimi's `kimiStep`,
+ * Codex's `codexStep`.
  */
 export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ event: StreamEvent }> {
   const { native, run, sessionId, prompt, backendName } = input
@@ -80,7 +82,8 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
   const deferredDenials: Promise<void>[] = []
   const claude = native instanceof ClaudeNativeSession ? claudeStep(input, native, deferredDenials)
     : native instanceof OpencodeNativeSession ? opencodeStep(input, native, deferredDenials)
-    : native instanceof KimiNativeSession ? kimiStep(input, native, deferredDenials) : null
+    : native instanceof KimiNativeSession ? kimiStep(input, native, deferredDenials)
+    : native instanceof CodexNativeSession ? codexStep(input, native, deferredDenials) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
       const event = recordValue(raw)
@@ -512,6 +515,155 @@ function kimiStep(
     }
     // Session, agent, context and task bookkeeping carry nothing a turn's consumer reads.
     if (['session', 'agent', 'context', 'task', 'task.list', 'todo', 'goal', 'turns'].includes(type)) return []
+    return null
+  }
+}
+
+/**
+ * Codex's step: one app-server message to canonical events, or null to keep it as `raw`. An agent message or
+ * reasoning item is one content part, fed by its deltas and its completed snapshot; a command, MCP tool call, file
+ * change or web search item is one tool part, named as the one-shot path names it. Each `thread/tokenUsage/updated`
+ * that moved the thread's total is one model call's usage. A `userMessage` item (the prompt or a steer) stays raw: it
+ * is the consumption receipt. The first failure sticks, as in one-shot.
+ */
+function codexStep(
+  input: NativeTurnInput,
+  native: CodexNativeSession,
+  deferredDenials: Promise<void>[],
+): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId, backendName } = input
+  const parts = new Map<string, { index: number; text: string }>()
+  const tools = new Map<string, 'pending' | 'running' | 'completed' | 'error'>()
+  const models = new Set<string>()
+  let lastTotal: string | null = null
+  let nextContentIndex = 0
+  let processing = false
+  let failure: string | null = null
+  const raw = (event: unknown): StreamEvent => ({ type: 'raw', backend: backendName, event })
+  // Publish only what extends the part's text; a stale or rewritten snapshot adds nothing the deltas did not.
+  const content = (key: string, kind: 'text' | 'reasoning', delta: string | null, snapshot = ''): StreamEvent[] => {
+    let entry = parts.get(key)
+    if (!entry) parts.set(key, entry = { index: nextContentIndex++, text: '' })
+    const appended = delta ?? (snapshot.startsWith(entry.text) ? snapshot.slice(entry.text.length) : '')
+    if (!appended) return []
+    entry.text += appended
+    return [(kind === 'reasoning' ? reasoningEvent : textEvent)(sessionId, run.id, entry.index, entry.text, appended)]
+  }
+  const tool = (item: Record<string, unknown>, ended: boolean): StreamEvent[] | null => {
+    const id = stringValue(item.id)
+    const kind = item.type
+    if (!id) return null
+    const named = kind === 'commandExecution' ? { name: 'bash', args: { command: item.command ?? '' } }
+      : kind === 'mcpToolCall' ? { name: [stringValue(item.server), stringValue(item.tool)].filter(Boolean).join('_') || 'mcp',
+        args: recordValue(item.arguments) ?? {} }
+      : kind === 'fileChange' ? { name: 'apply_patch', args: { changes: item.changes ?? [] } }
+      : kind === 'webSearch' ? { name: 'websearch', args: { query: item.query ?? '' } }
+      : null
+    if (!named) return null
+    const failed = item.status === 'failed' || item.status === 'declined'
+      || (typeof item.exitCode === 'number' && item.exitCode !== 0)
+    const status = !ended ? 'running' : failed ? 'error' : 'completed'
+    if (tools.get(id) === status) return []
+    tools.set(id, status)
+    const output = item.result ?? item.aggregatedOutput ?? null
+    const outcome = status === 'completed' ? { output }
+      : status === 'error' ? { error: stringValue(recordValue(item.error)?.message) ?? `${String(kind)} ${String(item.status ?? 'failed')}`, result: output }
+      : undefined
+    return [{ type: 'message.part.updated', part: toolPart(sessionId, run.id, id, named.name, named.args, status, outcome) }]
+  }
+  const approval = (method: string, nativeId: string, params: Record<string, unknown>): StreamEvent => {
+    const title = method === 'item/commandExecution/requestApproval' ? 'Permission: command'
+      : method === 'item/fileChange/requestApproval' ? 'Permission: file change'
+      : `Permission: ${[stringValue(params.serverName), stringValue(recordValue(params._meta)?.tool_name)].filter(Boolean).join('.')
+        .replace(/[^\p{L}\p{N} .,_:\/-]/gu, ' ').trim().slice(0, 120) || 'MCP tool'}`
+    const meta = recordValue(params._meta)
+    const body = [stringValue(params.command), stringValue(params.cwd), stringValue(params.reason), stringValue(params.message),
+      meta?.tool_params === undefined ? null : JSON.stringify(meta.tool_params)]
+      .filter((part): part is string => Boolean(part)).join('\n').slice(0, 4_000)
+    const interaction = permissionInteraction(run, nativeId, title, body || null, sessionId, input.providerName, input.environmentId)
+    if (interaction) return admitInteraction(input, interaction, deferredDenials)
+    // Codex waits on every approval; one the bridge cannot publish is declined.
+    deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
+    return { type: 'warning', code: 'unsupported_interaction', message: 'Codex asked an approval cli-bridge cannot publish; it was declined' }
+  }
+  return (event) => {
+    if (event.type === CODEX_TURN_SETTLED) return [settledStatus(failure)]
+    if (event.type === 'warning') {
+      return [{ type: 'warning', code: 'unsupported_interaction', message: `Codex sent ${String(event.method)}, which cli-bridge does not answer; it was refused` }]
+    }
+    const method = stringValue(event.method)
+    const params = recordValue(event.params) ?? {}
+    if (!method) return null
+    if (event.id !== undefined) {
+      const nativeId = String(event.id)
+      if (method === 'mcpServer/elicitation/request' && !isCodexToolApproval(params)) {
+        // An MCP server's own form has no Bridge interaction; it is declined.
+        deferredDenials.push(native.respondToNativeInteraction(nativeId, { cancelled: true }))
+        return [{ type: 'warning', code: 'unsupported_interaction', message: 'an MCP server asked for input cli-bridge cannot publish; it was declined' }]
+      }
+      return [approval(method, nativeId, params)]
+    }
+    if (method === 'turn/started') {
+      if (processing) return []
+      processing = true
+      return [{ type: 'status', status: 'processing' }]
+    }
+    if (method === 'turn/completed') {
+      const turn = recordValue(params.turn)
+      if (turn?.status === 'failed')
+        failure ??= sanitizeUpstreamErrorDetail(stringValue(recordValue(turn.error)?.message) ?? 'turn failed')
+      return null
+    }
+    if (method === 'error') {
+      if (params.willRetry !== true) failure ??= sanitizeUpstreamErrorDetail(stringValue(recordValue(params.error)?.message) ?? 'codex error')
+      return null
+    }
+    if (method === 'item/agentMessage/delta') {
+      const id = stringValue(params.itemId)
+      return id && typeof params.delta === 'string' ? content(id, 'text', params.delta) : null
+    }
+    if (method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') {
+      const id = stringValue(params.itemId)
+      const key = `${id}:${method === 'item/reasoning/textDelta' ? 'text' : 'summary'}`
+      return id && typeof params.delta === 'string' ? content(key, 'reasoning', params.delta) : null
+    }
+    if (method === 'item/started' || method === 'item/completed') {
+      const item = recordValue(params.item) ?? {}
+      const id = stringValue(item.id)
+      if (item.type === 'agentMessage' && id) return content(id, 'text', null, typeof item.text === 'string' ? item.text : '')
+      if (item.type === 'reasoning' && id) {
+        const summary = Array.isArray(item.summary) ? item.summary.filter((part) => typeof part === 'string').join('\n') : ''
+        return summary ? content(`${id}:summary`, 'reasoning', null, summary) : []
+      }
+      return tool(item, method === 'item/completed')
+    }
+    if (method === 'thread/tokenUsage/updated') {
+      const usage = recordValue(params.tokenUsage)
+      const total = JSON.stringify(usage?.total ?? null)
+      const last = recordValue(usage?.last)
+      if (!last || total === lastTotal) return []
+      lastTotal = total
+      const inputTokens = numberValue(last.inputTokens), cacheRead = numberValue(last.cachedInputTokens)
+      return [raw(usageEnvironmentEvent({
+        input: inputTokens ?? undefined,
+        freshInput: inputTokens !== null && cacheRead !== null && inputTokens >= cacheRead ? inputTokens - cacheRead : undefined,
+        cacheRead: cacheRead ?? undefined,
+        cacheWrite: numberValue(last.cacheWriteInputTokens) ?? undefined,
+        output: numberValue(last.outputTokens) ?? undefined,
+        reasoning: numberValue(last.reasoningOutputTokens) ?? undefined,
+      }, undefined))]
+    }
+    if (method === 'model/rerouted') {
+      // Codex names the served model only when it differs from the request, as on the one-shot path.
+      const model = stringValue(params.toModel)
+      if (!model || models.has(model)) return []
+      models.add(model)
+      return [raw({ type: 'raw', data: { model, provider_models: [model] } })]
+    }
+    // Thread, account, MCP startup and output-stream bookkeeping carry nothing a turn's consumer reads.
+    if (['thread/started', 'thread/status/changed', 'account/rateLimits/updated', 'mcpServer/startupStatus/updated',
+      'serverRequest/resolved', 'item/commandExecution/outputDelta', 'item/fileChange/outputDelta', 'item/mcpToolCall/progress',
+      'turn/diff/updated', 'remoteControl/status/changed'].includes(method)) return []
     return null
   }
 }
