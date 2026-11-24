@@ -252,9 +252,10 @@ function assertRetainedCapabilities(capabilities: AgentEnvironmentCapabilities, 
     capabilities.nativeContinuation?.atomicBoundary !== true ||
     capabilities.nativeContinuation.requestIdempotency !== true ||
     capabilities.nativeContinuation.admissionControl !== true ||
-    !capabilities.interactions ||
-    !capabilities.interactions.replay ||
-    !capabilities.interactions.responseIdempotency
+    // A CLI that asks for nothing declares no interactions (absent means unsupported, and a turn that
+    // requests one is refused at admission); one that does ask must make its interactions replayable.
+    (capabilities.interactions !== undefined &&
+      (!capabilities.interactions.replay || !capabilities.interactions.responseIdempotency))
   ) {
     throw new RetainedSessionError(
       `backend ${JSON.stringify(backendName)} does not advertise the complete retained-session contract`,

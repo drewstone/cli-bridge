@@ -15,6 +15,13 @@ export interface PiNativeSessionOptions {
   requestTimeoutMs: number
   cleanup(): void | Promise<void>
   providerSessionId?: string
+  /**
+   * A Pi lineage whose rpc mode ends a prompt at `agent_end` and never emits
+   * `agent_settled` (prime-agent 0.10): the turn settles at an `agent_end`
+   * after which `get_state` reports the session neither streaming nor
+   * compacting, so a retry or compaction that follows it stays in the turn.
+   */
+  settleWhenIdleAfterAgentEnd?: boolean
 }
 
 interface PiRpcResponse {
@@ -64,11 +71,13 @@ export class PiNativeSession implements NativeSession {
   private providerSession: string | null
   private turnActive = false
   private abortInFlight: Promise<void> | null = null
+  private readonly settleWhenIdleAfterAgentEnd: boolean
 
   constructor(spawned: Awaited<ReturnType<Spawner>>, options: PiNativeSessionOptions) {
     this.capabilities = options.capabilities
     this.requestTimeoutMs = options.requestTimeoutMs
     this.providerSession = options.providerSessionId ?? null
+    this.settleWhenIdleAfterAgentEnd = options.settleWhenIdleAfterAgentEnd === true
     this.life = new NativeChild(spawned, {
       names: { process: 'pi RPC', session: 'pi native session' },
       onStdout: (chunk) => this.consume(chunk),
@@ -133,6 +142,11 @@ export class PiNativeSession implements NativeSession {
         // an automatic retry or compaction. `agent_settled` is Pi's documented
         // session-level terminal boundary for prompts that started a run.
         if (event.type === 'agent_settled') return
+        if (event.type === 'agent_end' && this.settleWhenIdleAfterAgentEnd && await this.idle(signal)) {
+          // The settled boundary this lineage does not print, observed from its own state.
+          yield { type: 'agent_settled' }
+          return
+        }
       }
       throw this.childError ?? new Error('pi native session ended before agent_settled')
     } catch (error) {
@@ -147,6 +161,11 @@ export class PiNativeSession implements NativeSession {
       signal.removeEventListener('abort', onAbort)
       this.turnActive = false
     }
+  }
+
+  private async idle(signal: AbortSignal): Promise<boolean> {
+    const state = record((await this.request({ type: 'get_state' }, { signal, timeoutMs: this.requestTimeoutMs })).data)
+    return state?.isStreaming === false && state.isCompacting !== true
   }
 
   async steer(prompt: string): Promise<void> {

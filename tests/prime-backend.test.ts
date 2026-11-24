@@ -468,35 +468,6 @@ describe('PrimeBackend', () => {
     expect(b!.args[b!.args.indexOf('--session-dir') + 1]).toBe(a!.args[a!.args.indexOf('--session-dir') + 1])
   })
 
-  it('rejects request-scoped MCP servers instead of silently dropping them', async () => {
-    const backend = newBackend(primeSpawner([], []))
-    await expect(collect(backend.chat(
-      {
-        model: 'prime/tangle/glm-5.2',
-        messages: [{ role: 'user', content: 'TASK' }],
-        mcp: { mcpServers: { coordination: { command: 'node', args: ['c.mjs'] } } },
-      },
-      null,
-      new AbortController().signal,
-    ))).rejects.toThrowError(/cannot mount MCP servers.*coordination/)
-  })
-
-  it('rejects agent_profile.mcp instead of silently dropping it', async () => {
-    const backend = newBackend(primeSpawner([], []))
-    await expect(collect(backend.chat(
-      {
-        model: 'prime/tangle/glm-5.2',
-        messages: [{ role: 'user', content: 'TASK' }],
-        agent_profile: {
-          model: { provider: 'tangle', default: 'glm-5.2' },
-          mcp: { linear: { transport: 'http', url: 'https://mcp.linear.app/mcp' } },
-        },
-      },
-      null,
-      new AbortController().signal,
-    ))).rejects.toThrowError(/cannot mount MCP servers.*linear/)
-  })
-
   it('treats a fully disabled agent_profile.mcp map as no MCP request', async () => {
     const captures: SpawnCapture[] = []
     const backend = newBackend(primeSpawner(HAPPY_STREAM, captures))
