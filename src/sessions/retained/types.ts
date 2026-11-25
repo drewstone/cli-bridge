@@ -87,6 +87,8 @@ export interface RetainedSessionServiceOptions {
   store: SessionStore
   registry: BackendRegistry
   runs: RunRegistry
+  /** Writes the change ledger rows of each turn; absent means none are written. */
+  changes?: import('../../change-ledger/recorder.js').ChangeRecorder
   inputQueueMaxDepth?: number
   inputQueueTimeoutMs?: number
   healthProbeTimeoutMs?: number

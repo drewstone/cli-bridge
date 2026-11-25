@@ -399,6 +399,8 @@ export function mountChatCompletions(
     durableWriter?: Pick<DurableRunWriter, 'commit'>
     retainedRuns?: Pick<SessionStore, 'getRetainedRun' | 'claimRetainedRun' | 'updateRetainedRun' | 'appendRetainedDelta' | 'retainedEventsAfterRun'>
     runs: RunRegistry
+    /** Writes the change ledger rows of each turn; absent means none are written. */
+    changes?: import('../change-ledger/recorder.js').ChangeRecorder
     admission?: AdmissionGate
     /**
      * `x-tangle-client` prefixes routed to the reserved admission lane.
@@ -1000,6 +1002,17 @@ export function mountChatCompletions(
       if (!req.cwd && session?.cwd) {
         req.cwd = session.cwd
       }
+      // Read the working repository before the harness runs. A sandbox executes elsewhere, so its repository is not this host's.
+      await deps.changes?.begin({
+        sessionId: req.session_id ?? runId,
+        backend: backend.name,
+        turnId: run.executionId ?? runId,
+        runId,
+        cwd: req.execution?.kind === 'sandbox' || backend.name === 'sandbox' ? null : req.cwd ?? null,
+        priorTurns: session?.turns ?? 0,
+        oneShot: !req.session_id,
+        nativeSessionId: () => (req.session_id ? deps.sessions.get(req.session_id, backend.name)?.internalId : null) || null,
+      }, run)
       const profile = assertProfileRequestAuthority(req, session)
       if (!(req.execution?.kind === 'sandbox' && backend.name !== 'sandbox')) {
         req.jailSpec = hostRequestJail(req, backend.name, deps.jailEnv ?? process.env)

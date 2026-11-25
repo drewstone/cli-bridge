@@ -58,6 +58,7 @@ import { bindIncomingRequest } from './http/request-source.js'
 import type { BridgeServer, StartServerOptions } from './server-options.js'
 import { mountHubMcp } from './hub-mcp.js'
 import { mountCallerTools, type CallerTools } from './caller-tools.js'
+import { ChangeRecorder } from './change-ledger/recorder.js'
 
 function parseEnvPositiveInt(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -210,7 +211,10 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   // and model routing use the same registry as one-shot chat.
   const codexBackend = registry.byName('codex')
   const nativeCatalog = createNativeCatalog(config, codexBackend instanceof CodexBackend ? codexBackend.readCatalog : undefined, cwd)
-  const retained = new RetainedSessionService({ store: sessions, registry, runs, admitSubscription: nativeCatalog.admit })
+  // Rows of the turns this Bridge runs, for harnesses that have no hook of their own. Off when config omits it.
+  const changes = config.changeLedger ? new ChangeRecorder(config.changeLedger.dir) : undefined
+  if (changes) extras.shutdownHooks.unshift(async () => await changes.settled())
+  const retained = new RetainedSessionService({ store: sessions, registry, runs, changes, admitSubscription: nativeCatalog.admit })
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
   await continueInterruptedRuns({ store: sessions, runs, registry, durableWriter, jailEnv })
 
@@ -309,6 +313,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     retainedRuns: sessions,
     durableWriter: durableWriter ?? undefined,
     contextTransfers: retained,
+    changes,
     runs,
     admission,
     admissionReservedClients: config.admissionReservedClients,

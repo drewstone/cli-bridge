@@ -135,6 +135,13 @@ export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
     jailWritablePaths: string[];
     /** OTLP span emission for chat requests. See {@link TraceConfig}. */
     trace: TraceConfig;
+    /**
+     * The change ledger Bridge writes for each turn (`src/change-ledger/recorder.ts`): the directory holding
+     * `changes.jsonl`. `BRIDGE_CHANGE_LEDGER=off` omits it; `CHANGE_LEDGER_DIR` names the directory, as it does for the hooks.
+     */
+    changeLedger?: {
+        dir: string;
+    };
 }
 /**
  * Trace emission settings.

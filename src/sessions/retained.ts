@@ -111,6 +111,7 @@ export class RetainedSessionService {
       isClosing: (id) => this.closures.has(id),
       answerInteraction: (input, decision) => this.interactions.answerInteraction(input, decision),
       contextTransfers: this.contextTransfers,
+      changes: options.changes,
       admitSubscription: options.admitSubscription,
     })
     this.control = new RetainedControl(this.store, this.runs, this.state)

@@ -57,6 +57,7 @@ export interface RetainedTurnRunnerOptions {
     nativeId: string
   }, decision: 'allow' | 'deny') => Promise<void>
   contextTransfers: RetainedContextTransfers
+  changes?: import('../../change-ledger/recorder.js').ChangeRecorder
 }
 
 export interface RetainedBeginTurnOptions extends TurnLaneOptions {
@@ -82,6 +83,7 @@ export class RetainedTurnRunner {
   private readonly isClosing: (id: string) => boolean
   private readonly answerInteraction: RetainedTurnRunnerOptions['answerInteraction']
   private readonly contextTransfers: RetainedContextTransfers
+  private readonly changes: RetainedTurnRunnerOptions['changes']
   private readonly admitSubscription: RetainedTurnRunnerOptions['admitSubscription']
   /** In-flight durable commits, keyed by run id. */
   private readonly finalizations = new Map<string, Promise<void>>()
@@ -95,6 +97,7 @@ export class RetainedTurnRunner {
     this.isClosing = options.isClosing
     this.answerInteraction = options.answerInteraction
     this.contextTransfers = options.contextTransfers
+    this.changes = options.changes
     this.admitSubscription = options.admitSubscription
   }
 
@@ -391,6 +394,16 @@ export class RetainedTurnRunner {
       const request = this.requestFor(retained, input, prompt, interactions, interactionPolicy, config, contextMessages,
         options.childLineage)
       await this.admitSubscription?.(request, backend.name, run.signal)
+      // Read the working repository before the harness runs, so commits made by this turn are told from earlier ones.
+      await this.changes?.begin({
+        sessionId: id,
+        backend: retained.backend,
+        turnId: input.turn_id ?? executionId,
+        runId,
+        cwd: retained.cwd,
+        priorTurns: retained.turns,
+        nativeSessionId: () => this.store.getRetained(id)?.internalId ?? run.nativeSession()?.providerSessionId() ?? null,
+      }, run)
       try {
         if (!native) {
           native = await backend.startNativeSession(request, sessionRecordFor(retained), run.signal)
