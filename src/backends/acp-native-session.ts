@@ -189,14 +189,17 @@ export class AcpNativeSession implements NativeSession {
     if (steer === 'prompt') {
       let timer: NodeJS.Timeout | undefined
       const replaced = new Promise<void>((resolve, reject) => {
-        state.replacing.push(resolve)
+        // The receipt is queued as the replaced prompt's answer is read, so it never follows the turn's end.
+        state.replacing.push(() => {
+          if (!state.settled) this.enqueue({ ...receipt, state: 'applied' })
+          resolve()
+        })
         timer = setTimeout(() => reject(new BackendError(
           `${this.options.name} acp did not end its running prompt within ${this.options.requestTimeoutMs}ms of the steer`, 'timeout')), this.options.requestTimeoutMs)
         timer.unref?.()
       })
       this.prompt(state, this.sessionId, prompt)
       try { await replaced } finally { clearTimeout(timer) }
-      if (!state.settled) this.enqueue({ ...receipt, state: 'applied' })
       return
     }
     state.steering += 1

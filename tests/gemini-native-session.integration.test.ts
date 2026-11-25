@@ -93,7 +93,10 @@ describe('a retained Gemini session through the Bridge', () => {
   /** A run's events, read to its end. */
   const runEvents = async (runId: string) => {
     const response = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(runId)}/events`, { signal: AbortSignal.timeout(15_000) })
-    return (await response.text()).split('\n').filter((line) => line.startsWith('data:')).map((line) => JSON.parse(line.slice(5)) as Record<string, any>)
+    return (await response.text()).split('\n').filter((line) => line.startsWith('data:')).map((line) => {
+      const event = JSON.parse(line.slice(5)) as Record<string, any>
+      return (event.event ?? event) as Record<string, any>
+    })
   }
   const textOf = (events: Array<Record<string, any>>) => events
     .filter((event) => event.type === 'message.part.updated' && event.part?.type === 'text' && typeof event.delta === 'string').map((event) => event.delta).join('')
