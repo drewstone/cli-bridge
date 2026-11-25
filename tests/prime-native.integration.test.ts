@@ -47,16 +47,16 @@ lines.on('line', (line) => {
   const ok = (data) => out({ type: 'response', id: command.id, command: command.type, success: true, ...(data ? { data } : {}) })
   if (command.type === 'get_state') {
     const state = { sessionId: 'prime-fixture-session', messageCount: messages, isStreaming: streaming, isCompacting: false }
-    // A loaded host answers late; the Bridge asks get_state after a turn's run has ended.
-    if (slowState) { slowState = false; return void setTimeout(() => ok(state), 1500) }
+    // A loaded host answers late, including the get_state the Bridge asks after a turn's run has ended.
+    if (slowState) return void setTimeout(() => ok(state), 1500)
     return ok(state)
   }
   if (command.type === 'prompt') {
+    slowState = command.message === 'settle slowly'
     ok()
     streaming = true
     out({ type: 'agent_start' })
     if (command.message === 'wait') { waiting = true; return }
-    if (command.message === 'settle slowly') slowState = true
     if (command.message === 'mcp') return void callMcp().then(finish)
     return finish('echo ' + command.message)
   }
