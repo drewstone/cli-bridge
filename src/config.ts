@@ -26,13 +26,25 @@ export const localHarnesses = [
 ] as const
 
 /**
+ * Agents driven over ACP (AcpBackend): backend name (the model id and the `<NAME>_BIN` variable), harness
+ * id, default binary. How each one starts and steers is in backends/acp-agents.ts.
+ */
+export const acpHarnesses = [
+  ['hermes', 'hermes', 'hermes'],
+  ['copilot', 'github-copilot', 'copilot'],
+  ['qwen', 'qwen-code', 'qwen'],
+  ['grok', 'grok', 'grok'],
+] as const
+export type AcpHarnessName = typeof acpHarnesses[number][0]
+
+/**
  * Local drivers registered by the server. This is routing metadata, not proof
  * of installation, authentication, model availability or profile capabilities.
  * Consumers must still use the selected driver's admission contract.
  */
 export const localBackends = [
   ...localHarnesses.map(([name, harness]) => ({ name, harness, kind: 'native' as const })),
-  { name: 'hermes', harness: 'hermes', kind: 'acp' },
+  ...acpHarnesses.map(([name, harness]) => ({ name, harness, kind: 'acp' as const })),
   { name: 'openclaw', harness: 'openclaw', kind: 'openclaw' },
   { name: 'prime', harness: 'prime', kind: 'prime' },
 ] as const
@@ -40,6 +52,7 @@ export const localBackends = [
 type NativeHarnessConfig = {
   [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string
 } & { [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number }
+type AcpHarnessConfig = { [Key in AcpHarnessName as `${Key}Bin`]: string }
 
 /** Operator assertion only; never accepted from a request or exposed as a capability key. */
 export const JAIL_HOST_EGRESS_ENV = 'BRIDGE_JAIL_HOST_EGRESS_ENFORCED'
@@ -63,7 +76,7 @@ export function configuredJailBackend(env: NodeJS.ProcessEnv = process.env): Lin
   throw new Error(`invalid ${JAIL_BACKEND_ENV}: expected bwrap|landlock`)
 }
 
-export interface Config extends NativeHarnessConfig {
+export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
   host: string
   port: number
   bearer: string | null
@@ -73,8 +86,7 @@ export interface Config extends NativeHarnessConfig {
   backends: Set<string>
   /** Dedicated subscription consumers refuse API and unverified native routes. */
   subscriptionsOnly: boolean
-  /** hermes, driven via `hermes acp` (AcpBackend); openclaw, via `openclaw agent --local` (OpenclawBackend). */
-  hermesBin: string
+  /** openclaw, driven via `openclaw agent --local` (OpenclawBackend). */
   openclawBin: string
   primeBin: string
   primeTimeoutMs: number
@@ -232,7 +244,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? (name === 'cursor' ? 'cursor-agent' : name)],
       [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], name === 'codex' && !env.CLI_TIMEOUT_MS ? maxCodexSubscriptionTurnMs : defaultTimeout)],
     ])) as NativeHarnessConfig,
-    hermesBin: env.HERMES_BIN ?? 'hermes',
+    ...Object.fromEntries(acpHarnesses.map(([name, , bin]) => [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? bin])) as AcpHarnessConfig,
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     primeBin: env.PRIME_BIN ?? 'prime-agent',
     primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),

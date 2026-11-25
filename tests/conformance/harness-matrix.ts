@@ -112,10 +112,13 @@ async function runText(bridge: BridgeServer, runId: string): Promise<{ text: str
 const USAGE = { prompt: 1234, completion: 56 }
 // prime-agent 0.10 offers its model one tool, a Python REPL, and mounts an MCP server there as
 // `mcp.call_tool(server, tool, args)` (its system prompt's "Generic MCP Connections"), so prime's script
-// calls the REPL; every other harness offers the MCP tool itself.
+// calls the REPL. Grok CLI 1.0.88 offers MCP tools only through its `use_tool` tool, by `<server>__<tool>`.
+// Every other harness offers the MCP tool itself.
 const scriptedMcpCall = (harness: string, tool: string, args: Record<string, unknown>) => harness === 'prime'
   ? `Call the tool python_repl with exactly ${JSON.stringify({ code: `print(await mcp.call_tool('conformance', '${tool}', ${JSON.stringify(args)}))` })}`
-  : `Call the tool *${tool} with exactly ${JSON.stringify(args)}`
+  : harness === 'grok'
+    ? `Call the tool use_tool with exactly ${JSON.stringify({ tool_name: `conformance__${tool}`, tool_input: args })}`
+    : `Call the tool *${tool} with exactly ${JSON.stringify(args)}`
 
 // One MCP tool that writes `<dir>/<nonce>.nonce` and answers with the nonce, so a turn proves both effects.
 const nonceServer = (dir: string) => `const fs=require('node:fs'),path=require('node:path'),rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{let r;try{r=JSON.parse(line)}catch{return}if(r.id===undefined)return;let result={};if(r.method==='initialize')result={protocolVersion:(r.params&&r.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}};else if(r.method==='tools/list')result={tools:[{name:'write_nonce',description:'Writes the nonce file and returns the nonce.',inputSchema:{type:'object',properties:{nonce:{type:'string'}},required:['nonce']}},{name:'wait_seconds',description:'Waits the given number of seconds, then returns.',inputSchema:{type:'object',properties:{seconds:{type:'number'}},required:['seconds']}}]};else if(r.method==='tools/call'&&r.params&&r.params.name==='wait_seconds'){const seconds=Number(r.params.arguments&&r.params.arguments.seconds)||0;setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result:{content:[{type:'text',text:'waited '+seconds+' seconds'}]}})+'\\n'),seconds*1000);return}else if(r.method==='tools/call'){const nonce=String((r.params&&r.params.arguments&&r.params.arguments.nonce)||'');fs.writeFileSync(path.join(${JSON.stringify(dir)},nonce+'.nonce'),nonce);result={content:[{type:'text',text:'nonce '+nonce+' written'}]}}process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
