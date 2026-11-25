@@ -44,11 +44,11 @@ afterEach(async () => {
   rmSync(cwd, { recursive: true, force: true })
 })
 
-async function post(events: unknown[], stream = false) {
+async function post(events: unknown[], stream = false, extra: Record<string, unknown> = {}) {
   writeFileSync(join(cwd, 'events.json'), JSON.stringify(events))
   return app.request('/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: 'gemini/gemini-2.5-flash', cwd, stream, session_id: 'caller-session',
-      messages: [{ role: 'user', content: 'caller prompt must not be an answer' }] }) })
+      messages: [{ role: 'user', content: 'caller prompt must not be an answer' }], ...extra }) })
 }
 
 function frames(text: string): any[] {
@@ -123,19 +123,24 @@ it.each([
   expect(body.usage.cost_known).toBe(false)
 })
 
-it('gives the CLI its API route and the workspace trust, and keeps a trust setting the operator made', async () => {
+it('gives the CLI its API route, and trusts the project settings only for a turn whose configuration it wrote there', async () => {
   const names = ['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GEMINI_CLI_TRUST_WORKSPACE', 'GEMINI_UNRELATED'] as const
   const saved = names.map((name) => [name, process.env[name]] as const)
-  const launched = () => JSON.parse(readFileSync(join(cwd, 'launch-env.json'), 'utf8')) as Record<string, string | null>
+  const launched = () => ({ env: JSON.parse(readFileSync(join(cwd, 'launch-env.json'), 'utf8')) as Record<string, string | null>,
+    args: JSON.parse(readFileSync(join(cwd, 'launch.json'), 'utf8')) as string[] })
+  const route = { GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router' }
   try {
-    Object.assign(process.env, { GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router', GEMINI_UNRELATED: 'stays with the Bridge' })
-    delete process.env.GEMINI_CLI_TRUST_WORKSPACE
+    // The Bridge's own environment cannot state the trust: only what the Bridge wrote decides it.
+    Object.assign(process.env, { ...route, GEMINI_UNRELATED: 'stays with the Bridge', GEMINI_CLI_TRUST_WORKSPACE: 'true' })
     expect((await post([init, answer, result])).status).toBe(200)
-    expect(launched()).toEqual({ GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router',
-      GEMINI_CLI_TRUST_WORKSPACE: 'true', GEMINI_UNRELATED: null })
-    process.env.GEMINI_CLI_TRUST_WORKSPACE = 'false'
-    expect((await post([init, answer, result])).status).toBe(200)
-    expect(launched().GEMINI_CLI_TRUST_WORKSPACE).toBe('false')
+    expect(launched().env).toEqual({ ...route, GEMINI_CLI_TRUST_WORKSPACE: null, GEMINI_UNRELATED: null })
+    expect(launched().args).toContain('--skip-trust')
+
+    const mounted = await post([init, answer, result], false, { session_id: 'profiled-session', agent_profile: { name: 'fixture',
+      mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: join(cwd, 'server.cjs') }] } } } })
+    expect(mounted.status, await mounted.clone().text()).toBe(200)
+    expect(launched().env).toEqual({ ...route, GEMINI_CLI_TRUST_WORKSPACE: 'true', GEMINI_UNRELATED: null })
+    expect(launched().args).toContain('--skip-trust')
   } finally {
     for (const [name, value] of saved) {
       if (value === undefined) delete process.env[name]

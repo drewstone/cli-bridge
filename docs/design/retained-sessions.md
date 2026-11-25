@@ -318,7 +318,7 @@ On a host whose Codex login is a file-backed subscription, an unconfined session
 ## Gemini CLI native implementation
 
 One `gemini --acp` (Gemini CLI's Agent Client Protocol server) serves every turn of a session, launched as a one-shot `gemini --prompt` turn is: the same model, profile workspace, environment and subscription admission (`src/backends/gemini.ts` `startNativeSession`).
-The session is created with `session/new` (or continued with `session/load`), and the profile's MCP servers go inline in that request, so none is written to the workspace.
+The session is created with `session/new` (or continued with `session/load`), and the turn's MCP servers go inline in that request, so none is written to the workspace.
 No approval mode is passed: Gemini asks `session/request_permission` for each tool call, which reaches the Bridge and is answered by the turn's interaction policy.
 Gemini's message chunks carry no `messageId`, so a turn's text is one part.
 
@@ -328,7 +328,11 @@ The steer is `accepted` when Gemini answers the prompt it replaced, when the run
 Measured on Gemini CLI 0.68.0.
 
 Gemini reads a Gemini API route from `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL`, which the Bridge passes to it on both paths, and with a key it needs `security.auth.selectedType: gemini-api-key` in the user's `~/.gemini/settings.json`.
-The Bridge sets `GEMINI_CLI_TRUST_WORKSPACE=true` unless the operator set it: in a folder Gemini does not trust it ignores the project settings, where a one-shot turn's MCP servers are written, and lowers the approval mode.
+
+In a folder Gemini does not trust, a one-shot run exits 55 before any request, and an ACP session ignores GEMINI.md and the MCP servers of `session/new`.
+The Bridge passes `--skip-trust` on both paths, which runs them with the requested approval mode, GEMINI.md and those servers while Gemini still ignores the workspace's project settings (`<cwd>/.gemini/settings.json`).
+It sets `GEMINI_CLI_TRUST_WORKSPACE=true`, which makes Gemini read those settings, exactly when it wrote project configuration into the workspace: a profile, or a one-shot turn's MCP servers.
+A workspace's own project settings are otherwise not loaded, and the Bridge's own environment cannot state the trust; an operator who trusts every workspace says so in Gemini's user settings.
 
 ## MCP and ACP boundary
 

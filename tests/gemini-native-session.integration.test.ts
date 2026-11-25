@@ -64,8 +64,8 @@ describe('a retained Gemini session through the Bridge', () => {
   const saved = [...Object.keys(route), 'GEMINI_CLI_TRUST_WORKSPACE'].map((name) => [name, process.env[name]] as const)
   let root: string, bridge: BridgeServer
   beforeAll(async () => {
-    Object.assign(process.env, route)
-    delete process.env.GEMINI_CLI_TRUST_WORKSPACE
+    // The Bridge's own environment cannot state the trust: only what the Bridge wrote decides it.
+    Object.assign(process.env, { ...route, GEMINI_CLI_TRUST_WORKSPACE: 'true' })
     root = await realpath(await mkdtemp(join(tmpdir(), 'gemini-native-')))
     await mkdir(join(root, 'bin'))
     const bin = join(root, 'bin', 'gemini.cjs')
@@ -102,11 +102,11 @@ describe('a retained Gemini session through the Bridge', () => {
     .filter((event) => event.type === 'message.part.updated' && event.part?.type === 'text' && typeof event.delta === 'string').map((event) => event.delta).join('')
   /** The steer receipts a run carries: raw events from the agent session. */
   const steersOf = (events: Array<Record<string, any>>) => events.filter((event) => event.type === 'raw' && event.event?.type === 'steer').map((event) => event.event)
-  const open = async (name: string) => {
+  const open = async (name: string, profiled = true) => {
     const cwd = join(root, `${name}-${randomBytes(3).toString('hex')}`), id = `${name}-${randomBytes(3).toString('hex')}`
     await mkdir(cwd)
-    const created = await post('/v1/sessions', { id, model: 'gemini/fixture-model', cwd, interaction_policy: 'unattended-allow',
-      agent_profile: { name: 'fixture', mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: join(cwd, 'server.cjs') }] } } } })
+    const created = await post('/v1/sessions', { id, model: 'gemini/fixture-model', cwd, interaction_policy: 'unattended-allow', ...(profiled ? {
+      agent_profile: { name: 'fixture', mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: join(cwd, 'server.cjs') }] } } } } : {}) })
     expect(created.status, JSON.stringify(created.body)).toBeLessThan(300)
     const turn = async (n: number, message: string) => {
       const begun = await post(`/v1/sessions/${id}/turns`, { message, turn_id: `${id}-${n}`, run_id: `${id}-${n}-run`, execution_id: `${id}-${n}-execution` })
@@ -122,7 +122,7 @@ describe('a retained Gemini session through the Bridge', () => {
     return { id, cwd, turn, mine }
   }
 
-  it('keeps one `gemini --acp` across turns, started with the model, the API route, the workspace trust and the profile\'s MCP server', async () => {
+  it('keeps one `gemini --acp` across turns, started with the model, the API route, the profile\'s MCP server and trust in the profile\'s project settings', async () => {
     const session = await open('retained')
     expect(textOf(await runEvents(await session.turn(1, 'first')))).toBe('echo first')
     expect(textOf(await runEvents(await session.turn(2, 'repeat')))).toBe('echo first')
@@ -130,7 +130,7 @@ describe('a retained Gemini session through the Bridge', () => {
     const launches = mine.filter((call) => call.launch)
     expect(launches).toHaveLength(1)
     // No approval mode: the CLI asks, and the turn's interaction policy answers.
-    expect(launches[0]!.launch).toEqual(['--acp', '--model', 'fixture-model'])
+    expect(launches[0]!.launch).toEqual(['--acp', '--skip-trust', '--model', 'fixture-model'])
     expect(launches[0]!.env).toEqual({ GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router',
       GEMINI_CLI_TRUST_WORKSPACE: 'true', GEMINI_UNRELATED: null })
     const created = mine.filter((call) => call.method === 'session/new')
@@ -138,6 +138,16 @@ describe('a retained Gemini session through the Bridge', () => {
     expect(created[0]!.params!.mcpServers).toEqual([{ name: 'conformance', command: process.execPath, args: [join(session.cwd, 'server.cjs')], env: [] }])
     expect(mine.filter((call) => call.method === 'session/prompt').map((call) => call.params!.prompt[0].text)).toEqual(['first', 'repeat'])
     await post(`/v1/sessions/${session.id}/close`, {})
+
+    // Without a profile the Bridge wrote nothing into the workspace, so its project settings stay untrusted.
+    const bare = await open('bare', false)
+    expect(textOf(await runEvents(await bare.turn(1, 'first')))).toBe('echo first')
+    const launch = (await bare.mine()).find((call) => call.launch)!
+    expect(launch.launch).toEqual(['--acp', '--skip-trust', '--model', 'fixture-model'])
+    expect(launch.env).toEqual({ GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router',
+      GEMINI_CLI_TRUST_WORKSPACE: null, GEMINI_UNRELATED: null })
+    expect((await bare.mine()).find((call) => call.method === 'session/new')!.params!.mcpServers).toEqual([])
+    await post(`/v1/sessions/${bare.id}/close`, {})
   }, 40_000)
 
   it('steers with a second prompt: the running tool call is aborted and the turn goes on with the steer\'s answer', async () => {

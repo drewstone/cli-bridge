@@ -946,7 +946,7 @@ into the profile when the flag is absent.
 | codex      | yes       | yes          | Isolated `CODEX_HOME` with per-turn `config.toml`         |
 | kimi       | yes       | no           | project-local `<cwd>/.kimi-code/mcp.json` (restored after the turn) |
 | opencode   | yes       | no           | `OPENCODE_CONFIG=<tempfile>` (opencode's per-config schema)   |
-| gemini     | yes       | yes          | project-local `<cwd>/.gemini/settings.json` (restored after the turn), read because the Bridge states workspace trust; inline in `session/new` for a retained session |
+| gemini     | yes       | yes          | project-local `<cwd>/.gemini/settings.json` (restored after the turn), which the Bridge tells Gemini to trust for that turn; inline in `session/new` for a retained session |
 
 **stdio**: every MCP-enabled backend loads stdio MCP servers — `command`, `args`,
 and `env` round-trip through the materialised config file unchanged

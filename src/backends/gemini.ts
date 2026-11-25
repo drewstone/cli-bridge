@@ -26,6 +26,7 @@ import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
 import { AcpNativeSession } from './acp-native-session.js'
 import { acpNativeCapabilities } from './acp.js'
 import { hostRequestJail } from '../jail/host-request.js'
+import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
@@ -58,7 +59,7 @@ export interface GeminiBackendOptions {
 
 /**
  * What the CLI reads its API route from, kept through the host sanitizer, with the Bridge's statement
- * of workspace trust. These names are not request-controlled.
+ * of trust in the project settings it wrote. These names are not request-controlled.
  */
 export const GEMINI_ENV_PASSTHROUGH_KEYS: readonly string[] = ['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GEMINI_CLI_TRUST_WORKSPACE']
 
@@ -66,14 +67,18 @@ export const GEMINI_ENV_PASSTHROUGH_KEYS: readonly string[] = ['GEMINI_API_KEY',
 const NATIVE_REQUEST_TIMEOUT_CAP_MS = 60_000
 
 /**
- * The CLI's folder trust, which the Bridge states unless the operator set it. In a folder it does not
- * trust, Gemini CLI 0.68 ignores the project settings, so the MCP servers the Bridge writes there never
- * load, and it lowers the requested approval mode to `default`. `--skip-trust` keeps the approval mode
- * and still ignores the project settings; this variable restores both. The caller named the workspace
- * for the agent to work in, which is the trust the CLI asks about.
+ * How the Bridge states folder trust to the CLI. Measured on Gemini CLI 0.68: in a folder it does not
+ * trust, a one-shot run exits 55 before any request, and an ACP session ignores GEMINI.md and the MCP
+ * servers of `session/new`. `--skip-trust` runs both with the requested approval mode, GEMINI.md and
+ * those servers, and still ignores the workspace's project settings (`<cwd>/.gemini/settings.json`);
+ * `GEMINI_CLI_TRUST_WORKSPACE=true` makes the CLI read them. So every run passes the flag, and the
+ * variable is set exactly when the Bridge wrote project configuration into the workspace: a profile,
+ * or a one-shot turn's MCP servers. A workspace's own project settings are otherwise not loaded; an
+ * operator who trusts every workspace says so in the CLI's user settings, not in the Bridge's environment.
  */
-function workspaceTrustEnv(): Record<string, string> {
-  return process.env.GEMINI_CLI_TRUST_WORKSPACE === undefined ? { GEMINI_CLI_TRUST_WORKSPACE: 'true' } : {}
+const SKIP_TRUST_FLAG = '--skip-trust'
+function projectSettingsTrust(bridgeConfigured: boolean): Record<string, string> {
+  return bridgeConfigured ? { GEMINI_CLI_TRUST_WORKSPACE: 'true' } : {}
 }
 
 export class GeminiBackend implements NativeSessionBackend {
@@ -102,21 +107,22 @@ export class GeminiBackend implements NativeSessionBackend {
 
   /**
    * One retained `gemini --acp` per Bridge session, started as a one-shot turn is: the same model,
-   * profile workspace, environment and subscription admission. The profile's MCP servers go inline in
-   * `session/new`, so none is written to the workspace. No approval mode is passed: the CLI asks
-   * permission for each tool call and the turn's interaction policy answers it. A steer is a second
-   * prompt, which ends the running one and aborts its tool call.
+   * profile workspace, environment and subscription admission. The turn's MCP servers go inline in
+   * `session/new`, so none is written to the workspace, and the project settings are trusted only
+   * for a profile. No approval mode is passed: the CLI asks permission for each tool call and the
+   * turn's interaction policy answers it. A steer is a second prompt, which ends the running one
+   * and aborts its tool call.
    */
   async startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'gemini hosted modes require a verified tool-disable and sandbox contract')
     // The chat route resolves a one-shot's jail; a retained session starts here, so it resolves its own.
     req.jailSpec ??= hostRequestJail(req, this.name, this.opts.jailEnv ?? process.env)
-    const { cwd, model, provisioned, env } = this.prepare(req, session)
+    const { cwd, model, provisioned, profiled, env } = this.prepare(req, session)
     const sandbox = geminiSandboxFlag()
-    const args = ['--acp', ...(sandbox ? [sandbox] : []), ...(model ? ['--model', model] : []), ...provisioned.flags]
+    const args = ['--acp', SKIP_TRUST_FLAG, ...(sandbox ? [sandbox] : []), ...(model ? ['--model', model] : []), ...provisioned.flags]
     const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
-    const { spawned, invocation } = await this.spawn(req, args, cwd, env, provisioned.flags, signal)
+    const { spawned, invocation } = await this.spawn(req, args, cwd, { ...env, ...projectSettingsTrust(profiled) }, provisioned.flags, signal)
     const spawnError = spawned.spawnError?.()
     if (spawnError || !spawned.child.stdin || !spawned.child.stdout) {
       await terminateSpawned(spawned).finally(() => spawned.release())
@@ -148,7 +154,10 @@ export class GeminiBackend implements NativeSessionBackend {
     })
   }
 
-  /** What a one-shot turn and a retained session start from: the model, the workspace with the profile applied, and the child's environment. */
+  /**
+   * What a one-shot turn and a retained session start from: the model, the workspace with the profile
+   * applied (`profiled`), and the child's environment, without any ambient statement of folder trust.
+   */
   private prepare(req: ChatRequest, session: SessionRecord | null) {
     const model = this.extractModel(req.model)
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
@@ -161,7 +170,9 @@ export class GeminiBackend implements NativeSessionBackend {
       cwd,
       profileExecutionIdentity(req, session, 'gemini', null),
     )
-    return { model, cwd, provisioned, env: { ...process.env, ...workspaceTrustEnv(), ...provisioned.env } }
+    const env: NodeJS.ProcessEnv = { ...process.env, ...provisioned.env }
+    delete env.GEMINI_CLI_TRUST_WORKSPACE
+    return { model, cwd, provisioned, profiled: provisioned.workspacePlanDigest !== undefined, env }
   }
 
   /** Admit the launch against the request's subscription policy, then start the CLI. */
@@ -193,8 +204,8 @@ export class GeminiBackend implements NativeSessionBackend {
       'gemini hosted modes require a verified tool-disable and sandbox contract')
 
     const prompt = this.buildPrompt(req, session)
-    const { cwd, model, provisioned, env } = this.prepare(req, session)
-    const args = this.buildArgs(req.model)
+    const { cwd, model, provisioned, profiled, env } = this.prepare(req, session)
+    const args = [...this.buildArgs(req.model), SKIP_TRUST_FLAG]
     if (model) args.push('--model', model)
     if (session?.internalId) args.push('--resume', session.internalId)
     args.push(...provisioned.flags)
@@ -208,7 +219,8 @@ export class GeminiBackend implements NativeSessionBackend {
 
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      spawned = (await this.spawn(req, args, cwd, env, provisioned.flags)).spawned
+      const trust = projectSettingsTrust(profiled || mcpMaterialized !== null)
+      spawned = (await this.spawn(req, args, cwd, { ...env, ...trust }, provisioned.flags)).spawned
     } catch (error) {
       mcpMaterialized?.cleanup()
       throw error
@@ -517,9 +529,10 @@ function extractText(ev: Record<string, unknown>): string | null {
 
 /**
  * What a retained Gemini session proves: an ACP session's continuation and permission requests, with
- * the profile's system prompt applied as on a one-shot turn (`.gemini/system.md`).
+ * the profile surfaces of a one-shot turn, because the session starts from the same provisioned
+ * workspace. Measured on Gemini CLI 0.68 over ACP: `.gemini/system.md` replaces the base prompt,
+ * and GEMINI.md and the project settings are read.
  */
 export function geminiNativeCapabilities(): AgentEnvironmentCapabilities {
-  const acp = acpNativeCapabilities('gemini')
-  return { ...acp, profile: { ...acp.profile, systemPrompt: { replace: true, append: false } } }
+  return { ...acpNativeCapabilities('gemini'), profile: genericCliBridgeCapabilities('gemini').profile }
 }
