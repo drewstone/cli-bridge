@@ -4,7 +4,8 @@
 // a command asks `item/commandExecution/requestApproval` and an MCP tool call asks `mcpServer/elicitation/request`;
 // `turn/interrupt` ends the turn `interrupted`. The scripted model reads the turn's last user message:
 // `wait <s>` runs the MCP tool wait_seconds for s seconds, `run <file>` asks approval for a command that writes it,
-// `mcp <nonce>` asks approval for an MCP tool call, `remember <word>` and `recall` span turns.
+// `mcp <nonce>` asks approval for an MCP tool call, `commit <file> [branch]` commits a new file in the working
+// repository and pushes it to `branch` of origin, `remember <word>` and `recall` span turns.
 // Launch arguments, the effective config and every request are appended to codex-fixture.log in the working
 // directory, one JSON line each; the Router key is logged only as present or absent.
 const fs = require('node:fs')
@@ -48,7 +49,7 @@ async function runTurn(threadId, turnId, text) {
     notify('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: { total: { ...usage }, last, modelContextWindow: 1000 } })
   }
   let reply
-  const [verb, arg] = text.split(/\s+/u)
+  const [verb, arg, branch] = text.split(/\s+/u)
   if (verb === 'wait') {
     const id = `call_${randomUUID()}`
     const tool = { type: 'mcpToolCall', id, server: 'conformance', tool: 'wait_seconds', status: 'inProgress', arguments: { seconds: Number(arg) }, result: null, error: null }
@@ -89,6 +90,14 @@ async function runTurn(threadId, turnId, text) {
     item(threadId, turnId, { ...tool, status: accepted ? 'completed' : 'failed', result: accepted ? { content: [{ type: 'text', text: `nonce ${arg} written` }] } : null,
       error: accepted ? null : { message: 'user rejected MCP tool call' } }, false)
     reply = accepted ? `Tool write_nonce returned: nonce ${arg} written` : 'REFUSED'
+  } else if (verb === 'commit') {
+    // `commit <file> [branch]`: commit a new file in the working repository and push it to `branch` of origin.
+    const git = (...args) => require('node:child_process').execFileSync('git', args, { cwd: process.cwd(), stdio: 'ignore' })
+    fs.writeFileSync(path.join(process.cwd(), arg), `${arg}\n`)
+    git('add', arg)
+    git('commit', '-m', `fixture ${arg}`)
+    if (branch) git('push', 'origin', `HEAD:refs/heads/${branch}`)
+    reply = 'COMMITTED'
   } else if (verb === 'remember') {
     thread.memory = arg
     reply = 'OK'

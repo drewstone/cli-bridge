@@ -8,6 +8,7 @@
  */
 
 import { JAIL_RO_PATHS_ENV, JAIL_RW_PATHS_ENV, jailFloor, parseJailNetwork, parseJailPathList, parseRelayAllow } from './jail/resolve-spec.js'
+import { defaultChangeLedgerDir } from './change-ledger/recorder.js'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 
@@ -168,6 +169,11 @@ export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
   jailWritablePaths: string[]
   /** OTLP span emission for chat requests. See {@link TraceConfig}. */
   trace: TraceConfig
+  /**
+   * The change ledger Bridge writes for each turn (`src/change-ledger/recorder.ts`): the directory holding
+   * `changes.jsonl`. `BRIDGE_CHANGE_LEDGER=off` omits it; `CHANGE_LEDGER_DIR` names the directory, as it does for the hooks.
+   */
+  changeLedger?: { dir: string }
 }
 
 /**
@@ -285,6 +291,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     jailRoot: env.BRIDGE_JAIL_ROOT?.trim() || null,
     ...resolveJailPathLists(env),
     trace: parseTraceConfig(env, dataDir),
+    ...(parseOnOff('BRIDGE_CHANGE_LEDGER', env.BRIDGE_CHANGE_LEDGER, true) ? { changeLedger: { dir: resolve(defaultChangeLedgerDir(env)) } } : {}),
   }
 }
 
