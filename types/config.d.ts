@@ -16,6 +16,12 @@ export declare const localHarnesses: readonly [readonly ['claude', 'claude-code'
 export declare const acpHarnesses: readonly [readonly ['hermes', 'hermes', 'hermes'], readonly ['copilot', 'github-copilot', 'copilot'], readonly ['qwen', 'qwen-code', 'qwen'], readonly ['grok', 'grok', 'grok'], readonly ['dsh', 'deepseek-harness', 'dsh']];
 export type AcpHarnessName = typeof acpHarnesses[number][0];
 /**
+ * Agents run one process per turn (OneShotBackend): backend key (the `<KEY>_BIN` variable), harness id,
+ * default binary. How each one starts and is read is in backends/one-shot-agents.ts.
+ */
+export declare const oneShotHarnesses: readonly [readonly ['droid', 'factory-droids', 'droid'], readonly ['nanocode', 'nanocode', 'nc'], readonly ['exo', 'exo', 'exo']];
+export type OneShotHarnessName = typeof oneShotHarnesses[number][0];
+/**
  * Local drivers registered by the server. This is routing metadata, not proof
  * of installation, authentication, model availability or profile capabilities.
  * Consumers must still use the selected driver's admission contract.
@@ -28,6 +34,10 @@ export declare const localBackends: readonly [...({
     name: "copilot" | "dsh" | "grok" | "hermes" | "qwen";
     harness: "deepseek-harness" | "github-copilot" | "grok" | "hermes" | "qwen-code";
     kind: 'acp';
+} | {
+    name: "droid" | "exo" | "nanocode";
+    harness: "exo" | "factory-droids" | "nanocode";
+    kind: 'one-shot';
 })[], {
     readonly name: 'openclaw';
     readonly harness: 'openclaw';
@@ -43,7 +53,7 @@ type NativeHarnessConfig = {
     [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number;
 };
 type AcpHarnessConfig = {
-    [Key in AcpHarnessName as `${Key}Bin`]: string;
+    [Key in AcpHarnessName | OneShotHarnessName as `${Key}Bin`]: string;
 };
 /** Operator assertion only; never accepted from a request or exposed as a capability key. */
 export declare const JAIL_HOST_EGRESS_ENV = "BRIDGE_JAIL_HOST_EGRESS_ENFORCED";

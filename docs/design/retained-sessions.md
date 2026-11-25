@@ -346,6 +346,14 @@ A one-shot turn runs the agent in its own unattended mode (`--allow-all`, `--app
 
 Measured on Copilot CLI 1.0.113, Qwen Code 0.28.0, Grok CLI 1.0.88 and DeepSeek Harness 0.2.2-rc.1.
 
+## Factory Droid, nanocode and Exo: one-shot agents
+
+These have no retained native session. Each turn is one process on `OneShotBackend` (`src/backends/one-shot.ts`), and a later turn of the same `session_id` resumes the native session the previous one named (`--session-id`, `-r`, `--thread`). Their launch, MCP, session and usage rules are in `src/backends/one-shot-agents.ts`. The model id is the harness id (`factory-droids`, `nanocode`, `exo`) or its key (`droid`), optionally followed by `/<model>`.
+
+- Droid runs `droid exec --output-format stream-json`: its ACP mode refuses `session/new` without a Factory login. The turn's MCP servers go in a private `--settings` file; Droid offers MCP tools to its model through its `ToolSearch` tool. Its usage totals the session, so a turn reports what it added.
+- nanocode's `nc exec` reads no MCP server configuration, so a turn with MCP servers is refused. Its usage is read from its OpenTelemetry trace export.
+- Exo takes MCP servers by URL only, so the Bridge serves the turn's stdio servers by URL (`src/backends/mcp-url-relay.ts`). Its route is `EXO_MODEL_BASE_URL` and `EXO_MODEL_API_KEY`, the key held as a vault secret for the turn. A thread resumes only under the agent definition it was created with, so a Bridge session keeps one under `$EXO_HOME/bridge-agents/`.
+
 ## MCP and ACP boundary
 
 The generic MCP implementation belongs to `@tangle-network/sdk-provider-cli-base`.

@@ -24,6 +24,8 @@ import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
 import { AcpBackend } from './backends/acp.js'
 import { acpAgentLaunch } from './backends/acp-agents.js'
+import { OneShotBackend } from './backends/one-shot.js'
+import { oneShotAgents } from './backends/one-shot-agents.js'
 import { OpenclawBackend } from './backends/openclaw.js'
 import { PrimeBackend } from './backends/prime.js'
 import { SandboxBackend } from './backends/sandbox.js'
@@ -170,6 +172,9 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     } else if (kind === 'acp') {
       registry.register(new AcpBackend({ ...acpAgentLaunch[name], name: harness, alias: name, bin: config[`${name}Bin`],
         timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
+    } else if (kind === 'one-shot') {
+      registry.register(new OneShotBackend({ name: harness, alias: name, bin: config[`${name}Bin`], agent: oneShotAgents[name],
+        timeoutMs: config.cliTimeoutMsDefault }))
     } else if (kind === 'openclaw') {
       registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'prime') {
