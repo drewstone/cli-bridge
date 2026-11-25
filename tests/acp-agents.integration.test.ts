@@ -165,8 +165,8 @@ describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through
       const body = await response.json() as { choices?: Array<{ message: { content: string } }>; usage?: Record<string, unknown>; error?: unknown }
       expect(response.status, JSON.stringify(body.error)).toBe(200)
       expect(body.choices?.[0]?.message.content).toBe('echo hi')
+      // A turn with no measured usage gets the Bridge's estimate.
       if (row.usage) expect(body.usage, row.model).toMatchObject(row.usage)
-      else expect(body.usage?.prompt_tokens ?? 0, row.model).toBe(0)
 
       const mine = await calls(cwd)
       const launch = mine.find((call) => call.method === 'launch')!
