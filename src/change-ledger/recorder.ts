@@ -97,7 +97,8 @@ export function defaultChangeLedgerDir(env: NodeJS.ProcessEnv = process.env): st
 type SessionState = 'observed' | 'incomplete'
 
 interface ActiveTurn {
-  top: string
+  /** The turn's session: its own consecutive turns never overlap, so they are never "shared". */
+  session: string
   shared: boolean
 }
 
@@ -131,24 +132,31 @@ export class ChangeRecorder {
         if (state === 'observed') this.setState(stateKey, 'incomplete')
         return
       }
-      const mine: ActiveTurn = { top: before.top, shared: false }
+      // A fresh session is observed from its first turn on; the row itself is written with that turn's rows.
+      const observes = kept && state === undefined
+      if (observes) this.setState(stateKey, 'observed')
+      const mine: ActiveTurn = { session: stateKey, shared: false }
       const sharing = this.active.get(before.top) ?? new Set<ActiveTurn>()
       for (const other of sharing) {
+        if (other.session === stateKey) continue
         other.shared = true
         mine.shared = true
       }
       sharing.add(mine)
       this.active.set(before.top, sharing)
+      const release = (): void => {
+        sharing.delete(mine)
+        if (sharing.size === 0 && this.active.get(before.top) === sharing) this.active.delete(before.top)
+      }
       const finished = run
         .whenTerminal()
         .catch(() => undefined)
-        .then(() => this.finish({ turn, harness, stateKey, kept, startedAt, before, mine, cwd: turn.cwd! }))
+        .then(() => this.finish({ turn, harness, stateKey, kept, observes, startedAt, before, mine, cwd: turn.cwd!, release }))
         .catch((error) => {
+          release()
+          // Rows this turn should have written are missing: the session no longer proves "no change".
+          if (kept) this.setState(stateKey, 'incomplete')
           console.error(`[cli-bridge] change ledger: turn ${turn.turnId} wrote no rows: ${error instanceof Error ? error.message : String(error)}`)
-        })
-        .finally(() => {
-          sharing.delete(mine)
-          if (sharing.size === 0 && this.active.get(before.top) === sharing) this.active.delete(before.top)
         })
       this.pending.add(finished)
       void finished.finally(() => this.pending.delete(finished))
@@ -168,14 +176,20 @@ export class ChangeRecorder {
     stateKey: string
     /** False for a one-shot run: no session state is read or written. */
     kept: boolean
+    /** This turn writes the session's `observed` row. */
+    observes: boolean
     startedAt: number
     before: RepoReading
     mine: ActiveTurn
     cwd: string
+    /** Leave the set of running turns of this checkout. */
+    release: () => void
   }): Promise<void> {
-    const { turn, harness, stateKey, kept, startedAt, before, mine, cwd } = input
+    const { turn, harness, stateKey, kept, observes, startedAt, before, mine, cwd, release } = input
     const endedAt = this.now()
     const after = await readRepo(cwd)
+    // The turn is over: later turns of this checkout no longer overlap it.
+    release()
     const state = kept ? this.stateOf(stateKey) : undefined
     if (after === null || after.top !== before.top) {
       if (kept) this.setState(stateKey, 'incomplete')
@@ -229,13 +243,12 @@ export class ChangeRecorder {
       ...rest,
     })
     const rows: ChangeLedgerRow[] = []
-    if (state === undefined) rows.push(row('observed'))
+    if (observes || !kept) rows.push(row('observed'))
     rows.push(row('turn', { headBefore: before.head, head: after.head, incomplete }))
     for (const sha of commits) rows.push(row('commit', { sha }))
     for (const push of pushes) rows.push(row('push', { sha: push.sha, branch: push.branch }))
     for (const pull of pulls) rows.push(row(pull.action, { pr: pull.pr }))
     this.append(rows)
-    if (kept && state === undefined) this.setState(stateKey, 'observed')
   }
 
   private append(rows: readonly ChangeLedgerRow[]): void {

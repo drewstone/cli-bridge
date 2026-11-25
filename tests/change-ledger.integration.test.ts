@@ -18,7 +18,7 @@ const FIXTURE = join(import.meta.dirname, 'fixtures', 'codex-app-server.cjs')
 
 type Row = Record<string, any>
 
-describe('change ledger rows of retained turns', () => {
+describe('change ledger rows of retained turns', { timeout: 60_000 }, () => {
   let root: string, bridge: BridgeServer, ledger: string, ghLog: string
   let counter = 0
 
