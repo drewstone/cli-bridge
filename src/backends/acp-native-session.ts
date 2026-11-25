@@ -19,6 +19,8 @@
  *   earlier turns still in its history.
  * - Its message chunks carry no `messageId`, and each tool call asks `session/request_permission`.
  *
+ * Copilot CLI, Qwen Code and Grok CLI are measured in acp-agents.ts.
+ *
  * Every `session/request_permission` reaches the Bridge, which answers it by the turn's interaction
  * policy; `session/cancel` stops the running prompt.
  */
@@ -62,6 +64,50 @@ export type AcpSteer =
    * aborting its tool call, and answers the input; the Bridge turn goes on with that answer.
    */
   | 'prompt'
+  /**
+   * As `prompt`, for an agent that queues a second `session/prompt` behind the running one (Grok CLI):
+   * the Bridge sends `session/cancel` first, so the agent ends the running prompt and answers the input.
+   */
+  | 'interrupt'
+
+/** ACP's token counts for a prompt, by the protocol's names. */
+export type AcpUsage = Partial<Record<typeof ACP_USAGE_KEYS[number], number>>
+const ACP_USAGE_KEYS = ['inputTokens', 'outputTokens', 'thoughtTokens', 'cachedReadTokens', 'cachedWriteTokens'] as const
+
+function acpUsageCounts(value: unknown): AcpUsage | undefined {
+  const source = record(value)
+  if (!source) return undefined
+  const counts: AcpUsage = {}
+  for (const key of ACP_USAGE_KEYS) {
+    const count = source[key]
+    if (typeof count === 'number' && Number.isFinite(count) && count >= 0) counts[key] = count
+  }
+  return Object.keys(counts).length > 0 ? counts : undefined
+}
+
+/**
+ * The tokens one prompt used, where the agent reports them: ACP's `usage` on the `session/prompt`
+ * result (hermes, Copilot CLI), else `_meta.usage` on it (Grok CLI), else the sum of the `_meta.usage`
+ * its message chunks carry, one per model call (Qwen Code).
+ */
+export function acpPromptUsage(result: unknown, chunkUsage: readonly unknown[]): AcpUsage | undefined {
+  const answer = record(result)
+  const reported = acpUsageCounts(answer?.usage) ?? acpUsageCounts(record(answer?._meta)?.usage)
+  if (reported) return reported
+  const summed: AcpUsage = {}
+  for (const counts of chunkUsage.map((usage) => acpUsageCounts(usage))) {
+    for (const key of ACP_USAGE_KEYS) {
+      const count = counts?.[key]
+      if (count !== undefined) summed[key] = (summed[key] ?? 0) + count
+    }
+  }
+  return Object.keys(summed).length > 0 ? summed : undefined
+}
+
+/** The `_meta.usage` a message chunk carries (Qwen Code reports each model call's usage this way). */
+export function acpChunkUsage(update: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  return update?.sessionUpdate === 'agent_message_chunk' ? record(record(update._meta)?.usage) : undefined
+}
 
 export interface AcpNativeSessionOptions {
   /** Backend name, used in errors. */
@@ -73,6 +119,8 @@ export interface AcpNativeSessionOptions {
   resumeSessionId: string | null
   /** How the agent takes input for its running turn, or null when it takes none. */
   steer: AcpSteer | null
+  /** True when a prompt result's usage totals every prompt the process has answered (Copilot CLI). */
+  cumulativeUsage?: boolean
   /** Bound on every request except a prompt. */
   requestTimeoutMs: number
   cleanup: () => void | Promise<void>
@@ -86,6 +134,8 @@ interface TurnState {
   prompts: number
   /** Steers waiting for the prompt they replaced to be answered, oldest first. */
   replacing: Array<() => void>
+  /** The `_meta.usage` of the turn's message chunks. */
+  chunkUsage: Record<string, unknown>[]
 }
 
 interface Permission {
@@ -106,6 +156,8 @@ export class AcpNativeSession implements NativeSession {
   private readonly queue: Record<string, unknown>[] = []
   private readonly readers: Waiter<Record<string, unknown>>[] = []
   private abortInFlight: Promise<void> | null = null
+  /** The usage totals of the process's last answered prompt, for an agent that reports totals. */
+  private usageTotals: AcpUsage = {}
 
   constructor(spawned: Awaited<ReturnType<Spawner>>, private readonly options: AcpNativeSessionOptions) {
     this.capabilities = options.capabilities
@@ -149,7 +201,7 @@ export class AcpNativeSession implements NativeSession {
     const sessionId = this.sessionId
     if (this.life.closed || !sessionId) throw new BackendError(`${this.options.name} native session is closed`, 'upstream')
     if (this.turnState) throw new BackendError(`${this.options.name} native session already has an active turn`, 'upstream')
-    const state: TurnState = { steering: 0, settled: false, prompts: 0, replacing: [] }
+    const state: TurnState = { steering: 0, settled: false, prompts: 0, replacing: [], chunkUsage: [] }
     this.turnState = state
     const onAbort = (): void => { void this.abort().catch(() => {}) }
     signal.addEventListener('abort', onAbort, { once: true })
@@ -186,7 +238,7 @@ export class AcpNativeSession implements NativeSession {
       throw new BackendError(`${this.options.name} native session has no running turn to steer`, 'upstream')
     }
     const receipt = { type: 'steer', ...(operationId ? { operationId } : {}) }
-    if (steer === 'prompt') {
+    if (steer === 'prompt' || steer === 'interrupt') {
       let timer: NodeJS.Timeout | undefined
       const replaced = new Promise<void>((resolve, reject) => {
         // The receipt is queued as the replaced prompt's answer is read, so it never follows the turn's end.
@@ -198,6 +250,7 @@ export class AcpNativeSession implements NativeSession {
           `${this.options.name} acp did not end its running prompt within ${this.options.requestTimeoutMs}ms of the steer`, 'timeout')), this.options.requestTimeoutMs)
         timer.unref?.()
       })
+      if (steer === 'interrupt') this.notify('session/cancel', { sessionId: this.sessionId })
       this.prompt(state, this.sessionId, prompt)
       try { await replaced } finally { clearTimeout(timer) }
       return
@@ -298,8 +351,18 @@ export class AcpNativeSession implements NativeSession {
     for (const accepted of state.replacing.splice(0)) accepted()
     if (outcome.error === undefined) this.completedTurns += 1
     const result = outcome.result !== null && typeof outcome.result === 'object' ? outcome.result as Record<string, unknown> : {}
+    let usage = acpPromptUsage(result, state.chunkUsage)
+    if (this.options.cumulativeUsage && usage) {
+      const totals = usage, delta: AcpUsage = {}
+      for (const key of ACP_USAGE_KEYS) {
+        const count = totals[key]
+        if (count !== undefined) delta[key] = Math.max(0, count - (this.usageTotals[key] ?? 0))
+      }
+      usage = delta
+      this.usageTotals = totals
+    }
     if (this.turnState === state) {
-      this.enqueue({ type: ACP_TURN_SETTLED, stopReason: result.stopReason, usage: result.usage,
+      this.enqueue({ type: ACP_TURN_SETTLED, stopReason: result.stopReason, usage,
         ...(outcome.error === undefined ? {} : { error: outcome.error }) })
     }
   }
@@ -376,6 +439,8 @@ export class AcpNativeSession implements NativeSession {
       // Outside a turn an update is a resumed session's replay, or a late frame of a settled turn.
       if (!state || state.settled || params.sessionId !== this.sessionId) return
       const update = record(params.update)
+      const chunkUsage = acpChunkUsage(update)
+      if (chunkUsage) state.chunkUsage.push(chunkUsage)
       if (state.steering > 0 && update?.sessionUpdate === 'agent_message_chunk' && update.messageId === undefined) {
         this.enqueue({ type: 'steer.receipt', update })
         return

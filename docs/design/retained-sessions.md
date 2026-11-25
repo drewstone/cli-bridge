@@ -334,6 +334,17 @@ The Bridge passes `--skip-trust` on both paths, which runs them with the request
 It sets `GEMINI_CLI_TRUST_WORKSPACE=true`, which makes Gemini read those settings, exactly when it wrote project configuration into the workspace: a profile, or a one-shot turn's MCP servers.
 A workspace's own project settings are otherwise not loaded, and the Bridge's own environment cannot state the trust; an operator who trusts every workspace says so in Gemini's user settings.
 
+## Copilot CLI, Qwen Code and Grok CLI native implementation
+
+Each is an ACP agent on `AcpBackend` (`src/backends/acp.ts`), with its launch, MCP, usage and steer rules in `src/backends/acp-agents.ts`. The model id is the backend name (`copilot`, `qwen`, `grok`) or the harness id (`github-copilot`, `qwen-code`, `grok`); each runs the model its own configuration names.
+A one-shot turn runs the agent in its own unattended mode (`--allow-all`, `--approval-mode yolo`, `--always-approve`), because it has no interaction policy to answer a permission request; a retained session runs without it, so each tool call asks `session/request_permission` and the turn's interaction policy answers it.
+
+- Copilot CLI ignores `mcpServers` in `session/new`, so the Bridge writes the turn's MCP servers to a private file it names with `--additional-mcp-config @<file>`. Its prompt result's usage totals every prompt the process has answered; a retained turn reports what its prompt added. A steer is a second `session/prompt`, as for Gemini.
+- Qwen Code discovers MCP servers in the background after `session/new`; the Bridge sets `QWEN_CODE_LEGACY_MCP_BLOCKING=1`, so the session opens with their tools listed. It reports each model call's usage on a message chunk's `_meta.usage`, which the Bridge sums. A steer is a second `session/prompt`, as for Gemini.
+- Grok CLI reports usage in its prompt result's `_meta.usage`. A second `session/prompt` waits behind the running one, so a steer sends `session/cancel` first: Grok answers the running prompt `cancelled` and answers the steer in the same session. Its model reaches MCP tools only through Grok's own `use_tool` tool, by `<server>__<tool>`.
+
+Measured on Copilot CLI 1.0.113, Qwen Code 0.28.0 and Grok CLI 1.0.88.
+
 ## MCP and ACP boundary
 
 The generic MCP implementation belongs to `@tangle-network/sdk-provider-cli-base`.

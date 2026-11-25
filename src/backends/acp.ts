@@ -16,14 +16,14 @@
  *   → session/cancel {sessionId}               when the turn is cancelled
  *
  * The agent answers with the model its own configuration names: the model id is the bare backend
- * name, and `<name>/<model>` is refused. One bin per backend instance (hermes→`hermes acp`,
- * openclaw→`openclaw acp`).
+ * name or the harness id, and `<name>/<model>` is refused. One bin per backend instance; how each
+ * agent starts, takes MCP servers, reports usage and steers is in acp-agents.ts.
  */
 
 import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
 import type { BackendHealth, ChatDelta, ChatMessage, ChatRequest, NativeSession, NativeSessionBackend } from './types.js'
 import { BackendError } from './types.js'
-import { AcpNativeSession, type AcpSteer } from './acp-native-session.js'
+import { AcpNativeSession, acpChunkUsage, acpPromptUsage, type AcpSteer, type AcpUsage } from './acp-native-session.js'
 import { hostRequestJail } from '../jail/host-request.js'
 import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -31,7 +31,7 @@ import type { Spawner } from '../executors/types.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { contentToText } from './content.js'
-import { buildAcpMcpServers, resolveMcpServers } from './profile-mcp.js'
+import { buildAcpMcpServers, resolveMcpServers, writeMcpConfigFile, type MaterializedMcpConfig } from './profile-mcp.js'
 import { resolvePromptMessages } from './profile-prompt.js'
 import { BoundedDiagnosticBuffer } from './diagnostic-buffer.js'
 import { versionHealth } from './health.js'
@@ -40,10 +40,28 @@ import { attachNdjsonRpc, type JsonRpcMessage, type NdjsonRpc, RpcCallError } fr
 export interface AcpBackendOptions {
   /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
   name: string
+  /** The harness id agent-container's image gives the agent (`github-copilot`), also accepted as its model id. */
+  harness?: string
   /** Binary to spawn, e.g. 'hermes'. */
   bin: string
   /** Subcommand args that start the ACP server. Default ['acp']. */
   acpArgs?: string[]
+  /**
+   * The args of a one-shot turn, which has no interaction policy to answer a permission request: the
+   * agent's own mode that runs every tool without asking. Default `acpArgs`, and a request is refused.
+   */
+  unattendedArgs?: string[]
+  /** Variables the Bridge sets for the agent. */
+  env?: Record<string, string>
+  /** The variables the agent reads its route from, carried past the host allowlist by exact name. */
+  envPassthroughKeys?: string[]
+  /**
+   * Launch args naming a private MCP config file, for an agent that ignores `mcpServers` in
+   * `session/new`. Without it the servers go inline in `session/new`.
+   */
+  mcpConfigArgs?: (path: string) => string[]
+  /** True when a prompt result's usage totals every prompt the process has answered. */
+  cumulativeUsage?: boolean
   /** Operator fallback when the caller omits `execution.timeoutMs`; zero means none. */
   timeoutMs: number
   /** Subprocess spawner; defaults to the scoped host spawner. */
@@ -71,22 +89,17 @@ function mapStopReason(reason: unknown): ChatDelta['finish_reason'] {
 }
 
 /**
- * The token counts an agent reports on its `session/prompt` result (ACP's `usage`: inputTokens,
- * outputTokens, thoughtTokens, cachedReadTokens, cachedWriteTokens), for every model call of the
- * turn. A result without counts, or with all zero, leaves the turn's usage unreported.
+ * A turn's token counts as the Bridge reports them, from what the agent reported for the prompt
+ * (acpPromptUsage). Counts that are absent, or all zero, leave the turn's usage unreported.
  */
-function acpTurnUsage(value: unknown): ChatDelta['usage'] | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const read = (key: string): number | undefined => {
-    const count = (value as Record<string, unknown>)[key]
-    return typeof count === 'number' && Number.isFinite(count) && count >= 0 ? count : undefined
-  }
+function acpTurnUsage(counts: AcpUsage | undefined): ChatDelta['usage'] | undefined {
+  if (!counts) return undefined
   const usage = {
-    input_tokens: read('inputTokens'),
-    output_tokens: read('outputTokens'),
-    reasoning_output_tokens: read('thoughtTokens'),
-    cache_read_input_tokens: read('cachedReadTokens'),
-    cache_write_input_tokens: read('cachedWriteTokens'),
+    input_tokens: counts.inputTokens,
+    output_tokens: counts.outputTokens,
+    reasoning_output_tokens: counts.thoughtTokens,
+    cache_read_input_tokens: counts.cachedReadTokens,
+    cache_write_input_tokens: counts.cachedWriteTokens,
   }
   if (!Object.values(usage).some((count) => count !== undefined && count > 0)) return undefined
   return Object.fromEntries(Object.entries(usage).filter(([, count]) => count !== undefined)) as ChatDelta['usage']
@@ -104,20 +117,43 @@ export class AcpBackend implements NativeSessionBackend {
   readonly name: string
   readonly defaultExecutionTimeoutMs: number
   readonly nativeModes = ['byob'] as const
+  private readonly harness: string
   private readonly bin: string
   private readonly acpArgs: string[]
+  private readonly unattendedArgs: string[]
+  private readonly env: Record<string, string>
+  private readonly envPassthroughKeys: string[]
+  private readonly mcpConfigArgs: ((path: string) => string[]) | null
+  private readonly cumulativeUsage: boolean
   private readonly spawner: Spawner
   private readonly steer: AcpSteer | null
   private readonly jailEnv: NodeJS.ProcessEnv | undefined
 
   constructor(opts: AcpBackendOptions) {
     this.name = opts.name
+    this.harness = opts.harness ?? opts.name
     this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.bin = opts.bin
     this.acpArgs = opts.acpArgs ?? ['acp']
+    this.unattendedArgs = opts.unattendedArgs ?? this.acpArgs
+    this.env = opts.env ?? {}
+    this.envPassthroughKeys = [...(opts.envPassthroughKeys ?? []), ...Object.keys(this.env)]
+    this.mcpConfigArgs = opts.mcpConfigArgs ?? null
+    this.cumulativeUsage = opts.cumulativeUsage ?? false
     this.spawner = opts.spawner ?? scopedHostSpawner
     this.steer = opts.steer ?? null
     this.jailEnv = opts.jailEnv
+  }
+
+  /**
+   * Where the turn's MCP servers go: inline in `session/new` (ACP's own mount point), or, for an agent
+   * that ignores those, a private config file its launch args name. The caller removes the file.
+   */
+  private mcpLaunch(req: ChatRequest, session: SessionRecord | null): { inline: Array<Record<string, unknown>>; args: string[]; file: MaterializedMcpConfig | null } {
+    const specs = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true })
+    if (!this.mcpConfigArgs) return { inline: buildAcpMcpServers(specs), args: [], file: null }
+    const file = writeMcpConfigFile(specs, req.session_id, { typedStdio: true })
+    return { inline: [], args: file ? this.mcpConfigArgs(file.configPath) : [], file }
   }
 
   nativeCapabilities(): AgentEnvironmentCapabilities {
@@ -134,31 +170,32 @@ export class AcpBackend implements NativeSessionBackend {
     // Refuses a profile prompt intent ACP cannot carry, exactly as a one-shot turn does.
     resolvePromptMessages(req, session, this.name)
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
-    const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
+    const mcp = this.mcpLaunch(req, session)
     // The chat route resolves a one-shot's jail; a retained session starts here, so it resolves its own.
     req.jailSpec ??= hostRequestJail(req, this.name, this.jailEnv ?? process.env)
-    const spawned = await this.spawner(this.bin, this.acpArgs, {
-      signal, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: process.env,
+    const spawned = await this.spawner(this.bin, [...this.acpArgs, ...mcp.args], {
+      signal, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: { ...process.env, ...this.env }, envPassthroughKeys: this.envPassthroughKeys,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
       ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
       ...(req.admissionClass ? { admissionClass: req.admissionClass } : {}),
-    })
+    }).catch((error: unknown) => { mcp.file?.cleanup(); throw error })
     const spawnError = spawned.spawnError?.()
     if (spawnError || !spawned.child.stdin || !spawned.child.stdout) {
-      await terminateSpawned(spawned).finally(() => spawned.release())
+      await terminateSpawned(spawned).finally(() => { spawned.release(); mcp.file?.cleanup() })
       throw new BackendError(`${this.name} acp failed to start with stdin and stdout pipes`, 'upstream', spawnError)
     }
     const native = new AcpNativeSession(spawned, {
       name: this.name,
       capabilities: acpNativeCapabilities(this.name),
       cwd,
-      mcpServers,
+      mcpServers: mcp.inline,
       resumeSessionId: session?.internalId || null,
       steer: this.steer,
+      cumulativeUsage: this.cumulativeUsage,
       requestTimeoutMs: this.defaultExecutionTimeoutMs > 0 ? Math.min(this.defaultExecutionTimeoutMs, REQUEST_TIMEOUT_CAP_MS) : REQUEST_TIMEOUT_CAP_MS,
-      cleanup: () => {},
+      cleanup: () => mcp.file?.cleanup(),
     })
     try {
       await native.start(signal)
@@ -172,7 +209,7 @@ export class AcpBackend implements NativeSessionBackend {
   private assertConfiguredModel(model: string): void {
     // The agent runs the model its own configuration names; ACP gives this client no portable way to pick
     // another, so a named model is refused instead of being dropped while the configured one answers.
-    if (model !== this.name) {
+    if (model !== this.name && model !== this.harness) {
       throw new BackendError(
         `backend ${this.name} runs the model ${this.name}'s own configuration names; request model "${this.name}" `
           + `instead of "${model}" and select the model in ${this.name}'s configuration`,
@@ -182,7 +219,7 @@ export class AcpBackend implements NativeSessionBackend {
   }
 
   matches(model: string): boolean {
-    return model === this.name || model.startsWith(`${this.name}/`)
+    return [this.name, this.harness].some((id) => model === id || model.startsWith(`${id}/`))
   }
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {
@@ -193,22 +230,22 @@ export class AcpBackend implements NativeSessionBackend {
     this.assertConfiguredModel(req.model)
     const cwd = req.cwd ?? session?.cwd ?? process.cwd()
     const promptText = renderPrompt(resolvePromptMessages(req, session, this.name))
-    // Profile MCP, or body/header MCP when no profile is present, is passed
-    // INLINE to session/new — ACP's native mount point, no
-    // temp file. Schema verified live against `hermes acp`: remote is
-    // `{type, name, url, headers:[{name,value}]}`, stdio is
+    // Profile MCP, or body/header MCP when no profile is present. Schema verified live against
+    // `hermes acp`: remote is `{type, name, url, headers:[{name,value}]}`, stdio is
     // `{name, command, args, env:[{name,value}]}`.
-    const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
+    const mcp = this.mcpLaunch(req, session)
+    const mcpServers = mcp.inline
 
-    const spawned = await this.spawner(this.bin, this.acpArgs, {
+    const spawned = await this.spawner(this.bin, [...this.unattendedArgs, ...mcp.args], {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd,
-      env: process.env,
+      env: { ...process.env, ...this.env },
+      envPassthroughKeys: this.envPassthroughKeys,
       ...(req.session_id ? { sessionId: req.session_id } : {}),
       ...(req.jailSpec ? { jail: req.jailSpec } : {}),
       ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
       ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
-    })
+    }).catch((error: unknown) => { mcp.file?.cleanup(); throw error })
     const child = spawned.child
     const release = spawned.release
     const stderr = new BoundedDiagnosticBuffer()
@@ -241,6 +278,7 @@ export class AcpBackend implements NativeSessionBackend {
       let streamEnded = false
       let driverError: Error | null = null
       let prompting = false
+      const chunkUsage: Record<string, unknown>[] = []
       const push = (d: ChatDelta): void => { queue.push(d); wake?.() }
 
       const rpc = attachNdjsonRpc({
@@ -255,6 +293,8 @@ export class AcpBackend implements NativeSessionBackend {
             const update = (m.params as { update?: { sessionUpdate?: string; content?: { type?: string; text?: string } } })?.update
             const kind = update?.sessionUpdate
             const c = update?.content
+            const counted = acpChunkUsage(update as Record<string, unknown> | undefined)
+            if (counted) chunkUsage.push(counted)
             // Emit the agent's MESSAGE text as content; skip thought/plan/tool chunks
             // so reasoning never pollutes the OpenAI content stream. `undefined` kind
             // (older agents that only send content) is treated as a message chunk.
@@ -299,8 +339,8 @@ export class AcpBackend implements NativeSessionBackend {
         if (signal.aborted) throw new BackendError(`${this.name} acp turn was cancelled`, 'aborted')
         push({ internal_session_id: sessionId })
         prompting = true
-        const result = (await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: promptText }] })) as { stopReason?: unknown; usage?: unknown }
-        const usage = acpTurnUsage(result?.usage)
+        const result = (await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: promptText }] })) as { stopReason?: unknown }
+        const usage = acpTurnUsage(acpPromptUsage(result, chunkUsage))
         if (usage) push({ usage })
         push({ finish_reason: signal.aborted ? 'error' : mapStopReason(result?.stopReason) })
       })()
@@ -339,6 +379,7 @@ export class AcpBackend implements NativeSessionBackend {
       clearTimeout(graceTimer)
       await terminateSpawned(spawned)
       release()
+      mcp.file?.cleanup()
     }
   }
 

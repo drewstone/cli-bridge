@@ -51,7 +51,7 @@ test('packed production install embeds isolated HTTP services and runs the exist
     void catalog;
     const model: ModelEntry = { id: 'codex/native', object: 'model', backend: 'codex', provider: 'openai', authentication: { status: 'unknown', authMode: 'unknown', source: 'native_status' } };
     void model;
-    const localDrivers: readonly { name: string; harness: string; kind: 'native' | 'acp' | 'prime' }[] = localBackends;
+    const localDrivers: readonly { name: string; harness: string; kind: 'native' | 'acp' | 'openclaw' | 'prime' }[] = localBackends;
     void localDrivers;
   `)
   await command(join(repo, 'node_modules/.bin/tsc'), ['--noEmit', '--strict', '--skipLibCheck', 'false',

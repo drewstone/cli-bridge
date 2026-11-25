@@ -352,9 +352,16 @@ function cleanupDir(dir: string): () => void {
 export function writeMcpConfigFile(
   specs: Record<string, McpServerSpec> | null,
   sessionId?: string,
+  options: {
+    /** Name each stdio server's transport (`type: 'stdio'`), for a CLI that reads it from every entry (Copilot CLI). */
+    typedStdio?: boolean
+  } = {},
 ): MaterializedMcpConfig | null {
   if (!specs) return null
-  const mcpServers = buildCanonicalMcpServers(specs)
+  const canonical = buildCanonicalMcpServers(specs)
+  const mcpServers = options.typedStdio
+    ? Object.fromEntries(Object.entries(canonical).map(([name, spec]) => [name, 'command' in spec ? { type: 'stdio', ...spec } : spec]))
+    : canonical
   const serverNames = Object.keys(mcpServers)
   if (process.env.CLI_BRIDGE_DEBUG_MCP) {
     console.error(`[cli-bridge mcp] materialized servers: ${serverNames.length ? serverNames.join(", ") : "(none)"} from specs: ${Object.keys(specs).join(", ") || "(empty)"}`)

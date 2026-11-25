@@ -23,6 +23,7 @@ import { createLocalBackend } from './backends/local.js'
 import { ClaudishBackend } from './backends/claudish.js'
 import { CodexBackend } from './backends/codex.js'
 import { AcpBackend } from './backends/acp.js'
+import { acpAgentLaunch } from './backends/acp-agents.js'
 import { OpenclawBackend } from './backends/openclaw.js'
 import { PrimeBackend } from './backends/prime.js'
 import { SandboxBackend } from './backends/sandbox.js'
@@ -160,16 +161,15 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     ...(config.jailRelayAllow?.length ? { BRIDGE_JAIL_RELAY_ALLOW: config.jailRelayAllow.join(',') } : {}),
   }
   // The public routing metadata and actual registration share one owner.
-  for (const { name, kind } of localBackends) {
+  for (const { name, harness, kind } of localBackends) {
     if (!config.backends.has(name)) continue
     if (kind === 'native') {
       // The backends whose retained session resolves its own jail.
       const retained = ['pi', 'opencode', 'kimi', 'codex', 'gemini'].includes(name)
       registry.register(createLocalBackend(config, name, { stateDir: join(config.dataDir, name), ...(retained ? { jailEnv } : {}) }))
     } else if (kind === 'acp') {
-      // hermes steers a running turn with its `/steer` command (measured on 0.23.2).
-      registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault, jailEnv,
-        ...(name === 'hermes' ? { steer: { command: '/steer' } } : {}) }))
+      registry.register(new AcpBackend({ ...acpAgentLaunch[name], name, harness, bin: config[`${name}Bin`],
+        timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'openclaw') {
       registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'prime') {
