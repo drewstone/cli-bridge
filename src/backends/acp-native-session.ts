@@ -209,7 +209,10 @@ export class AcpNativeSession implements NativeSession {
     if (!state.settled) this.enqueue({ ...receipt, state: 'queued' })
   }
 
-  /** Send one prompt of the turn. The answer to the turn's last prompt settles it; the answer to one a steer replaced is that steer's receipt. */
+  /**
+   * Send one prompt of the turn. The answer to the turn's last prompt settles it; the answer to one a
+   * steer replaced is that steer's receipt.
+   */
   private prompt(state: TurnState, sessionId: string, text: string): void {
     const sent = ++state.prompts
     const answered = (outcome: { result?: unknown; error?: string }): void => {

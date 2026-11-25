@@ -36,12 +36,10 @@ type Cell = { state: 'green' | 'red' | 'unsupported' | 'blocked'; detail: string
 const SCRIPTED = process.env.CONFORMANCE_SCRIPTED === '1'
 const AXIS = SCRIPTED ? 'scripted' : 'seat'
 const AXIS_TEXT = SCRIPTED ? 'scripted model (tangle/canary-echo through the Router)' : "the harness's own model on a seat"
-// Cursor Agent talks only to Cursor's own backend, so no scripted model is on its route.
-// Harnesses no scripted model can reach. Cursor Agent talks only to Cursor's backend (the CLI cannot);
-// Gemini CLI speaks only the Gemini API, which the Router does not serve (no route, not a CLI limit).
+// Harnesses no scripted model can reach: Cursor Agent talks only to Cursor's own backend. Gemini CLI speaks
+// only the Gemini API, which the Router serves for the scripted model (GEMINI_API_KEY, GOOGLE_GEMINI_BASE_URL).
 const NO_SCRIPTED_ROUTE: Record<string, Cell> = {
   cursor: { state: 'unsupported', detail: 'Cursor Agent reaches only Cursor\'s own backend; the seat axis measures it' },
-  gemini: { state: 'blocked', detail: 'no scripted route: Gemini CLI speaks only the Gemini API, which the Router does not serve; the seat axis needs a Google login on the Bridge host' },
 }
 const VERBS = ['tool', 'retained', 'steer', 'abort', 'profile+mcp', 'usage+outcome'] as const
 type Verb = typeof VERBS[number]

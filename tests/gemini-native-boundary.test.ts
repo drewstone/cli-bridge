@@ -26,6 +26,8 @@ beforeEach(() => {
 process.stdin.resume();
 process.stdin.on('end', () => {
   fs.writeFileSync('launch.json', JSON.stringify(process.argv.slice(2)));
+  fs.writeFileSync('launch-env.json', JSON.stringify(Object.fromEntries(
+    ['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GEMINI_CLI_TRUST_WORKSPACE', 'GEMINI_UNRELATED'].map((key) => [key, process.env[key] ?? null]))));
   for (const event of JSON.parse(fs.readFileSync('events.json', 'utf8'))) {
     process.stdout.write(JSON.stringify(event) + '\\n');
   }
@@ -79,10 +81,10 @@ it('retains native session, exact tool outcomes and measured usage across two HT
   expect(second.status).toBe(200)
   const body = await second.json() as any
   expect(body.choices[0].message.content).toBe('native answer')
-  expect(body.usage).toMatchObject({ prompt_tokens: 100,
+  // Input, output and total are all positive and the total is their sum, so the output subtotal is kept;
+  // the first turn's total held 6 tokens more than its input and output, and its output stayed unknown.
+  expect(body.usage).toMatchObject({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
     cache_read_input_tokens: 7, fresh_input_tokens: 93, estimated: false, cost_known: false })
-  expect(body.usage).not.toHaveProperty('completion_tokens')
-  expect(body.usage).not.toHaveProperty('total_tokens')
   expect(body).not.toHaveProperty('provider_models')
   const args = JSON.parse(readFileSync(join(cwd, 'launch.json'), 'utf8')) as string[]
   expect(args.slice(args.indexOf('--resume'), args.indexOf('--resume') + 2)).toEqual(['--resume', nativeId])
@@ -119,4 +121,25 @@ it.each([
   }
   expect(body.usage.estimated).not.toBe(true)
   expect(body.usage.cost_known).toBe(false)
+})
+
+it('gives the CLI its API route and the workspace trust, and keeps a trust setting the operator made', async () => {
+  const names = ['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GEMINI_CLI_TRUST_WORKSPACE', 'GEMINI_UNRELATED'] as const
+  const saved = names.map((name) => [name, process.env[name]] as const)
+  const launched = () => JSON.parse(readFileSync(join(cwd, 'launch-env.json'), 'utf8')) as Record<string, string | null>
+  try {
+    Object.assign(process.env, { GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router', GEMINI_UNRELATED: 'stays with the Bridge' })
+    delete process.env.GEMINI_CLI_TRUST_WORKSPACE
+    expect((await post([init, answer, result])).status).toBe(200)
+    expect(launched()).toEqual({ GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router',
+      GEMINI_CLI_TRUST_WORKSPACE: 'true', GEMINI_UNRELATED: null })
+    process.env.GEMINI_CLI_TRUST_WORKSPACE = 'false'
+    expect((await post([init, answer, result])).status).toBe(200)
+    expect(launched().GEMINI_CLI_TRUST_WORKSPACE).toBe('false')
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
 })
