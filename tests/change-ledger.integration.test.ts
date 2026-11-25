@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { loadConfig, startServer, type BridgeServer } from '../src/server.js'
 
 const BEARER = 'change-ledger'
@@ -21,6 +21,7 @@ type Row = Record<string, any>
 describe('change ledger rows of retained turns', { timeout: 60_000 }, () => {
   let root: string, bridge: BridgeServer, ledger: string, ghLog: string
   let counter = 0
+  const opened: string[] = []
 
   const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
@@ -52,6 +53,9 @@ console.log(JSON.stringify(head === 'feature'
       cwd: root, quiet: true, handleSignals: false,
     })
   }, 60_000)
+  afterEach(async () => {
+    for (const id of opened.splice(0)) await call(`/v1/sessions/${id}/close`, {})
+  })
   afterAll(async () => {
     await bridge?.close()
     vi.unstubAllEnvs()
@@ -85,6 +89,7 @@ console.log(JSON.stringify(head === 'feature'
 
   const open = async (cwd: string) => {
     const id = `ledger-${++counter}`
+    opened.push(id)
     const created = await call('/v1/sessions', { id, model: MODEL, cwd, interaction_policy: 'unattended-allow' })
     expect(created.status, await created.clone().text()).toBeLessThan(300)
     return id
