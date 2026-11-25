@@ -10,10 +10,23 @@
  * Gemini's stream-json protocol carries native session, assistant, tool, and
  * terminal usage events. Model labels in init/stats can fall back to the
  * request and therefore do not establish provider response identity.
+ *
+ * A retained session is one `gemini --acp` process (acp-native-session.ts).
+ *
+ * The CLI reads a Gemini API route from `GEMINI_API_KEY` and
+ * `GOOGLE_GEMINI_BASE_URL`: Google's own endpoint, or a Router that serves the
+ * Gemini wire. With a key it also needs `security.auth.selectedType` set to
+ * `gemini-api-key` in the user's `~/.gemini/settings.json`; 0.68 refuses to
+ * start on the key alone ("Invalid auth method selected.").
  */
 
-import type { Backend, ChatDelta, ChatRequest, BackendHealth } from './types.js'
+import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
+import type { Backend, ChatDelta, ChatRequest, BackendHealth, NativeSession, NativeSessionBackend } from './types.js'
 import { BackendError, JSON_MODE_DIRECTIVE, wantsJsonObject } from './types.js'
+import { AcpNativeSession } from './acp-native-session.js'
+import { acpNativeCapabilities } from './acp.js'
+import { hostRequestJail } from '../jail/host-request.js'
+import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import {
@@ -22,6 +35,7 @@ import {
   provisionProfileWorkspace,
 } from './profile-support.js'
 import {
+  buildAcpMcpServers,
   materializeMcpServersForGemini,
   resolveMcpServers,
 } from './profile-mcp.js'
@@ -39,11 +53,38 @@ export interface GeminiBackendOptions {
   timeoutMs: number
   /** Subprocess spawner. Defaults to host spawn; pass a docker-pooled spawner for parallel-safe execution. */
   spawner?: Spawner
+  /** The operator's jail settings, which a retained session resolves its jail from. */
+  jailEnv?: NodeJS.ProcessEnv
 }
 
-export class GeminiBackend implements Backend {
+/**
+ * What the CLI reads its API route from, kept through the host sanitizer, with the Bridge's statement
+ * of trust in the project settings it wrote. These names are not request-controlled.
+ */
+export const GEMINI_ENV_PASSTHROUGH_KEYS: readonly string[] = ['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GEMINI_CLI_TRUST_WORKSPACE']
+
+/** Bound on every retained-session request except a prompt. */
+const NATIVE_REQUEST_TIMEOUT_CAP_MS = 60_000
+
+/**
+ * How the Bridge states folder trust to the CLI. Measured on Gemini CLI 0.68: in a folder it does not
+ * trust, a one-shot run exits 55 before any request, and an ACP session ignores GEMINI.md and the MCP
+ * servers of `session/new`. `--skip-trust` runs both with the requested approval mode, GEMINI.md and
+ * those servers, and still ignores the workspace's project settings (`<cwd>/.gemini/settings.json`);
+ * `GEMINI_CLI_TRUST_WORKSPACE=true` makes the CLI read them. So every run passes the flag, and the
+ * variable is set exactly when the Bridge wrote project configuration into the workspace: a profile,
+ * or a one-shot turn's MCP servers. A workspace's own project settings are otherwise not loaded; an
+ * operator who trusts every workspace says so in the CLI's user settings, not in the Bridge's environment.
+ */
+const SKIP_TRUST_FLAG = '--skip-trust'
+function projectSettingsTrust(bridgeConfigured: boolean): Record<string, string> {
+  return bridgeConfigured ? { GEMINI_CLI_TRUST_WORKSPACE: 'true' } : {}
+}
+
+export class GeminiBackend implements NativeSessionBackend {
   readonly name = 'gemini'
   readonly defaultExecutionTimeoutMs: number
+  readonly nativeModes = ['byob'] as const
   private readonly spawner: Spawner
 
   constructor(private readonly opts: GeminiBackendOptions) {
@@ -60,21 +101,66 @@ export class GeminiBackend implements Backend {
     return versionHealth(this.name, this.opts.bin, this.spawner, undefined, signal)
   }
 
-  async *chat(
-    req: ChatRequest,
-    session: SessionRecord | null,
-    signal: AbortSignal,
-  ): AsyncIterable<ChatDelta> {
+  nativeCapabilities(): AgentEnvironmentCapabilities {
+    return geminiNativeCapabilities()
+  }
+
+  /**
+   * One retained `gemini --acp` per Bridge session, started as a one-shot turn is: the same model,
+   * profile workspace, environment and subscription admission. The turn's MCP servers go inline in
+   * `session/new`, so none is written to the workspace, and the project settings are trusted only
+   * for a profile. No approval mode is passed: the CLI asks permission for each tool call and the
+   * turn's interaction policy answers it. A steer is a second prompt, which ends the running one
+   * and aborts its tool call.
+   */
+  async startNativeSession(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<NativeSession> {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
       'gemini hosted modes require a verified tool-disable and sandbox contract')
+    // The chat route resolves a one-shot's jail; a retained session starts here, so it resolves its own.
+    req.jailSpec ??= hostRequestJail(req, this.name, this.opts.jailEnv ?? process.env)
+    const { cwd, model, provisioned, profiled, env } = this.prepare(req, session)
+    const sandbox = geminiSandboxFlag()
+    const args = ['--acp', SKIP_TRUST_FLAG, ...(sandbox ? [sandbox] : []), ...(model ? ['--model', model] : []), ...provisioned.flags]
+    const mcpServers = buildAcpMcpServers(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
+    const { spawned, invocation } = await this.spawn(req, args, cwd, { ...env, ...projectSettingsTrust(profiled) }, provisioned.flags, signal)
+    const spawnError = spawned.spawnError?.()
+    if (spawnError || !spawned.child.stdin || !spawned.child.stdout) {
+      await terminateSpawned(spawned).finally(() => spawned.release())
+      throw new BackendError('gemini --acp failed to start with stdin and stdout pipes', 'upstream', spawnError)
+    }
+    const native = new AcpNativeSession(spawned, {
+      name: this.name,
+      capabilities: geminiNativeCapabilities(),
+      cwd: cwd ?? process.cwd(),
+      mcpServers,
+      resumeSessionId: session?.internalId || null,
+      steer: 'prompt',
+      requestTimeoutMs: this.opts.timeoutMs > 0 ? Math.min(this.opts.timeoutMs, NATIVE_REQUEST_TIMEOUT_CAP_MS) : NATIVE_REQUEST_TIMEOUT_CAP_MS,
+      cleanup: () => provisioned.cleanup?.(),
+    })
+    try {
+      req.subscriptionAdmission?.require()
+      await native.start(signal)
+    } catch (error) {
+      await native.close().catch(() => {})
+      throw error
+    }
+    return Object.assign(native, {
+      // A later turn reuses this process, so it re-presents the launch that was admitted.
+      async admitSubscription(admission: NonNullable<ChatRequest['subscriptionAdmission']>): Promise<void> {
+        await admitNativeSubscription({ ...req, subscriptionAdmission: admission }, invocation)
+        admission.require()
+      },
+    })
+  }
 
-    const prompt = this.buildPrompt(req, session)
+  /**
+   * What a one-shot turn and a retained session start from: the model, the workspace with the profile
+   * applied (`profiled`), and the child's environment, without any ambient statement of folder trust.
+   */
+  private prepare(req: ChatRequest, session: SessionRecord | null) {
     const model = this.extractModel(req.model)
-    const args = this.buildArgs(req.model)
-    if (model) args.push('--model', model)
-    if (session?.internalId) args.push('--resume', session.internalId)
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? undefined)
-
     // Validate the profile before touching project-scoped Gemini settings,
     // which can contain MCP headers and other credentials.
     const provisioned = provisionProfileWorkspace(
@@ -84,6 +170,44 @@ export class GeminiBackend implements Backend {
       cwd,
       profileExecutionIdentity(req, session, 'gemini', null),
     )
+    const env: NodeJS.ProcessEnv = { ...process.env, ...provisioned.env }
+    delete env.GEMINI_CLI_TRUST_WORKSPACE
+    return { model, cwd, provisioned, profiled: provisioned.workspacePlanDigest !== undefined, env }
+  }
+
+  /** Admit the launch against the request's subscription policy, then start the CLI. */
+  private async spawn(req: ChatRequest, args: string[], cwd: string | undefined, env: NodeJS.ProcessEnv,
+    flags: readonly string[], signal?: AbortSignal) {
+    const invocation = { env, args, envPassthroughKeys: GEMINI_ENV_PASSTHROUGH_KEYS, flags,
+      cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment }
+    await admitNativeSubscription(req, invocation)
+    const spawned = await this.spawner(this.opts.bin, args, {
+      ...(signal ? { signal } : {}),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd,
+      env,
+      envPassthroughKeys: GEMINI_ENV_PASSTHROUGH_KEYS,
+      ...(req.session_id ? { sessionId: req.session_id } : {}),
+      ...(req.jailSpec ? { jail: req.jailSpec } : {}),
+      ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
+      ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
+    })
+    return { spawned, invocation }
+  }
+
+  async *chat(
+    req: ChatRequest,
+    session: SessionRecord | null,
+    signal: AbortSignal,
+  ): AsyncIterable<ChatDelta> {
+    assertModeSupported(this.name, req.mode ?? 'byob', ['byob'],
+      'gemini hosted modes require a verified tool-disable and sandbox contract')
+
+    const prompt = this.buildPrompt(req, session)
+    const { cwd, model, provisioned, profiled, env } = this.prepare(req, session)
+    const args = [...this.buildArgs(req.model), SKIP_TRUST_FLAG]
+    if (model) args.push('--model', model)
+    if (session?.internalId) args.push('--resume', session.internalId)
     args.push(...provisioned.flags)
 
     // Materialize the one selected MCP source into `<cwd>/.gemini/settings.json`.
@@ -95,18 +219,8 @@ export class GeminiBackend implements Backend {
 
     let spawned: Awaited<ReturnType<Spawner>>
     try {
-      const childEnv = { ...process.env, ...provisioned.env }
-      await admitNativeSubscription(req, { env: childEnv, args, flags: provisioned.flags,
-        cwd: cwd ?? process.cwd(), model: req.model, executor: this.spawner.executionEnvironment })
-      spawned = await this.spawner(this.opts.bin, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd,
-        env: childEnv,
-        ...(req.session_id ? { sessionId: req.session_id } : {}),
-        ...(req.jailSpec ? { jail: req.jailSpec } : {}),
-        ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
-        ...(req.acquireDeadlineMs !== undefined ? { acquireDeadlineMs: req.acquireDeadlineMs } : {}),
-      })
+      const trust = projectSettingsTrust(profiled || mcpMaterialized !== null)
+      spawned = (await this.spawn(req, args, cwd, { ...env, ...trust }, provisioned.flags)).spawned
     } catch (error) {
       mcpMaterialized?.cleanup()
       throw error
@@ -356,8 +470,13 @@ function extractToolCall(ev: Record<string, unknown>): { id: string; name: strin
   }
 }
 
-/** StreamStats defaults missing classes to zero and aggregates across requests without
- * per-response coverage. Keep observed input/cache subtotals; inclusive output stays unknown. */
+/**
+ * StreamStats defaults a missing class to zero and aggregates a turn's requests without per-response
+ * coverage, so a zero is not a measurement and a positive count is a subtotal of what was reported.
+ * Input and cache subtotals are kept when positive. `output_tokens` is the candidates alone; it is kept
+ * when input, output and total are all positive and the provider's total is exactly their sum, which
+ * leaves no reported output outside it.
+ */
 function geminiUsage(value: unknown): ChatDelta['usage'] {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
   const stats = value as Record<string, unknown>
@@ -370,8 +489,8 @@ function geminiUsage(value: unknown): ChatDelta['usage'] {
     return value
   }
   const input = count('input_tokens')
-  count('output_tokens')
-  count('total_tokens')
+  const output = count('output_tokens')
+  const total = count('total_tokens')
   const cached = count('cached')
   const fresh = count('input')
   if (input === undefined && cached === undefined && fresh === undefined) return undefined
@@ -382,6 +501,7 @@ function geminiUsage(value: unknown): ChatDelta['usage'] {
   }
   return {
     ...(input !== undefined && input > 0 ? { input_tokens: input } : {}),
+    ...(input !== undefined && input > 0 && output !== undefined && output > 0 && total === input + output ? { output_tokens: output } : {}),
     ...(cached !== undefined && cached > 0 ? { cache_read_input_tokens: cached } : {}),
     // Native fresh input is derived using a possibly defaulted cache count.
     ...(input !== undefined && input > 0 && cached !== undefined && cached > 0
@@ -405,4 +525,14 @@ function extractText(ev: Record<string, unknown>): string | null {
     if (typeof c === 'string' && c.length > 0) return c
   }
   return null
+}
+
+/**
+ * What a retained Gemini session proves: an ACP session's continuation and permission requests, with
+ * the profile surfaces of a one-shot turn, because the session starts from the same provisioned
+ * workspace. Measured on Gemini CLI 0.68 over ACP: `.gemini/system.md` replaces the base prompt,
+ * and GEMINI.md and the project settings are read.
+ */
+export function geminiNativeCapabilities(): AgentEnvironmentCapabilities {
+  return { ...acpNativeCapabilities('gemini'), profile: genericCliBridgeCapabilities('gemini').profile }
 }

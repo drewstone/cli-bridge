@@ -26,6 +26,8 @@ beforeEach(() => {
 process.stdin.resume();
 process.stdin.on('end', () => {
   fs.writeFileSync('launch.json', JSON.stringify(process.argv.slice(2)));
+  fs.writeFileSync('launch-env.json', JSON.stringify(Object.fromEntries(
+    ['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GEMINI_CLI_TRUST_WORKSPACE', 'GEMINI_UNRELATED'].map((key) => [key, process.env[key] ?? null]))));
   for (const event of JSON.parse(fs.readFileSync('events.json', 'utf8'))) {
     process.stdout.write(JSON.stringify(event) + '\\n');
   }
@@ -42,11 +44,11 @@ afterEach(async () => {
   rmSync(cwd, { recursive: true, force: true })
 })
 
-async function post(events: unknown[], stream = false) {
+async function post(events: unknown[], stream = false, extra: Record<string, unknown> = {}) {
   writeFileSync(join(cwd, 'events.json'), JSON.stringify(events))
   return app.request('/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: 'gemini/gemini-2.5-flash', cwd, stream, session_id: 'caller-session',
-      messages: [{ role: 'user', content: 'caller prompt must not be an answer' }] }) })
+      messages: [{ role: 'user', content: 'caller prompt must not be an answer' }], ...extra }) })
 }
 
 function frames(text: string): any[] {
@@ -79,10 +81,10 @@ it('retains native session, exact tool outcomes and measured usage across two HT
   expect(second.status).toBe(200)
   const body = await second.json() as any
   expect(body.choices[0].message.content).toBe('native answer')
-  expect(body.usage).toMatchObject({ prompt_tokens: 100,
+  // Input, output and total are all positive and the total is their sum, so the output subtotal is kept;
+  // the first turn's total held 6 tokens more than its input and output, and its output stayed unknown.
+  expect(body.usage).toMatchObject({ prompt_tokens: 100, completion_tokens: 20, total_tokens: 120,
     cache_read_input_tokens: 7, fresh_input_tokens: 93, estimated: false, cost_known: false })
-  expect(body.usage).not.toHaveProperty('completion_tokens')
-  expect(body.usage).not.toHaveProperty('total_tokens')
   expect(body).not.toHaveProperty('provider_models')
   const args = JSON.parse(readFileSync(join(cwd, 'launch.json'), 'utf8')) as string[]
   expect(args.slice(args.indexOf('--resume'), args.indexOf('--resume') + 2)).toEqual(['--resume', nativeId])
@@ -119,4 +121,30 @@ it.each([
   }
   expect(body.usage.estimated).not.toBe(true)
   expect(body.usage.cost_known).toBe(false)
+})
+
+it('gives the CLI its API route, and trusts the project settings only for a turn whose configuration it wrote there', async () => {
+  const names = ['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'GEMINI_CLI_TRUST_WORKSPACE', 'GEMINI_UNRELATED'] as const
+  const saved = names.map((name) => [name, process.env[name]] as const)
+  const launched = () => ({ env: JSON.parse(readFileSync(join(cwd, 'launch-env.json'), 'utf8')) as Record<string, string | null>,
+    args: JSON.parse(readFileSync(join(cwd, 'launch.json'), 'utf8')) as string[] })
+  const route = { GEMINI_API_KEY: 'fixture-key', GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9/router' }
+  try {
+    // The Bridge's own environment cannot state the trust: only what the Bridge wrote decides it.
+    Object.assign(process.env, { ...route, GEMINI_UNRELATED: 'stays with the Bridge', GEMINI_CLI_TRUST_WORKSPACE: 'true' })
+    expect((await post([init, answer, result])).status).toBe(200)
+    expect(launched().env).toEqual({ ...route, GEMINI_CLI_TRUST_WORKSPACE: null, GEMINI_UNRELATED: null })
+    expect(launched().args).toContain('--skip-trust')
+
+    const mounted = await post([init, answer, result], false, { session_id: 'profiled-session', agent_profile: { name: 'fixture',
+      mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: join(cwd, 'server.cjs') }] } } } })
+    expect(mounted.status, await mounted.clone().text()).toBe(200)
+    expect(launched().env).toEqual({ ...route, GEMINI_CLI_TRUST_WORKSPACE: 'true', GEMINI_UNRELATED: null })
+    expect(launched().args).toContain('--skip-trust')
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
 })

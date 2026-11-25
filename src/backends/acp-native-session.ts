@@ -11,6 +11,14 @@
  * - `session/resume` of a stored session replays its history as `session/update` before answering;
  *   updates outside a turn are never a turn's output.
  *
+ * Measured on Gemini CLI 0.68 (`gemini --acp`):
+ *
+ * - The agent has no command that adds guidance to a running prompt. A second `session/prompt` ends
+ *   the running one: its tool call is reported `failed` ("Tool call aborted"), it is answered
+ *   `stopReason: cancelled`, and the agent answers the new prompt in the same session, with the
+ *   earlier turns still in its history.
+ * - Its message chunks carry no `messageId`, and each tool call asks `session/request_permission`.
+ *
  * Every `session/request_permission` reaches the Bridge, which answers it by the turn's interaction
  * policy; `session/cancel` stops the running prompt.
  */
@@ -42,6 +50,19 @@ interface AcpCapabilities {
   sessionCapabilities?: { resume?: unknown }
 }
 
+/** How an agent takes input for its running turn. */
+export type AcpSteer =
+  /**
+   * A command of the agent's own (`/steer` for hermes), sent as a concurrent `session/prompt`. The
+   * agent answers it at once and applies the text after the running tool call, inside the same prompt.
+   */
+  | { command: string }
+  /**
+   * The input is itself a second `session/prompt` (Gemini CLI). The agent ends the running prompt,
+   * aborting its tool call, and answers the input; the Bridge turn goes on with that answer.
+   */
+  | 'prompt'
+
 export interface AcpNativeSessionOptions {
   /** Backend name, used in errors. */
   name: string
@@ -50,17 +71,21 @@ export interface AcpNativeSessionOptions {
   mcpServers: Array<Record<string, unknown>>
   /** An agent session id to continue; null creates one. */
   resumeSessionId: string | null
-  /** The agent's command that steers its running turn (`/steer` for hermes), or null when it has none. */
-  steerCommand: string | null
+  /** How the agent takes input for its running turn, or null when it takes none. */
+  steer: AcpSteer | null
   /** Bound on every request except a prompt. */
   requestTimeoutMs: number
   cleanup: () => void | Promise<void>
 }
 
 interface TurnState {
-  /** Steers sent and not yet answered. */
+  /** Steer commands sent and not yet answered. */
   steering: number
   settled: boolean
+  /** Prompts sent in this turn. The answer to the last one settles it; one a steer replaced does not. */
+  prompts: number
+  /** Steers waiting for the prompt they replaced to be answered, oldest first. */
+  replacing: Array<() => void>
 }
 
 interface Permission {
@@ -124,15 +149,12 @@ export class AcpNativeSession implements NativeSession {
     const sessionId = this.sessionId
     if (this.life.closed || !sessionId) throw new BackendError(`${this.options.name} native session is closed`, 'upstream')
     if (this.turnState) throw new BackendError(`${this.options.name} native session already has an active turn`, 'upstream')
-    const state: TurnState = { steering: 0, settled: false }
+    const state: TurnState = { steering: 0, settled: false, prompts: 0, replacing: [] }
     this.turnState = state
     const onAbort = (): void => { void this.abort().catch(() => {}) }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
-      this.call('session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] }, 'prompt', 0).then(
-        (result) => this.settle(state, { result }),
-        (error: unknown) => this.settle(state, { error: error instanceof Error ? error.message : String(error) }),
-      )
+      this.prompt(state, sessionId, prompt)
       while (true) {
         const event = await this.next(signal)
         yield event
@@ -149,25 +171,61 @@ export class AcpNativeSession implements NativeSession {
   }
 
   /**
-   * Resolves once the agent has accepted the input for the running turn. The turn then carries a raw
-   * `{ type: 'steer', operationId, state: 'queued' }`; the agent applies it at its next safe point.
+   * Resolves once the agent has accepted the input for the running turn. With a steer command the
+   * turn then carries a raw `{ type: 'steer', operationId, state: 'queued' }` and the agent applies
+   * the input at its next safe point. With a steer that is a prompt, the agent has accepted it when it
+   * answers the prompt it replaced, and the turn carries `state: 'applied'`.
    */
   async steer(prompt: string, operationId?: string): Promise<void> {
     const state = this.turnState
-    if (!this.options.steerCommand) {
-      throw new BackendError(`${this.options.name} acp has no command that steers a running turn`, 'capability_denied')
+    const steer = this.options.steer
+    if (!steer) {
+      throw new BackendError(`${this.options.name} acp takes no input for a running turn`, 'capability_denied')
     }
     if (this.life.closed || !this.sessionId || !state || state.settled) {
       throw new BackendError(`${this.options.name} native session has no running turn to steer`, 'upstream')
     }
+    const receipt = { type: 'steer', ...(operationId ? { operationId } : {}) }
+    if (steer === 'prompt') {
+      let timer: NodeJS.Timeout | undefined
+      const replaced = new Promise<void>((resolve, reject) => {
+        // The receipt is queued as the replaced prompt's answer is read, so it never follows the turn's end.
+        state.replacing.push(() => {
+          if (!state.settled) this.enqueue({ ...receipt, state: 'applied' })
+          resolve()
+        })
+        timer = setTimeout(() => reject(new BackendError(
+          `${this.options.name} acp did not end its running prompt within ${this.options.requestTimeoutMs}ms of the steer`, 'timeout')), this.options.requestTimeoutMs)
+        timer.unref?.()
+      })
+      this.prompt(state, this.sessionId, prompt)
+      try { await replaced } finally { clearTimeout(timer) }
+      return
+    }
     state.steering += 1
     try {
-      await this.call('session/prompt', { sessionId: this.sessionId, prompt: [{ type: 'text', text: `${this.options.steerCommand} ${prompt}` }] },
+      await this.call('session/prompt', { sessionId: this.sessionId, prompt: [{ type: 'text', text: `${steer.command} ${prompt}` }] },
         'steer', this.options.requestTimeoutMs)
     } finally {
       state.steering -= 1
     }
-    if (!state.settled) this.enqueue({ type: 'steer', ...(operationId ? { operationId } : {}), state: 'queued' })
+    if (!state.settled) this.enqueue({ ...receipt, state: 'queued' })
+  }
+
+  /**
+   * Send one prompt of the turn. The answer to the turn's last prompt settles it; the answer to one a
+   * steer replaced is that steer's receipt.
+   */
+  private prompt(state: TurnState, sessionId: string, text: string): void {
+    const sent = ++state.prompts
+    const answered = (outcome: { result?: unknown; error?: string }): void => {
+      if (sent === state.prompts) this.settle(state, outcome)
+      else state.replacing.shift()?.()
+    }
+    this.call('session/prompt', { sessionId, prompt: [{ type: 'text', text }] }, 'prompt', 0).then(
+      (result) => answered({ result }),
+      (error: unknown) => answered({ error: error instanceof Error ? error.message : String(error) }),
+    )
   }
 
   /** Ask the agent to cancel the running prompt, then stop the process. */
@@ -236,6 +294,8 @@ export class AcpNativeSession implements NativeSession {
   private settle(state: TurnState, outcome: { result?: unknown; error?: string }): void {
     if (state.settled) return
     state.settled = true
+    // The turn's last prompt is answered, so the agent has taken every steer before it.
+    for (const accepted of state.replacing.splice(0)) accepted()
     if (outcome.error === undefined) this.completedTurns += 1
     const result = outcome.result !== null && typeof outcome.result === 'object' ? outcome.result as Record<string, unknown> : {}
     if (this.turnState === state) {

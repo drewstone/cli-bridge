@@ -315,6 +315,25 @@ The thread is started with `thread/start` (or continued with `thread/resume`; an
 A steer is `turn/steer` with the running turn as `expectedTurnId`; Codex accepts it at once and applies it at its next model call, after the running tool call, as a `userMessage` item of the same turn whose `clientId` is the steer's `clientUserMessageId`, when the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }`. A Bridge turn settles at that turn's `turn/completed`. Measured on Codex 0.169.0.
 On a host whose Codex login is a file-backed subscription, an unconfined session holds the host's credential-rotation lease for its whole life, as a one-shot turn holds it for its own, so other unconfined Codex turns on that login wait until it closes; a jailed session's access-only seed is checked against the first turn's deadline only.
 
+## Gemini CLI native implementation
+
+One `gemini --acp` (Gemini CLI's Agent Client Protocol server) serves every turn of a session, launched as a one-shot `gemini --prompt` turn is: the same model, profile workspace, environment and subscription admission (`src/backends/gemini.ts` `startNativeSession`).
+The session is created with `session/new` (or continued with `session/load`), and the turn's MCP servers go inline in that request, so none is written to the workspace.
+No approval mode is passed: Gemini asks `session/request_permission` for each tool call, which reaches the Bridge and is answered by the turn's interaction policy.
+Gemini's message chunks carry no `messageId`, so a turn's text is one part.
+
+A steer is a second `session/prompt`. Gemini has no way to add guidance to a running prompt, so the steer interrupts it: the running tool call is aborted and reported `failed` ("Tool call aborted"), the first prompt is answered `stopReason: cancelled`, and Gemini answers the steer in the same session with the earlier turns still in its history.
+This differs from every harness above, which applies a steer after the running tool call; a caller that needs the tool call to finish must wait for it before steering Gemini.
+The steer is `accepted` when Gemini answers the prompt it replaced, when the run's events carry a raw `{ type: 'steer', operationId, state: 'applied' }`; the Bridge turn settles at the answer to its last prompt, and reports that prompt's usage.
+Measured on Gemini CLI 0.68.0.
+
+Gemini reads a Gemini API route from `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL`, which the Bridge passes to it on both paths, and with a key it needs `security.auth.selectedType: gemini-api-key` in the user's `~/.gemini/settings.json`.
+
+In a folder Gemini does not trust, a one-shot run exits 55 before any request, and an ACP session ignores GEMINI.md and the MCP servers of `session/new`.
+The Bridge passes `--skip-trust` on both paths, which runs them with the requested approval mode, GEMINI.md and those servers while Gemini still ignores the workspace's project settings (`<cwd>/.gemini/settings.json`).
+It sets `GEMINI_CLI_TRUST_WORKSPACE=true`, which makes Gemini read those settings, exactly when it wrote project configuration into the workspace: a profile, or a one-shot turn's MCP servers.
+A workspace's own project settings are otherwise not loaded, and the Bridge's own environment cannot state the trust; an operator who trusts every workspace says so in Gemini's user settings.
+
 ## MCP and ACP boundary
 
 The generic MCP implementation belongs to `@tangle-network/sdk-provider-cli-base`.

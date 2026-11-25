@@ -163,12 +163,13 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   for (const { name, kind } of localBackends) {
     if (!config.backends.has(name)) continue
     if (kind === 'native') {
-      registry.register(createLocalBackend(config, name, {
-        stateDir: join(config.dataDir, name), ...(name === 'pi' || name === 'opencode' || name === 'kimi' || name === 'codex' ? { jailEnv } : {}) }))
+      // The backends whose retained session resolves its own jail.
+      const retained = ['pi', 'opencode', 'kimi', 'codex', 'gemini'].includes(name)
+      registry.register(createLocalBackend(config, name, { stateDir: join(config.dataDir, name), ...(retained ? { jailEnv } : {}) }))
     } else if (kind === 'acp') {
       // hermes steers a running turn with its `/steer` command (measured on 0.23.2).
       registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault, jailEnv,
-        ...(name === 'hermes' ? { steerCommand: '/steer' } : {}) }))
+        ...(name === 'hermes' ? { steer: { command: '/steer' } } : {}) }))
     } else if (kind === 'openclaw') {
       registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'prime') {
