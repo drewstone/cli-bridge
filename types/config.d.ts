@@ -13,7 +13,7 @@ export declare const localHarnesses: readonly [readonly ['claude', 'claude-code'
  * Agents driven over ACP (AcpBackend): backend name (the model id and the `<NAME>_BIN` variable), harness
  * id, default binary. How each one starts and steers is in backends/acp-agents.ts.
  */
-export declare const acpHarnesses: readonly [readonly ['hermes', 'hermes', 'hermes'], readonly ['copilot', 'github-copilot', 'copilot'], readonly ['qwen', 'qwen-code', 'qwen'], readonly ['grok', 'grok', 'grok']];
+export declare const acpHarnesses: readonly [readonly ['hermes', 'hermes', 'hermes'], readonly ['copilot', 'github-copilot', 'copilot'], readonly ['qwen', 'qwen-code', 'qwen'], readonly ['grok', 'grok', 'grok'], readonly ['dsh', 'deepseek-harness', 'dsh']];
 export type AcpHarnessName = typeof acpHarnesses[number][0];
 /**
  * Local drivers registered by the server. This is routing metadata, not proof
@@ -25,8 +25,8 @@ export declare const localBackends: readonly [...({
     harness: "claude-code" | "codex" | "cursor" | "gemini" | "kimi-code" | "opencode" | "pi";
     kind: 'native';
 } | {
-    name: "copilot" | "grok" | "hermes" | "qwen";
-    harness: "github-copilot" | "grok" | "hermes" | "qwen-code";
+    name: "copilot" | "dsh" | "grok" | "hermes" | "qwen";
+    harness: "deepseek-harness" | "github-copilot" | "grok" | "hermes" | "qwen-code";
     kind: 'acp';
 })[], {
     readonly name: 'openclaw';

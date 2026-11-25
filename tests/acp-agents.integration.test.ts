@@ -1,9 +1,10 @@
 /**
- * Copilot CLI, Qwen Code and Grok CLI through a real Bridge listener and the host spawner, against a
- * synthetic agent per CLI that keeps each one's measured rules (acp-agents.ts): Copilot loads MCP
- * servers only from `--additional-mcp-config @<file>` and reports usage totals for its process; Qwen
- * reports each model call's usage on a message chunk; Grok reports usage in the result's `_meta` and
- * queues a second prompt behind a running one until `session/cancel`. No model is called.
+ * Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness through a real Bridge listener and the host
+ * spawner, against a synthetic agent per CLI that keeps each one's measured rules (acp-agents.ts):
+ * Copilot loads MCP servers only from `--additional-mcp-config @<file>` and reports usage totals for its
+ * process; Qwen reports each model call's usage on a message chunk; Grok reports usage in the result's
+ * `_meta` and queues a second prompt behind a running one until `session/cancel`; DeepSeek Harness
+ * reports context occupancy only and refuses a second prompt while one is in flight. No model is called.
  */
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
@@ -25,6 +26,7 @@ const at = process.argv.indexOf('--additional-mcp-config')
 const mcpFile = at > 0 ? process.argv[at + 1].replace(/^@/, '') : null
 log({ method: 'launch', args: process.argv.slice(2), blocking: process.env.QWEN_CODE_LEGACY_MCP_BLOCKING ?? null,
   route: process.env.COPILOT_PROVIDER_BASE_URL ?? process.env.GROK_MODELS_BASE_URL ?? null, mcpFile,
+  telemetry: process.env.DSH_TELEMETRY_MODE ?? null,
   mcpConfig: mcpFile ? JSON.parse(fs.readFileSync(mcpFile, 'utf8')) : null })
 const say = (sessionId, text, extra = {}) => send({ method: 'session/update', params: { sessionId,
   update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: 'm-' + Math.random().toString(16).slice(2), ...extra } } })
@@ -38,6 +40,10 @@ const answer = (id, sessionId, text) => {
   }
   if (flavor === 'qwen') {
     say(sessionId, '', { _meta: { usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 } } })
+    return send({ id, result: { stopReason: 'end_turn' } })
+  }
+  if (flavor === 'dsh') {
+    send({ method: 'session/update', params: { sessionId, update: { sessionUpdate: 'usage_update', used: 1290, size: 128000 } } })
     return send({ id, result: { stopReason: 'end_turn' } })
   }
   return send({ id, result: { stopReason: 'end_turn', _meta: { usage: { inputTokens: 5, outputTokens: 1 } } } })
@@ -60,6 +66,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     if (held !== null) {
       // Grok queues a second prompt behind the running one; Copilot and Qwen end the running one and answer it.
       if (flavor === 'grok') return void queued.push({ id: message.id, sessionId: params.sessionId, text })
+      if (flavor === 'dsh') return send({ id: message.id, error: { code: -32602, message: 'Invalid params: a prompt is already in flight for this session' } })
       send({ id: held, result: { stopReason: 'cancelled' } })
       held = null
       return answer(message.id, params.sessionId, text)
@@ -72,28 +79,28 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 `
 
 type Call = { flavor: string; cwd: string; method: string; params?: Record<string, any>; args?: string[]; blocking?: string | null
-  route?: string | null; mcpFile?: string | null; mcpConfig?: Record<string, any> | null }
+  route?: string | null; mcpFile?: string | null; mcpConfig?: Record<string, any> | null; telemetry?: string | null }
 type Event = Record<string, any>
 
 const COPILOT_ROUTE = 'http://127.0.0.1:9/copilot/v1'
 const GROK_ROUTE = 'http://127.0.0.1:9/grok/v1'
 
-describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () => {
+describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through the Bridge', () => {
   let root: string, bridge: BridgeServer
   const saved = { copilot: process.env.COPILOT_PROVIDER_BASE_URL, grok: process.env.GROK_MODELS_BASE_URL }
   beforeAll(async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), 'acp-agents-')))
     await mkdir(join(root, 'bin'))
     const bins: Record<string, string> = {}
-    for (const flavor of ['copilot', 'qwen', 'grok']) {
+    for (const flavor of ['copilot', 'qwen', 'grok', 'dsh']) {
       bins[flavor] = join(root, 'bin', `${flavor}.cjs`)
       await writeFile(bins[flavor]!, `#!${process.execPath}\n${agent(flavor)}`, { mode: 0o700 })
     }
     // The route variables the host allowlist drops unless the agent's launch names them.
     process.env.COPILOT_PROVIDER_BASE_URL = COPILOT_ROUTE
     process.env.GROK_MODELS_BASE_URL = GROK_ROUTE
-    const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'github-copilot,qwen-code,grok',
-      COPILOT_BIN: bins.copilot, QWEN_BIN: bins.qwen, GROK_BIN: bins.grok, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'off' })
+    const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'github-copilot,qwen-code,grok,deepseek-harness',
+      COPILOT_BIN: bins.copilot, QWEN_BIN: bins.qwen, GROK_BIN: bins.grok, DSH_BIN: bins.dsh, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'off' })
     bridge = await startServer({ config: { ...config, port: 0 }, cwd: root, quiet: true, handleSignals: false })
   })
   afterAll(async () => {
@@ -147,6 +154,8 @@ describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () =
       { model: 'github-copilot', flavor: 'copilot', args: ['--acp', '--allow-all', '--additional-mcp-config'], usage: { prompt_tokens: 10, completion_tokens: 2 } },
       { model: 'qwen-code', flavor: 'qwen', args: ['--acp', '--approval-mode', 'yolo'], usage: { prompt_tokens: 7, completion_tokens: 3 } },
       { model: 'grok', flavor: 'grok', args: ['agent', '--always-approve', 'stdio'], usage: { prompt_tokens: 5, completion_tokens: 1 } },
+      // DeepSeek Harness reports no token usage, only context occupancy.
+      { model: 'deepseek-harness', flavor: 'dsh', args: ['--profile', 'acp'], usage: undefined },
     ]
     for (const row of rows) {
       const cwd = await workspace(row.flavor)
@@ -156,7 +165,8 @@ describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () =
       const body = await response.json() as { choices?: Array<{ message: { content: string } }>; usage?: Record<string, unknown>; error?: unknown }
       expect(response.status, JSON.stringify(body.error)).toBe(200)
       expect(body.choices?.[0]?.message.content).toBe('echo hi')
-      expect(body.usage, row.model).toMatchObject(row.usage)
+      // A turn with no measured usage gets the Bridge's estimate.
+      if (row.usage) expect(body.usage, row.model).toMatchObject(row.usage)
 
       const mine = await calls(cwd)
       const launch = mine.find((call) => call.method === 'launch')!
@@ -173,6 +183,7 @@ describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () =
       }
       if (row.flavor === 'qwen') expect(launch.blocking).toBe('1')
       if (row.flavor === 'grok') expect(launch.route).toBe(GROK_ROUTE)
+      expect(launch.telemetry).toBe(row.flavor === 'dsh' ? 'DISABLED' : null)
     }
   }, 60_000)
 
@@ -190,24 +201,27 @@ describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () =
     }
   }, 40_000)
 
-  it('steers a running Grok turn by cancelling it first, since Grok queues a second prompt', async () => {
-    const session = await retained('grok', 'grok-steer')
-    try {
-      const running = await session.turn('hold')
-      const status = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(running)}`)
-      const header = (name: string) => status.headers.get(`x-run-${name}`)
-      const steered = await post(`/v1/sessions/${session.id}/steer`, { operationId: `steer-${randomBytes(3).toString('hex')}`, message: 'turn left',
-        run: { runId: header('id'), requestDigest: header('request-digest'), provider: header('provider'), environmentId: header('environment-id'),
-          sessionId: header('session-id'), executionId: header('execution-id') } })
-      expect(steered.status, JSON.stringify(steered.body)).toBeLessThan(300)
-      expect(textOf(await runEvents(running))).toBe('echo turn left')
-      const mine = await calls(session.cwd)
-      expect(mine.find((call) => call.method === 'launch')?.args).toEqual(['agent', 'stdio'])
-      const order = mine.filter((call) => call.method === 'session/cancel' || (call.method === 'session/prompt' && call.params?.prompt?.[0]?.text === 'turn left'))
-        .map((call) => call.method)
-      expect(order).toEqual(['session/cancel', 'session/prompt'])
-    } finally {
-      await post(`/v1/sessions/${session.id}/close`, {})
-    }
-  }, 40_000)
+  // Grok queues a second prompt behind the running one; DeepSeek Harness refuses it. Each is cancelled first,
+  // and the steer is sent once the agent has answered the cancelled prompt.
+  it.each([['grok', 'grok', ['agent', 'stdio']], ['deepseek-harness', 'dsh', ['--profile', 'acp']]] as const)(
+    'steers a running %s turn by cancelling the running prompt first', async (model, flavor, args) => {
+      const session = await retained(model, `${flavor}-steer`)
+      try {
+        const running = await session.turn('hold')
+        const status = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(running)}`)
+        const header = (name: string) => status.headers.get(`x-run-${name}`)
+        const steered = await post(`/v1/sessions/${session.id}/steer`, { operationId: `steer-${randomBytes(3).toString('hex')}`, message: 'turn left',
+          run: { runId: header('id'), requestDigest: header('request-digest'), provider: header('provider'), environmentId: header('environment-id'),
+            sessionId: header('session-id'), executionId: header('execution-id') } })
+        expect(steered.status, JSON.stringify(steered.body)).toBeLessThan(300)
+        expect(textOf(await runEvents(running))).toBe('echo turn left')
+        const mine = await calls(session.cwd)
+        expect(mine.find((call) => call.method === 'launch')?.args).toEqual([...args])
+        const order = mine.filter((call) => call.method === 'session/cancel' || (call.method === 'session/prompt' && call.params?.prompt?.[0]?.text === 'turn left'))
+          .map((call) => call.method)
+        expect(order).toEqual(['session/cancel', 'session/prompt'])
+      } finally {
+        await post(`/v1/sessions/${session.id}/close`, {})
+      }
+    }, 40_000)
 })

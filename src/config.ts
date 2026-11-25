@@ -33,7 +33,7 @@ export const acpHarnesses = [
   ['hermes', 'hermes', 'hermes'],
   ['copilot', 'github-copilot', 'copilot'],
   ['qwen', 'qwen-code', 'qwen'],
-  ['grok', 'grok', 'grok'],
+  ['grok', 'grok', 'grok'], ['dsh', 'deepseek-harness', 'dsh'],
 ] as const
 export type AcpHarnessName = typeof acpHarnesses[number][0]
 
