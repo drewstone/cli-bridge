@@ -231,7 +231,7 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
       turn_id: `${sessionId}-steer`, run_id: `${sessionId}-steer-run`, execution_id: `${sessionId}-steer-execution`,
     })
     const body = await turn.json() as Record<string, any>
-    if (turn.status >= 300) return red(`turn HTTP ${turn.status}`)
+    if (turn.status >= 300) return red(`turn HTTP ${turn.status}: ${JSON.stringify(body.error ?? body).slice(0, 160)}`)
     // A steer names the exact run, whose six coordinates the run's status response carries as X-Run-* headers.
     const status = await call(bridge, `/v1/runs/${encodeURIComponent(String(body.run?.id))}`)
     const header = (name: string) => status.headers.get(`x-run-${name}`)
