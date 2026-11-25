@@ -73,6 +73,8 @@ console.log(JSON.stringify(head === 'feature'
     git(work, 'config', 'user.email', 'fixture@example.invalid')
     git(work, 'config', 'user.name', 'Fixture')
     git(work, 'config', 'commit.gpgsign', 'false')
+    // The machine's global hooks refuse fixture identities; this repository is a throwaway.
+    git(work, 'config', 'core.hooksPath', '/dev/null')
     git(work, 'remote', 'add', 'origin', 'https://github.com/acme/widgets.git')
     git(work, 'config', `url.${bare}.pushInsteadOf`, 'https://github.com/acme/widgets.git')
     await writeFile(join(work, 'README.md'), 'start\n')

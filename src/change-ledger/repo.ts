@@ -148,7 +148,8 @@ export async function pullRequestActions(
     return Number.isFinite(at) && at >= startMs - 1_000 && at <= endMs + 5_000
   }
   for (const branch of branches) {
-    const out = await run(ghBin, ['pr', 'list', '--repo', repo, '--head', branch, '--state', 'all', '--limit', '30', '--json', 'number,createdAt,mergedAt'], cwd, GH_TIMEOUT_MS)
+    const listing = ['pr', 'list', '--repo', repo, '--head', branch, '--state', 'all', '--limit', '30', '--json', 'number,createdAt,mergedAt']
+    const out = await run(ghBin, listing, cwd, GH_TIMEOUT_MS)
     if (out === null) return null
     let rows: unknown
     try {
