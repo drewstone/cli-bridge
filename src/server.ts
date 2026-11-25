@@ -170,7 +170,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault, jailEnv,
         ...(name === 'hermes' ? { steerCommand: '/steer' } : {}) }))
     } else if (kind === 'openclaw') {
-      registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault }))
+      registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'prime') {
       registry.register(new PrimeBackend({
         bin: config.primeBin,
