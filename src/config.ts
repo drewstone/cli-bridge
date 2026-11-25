@@ -33,9 +33,21 @@ export const acpHarnesses = [
   ['hermes', 'hermes', 'hermes'],
   ['copilot', 'github-copilot', 'copilot'],
   ['qwen', 'qwen-code', 'qwen'],
-  ['grok', 'grok', 'grok'], ['dsh', 'deepseek-harness', 'dsh'],
+  ['grok', 'grok', 'grok'],
+  ['dsh', 'deepseek-harness', 'dsh'],
 ] as const
 export type AcpHarnessName = typeof acpHarnesses[number][0]
+
+/**
+ * Agents run one process per turn (OneShotBackend): backend key (the `<KEY>_BIN` variable), harness id,
+ * default binary. How each one starts and is read is in backends/one-shot-agents.ts.
+ */
+export const oneShotHarnesses = [
+  ['droid', 'factory-droids', 'droid'],
+  ['nanocode', 'nanocode', 'nc'],
+  ['exo', 'exo', 'exo'],
+] as const
+export type OneShotHarnessName = typeof oneShotHarnesses[number][0]
 
 /**
  * Local drivers registered by the server. This is routing metadata, not proof
@@ -45,6 +57,7 @@ export type AcpHarnessName = typeof acpHarnesses[number][0]
 export const localBackends = [
   ...localHarnesses.map(([name, harness]) => ({ name, harness, kind: 'native' as const })),
   ...acpHarnesses.map(([name, harness]) => ({ name, harness, kind: 'acp' as const })),
+  ...oneShotHarnesses.map(([name, harness]) => ({ name, harness, kind: 'one-shot' as const })),
   { name: 'openclaw', harness: 'openclaw', kind: 'openclaw' },
   { name: 'prime', harness: 'prime', kind: 'prime' },
 ] as const
@@ -52,7 +65,7 @@ export const localBackends = [
 type NativeHarnessConfig = {
   [Key in typeof localHarnesses[number][0] as `${Key}Bin`]: string
 } & { [Key in typeof localHarnesses[number][0] as `${Key}TimeoutMs`]: number }
-type AcpHarnessConfig = { [Key in AcpHarnessName as `${Key}Bin`]: string }
+type AcpHarnessConfig = { [Key in AcpHarnessName | OneShotHarnessName as `${Key}Bin`]: string }
 
 /** Operator assertion only; never accepted from a request or exposed as a capability key. */
 export const JAIL_HOST_EGRESS_ENV = 'BRIDGE_JAIL_HOST_EGRESS_ENFORCED'
@@ -244,7 +257,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? (name === 'cursor' ? 'cursor-agent' : name)],
       [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], name === 'codex' && !env.CLI_TIMEOUT_MS ? maxCodexSubscriptionTurnMs : defaultTimeout)],
     ])) as NativeHarnessConfig,
-    ...Object.fromEntries(acpHarnesses.map(([name, , bin]) => [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? bin])) as AcpHarnessConfig,
+    ...Object.fromEntries([...acpHarnesses, ...oneShotHarnesses].map(([name, , bin]) => [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? bin])) as AcpHarnessConfig,
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     primeBin: env.PRIME_BIN ?? 'prime-agent',
     primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),
