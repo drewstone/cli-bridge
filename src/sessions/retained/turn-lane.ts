@@ -2,8 +2,9 @@
  * One ordered admission lane per retained session.
  *
  * A native child answers one turn at a time, so turns for a session are
- * serialized here rather than at the provider. `/turns` refuses to queue and
- * fails fast with 409; `/input` queues up to a bounded depth and fails with
+ * serialized here rather than at the provider. `/turns` refuses to queue behind
+ * a running turn and fails fast with 409, but waits out the finalization of one
+ * whose run has ended; `/input` queues up to a bounded depth and fails with
  * 429 beyond it, or 408 if the caller gives up or the wait exceeds its budget.
  * The lane is released only once the previous turn's durable finalization has
  * settled, so the successor cannot observe a half-committed predecessor.

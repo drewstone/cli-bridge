@@ -104,9 +104,12 @@ export class RetainedTurnRunner {
     }
     const retained = this.state.require(id)
     const control = this.runs.nativeSession(id)
+    // A turn whose run has ended holds the lane only while its finalization commits (for some
+    // agents a round trip to the child); the next turn waits for the lane instead of being refused.
+    const finalizing = retained.runId !== null && this.runs.get(retained.runId)?.snapshot().terminal === true
     const executionActive =
       (control && !control.run.snapshot().terminal) ||
-      (this.lanes.isActive(id) && retained.status === 'running')
+      (this.lanes.isActive(id) && retained.status === 'running' && !finalizing)
     if (!options.queue && executionActive) {
       // A retry for an admitted run is read-only. Resolve it before the lane
       // check so the same operation remains idempotent during finalization.
