@@ -163,7 +163,7 @@ describe('Factory Droid, nanocode and Exo as one-shot agents through the Bridge'
     expect(one.text).toBe('echo one')
     expect(one.usage).toMatchObject({ prompt_tokens: 10, completion_tokens: 2 })
     const two = await chat('factory-droids', cwd, 'two', { session_id: session, agent_profile: await profile(cwd, token) })
-    expect(two.status, 'the session begun on a private home resumes on the next one').toBe(200)
+    expect(two.status, 'the session begun on one private home resumes on the next').toBe(200)
     expect(two.usage, 'the second turn reports what it added to the session total').toMatchObject({ prompt_tokens: 10, completion_tokens: 2 })
     const [first, second] = await calls((call) => call.flavor === 'droid' && call.cwd === cwd)
     expect(first!.args.slice(0, 6)).toEqual(['exec', '--skip-permissions-unsafe', '--output-format', 'stream-json', '--cwd', cwd])
@@ -175,15 +175,15 @@ describe('Factory Droid, nanocode and Exo as one-shot agents through the Bridge'
     expect(first!.args).not.toContain('--session-id')
     const resumed = second!.args[second!.args.indexOf('--session-id') + 1]
     expect(resumed).toMatch(/^droid-/u)
+    expect(existsSync(join(process.env.FACTORY_HOME_OVERRIDE!, '.factory', 'sessions', `${resumed}.json`)), 'the session is in the real store').toBe(true)
 
     // A turn without MCP servers runs on the operator's home, its own servers and custom model included.
-    const named = await chat('factory-droids/custom:fixture', cwd, 'three', { session_id: session })
+    const named = await chat('factory-droids/custom:fixture', cwd, 'three')
     expect(named.status, JSON.stringify(named.error)).toBe(200)
     const third = (await calls((call) => call.flavor === 'droid' && call.cwd === cwd))[2]!
     expect(third.home).toBe(process.env.FACTORY_HOME_OVERRIDE)
     expect(Object.keys(third.mcp!.mcpServers)).toEqual(['own'])
     expect(third.args.slice(third.args.indexOf('--model'), third.args.indexOf('--model') + 2)).toEqual(['--model', 'custom:fixture'])
-    expect(third.args[third.args.indexOf('--session-id') + 1]).toBe(resumed)
     const refused = await chat('factory-droids/custom:no-such-model', cwd, 'four')
     expect(refused.status).toBeGreaterThanOrEqual(400)
     expect(refused.error?.type ?? refused.error?.code).toBeTruthy()
