@@ -168,7 +168,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       const retained = ['pi', 'opencode', 'kimi', 'codex', 'gemini'].includes(name)
       registry.register(createLocalBackend(config, name, { stateDir: join(config.dataDir, name), ...(retained ? { jailEnv } : {}) }))
     } else if (kind === 'acp') {
-      registry.register(new AcpBackend({ ...acpAgentLaunch[name], name, harness, bin: config[`${name}Bin`],
+      registry.register(new AcpBackend({ ...acpAgentLaunch[name], name: harness, alias: name, bin: config[`${name}Bin`],
         timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'openclaw') {
       registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))

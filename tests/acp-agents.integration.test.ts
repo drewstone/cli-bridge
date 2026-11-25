@@ -97,13 +97,13 @@ describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () =
     bridge = await startServer({ config: { ...config, port: 0 }, cwd: root, quiet: true, handleSignals: false })
   })
   afterAll(async () => {
-    await bridge?.close()
+    await bridge?.close().catch(() => undefined)
     await rm(root, { recursive: true, force: true })
     for (const [name, value] of [['COPILOT_PROVIDER_BASE_URL', saved.copilot], ['GROK_MODELS_BASE_URL', saved.grok]] as const) {
       if (value === undefined) delete process.env[name]
       else process.env[name] = value
     }
-  })
+  }, 30_000)
 
   const workspace = async (name: string) => {
     const cwd = join(root, `${name}-${randomBytes(3).toString('hex')}`)
@@ -121,6 +121,8 @@ describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () =
     const response = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(runId)}/events`, { signal: AbortSignal.timeout(15_000) })
     return (await response.text()).split('\n').filter((line) => line.startsWith('data:'))
       .map((line) => JSON.parse(line.slice(5)) as Event).map((event) => (event.event ?? event) as Event)
+      // A usage receipt rides a raw event.
+      .map((event) => (event.type === 'raw' && event.event ? event.event : event) as Event)
   }
   const textOf = (events: Event[]) => events
     .filter((event) => event.type === 'message.part.updated' && event.part?.type === 'text' && typeof event.delta === 'string')
@@ -176,30 +178,36 @@ describe('Copilot CLI, Qwen Code and Grok CLI over ACP through the Bridge', () =
 
   it('reports what each Copilot prompt added to the usage totals its process reports', async () => {
     const session = await retained('github-copilot', 'copilot-usage')
-    const usage = async (message: string) => (await runEvents(await session.turn(message)))
-      .filter((event) => event.type === 'usage').map((event) => [event.usage?.inputTokens, event.usage?.outputTokens])
-    expect(await usage('one')).toEqual([[10, 2]])
-    expect(await usage('two')).toEqual([[10, 2]])
-    // A retained session runs without the unattended flag: the turn's interaction policy answers permissions.
-    expect((await calls(session.cwd)).find((call) => call.method === 'launch')?.args).toEqual(['--acp'])
-    await post(`/v1/sessions/${session.id}/close`, {})
+    try {
+      const usage = async (message: string) => (await runEvents(await session.turn(message)))
+        .filter((event) => event.type === 'usage').map((event) => [event.usage?.inputTokens, event.usage?.outputTokens])
+      expect(await usage('one')).toEqual([[10, 2]])
+      expect(await usage('two')).toEqual([[10, 2]])
+      // A retained session runs without the unattended flag: the turn's interaction policy answers permissions.
+      expect((await calls(session.cwd)).find((call) => call.method === 'launch')?.args).toEqual(['--acp'])
+    } finally {
+      await post(`/v1/sessions/${session.id}/close`, {})
+    }
   }, 40_000)
 
   it('steers a running Grok turn by cancelling it first, since Grok queues a second prompt', async () => {
     const session = await retained('grok', 'grok-steer')
-    const running = await session.turn('hold')
-    const status = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(running)}`)
-    const header = (name: string) => status.headers.get(`x-run-${name}`)
-    const steered = await post(`/v1/sessions/${session.id}/steer`, { operationId: `steer-${randomBytes(3).toString('hex')}`, message: 'turn left',
-      run: { runId: header('id'), requestDigest: header('request-digest'), provider: header('provider'), environmentId: header('environment-id'),
-        sessionId: header('session-id'), executionId: header('execution-id') } })
-    expect(steered.status, JSON.stringify(steered.body)).toBeLessThan(300)
-    expect(textOf(await runEvents(running))).toBe('echo turn left')
-    const mine = await calls(session.cwd)
-    expect(mine.find((call) => call.method === 'launch')?.args).toEqual(['agent', 'stdio'])
-    const order = mine.filter((call) => call.method === 'session/cancel' || (call.method === 'session/prompt' && call.params?.prompt?.[0]?.text === 'turn left'))
-      .map((call) => call.method)
-    expect(order).toEqual(['session/cancel', 'session/prompt'])
-    await post(`/v1/sessions/${session.id}/close`, {})
+    try {
+      const running = await session.turn('hold')
+      const status = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(running)}`)
+      const header = (name: string) => status.headers.get(`x-run-${name}`)
+      const steered = await post(`/v1/sessions/${session.id}/steer`, { operationId: `steer-${randomBytes(3).toString('hex')}`, message: 'turn left',
+        run: { runId: header('id'), requestDigest: header('request-digest'), provider: header('provider'), environmentId: header('environment-id'),
+          sessionId: header('session-id'), executionId: header('execution-id') } })
+      expect(steered.status, JSON.stringify(steered.body)).toBeLessThan(300)
+      expect(textOf(await runEvents(running))).toBe('echo turn left')
+      const mine = await calls(session.cwd)
+      expect(mine.find((call) => call.method === 'launch')?.args).toEqual(['agent', 'stdio'])
+      const order = mine.filter((call) => call.method === 'session/cancel' || (call.method === 'session/prompt' && call.params?.prompt?.[0]?.text === 'turn left'))
+        .map((call) => call.method)
+      expect(order).toEqual(['session/cancel', 'session/prompt'])
+    } finally {
+      await post(`/v1/sessions/${session.id}/close`, {})
+    }
   }, 40_000)
 })

@@ -20,15 +20,15 @@ export type AcpHarnessName = typeof acpHarnesses[number][0];
  * of installation, authentication, model availability or profile capabilities.
  * Consumers must still use the selected driver's admission contract.
  */
-export declare const localBackends: readonly [...{
+export declare const localBackends: readonly [...({
     name: "claude" | "codex" | "cursor" | "gemini" | "kimi" | "opencode" | "pi";
     harness: "claude-code" | "codex" | "cursor" | "gemini" | "kimi-code" | "opencode" | "pi";
     kind: 'native';
-}[], ...{
+} | {
     name: "copilot" | "grok" | "hermes" | "qwen";
     harness: "github-copilot" | "grok" | "hermes" | "qwen-code";
     kind: 'acp';
-}[], {
+})[], {
     readonly name: 'openclaw';
     readonly harness: 'openclaw';
     readonly kind: 'openclaw';

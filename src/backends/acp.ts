@@ -16,7 +16,7 @@
  *   → session/cancel {sessionId}               when the turn is cancelled
  *
  * The agent answers with the model its own configuration names: the model id is the bare backend
- * name or the harness id, and `<name>/<model>` is refused. One bin per backend instance; how each
+ * name (the harness id) or its alias, and `<name>/<model>` is refused. One bin per backend instance; how each
  * agent starts, takes MCP servers, reports usage and steers is in acp-agents.ts.
  */
 
@@ -38,10 +38,10 @@ import { versionHealth } from './health.js'
 import { attachNdjsonRpc, type JsonRpcMessage, type NdjsonRpc, RpcCallError } from './ndjson-rpc.js'
 
 export interface AcpBackendOptions {
-  /** Registry/backend name + model-id prefix, e.g. 'hermes'. */
+  /** Registry/backend name + model-id prefix: the harness id, e.g. 'hermes', 'github-copilot'. */
   name: string
-  /** The harness id agent-container's image gives the agent (`github-copilot`), also accepted as its model id. */
-  harness?: string
+  /** The Bridge's shorter key for the agent (`copilot`), also accepted as its model id. */
+  alias?: string
   /** Binary to spawn, e.g. 'hermes'. */
   bin: string
   /** Subcommand args that start the ACP server. Default ['acp']. */
@@ -117,7 +117,7 @@ export class AcpBackend implements NativeSessionBackend {
   readonly name: string
   readonly defaultExecutionTimeoutMs: number
   readonly nativeModes = ['byob'] as const
-  private readonly harness: string
+  private readonly alias: string
   private readonly bin: string
   private readonly acpArgs: string[]
   private readonly unattendedArgs: string[]
@@ -131,7 +131,7 @@ export class AcpBackend implements NativeSessionBackend {
 
   constructor(opts: AcpBackendOptions) {
     this.name = opts.name
-    this.harness = opts.harness ?? opts.name
+    this.alias = opts.alias ?? opts.name
     this.defaultExecutionTimeoutMs = opts.timeoutMs
     this.bin = opts.bin
     this.acpArgs = opts.acpArgs ?? ['acp']
@@ -149,7 +149,8 @@ export class AcpBackend implements NativeSessionBackend {
    * Where the turn's MCP servers go: inline in `session/new` (ACP's own mount point), or, for an agent
    * that ignores those, a private config file its launch args name. The caller removes the file.
    */
-  private mcpLaunch(req: ChatRequest, session: SessionRecord | null): { inline: Array<Record<string, unknown>>; args: string[]; file: MaterializedMcpConfig | null } {
+  private mcpLaunch(req: ChatRequest, session: SessionRecord | null):
+    { inline: Array<Record<string, unknown>>; args: string[]; file: MaterializedMcpConfig | null } {
     const specs = resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true })
     if (!this.mcpConfigArgs) return { inline: buildAcpMcpServers(specs), args: [], file: null }
     const file = writeMcpConfigFile(specs, req.session_id, { typedStdio: true })
@@ -209,7 +210,7 @@ export class AcpBackend implements NativeSessionBackend {
   private assertConfiguredModel(model: string): void {
     // The agent runs the model its own configuration names; ACP gives this client no portable way to pick
     // another, so a named model is refused instead of being dropped while the configured one answers.
-    if (model !== this.name && model !== this.harness) {
+    if (model !== this.name && model !== this.alias) {
       throw new BackendError(
         `backend ${this.name} runs the model ${this.name}'s own configuration names; request model "${this.name}" `
           + `instead of "${model}" and select the model in ${this.name}'s configuration`,
@@ -219,7 +220,7 @@ export class AcpBackend implements NativeSessionBackend {
   }
 
   matches(model: string): boolean {
-    return [this.name, this.harness].some((id) => model === id || model.startsWith(`${id}/`))
+    return [this.name, this.alias].some((id) => model === id || model.startsWith(`${id}/`))
   }
 
   async health(signal?: AbortSignal): Promise<BackendHealth> {

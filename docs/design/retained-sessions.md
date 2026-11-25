@@ -336,7 +336,7 @@ A workspace's own project settings are otherwise not loaded, and the Bridge's ow
 
 ## Copilot CLI, Qwen Code and Grok CLI native implementation
 
-Each is an ACP agent on `AcpBackend` (`src/backends/acp.ts`), with its launch, MCP, usage and steer rules in `src/backends/acp-agents.ts`. The model id is the backend name (`copilot`, `qwen`, `grok`) or the harness id (`github-copilot`, `qwen-code`, `grok`); each runs the model its own configuration names.
+Each is an ACP agent on `AcpBackend` (`src/backends/acp.ts`), with its launch, MCP, usage and steer rules in `src/backends/acp-agents.ts`. The model id is the harness id (`github-copilot`, `qwen-code`, `grok`) or the Bridge's key for it (`copilot`, `qwen`); each runs the model its own configuration names.
 A one-shot turn runs the agent in its own unattended mode (`--allow-all`, `--approval-mode yolo`, `--always-approve`), because it has no interaction policy to answer a permission request; a retained session runs without it, so each tool call asks `session/request_permission` and the turn's interaction policy answers it.
 
 - Copilot CLI ignores `mcpServers` in `session/new`, so the Bridge writes the turn's MCP servers to a private file it names with `--additional-mcp-config @<file>`. Its prompt result's usage totals every prompt the process has answered; a retained turn reports what its prompt added. A steer is a second `session/prompt`, as for Gemini.
