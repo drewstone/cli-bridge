@@ -53,7 +53,14 @@ interface Waiter<T> {
 
 export interface OpenclawNativeSessionOptions {
   bin: string
+  /** Starts the Gateway, which holds the session's workload slot for its life. */
   spawner: Spawner
+  /**
+   * Starts each `openclaw agent` call: a client of the session's Gateway, which does the turn's work
+   * under the slot it already holds. A call that queued for a second slot would wait on its own
+   * session's Gateway wherever the host admits one workload at a time.
+   */
+  clientSpawner: Spawner
   capabilities: AgentEnvironmentCapabilities
   cwd: string
   /** The OpenClaw session every call of this Bridge session names with `--session-id`. */
@@ -242,7 +249,8 @@ export class OpenclawNativeSession implements NativeSession {
   }
 
   private async spawn(args: string[], signal?: AbortSignal): Promise<Awaited<ReturnType<Spawner>>> {
-    const spawned = await this.options.spawner(this.options.bin, args, {
+    const spawner = args[0] === 'gateway' ? this.options.spawner : this.options.clientSpawner
+    const spawned = await spawner(this.options.bin, args, {
       ...(signal ? { signal } : {}),
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: this.options.cwd,

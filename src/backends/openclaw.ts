@@ -32,6 +32,7 @@ import { hostRequestJail } from '../jail/host-request.js'
 import { BackendError } from './types.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { scopedHostSpawner } from '../executors/scoped-host.js'
+import { hostSpawner } from '../executors/host.js'
 import type { Spawner } from '../executors/types.js'
 import { terminateSpawned } from '../executors/process-tree.js'
 import { contentToText } from './content.js'
@@ -95,6 +96,8 @@ export class OpenclawBackend implements NativeSessionBackend {
     const native = new OpenclawNativeSession({
       bin: this.opts.bin,
       spawner: this.spawner,
+      // An injected spawner (a container, a test) runs both; the default host scope admits only the Gateway.
+      clientSpawner: this.opts.spawner ?? hostSpawner,
       capabilities: openclawNativeCapabilities(this.name),
       cwd,
       sessionKey: openclawSessionId(req.session_id, session?.internalId),
