@@ -135,7 +135,8 @@ export async function startMcpUrlRelay(servers: Record<string, McpServerSpec>, c
         return
       }
       const batch = Array.isArray(parsed)
-      const answers = (await Promise.all((batch ? parsed : [parsed]).map((message) => target.send(message as Message))))
+      const messages: unknown[] = Array.isArray(parsed) ? parsed : [parsed]
+      const answers = (await Promise.all(messages.map((message) => target.send(message as Message))))
         .filter((answer): answer is Message => answer !== null)
       if (answers.length === 0) { response.writeHead(202).end(); return }
       response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(batch ? answers : answers[0]))

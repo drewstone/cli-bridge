@@ -70,7 +70,7 @@ if (args[0] === 'thread' && args[1] === 'events') {
 const file = args[1], definition = fs.readFileSync(file, 'utf8'), prompt = args.find((arg) => arg.startsWith('--prompt=')).slice('--prompt='.length)
 const thread = at('--thread') || uuid()
 log({ flavor: 'exo', method: 'run', file, args, cwd: process.cwd(), home: process.env.EXO_HOME, definition })
-const url = /url: "([^"]+)"/.exec(definition)?.[1]
+const url = /^    url: "([^"]+)"/m.exec(definition)?.[1]
 const rpc = async (id, method, params) => {
   const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
     body: JSON.stringify({ jsonrpc: '2.0', ...(id === null ? {} : { id }), method, params }) })
