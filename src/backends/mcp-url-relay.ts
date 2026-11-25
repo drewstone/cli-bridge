@@ -135,7 +135,7 @@ export class McpUrlRelay {
   /**
    * Starts the stdio servers in `servers` and serves them by URL until `close`. A server already given by
    * URL keeps its URL. Each child gets PATH, HOME and the locale from the Bridge, and its own `env`,
-   * nothing else. A Bridge session (`sessionKey`) runs one turn at a time here.
+   * nothing else.
    */
   async serve(servers: Record<string, McpServerSpec>, cwd: string, sessionKey: string | null): Promise<{ urls: Record<string, string>; close(): Promise<void> }> {
     const urls: Record<string, string> = {}
@@ -158,9 +158,10 @@ export class McpUrlRelay {
     const port = await this.listen()
     const token = sessionKey === null ? randomBytes(24).toString('hex')
       : createHmac('sha256', this.secret).update(sessionKey).digest('hex').slice(0, 48)
-    if (this.turns.has(token)) {
-      throw new BackendError('another turn of this session is running with its MCP servers; send one turn at a time', 'capability_denied')
-    }
+    // A Bridge session runs one turn at a time, so servers still held under its token are its previous
+    // turn's, which ended or is being torn down: they stop, and this turn takes the URLs.
+    const previous = this.turns.get(token)
+    if (previous) await Promise.all([...previous.values()].map((entry) => entry.stop()))
     const relayed = new Map<string, Relayed>()
     this.turns.set(token, relayed)
     const inherited = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'].flatMap((key) => {

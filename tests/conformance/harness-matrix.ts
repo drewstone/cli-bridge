@@ -23,6 +23,8 @@
  * The scripted model makes one call per instruction, so it cannot search for a deferred tool first: the
  * axis runs the Bridge with ENABLE_TOOL_SEARCH=false (unless set), which has Claude Code put every MCP
  * tool in each request instead of behind its ToolSearch tool, as it does for an endpoint without search.
+ * Factory Droid has no such setting, so each of its MCP cells first loads the tool with its ToolSearch tool
+ * in a turn of the same session (`scriptedToolLoad`); a model that searches does both in one turn.
  */
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -119,6 +121,11 @@ const scriptedMcpCall = (harness: string, tool: string, args: Record<string, unk
   : harness === 'grok'
     ? `Call the tool use_tool with exactly ${JSON.stringify({ tool_name: `conformance__${tool}`, tool_input: args })}`
     : `Call the tool *${tool} with exactly ${JSON.stringify(args)}`
+// Factory Droid 1.13 offers MCP tools only behind its ToolSearch tool and puts a loaded one in every later
+// request of the session, so a cell loads the tool in the turn before it calls it.
+const scriptedToolLoad = (harness: string, tool: string) => harness === 'factory-droids'
+  ? `Call the tool ToolSearch with exactly ${JSON.stringify({ query: `+${tool}` })}`
+  : null
 
 // One MCP tool that writes `<dir>/<nonce>.nonce` and answers with the nonce, so a turn proves both effects.
 const nonceServer = (dir: string) => `const fs=require('node:fs'),path=require('node:path'),rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{let r;try{r=JSON.parse(line)}catch{return}if(r.id===undefined)return;let result={};if(r.method==='initialize')result={protocolVersion:(r.params&&r.params.protocolVersion)||'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}};else if(r.method==='tools/list')result={tools:[{name:'write_nonce',description:'Writes the nonce file and returns the nonce.',inputSchema:{type:'object',properties:{nonce:{type:'string'}},required:['nonce']}},{name:'wait_seconds',description:'Waits the given number of seconds, then returns.',inputSchema:{type:'object',properties:{seconds:{type:'number'}},required:['seconds']}}]};else if(r.method==='tools/call'&&r.params&&r.params.name==='wait_seconds'){const seconds=Number(r.params.arguments&&r.params.arguments.seconds)||0;setTimeout(()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result:{content:[{type:'text',text:'waited '+seconds+' seconds'}]}})+'\\n'),seconds*1000);return}else if(r.method==='tools/call'){const nonce=String((r.params&&r.params.arguments&&r.params.arguments.nonce)||'');fs.writeFileSync(path.join(${JSON.stringify(dir)},nonce+'.nonce'),nonce);result={content:[{type:'text',text:'nonce '+nonce+' written'}]}}process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
@@ -130,13 +137,17 @@ const tokenServer = (token: string) => `const rl=require('node:readline').create
  * help: a server, ACP, an RPC mode or streamed input. Without one, steer is not supported by the CLI.
  */
 function retainedModeEvidence(bin: string): { offered: boolean; evidence: string } {
-  const help = spawnSync(bin, ['--help'], { encoding: 'utf8', timeout: 30_000 })
-  const text = `${help.stdout ?? ''}\n${help.stderr ?? ''}`
+  // A one-shot agent's modes can sit on the subcommand its turns run (`droid exec`, `exo run`).
+  const text = [['--help'], ['exec', '--help'], ['run', '--help']].map((args) => {
+    const help = spawnSync(bin, args, { encoding: 'utf8', timeout: 30_000 })
+    return `${help.stdout ?? ''}\n${help.stderr ?? ''}`
+  }).join('\n')
   // A subcommand line, with or without the program name in front: `  acp ...` or `  opencode serve ...`.
-  const modes = [/^\s+(?:[\w-]+\s)?(?:acp|serve|app-server|web)\b/mu, /--(?:experimental-)?acp\b/u, /--mode\b[^\n]*\brpc\b/u, /--input-format\b/u]
+  const modes = [/^\s+(?:[\w-]+\s)?(?:acp|serve|app-server|web)\b/mu, /--(?:experimental-)?acp\b/u, /--mode\b[^\n]*\brpc\b/u, /--input-format\b/u,
+    /--output-format\b[^\n]*\bacp\b/u, /^\s+--serve\b/mu]
   const offered = modes.some((mode) => mode.test(text))
   const version = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 30_000 }).stdout?.trim().split('\n')[0] ?? ''
-  return { offered, evidence: `\`${bin} --help\` (${version}) lists no server, ACP, RPC or streamed-input mode` }
+  return { offered, evidence: `\`${bin} --help\`, \`exec --help\` and \`run --help\` (${version}) list no server, ACP, RPC or streamed-input mode` }
 }
 
 async function harnessCells(bridge: BridgeServer, harness: string, root: string, bin: string): Promise<Record<Verb, Cell>> {
@@ -144,6 +155,13 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   const cwd = await mkdtemp(join(root, `${harness}-`))
   const cells = {} as Record<Verb, Cell>
   const scriptedCall = (tool: string, args: Record<string, unknown>) => scriptedMcpCall(harness, tool, args)
+  // The turn before a scripted MCP call, in its session, for a harness that offers the tool only once loaded.
+  const loadTool = async (tool: string, extra: Record<string, unknown>) => {
+    const load = SCRIPTED ? scriptedToolLoad(harness, tool) : null
+    if (!load) return
+    const loaded = await chat(bridge, model, cwd, load, extra)
+    if (loaded.status !== 200) throw new Error(`loading ${tool} with ToolSearch: HTTP ${loaded.status}: ${JSON.stringify(loaded.error)}`)
+  }
   const guard = async (verb: Verb, run: () => Promise<Cell>) => {
     try { cells[verb] = await run() } catch (error) { cells[verb] = red(error instanceof Error ? error.message : String(error)) }
   }
@@ -171,8 +189,9 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   }
   await guard('tool', async () => {
     if (SCRIPTED) {
-      const nonce = marker('nonce')
-      toolTurn = await chat(bridge, model, cwd, scriptedCall('write_nonce', { nonce }), { session_id: marker(`${harness}-tool`), agent_profile: await nonceProfile() })
+      const nonce = marker('nonce'), session = { session_id: marker(`${harness}-tool`), agent_profile: await nonceProfile() }
+      await loadTool('write_nonce', session)
+      toolTurn = await chat(bridge, model, cwd, scriptedCall('write_nonce', { nonce }), session)
       if (toolTurn.status !== 200) return red(`HTTP ${toolTurn.status}: ${JSON.stringify(toolTurn.error)}`)
       const written = await readFile(join(cwd, `${nonce}.nonce`), 'utf8').catch(() => '')
       if (written !== nonce) return red(`the harness did not call write_nonce (no nonce file); reply: ${toolTurn.text}`)
@@ -251,6 +270,7 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   await guard('abort', async () => {
     const session = marker(`${harness}-abort`), runId = marker(`${harness}-abort-run`)
     const controller = new AbortController()
+    await loadTool('wait_seconds', { session_id: session, agent_profile: await nonceProfile() })
     const slow = chat(bridge, model, cwd, SCRIPTED ? scriptedCall('wait_seconds', { seconds: 120 }) : 'Use your shell tool to run `sleep 120`, then reply DONE.',
       { session_id: session, run_id: runId, ...(SCRIPTED ? { agent_profile: await nonceProfile() } : {}) }, controller.signal).catch(() => undefined)
     await new Promise((resolve) => setTimeout(resolve, 10_000))
@@ -267,8 +287,9 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   await guard('profile+mcp', async () => {
     if (SCRIPTED) {
       // The echo model ignores a system prompt, so only the profile's MCP server is observable here.
-      const nonce = marker('profile')
-      const turn = await chat(bridge, model, cwd, scriptedCall('write_nonce', { nonce }), { session_id: marker(`${harness}-profile`), agent_profile: await nonceProfile() })
+      const nonce = marker('profile'), session = { session_id: marker(`${harness}-profile`), agent_profile: await nonceProfile() }
+      await loadTool('write_nonce', session)
+      const turn = await chat(bridge, model, cwd, scriptedCall('write_nonce', { nonce }), session)
       const written = await readFile(join(cwd, `${nonce}.nonce`), 'utf8').catch(() => '')
       return turn.status === 200 && written === nonce
         ? green('the profile\'s MCP server reached the harness (prompt text is not observable on the scripted model)')
