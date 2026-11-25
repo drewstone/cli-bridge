@@ -93,13 +93,12 @@ describe('a retained Gemini session through the Bridge', () => {
   /** A run's events, read to its end. */
   const runEvents = async (runId: string) => {
     const response = await fetch(`${bridge.url}/v1/runs/${encodeURIComponent(runId)}/events`, { signal: AbortSignal.timeout(15_000) })
-    return (await response.text()).split('\n').filter((line) => line.startsWith('data:')).map((line) => {
-      const event = JSON.parse(line.slice(5)) as Record<string, any>
-      return (event.event ?? event) as Record<string, any>
-    })
+    return (await response.text()).split('\n').filter((line) => line.startsWith('data:')).map((line) => JSON.parse(line.slice(5)) as Record<string, any>)
   }
   const textOf = (events: Array<Record<string, any>>) => events
     .filter((event) => event.type === 'message.part.updated' && event.part?.type === 'text' && typeof event.delta === 'string').map((event) => event.delta).join('')
+  /** The steer receipts a run carries: raw events from the agent session. */
+  const steersOf = (events: Array<Record<string, any>>) => events.filter((event) => event.type === 'raw' && event.event?.type === 'steer').map((event) => event.event)
   const open = async (name: string) => {
     const cwd = join(root, `${name}-${randomBytes(3).toString('hex')}`), id = `${name}-${randomBytes(3).toString('hex')}`
     await mkdir(cwd)
@@ -157,7 +156,7 @@ describe('a retained Gemini session through the Bridge', () => {
     const events = await runEvents(running)
     expect(textOf(events)).toBe('echo turn left')
     expect(JSON.stringify(events)).toContain('Tool call aborted')
-    expect(events.filter((event) => event.type === 'raw' && event.event?.type === 'steer').map((event) => event.event)).toEqual([{ type: 'steer', operationId, state: 'applied' }])
+    expect(steersOf(events)).toEqual([{ type: 'steer', operationId, state: 'applied' }])
     // The same agent session takes the next turn, with the steer's answer in its history.
     expect(textOf(await runEvents(await session.turn(2, 'repeat')))).toBe('echo turn left')
     const mine = await session.mine()
