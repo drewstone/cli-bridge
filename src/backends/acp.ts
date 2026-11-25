@@ -23,7 +23,7 @@
 import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
 import type { BackendHealth, ChatDelta, ChatMessage, ChatRequest, NativeSession, NativeSessionBackend } from './types.js'
 import { BackendError } from './types.js'
-import { AcpNativeSession } from './acp-native-session.js'
+import { AcpNativeSession, type AcpSteer } from './acp-native-session.js'
 import { hostRequestJail } from '../jail/host-request.js'
 import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -48,11 +48,8 @@ export interface AcpBackendOptions {
   timeoutMs: number
   /** Subprocess spawner; defaults to the scoped host spawner. */
   spawner?: Spawner
-  /**
-   * The agent's ACP command that steers its running turn, sent as a concurrent `session/prompt`
-   * (`/steer` for hermes). Without one a retained session refuses a steer.
-   */
-  steerCommand?: string
+  /** How the agent takes input for its running turn. Without it a retained session refuses a steer. */
+  steer?: AcpSteer
   /** The operator's jail settings; a retained session resolves its own jail from them, as the chat route does. */
   jailEnv?: NodeJS.ProcessEnv
 }
@@ -110,7 +107,7 @@ export class AcpBackend implements NativeSessionBackend {
   private readonly bin: string
   private readonly acpArgs: string[]
   private readonly spawner: Spawner
-  private readonly steerCommand: string | null
+  private readonly steer: AcpSteer | null
   private readonly jailEnv: NodeJS.ProcessEnv | undefined
 
   constructor(opts: AcpBackendOptions) {
@@ -119,7 +116,7 @@ export class AcpBackend implements NativeSessionBackend {
     this.bin = opts.bin
     this.acpArgs = opts.acpArgs ?? ['acp']
     this.spawner = opts.spawner ?? scopedHostSpawner
-    this.steerCommand = opts.steerCommand ?? null
+    this.steer = opts.steer ?? null
     this.jailEnv = opts.jailEnv
   }
 
@@ -159,7 +156,7 @@ export class AcpBackend implements NativeSessionBackend {
       cwd,
       mcpServers,
       resumeSessionId: session?.internalId || null,
-      steerCommand: this.steerCommand,
+      steer: this.steer,
       requestTimeoutMs: this.defaultExecutionTimeoutMs > 0 ? Math.min(this.defaultExecutionTimeoutMs, REQUEST_TIMEOUT_CAP_MS) : REQUEST_TIMEOUT_CAP_MS,
       cleanup: () => {},
     })

@@ -168,7 +168,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     } else if (kind === 'acp') {
       // hermes steers a running turn with its `/steer` command (measured on 0.23.2).
       registry.register(new AcpBackend({ name, bin: config[`${name}Bin`], timeoutMs: config.cliTimeoutMsDefault, jailEnv,
-        ...(name === 'hermes' ? { steerCommand: '/steer' } : {}) }))
+        ...(name === 'hermes' ? { steer: { command: '/steer' } } : {}) }))
     } else if (kind === 'openclaw') {
       registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'prime') {
