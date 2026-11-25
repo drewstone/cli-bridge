@@ -334,16 +334,17 @@ The Bridge passes `--skip-trust` on both paths, which runs them with the request
 It sets `GEMINI_CLI_TRUST_WORKSPACE=true`, which makes Gemini read those settings, exactly when it wrote project configuration into the workspace: a profile, or a one-shot turn's MCP servers.
 A workspace's own project settings are otherwise not loaded, and the Bridge's own environment cannot state the trust; an operator who trusts every workspace says so in Gemini's user settings.
 
-## Copilot CLI, Qwen Code and Grok CLI native implementation
+## Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness native implementation
 
-Each is an ACP agent on `AcpBackend` (`src/backends/acp.ts`), with its launch, MCP, usage and steer rules in `src/backends/acp-agents.ts`. The model id is the harness id (`github-copilot`, `qwen-code`, `grok`) or the Bridge's key for it (`copilot`, `qwen`); each runs the model its own configuration names.
+Each is an ACP agent on `AcpBackend` (`src/backends/acp.ts`), with its launch, MCP, usage and steer rules in `src/backends/acp-agents.ts`. The model id is the harness id (`github-copilot`, `qwen-code`, `grok`, `deepseek-harness`) or the Bridge's key for it (`copilot`, `qwen`, `dsh`); each runs the model its own configuration names.
 A one-shot turn runs the agent in its own unattended mode (`--allow-all`, `--approval-mode yolo`, `--always-approve`), because it has no interaction policy to answer a permission request; a retained session runs without it, so each tool call asks `session/request_permission` and the turn's interaction policy answers it.
 
 - Copilot CLI ignores `mcpServers` in `session/new`, so the Bridge writes the turn's MCP servers to a private file it names with `--additional-mcp-config @<file>`. Its prompt result's usage totals every prompt the process has answered; a retained turn reports what its prompt added. A steer is a second `session/prompt`, as for Gemini.
 - Qwen Code discovers MCP servers in the background after `session/new`; the Bridge sets `QWEN_CODE_LEGACY_MCP_BLOCKING=1`, so the session opens with their tools listed. It reports each model call's usage on a message chunk's `_meta.usage`, which the Bridge sums. A steer is a second `session/prompt`, as for Gemini.
 - Grok CLI reports usage in its prompt result's `_meta.usage`. A second `session/prompt` waits behind the running one, so a steer sends `session/cancel` first: Grok answers the running prompt `cancelled` and answers the steer in the same session. Its model reaches MCP tools only through Grok's own `use_tool` tool, by `<server>__<tool>`.
+- DeepSeek Harness runs its `acp` profile (`dsh --profile acp`), with its provider route and model from a profile patch such as `~/.dsh/cordis.patch.yml`. It refuses a second `session/prompt` while one is in flight, so a steer sends `session/cancel`, waits for the `cancelled` answer, then prompts; Grok's steer takes the same path. It reports context occupancy only (`usage_update`), so its turns carry no token usage. The Bridge sets `DSH_TELEMETRY_MODE=DISABLED`.
 
-Measured on Copilot CLI 1.0.113, Qwen Code 0.28.0 and Grok CLI 1.0.88.
+Measured on Copilot CLI 1.0.113, Qwen Code 0.28.0, Grok CLI 1.0.88 and DeepSeek Harness 0.2.2-rc.1.
 
 ## MCP and ACP boundary
 

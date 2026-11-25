@@ -65,8 +65,9 @@ export type AcpSteer =
    */
   | 'prompt'
   /**
-   * As `prompt`, for an agent that queues a second `session/prompt` behind the running one (Grok CLI):
-   * the Bridge sends `session/cancel` first, so the agent ends the running prompt and answers the input.
+   * As `prompt`, for an agent that queues a second `session/prompt` behind the running one (Grok CLI)
+   * or refuses it (DeepSeek Harness): the Bridge sends `session/cancel`, waits for the agent to answer
+   * the running prompt, then sends the input as the turn's next prompt.
    */
   | 'interrupt'
 
@@ -250,9 +251,17 @@ export class AcpNativeSession implements NativeSession {
           `${this.options.name} acp did not end its running prompt within ${this.options.requestTimeoutMs}ms of the steer`, 'timeout')), this.options.requestTimeoutMs)
         timer.unref?.()
       })
-      if (steer === 'interrupt') this.notify('session/cancel', { sessionId: this.sessionId })
-      this.prompt(state, this.sessionId, prompt)
+      if (steer === 'prompt') {
+        this.prompt(state, this.sessionId, prompt)
+        try { await replaced } finally { clearTimeout(timer) }
+        return
+      }
+      // The number is taken now, so the cancelled prompt's answer reads as replaced, not as the turn's end.
+      const sent = ++state.prompts
+      const sessionId = this.sessionId
+      this.notify('session/cancel', { sessionId })
       try { await replaced } finally { clearTimeout(timer) }
+      if (!state.settled && !this.life.closed) this.prompt(state, sessionId, prompt, sent)
       return
     }
     state.steering += 1
@@ -269,8 +278,7 @@ export class AcpNativeSession implements NativeSession {
    * Send one prompt of the turn. The answer to the turn's last prompt settles it; the answer to one a
    * steer replaced is that steer's receipt.
    */
-  private prompt(state: TurnState, sessionId: string, text: string): void {
-    const sent = ++state.prompts
+  private prompt(state: TurnState, sessionId: string, text: string, sent = ++state.prompts): void {
     const answered = (outcome: { result?: unknown; error?: string }): void => {
       if (sent === state.prompts) this.settle(state, outcome)
       else state.replacing.shift()?.()
