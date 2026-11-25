@@ -31,7 +31,7 @@ import type { OneShotHarnessName } from '../config.js'
 import type { McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
 import type { OneShotAgent, OneShotRead } from './one-shot.js'
-import { startMcpUrlRelay } from './mcp-url-relay.js'
+import { McpUrlRelay } from './mcp-url-relay.js'
 
 const run = promisify(execFile)
 
@@ -147,6 +147,7 @@ const nanocode: OneShotAgent = {
 }
 
 const EXO_KEY_ENV = 'EXO_MODEL_API_KEY'
+const relay = new McpUrlRelay()
 
 const exo: OneShotAgent = {
   envPassthroughKeys: ['EXO_HOME', 'EXO_SECRET_BACKEND', 'EXO_MASTER_KEY_PATH', 'EXO_CONFIG_DIR'],
@@ -164,14 +165,14 @@ const exo: OneShotAgent = {
     const slug = `bridge-${createHash('sha256').update(turn.sessionKey ?? randomBytes(16).toString('hex')).digest('hex').slice(0, 16)}`
     const file = join(home, 'bridge-agents', `${slug}.md`)
     const credential = `bridge-${randomBytes(8).toString('hex')}`
-    let relay: Awaited<ReturnType<typeof startMcpUrlRelay>> | null = null
+    let served: Awaited<ReturnType<McpUrlRelay['serve']>> | null = null
     let secret = false
     const cleanup = async (): Promise<void> => {
-      await relay?.close()
+      await served?.close()
       if (secret) await exoCli(['vault', 'secret', 'delete', 'global', credential]).catch(() => undefined)
     }
     try {
-      relay = turn.mcp ? await startMcpUrlRelay(turn.mcp, turn.cwd) : null
+      served = turn.mcp ? await relay.serve(turn.mcp, turn.cwd, turn.sessionKey) : null
       await exoCli(['vault', 'secret', 'create', 'global', credential, '--token-env', EXO_KEY_ENV, '--allow-origin', new URL(baseUrl).origin])
         .catch((error: { stderr?: string }) => { throw new BackendError(`exo vault secret create failed: ${String(error.stderr ?? '').slice(-300)}`, 'not_configured') })
       secret = true
@@ -179,7 +180,7 @@ const exo: OneShotAgent = {
       // JSON strings are YAML scalars, so no value can break the front matter.
       await writeFile(file, [
         '---', 'harness: basic', 'model:', `  name: ${JSON.stringify(model)}`, `  base_url: ${JSON.stringify(baseUrl)}`, `  credential: ${credential}`,
-        ...(relay ? ['mcp_servers:', ...Object.entries(relay.urls).flatMap(([name, url]) => [
+        ...(served ? ['mcp_servers:', ...Object.entries(served.urls).flatMap(([name, url]) => [
           '  - type: url', `    name: ${JSON.stringify(name)}`, `    url: ${JSON.stringify(url)}`, '    permission_policy:', '      type: always_allow'])] : []),
         '---', '', 'You are a coding agent working in this directory.', '',
       ].join('\n'), { mode: 0o600 })

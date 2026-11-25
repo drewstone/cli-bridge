@@ -1,22 +1,18 @@
 /**
  * Serves a turn's stdio MCP servers by URL, for an agent that takes MCP servers only by URL (Exo). The
- * relay starts each server as its own child and answers MCP Streamable HTTP at
+ * relay starts each server as its own child for the turn and answers MCP Streamable HTTP at
  * `http://127.0.0.1:<port>/<token>/<name>` with `application/json`, one JSON-RPC response per request.
- * The unguessable token is the credential. A request the server sends to its client is refused, and its
- * notifications are dropped: the relay carries the client's requests and their answers only.
+ * One listener serves every turn of this process, and a Bridge session's token is derived from its key,
+ * so its servers keep their URLs across its turns: Exo refuses to resume a thread whose MCP destinations
+ * changed. The unguessable token is the credential. A request the server sends to its client is refused,
+ * and its notifications are dropped: the relay carries the client's requests and their answers only.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createHmac, randomBytes } from 'node:crypto'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createInterface } from 'node:readline'
 import type { McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
-
-export interface McpUrlRelay {
-  /** Each server's URL, by its name. */
-  urls: Record<string, string>
-  close(): Promise<void>
-}
 
 type Message = { jsonrpc?: string; id?: string | number | null; method?: string; params?: unknown; result?: unknown; error?: unknown }
 
@@ -92,39 +88,31 @@ async function body(request: IncomingMessage): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
-/**
- * Starts the stdio servers in `servers` and serves them by URL. A server already given by URL keeps its
- * URL. Each child gets PATH, HOME and the locale from the Bridge, and its own `env`, nothing else.
- */
-export async function startMcpUrlRelay(servers: Record<string, McpServerSpec>, cwd: string): Promise<McpUrlRelay> {
-  const token = randomBytes(24).toString('hex')
-  const relayed = new Map<string, Relayed>()
-  const urls: Record<string, string> = {}
-  const stdio: Array<[string, McpServerSpec & { command: string }]> = []
-  // Every entry is checked before any server starts, so a refusal leaves nothing running.
-  for (const [name, spec] of Object.entries(servers)) {
-    if (spec.type === 'http' || spec.type === 'sse' || spec.url) {
-      if (!spec.url) throw new BackendError(`MCP server ${JSON.stringify(name)} names no URL`, 'parse_error')
-      if (spec.headers && Object.keys(spec.headers).length > 0) {
-        throw new BackendError(`MCP server ${JSON.stringify(name)}: this agent takes a URL server without headers`, 'capability_denied')
-      }
-      urls[name] = spec.url
-    } else if (spec.command) {
-      stdio.push([name, { ...spec, command: spec.command }])
-    } else {
-      throw new BackendError(`MCP server ${JSON.stringify(name)} names no command`, 'parse_error')
-    }
+/** One listener for the process, started on first use; it holds no turn's servers between turns. */
+export class McpUrlRelay {
+  private server: Server | null = null
+  private port = 0
+  private readonly secret = randomBytes(32)
+  private readonly turns = new Map<string, Map<string, Relayed>>()
+
+  private async listen(): Promise<number> {
+    if (this.server) return this.port
+    const server = createServer((request, response) => { void this.answer(request, response) })
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+    server.unref()
+    const address = server.address()
+    this.port = typeof address === 'object' && address ? address.port : 0
+    this.server = server
+    return this.port
   }
-  const base = Object.fromEntries(['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'].flatMap((key) => process.env[key] ? [[key, process.env[key]!]] : []))
-  for (const [name, spec] of stdio) {
-    const child = spawn(spec.command, spec.args ?? [], { cwd, env: { ...base, ...spec.env }, stdio: ['pipe', 'pipe', 'ignore'] })
-    relayed.set(name, new Relayed(name, child))
-  }
-  const stopAll = () => Promise.all([...relayed.values()].map((entry) => entry.stop())).then(() => undefined)
-  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
-    void (async () => {
-      const [, given, name] = (request.url ?? '').split('/')
-      const target = given === token && name ? relayed.get(decodeURIComponent(name)) : undefined
+
+  private async answer(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    try {
+      const [, token, name] = (request.url ?? '').split('/')
+      const target = token && name ? this.turns.get(token)?.get(decodeURIComponent(name)) : undefined
       if (!target) { response.writeHead(404).end(); return }
       if (request.method === 'DELETE') { response.writeHead(200).end(); return }
       if (request.method !== 'POST') { response.writeHead(405, { allow: 'POST' }).end(); return }
@@ -134,32 +122,62 @@ export async function startMcpUrlRelay(servers: Record<string, McpServerSpec>, c
           .end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }))
         return
       }
-      const batch = Array.isArray(parsed)
       const messages: unknown[] = Array.isArray(parsed) ? parsed : [parsed]
       const answers = (await Promise.all(messages.map((message) => target.send(message as Message))))
         .filter((answer): answer is Message => answer !== null)
       if (answers.length === 0) { response.writeHead(202).end(); return }
-      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(batch ? answers : answers[0]))
-    })().catch(() => { if (!response.headersSent) response.writeHead(500).end() })
-  })
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(0, '127.0.0.1', () => resolve())
-    })
-  } catch (error) {
-    await stopAll()
-    throw error
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(Array.isArray(parsed) ? answers : answers[0]))
+    } catch {
+      if (!response.headersSent) response.writeHead(500).end()
+    }
   }
-  const address = server.address()
-  const port = typeof address === 'object' && address ? address.port : 0
-  for (const name of relayed.keys()) urls[name] = `http://127.0.0.1:${port}/${token}/${encodeURIComponent(name)}`
-  return {
-    urls,
-    close: async () => {
-      await stopAll()
-      server.closeAllConnections()
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-    },
+
+  /**
+   * Starts the stdio servers in `servers` and serves them by URL until `close`. A server already given by
+   * URL keeps its URL. Each child gets PATH, HOME and the locale from the Bridge, and its own `env`,
+   * nothing else. A Bridge session (`sessionKey`) runs one turn at a time here.
+   */
+  async serve(servers: Record<string, McpServerSpec>, cwd: string, sessionKey: string | null): Promise<{ urls: Record<string, string>; close(): Promise<void> }> {
+    const urls: Record<string, string> = {}
+    const stdio: Array<[string, McpServerSpec & { command: string }]> = []
+    // Every entry is checked before any server starts, so a refusal leaves nothing running.
+    for (const [name, spec] of Object.entries(servers)) {
+      if (spec.type === 'http' || spec.type === 'sse' || spec.url) {
+        if (!spec.url) throw new BackendError(`MCP server ${JSON.stringify(name)} names no URL`, 'parse_error')
+        if (spec.headers && Object.keys(spec.headers).length > 0) {
+          throw new BackendError(`MCP server ${JSON.stringify(name)}: this agent takes a URL server without headers`, 'capability_denied')
+        }
+        urls[name] = spec.url
+      } else if (spec.command) {
+        stdio.push([name, { ...spec, command: spec.command }])
+      } else {
+        throw new BackendError(`MCP server ${JSON.stringify(name)} names no command`, 'parse_error')
+      }
+    }
+    if (stdio.length === 0) return { urls, close: async () => undefined }
+    const port = await this.listen()
+    const token = sessionKey === null ? randomBytes(24).toString('hex')
+      : createHmac('sha256', this.secret).update(sessionKey).digest('hex').slice(0, 48)
+    if (this.turns.has(token)) {
+      throw new BackendError('another turn of this session is running with its MCP servers; send one turn at a time', 'capability_denied')
+    }
+    const relayed = new Map<string, Relayed>()
+    this.turns.set(token, relayed)
+    const inherited = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'].flatMap((key) => {
+      const value = process.env[key]
+      return value ? [[key, value] as const] : []
+    })
+    for (const [name, spec] of stdio) {
+      const child = spawn(spec.command, spec.args ?? [], { cwd, env: { ...Object.fromEntries(inherited), ...spec.env }, stdio: ['pipe', 'pipe', 'ignore'] })
+      relayed.set(name, new Relayed(name, child))
+      urls[name] = `http://127.0.0.1:${port}/${token}/${encodeURIComponent(name)}`
+    }
+    return {
+      urls,
+      close: async () => {
+        if (this.turns.get(token) === relayed) this.turns.delete(token)
+        await Promise.all([...relayed.values()].map((entry) => entry.stop()))
+      },
+    }
   }
 }

@@ -195,8 +195,9 @@ describe('Factory Droid, nanocode and Exo as one-shot agents through the Bridge'
     expect(one.status, JSON.stringify(one.error)).toBe(200)
     expect(one.text).toBe(`echo one ${token}`)
     expect(one.usage, 'the latest turn of the thread').toMatchObject({ prompt_tokens: 7, completion_tokens: 3 })
+    // The session keeps its profile, and its MCP servers keep their URLs: Exo refuses a thread whose MCP destinations changed.
     const two = await chat('exo/fixture-model', cwd, 'two', { session_id: session })
-    expect(two.text).toBe('echo two')
+    expect(two.text).toBe(`echo two ${token}`)
     const runs = await calls((call) => call.flavor === 'exo' && call.method === 'run' && call.cwd === cwd)
     expect(runs).toHaveLength(2)
     expect(runs[1]!.file).toBe(runs[0]!.file)
@@ -205,7 +206,8 @@ describe('Factory Droid, nanocode and Exo as one-shot agents through the Bridge'
     expect(runs[1]!.args[runs[1]!.args.indexOf('--thread') + 1]).toMatch(/^[0-9a-f-]{36}$/u)
     expect(runs[0]!.definition).toContain('permission_policy:\n      type: always_allow')
     expect(runs[0]!.definition).toContain(`name: "fixture-model"\n  base_url: "${ENV.EXO_MODEL_BASE_URL}"`)
-    expect(runs[1]!.definition).not.toContain('mcp_servers')
+    const url = (definition: string) => /^    url: "([^"]+)"/mu.exec(definition)?.[1]
+    expect(url(runs[1]!.definition!)).toBe(url(runs[0]!.definition!))
     // Each turn's key is a vault secret created before the run and deleted after it.
     const vault = await calls((call) => call.flavor === 'exo' && call.method === 'vault')
     const credential = /credential: (\S+)/u.exec(runs[0]!.definition!)![1]
