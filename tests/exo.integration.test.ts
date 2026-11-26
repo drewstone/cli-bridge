@@ -173,7 +173,7 @@ const server = http.createServer((req, res) => {
       const set = watchers.get(thread.id) || new Set()
       watchers.set(thread.id, set)
       set.add(res)
-      req.on('close', () => set.delete(res))
+      // A request's own 'close' comes once its body is read; the response's comes when the client goes.
       res.on('close', () => set.delete(res))
       return
     }
