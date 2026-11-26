@@ -285,7 +285,8 @@ describe('Exo on its HTTP service through the Bridge', () => {
     expect(await readFile(join(cwd, 'made.txt'), 'utf8'), 'the thread\'s tools run on the workspace').toBe('made\n')
     const [, second] = await services(home)
     const requests = (await calls((call) => call.pid === second && call.method === 'http')).map((call) => `${call.verb} ${call.path?.replace(/[0-9a-f-]{36}/gu, '<id>')}`)
-    expect(requests.slice(0, 3), 'a later process reads the thread and creates none').toEqual(['GET agent', 'GET agent/<id>/thread/<id>', 'POST agent/<id>/thread/<id>/turn'])
+    expect(requests.slice(0, 4), 'a later process reads the thread and creates none')
+      .toEqual(['GET agent', 'GET agent/<id>/thread/<id>', 'GET agent/<id>/thread/<id>/event/watch', 'POST agent/<id>/thread/<id>/turn'])
     // Each process's key is a vault credential created before it starts and deleted after it stops.
     const vault = await calls((call) => call.method === 'vault' && call.home === home)
     expect(vault.map((call) => call.action)).toEqual(['create', 'delete', 'create', 'delete', 'create', 'delete'])
