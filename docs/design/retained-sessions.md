@@ -358,12 +358,23 @@ Droid's native session is `droid exec --input-format stream-jsonrpc --output-for
 
 Measured on Droid 1.13.0 and 1.21.0.
 
-## nanocode and Exo: one-shot agents
+## Exo: its HTTP service
 
-These have no retained native session. Each turn is one process on `OneShotBackend` (`src/backends/one-shot.ts`), and a later turn of the same `session_id` resumes the native session the previous one named (`-r`, `--thread`). Their launch, MCP, session and usage rules are in `src/backends/one-shot-agents.ts`. The model id is the harness id (`nanocode`, `exo`), optionally followed by `/<model>`.
+Exo's native session is `exo run <agent file> --serve --bind 127.0.0.1:0` (`src/backends/exo-serve-session.ts`): one process serves one agent and holds one thread, read from the thread's event stream. A retained session holds one such process; a chat turn runs one for its one message. The model id is `exo`, optionally followed by `/<model>`; without one the Bridge runs `EXO_MODEL`.
 
-- nanocode's `nc exec` reads no MCP server configuration, so a turn with MCP servers is refused. Its usage is read from its OpenTelemetry trace export.
-- Exo takes MCP servers by URL only, so the Bridge serves the turn's stdio servers by URL (`src/backends/mcp-url-relay.ts`). Its route is `EXO_MODEL_BASE_URL` and `EXO_MODEL_API_KEY`, the key held as a vault secret for the turn. A thread resumes only under the agent definition it was created with and the MCP URLs it started with, so a Bridge session keeps one definition under `$EXO_HOME/bridge-agents/`, and the relay gives its servers the same URLs on every turn.
+- Exo runs one service per state root, so each Bridge session has its own root under `$EXO_HOME/bridge-sessions/`, which keeps its thread for a later process; a turn outside a session gets a root of its own, removed after it.
+- The root's agent definition names the model, the route `EXO_MODEL_BASE_URL` and a vault credential holding `EXO_MODEL_API_KEY` while the process runs. Exo takes MCP servers by URL only, so the Bridge serves the turn's stdio servers by URL (`src/backends/mcp-url-relay.ts`), with the same URLs for every process of a session: Exo refuses a thread whose MCP destinations changed.
+- `--serve` takes no `--sandbox` or `--mount`, so the Bridge creates the thread with a local-process environment on the workspace; without it, Exo's tools run in its default VM sandbox.
+- A steer is a turn sent with `attention: interrupt`: Exo cancels the running turn at once and runs the steer next, and the Bridge turn ends with the steer's turn. A cancel is Exo's turn cancel, then the process stops.
+- Usage is each model call's `usage` in the thread's `messages` events; the prompt count includes its cached part.
+
+Measured on Exo 0.1.0-unstable-2026-11-17.
+
+## nanocode: a one-shot agent
+
+nanocode has no retained native session. Each turn is one process on `OneShotBackend` (`src/backends/one-shot.ts`), and a later turn of the same `session_id` resumes the native session the previous one named (`-r`). Its launch, session and usage rules are in `src/backends/one-shot-agents.ts`. The model id is `nanocode`, optionally followed by `/<model>`.
+
+- `nc exec` reads no MCP server configuration, so a turn with MCP servers is refused. Its usage is read from its OpenTelemetry trace export.
 
 ## MCP and ACP boundary
 

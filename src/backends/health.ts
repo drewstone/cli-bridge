@@ -174,9 +174,11 @@ export async function versionHealth(
   /** Extra context for the `ready` verdict, e.g. the base URL a proxy is using. */
   readyDetail?: string,
   signal?: AbortSignal,
+  /** The probe; a CLI without `--version` (Exo) answers `--help`, and then reports no version. */
+  probe: { args: readonly string[]; reportsVersion: boolean } = { args: ['--version'], reportsVersion: true },
 ): Promise<BackendHealth> {
   const ttl = readyCacheTtlMs()
-  const key = `${name}\u0000${bin}`
+  const key = `${name}\u0000${bin}\u0000${probe.args.join(' ')}`
   const cached = ttl > 0 ? readyCache.get(key) : undefined
   if (cached && cached.expiresAt > Date.now() && !signal?.aborted) return cached.health
   if (cached) readyCache.delete(key)
@@ -189,7 +191,7 @@ export async function versionHealth(
     if (readiness.findings.length > 0) {
       return { name, state: 'error', detail: formatExecutorFindings(readiness.findings) }
     }
-    const spawned = await spawner(bin, ['--version'], {
+    const spawned = await spawner(bin, [...probe.args], {
       stdio: ['ignore', 'pipe', 'pipe'],
       probe: true,
       ...(signal ? { signal } : {}),
@@ -232,7 +234,7 @@ export async function versionHealth(
     if (closed.code === 0) {
       // Some runners, including Prime Agent 0.7.0, write `--version` to stderr.
       // Exit status still owns readiness; use stderr only when stdout is empty.
-      const version = closed.stdout.trim() || closed.stderr.trim() || undefined
+      const version = probe.reportsVersion ? closed.stdout.trim() || closed.stderr.trim() || undefined : undefined
       const health: BackendHealth = {
         name,
         state: 'ready',

@@ -39,6 +39,7 @@ import { ACP_PERMISSION, ACP_TURN_SETTLED, AcpNativeSession } from '../../backen
 import { CODEX_TURN_SETTLED, CodexNativeSession, isCodexToolApproval } from '../../backends/codex-native-session.js'
 import { KIMI_TURN_SETTLED, KimiNativeSession } from '../../backends/kimi-native-session.js'
 import { DROID_TURN_SETTLED, DroidNativeSession } from '../../backends/droid-native-session.js'
+import { EXO_TURN_SETTLED, EXO_TURN_SUPERSEDED, ExoServeSession, exoAssistantParts } from '../../backends/exo-serve-session.js'
 import { OPENCLAW_REPLY, OPENCLAW_TURN_SETTLED, OpenclawNativeSession } from '../../backends/openclaw-native-session.js'
 import { OPENCODE_TURN_SETTLED, OpencodeNativeSession } from '../../backends/opencode-native-session.js'
 import { opencodeStepUsage } from '../../backends/opencode.js'
@@ -89,6 +90,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
     : native instanceof CodexNativeSession ? codexStep(input, native, deferredDenials)
     : native instanceof AcpNativeSession ? acpStep(input, native, deferredDenials)
     : native instanceof DroidNativeSession ? droidStep(input)
+    : native instanceof ExoServeSession ? exoStep(input)
     : native instanceof OpenclawNativeSession ? openclawStep(input) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
@@ -664,6 +666,66 @@ function droidStep(input: NativeTurnInput): (event: Record<string, unknown>) => 
     // are not a turn's output: text arrives as deltas and usage with the settle frame.
     if (['create_message', 'assistant_text_complete', 'thinking_text_complete', 'agent_turn_completed', 'droid_working_state_changed',
       'queued_messages_changed', 'settings_updated', 'mcp_status_changed', 'session_title_updated', 'session_token_usage_changed'].includes(type)) return []
+    return null
+  }
+}
+
+/**
+ * Exo's step: one thread event to canonical events, or null to keep it as `raw`. Each assistant message's
+ * text (or reasoning) is one content part; a tool call is one tool part, running from its request and ended
+ * by its result, or by the steer that cancelled its turn. The settle frame carries the turn's usage. A
+ * steer's receipt stays raw.
+ */
+function exoStep(input: NativeTurnInput): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId } = input
+  const tools = new Map<string, { name: string; args: Record<string, unknown>; turnId: unknown; ended: boolean }>()
+  let nextContentIndex = 0
+  const tool = (id: string, status: 'running' | 'completed' | 'error', outcome?: Record<string, unknown>): StreamEvent[] => {
+    const known = tools.get(id)
+    if (!known) return []
+    known.ended = status !== 'running'
+    return [{ type: 'message.part.updated', part: toolPart(sessionId, run.id, id, known.name, known.args, status, outcome) }]
+  }
+  return (event) => {
+    const type = String(event.type ?? '')
+    if (type === EXO_TURN_SETTLED) {
+      const usage = recordValue(event.usage)
+      const read = (key: string) => numberValue(usage?.[key]) ?? 0
+      const cached = read('cacheRead') > 0 && read('cacheRead') <= read('input')
+      return [
+        ...(read('calls') > 0 ? [{ type: 'raw', backend: input.backendName, event: usageEnvironmentEvent({ input: read('input'), output: read('output'),
+          ...(cached ? { cacheRead: read('cacheRead'), freshInput: read('input') - read('cacheRead') } : {}) }, undefined) } satisfies StreamEvent] : []),
+        settledStatus(typeof event.error === 'string' ? sanitizeUpstreamErrorDetail(event.error) : null),
+      ]
+    }
+    if (type === 'messages') {
+      return exoAssistantParts(event).map((part) => (part.kind === 'reasoning' ? reasoningEvent : textEvent)(sessionId, run.id, nextContentIndex++, part.text, part.text))
+    }
+    if (type === 'tool_requested') {
+      const id = stringValue(event.tool_call_id)
+      const request = recordValue(event.request)
+      if (!id) return null
+      tools.set(id, { name: stringValue(request?.function_name) ?? 'tool', args: recordValue(request?.arguments) ?? {}, turnId: event.turnId, ended: false })
+      return tool(id, 'running')
+    }
+    if (type === 'tool_result') {
+      const id = stringValue(event.tool_call_id)
+      if (!id) return null
+      const result = recordValue(event.result)
+      const text = Array.isArray(result?.content)
+        ? result.content.map((part) => stringValue(recordValue(part)?.text) ?? '').join('')
+        : JSON.stringify(event.result ?? null)
+      const failed = result?.ok === false || result?.isError === true || typeof result?.error === 'string'
+      return failed ? tool(id, 'error', { error: stringValue(result?.error) ?? (text || 'tool failed') }) : tool(id, 'completed', { output: text })
+    }
+    if (type === EXO_TURN_SUPERSEDED) {
+      return [...tools.entries()].filter(([, known]) => known.turnId === event.turnId && !known.ended)
+        .flatMap(([id]) => tool(id, 'error', { error: 'the steer cancelled this tool call' }))
+    }
+    // Turn and session boundaries, errors (the settle frame reports the failure), runtime status, sandbox and
+    // artifact records are not a turn's output.
+    if (['session_started', 'session_ended', 'turn_started', 'turn_ended', 'error', 'custom', 'artifact_written'].includes(type)
+      || type.startsWith('sandbox_')) return []
     return null
   }
 }
