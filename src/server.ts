@@ -26,6 +26,7 @@ import { AcpBackend } from './backends/acp.js'
 import { acpAgentLaunch } from './backends/acp-agents.js'
 import { OneShotBackend } from './backends/one-shot.js'
 import { DroidBackend } from './backends/droid.js'
+import { ExoBackend } from './backends/exo.js'
 import { oneShotAgents } from './backends/one-shot-agents.js'
 import { OpenclawBackend } from './backends/openclaw.js'
 import { PrimeBackend } from './backends/prime.js'
@@ -179,6 +180,8 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
         timeoutMs: config.cliTimeoutMsDefault }))
     } else if (kind === 'droid') {
       registry.register(new DroidBackend({ bin: config.droidBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
+    } else if (kind === 'exo') {
+      registry.register(new ExoBackend({ bin: config.exoBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'openclaw') {
       registry.register(new OpenclawBackend({ bin: config.openclawBin, timeoutMs: config.cliTimeoutMsDefault, jailEnv }))
     } else if (kind === 'prime') {

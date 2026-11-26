@@ -45,7 +45,6 @@ export type AcpHarnessName = typeof acpHarnesses[number][0]
  */
 export const oneShotHarnesses = [
   ['nanocode', 'nanocode', 'nc'],
-  ['exo', 'exo', 'exo'],
 ] as const
 export type OneShotHarnessName = typeof oneShotHarnesses[number][0]
 
@@ -59,6 +58,7 @@ export const localBackends = [
   ...acpHarnesses.map(([name, harness]) => ({ name, harness, kind: 'acp' as const })),
   ...oneShotHarnesses.map(([name, harness]) => ({ name, harness, kind: 'one-shot' as const })),
   { name: 'droid', harness: 'factory-droids', kind: 'droid' },
+  { name: 'exo', harness: 'exo', kind: 'exo' },
   { name: 'openclaw', harness: 'openclaw', kind: 'openclaw' },
   { name: 'prime', harness: 'prime', kind: 'prime' },
 ] as const
@@ -102,6 +102,8 @@ export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
   subscriptionsOnly: boolean
   /** Factory Droid, driven on its streamed JSON-RPC mode (DroidBackend). */
   droidBin: string
+  /** Exo, driven on its HTTP service (ExoBackend). */
+  exoBin: string
   /** openclaw, driven via `openclaw agent --local` (OpenclawBackend). */
   openclawBin: string
   primeBin: string
@@ -267,6 +269,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ])) as NativeHarnessConfig,
     ...Object.fromEntries([...acpHarnesses, ...oneShotHarnesses].map(([name, , bin]) => [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? bin])) as AcpHarnessConfig,
     droidBin: env.DROID_BIN ?? 'droid',
+    exoBin: env.EXO_BIN ?? 'exo',
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     primeBin: env.PRIME_BIN ?? 'prime-agent',
     primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),

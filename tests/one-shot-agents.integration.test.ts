@@ -1,9 +1,7 @@
 /**
- * nanocode and Exo through a real Bridge listener and the host spawner, against a synthetic CLI for each
- * that keeps its measured rules (one-shot-agents.ts): nanocode prints its reply on stdout, its session on
- * stderr and its usage in its OpenTelemetry trace export; Exo reads an agent definition with URL MCP
- * servers, prints headers and its reply, and keeps usage in its thread's event log. Exo's MCP call reaches
- * a real stdio server through the Bridge's URL relay. No model is called.
+ * nanocode through a real Bridge listener and the host spawner, against a synthetic `nc` that keeps its
+ * measured rules (one-shot-agents.ts): it prints its reply on stdout, its session on stderr and its usage in
+ * its OpenTelemetry trace export. No model is called.
  */
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -39,64 +37,24 @@ process.stderr.write('nanocode: computer use unavailable, continuing without it\
 process.stdout.write('echo ' + prompt + '\n')
 `
 
-const exo = String.raw`${common}
-const AGENT = '01a211f1-c778-7132-b355-905b67eaa71d'
-if (args[0] === 'vault') { log({ flavor: 'exo', method: 'vault', args, key: process.env.EXO_MODEL_API_KEY ? 'set' : 'unset', home: process.env.EXO_HOME }); process.exit(0) }
-if (args[0] === 'thread' && args[1] === 'events') {
-  const usage = (prompt_tokens, completion_tokens) => ({ type: 'messages', usage: { prompt_tokens, completion_tokens } })
-  console.log(JSON.stringify({ events: [
-    { id: 'e3', turn_id: 'latest', data: usage(4, 1) }, { id: 'e2', turn_id: 'latest', data: usage(3, 2) }, { id: 'e1', turn_id: 'earlier', data: usage(100, 100) },
-  ], cursor: null }))
-  process.exit(0)
-}
-const file = args[1], definition = fs.readFileSync(file, 'utf8'), prompt = args.find((arg) => arg.startsWith('--prompt=')).slice('--prompt='.length)
-const thread = at('--thread') || uuid()
-log({ flavor: 'exo', method: 'run', file, args, cwd: process.cwd(), home: process.env.EXO_HOME, definition })
-const url = /^    url: "([^"]+)"/m.exec(definition)?.[1]
-const rpc = async (id, method, params) => {
-  const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-    body: JSON.stringify({ jsonrpc: '2.0', ...(id === null ? {} : { id }), method, params }) })
-  return response.status === 202 ? null : (await response.json()).result
-}
-;(async () => {
-  let token = ''
-  if (url) {
-    await rpc(1, 'initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'exo-fixture', version: '1' } })
-    await rpc(null, 'notifications/initialized', {})
-    const { tools } = await rpc(2, 'tools/list', {})
-    token = ' ' + (await rpc(3, 'tools/call', { name: tools[0].name, arguments: {} })).content[0].text
-  }
-  console.log('agent: ' + path.basename(file, '.md') + ' (' + AGENT + ')')
-  console.log('thread: quiet-river-1 (' + thread + ')')
-  console.log('model: fixture')
-  console.log('[12:00:00] agent: echo ' + prompt + token)
-  console.log('ttft: 1ms, duration: 2ms (1 tok/s), 10 [10 total] tok, cost: unavailable')
-})()
-`
-
 // Answers its one tool with the token from its env.
 const tokenServer = `const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{const r=JSON.parse(line);if(r.id===undefined)return;const result=r.method==='initialize'?{protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}}:r.method==='tools/list'?{tools:[{name:'conformance_token',inputSchema:{type:'object',properties:{}}}]}:{content:[{type:'text',text:process.env.CONFORMANCE_REPLY}]};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
 
-type Call = { flavor: string; cwd?: string | null; method?: string; args: string[]; route?: string | null
-  file?: string; home?: string; key?: string; definition?: string }
+type Call = { flavor: string; cwd?: string | null; args: string[]; route?: string | null }
 
-const ENV = { NANOCODE_HOME: '', NANOCODE_OPENAI_BASE_URL: 'http://127.0.0.1:9/nanocode/v1', EXO_HOME: '', EXO_MODEL_BASE_URL: 'http://127.0.0.1:9/exo/v1',
-  EXO_MODEL_API_KEY: 'fixture-exo-key' }
+const ENV = { NANOCODE_HOME: '', NANOCODE_OPENAI_BASE_URL: 'http://127.0.0.1:9/nanocode/v1' }
 
-describe('nanocode and Exo as one-shot agents through the Bridge', () => {
+describe('nanocode as a one-shot agent through the Bridge', () => {
   let root: string, bridge: BridgeServer
   const saved = Object.fromEntries(Object.keys(ENV).map((name) => [name, process.env[name]]))
   beforeAll(async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), 'one-shot-agents-')))
     await mkdir(join(root, 'bin'))
-    const bins: Record<string, string> = {}
-    for (const [name, source] of Object.entries({ nc: nanocode, exo })) {
-      bins[name] = join(root, 'bin', `${name}.cjs`)
-      await writeFile(bins[name]!, `#!${process.execPath}\n${source}`, { mode: 0o700 })
-    }
-    Object.assign(process.env, ENV, { NANOCODE_HOME: join(root, 'nanocode-home'), EXO_HOME: join(root, 'exo-home') })
-    const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'nanocode,exo',
-      NANOCODE_BIN: bins.nc, EXO_BIN: bins.exo, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'off' })
+    const bin = join(root, 'bin', 'nc.cjs')
+    await writeFile(bin, `#!${process.execPath}\n${nanocode}`, { mode: 0o700 })
+    Object.assign(process.env, ENV, { NANOCODE_HOME: join(root, 'nanocode-home') })
+    const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'nanocode',
+      NANOCODE_BIN: bin, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'off' })
     bridge = await startServer({ config: { ...config, port: 0 }, cwd: root, quiet: true, handleSignals: false })
   })
   afterAll(async () => {
@@ -143,30 +101,5 @@ describe('nanocode and Exo as one-shot agents through the Bridge', () => {
     const refused = await chat('nanocode/fixture-model', cwd, 'mcp', { agent_profile: await profile(cwd, 'unused') })
     expect(refused.status).toBeGreaterThanOrEqual(400)
     expect(JSON.stringify(refused.error)).toMatch(/no MCP server configuration/u)
-  }, 60_000)
-
-  it('runs Exo with its MCP servers relayed by URL, resumes its thread under the same definition, and reads usage from the thread log', async () => {
-    const cwd = await workspace('exo'), session = `exo-${randomBytes(3).toString('hex')}`, token = `T-${randomBytes(3).toString('hex')}`
-    const one = await chat('exo/fixture-model', cwd, 'one', { session_id: session, agent_profile: await profile(cwd, token) })
-    expect(one.status, JSON.stringify(one.error)).toBe(200)
-    expect(one.text).toBe(`echo one ${token}`)
-    expect(one.usage, 'the latest turn of the thread').toMatchObject({ prompt_tokens: 7, completion_tokens: 3 })
-    // The session keeps its profile, and its MCP servers keep their URLs: Exo refuses a thread whose MCP destinations changed.
-    const two = await chat('exo/fixture-model', cwd, 'two', { session_id: session })
-    expect(two.text).toBe(`echo two ${token}`)
-    const runs = await calls((call) => call.flavor === 'exo' && call.method === 'run' && call.cwd === cwd)
-    expect(runs).toHaveLength(2)
-    expect(runs[1]!.file).toBe(runs[0]!.file)
-    expect(runs[0]!.file!.startsWith(join(process.env.EXO_HOME!, 'bridge-agents'))).toBe(true)
-    expect(runs[0]!.args).not.toContain('--thread')
-    expect(runs[1]!.args[runs[1]!.args.indexOf('--thread') + 1]).toMatch(/^[0-9a-f-]{36}$/u)
-    expect(runs[0]!.definition).toContain('permission_policy:\n      type: always_allow')
-    expect(runs[0]!.definition).toContain(`name: "fixture-model"\n  base_url: "${ENV.EXO_MODEL_BASE_URL}"`)
-    const url = (definition: string) => /^    url: "([^"]+)"/mu.exec(definition)?.[1]
-    expect(url(runs[1]!.definition!)).toBe(url(runs[0]!.definition!))
-    // Each turn's key is a vault secret created before the run and deleted after it.
-    const vault = await calls((call) => call.flavor === 'exo' && call.method === 'vault')
-    const credential = /credential: (\S+)/u.exec(runs[0]!.definition!)![1]
-    expect(vault.filter((call) => call.args.includes(credential!)).map((call) => [call.args[2], call.key])).toEqual([['create', 'set'], ['delete', 'set']])
   }, 60_000)
 })
