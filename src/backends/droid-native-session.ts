@@ -148,7 +148,8 @@ export class DroidNativeSession implements NativeSession {
         .flatMap((message) => Array.isArray(record(message)?.content) ? record(message)?.content as unknown[] : [])
         .map((part) => record(part)?.text).find((text): text is string => typeof text === 'string')
       throw new BackendError(`droid has no model ${JSON.stringify(modelId)}; it would run ${JSON.stringify(selected)} instead`
-        + `${notice ? ` (${notice.slice(0, 200)})` : ''}. Name the model in Droid's settings (customModels) and request factory-droids/<its id>`, 'not_configured')
+        + `${notice ? ` (${notice.slice(0, 200)})` : ''}. Name the model in Droid's settings (customModels) `
+        + 'and request factory-droids/<its id>', 'not_configured')
     }
     await this.call('droid.rename_session', { title: 'cli-bridge' }, 'session naming', requestTimeoutMs, signal)
   }

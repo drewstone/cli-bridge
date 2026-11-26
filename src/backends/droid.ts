@@ -74,7 +74,8 @@ export class DroidBackend implements NativeSessionBackend {
     assertModeSupported(this.name, req.mode ?? 'byob', ['byob'])
     if ((req.env && Object.keys(req.env).length > 0) || req.effort || req.temperature !== undefined || req.max_tokens !== undefined
       || req.messages.some((message) => typeof message.content !== 'string' && message.content !== null)) {
-      throw new BackendError(`${this.name} takes text turns, native resume and MCP; public env, reasoning and sampling overrides and attachments are not configured`, 'capability_denied')
+      throw new BackendError(`${this.name} takes text turns, native resume and MCP; `
+        + 'public env, reasoning and sampling overrides and attachments are not configured', 'capability_denied')
     }
     const prompt = flattenMessages(resolvePromptMessages(req, session, this.name))
     signal.throwIfAborted()
