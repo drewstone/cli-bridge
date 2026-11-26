@@ -121,7 +121,7 @@ const scriptedMcpCall = (harness: string, tool: string, args: Record<string, unk
   : harness === 'grok'
     ? `Call the tool use_tool with exactly ${JSON.stringify({ tool_name: `conformance__${tool}`, tool_input: args })}`
     : `Call the tool *${tool} with exactly ${JSON.stringify(args)}`
-// Factory Droid 1.13 offers MCP tools only behind its ToolSearch tool and puts a loaded one in every later
+// Factory Droid (1.13 and 1.21) offers MCP tools only behind its ToolSearch tool and puts a loaded one in every later
 // request of the session, so a cell loads the tool in the turn before it calls it.
 const scriptedToolLoad = (harness: string, tool: string) => harness === 'factory-droids'
   ? `Call the tool ToolSearch with exactly ${JSON.stringify({ query: `+${tool}` })}`
@@ -244,6 +244,11 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
         : { state: 'unsupported', detail: `not supported by the CLI: ${cli.evidence}; retained and abort pass on its one-shot continuation` }
     }
     const word = marker('steered')
+    const load = SCRIPTED ? scriptedToolLoad(harness, 'wait_seconds') : null
+    if (load) {
+      const loaded = await nativeTurn(3, load)
+      if (loaded.failed) return red(`loading wait_seconds with ToolSearch: ${loaded.failed}`)
+    }
     const turn = await call(bridge, `/v1/sessions/${sessionId}/turns`, {
       message: SCRIPTED ? scriptedCall('wait_seconds', { seconds: 40 })
         : 'Count slowly from 1 to 200, one number per line, using your shell tool to sleep 1 second between numbers.',

@@ -38,6 +38,7 @@ import { CLAUDE_TURN_SETTLED, ClaudeNativeSession } from '../../backends/claude-
 import { ACP_PERMISSION, ACP_TURN_SETTLED, AcpNativeSession } from '../../backends/acp-native-session.js'
 import { CODEX_TURN_SETTLED, CodexNativeSession, isCodexToolApproval } from '../../backends/codex-native-session.js'
 import { KIMI_TURN_SETTLED, KimiNativeSession } from '../../backends/kimi-native-session.js'
+import { DROID_TURN_SETTLED, DroidNativeSession } from '../../backends/droid-native-session.js'
 import { OPENCLAW_REPLY, OPENCLAW_TURN_SETTLED, OpenclawNativeSession } from '../../backends/openclaw-native-session.js'
 import { OPENCODE_TURN_SETTLED, OpencodeNativeSession } from '../../backends/opencode-native-session.js'
 import { opencodeStepUsage } from '../../backends/opencode.js'
@@ -87,6 +88,7 @@ export async function* canonicalTurn(input: NativeTurnInput): AsyncIterable<{ ev
     : native instanceof KimiNativeSession ? kimiStep(input, native, deferredDenials)
     : native instanceof CodexNativeSession ? codexStep(input, native, deferredDenials)
     : native instanceof AcpNativeSession ? acpStep(input, native, deferredDenials)
+    : native instanceof DroidNativeSession ? droidStep(input)
     : native instanceof OpenclawNativeSession ? openclawStep(input) : null
   try {
     for await (const raw of native.turn(prompt, run.signal)) {
@@ -596,6 +598,73 @@ function acpStep(
     }
     // Plans, usage gauges, session info, commands and config are not a turn's output.
     return []
+  }
+}
+
+/**
+ * Factory Droid's step: one session notification to canonical events, or null to keep it as `raw`. Each
+ * assistant text block (by message and block) is one content part fed by its deltas; a tool call is one tool
+ * part, pending when Droid streams it, running when it executes and ended by its result. The settle frame
+ * carries the turn's usage. A steer's receipt stays raw.
+ */
+function droidStep(input: NativeTurnInput): (event: Record<string, unknown>) => StreamEvent[] | null {
+  const { run, sessionId, backendName } = input
+  const parts = new Map<string, { index: number; text: string }>()
+  const tools = new Map<string, { name: string; args: Record<string, unknown>; status: 'pending' | 'running' | 'completed' | 'error' | null }>()
+  let nextContentIndex = 0
+  const raw = (event: unknown): StreamEvent => ({ type: 'raw', backend: backendName, event })
+  const content = (key: string, kind: 'text' | 'reasoning', delta: string): StreamEvent[] => {
+    let entry = parts.get(key)
+    if (!entry) parts.set(key, entry = { index: nextContentIndex++, text: '' })
+    entry.text += delta
+    return [(kind === 'reasoning' ? reasoningEvent : textEvent)(sessionId, run.id, entry.index, entry.text, delta)]
+  }
+  const tool = (id: string, status: 'pending' | 'running' | 'completed' | 'error', fields: { name?: string; args?: Record<string, unknown> },
+    outcome?: Record<string, unknown>): StreamEvent[] => {
+    const known = tools.get(id) ?? { name: 'tool', args: {}, status: null }
+    const args = fields.args && Object.keys(fields.args).length > 0 ? fields.args : known.args
+    const next = { name: fields.name ?? known.name, args, status }
+    tools.set(id, next)
+    if (status === known.status && args === known.args) return []
+    return [{ type: 'message.part.updated', part: toolPart(sessionId, run.id, id, next.name, args, status, outcome) }]
+  }
+  return (event) => {
+    const type = String(event.type ?? '')
+    if (type === DROID_TURN_SETTLED) {
+      const usage = recordValue(event.usage)
+      const read = (key: string) => numberValue(usage?.[key]) ?? undefined
+      const counted = [read('inputTokens'), read('outputTokens')].some((count) => count !== undefined && count > 0)
+      return [
+        ...(counted ? [raw(usageEnvironmentEvent({ input: read('inputTokens'), output: read('outputTokens'), reasoning: read('thinkingTokens'),
+          cacheRead: read('cacheReadTokens'), cacheWrite: read('cacheCreationTokens') }, undefined))] : []),
+        settledStatus(typeof event.error === 'string' ? sanitizeUpstreamErrorDetail(event.error) : null),
+      ]
+    }
+    if ((type === 'assistant_text_delta' || type === 'thinking_text_delta') && typeof event.textDelta === 'string') {
+      const key = `${type}:${String(event.messageId)}:${String(event.blockIndex)}`
+      return event.textDelta ? content(key, type === 'thinking_text_delta' ? 'reasoning' : 'text', event.textDelta) : []
+    }
+    if (type === 'tool_call') {
+      const use = recordValue(event.toolUse)
+      const id = stringValue(use?.id)
+      if (!id) return null
+      return tool(id, tools.get(id)?.status ?? 'pending', { name: stringValue(use?.name) ?? undefined, args: recordValue(use?.input) ?? undefined })
+    }
+    if (type === 'tool_execution_phase_changed') {
+      const id = stringValue(event.toolUseId)
+      return id && event.phase === 'executing' ? tool(id, 'running', { name: stringValue(event.toolName) ?? undefined }) : []
+    }
+    if (type === 'tool_result') {
+      const id = stringValue(event.toolUseId)
+      if (!id) return null
+      const output = typeof event.content === 'string' ? event.content : event.content === undefined ? null : JSON.stringify(event.content)
+      return event.isError === true ? tool(id, 'error', {}, { error: output || 'tool failed' }) : tool(id, 'completed', {}, { output })
+    }
+    // Messages, text and turn boundaries, working state, the queue, settings, MCP status, the title and token gauges
+    // are not a turn's output: text arrives as deltas and usage with the settle frame.
+    if (['create_message', 'assistant_text_complete', 'thinking_text_complete', 'agent_turn_completed', 'droid_working_state_changed',
+      'queued_messages_changed', 'settings_updated', 'mcp_status_changed', 'session_title_updated', 'session_token_usage_changed'].includes(type)) return []
+    return null
   }
 }
 

@@ -3,15 +3,6 @@
  * (one-shot.ts). Each entry was measured on the version agent-container's image pins
  * (`infra/nix/agent-clis.json`), against the Router's scripted model with no vendor login.
  *
- * - Factory Droid 1.13.0 (`droid exec`) runs on the custom models its own settings name
- *   (`~/.factory/settings.json` `customModels`, model id `custom:<id>`); its ACP mode refuses
- *   `session/new` without a Factory login, so the Bridge runs `exec` with `--output-format stream-json`.
- *   It reads MCP servers from `<home>/.factory/mcp.json` and the project's `.factory/mcp.json` only, not
- *   from a `--settings` file, and its home is `FACTORY_HOME_OVERRIDE`, else `HOME`. A turn with MCP
- *   servers runs on a private home (`droidHome`). It offers MCP tools to its model through its
- *   `ToolSearch` tool, not directly, and has no setting that turns that off. Its `completion` event's
- *   usage totals every turn of the session, so the Bridge reports what a turn added. `--session-id`
- *   resumes.
  * - nanocode 0.7.0 (`nc exec`) takes its route from `NANOCODE_OPENAI_BASE_URL`, `NANOCODE_OPENAI_API_KEY`
  *   and `NANOCODE_MODELS_URL`. It prints the reply alone on stdout and `session <id>` on stderr, and `-r`
  *   resumes. It reads no MCP server configuration in `exec`, so a turn with MCP servers is refused. Its
@@ -26,12 +17,11 @@
  */
 import { execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import type { OneShotHarnessName } from '../config.js'
-import type { McpServerSpec } from './types.js'
 import { BackendError } from './types.js'
 import type { OneShotAgent, OneShotRead } from './one-shot.js'
 import { McpUrlRelay } from './mcp-url-relay.js'
@@ -46,61 +36,6 @@ const count = (value: unknown): number | null => {
 }
 const json = (line: string): Record<string, unknown> | null => {
   try { return record(JSON.parse(line)) } catch { return null }
-}
-
-function droidMcp(specs: Record<string, McpServerSpec>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(specs).map(([name, spec]) => [name, spec.url
-    ? { type: spec.type === 'sse' ? 'sse' : 'http', url: spec.url, ...(spec.headers ? { headers: spec.headers } : {}) }
-    : { type: 'stdio', command: spec.command, args: spec.args ?? [], ...(spec.env ? { env: spec.env } : {}) }]))
-}
-
-/**
- * A private Droid home for one turn: its `.factory` links every entry of the real one except `mcp.json`,
- * which holds the turn's servers alone. Settings, custom models and the session store stay the real ones,
- * so the next turn resumes the session with or without MCP servers. What Droid writes beside those links
- * (logs, caches it had not made yet) goes with the turn's directory.
- */
-async function droidHome(dir: string, mcp: Record<string, McpServerSpec>): Promise<string> {
-  const real = join(process.env.FACTORY_HOME_OVERRIDE || process.env.HOME || homedir(), '.factory')
-  // Droid makes its session store on first use; made here, a session begun on the private home is kept.
-  await mkdir(join(real, 'sessions'), { recursive: true })
-  const home = join(dir, 'factory-home'), factory = join(home, '.factory')
-  await mkdir(factory, { recursive: true })
-  for (const entry of await readdir(real)) if (entry !== 'mcp.json') await symlink(join(real, entry), join(factory, entry))
-  await writeFile(join(factory, 'mcp.json'), JSON.stringify({ mcpServers: droidMcp(mcp) }), { mode: 0o600 })
-  return home
-}
-
-const droid: OneShotAgent = {
-  envPassthroughKeys: ['FACTORY_HOME_OVERRIDE'],
-  cumulativeUsage: true,
-  async launch(turn) {
-    const args = ['exec', '--skip-permissions-unsafe', '--output-format', 'stream-json', '--cwd', turn.cwd]
-    if (turn.model) args.push('--model', turn.model)
-    if (turn.resume) args.push('--session-id', turn.resume)
-    args.push('--', turn.prompt)
-    return {
-      args,
-      ...(turn.mcp ? { env: { FACTORY_HOME_OVERRIDE: await droidHome(turn.dir, turn.mcp) } } : {}),
-      stdout(line) {
-        const event = json(line)
-        if (!event) return null
-        if (event.type === 'error') throw new BackendError(`droid: ${String(event.message ?? event.content ?? 'error')}`.slice(0, 500), 'upstream')
-        const sessionId = typeof event.session_id === 'string' ? event.session_id : undefined
-        if (event.type === 'message' && event.role === 'assistant' && typeof event.text === 'string') return { line: event.text, ...(sessionId ? { sessionId } : {}) }
-        if (event.type === 'completion') {
-          const usage = record(event.usage)
-          const input = count(usage?.input_tokens), output = count(usage?.output_tokens)
-          return {
-            ...(sessionId ? { sessionId } : {}),
-            ...(typeof event.finalText === 'string' ? { finalText: event.finalText } : {}),
-            ...(input !== null && output !== null ? { usage: { input, output } } : {}),
-          }
-        }
-        return sessionId ? { sessionId } : null
-      },
-    }
-  },
 }
 
 /** Sums the completed model calls' tokens in one nanocode process's trace export. */
@@ -246,4 +181,4 @@ const exo: OneShotAgent = {
   },
 }
 
-export const oneShotAgents: Record<OneShotHarnessName, OneShotAgent> = { droid, nanocode, exo }
+export const oneShotAgents: Record<OneShotHarnessName, OneShotAgent> = { nanocode, exo }
