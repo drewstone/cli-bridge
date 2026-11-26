@@ -64,8 +64,6 @@ export interface OneShotRead {
 export interface OneShotAgent {
   /** Host variables the agent reads, passed through the host allowlist by exact name. */
   envPassthroughKeys: readonly string[]
-  /** The usage the agent reports is its session's running total, not the turn's. */
-  cumulativeUsage?: boolean
   launch(turn: OneShotTurn): Promise<OneShotLaunch>
 }
 
@@ -75,8 +73,6 @@ export class OneShotBackend implements Backend {
   readonly name: string
   readonly defaultExecutionTimeoutMs: number
   private readonly spawner: Spawner
-  /** Each native session's last reported totals, for an agent whose usage is cumulative. */
-  private readonly totals = new Map<string, { input: number; output: number }>()
 
   constructor(private readonly opts: { name: string; alias: string; bin: string; agent: OneShotAgent; timeoutMs: number; spawner?: Spawner }) {
     this.name = opts.name
@@ -178,7 +174,7 @@ export class OneShotBackend implements Backend {
       for (const delta of take(await launch.after?.({ sessionId, pid: child.pid }) ?? null)) yield delta
       if (!sessionId) throw new BackendError(`${this.name} exited without naming its native session`, 'upstream')
       if (lines === 0 && finalText) { text = finalText; yield { content: finalText } }
-      yield { final_text: text, usage: { ...this.turnUsage(sessionId, turn.resume, usage), cost_known: false }, finish_reason: 'stop' }
+      yield { final_text: text, usage: { ...reportedUsage(usage), cost_known: false }, finish_reason: 'stop' }
     } finally {
       signal.removeEventListener('abort', stop)
       if (spawned) { await terminateSpawned(spawned); spawned.release() }
@@ -186,17 +182,8 @@ export class OneShotBackend implements Backend {
       await rm(dir, { recursive: true, force: true })
     }
   }
+}
 
-  /**
-   * The turn's counts. A cumulative total less the session's last one; a resumed session whose last total
-   * this process did not see reports none, since its own share cannot be told apart.
-   */
-  private turnUsage(sessionId: string, resumed: string | null, usage: OneShotRead['usage']): { input_tokens?: number; output_tokens?: number; estimated?: false } {
-    if (!usage) return {}
-    if (!this.opts.agent.cumulativeUsage) return { input_tokens: usage.input, output_tokens: usage.output, estimated: false }
-    const before = resumed ? this.totals.get(sessionId) : { input: 0, output: 0 }
-    this.totals.set(sessionId, usage)
-    if (!before || usage.input < before.input || usage.output < before.output) return {}
-    return { input_tokens: usage.input - before.input, output_tokens: usage.output - before.output, estimated: false }
-  }
+function reportedUsage(usage: OneShotRead['usage']): { input_tokens?: number; output_tokens?: number; estimated?: false } {
+  return usage ? { input_tokens: usage.input, output_tokens: usage.output, estimated: false } : {}
 }

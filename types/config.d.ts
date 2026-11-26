@@ -19,7 +19,7 @@ export type AcpHarnessName = typeof acpHarnesses[number][0];
  * Agents run one process per turn (OneShotBackend): backend key (the `<KEY>_BIN` variable), harness id,
  * default binary. How each one starts and is read is in backends/one-shot-agents.ts.
  */
-export declare const oneShotHarnesses: readonly [readonly ['droid', 'factory-droids', 'droid'], readonly ['nanocode', 'nanocode', 'nc'], readonly ['exo', 'exo', 'exo']];
+export declare const oneShotHarnesses: readonly [readonly ['nanocode', 'nanocode', 'nc'], readonly ['exo', 'exo', 'exo']];
 export type OneShotHarnessName = typeof oneShotHarnesses[number][0];
 /**
  * Local drivers registered by the server. This is routing metadata, not proof
@@ -35,10 +35,14 @@ export declare const localBackends: readonly [...({
     harness: "deepseek-harness" | "github-copilot" | "grok" | "hermes" | "qwen-code";
     kind: 'acp';
 } | {
-    name: "droid" | "exo" | "nanocode";
-    harness: "exo" | "factory-droids" | "nanocode";
+    name: "exo" | "nanocode";
+    harness: "exo" | "nanocode";
     kind: 'one-shot';
 })[], {
+    readonly name: 'droid';
+    readonly harness: 'factory-droids';
+    readonly kind: 'droid';
+}, {
     readonly name: 'openclaw';
     readonly harness: 'openclaw';
     readonly kind: 'openclaw';
@@ -76,6 +80,8 @@ export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
     backends: Set<string>;
     /** Dedicated subscription consumers refuse API and unverified native routes. */
     subscriptionsOnly: boolean;
+    /** Factory Droid, driven on its streamed JSON-RPC mode (DroidBackend). */
+    droidBin: string;
     /** openclaw, driven via `openclaw agent --local` (OpenclawBackend). */
     openclawBin: string;
     primeBin: string;

@@ -1,12 +1,10 @@
 /**
- * Factory Droid, nanocode and Exo through a real Bridge listener and the host spawner, against a synthetic
- * CLI for each that keeps its measured rules (one-shot-agents.ts): Droid prints stream-json and totals its
- * session's usage on `completion`; nanocode prints its reply on stdout, its session on stderr and its usage
- * in its OpenTelemetry trace export; Exo reads an agent definition with URL MCP servers, prints headers
- * and its reply, and keeps usage in its thread's event log. Exo's MCP call reaches a real stdio server
- * through the Bridge's URL relay. No model is called.
+ * nanocode and Exo through a real Bridge listener and the host spawner, against a synthetic CLI for each
+ * that keeps its measured rules (one-shot-agents.ts): nanocode prints its reply on stdout, its session on
+ * stderr and its usage in its OpenTelemetry trace export; Exo reads an agent definition with URL MCP
+ * servers, prints headers and its reply, and keeps usage in its thread's event log. Exo's MCP call reaches
+ * a real stdio server through the Bridge's URL relay. No model is called.
  */
-import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,27 +21,6 @@ fs.mkdirSync(state, { recursive: true })
 const at = (flag) => { const i = args.indexOf(flag); return i >= 0 ? args[i + 1] : null }
 const log = (entry) => fs.appendFileSync(path.join(state, 'calls.jsonl'), JSON.stringify(entry) + '\n')
 const uuid = () => [8, 4, 4, 4, 12].map((n) => require('node:crypto').randomBytes(n).toString('hex').slice(0, n)).join('-')
-`
-
-const droid = String.raw`${common}
-const prompt = args[args.indexOf('--') + 1]
-const home = process.env.FACTORY_HOME_OVERRIDE || process.env.HOME, factory = path.join(home, '.factory')
-const read = (name) => { try { return JSON.parse(fs.readFileSync(path.join(factory, name), 'utf8')) } catch { return null } }
-log({ flavor: 'droid', cwd: at('--cwd'), args, home, mcp: read('mcp.json') })
-const models = (read('settings.json')?.customModels ?? []).map((entry) => entry.id)
-if (at('--model') && !models.includes(at('--model'))) { process.stderr.write('Unknown model ' + at('--model') + '. Available: ' + models.join(', ') + '\n'); process.exit(1) }
-const sid = at('--session-id') || 'droid-' + uuid()
-fs.mkdirSync(path.join(factory, 'sessions'), { recursive: true })
-const totals = path.join(factory, 'sessions', sid + '.json')
-if (at('--session-id') && !fs.existsSync(totals)) { process.stderr.write('Session not found: ' + sid + '\n'); process.exit(1) }
-const before = fs.existsSync(totals) ? JSON.parse(fs.readFileSync(totals, 'utf8')) : { i: 0, o: 0 }
-const total = { i: before.i + 10, o: before.o + 2 }
-fs.writeFileSync(totals, JSON.stringify(total))
-const out = (event) => process.stdout.write(JSON.stringify(event) + '\n')
-out({ type: 'system', subtype: 'init', session_id: sid })
-out({ type: 'message', role: 'user', text: prompt, session_id: sid })
-out({ type: 'message', role: 'assistant', text: 'echo ' + prompt, session_id: sid })
-out({ type: 'completion', finalText: 'echo ' + prompt, session_id: sid, usage: { input_tokens: total.i, output_tokens: total.o } })
 `
 
 const nanocode = String.raw`${common}
@@ -100,31 +77,26 @@ const rpc = async (id, method, params) => {
 // Answers its one tool with the token from its env.
 const tokenServer = `const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',(line)=>{const r=JSON.parse(line);if(r.id===undefined)return;const result=r.method==='initialize'?{protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'conformance',version:'1'}}:r.method==='tools/list'?{tools:[{name:'conformance_token',inputSchema:{type:'object',properties:{}}}]}:{content:[{type:'text',text:process.env.CONFORMANCE_REPLY}]};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:r.id,result})+'\\n')})`
 
-type Call = { flavor: string; cwd?: string | null; method?: string; args: string[]; mcp?: Record<string, any> | null; route?: string | null
+type Call = { flavor: string; cwd?: string | null; method?: string; args: string[]; route?: string | null
   file?: string; home?: string; key?: string; definition?: string }
 
-const ENV = { FACTORY_HOME_OVERRIDE: '', NANOCODE_HOME: '', NANOCODE_OPENAI_BASE_URL: 'http://127.0.0.1:9/nanocode/v1', EXO_HOME: '', EXO_MODEL_BASE_URL: 'http://127.0.0.1:9/exo/v1',
+const ENV = { NANOCODE_HOME: '', NANOCODE_OPENAI_BASE_URL: 'http://127.0.0.1:9/nanocode/v1', EXO_HOME: '', EXO_MODEL_BASE_URL: 'http://127.0.0.1:9/exo/v1',
   EXO_MODEL_API_KEY: 'fixture-exo-key' }
 
-describe('Factory Droid, nanocode and Exo as one-shot agents through the Bridge', () => {
+describe('nanocode and Exo as one-shot agents through the Bridge', () => {
   let root: string, bridge: BridgeServer
   const saved = Object.fromEntries(Object.keys(ENV).map((name) => [name, process.env[name]]))
   beforeAll(async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), 'one-shot-agents-')))
     await mkdir(join(root, 'bin'))
     const bins: Record<string, string> = {}
-    for (const [name, source] of Object.entries({ droid, nc: nanocode, exo })) {
+    for (const [name, source] of Object.entries({ nc: nanocode, exo })) {
       bins[name] = join(root, 'bin', `${name}.cjs`)
       await writeFile(bins[name]!, `#!${process.execPath}\n${source}`, { mode: 0o700 })
     }
-    // The operator's own Droid home: its custom model and its own MCP server.
-    const factory = join(root, 'droid-home', '.factory')
-    await mkdir(factory, { recursive: true })
-    await writeFile(join(factory, 'settings.json'), JSON.stringify({ customModels: [{ id: 'custom:fixture', model: 'fixture' }] }))
-    await writeFile(join(factory, 'mcp.json'), JSON.stringify({ mcpServers: { own: { type: 'stdio', command: 'own-server' } } }))
-    Object.assign(process.env, ENV, { FACTORY_HOME_OVERRIDE: join(root, 'droid-home'), NANOCODE_HOME: join(root, 'nanocode-home'), EXO_HOME: join(root, 'exo-home') })
-    const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'factory-droids,nanocode,exo',
-      DROID_BIN: bins.droid, NANOCODE_BIN: bins.nc, EXO_BIN: bins.exo, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'off' })
+    Object.assign(process.env, ENV, { NANOCODE_HOME: join(root, 'nanocode-home'), EXO_HOME: join(root, 'exo-home') })
+    const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'nanocode,exo',
+      NANOCODE_BIN: bins.nc, EXO_BIN: bins.exo, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'off' })
     bridge = await startServer({ config: { ...config, port: 0 }, cwd: root, quiet: true, handleSignals: false })
   })
   afterAll(async () => {
@@ -155,39 +127,6 @@ describe('Factory Droid, nanocode and Exo as one-shot agents through the Bridge'
     return { name: 'conformance', mcp: { conformance: { transport: 'stdio', command: process.execPath, args: [{ kind: 'public', value: server }],
       env: { CONFORMANCE_REPLY: { kind: 'public', value: token } } } } }
   }
-
-  it('runs Droid in stream-json with its MCP servers on a private home, resumes it, and reports what each turn added', async () => {
-    const cwd = await workspace('droid'), session = `droid-${randomBytes(3).toString('hex')}`, token = `T-${randomBytes(3).toString('hex')}`
-    const one = await chat('factory-droids', cwd, 'one', { session_id: session, agent_profile: await profile(cwd, token) })
-    expect(one.status, JSON.stringify(one.error)).toBe(200)
-    expect(one.text).toBe('echo one')
-    expect(one.usage).toMatchObject({ prompt_tokens: 10, completion_tokens: 2 })
-    const two = await chat('factory-droids', cwd, 'two', { session_id: session, agent_profile: await profile(cwd, token) })
-    expect(two.status, 'the session begun on one private home resumes on the next').toBe(200)
-    expect(two.usage, 'the second turn reports what it added to the session total').toMatchObject({ prompt_tokens: 10, completion_tokens: 2 })
-    const [first, second] = await calls((call) => call.flavor === 'droid' && call.cwd === cwd)
-    expect(first!.args.slice(0, 6)).toEqual(['exec', '--skip-permissions-unsafe', '--output-format', 'stream-json', '--cwd', cwd])
-    // The turn's servers alone, in place of the operator's own.
-    expect(first!.mcp).toEqual({ mcpServers: { conformance: { type: 'stdio', command: process.execPath, args: [join(cwd, 'token-mcp.cjs')],
-      env: { CONFORMANCE_REPLY: token } } } })
-    expect(first!.home).not.toBe(process.env.FACTORY_HOME_OVERRIDE)
-    expect(existsSync(first!.home!), 'the private home outlived the turn').toBe(false)
-    expect(first!.args).not.toContain('--session-id')
-    const resumed = second!.args[second!.args.indexOf('--session-id') + 1]
-    expect(resumed).toMatch(/^droid-/u)
-    expect(existsSync(join(process.env.FACTORY_HOME_OVERRIDE!, '.factory', 'sessions', `${resumed}.json`)), 'the session is in the real store').toBe(true)
-
-    // A turn without MCP servers runs on the operator's home, its own servers and custom model included.
-    const named = await chat('factory-droids/custom:fixture', cwd, 'three')
-    expect(named.status, JSON.stringify(named.error)).toBe(200)
-    const third = (await calls((call) => call.flavor === 'droid' && call.cwd === cwd))[2]!
-    expect(third.home).toBe(process.env.FACTORY_HOME_OVERRIDE)
-    expect(Object.keys(third.mcp!.mcpServers)).toEqual(['own'])
-    expect(third.args.slice(third.args.indexOf('--model'), third.args.indexOf('--model') + 2)).toEqual(['--model', 'custom:fixture'])
-    const refused = await chat('factory-droids/custom:no-such-model', cwd, 'four')
-    expect(refused.status).toBeGreaterThanOrEqual(400)
-    expect(refused.error?.type ?? refused.error?.code).toBeTruthy()
-  }, 60_000)
 
   it('runs nanocode, reads its session from stderr and its usage from its trace export, and refuses MCP servers it cannot take', async () => {
     const cwd = await workspace('nc'), session = `nc-${randomBytes(3).toString('hex')}`

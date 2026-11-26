@@ -44,7 +44,6 @@ export type AcpHarnessName = typeof acpHarnesses[number][0]
  * default binary. How each one starts and is read is in backends/one-shot-agents.ts.
  */
 export const oneShotHarnesses = [
-  ['droid', 'factory-droids', 'droid'],
   ['nanocode', 'nanocode', 'nc'],
   ['exo', 'exo', 'exo'],
 ] as const
@@ -59,6 +58,7 @@ export const localBackends = [
   ...localHarnesses.map(([name, harness]) => ({ name, harness, kind: 'native' as const })),
   ...acpHarnesses.map(([name, harness]) => ({ name, harness, kind: 'acp' as const })),
   ...oneShotHarnesses.map(([name, harness]) => ({ name, harness, kind: 'one-shot' as const })),
+  { name: 'droid', harness: 'factory-droids', kind: 'droid' },
   { name: 'openclaw', harness: 'openclaw', kind: 'openclaw' },
   { name: 'prime', harness: 'prime', kind: 'prime' },
 ] as const
@@ -100,6 +100,8 @@ export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
   backends: Set<string>
   /** Dedicated subscription consumers refuse API and unverified native routes. */
   subscriptionsOnly: boolean
+  /** Factory Droid, driven on its streamed JSON-RPC mode (DroidBackend). */
+  droidBin: string
   /** openclaw, driven via `openclaw agent --local` (OpenclawBackend). */
   openclawBin: string
   primeBin: string
@@ -264,6 +266,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       [`${name}TimeoutMs`, parseExecutionTimeoutMs(`${name.toUpperCase()}_TIMEOUT_MS`, env[`${name.toUpperCase()}_TIMEOUT_MS`], name === 'codex' && !env.CLI_TIMEOUT_MS ? maxCodexSubscriptionTurnMs : defaultTimeout)],
     ])) as NativeHarnessConfig,
     ...Object.fromEntries([...acpHarnesses, ...oneShotHarnesses].map(([name, , bin]) => [`${name}Bin`, env[`${name.toUpperCase()}_BIN`] ?? bin])) as AcpHarnessConfig,
+    droidBin: env.DROID_BIN ?? 'droid',
     openclawBin: env.OPENCLAW_BIN ?? 'openclaw',
     primeBin: env.PRIME_BIN ?? 'prime-agent',
     primeTimeoutMs: parseExecutionTimeoutMs('PRIME_TIMEOUT_MS', env.PRIME_TIMEOUT_MS, defaultTimeout),
