@@ -66,7 +66,7 @@ export class DroidBackend implements NativeSessionBackend {
     resolvePromptMessages(req, session, this.name)
     // The chat route resolves a one-shot's jail; a retained session starts here, so it resolves its own.
     req.jailSpec ??= hostRequestJail(req, this.name, this.opts.jailEnv ?? process.env)
-    return await this.open(req, session, signal)
+    return await this.open(req, session, signal, signal)
   }
 
   /** One turn on its own process, continuing the Bridge session's Droid session when it has one. */
@@ -79,6 +79,7 @@ export class DroidBackend implements NativeSessionBackend {
     }
     const prompt = flattenMessages(resolvePromptMessages(req, session, this.name))
     signal.throwIfAborted()
+    // The run's cancel reaches the session, which interrupts Droid before stopping it; the spawner would only kill it.
     const native = await this.open(req, session, signal)
     try {
       yield { internal_session_id: native.providerSessionId()! }
@@ -116,12 +117,13 @@ export class DroidBackend implements NativeSessionBackend {
     return null
   }
 
-  private async open(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal): Promise<DroidNativeSession> {
+  /** `stopOn` ends the process with that signal; without it the session's own abort does. */
+  private async open(req: ChatRequest, session: SessionRecord | null, signal?: AbortSignal, stopOn?: AbortSignal): Promise<DroidNativeSession> {
     const cwd = resolveSpawnerCwd(this.spawner, req.cwd ?? session?.cwd ?? process.cwd())!
     const mcpServers = droidMcpServers(resolveMcpServers(req, session, { backend: this.name, privateMcpConfig: true }))
     const spawned = await this.spawner(this.opts.bin,
       ['exec', '--input-format', 'stream-jsonrpc', '--output-format', 'stream-jsonrpc', '--skip-permissions-unsafe', '--cwd', cwd], {
-        signal, stdio: ['pipe', 'pipe', 'pipe'], cwd, env: process.env, envPassthroughKeys: ['FACTORY_HOME_OVERRIDE'],
+        ...(stopOn ? { signal: stopOn } : {}), stdio: ['pipe', 'pipe', 'pipe'], cwd, env: process.env, envPassthroughKeys: ['FACTORY_HOME_OVERRIDE'],
         ...(req.session_id ? { sessionId: req.session_id } : {}),
         ...(req.jailSpec ? { jail: req.jailSpec } : {}),
         ...(req.childLineage ? { lineageEnv: req.childLineage } : {}),
