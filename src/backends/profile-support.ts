@@ -126,7 +126,10 @@ export function provisionProfileWorkspace(
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   let scoped: PrivateProfileScope | undefined
   try {
-    const plan = materializeProfile(withResolvedResources(req, workspaceProfile(req, profile)), harness, { skip: ['mcp'], binds: harness === 'codex' ? ['codex.developer-instructions'] : [] })
+    const plan = materializeProfile(withResolvedResources(req, workspaceProfile(req, profile)), harness, {
+      skip: ['mcp'],
+      binds: harness === 'codex' ? ['codex.developer-instructions'] : [],
+    })
     // Bind generated --settings to this exact profile. A resumed session retains its already-applied plan.
     if (harness === 'claude-code' && sessionAppliedPlanDigest(session, workspaceCwd).appliedPlanDigest !== hashWorkspacePlan(plan)) {
       const settingsPath = '.tangle/claude-settings.json'
