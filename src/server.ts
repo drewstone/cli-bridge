@@ -61,6 +61,8 @@ import { reapStalePrivateTemporaryRoots } from './runtime/private-temporary.js'
 import { bindIncomingRequest } from './http/request-source.js'
 import type { BridgeServer, StartServerOptions } from './server-options.js'
 import { mountHubMcp } from './hub-mcp.js'
+import { resolveProfileResources } from './profile-resources.js'
+import { resolveAgentProfile } from './backends/profile-support.js'
 import { mountCallerTools, type CallerTools } from './caller-tools.js'
 import { ChangeRecorder } from './change-ledger/recorder.js'
 
@@ -225,7 +227,11 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
   // Rows of the turns this Bridge runs, for harnesses that have no hook of their own. Off when config omits it.
   const changes = config.changeLedger ? new ChangeRecorder(config.changeLedger.dir) : undefined
   if (changes) extras.shutdownHooks.unshift(async () => await changes.settled())
-  const retained = new RetainedSessionService({ store: sessions, registry, runs, changes, admitSubscription: nativeCatalog.admit })
+  const retained = new RetainedSessionService({ store: sessions, registry, runs, changes,
+    admitSubscription: async (request, backend, signal) => {
+      await nativeCatalog.admit(request, backend, signal)
+      await resolveProfileResources(request, resolveAgentProfile(request, null), backend, signal)
+    } })
   extras.shutdownHooks.unshift(async () => await retained.shutdown())
   await continueInterruptedRuns({ store: sessions, runs, registry, durableWriter, jailEnv })
 
@@ -332,6 +338,7 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
     jailEnv,
     admitSubscription: async (request, backend, signal) => {
       await nativeCatalog.admit(request, backend, signal)
+      await resolveProfileResources(request, resolveAgentProfile(request, null), backend, signal)
       const releaseHub = await hub?.prepare(request, signal, backend)
       let releasePrivate: (() => void) | undefined, releaseServices: (() => void) | undefined, releaseCaller: (() => void) | undefined
       try {

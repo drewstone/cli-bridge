@@ -276,6 +276,12 @@ Behavior:
 
 - `sandbox` backends honor the full `agent_profile` natively
 - local harness backends (`claude-code`, `codex`, `kimi-code`, `gemini`, `pi`, `prime`) persist the full profile and reject profile dimensions they cannot execute
+- a profile resource named by GitHub reference (a skill, mounted file, tool, agent, command or
+  instruction) is fetched from `raw.githubusercontent.com` when the request is admitted, before any
+  harness starts, and its bytes are written to the workspace. A reference that cannot be fetched
+  fails the request. The profile digest and session binding still name the references. Bytes of a
+  reference pinned to a full commit are kept in memory and reused by later turns
+  ([`src/profile-resources.ts`](src/profile-resources.ts)).
 - `codex/default` and `codex/<provider>/default` select the Codex CLI configured model without a model override; the qualified form retains the explicit provider.
   Its exact profile may omit `model.provider` or name the harness as the provider.
   A harness name is never passed to a CLI as its model provider. The backend drops a provider
