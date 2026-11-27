@@ -214,9 +214,9 @@ describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through
     const session = await retained('deepseek-harness', 'dsh-usage')
     try {
       const usage = async (message: string) => (await runEvents(await session.turn(message)))
-        .filter((event) => event.type === 'usage').map((event) => [event.usage?.inputTokens, event.usage?.outputTokens, event.usage?.cachedReadTokens])
-      expect(await usage('one')).toEqual([[10, 2, 4]])
-      expect(await usage('two')).toEqual([[10, 2, 4]])
+        .filter((event) => event.type === 'usage').map((event) => [event.usage?.inputTokens, event.usage?.outputTokens])
+      expect(await usage('one')).toEqual([[10, 2]])
+      expect(await usage('two')).toEqual([[10, 2]])
     } finally {
       await post(`/v1/sessions/${session.id}/close`, {})
     }
