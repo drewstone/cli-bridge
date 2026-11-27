@@ -21,6 +21,7 @@ import type { BackendRegistry } from '../../backends/registry.js'
 import type { Backend, ChatMessage, PreparedContextTransfer } from '../../backends/types.js'
 import { contextTransferRoute, exactSessionProfileBinding } from '../../backends/profile-support.js'
 import type { SessionStore, StoredRetainedControlOperation } from '../store.js'
+import { fetchProfileResources } from '../../profile-resources.js'
 import { readyBackendCapabilities } from './capabilities.js'
 import { RetainedSessionError } from './types.js'
 
@@ -199,6 +200,8 @@ export class RetainedContextTransfers {
       if (!backend?.validateContextTransfer || !backend.prepareContextTransfer) {
         throw new RetainedSessionError('destination runner does not support typed native context import', 501, 'capability_denied')
       }
+      // The destination writes the profile's workspace from fetched bytes; a GitHub reference fails here, before any claim.
+      await fetchProfileResources(request.profile, signal ?? new AbortController().signal)
       backend.validateContextTransfer(request)
     }
     let binding = bindingFor(request)
@@ -264,6 +267,7 @@ export class RetainedContextTransfers {
       if (!backend.validateContextTransfer || !backend.prepareContextTransfer || !request.profile || ready.capabilities.contextTransfer?.freshSession !== true) {
         return unknown(binding, 'destination runner cannot import this exact public profile and typed context', false)
       }
+      await fetchProfileResources(request.profile, signal ?? new AbortController().signal)
       backend.validateContextTransfer(request)
     } catch (error) {
       return unknown(

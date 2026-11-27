@@ -126,7 +126,7 @@ export function provisionProfileWorkspace(
   const workspaceCwd = requireMaterializationCwd(cwd, `${harness} AgentProfile materialization`)
   let scoped: PrivateProfileScope | undefined
   try {
-    const plan = materializeProfile(withResolvedResources(req, workspaceProfile(req, profile)), harness, {
+    const plan = materializeProfile(withResolvedResources(workspaceProfile(req, profile)), harness, {
       skip: ['mcp'],
       binds: harness === 'codex' ? ['codex.developer-instructions'] : [],
     })
@@ -379,7 +379,7 @@ export function provisionPiProfile(
         `no request-scoped Pi loader exists for generic workspace file(s): ${genericFiles.join(', ')}`,
       )
     }
-    const plan = materializeProfile(withResolvedResources(req, workspaceProfile(req, profile)), 'pi', { skip: ['mcp', 'extensions'] })
+    const plan = materializeProfile(withResolvedResources(workspaceProfile(req, profile)), 'pi', { skip: ['mcp', 'extensions'] })
     assertWorkspacePlanSupported(plan)
     const nativeLoaders = assertPiPlanHasNativeLoaders(plan)
 

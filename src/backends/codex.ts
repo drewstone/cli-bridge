@@ -1,5 +1,6 @@
 /** Codex native execution and retained context import; cli-bridge owns the JSONL and app-server transports. */
 
+import { withResolvedResources } from '../profile-resources.js'
 import { dirname, join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
@@ -125,7 +126,7 @@ export class CodexBackend implements NativeSessionBackend {
     const req = codexTransferChatRequest(request)
     const effort = nativeReasoningControl('codex', resolveRequestedReasoningEffort(req, null))
     profileExecutionIdentity(req, null, 'codex', effort)
-    assertWorkspacePlanSupported(materializeProfile(profile, 'codex', { skip: ['mcp'], binds: ['codex.developer-instructions'] }))
+    assertWorkspacePlanSupported(materializeProfile(withResolvedResources(profile), 'codex', { skip: ['mcp'], binds: ['codex.developer-instructions'] }))
   }
 
   async prepareContextTransfer(
