@@ -4,7 +4,8 @@
  * Copilot loads MCP servers only from `--additional-mcp-config @<file>` and reports usage totals for its
  * process; Qwen reports each model call's usage on a message chunk; Grok reports usage in the result's
  * `_meta` and queues a second prompt behind a running one until `session/cancel`; DeepSeek Harness
- * reports context occupancy only and refuses a second prompt while one is in flight. No model is called.
+ * reports context occupancy only over ACP (its token counts are in its projection cache, which the
+ * synthetic agent writes as the real one does) and refuses a second prompt while one is in flight. No model is called.
  */
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
@@ -30,7 +31,7 @@ log({ method: 'launch', args: process.argv.slice(2), blocking: process.env.QWEN_
   mcpConfig: mcpFile ? JSON.parse(fs.readFileSync(mcpFile, 'utf8')) : null })
 const say = (sessionId, text, extra = {}) => send({ method: 'session/update', params: { sessionId,
   update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: 'm-' + Math.random().toString(16).slice(2), ...extra } } })
-let total = { inputTokens: 0, outputTokens: 0 }, held = null
+let total = { inputTokens: 0, outputTokens: 0 }, dsh = { u: 0, o: 0, r: 0 }, held = null
 const queued = []
 const answer = (id, sessionId, text) => {
   say(sessionId, 'echo ' + text)
@@ -44,6 +45,13 @@ const answer = (id, sessionId, text) => {
   }
   if (flavor === 'dsh') {
     send({ method: 'session/update', params: { sessionId, update: { sessionUpdate: 'usage_update', used: 1290, size: 128000 } } })
+    // The projection cache, written a moment after the prompt is answered: totals of 6 uncached and 4 cached
+    // prompt tokens and 2 completion tokens for each prompt.
+    dsh = { u: dsh.u + 6, o: dsh.o + 2, r: dsh.r + 4 }
+    const file = path.join(process.env.DSH_HOME, 'storages', 'session_projcache', 'sessions', sessionId + '.json')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    setTimeout(() => fs.writeFileSync(file, JSON.stringify({ version: 1, record: { rows: { tokenUsage: { ver: 2, seq: 23, val: { totals: {
+      uncachedInputTokens: dsh.u, outputTokens: dsh.o, cacheReadTokens: dsh.r, cacheWriteTokens: 0 } } } } } })), 150)
     return send({ id, result: { stopReason: 'end_turn' } })
   }
   return send({ id, result: { stopReason: 'end_turn', _meta: { usage: { inputTokens: 5, outputTokens: 1 } } } })
@@ -87,7 +95,7 @@ const GROK_ROUTE = 'http://127.0.0.1:9/grok/v1'
 
 describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through the Bridge', () => {
   let root: string, bridge: BridgeServer
-  const saved = { copilot: process.env.COPILOT_PROVIDER_BASE_URL, grok: process.env.GROK_MODELS_BASE_URL }
+  const saved = { copilot: process.env.COPILOT_PROVIDER_BASE_URL, grok: process.env.GROK_MODELS_BASE_URL, dsh: process.env.DSH_HOME }
   beforeAll(async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), 'acp-agents-')))
     await mkdir(join(root, 'bin'))
@@ -99,6 +107,7 @@ describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through
     // The route variables the host allowlist drops unless the agent's launch names them.
     process.env.COPILOT_PROVIDER_BASE_URL = COPILOT_ROUTE
     process.env.GROK_MODELS_BASE_URL = GROK_ROUTE
+    process.env.DSH_HOME = join(root, 'dsh-home')
     const config = loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'github-copilot,qwen-code,grok,deepseek-harness',
       COPILOT_BIN: bins.copilot, QWEN_BIN: bins.qwen, GROK_BIN: bins.grok, DSH_BIN: bins.dsh, BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'off' })
     bridge = await startServer({ config: { ...config, port: 0 }, cwd: root, quiet: true, handleSignals: false })
@@ -106,7 +115,7 @@ describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through
   afterAll(async () => {
     await bridge?.close().catch(() => undefined)
     await rm(root, { recursive: true, force: true })
-    for (const [name, value] of [['COPILOT_PROVIDER_BASE_URL', saved.copilot], ['GROK_MODELS_BASE_URL', saved.grok]] as const) {
+    for (const [name, value] of [['COPILOT_PROVIDER_BASE_URL', saved.copilot], ['GROK_MODELS_BASE_URL', saved.grok], ['DSH_HOME', saved.dsh]] as const) {
       if (value === undefined) delete process.env[name]
       else process.env[name] = value
     }
@@ -154,8 +163,8 @@ describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through
       { model: 'github-copilot', flavor: 'copilot', args: ['--acp', '--allow-all', '--additional-mcp-config'], usage: { prompt_tokens: 10, completion_tokens: 2 } },
       { model: 'qwen-code', flavor: 'qwen', args: ['--acp', '--approval-mode', 'yolo'], usage: { prompt_tokens: 7, completion_tokens: 3 } },
       { model: 'grok', flavor: 'grok', args: ['agent', '--always-approve', 'stdio'], usage: { prompt_tokens: 5, completion_tokens: 1 } },
-      // DeepSeek Harness reports no token usage, only context occupancy.
-      { model: 'deepseek-harness', flavor: 'dsh', args: ['--profile', 'acp'], usage: undefined },
+      // DeepSeek Harness's ACP answers carry no token counts; its projection cache does.
+      { model: 'deepseek-harness', flavor: 'dsh', args: ['--profile', 'acp'], usage: { prompt_tokens: 10, completion_tokens: 2 } },
     ]
     for (const row of rows) {
       const cwd = await workspace(row.flavor)
@@ -196,6 +205,18 @@ describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through
       expect(await usage('two')).toEqual([[10, 2]])
       // A retained session runs without the unattended flag: the turn's interaction policy answers permissions.
       expect((await calls(session.cwd)).find((call) => call.method === 'launch')?.args).toEqual(['--acp'])
+    } finally {
+      await post(`/v1/sessions/${session.id}/close`, {})
+    }
+  }, 40_000)
+
+  it('reports what each DeepSeek Harness prompt added to its session totals', async () => {
+    const session = await retained('deepseek-harness', 'dsh-usage')
+    try {
+      const usage = async (message: string) => (await runEvents(await session.turn(message)))
+        .filter((event) => event.type === 'usage').map((event) => [event.usage?.inputTokens, event.usage?.outputTokens])
+      expect(await usage('one')).toEqual([[10, 2]])
+      expect(await usage('two')).toEqual([[10, 2]])
     } finally {
       await post(`/v1/sessions/${session.id}/close`, {})
     }

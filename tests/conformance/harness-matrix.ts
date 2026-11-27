@@ -23,6 +23,9 @@
  * The scripted model makes one call per instruction, so it cannot search for a deferred tool first: the
  * axis runs the Bridge with ENABLE_TOOL_SEARCH=false (unless set), which has Claude Code put every MCP
  * tool in each request instead of behind its ToolSearch tool, as it does for an endpoint without search.
+ * nanocode takes no MCP server from its caller, so on this axis its tool and abort verbs run on its own tool,
+ * a custom tool `exec` that takes JavaScript and reaches its shell as `tools.exec_command` (`scriptedShell`), and
+ * its profile+mcp cell is `unsupported` when the Bridge refuses the profile's server with a typed `capability_denied`.
  * Factory Droid has no such setting, so each of its MCP cells first loads the tool with its ToolSearch tool
  * in a turn of the same session (`scriptedToolLoad`); a model that searches does both in one turn.
  */
@@ -121,6 +124,16 @@ const scriptedMcpCall = (harness: string, tool: string, args: Record<string, unk
   : harness === 'grok'
     ? `Call the tool use_tool with exactly ${JSON.stringify({ tool_name: `conformance__${tool}`, tool_input: args })}`
     : `Call the tool *${tool} with exactly ${JSON.stringify(args)}`
+// nanocode 0.7.0 (`nc exec --harness codex`) offers its model one tool, the custom tool `exec`, which takes raw JavaScript
+// and runs it with the shell as `tools.exec_command({ cmd })` (measured against the Router's scripted model: the request's
+// `additional_tools` hold `exec` and `wait`). Its CLI takes no MCP server from a caller (`bin/nanocode/src/host.rs` mounts one
+// only through the library builder, and `tempo.rs` is the CLI's one caller), so a scripted shell command goes through `exec`.
+const scriptedShell = (harness: string, cmd: string): string | null => harness === 'nanocode'
+  ? `Call the custom tool exec with exactly this text:\ntext(await tools.exec_command({ cmd: ${JSON.stringify(cmd)} }))\nEnd of custom tool text`
+  : null
+const NO_MCP_IN_CLI: Record<string, string> = {
+  nanocode: 'nanocode 0.7.0 takes no MCP server from its caller: its CLI mounts one only for Tempo payments (bin/nanocode/src/host.rs `mcp_server` is a library builder method; bin/nanocode/src/tempo.rs is its one CLI caller in nanocodexyz/nanocode master), and a probe with [mcp_servers] in $NANOCODE_HOME/config.toml, ~/.codex/config.toml and a project .mcp.json offered the model [exec_command, write_stdin, view_image, job_start, job_wait, job_kill, tool_search] with the server never started',
+}
 // Factory Droid (1.13 and 1.21) offers MCP tools only behind its ToolSearch tool and puts a loaded one in every later
 // request of the session, so a cell loads the tool in the turn before it calls it.
 const scriptedToolLoad = (harness: string, tool: string) => harness === 'factory-droids'
@@ -189,13 +202,16 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   }
   await guard('tool', async () => {
     if (SCRIPTED) {
-      const nonce = marker('nonce'), session = { session_id: marker(`${harness}-tool`), agent_profile: await nonceProfile() }
+      const nonce = marker('nonce')
+      // A harness with no MCP in its CLI proves its tool turn on its own shell tool: the file and the reply carry the nonce.
+      const shell = scriptedShell(harness, `printf %s ${nonce} | tee '${join(cwd, `${nonce}.nonce`)}'`)
+      const session = { session_id: marker(`${harness}-tool`), ...(shell ? {} : { agent_profile: await nonceProfile() }) }
       await loadTool('write_nonce', session)
-      toolTurn = await chat(bridge, model, cwd, scriptedCall('write_nonce', { nonce }), session)
+      toolTurn = await chat(bridge, model, cwd, shell ?? scriptedCall('write_nonce', { nonce }), session)
       if (toolTurn.status !== 200) return red(`HTTP ${toolTurn.status}: ${JSON.stringify(toolTurn.error)}`)
       const written = await readFile(join(cwd, `${nonce}.nonce`), 'utf8').catch(() => '')
-      if (written !== nonce) return red(`the harness did not call write_nonce (no nonce file); reply: ${toolTurn.text}`)
-      return toolTurn.text.includes(nonce) ? green('called write_nonce and reported its result') : red(`tool ran; reply lacks its result: ${toolTurn.text}`)
+      if (written !== nonce) return red(`the harness did not call its tool (no nonce file); reply: ${toolTurn.text}`)
+      return toolTurn.text.includes(nonce) ? green(`called ${shell ? 'its shell tool' : 'write_nonce'} and reported its result`) : red(`tool ran; reply lacks its result: ${toolTurn.text}`)
     }
     const value = marker('tool'), file = `${value}.txt`
     toolTurn = await chat(bridge, model, cwd, `Use your file tool to create the file ${file} in the current directory containing exactly ${value}. Then read it back with your file tool and reply with its exact contents only.`, { session_id: marker(`${harness}-tool`) })
@@ -275,9 +291,12 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
   await guard('abort', async () => {
     const session = marker(`${harness}-abort`), runId = marker(`${harness}-abort-run`)
     const controller = new AbortController()
-    await loadTool('wait_seconds', { session_id: session, agent_profile: await nonceProfile() })
-    const slow = chat(bridge, model, cwd, SCRIPTED ? scriptedCall('wait_seconds', { seconds: 120 }) : 'Use your shell tool to run `sleep 120`, then reply DONE.',
-      { session_id: session, run_id: runId, ...(SCRIPTED ? { agent_profile: await nonceProfile() } : {}) }, controller.signal).catch(() => undefined)
+    // The cancelled turn waits in the matrix's MCP tool, or in the shell of a harness whose CLI takes no MCP.
+    const shell = SCRIPTED ? scriptedShell(harness, 'sleep 120') : null
+    const withProfile = async () => SCRIPTED && !shell ? { agent_profile: await nonceProfile() } : {}
+    await loadTool('wait_seconds', { session_id: session, ...(await withProfile()) })
+    const slow = chat(bridge, model, cwd, SCRIPTED ? shell ?? scriptedCall('wait_seconds', { seconds: 120 }) : 'Use your shell tool to run `sleep 120`, then reply DONE.',
+      { session_id: session, run_id: runId, ...(await withProfile()) }, controller.signal).catch(() => undefined)
     await new Promise((resolve) => setTimeout(resolve, 10_000))
     const cancelled = await call(bridge, `/v1/runs/${runId}/cancel?wait_ms=20000`, {})
     controller.abort()
@@ -285,11 +304,22 @@ async function harnessCells(bridge: BridgeServer, harness: string, root: string,
     if (cancelled.status >= 300) return red(`cancel HTTP ${cancelled.status}: ${(await cancelled.text()).slice(0, 160)}`)
     const word = marker('replaced')
     const next = await chat(bridge, model, cwd, SCRIPTED ? `Reply with exactly ${word}` : `Reply with ${word} only.`,
-      { session_id: session, ...(SCRIPTED ? { agent_profile: await nonceProfile() } : {}) })
+      { session_id: session, ...(await withProfile()) })
     return next.status === 200 && next.text.includes(word) ? green('cancelled, replacement answered') : red(`replacement HTTP ${next.status}: ${next.text || JSON.stringify(next.error)}`)
   })
 
   await guard('profile+mcp', async () => {
+    // A harness whose CLI takes no MCP server is `unsupported` only while the Bridge refuses the profile's server
+    // with its typed refusal; a Bridge that accepts it runs the check below.
+    const noMcp = NO_MCP_IN_CLI[harness]
+    if (noMcp) {
+      const probeTurn = await chat(bridge, model, cwd, SCRIPTED ? `Reply with exactly ${marker('mcp')}` : 'Reply with OK only.',
+        { session_id: marker(`${harness}-mcp-refusal`), agent_profile: await nonceProfile() })
+      const typed = probeTurn.error as { type?: string; code?: string; message?: string } | undefined
+      if (typed?.type === 'capability_denied' || typed?.code === 'capability_denied') {
+        return { state: 'unsupported', detail: `not supported by the harness: the Bridge refuses its MCP servers (capability_denied: ${String(typed.message ?? '').slice(0, 100)}); ${noMcp}` }
+      }
+    }
     if (SCRIPTED) {
       // The echo model ignores a system prompt, so only the profile's MCP server is observable here.
       const nonce = marker('profile'), session = { session_id: marker(`${harness}-profile`), agent_profile: await nonceProfile() }
