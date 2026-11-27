@@ -1320,6 +1320,10 @@ MIT
 ### Process and native evidence
 
 Set `BRIDGE_RAW_CAPTURE_DIR` to a private absolute directory to retain original stdout and stderr for one-shot durable runs.
+`loadConfig` captures it once as `rawCaptureDir`. Embedded servers can pass separate
+roots in their trusted configuration; `null` disables capture. Process-environment
+changes after startup do not redirect process frames or terminal native copies.
+HTTP requests cannot select this directory.
 The Bridge creates that directory, or narrows one its own user owns, to mode 0700; it refuses a link or another user's directory.
 Use an enforced filesystem jail whose writable workspace cannot reach that directory.
 The shared host, scoped-host, and Docker process seam captures bytes before a harness parser decodes them.

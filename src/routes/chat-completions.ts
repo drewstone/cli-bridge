@@ -391,6 +391,8 @@ export function mountChatCompletions(
     registry: BackendRegistry
     onRunRedaction?: PrivateRunRedactionObserver
     captureNative?: NativeCaptureTarget
+    /** Trusted server startup snapshot; null disables capture regardless of ambient env. */
+    rawCaptureDir?: string | null
     admitSubscription?: (request: ChatRequest, backend: string, signal: AbortSignal) => Promise<void | (() => void)>
     callerTools?: CallerTools
     /** Captured operator jail defaults; standalone mounts retain process defaults. */
@@ -1210,7 +1212,7 @@ export function mountChatCompletions(
       const redaction = privateExecutionRedaction(req, run, sessionProfileBinding?.effectiveProfileDigest ?? null, deps.onRunRedaction)
       const terminal = deps.captureNative ? async (input: Parameters<import('../executors/raw-capture.js').TerminalNativeCapture>[0]) => run.setNativeCapture(await deps.captureNative!({ ...input,
         snapshot: run.snapshot(), backend: backend.name, cwd: req.cwd, profileDigest: sessionProfileBinding?.effectiveProfileDigest ?? null })) : undefined
-      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, redaction, terminal)), chatCompletionDeltaOptions(req))
+      const job = run.pump(wrap(withRawProcessCapture(makeSource(run), run.snapshot(), backend.name, req.cwd, redaction, terminal, deps.rawCaptureDir)), chatCompletionDeltaOptions(req))
       caller?.bind(run, job)
       admissionSlot?.holdUntil(job)
       admissionSlot = null

@@ -58,9 +58,9 @@ async function files(directory:string):Promise<Buffer[]> {
   return result;
 }
 
-it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as const)('keeps %s private tools scoped through an actual filesystem jail',async harness=>{
+async function privateJail(harness:'claude-code'|'codex',beforeDispatch?:()=>Promise<void>){
  const root=await realpath(await mkdtemp(join(tmpdir(),'native-private-jail-'))),workspace=join(root,'workspace'),state=join(root,'state'),capture=join(root,'frames');
- await mkdir(workspace);await mkdir(capture,{mode:0o700});vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',capture);
+ await mkdir(workspace);await mkdir(capture,{mode:0o700});
  const toolSecret='private-stdio-canary-39ad',coordSecret='private-coordination-canary-81ce',hubKey='private-hub-key-canary-21dc';
  const tokens:string[]=[];let hubCalls=0,coordCalls=0;
  const upstream=createServer(async(req,res)=>{
@@ -76,12 +76,13 @@ it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as c
  await writeFile(join(workspace,'canonical-coordination'),coordUrl);
  await writeFile(tool,`const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',line=>{const r=JSON.parse(line);if(!r.id)return;const result=r.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'private-tool',version:'1'}}:{content:[{type:'text',text:process.env.MCP_PRIVATE}]};console.log(JSON.stringify({jsonrpc:'2.0',id:r.id,result}))})`);
  const hubEntry=fileURLToPath(import.meta.resolve('@tangle-network/hub-sdk/mcp/stdio'));
- const config={...loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_DATA_DIR:state,BRIDGE_BACKENDS:harness==='codex'?'codex':'claude',CODEX_BIN:bin,CLAUDE_BIN:bin,BRIDGE_TRACE:'off',BRIDGE_JAIL_MODE:'fs-jail',BRIDGE_JAIL_FALLBACK:'deny',BRIDGE_JAIL_NETWORK:'none'}),port:0};
+ const config={...loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_DATA_DIR:state,BRIDGE_RAW_CAPTURE_DIR:capture,BRIDGE_BACKENDS:harness==='codex'?'codex':'claude',CODEX_BIN:bin,CLAUDE_BIN:bin,BRIDGE_TRACE:'off',BRIDGE_JAIL_MODE:'fs-jail',BRIDGE_JAIL_FALLBACK:'deny',BRIDGE_JAIL_NETWORK:'none'}),port:0};
  // Explicit installed code mounts for the unbundled SDK fixture; the CLI ships its own stdio bundle.
  config.jailReadablePaths=[await realpath(join(process.cwd(),'node_modules')),dirname(dirname(dirname(hubEntry)))];
  let server:Awaited<ReturnType<typeof startServer>>|undefined;const lifetime=new AbortController();
  try{
   server=await startServer({config,cwd:workspace,quiet:true,handleSignals:false,mcpSecrets:{async get(key){return key==='private-tool'?toolSecret:undefined}},hub:{client:new HubClient({baseUrl:`http://127.0.0.1:${address.port}`,apiKey:hubKey}),hash:value=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex'),serverForGrant(token){tokens.push(token);return{transport:'stdio',command:process.execPath,args:[{kind:'public',value:hubEntry}],env:{TANGLE_HUB_MCP_ENDPOINT:{kind:'public',value:`${server!.url}/hub/mcp/grants/${token}`}}}}}});
+  await beforeDispatch?.();
   const profile={name:'trusted-private-tools',connections:[{connectionId:'hubconn_fixture',capabilities:['fixture.proof'],alias:'hub'}],mcp:{local:{command:process.execPath,args:[{kind:'public',value:tool}],env:{MCP_PRIVATE:{kind:'secret-ref',key:'private-tool'}}}}};
   const body={stream:true,model:`${harness}/protocol-proof`,run_id:`private-native-${harness}`,session_id:`private-native-${harness}`,cwd:workspace,agent_profile:profile,messages:[{role:'user',content:'Use the scoped private tools'}],env:{AGENT_RUNTIME_COORDINATION_TOKEN:coordSecret},runtime_attachments:{mcp:{coord:{transport:'http',url:coordUrl,headers:{Authorization:{kind:'secret-ref',key:'AGENT_RUNTIME_COORDINATION_TOKEN',format:'bearer'}}}}}};
   const dispatch=(value:typeof body)=>fetch(`${server!.url}/v1/chat/completions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(value)});
@@ -93,16 +94,41 @@ it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as c
   const response=await dispatch(body);
   const text=await response.text();expect(response.status,text).toBe(200);expect(text).toContain('[redacted:MCP]');expect(hubCalls).toBe(1);expect(coordCalls).toBe(1);
   const terminal=await fetch(`${server.url}/v1/runs/private-native-${harness}`).then(r=>r.json()) as {nativeCapture:{status:string;path:string}};expect(terminal.nativeCapture.status).toBe('retained');
-  const manifestBytes=await readFile(terminal.nativeCapture.path),manifest=JSON.parse(manifestBytes.toString());expect(manifest.nativeSessions[0].complete).toBe(false);
+  expect(dirname(terminal.nativeCapture.path)).toBe(capture);
+  const manifestBytes=await readFile(terminal.nativeCapture.path),manifest=JSON.parse(manifestBytes.toString());expect(manifest.nativeSessions[0].complete).toBe(false);expect(manifest.bridge.cwd).toBe(workspace);
   const vendorPath=await readFile(join(workspace,'vendor-path'),'utf8'),original=await readFile(vendorPath),sourceHash=createHash('sha256').update(original).digest('hex');
   expect(original.toString()).toContain(toolSecret);expect(original.toString()).toContain(coordSecret);
   const caps=[...new Set([...original.toString().matchAll(/http:\/\/127\.0\.0\.1:3128\/([A-Za-z0-9_-]+)/g)].map(match=>match[1]!))];expect(caps).toHaveLength(2);
   const retained=await files(capture),streams=new Map<string,Buffer[]>();
+  const names=await readdir(capture);expect(names.some(name=>name.endsWith('.frames'))).toBe(true);
+  for(const name of names.filter(name=>name.endsWith('.json')&&!name.endsWith('.native.json'))){const binding=JSON.parse(await readFile(join(capture,name),'utf8'));expect(binding.requestDigest).toBe(manifest.bridge.requestDigest)}
   for(const bytes of retained)for(const line of bytes.toString().split('\n')){try{const frame=JSON.parse(line);if(typeof frame.processId==='string'&&typeof frame.stream==='string'&&typeof frame.base64Bytes==='string'){const key=`${frame.processId}/${frame.stream}`,chunks=streams.get(key)??[];chunks.push(Buffer.from(frame.base64Bytes,'base64'));streams.set(key,chunks)}}catch{}}
   const decoded=[...streams.values()].map(chunks=>Buffer.concat(chunks));expect(decoded.length).toBeGreaterThan(0);
   for(const value of [toolSecret,coordSecret,hubKey,...tokens,...caps])for(const bytes of [...retained,...decoded,Buffer.from(text),Buffer.from(JSON.stringify(terminal))])expect(bytes.includes(Buffer.from(value))).toBe(false);
   expect(createHash('sha256').update(await readFile(vendorPath)).digest('hex')).toBe(sourceHash);
   expect(manifest.bridge.files.some((file:{sourceSha256:string})=>file.sourceSha256===`sha256:${sourceHash}`)).toBe(true);
   lifetime.abort();expect((await fetch(`${server.url}/hub/mcp/grants/${tokens[0]}/tools`)).status).toBe(403);
- }finally{lifetime.abort();await server?.close();await new Promise<void>(resolve=>upstream.close(()=>resolve()));vi.unstubAllEnvs();await rm(root,{recursive:true,force:true})}
-},60000);
+ }finally{lifetime.abort();await server?.close();await new Promise<void>(resolve=>upstream.close(()=>resolve()));await rm(root,{recursive:true,force:true})}
+}
+
+it.skipIf(!new LinuxBwrapJail().isAvailable()).each(['claude-code','codex'] as const)('keeps %s private tools scoped through an actual filesystem jail',harness=>privateJail(harness),60000);
+
+it.skipIf(!new LinuxBwrapJail().isAvailable())('keeps concurrent embedded server captures in their startup roots after the process environment changes',async()=>{
+ const ambient=await realpath(await mkdtemp(join(tmpdir(),'native-capture-ambient-')));
+ let arrived=0,release!:()=>void,refuse!:(error:unknown)=>void;
+ const ready=new Promise<void>((resolve,reject)=>{release=resolve;refuse=reject});
+ void ready.catch(()=>{});
+ const beforeDispatch=async()=>{
+  if(++arrived===2){vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',ambient);release()}
+  await ready;
+ };
+ const run=(harness:'claude-code'|'codex')=>privateJail(harness,beforeDispatch).catch(error=>{refuse(error);throw error});
+ try{
+  const settled=await Promise.allSettled([run('claude-code'),run('codex')]);
+  for(const result of settled)if(result.status==='rejected')throw result.reason;
+  expect(await readdir(ambient)).toEqual([]);
+ }finally{
+  vi.unstubAllEnvs();
+  await rm(ambient,{recursive:true,force:true});
+ }
+},90000);

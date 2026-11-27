@@ -92,8 +92,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   const harness = backend === 'claude' ? 'claude-code' : backend
   const root = await mkdtemp(join(tmpdir(), 'private-mcp-'))
   const captureRoot = await mkdtemp(join(tmpdir(), 'private-mcp-capture-'))
-  if (capture) vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR', captureRoot)
-  else vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR', '')
+  vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR', captureRoot)
   const secret = 'private-mcp-provider-canary-9e5dff-quote-"\\'
   const methods: string[] = []
   const grantTokens: string[] = []
@@ -129,7 +128,7 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
   const redactors: Parameters<NonNullable<StartServerOptions['onRunRedaction']>>[0][] = []
   let server: Awaited<ReturnType<typeof startServer>>
   const createHost = (): ReturnType<typeof startServer> => startServer({ cwd: root, quiet: true, handleSignals: false,
-    config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: backend, BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CODEX_BIN: binary }), port: 0 },
+    config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_RAW_CAPTURE_DIR: capture ? captureRoot : '', BRIDGE_BACKENDS: backend, BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CODEX_BIN: binary }), port: 0 },
     onRunRedaction: run => redactors.push(run),
     mcpSecrets: { async get(key) { calls.push(key); return key === 'private-tool' ? secret : undefined } },
     hub: { client: new HubClient({baseUrl:`http://127.0.0.1:${address.port}`,apiKey:hubKey}),
@@ -230,14 +229,14 @@ it.each([['claude', false], ['claude', true], ['codex', false], ['codex', true]]
       const manifests = (await readdir(captureRoot)).filter(file => file.endsWith('.json'))
       expect(manifests.length).toBeGreaterThan(0)
       for (const name of manifests) expect(JSON.parse(await readFile(join(captureRoot, name), 'utf8')).redaction).toBe('private-mcp-secrets')
-    }
+    } else expect(streams).toHaveLength(0)
   } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); await rm(captureRoot, { recursive: true, force: true }) }
 }, 30000)
 
 it.each([false,true])('fences historical private output on a host backend without vendor-family capture (raw %s)', async (capture) => {
   const root = await mkdtemp(join(tmpdir(),'private-opencode-history-'))
   const captureRoot = await mkdtemp(join(tmpdir(),'private-opencode-frames-'))
-  vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',capture ? captureRoot : '')
+  vi.stubEnv('BRIDGE_RAW_CAPTURE_DIR',captureRoot)
   const old = 'private-opencode-prior-"coordination"-canary-a783\\tail'
   const next = 'private-opencode-next-"coordination"-canary-c294\\tail'
   let expected = old, effects = 0
@@ -262,7 +261,7 @@ async function main(){
  console.log(JSON.stringify({type:'turn.completed',sessionID:'owned-opencode-history',usage:{input_tokens:1,output_tokens:1}}));
 } main().catch(()=>{console.error('native peer failed');process.exitCode=1});`,{mode:0o700})
   const createHost = () => startServer({ cwd:root,quiet:true,handleSignals:false,
-    config:{...loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_DATA_DIR:join(root,'state'),BRIDGE_BACKENDS:'opencode',OPENCODE_BIN:bin,BRIDGE_TRACE:'off',BRIDGE_JAIL_MODE:'off'}),port:0} })
+    config:{...loadConfig({BRIDGE_HOST:'127.0.0.1',BRIDGE_DATA_DIR:join(root,'state'),BRIDGE_RAW_CAPTURE_DIR:capture ? captureRoot : '',BRIDGE_BACKENDS:'opencode',OPENCODE_BIN:bin,BRIDGE_TRACE:'off',BRIDGE_JAIL_MODE:'off'}),port:0} })
   let server = await createHost()
   const body = (token:string,runId:string) => JSON.stringify({stream:true,model:'opencode/history-fixture',session_id:'private-opencode-history',run_id:runId,cwd:root,
     messages:[{role:'user',content:'Use the private tool and continue the native conversation'}],env:{AGENT_RUNTIME_COORDINATION_TOKEN:token},
@@ -293,6 +292,7 @@ async function main(){
     const retained = [...await bytesUnder(root,new Set([join(root,'native-conversation')])),...captured]
     clean(retained)
     if(capture) expect(processStreams(retained).length).toBeGreaterThan(0)
+    else expect(processStreams(retained)).toHaveLength(0)
     await server.close(); server = await createHost()
     // After a restart the first token is unknown here: the turn runs, its output may carry that revoked token
     // as on a Bridge without cross-turn redaction, and it keeps no process frames.

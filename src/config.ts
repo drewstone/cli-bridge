@@ -95,6 +95,8 @@ export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
   port: number
   bearer: string | null
   dataDir: string
+  /** Trusted server-owned capture root; null disables native/process capture. */
+  rawCaptureDir?: string | null
   /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
   asyncDurableWrites: boolean
   backends: Set<string>
@@ -260,6 +262,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port,
     bearer,
     dataDir,
+    rawCaptureDir: env.BRIDGE_RAW_CAPTURE_DIR?.trim() || null,
     asyncDurableWrites: parseOnOff('BRIDGE_ASYNC_DURABLE_WRITES', env.BRIDGE_ASYNC_DURABLE_WRITES, false),
     backends,
     subscriptionsOnly: parseOnOff('BRIDGE_SUBSCRIPTIONS_ONLY', env.BRIDGE_SUBSCRIPTIONS_ONLY, false),

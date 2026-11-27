@@ -306,9 +306,10 @@ export async function buildApp(config: Config, cwd = process.cwd(), hubOptions?:
       return { values: [...authority], ...(withheld && { withheld }) }
     },
     // Native copies share the raw-capture directory, whose operator owns retention; unset, none is made.
+    rawCaptureDir: config.rawCaptureDir ?? null,
     captureNative: async (input) => {
       const source = nativeRedactors.get(`${input.snapshot.id}:${input.snapshot.requestDigest}`)
-      const root = process.env.BRIDGE_RAW_CAPTURE_DIR
+      const root = config.rawCaptureDir
       if (source?.withheld || !root) return { status: 'unavailable', reason: source?.withheld ?? 'native-capture-not-configured' }
       return captureTerminalNativeFamily({ ...input, root,
         redact: (bytes) => {

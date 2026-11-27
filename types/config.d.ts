@@ -79,6 +79,8 @@ export interface Config extends NativeHarnessConfig, AcpHarnessConfig {
     port: number;
     bearer: string | null;
     dataDir: string;
+    /** Trusted server-owned capture root; null disables native/process capture. */
+    rawCaptureDir?: string | null;
     /** Opt-in worker isolation for durable streamed writes; FULL WAL semantics stay unchanged. */
     asyncDurableWrites: boolean;
     backends: Set<string>;
