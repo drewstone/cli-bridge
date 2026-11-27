@@ -55,6 +55,7 @@ import { installOutputCapPlugin, verifiedStepOutput } from './opencode-output-bu
 export { outputCapPluginSource } from './opencode-output-budget.js'
 import { chatContinuing, runnerDelta, type RunnerWatch } from './runner-continuation.js'
 import { opencodeNativeCapabilities, startOpencodeNativeSession } from './opencode-native-start.js'
+import { opencodeDatabaseEnv } from './opencode-database.js'
 
 type UsageReceipt = NonNullable<ChatDelta['usage']>
 
@@ -284,6 +285,7 @@ export class OpencodeBackend implements NativeSessionBackend {
         // Keep one native wrapper store for the entire resumable session.
         ...(req.session_id ? { OPENCODE_RUNTIME_ID: req.session_id.replace(/[^A-Za-z0-9_.-]/g, '-') } : {}),
         ...provisioned.env,
+        ...opencodeDatabaseEnv(req, session),
         ...(mcpMaterialized ? { OPENCODE_CONFIG: mcpMaterialized.configPath } : {}),
         ...(outputCap ? { [OUTPUT_TOKEN_FLAG_ENV]: String(outputCap.cap) } : {}),
         ...(plainCapConfigDir !== undefined ? { OPENCODE_CONFIG_DIR: plainCapConfigDir } : {}),

@@ -19,6 +19,7 @@ import { createPrivateTemporaryRoot } from '../runtime/private-temporary.js'
 import { assertModeSupported } from '../modes.js'
 import type { SessionRecord } from '../sessions/store.js'
 import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
+import { opencodeDatabaseEnv } from './opencode-database.js'
 
 const SERVE_SOCKET_SHIM = fileURLToPath(new URL('./opencode-serve-socket.mjs', import.meta.url))
 
@@ -85,6 +86,7 @@ export async function startOpencodeNativeSession(
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...provisioned.env,
+      ...opencodeDatabaseEnv(req, session),
       ...(mcp ? { OPENCODE_CONFIG: mcp.configPath } : {}),
       OPENCODE_SERVER_USERNAME: 'opencode',
       OPENCODE_SERVER_PASSWORD: password,
