@@ -29,9 +29,9 @@ interface CaptureScope {
 const scopes = new AsyncLocalStorage<CaptureScope>()
 
 /** Bind process bytes to the durable run after any admitted credential redaction; a withheld run keeps none. */
-export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: RunSnapshot, backend: string, workspace?: string, redaction: RunRedaction = { values: [] }, terminal?: TerminalNativeCapture): AsyncIterable<T> {
+export function withRawProcessCapture<T>(source: AsyncIterable<T>, snapshot: RunSnapshot, backend: string, workspace?: string, redaction: RunRedaction = { values: [] }, terminal?: TerminalNativeCapture, captureRoot: string | null | undefined = process.env.BRIDGE_RAW_CAPTURE_DIR): AsyncIterable<T> {
   const protectedValues = redaction.values
-  const root = redaction.withheld ? undefined : process.env.BRIDGE_RAW_CAPTURE_DIR
+  const root = redaction.withheld ? undefined : captureRoot
   if (!root && !protectedValues.length && !terminal) return source
   if (root && !isAbsolute(root)) throw new Error('BRIDGE_RAW_CAPTURE_DIR must be absolute')
   const scope: CaptureScope = {

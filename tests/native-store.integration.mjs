@@ -59,7 +59,7 @@ label=$(sed -n 's/.*"Authorization":[[:space:]]*"Bearer \\([^" ]*\\)".*/\\1/p' "
 ln -s "${nativeRoot}/${directory}/${filename}" "${nativeRoot}/${directory}/$label.jsonl"
 ` : ''}printf '%s\\n' ${events.map(event => `'${JSON.stringify(event)}'`).join(' ')}
 `, { mode: 0o700 })
-    const config = { ...loadConfig({ BRIDGE_DATA_DIR: state, BRIDGE_BACKENDS: harness === 'codex' ? 'codex' : 'claude', CODEX_BIN: bin, CLAUDE_BIN: bin,
+    const config = { ...loadConfig({ BRIDGE_DATA_DIR: state, BRIDGE_RAW_CAPTURE_DIR: captureDir, BRIDGE_BACKENDS: harness === 'codex' ? 'codex' : 'claude', CODEX_BIN: bin, CLAUDE_BIN: bin,
       BRIDGE_BEARER: 'native-store-public-fixture', BRIDGE_TRACE: 'off', BRIDGE_JAIL_MODE: 'fs-jail' }), port: 0 }
     const mcpSecrets = { async get(key) { return key === 'label' ? labelSecret : undefined } }
     server = await startServer({ config, cwd: workspace, quiet: true, handleSignals: false, mcpSecrets })
