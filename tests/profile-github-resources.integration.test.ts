@@ -34,14 +34,18 @@ const github = (path: string, name?: string) => ({
   ...(name === undefined ? {} : { name }),
 })
 
-it('a profile with commit-pinned GitHub resources mounts their exact bytes, and an unreadable one fails before the harness starts', async () => {
+// With an execution timeout the chat route runs a copy of the request; the copy must write the bytes admission fetched.
+it.each([
+  ['without an execution timeout', '0'],
+  ['with an execution timeout', '600000'],
+])('a profile with commit-pinned GitHub resources mounts their exact bytes, and an unreadable one fails before the harness starts, %s', async (_label, timeoutMs) => {
   const root = await mkdtemp(join(tmpdir(), 'profile-github-resources-'))
   const binary = join(root, 'claude')
   await writeFile(binary, harness)
   await chmod(binary, 0o755)
   const server = await startServer({ cwd: root, quiet: true, handleSignals: false,
     config: { ...loadConfig({ BRIDGE_HOST: '127.0.0.1', BRIDGE_DATA_DIR: join(root, 'state'), BRIDGE_BACKENDS: 'claude',
-      BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary }), port: 0 } })
+      BRIDGE_JAIL_MODE: 'off', CLAUDE_BIN: binary, CLAUDE_TIMEOUT_MS: timeoutMs }), port: 0 } })
   try {
     const post = async (cwd: string, profile: unknown) => {
       await mkdir(cwd, { recursive: true })
