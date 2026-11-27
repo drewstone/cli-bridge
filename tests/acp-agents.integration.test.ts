@@ -72,19 +72,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   if (message.method === 'session/prompt') {
     const text = params.prompt[0].text
     if (held !== null) {
-      it('reports what each DeepSeek Harness prompt added to its session totals', async () => {
-    const session = await retained('deepseek-harness', 'dsh-usage')
-    try {
-      const usage = async (message: string) => (await runEvents(await session.turn(message)))
-        .filter((event) => event.type === 'usage').map((event) => [event.usage?.inputTokens, event.usage?.outputTokens, event.usage?.cachedReadTokens])
-      expect(await usage('one')).toEqual([[10, 2, 4]])
-      expect(await usage('two')).toEqual([[10, 2, 4]])
-    } finally {
-      await post(`/v1/sessions/${session.id}/close`, {})
-    }
-  }, 40_000)
-
-  // Grok queues a second prompt behind the running one; Copilot and Qwen end the running one and answer it.
+      // Grok queues a second prompt behind the running one; Copilot and Qwen end the running one and answer it.
       if (flavor === 'grok') return void queued.push({ id: message.id, sessionId: params.sessionId, text })
       if (flavor === 'dsh') return send({ id: message.id, error: { code: -32602, message: 'Invalid params: a prompt is already in flight for this session' } })
       send({ id: held, result: { stopReason: 'cancelled' } })
@@ -217,6 +205,18 @@ describe('Copilot CLI, Qwen Code, Grok CLI and DeepSeek Harness over ACP through
       expect(await usage('two')).toEqual([[10, 2]])
       // A retained session runs without the unattended flag: the turn's interaction policy answers permissions.
       expect((await calls(session.cwd)).find((call) => call.method === 'launch')?.args).toEqual(['--acp'])
+    } finally {
+      await post(`/v1/sessions/${session.id}/close`, {})
+    }
+  }, 40_000)
+
+  it('reports what each DeepSeek Harness prompt added to its session totals', async () => {
+    const session = await retained('deepseek-harness', 'dsh-usage')
+    try {
+      const usage = async (message: string) => (await runEvents(await session.turn(message)))
+        .filter((event) => event.type === 'usage').map((event) => [event.usage?.inputTokens, event.usage?.outputTokens, event.usage?.cachedReadTokens])
+      expect(await usage('one')).toEqual([[10, 2, 4]])
+      expect(await usage('two')).toEqual([[10, 2, 4]])
     } finally {
       await post(`/v1/sessions/${session.id}/close`, {})
     }
