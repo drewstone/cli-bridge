@@ -75,6 +75,32 @@ export type AcpSteer =
 export type AcpUsage = Partial<Record<typeof ACP_USAGE_KEYS[number], number>>
 const ACP_USAGE_KEYS = ['inputTokens', 'outputTokens', 'thoughtTokens', 'cachedReadTokens', 'cachedWriteTokens'] as const
 
+/**
+ * Where an agent that keeps its token counts outside ACP records them: the session's running totals,
+ * read by the agent's session id. Undefined while the agent has recorded none.
+ */
+export type AcpUsageSource = (agentSessionId: string) => Promise<AcpUsage | undefined>
+const USAGE_SETTLE_MS = 2_000
+
+/**
+ * The tokens a session used since `before`, from its usage source. An agent writes its totals as it ends
+ * a turn, so this polls until they move; totals that never move leave the turn's usage unreported.
+ */
+export async function acpUsageSince(source: AcpUsageSource, agentSessionId: string, before: AcpUsage):
+  Promise<{ totals: AcpUsage; delta: AcpUsage } | undefined> {
+  const deadline = Date.now() + USAGE_SETTLE_MS
+  for (;;) {
+    const totals = await source(agentSessionId).catch(() => undefined)
+    if (totals && ACP_USAGE_KEYS.some((key) => (totals[key] ?? 0) !== (before[key] ?? 0))) {
+      const delta: AcpUsage = {}
+      for (const key of ACP_USAGE_KEYS) if (totals[key] !== undefined) delta[key] = Math.max(0, totals[key]! - (before[key] ?? 0))
+      return { totals, delta }
+    }
+    if (Date.now() >= deadline) return undefined
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+}
+
 function acpUsageCounts(value: unknown): AcpUsage | undefined {
   const source = record(value)
   if (!source) return undefined
@@ -122,6 +148,8 @@ export interface AcpNativeSessionOptions {
   steer: AcpSteer | null
   /** True when a prompt result's usage totals every prompt the process has answered (Copilot CLI). */
   cumulativeUsage?: boolean
+  /** The agent's own record of its token counts, for an agent whose ACP answers carry none. */
+  usageSource?: AcpUsageSource
   /** Bound on every request except a prompt. */
   requestTimeoutMs: number
   cleanup: () => void | Promise<void>
@@ -137,6 +165,8 @@ interface TurnState {
   replacing: Array<() => void>
   /** The `_meta.usage` of the turn's message chunks. */
   chunkUsage: Record<string, unknown>[]
+  /** What the usage source recorded for the turn, read once its last prompt was answered. */
+  sourceUsage?: AcpUsage
 }
 
 interface Permission {
@@ -159,6 +189,8 @@ export class AcpNativeSession implements NativeSession {
   private abortInFlight: Promise<void> | null = null
   /** The usage totals of the process's last answered prompt, for an agent that reports totals. */
   private usageTotals: AcpUsage = {}
+  /** Whether `usageTotals` holds the usage source's totals as the session opened. */
+  private usageBaselined = false
 
   constructor(spawned: Awaited<ReturnType<Spawner>>, private readonly options: AcpNativeSessionOptions) {
     this.capabilities = options.capabilities
@@ -204,6 +236,11 @@ export class AcpNativeSession implements NativeSession {
     if (this.turnState) throw new BackendError(`${this.options.name} native session already has an active turn`, 'upstream')
     const state: TurnState = { steering: 0, settled: false, prompts: 0, replacing: [], chunkUsage: [] }
     this.turnState = state
+    const source = this.options.usageSource
+    if (source && !this.usageBaselined) {
+      this.usageTotals = await source(sessionId).catch(() => undefined) ?? {}
+      this.usageBaselined = true
+    }
     const onAbort = (): void => { void this.abort().catch(() => {}) }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
@@ -280,8 +317,13 @@ export class AcpNativeSession implements NativeSession {
    */
   private prompt(state: TurnState, sessionId: string, text: string, sent = ++state.prompts): void {
     const answered = (outcome: { result?: unknown; error?: string }): void => {
-      if (sent === state.prompts) this.settle(state, outcome)
-      else state.replacing.shift()?.()
+      if (sent !== state.prompts) { state.replacing.shift()?.(); return }
+      const source = this.options.usageSource
+      if (!source || outcome.error !== undefined) { this.settle(state, outcome); return }
+      void acpUsageSince(source, sessionId, this.usageTotals).then((seen) => {
+        if (seen) { state.sourceUsage = seen.delta; this.usageTotals = seen.totals }
+        this.settle(state, outcome)
+      })
     }
     this.call('session/prompt', { sessionId, prompt: [{ type: 'text', text }] }, 'prompt', 0).then(
       (result) => answered({ result }),
@@ -359,7 +401,7 @@ export class AcpNativeSession implements NativeSession {
     for (const accepted of state.replacing.splice(0)) accepted()
     if (outcome.error === undefined) this.completedTurns += 1
     const result = outcome.result !== null && typeof outcome.result === 'object' ? outcome.result as Record<string, unknown> : {}
-    let usage = acpPromptUsage(result, state.chunkUsage)
+    let usage = acpPromptUsage(result, state.chunkUsage) ?? state.sourceUsage
     if (this.options.cumulativeUsage && usage) {
       const totals = usage, delta: AcpUsage = {}
       for (const key of ACP_USAGE_KEYS) {

@@ -23,8 +23,9 @@
  *   `cancelled` and answers the steer about 0.4 s later. `--always-approve` runs every tool without asking.
  * - DeepSeek Harness 0.2.2-rc.1 (`dsh --profile acp`) takes its provider route and model from a profile
  *   patch, such as `~/.dsh/cordis.patch.yml`, and mounts stdio and HTTP MCP servers from `session/new`.
- *   It reports only context occupancy (`usage_update` with `used` and `size`); its prompt result
- *   carries a stop reason alone, so it reports no token usage. It refuses a second `session/prompt`
+ *   Its ACP answers carry no token counts (`usage_update` is context occupancy, `used` and `size`, and
+ *   the prompt result a stop reason alone); the session's running totals are in its projection cache
+ *   (dsh-usage.ts), which the Bridge reads for each turn's usage. It refuses a second `session/prompt`
  *   while one is in flight ("a prompt is already in flight for this session"), so a steer cancels the
  *   running prompt and waits for its `cancelled` answer before it prompts. The Bridge turns off its
  *   session telemetry export (`DSH_TELEMETRY_MODE=DISABLED`).
@@ -33,9 +34,10 @@
 
 import type { AcpHarnessName } from '../config.js'
 import type { AcpBackendOptions } from './acp.js'
+import { dshSessionUsage } from './dsh-usage.js'
 
 export type AcpAgentLaunch = Pick<AcpBackendOptions,
-  'acpArgs' | 'unattendedArgs' | 'env' | 'envPassthroughKeys' | 'mcpConfigArgs' | 'cumulativeUsage' | 'steer'>
+  'acpArgs' | 'unattendedArgs' | 'env' | 'envPassthroughKeys' | 'mcpConfigArgs' | 'cumulativeUsage' | 'usageSource' | 'steer'>
 
 export const acpAgentLaunch: Record<AcpHarnessName, AcpAgentLaunch> = {
   hermes: { acpArgs: ['acp'], steer: { command: '/steer' } },
@@ -43,6 +45,7 @@ export const acpAgentLaunch: Record<AcpHarnessName, AcpAgentLaunch> = {
     acpArgs: ['--profile', 'acp'],
     env: { DSH_TELEMETRY_MODE: 'DISABLED' },
     envPassthroughKeys: ['DSH_HOME', 'DSH_PERMISSION_MODE'],
+    usageSource: dshSessionUsage,
     steer: 'interrupt',
   },
   copilot: {

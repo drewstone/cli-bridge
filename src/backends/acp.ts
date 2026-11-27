@@ -23,7 +23,7 @@
 import type { AgentEnvironmentCapabilities } from '@tangle-network/agent-interface'
 import type { BackendHealth, ChatDelta, ChatMessage, ChatRequest, NativeSession, NativeSessionBackend } from './types.js'
 import { BackendError } from './types.js'
-import { AcpNativeSession, acpChunkUsage, acpPromptUsage, type AcpSteer, type AcpUsage } from './acp-native-session.js'
+import { AcpNativeSession, acpChunkUsage, acpPromptUsage, acpUsageSince, type AcpSteer, type AcpUsage, type AcpUsageSource } from './acp-native-session.js'
 import { hostRequestJail } from '../jail/host-request.js'
 import { genericCliBridgeCapabilities } from '../sessions/retained/capabilities.js'
 import type { SessionRecord } from '../sessions/store.js'
@@ -62,6 +62,8 @@ export interface AcpBackendOptions {
   mcpConfigArgs?: (path: string) => string[]
   /** True when a prompt result's usage totals every prompt the process has answered. */
   cumulativeUsage?: boolean
+  /** The agent's own record of its token counts, for an agent whose ACP answers carry none. */
+  usageSource?: AcpUsageSource
   /** Operator fallback when the caller omits `execution.timeoutMs`; zero means none. */
   timeoutMs: number
   /** Subprocess spawner; defaults to the scoped host spawner. */
@@ -125,6 +127,7 @@ export class AcpBackend implements NativeSessionBackend {
   private readonly envPassthroughKeys: string[]
   private readonly mcpConfigArgs: ((path: string) => string[]) | null
   private readonly cumulativeUsage: boolean
+  private readonly usageSource: AcpUsageSource | null
   private readonly spawner: Spawner
   private readonly steer: AcpSteer | null
   private readonly jailEnv: NodeJS.ProcessEnv | undefined
@@ -140,6 +143,7 @@ export class AcpBackend implements NativeSessionBackend {
     this.envPassthroughKeys = [...(opts.envPassthroughKeys ?? []), ...Object.keys(this.env)]
     this.mcpConfigArgs = opts.mcpConfigArgs ?? null
     this.cumulativeUsage = opts.cumulativeUsage ?? false
+    this.usageSource = opts.usageSource ?? null
     this.spawner = opts.spawner ?? scopedHostSpawner
     this.steer = opts.steer ?? null
     this.jailEnv = opts.jailEnv
@@ -195,6 +199,7 @@ export class AcpBackend implements NativeSessionBackend {
       resumeSessionId: session?.internalId || null,
       steer: this.steer,
       cumulativeUsage: this.cumulativeUsage,
+      ...(this.usageSource ? { usageSource: this.usageSource } : {}),
       requestTimeoutMs: this.defaultExecutionTimeoutMs > 0 ? Math.min(this.defaultExecutionTimeoutMs, REQUEST_TIMEOUT_CAP_MS) : REQUEST_TIMEOUT_CAP_MS,
       cleanup: () => mcp.file?.cleanup(),
     })
@@ -339,9 +344,12 @@ export class AcpBackend implements NativeSessionBackend {
         cancel = () => rpc.notify('session/cancel', { sessionId })
         if (signal.aborted) throw new BackendError(`${this.name} acp turn was cancelled`, 'aborted')
         push({ internal_session_id: sessionId })
+        // A resumed session's totals already hold its earlier turns.
+        const before = this.usageSource ? await this.usageSource(sessionId).catch(() => undefined) ?? {} : {}
         prompting = true
         const result = (await request('session/prompt', { sessionId, prompt: [{ type: 'text', text: promptText }] })) as { stopReason?: unknown }
-        const usage = acpTurnUsage(acpPromptUsage(result, chunkUsage))
+        const sourced = !this.usageSource ? undefined : await acpUsageSince(this.usageSource, sessionId, before)
+        const usage = acpTurnUsage(acpPromptUsage(result, chunkUsage) ?? sourced?.delta)
         if (usage) push({ usage })
         push({ finish_reason: signal.aborted ? 'error' : mapStopReason(result?.stopReason) })
       })()
