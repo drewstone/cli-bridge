@@ -285,6 +285,10 @@ Behavior:
   Codex CLI 0.147.0 supplied the accepted values through direct probes.
 - A jailed OpenCode run seeds only `auth.json` into its writable private data directory.
   The bridge does not expose or copy the host database and logs.
+  New Bridge sessions use separate, stable `OPENCODE_DB` files inside that directory,
+  including retained `serve` sessions. Parallel nodes sharing a working directory keep
+  their own native database. Resumed sessions without that binding retain their original
+  shared database; no native sessions are moved or deleted. Unjailed runs are unchanged.
 - OpenCode turns accept an explicit `max_tokens`. The request value becomes the runner's
   experimental output-token maximum (`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`) for that one
   turn, fresh or resumed. Its budget plugin reserves each model request before sending it.
