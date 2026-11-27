@@ -10,9 +10,16 @@
  * session binding and the receipts name the references. Only the files written
  * to the workspace carry the fetched bytes.
  *
+ * The fetched resources are found again by the declared resources' content,
+ * not by the request object: the chat route copies a request to add its
+ * timeout, and a context transfer builds a new request from its plan, and both
+ * must write the bytes admission fetched. Every admission fetches again, so a
+ * reference to a branch is as fresh as the turn that names it.
+ *
  * A reference pinned to a full commit names fixed bytes, so the Bridge keeps
  * what it fetched for it and later turns reuse it instead of fetching again.
  */
+import { createHash } from 'node:crypto'
 import { basename } from 'node:path'
 import type {
   AgentProfile,
@@ -22,7 +29,13 @@ import type {
 import { resolveAgentProfileResources } from '@tangle-network/agent-profile-materialize'
 import { BackendError, type ChatRequest } from './backends/types.js'
 
-const resolvedResources = new WeakMap<ChatRequest, Resources>()
+/** Requests whose admission already fetched; a retained turn and the chat route both admit. */
+const admitted = new WeakSet<ChatRequest>()
+
+/** Fetched resources by the declared resources' content key, oldest first; bounded by total bytes. */
+const resolvedResources = new Map<string, { resources: Resources; bytes: number }>()
+const MAX_RESOLVED_BYTES = 256 * 1024 * 1024
+let resolvedBytes = 0
 
 /** Bodies of commit-pinned references, oldest first; bounded by total bytes. */
 const pinned = new Map<string, ResourceRef>()
@@ -53,6 +66,38 @@ function keep(key: string, resolved: ResourceRef): void {
   }
 }
 
+/** JSON with object keys sorted, so equal resources give one key whatever their key order. */
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function resourcesKey(resources: Resources): string {
+  return createHash('sha256').update(stableJson(resources)).digest('hex')
+}
+
+function remember(key: string, resources: Resources): void {
+  const previous = resolvedResources.get(key)
+  if (previous !== undefined) {
+    resolvedResources.delete(key)
+    resolvedBytes -= previous.bytes
+  }
+  const bytes = refsOf(resources).reduce((total, ref) => total + contentBytes(ref), 0)
+  resolvedResources.set(key, { resources, bytes })
+  resolvedBytes += bytes
+  for (const [oldest, entry] of resolvedResources) {
+    if (resolvedBytes <= MAX_RESOLVED_BYTES || oldest === key) break
+    resolvedResources.delete(oldest)
+    resolvedBytes -= entry.bytes
+  }
+}
+
 /** Apply `map` to every reference, in one fixed order. */
 function mapRefs(resources: Resources, map: (ref: ResourceRef) => ResourceRef): Resources {
   const list = (values: ResourceRef[] | undefined) => values?.map(map)
@@ -79,10 +124,9 @@ function refsOf(resources: Resources): ResourceRef[] {
 }
 
 /**
- * Fetch the GitHub resources of the request's profile, once per request. A
- * request whose run executes in a Sandbox is left alone: the Sandbox SDK
- * resolves its own. A reference that cannot be fetched fails the request before
- * any harness starts.
+ * Fetch the GitHub resources of the request's profile. A request whose run
+ * executes in a Sandbox is left alone: the Sandbox SDK resolves its own. A
+ * reference that cannot be fetched fails the request before any harness starts.
  */
 export async function resolveProfileResources(
   req: ChatRequest,
@@ -90,8 +134,13 @@ export async function resolveProfileResources(
   backend: string,
   signal: AbortSignal,
 ): Promise<void> {
-  if (resolvedResources.has(req)) return
-  if (req.execution?.kind === 'sandbox' || backend === 'sandbox') return
+  if (admitted.has(req) || req.execution?.kind === 'sandbox' || backend === 'sandbox') return
+  await fetchProfileResources(profile, signal)
+  admitted.add(req)
+}
+
+/** Fetch the GitHub resources a profile names, so the workspace written for it carries their bytes. */
+export async function fetchProfileResources(profile: AgentProfile | null, signal: AbortSignal): Promise<void> {
   const resources = profile?.resources
   if (resources === undefined || refsOf(resources).every((ref) => ref.kind === 'inline')) return
   const known = mapRefs(resources, (ref) => {
@@ -123,11 +172,16 @@ export async function resolveProfileResources(
     const value = fetched[index]
     if (key !== null && value !== undefined) keep(key, value)
   }
-  resolvedResources.set(req, resolved.resources ?? {})
+  remember(resourcesKey(resources), resolved.resources ?? {})
 }
 
-/** The profile to materialize: the given one, with the request's fetched resources in place of their references. */
-export function withResolvedResources(req: ChatRequest, profile: AgentProfile): AgentProfile {
-  const resources = resolvedResources.get(req)
-  return resources === undefined ? profile : { ...profile, resources }
+/** The profile to materialize: the given one, with the resources fetched for it in place of their references. */
+export function withResolvedResources(profile: AgentProfile): AgentProfile {
+  if (profile.resources === undefined) return profile
+  const key = resourcesKey(profile.resources)
+  const entry = resolvedResources.get(key)
+  if (entry === undefined) return profile
+  resolvedResources.delete(key)
+  resolvedResources.set(key, entry)
+  return { ...profile, resources: entry.resources }
 }
